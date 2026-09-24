@@ -19,7 +19,8 @@
 
     python scripts/aggregate_decisions.py
     python scripts/aggregate_decisions.py --point layer_classification_shadow
-    python scripts/aggregate_decisions.py --dir local/logs/debug --json out.json
+    python scripts/aggregate_decisions.py --dir userdata/logs/debug --json out.json
+    python scripts/aggregate_decisions.py --data-root D:/evoref-data
 """
 
 from __future__ import annotations
@@ -36,7 +37,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if hasattr(sys.stdout, "reconfigure"):  # pragma: no cover - 実行環境依存
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-DEFAULT_LOG_DIR = REPO_ROOT / "local" / "logs" / "debug"
+
+def default_log_dir(data_root: str | None = None) -> Path:
+    """データ根の ``logs/debug`` (c_03 §10.1)。
+
+    データ根は ``--data-root`` → ``EVOREF_DATA_ROOT`` → ``<repo>/userdata``。
+    """
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from backend.config import PathResolver
+    from backend.data_root import resolve_data_root
+
+    resolver = PathResolver({}, REPO_ROOT, data_root=resolve_data_root(data_root, root=REPO_ROOT))
+    return resolver.resolve_local("logs_dir") / "debug"
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -184,12 +197,19 @@ def outcome_correlation(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
-        "--dir", type=Path, default=DEFAULT_LOG_DIR, help="JSONL の置き場",
+        "--dir", type=Path, default=None,
+        help="JSONL の置き場 (既定: データ根の logs/debug)",
+    )
+    ap.add_argument(
+        "--data-root", default=None,
+        help="データ根 (既定: EVOREF_DATA_ROOT → <repo>/userdata)",
     )
     ap.add_argument("--point", default="", help="判定点名で絞る (部分一致)")
     ap.add_argument("--top", type=int, default=15, help="相関の表示件数")
     ap.add_argument("--json", type=Path, default=None, help="結果を JSON で保存")
     args = ap.parse_args(argv)
+    if args.dir is None:
+        args.dir = default_log_dir(args.data_root)
 
     if not args.dir.exists():
         print(f"ログディレクトリがありません: {args.dir}", file=sys.stderr)

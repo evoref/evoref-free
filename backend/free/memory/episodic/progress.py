@@ -8,17 +8,22 @@ sleep-time のノート生成は「会話履歴のうち、まだノートにし
 があり、そのとき件数基準だと未処理のターンを飛ばす。id が見つかればそれを
 優先し、見つからないときだけ件数へ落ちる。
 
-エンベロープ (``schema_version`` / ``written_at`` / ``producer`` / ``payload``)
-と「未対応の新しい版は読まず書き戻さない」規約は c_05 §0.5 のとおり。
+封筒 (形式 ``episodic.progress``、:class:`~backend.io.versioned.VersionedJsonFile`)
+と「新しい版 / G1 の封筒でないファイルは読まず書き戻さない (readonly)、壊れた
+ファイルは退避する」規約は c_05 §0.4 / §0.5 のとおり。readonly の間はノート化を
+止める (進捗を残せないまま取り込むと、再起動のたびに同じターンを二度ノートにする
+— :func:`~backend.free.memory.episodic.ingest.ingest_new_turns`)。
 """
 
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from backend.io import AtomicWriter
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -26,76 +31,91 @@ logger = get_logger("memory.episodic.progress")
 
 PROGRESS_FILE = "progress.json"
 
+
+@persisted()
+@dataclass
+class SessionProgress:
+    """1 セッションの進捗 (最後にノート化したターンの id と件数)。"""
+
+    last_turn_id: str = ""
+    turn_count: int = 0
+    updated_at: str = ""
+    #: この版が知らないキー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
+
+
+@persisted()
+@dataclass
+class ProgressPayload:
+    """``progress.json`` の payload (``sessions`` の無いファイルは壊れている)。"""
+
+    sessions: dict[str, SessionProgress]
+    _extra: dict[str, Any] | None = None
+
+
+_PAYLOAD_CODEC = codec_for(ProgressPayload)
+
 #: 1 セッションあたりで覚えておくターン数の上限は持たない — 保持しているのは
 #: 「最後の 1 件の id と件数」だけなので、セッション数に比例した定数サイズ。
-SCHEMA_VERSION = 1
+EPISODIC_PROGRESS_FORMAT = register_format(FormatSpec(
+    format_id="episodic.progress",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/memory/episodic/progress.json",
+    retention="follows forget; one entry per session",
+    export=True,
+    records=(ProgressPayload,),
+))
 
 
-class EpisodicProgress:
+class EpisodicProgress(VersionedJsonFile):
     """セッション → 最後にノート化したターン。
 
     Attributes:
-        sessions: ``{session_id: {"last_turn_id": str, "turn_count": int,
-            "updated_at": ISO}}``。
+        sessions: ``{session_id: SessionProgress}``。
+        readonly: ディスク上のファイルを書き戻すと壊す (新しい版 / G1 の封筒で
+            ない / 退避に失敗した)。``save`` は書かない。
     """
 
+    FORMAT = EPISODIC_PROGRESS_FORMAT
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
+
     def __init__(self, path: Path | str) -> None:
-        self.path = Path(path)
-        self.sessions: dict[str, dict[str, Any]] = {}
-        #: 未対応の新しい版を読んだ = 書き戻すと壊すので保存しない。
-        self.readonly: bool = False
+        super().__init__(path)
+        self.sessions: dict[str, SessionProgress] = {}
+        #: payload の未知キー (書き戻しでそのまま戻す)。
+        self._extra: dict[str, Any] | None = None
         self._dirty = False
 
     # ── 読み書き ──
 
-    def load(self) -> bool:
-        """進捗を読む。ファイル不在 / 破損 / 新しい版では ``False``。"""
-        if not self.path.exists():
-            return False
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("Failed to read episodic progress %s: %s", self.path, e)
-            return False
-        version = int((raw or {}).get("schema_version") or 0)
-        if version > SCHEMA_VERSION:
-            logger.warning(
-                "Episodic progress %s is schema_version=%d (> %d); refusing to "
-                "read or write it back", self.path, version, SCHEMA_VERSION,
-            )
-            self.readonly = True
-            return False
-        payload = (raw or {}).get("payload") or {}
-        sessions = payload.get("sessions")
-        if not isinstance(sessions, dict):
-            logger.warning("Episodic progress %s has no sessions map", self.path)
-            return False
-        self.sessions = {
-            str(sid): dict(entry)
-            for sid, entry in sessions.items()
-            if isinstance(entry, dict)
-        }
-        return True
+    def save(self, path: Path | str | None = None) -> bool:
+        """進捗を封筒付きで原子的に書き出す (変更が無ければ何もしない)。
 
-    def save(self) -> None:
-        """進捗を原子的に書き出す (変更が無ければ何もしない)。"""
+        readonly ならログに出して ``False``。書き込みの失敗は従来どおり送出する。
+        """
         if self.readonly:
             logger.warning(
-                "Skipping save of episodic progress %s: on-disk file is newer",
-                self.path,
+                "Skipping save of episodic progress %s: the on-disk file must "
+                "not be overwritten (%s)", self.path, self.last_status,
             )
-            return
+            return False
         if not self._dirty:
-            return
-        envelope = {
-            "schema_version": SCHEMA_VERSION,
-            "written_at": utc_now(),
-            "producer": {"component": "memory.episodic.progress"},
-            "payload": {"sessions": self.sessions},
-        }
-        with AtomicWriter(self.path) as f:
-            f.write(json.dumps(envelope, ensure_ascii=False, indent=2))
+            return True
+        if not super().save(path):
+            return False
         self._dirty = False
+        return True
+
+    def _to_payload(self) -> dict[str, Any]:
+        return _PAYLOAD_CODEC.encode(ProgressPayload(sessions=self.sessions, _extra=self._extra))
+
+    def _from_payload(self, payload: Any) -> None:
+        data = _PAYLOAD_CODEC.decode(payload)
+        self.sessions = data.sessions
+        self._extra = data._extra
 
     # ── 判定 ──
 
@@ -106,26 +126,25 @@ class EpisodicProgress:
         見つからなければ記録済みの件数から始める (どちらも無ければ 0)。
         """
         entry = self.sessions.get(session_id)
-        if not entry:
+        if entry is None:
             return 0
-        last_turn_id = str(entry.get("last_turn_id") or "")
-        if last_turn_id:
+        if entry.last_turn_id:
             for index, turn in enumerate(turns):
-                if str(turn.get("turn_id") or "") == last_turn_id:
+                if str(turn.get("turn_id") or "") == entry.last_turn_id:
                     return index + 1
-        count = int(entry.get("turn_count") or 0)
-        return min(count, len(turns))
+        return min(entry.turn_count, len(turns))
 
     def mark(self, session_id: str, turns: list[dict], processed_upto: int) -> None:
-        """``turns[:processed_upto]`` までノート化した、と記録する。"""
+        """``turns[:processed_upto]`` までノート化した、と記録する (未知キーは残す)。"""
         if processed_upto <= 0:
             return
         last = turns[processed_upto - 1]
-        self.sessions[session_id] = {
-            "last_turn_id": str(last.get("turn_id") or ""),
-            "turn_count": int(processed_upto),
-            "updated_at": utc_now(),
-        }
+        self.sessions[session_id] = replace(
+            self.sessions.get(session_id) or SessionProgress(),
+            last_turn_id=str(last.get("turn_id") or ""),
+            turn_count=int(processed_upto),
+            updated_at=utc_now(),
+        )
         self._dirty = True
 
     def forget(self, session_id: str) -> None:
@@ -134,4 +153,4 @@ class EpisodicProgress:
             self._dirty = True
 
 
-__all__ = ["PROGRESS_FILE", "SCHEMA_VERSION", "EpisodicProgress"]
+__all__ = ["EPISODIC_PROGRESS_FORMAT", "PROGRESS_FILE", "EpisodicProgress"]

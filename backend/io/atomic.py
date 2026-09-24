@@ -77,6 +77,9 @@ class AtomicWriter:
         self._bytes_written = 0
 
     def __enter__(self) -> IO[Any]:
+        from backend.io.readonly import guard_write
+
+        guard_write(self._path)  # readonly の store/ には書かない (c_05 §0.4.2)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_str = tempfile.mkstemp(
             prefix=self._path.name + ".",
@@ -93,6 +96,24 @@ class AtomicWriter:
         self._fd = None
         return self._fh
 
+    @staticmethod
+    def _close_quietly(fh: IO[Any]) -> None:
+        try:
+            fh.close()
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _discard_tmp(tmp: Path | None) -> None:
+        if tmp is None:
+            return
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_err:
+            logger.warning("Failed to remove tmp file %s after exception: %s", tmp, cleanup_err)
+
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
@@ -101,35 +122,29 @@ class AtomicWriter:
     ) -> None:
         tmp = self._tmp_path
         fh = self._fh
-        # 1) ファイルハンドルクローズ (失敗時も含めて必ず close)
+        # 1) 書き出しを確定させる。flush / fsync / close の失敗は握り潰さない
+        #    (c_05 §0.5.8)。close() の暗黙 flush で ENOSPC を握り潰すと、切れた
+        #    tmp が宛先を置き換えて 0 バイトになる (G0 で実際に起きた)。
         if fh is not None:
-            try:
-                if exc_type is None and self._fsync:
+            if exc_type is None:
+                try:
                     fh.flush()
-                    os.fsync(fh.fileno())
-                # 書き込みバイト数 (テキストモードでは近似値)
-                if exc_type is None:
+                    if self._fsync:
+                        os.fsync(fh.fileno())
                     try:
                         self._bytes_written = fh.tell()
                     except (OSError, ValueError):
                         self._bytes_written = 0
-            finally:
-                try:
                     fh.close()
-                except OSError:
-                    pass
+                except BaseException:
+                    self._close_quietly(fh)
+                    self._discard_tmp(tmp)
+                    raise
+            else:
+                self._close_quietly(fh)
         # 2) 例外発生時: tmp ファイルを消す
         if exc_type is not None:
-            if tmp is not None:
-                try:
-                    tmp.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as cleanup_err:
-                    logger.warning(
-                        "Failed to remove tmp file %s after exception: %s",
-                        tmp, cleanup_err,
-                    )
+            self._discard_tmp(tmp)
             return  # 元例外をそのまま再送出
         # 3) 正常終了時: tmp -> dst を atomic に切り替え (Windows retry 付き)
         assert tmp is not None

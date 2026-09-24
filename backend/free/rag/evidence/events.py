@@ -1,11 +1,12 @@
-"""事象ログ (c_16 §5.2) — `put` / `patch` / `retract` / `touch` の追記のみ
+"""事象ログ (c_16 §5.2) — `create` / `put` / `patch` / `retract` / `touch` の追記のみ
 
 稼働中の snapshot / 索引は書き換えず、**版を積んで指す**のが c_16 の不変則。
 書き手 (sleep-time) はここへ 1 行追記するだけで、読み手は「snapshot + それ
 以降の事象」を畳んで現在状態を得る。
 
 - 月次ファイル ``events/<yyyy-mm>.jsonl``
-- 1 行 = ``{"_version", "op", "id", "at", "by", "payload"}``
+- 1 行 = ``{"_v", "op", "id", "at", "by", "payload"}`` (``_v`` は行の版、c_05 §0.5.1)。
+  版が新しい行は :class:`EvidenceVersionError` (読み手はストアごと readonly)
 - 追記は :class:`backend.io.JSONLAppendStore` (同一プロセス内の単一 writer 前提。
   **別プロセスからの書込は禁止** — advisory lock を取らない)
 - ``touch`` は複数 id を 1 事象にまとめる (毎ターンの ``last_used_at`` 更新で
@@ -18,12 +19,15 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from backend.free.rag.evidence.types import EvidenceVersionError
 from backend.io import JSONLAppendStore
+from backend.io.format_registry import FormatSpec, register_format
 from backend.log_config import get_logger
 from backend.utils import utc_now, utc_now_dt
 
@@ -32,7 +36,23 @@ logger = get_logger("rag.evidence.events")
 #: 事象行の版。行の形を変えるときに上げる。
 EVENT_VERSION = 1
 
-EventOp = Literal["put", "patch", "retract", "touch"]
+#: ``create`` は新しい id の追加 (既存の id なら書き手が拒否する)、``put`` は明示の
+#: 全置換 (c_16 §5.2 の G1 の事象)。
+EventOp = Literal["create", "put", "patch", "retract", "touch"]
+
+#: 事象ログの形式 (c_05 §0.7.1)。``op`` は ``closed`` — 未知の op の追加は版上げ
+#: (c_05 §0.4.4)。
+EVIDENCE_EVENT_FORMAT = register_format(FormatSpec(
+    format_id="evidence.event",
+    version=EVENT_VERSION,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/memory/<store>/events/<yyyy-mm>.jsonl",
+    retention="events_keep_months after folding (c_16 §5.4)",
+    export=True,
+    encodings=("jsonl",),
+    enums={"op": "closed"},
+))
 
 #: 月次ファイル名 (``2026-09.jsonl``) の stem 形式。
 _MONTH_FORMAT = "%Y-%m"
@@ -115,7 +135,7 @@ class EvidenceEventLog:
     ) -> dict[str, Any]:
         """1 事象を追記して、書いた行 (dict) を返す。"""
         event = {
-            "_version": EVENT_VERSION,
+            "_v": EVENT_VERSION,
             "op": op,
             "id": record_id,
             "at": at or utc_now(),
@@ -125,6 +145,16 @@ class EvidenceEventLog:
         self._store_for(self._month_of(event["at"])).append(event)
         return event
 
+    def append_create(self, record: dict[str, Any], *, by: str | None = None) -> dict[str, Any]:
+        """新しい id の完全な Evidence レコードを ``create`` する。
+
+        既存の id かどうかの検査は書き手 (``EvidenceStore.create``) が行う。
+        """
+        record_id = str(record.get("id") or "")
+        if not record_id:
+            raise ValueError("create event requires record['id']")
+        return self.append("create", record_id, {"record": record}, by=by)
+
     def append_put(self, record: dict[str, Any], *, by: str | None = None) -> dict[str, Any]:
         """完全な Evidence レコードを ``put`` する。"""
         record_id = str(record.get("id") or "")
@@ -133,12 +163,24 @@ class EvidenceEventLog:
         return self.append("put", record_id, {"record": record}, by=by)
 
     def append_patch(
-        self, record_id: str, fields: dict[str, Any], *, by: str | None = None,
+        self,
+        record_id: str,
+        fields: dict[str, Any],
+        *,
+        unset: list[str] | tuple[str, ...] = (),
+        by: str | None = None,
     ) -> dict[str, Any]:
-        """変更フィールドだけを ``patch`` する (c_16 §5.2)。"""
-        if not fields:
-            raise ValueError("patch event requires at least one field")
-        return self.append("patch", record_id, {"fields": dict(fields)}, by=by)
+        """変更フィールドだけを ``patch`` する (c_16 §5.2)。
+
+        ``unset`` は消すフィールド / キー (``"valid_until"`` / ``"attrs.<key>"`` 等)。
+        値の削除を null で表さない (null は「値が無い」を書く)。
+        """
+        if not fields and not unset:
+            raise ValueError("patch event requires at least one field or unset")
+        payload: dict[str, Any] = {"fields": dict(fields)}
+        if unset:
+            payload["unset"] = list(dict.fromkeys(unset))
+        return self.append("patch", record_id, payload, by=by)
 
     def append_retract(
         self, record_id: str, reason: str, *, by: str | None = None,
@@ -189,9 +231,10 @@ class EvidenceEventLog:
     ) -> Iterator[dict[str, Any]]:
         """``marker`` の続きから ``until`` までの事象を古い順に返す。
 
-        壊れた行は WARNING を出して飛ばすが、**位置は物理行で数える** —
-        飛ばした行のぶんカウントがずれると、次回の畳み込みが同じ事象を
-        二度読む / 読み落とす。
+        壊れた行 (``_v`` の無い行を含む) は WARNING を出して飛ばすが、**位置は物理行で
+        数える** — 飛ばした行のぶんカウントがずれると、次回の畳み込みが同じ事象を
+        二度読む / 読み落とす。``_v`` が新しい行は :class:`EvidenceVersionError`
+        (飛ばさない。知らない形の事象を畳んで書き戻すと失う)。
         """
         start = marker or EventPosition()
         stop = until
@@ -214,7 +257,10 @@ class EvidenceEventLog:
     ) -> Iterator[dict[str, Any]]:
         if not path.exists():
             return
-        with path.open("r", encoding="utf-8") as f:
+        # 多バイト文字の途中で切れた行は置換文字で読み、壊れた行として飛ばす
+        # (strict だと 1 行で月ファイル全体の読み出しが落ちる)。行の位置は物理行で
+        # 数えたまま (c_05 §0.5.8)。
+        with path.open("r", encoding="utf-8", errors="replace") as f:
             for index, line in enumerate(f):
                 if limit is not None and index >= limit:
                     break
@@ -223,19 +269,94 @@ class EvidenceEventLog:
                 text = line.strip()
                 if not text:
                     continue
+                if "\x00" in text:
+                    logger.warning("skipping event line with NUL at %s:%d", path, index)
+                    continue
                 try:
                     event = json.loads(text)
                 except json.JSONDecodeError as e:
                     logger.warning("skipping malformed event line %s:%d: %s", path, index, e)
                     continue
-                if isinstance(event, dict) and event.get("op"):
-                    yield event
-                else:
+                if not (isinstance(event, dict) and event.get("op")):
                     logger.warning("skipping event without op at %s:%d", path, index)
+                    continue
+                version = event.get("_v")
+                if not isinstance(version, int) or isinstance(version, bool):
+                    logger.warning("skipping event without _v at %s:%d", path, index)
+                    continue
+                if version > EVENT_VERSION:
+                    raise EvidenceVersionError(
+                        f"event at {path}:{index} has _v {version}, newer than the supported {EVENT_VERSION}",
+                    )
+                yield event
 
     def count_since(self, marker: EventPosition | None) -> int:
         """``marker`` 以降の事象数 (manifest の ``events_since_snapshot`` 用)。"""
         return sum(1 for _ in self.iter_since(marker))
+
+    # ── 耐久性 (c_16 §5.2 / c_05 §0.5.8) ──
+
+    def fsync_range(self, start: EventPosition, end: EventPosition) -> int:
+        """``start`` から ``end`` までを含む月ファイルを fsync する (snapshot の前)。
+
+        snapshot が畳んだ事象は prune の後は版の records だけが原本になるので、
+        版を作る前に事象側を先に耐久化する。
+
+        Returns:
+            fsync したファイル数。
+        """
+        if not end.month:
+            return 0
+        start_key = month_key(start.month) if start.month else None
+        end_key = month_key(end.month)
+        synced = 0
+        for month in self.months():
+            key = month_key(month)
+            if (start_key is not None and key < start_key) or key > end_key:
+                continue
+            with self._path(month).open("r+b") as f:
+                os.fsync(f.fileno())
+            synced += 1
+        return synced
+
+    def pad_to(self, position: EventPosition) -> int:
+        """月ファイルの物理行数が ``position.line`` に足りなければ空行で埋める。
+
+        クラッシュで末尾の行が失われると、manifest の ``folded_through`` が実際の
+        行数より先を指す。そのまま追記すると新しい事象が「畳み済み」の位置に
+        入り、以後ずっと読み飛ばされる (c_16 §5.2)。欠けた行は空行として計上し、
+        追記は本当の末尾の後ろへ続ける。途中で切れた最終行は改行で終端するだけで
+        切り詰めない (物理行の位置を保つ)。readonly 中は呼ばない。
+
+        月ファイルそのものが無い場合は作らない — corpus は畳んだ後に ``events/``
+        を意図して消す (版が履歴そのもの、c_16 §2.1)。
+
+        Returns:
+            足した空行の数。
+        """
+        if not position.month or position.line <= 0:
+            return 0
+        path = self._path(position.month)
+        if not path.exists():
+            return 0
+        have = self._count_lines(path)
+        missing = position.line - have
+        if missing <= 0:
+            return 0
+        with path.open("ab") as f:
+            if f.tell() > 0:
+                with path.open("rb") as tail:
+                    tail.seek(-1, os.SEEK_END)
+                    if tail.read(1) not in (b"\n", b"\r"):
+                        f.write(b"\n")
+            f.write(b"\n" * missing)
+            f.flush()
+            os.fsync(f.fileno())
+        logger.warning(
+            "Event file %s had %d line(s) but the manifest folded through line %d; "
+            "padded %d empty line(s)", path, have, position.line, missing,
+        )
+        return missing
 
     # ── 保持 (c_16 §5.4: events_keep_months) ──
 
@@ -305,16 +426,36 @@ class EvidenceEventLog:
                 serialize=lambda e: json.dumps(e, ensure_ascii=False),
                 deserialize=json.loads,
                 key_of=lambda e: f"{e.get('at', '')}|{e.get('op', '')}|{e.get('id', '')}",
+                row_version=EVENT_VERSION,
             )
             self._stores[month] = store
         return store
 
     @staticmethod
     def _count_lines(path: Path) -> int:
+        """物理行数 (:meth:`_iter_file` の ``enumerate`` と同じ数え方)。
+
+        テキストモードで 1 行ずつ回すと 50k 行の月ファイルで約 0.2 秒ループが
+        止まる (版の生成のたびに呼ばれる)。バイトのまま数える: テキストモードの
+        改行は LF / CRLF / 単独の CR で、改行で終わらない末尾も 1 行。
+        """
         if not path.exists():
             return 0
-        with path.open("r", encoding="utf-8") as f:
-            return sum(1 for _ in f)
+        lines = 0
+        last = b""
+        carried_cr = False
+        with path.open("rb") as f:
+            while chunk := f.read(1 << 20):
+                lines += chunk.count(b"\n")
+                if b"\r" in chunk:  # 普段の事象ログは LF だけ (走査を 1 回で済ませる)
+                    lines += chunk.count(b"\r") - chunk.count(b"\r\n")
+                if carried_cr and chunk.startswith(b"\n"):
+                    lines -= 1  # CRLF がチャンクの境目で割れた
+                carried_cr = chunk.endswith(b"\r")
+                last = chunk[-1:]
+        if last and last not in (b"\n", b"\r"):
+            lines += 1
+        return lines
 
 
 __all__ = [

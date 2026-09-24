@@ -16,14 +16,14 @@ LRU eviction の影響を受けないようにする。
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 from diskcache import Cache
 
-from backend.io import AtomicWriter
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile, write_versioned
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -37,6 +37,16 @@ _DEFAULT_CACHE_MAX_MB = 100
 
 # 整合性メタファイル (dim / model_name)
 _META_FILENAME = "meta.json"
+
+#: 整合性メタの形式 (volatile — 読めなければ欠損扱いで書き直す)。
+EMBEDDING_CACHE_META_FORMAT = register_format(FormatSpec(
+    format_id="cache.embedding",
+    version=1,
+    klass="volatile",
+    writers=frozenset({"free"}),
+    path_key="cache/embeddings/meta.json",
+    retention="rewritten when the embedder changes",
+))
 
 
 def _cache_key(text: str, model_name: str, identity: str = "") -> str:
@@ -74,22 +84,18 @@ def _mode_affects_documents(inner: object) -> bool:
 
 
 def _read_meta(meta_path: Path) -> dict | None:
-    """``meta.json`` を読み込む (存在しない・破損は ``None``)"""
-    if not meta_path.exists():
+    """``meta.json`` を読み込む (存在しない・破損・別形式・新しい版は ``None``)"""
+    file = VersionedPayloadFile(
+        EMBEDDING_CACHE_META_FORMAT, meta_path,
+        component="CachedEmbeddingBackend", state_logger=logger,
+    )
+    if not file.load():
         return None
-    try:
-        data = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(
-            "Failed to read embedding cache meta %s: %s (treated as missing)",
-            meta_path, e,
-        )
-        return None
-    return data if isinstance(data, dict) else None
+    return file.payload if isinstance(file.payload, dict) else None
 
 
 def _write_meta_atomic(meta_path: Path, meta: dict) -> None:
-    """``meta.json`` を原子的に書き換える (:class:`AtomicWriter` 委譲)。
+    """``meta.json`` を封筒 (c_05 §0.5) で包んで原子的に書き換える (:class:`AtomicWriter` 委譲)。
 
     内部実装は ``backend.io.AtomicWriter`` に委譲。``tempfile.mkstemp`` で
     呼出ごとにユニークな tmp ファイル名を発番し、``os.replace`` の
@@ -101,8 +107,14 @@ def _write_meta_atomic(meta_path: Path, meta: dict) -> None:
     設定なら内容が一致するため問題ない。書込頻度の削減自体は
     :func:`_verify_meta` 側の double-check で対応する。
     """
-    with AtomicWriter(meta_path) as f:
-        f.write(json.dumps(meta, ensure_ascii=False))
+    write_versioned(
+        meta_path,
+        format_id=EMBEDDING_CACHE_META_FORMAT.format_id,
+        format_version=EMBEDDING_CACHE_META_FORMAT.version,
+        payload=meta,
+        component="CachedEmbeddingBackend",
+        fsync=False,
+    )
 
 
 def _write_meta_if_changed(meta_path: Path, expected: dict) -> bool:
@@ -320,6 +332,10 @@ class CachedEmbeddingBackend:
 
     def model_name(self) -> str:
         return self._inner.model_name()
+
+    @property
+    def model_key(self) -> str:
+        return str(getattr(self._inner, "model_key", "") or "")
 
     def backend_type(self) -> str:
         return self._inner.backend_type()

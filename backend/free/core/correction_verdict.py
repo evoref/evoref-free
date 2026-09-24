@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from backend.free.core.script_ranges import (
     KANJI,
     KATAKANA_WORD,
@@ -64,6 +64,12 @@ RejectReason = Literal[
     "no_verdict", "invalid_target", "not_correction", "invalid_span",
     "same_value", "already_stated",
 ]
+
+#: 経験に刻む検証結果 (``FeedbackSignals.correction_verdict``) の語彙。帰属・
+#: コード側の却下理由と、検証器が付ける ``no_context`` (直前応答を解決できない) /
+#: ``disputed`` (訂正への回答が値を退けた)。台帳では ``open`` の列挙 (c_05 §0.5.3)。
+VerdictCode = Literal[CorrectionTarget, RejectReason, Literal["no_context", "disputed"]]
+VERDICT_CODES: frozenset[str] = frozenset(get_args(VerdictCode))
 
 
 def mask_quoted_speech(text: str) -> str:

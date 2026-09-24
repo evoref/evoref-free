@@ -5,6 +5,7 @@ from collections.abc import Callable
 from uuid import uuid4
 
 from backend.free.memory.stores.fact_slate import SessionFactSlate
+from backend.io.id_registry import new_id
 from backend.trace_context import get_trace_id
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens as _estimate_tokens
@@ -126,7 +127,7 @@ class WorkingMemory:
             1, int(mem.get("working_evict_block", 6)),
         )
         self.turns: list[dict] = []
-        self.session_id: str = uuid4().hex[:8]
+        self.session_id: str = str(uuid4())
         #: 押し出したターンの要点表 (f_02 §1.2)。窓の補助であって記憶層ではない。
         self.fact_slate = SessionFactSlate()
         #: 現在のセッションで押し出したターン数 (``clear()`` でリセット)。
@@ -191,7 +192,7 @@ class WorkingMemory:
         pending へ落とすのを免除する。訂正は会話中に起きるので、この印が無いと
         **いちばん確度の高い訂正がいちばん自動解決されない**。
         """
-        turn_id = f"t_{uuid4().hex[:12]}"
+        turn_id = new_id("t_")
         est_tokens = _estimate_tokens(content)
         logger.debug(
             "add_turn: role=%s, content_len=%d, est_tokens=%d, "

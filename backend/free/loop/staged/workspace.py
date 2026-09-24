@@ -7,7 +7,7 @@ SemMem (artifact/progress/failure ファクト) は内容を持たない進捗�
 
 ディレクトリ構成 (``create_workspace_dir/{workspace_id}/``)::
 
-    manifest.json            工程間ハンドオフ (atomic, fsync)
+    manifest.json            工程間ハンドオフ (封筒 ``create.workspace_manifest``、atomic, fsync)
     spec.md                  spec 工程の設計仕様
     src/<logical_path>       生成コード (パス忠実)
     tests/<logical_path>     生成テスト (パス忠実)
@@ -27,15 +27,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
 
+from backend.free.loop.staged.run_record import CREATE_WORKSPACE_MANIFEST_FORMAT
 from backend.io.atomic import AtomicWriter
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
+from backend.utils import epoch_to_utc, utc_now, utc_to_epoch
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
 
 logger = get_logger("loop.staged.workspace")
 
-SCHEMA_VERSION = 1
+MANIFEST_FILE = "manifest.json"
 
 FileKind = Literal["src", "test", "spec"]
 Stage = Literal["spec", "code", "test"]
@@ -131,11 +134,10 @@ class WorkspaceManager:
         (root / "src").mkdir(exist_ok=True)
         (root / "tests" / "_runs").mkdir(parents=True, exist_ok=True)
         mgr = cls(root=root, workspace_id=workspace_id, debug_logger=debug_logger)
-        manifest_path = root / "manifest.json"
+        manifest_path = root / MANIFEST_FILE
         if not manifest_path.exists():
-            now = time.time()
+            now = utc_now()
             mgr._write_manifest_raw({
-                "schema_version": SCHEMA_VERSION,
                 "workspace_id": workspace_id,
                 "project_id": project_id,
                 "session_id": session_id,
@@ -182,7 +184,7 @@ class WorkspaceManager:
         now = time.time()
         rec = {
             "workspace_path": "spec.md", "sha256": sha,
-            "produced_by_task": task_id, "last_updated": now,
+            "produced_by_task": task_id, "last_updated": epoch_to_utc(now),
         }
         self._update_manifest(lambda m: m.__setitem__("spec", rec))
         return WorkspaceFile(
@@ -209,7 +211,7 @@ class WorkspaceManager:
         now = time.time()
         rec = {
             "workspace_path": "flowchart.md", "sha256": sha,
-            "produced_by_task": task_id, "last_updated": now,
+            "produced_by_task": task_id, "last_updated": epoch_to_utc(now),
         }
         self._update_manifest(lambda m: m.__setitem__("flowchart", rec))
         return WorkspaceFile(
@@ -255,7 +257,7 @@ class WorkspaceManager:
             m["files"][rel] = {
                 "kind": kind, "workspace_path": ws_rel, "sha256": sha,
                 "bytes": wf.bytes, "produced_by_task": task_id, "stage": stage,
-                "last_updated": now, "covers": list(covers),
+                "last_updated": epoch_to_utc(now), "covers": list(covers),
             }
 
         self._update_manifest(_mut)
@@ -283,7 +285,7 @@ class WorkspaceManager:
                 bytes=int(rec.get("bytes", 0)),
                 produced_by_task=rec.get("produced_by_task", ""),
                 stage=rec.get("stage", "code"),
-                last_updated=float(rec.get("last_updated", 0.0)),
+                last_updated=utc_to_epoch(rec.get("last_updated"), 0.0),
                 covers=tuple(rec.get("covers") or ()),
             )
         return out
@@ -332,7 +334,7 @@ class WorkspaceManager:
         depends_on: list[str] | None = None, last_error: str | None = None,
     ) -> None:
         def _mut(m: dict) -> None:
-            now = time.time()
+            now = utc_now()
             tasks = m["tasks"]
             for t in tasks:
                 if t.get("task_id") == task_id:
@@ -356,7 +358,7 @@ class WorkspaceManager:
             for t in m["tasks"]:
                 if t.get("task_id") == task_id:
                     t["attempts"] = int(t.get("attempts", 0)) + 1
-                    t["updated_at"] = time.time()
+                    t["updated_at"] = utc_now()
                     return
 
         self._update_manifest(_mut)
@@ -381,7 +383,7 @@ class WorkspaceManager:
                 "task_id": result.task_id, "passed": result.passed,
                 "failed_count": result.failed_count, "attempt": result.attempt,
                 "summary": result.summary, "output_tail": result.output_tail,
-                "ran_at": result.ran_at, "kind": result.kind,
+                "ran_at": epoch_to_utc(result.ran_at), "kind": result.kind,
             }, ensure_ascii=False, indent=2))
 
         def _mut(m: dict) -> None:
@@ -389,7 +391,7 @@ class WorkspaceManager:
                 "passed": result.passed, "failed_count": result.failed_count,
                 "attempt": result.attempt, "summary": result.summary,
                 "output_tail": result.output_tail, "run_ref": run_ref,
-                "ran_at": result.ran_at, "kind": result.kind,
+                "ran_at": epoch_to_utc(result.ran_at), "kind": result.kind,
             }
 
         self._update_manifest(_mut)
@@ -405,22 +407,34 @@ class WorkspaceManager:
             attempt=int(rec.get("attempt", 0)),
             summary=str(rec.get("summary", "")),
             output_tail=str(rec.get("output_tail", "")),
-            ran_at=float(rec.get("ran_at", 0.0)),
+            ran_at=utc_to_epoch(rec.get("ran_at"), 0.0),
             run_ref=str(rec.get("run_ref", "")),
             kind=str(rec.get("kind", "")),
         )
 
     # ── manifest I/O ──────────────────────────────────────────────────
+    def _manifest_file(self) -> VersionedPayloadFile:
+        return VersionedPayloadFile(
+            CREATE_WORKSPACE_MANIFEST_FORMAT, self.root / MANIFEST_FILE,
+            component="WorkspaceManager", state_logger=logger,
+        )
+
     def read_manifest(self) -> dict:
-        p = self.root / "manifest.json"
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        """manifest の payload。無い / 読めない (壊れた・新しい版・G1 でない) なら ``{}``。
+
+        壊れたファイルは退避される。新しい版 / G1 でないファイルは触らない
+        (``_update_manifest`` は ``{}`` を見て書かない)。
+        """
+        f = self._manifest_file()
+        if not f.load() or not isinstance(f.payload, dict):
             return {}
+        return f.payload
 
     def _write_manifest_raw(self, manifest: dict) -> None:
-        with AtomicWriter(self.root / "manifest.json", fsync=True) as f:
-            f.write(json.dumps(manifest, ensure_ascii=False, indent=2))
+        f = self._manifest_file()
+        f.payload = manifest
+        if not f.save():
+            raise OSError(f"failed to write the workspace manifest in {self.root}")
 
     def _update_manifest(self, mutate: Callable[[dict], None]) -> dict:
         """Lock 下で read-modify-write (+ progress 再計算 + fsync)。"""
@@ -434,7 +448,7 @@ class WorkspaceManager:
             m.setdefault("stage_notes", {})
             m.setdefault("test_results", {})
             mutate(m)
-            m["updated_at"] = time.time()
+            m["updated_at"] = utc_now()
             m["progress"] = self._recompute_progress(m)
             self._write_manifest_raw(m)
             return m

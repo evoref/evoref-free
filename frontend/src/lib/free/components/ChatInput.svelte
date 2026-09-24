@@ -25,12 +25,19 @@
 		attachedFiles,
 		clearFiles, corpusMode, selectedTemplate, templatesRevision, templateHint
 	} from '$lib/free/stores/chat';
-	import { chatStream, cancelChat, listTemplates, type TemplateSummary } from '$lib/free/api';
+	import {
+		chatStream,
+		cancelChat,
+		confirmReembed,
+		listTemplates,
+		type TemplateSummary
+	} from '$lib/free/api';
 	import { handleApiCall } from '$lib/free/utils/error';
 	import { get } from 'svelte/store';
 	import { themeSlots } from '$lib/free/stores/theme';
 	import { setActiveCreateRun, clearActiveCreateRun } from '$lib/free/stores/createRun';
 	import { addToast } from '$lib/free/stores/toast';
+	import { refreshServerStatus, serverState } from '$lib/free/stores/server';
 	import FileUpload from './FileUpload.svelte';
 	import FilePreview from './FilePreview.svelte';
 
@@ -84,6 +91,17 @@
 
 	function dismissTemplateHint(): void {
 		templateHint.set(null);
+	}
+
+	/** 埋め込みモデルの変更を確認し、確認待ちのストアの埋め直しを始める */
+	async function handleConfirmReembed(): Promise<void> {
+		const result = await handleApiCall(() => confirmReembed(), {
+			fallbackKey: 'chat.reembed_confirm_failed'
+		});
+		if (result) {
+			addToast({ type: 'info', i18nKey: 'chat.reembed_started' });
+			await refreshServerStatus();
+		}
 	}
 
 	let inputText = $state('');
@@ -380,6 +398,34 @@
 			</button>
 		</div>
 	{/if}
+	{#if $serverState.dataHealth?.readonly}
+		<div class="readonly-note" role="status">{$t('chat.data_readonly_banner')}</div>
+	{/if}
+	{#if $serverState.dataHealth?.served_model_mismatch}
+		<div class="readonly-note" role="status">
+			{$t('chat.served_model_mismatch_banner', {
+				served: $serverState.dataHealth.served_model,
+				expected: $serverState.dataHealth.expected_model
+			})}
+		</div>
+	{/if}
+	{#if Object.keys($serverState.dataHealth?.formats ?? {}).length}
+		<div class="readonly-note" role="status">
+			{$t('chat.format_health_banner', {
+				count: Object.keys($serverState.dataHealth?.formats ?? {}).length
+			})}
+		</div>
+	{/if}
+	{#if $serverState.dataHealth?.reembed_pending?.length}
+		<div class="readonly-note" role="status">
+			{$t('chat.reembed_pending_banner', {
+				count: $serverState.dataHealth.reembed_pending.length
+			})}
+			<button type="button" class="reembed-confirm" onclick={handleConfirmReembed}>
+				{$t('chat.reembed_confirm')}
+			</button>
+		</div>
+	{/if}
 	<div class="input-row">
 		<FileUpload />
 		<textarea
@@ -498,6 +544,18 @@
 	.template-parts {
 		opacity: 0.8;
 	}
+	.readonly-note {
+		padding-bottom: 8px;
+		font-size: 12px;
+		color: var(--error, #c0392b);
+	}
+
+	.reembed-confirm {
+		margin-left: 8px;
+		font-size: 12px;
+		text-decoration: underline;
+	}
+
 	.template-hint {
 		display: flex;
 		align-items: center;

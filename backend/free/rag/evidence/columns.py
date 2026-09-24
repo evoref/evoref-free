@@ -6,11 +6,11 @@ lazy に読み、常駐させるのは id とカラムだけ。
 
 | 配列 | dtype | 用途 |
 |---|---|---|
-| ``ids`` | ``<U16`` | 行 → id |
+| ``ids`` | ``S24`` (ASCII) | 行 → id |
 | ``as_of_epoch`` / ``observed_epoch`` / ``valid_until_epoch`` | float64 (NaN=null) | 鮮度・失効 |
 | ``half_life_days`` | float32 (NaN=null) | 減衰 |
 | ``confidence`` | float32 | 順位 |
-| ``flags`` | uint8 bitfield | private / secret / pinned / retracted / superseded / assistant |
+| ``flags`` | uint8 bitfield | private / secret / pinned / retracted / superseded / assistant / unknown |
 | ``origin`` / ``kind`` / ``veracity`` | uint8 enum | マスク・origin 優先 |
 | ``namespace_id`` / ``tier`` / ``package_idx`` | int16 | 部分集合の選択 |
 | ``claim_hash64`` | uint64 | claim_key の先頭 64bit (畳み込み) |
@@ -40,6 +40,7 @@ from backend.free.rag.evidence.types import (
     claim_hash64,
 )
 from backend.io import AtomicWriter, atomic_write_text
+from backend.io.id_registry import ID_COLUMN_WIDTH, fits_id_column
 from backend.log_config import get_logger
 from backend.utils import parse_utc
 
@@ -52,6 +53,10 @@ FLAG_PINNED = 1 << 2
 FLAG_RETRACTED = 1 << 3
 FLAG_SUPERSEDED = 1 << 4
 FLAG_ASSISTANT_ORIGIN = 1 << 5
+#: 未知の列挙値を持つ行 (:attr:`Evidence.ignored`)。保持するが使わない (c_05 §0.4.5)。
+#: kind / origin / veracity は列値の番兵 (255) でも分かるが、store / confidentiality /
+#: note の tier・mode は列を持たないのでこのビットで表す。
+FLAG_UNKNOWN_ENUM = 1 << 6
 
 #: ファイル名。
 COLUMNS_FILE = "columns.npz"
@@ -60,8 +65,8 @@ TABLES_FILE = "columns_tables.json"
 #: 1 日の秒数 (age_days 換算)。
 _SECONDS_PER_DAY = 86400.0
 
-#: ``ids`` の dtype。``ev_`` + 12 hex = 15 文字なので 16 で足りる。
-_ID_DTYPE = "<U16"
+#: ``ids`` の dtype。ID 台帳の最長 (``<prefix>_<hex16>``) が収まる幅 (c_05 §0.5.5 / R10)。
+_ID_DTYPE = f"S{ID_COLUMN_WIDTH}"
 
 
 @dataclass(slots=True)
@@ -89,9 +94,32 @@ class EvidenceColumns:
     def __len__(self) -> int:
         return int(len(self.ids))
 
-    def id_index(self) -> dict[str, int]:
-        """id → 行番号。"""
-        return {str(v): i for i, v in enumerate(self.ids)}
+    def id_index(self) -> dict[bytes, int]:
+        """id (ASCII バイト列) → 行番号。引くときは :func:`encode_id` で符号化する。"""
+        return {v: i for i, v in enumerate(self.ids.tolist())}
+
+
+def encode_id_column(ids: Sequence[str]) -> np.ndarray:
+    """id の列を固定幅の ``S24`` にする。
+
+    numpy は幅を超える値を**黙って切り詰める**ので、超過と非 ASCII はここで例外に
+    する (c_05 §0.5.5: 固定幅の列は長さ超過で例外)。
+    """
+    for value in ids:
+        if not fits_id_column(value):
+            raise ValueError(
+                f"evidence id {value!r} does not fit the {_ID_DTYPE} id column "
+                f"(ASCII, at most {ID_COLUMN_WIDTH} bytes)",
+            )
+    return np.array([value.encode("ascii") for value in ids], dtype=_ID_DTYPE)
+
+
+def encode_id(record_id: str) -> bytes | None:
+    """1 つの id を列のキーへ (ASCII でなければ ``None`` = 列に無い)。"""
+    try:
+        return record_id.encode("ascii")
+    except (UnicodeEncodeError, AttributeError):
+        return None
 
 
 def _epoch(value: str | None) -> float:
@@ -114,6 +142,8 @@ def _flags_of(record: Evidence) -> int:
         flags |= FLAG_SUPERSEDED
     if record.origin == "assistant":
         flags |= FLAG_ASSISTANT_ORIGIN
+    if record.ignored:
+        flags |= FLAG_UNKNOWN_ENUM
     return flags
 
 
@@ -180,7 +210,7 @@ def build_columns(records: Sequence[Evidence] | Iterable[Evidence]) -> EvidenceC
             package_idx.append(UNKNOWN_I16)
 
     return EvidenceColumns(
-        ids=np.array(ids, dtype=_ID_DTYPE),
+        ids=encode_id_column(ids),
         as_of_epoch=np.array(as_of, dtype=np.float64),
         observed_epoch=np.array(observed, dtype=np.float64),
         valid_until_epoch=np.array(valid_until, dtype=np.float64),
@@ -233,6 +263,8 @@ def load_columns(snapshot_dir: Path | str) -> EvidenceColumns:
         return build_columns([])
     with np.load(str(npz_path), allow_pickle=False) as data:
         arrays = {name: data[name] for name in _ARRAY_FIELDS}
+    if arrays["ids"].dtype.kind == "U":  # G1-4 以前の版 (``<U16``) は読み替える
+        arrays["ids"] = np.char.encode(arrays["ids"], "ascii")
     tables_path = directory / TABLES_FILE
     namespaces: list[str] = []
     packages: list[str] = []
@@ -259,12 +291,16 @@ def active_mask(
 
     ``~retracted & ~superseded & ~secret & (valid_until 未到来)``。
     ``include_private=False`` では ``private`` も落とす (private セッション外)。
+    未知の列挙値の行 (列値 255 / :data:`FLAG_UNKNOWN_ENUM`) も落とす — 除外の関門は
+    ここと :func:`~backend.free.rag.evidence.store.is_active` だけ (c_05 §0.5.3)。
     """
     flags = columns.flags
-    blocked = FLAG_RETRACTED | FLAG_SUPERSEDED | FLAG_SECRET
+    blocked = FLAG_RETRACTED | FLAG_SUPERSEDED | FLAG_SECRET | FLAG_UNKNOWN_ENUM
     if not include_private:
         blocked |= FLAG_PRIVATE
     mask = (flags & np.uint8(blocked)) == 0
+    unknown = np.uint8(UNKNOWN_U8)
+    mask &= (columns.kind != unknown) & (columns.origin != unknown) & (columns.veracity != unknown)
     valid_until = columns.valid_until_epoch
     not_expired = np.isnan(valid_until) | (valid_until > now_epoch)
     return mask & not_expired
@@ -298,10 +334,13 @@ __all__ = [
     "FLAG_RETRACTED",
     "FLAG_SECRET",
     "FLAG_SUPERSEDED",
+    "FLAG_UNKNOWN_ENUM",
     "TABLES_FILE",
     "EvidenceColumns",
     "active_mask",
     "build_columns",
+    "encode_id",
+    "encode_id_column",
     "freshness",
     "load_columns",
     "save_columns",

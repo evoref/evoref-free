@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from backend.extraction import get_registry
 from backend.extraction.base import ExtractionError
+from backend.io.id_registry import new_id
 from backend.log_config import get_logger
 
 logger = get_logger("agent.file_manager")
@@ -66,7 +66,7 @@ class SessionFileManager:
         if ext not in get_allowed_extensions():
             raise ValueError(f"Unsupported file extension: {ext}")
 
-        file_id = uuid.uuid4().hex[:12]
+        file_id = new_id("file_")
         dest = self._session_dir(session_id) / f"{file_id}_{filename}"
         dest.write_bytes(data)
 

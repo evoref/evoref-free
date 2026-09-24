@@ -28,6 +28,7 @@ import numpy as np
 from backend.free.memory.episodic.note import (
     MemoryNote,
     evidence_to_note,
+    note_patch,
     note_to_evidence,
 )
 from backend.free.memory.episodic.progress import PROGRESS_FILE, EpisodicProgress
@@ -131,7 +132,7 @@ class EpisodicStore:
             rag_config=rag_config,
             by=WRITER,
             shard_key_for=episodic_shard_key,
-            gc_filter=self._keep_in_snapshot,
+            gc_drop_ids=self._physical_gc_ids,
         )
         self.progress = EpisodicProgress(self.store_dir / PROGRESS_FILE)
         self._debug_logger = debug_logger
@@ -367,31 +368,40 @@ class EpisodicStore:
             include_private=include_private,
             shards=shards,
         )
-        snapshot = self.evidence.snapshot
-        if snapshot is None:
-            return []
         hits: list[EpisodicHit] = []
-        for row, cosine, score in raw:
-            record_id = snapshot.id_at(row)
-            record = self.evidence.get(record_id)
-            if record is None or record.kind != "note":
-                continue
-            if (record.tier or "short") != tier:
-                continue
-            hits.append(
-                EpisodicHit(record, cosine, score, record.text or self.evidence.text_at(row)),
+        snapshot = self.evidence.snapshot
+        if snapshot is not None:
+            for row, cosine, score in raw:
+                record_id = snapshot.id_at(row)
+                record = self.evidence.get(record_id)
+                if record is None or record.kind != "note":
+                    continue
+                if (record.tier or "short") != tier:
+                    continue
+                hits.append(
+                    EpisodicHit(record, cosine, score, record.text or self.evidence.text_at(row)),
+                )
+                if len(hits) >= top_k:
+                    break
+        # まだ版に入っていないノート (tail、c_16 §6.4) も同じ順位式で混ぜる
+        tail = [
+            EpisodicHit(record, cosine, score, record.text or "")
+            for record, cosine, score in self.evidence.search_tail(
+                query_vec, threshold=threshold, now=now, include_private=include_private,
             )
-            if len(hits) >= top_k:
-                break
-        return hits
+            if record.kind == "note" and (record.tier or "short") == tier
+        ]
+        if tail:
+            hits = sorted(hits + tail, key=lambda hit: hit.score, reverse=True)
+        return hits[:top_k]
 
     def _shards_for(self, tier: str, now: float) -> list[str] | None:
         """``tier`` のシャード名。索引が無ければ ``None`` (= 全シャード)。"""
-        shard_set = self.evidence.lexical_shards()
-        if shard_set is None:
+        shard_names = self.evidence.lexical_shard_names()
+        if shard_names is None:
             return None
         prefix = f"{tier}:"
-        names = [name for name in shard_set.shards if name.startswith(prefix)]
+        names = [name for name in shard_names if name.startswith(prefix)]
         if tier != "long":
             return names
         cutoff = _month_cutoff(now, LONG_SHARD_WINDOW_MONTHS)
@@ -400,13 +410,30 @@ class EpisodicStore:
     # ── 書き込み (sleep-time 専用) ──
 
     def put_note(self, note: MemoryNote, *, tier: str = "short") -> Evidence:
-        """ノートを ``put`` する (新規 id はここで発番)。"""
+        """新しいノートを ``create`` する (新規 id はここで発番、既存の id は拒否)。
+
+        既存ノートの更新は :meth:`update_note` / :meth:`patch_note` (全置換しない)。
+        """
         if not note.id:
             note.id = new_evidence_id()
         note.tier = tier
         record = note_to_evidence(note, tier=tier)
         self._invalidate_cache(record.id)
-        return self.evidence.put(record)
+        return self.evidence.create(record)
+
+    def update_note(self, note: MemoryNote, names: list[str]) -> Evidence | None:
+        """既存ノートの ``names`` の変更を差分で当てる (``patch`` 事象、c_05 §1.4)。
+
+        差分が無ければ何も書かず、現在のレコードを返す。無い id は ``None``。
+        """
+        stored = self.evidence.get(note.id)
+        if stored is None:
+            return None
+        fields, unset = note_patch(note, stored, names)
+        if not fields and not unset:
+            return stored
+        self._invalidate_cache(note.id)
+        return self.evidence.patch(note.id, unset=unset, **fields)
 
     def patch_note(self, record_id: str, **fields: Any) -> Evidence | None:
         """レコードの一部を ``patch`` する。"""
@@ -530,8 +557,8 @@ class EpisodicStore:
         ``pinned`` は落とさない。pin は「消すな」の明示なので、上限超過で
         ``retract`` されたあとでも物理削除の対象にはしない。
 
-        これは公開の問い合わせで、実際に落とすのは :meth:`_keep_in_snapshot`
-        (:class:`~backend.free.rag.evidence.EvidenceStore` の ``gc_filter``)。
+        これは公開の問い合わせで、実際に落とすのは :meth:`_physical_gc_ids`
+        (:class:`~backend.free.rag.evidence.EvidenceStore` の ``gc_drop_ids``)。
         """
         versions = list_versions(self.store_dir)
         keep = int(
@@ -550,7 +577,8 @@ class EpisodicStore:
             if record.kind != "note" or record.veracity != "retracted":
                 continue
             current = self.evidence.get(record.id)
-            if current is None or current.pinned:
+            # 未知の列挙値の行は GC でも消さない (c_05 §0.4.5)。
+            if current is None or current.pinned or current.ignored:
                 continue
             if current.veracity == "retracted":
                 out.append(record.id)
@@ -570,10 +598,6 @@ class EpisodicStore:
             self._gc_ids_key = key
         return self._gc_ids
 
-    def _keep_in_snapshot(self, record: Evidence) -> bool:
-        """``EvidenceStore`` の ``gc_filter``。``False`` で新しい版から落とす。"""
-        return record.id not in self._physical_gc_ids()
-
     def _invalidate_gc_cache(self) -> None:
         """物理 GC 対象のキャッシュを落とす。"""
         self._gc_ids = None
@@ -586,7 +610,7 @@ class EpisodicStore:
     async def create_snapshot(self) -> str | None:
         """未畳み込みの事象があるときだけ版を作る。
 
-        畳み込みの結果には :meth:`_keep_in_snapshot` が掛かるので、この版で
+        畳み込みの結果には :meth:`_physical_gc_ids` が掛かるので、この版で
         「``snapshots_keep`` 版を ``retracted`` のまま過ごしたノート」
         (:meth:`pending_physical_gc`) は物理的に消える。
 
@@ -637,8 +661,7 @@ class EpisodicStore:
             return {}
         rows: list[int] = []
         ids: list[str] = []
-        for row, meta in enumerate(store.metadata):
-            record_id = str(meta.get("id") or "")
+        for row, record_id in enumerate(store.row_ids):
             if record_id in wanted:
                 rows.append(row)
                 ids.append(record_id)

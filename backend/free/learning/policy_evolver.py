@@ -14,17 +14,21 @@ ACE (arXiv:2510.04618) のデルタ更新パターンを参考に、
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
 from backend.free.core.session_mode import normalize_session_mode
 from backend.free.learning.fitness import DEFECT_WEIGHTS, defect_rate_fitness
-from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import JsonPayload, VersionedJsonFile
 from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
+from backend.utils import parse_utc
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
@@ -302,7 +306,42 @@ def is_degenerate_fitness(history: list[float]) -> bool:
     return (max(recent) - min(recent)) < FITNESS_EPSILON
 
 
-class PolicyParamEvolver(JsonStateStore):
+@persisted()
+@dataclass
+class PolicyEvolverFile:
+    """``policy_evolver_state.json`` のペイロード。各表のキーは ``"<domain>:<mode>"``。"""
+
+    #: fitness の定義の版 (:data:`FITNESS_SCHEMA_VERSION`)。欠損は最初の定義 (1)。
+    fitness_schema_version: int = 1
+    generation: int = 0
+    fitness_history: dict[str, list[float]] = field(default_factory=dict)
+    decline_count: dict[str, int] = field(default_factory=dict)
+    best_fitness: dict[str, float] = field(default_factory=dict)
+    best_params: dict[str, dict[str, Any]] = field(default_factory=dict)
+    survived_count: dict[str, int] = field(default_factory=dict)
+    last_evolved_at: dict[str, str] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
+
+
+POLICY_EVOLVER_FORMAT = register_format(FormatSpec(
+    format_id="learning.policy_evolver",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/policy_evolver_state.json",
+    retention="one per partition",
+    export=True,
+    records=(PolicyEvolverFile,),
+))
+
+
+def _split_key(key: str) -> tuple[str, str] | None:
+    """``"<domain>:<mode>"`` → ``(domain, mode)``。``:`` が無ければ ``None``。"""
+    domain, sep, mode = key.partition(":")
+    return (domain, mode) if sep else None
+
+
+class PolicyParamEvolver(VersionedJsonFile):
     """ポリシーパラメータのモード別自動進化
 
     各ドメイン・モードごとに独立して進化を行う。
@@ -310,6 +349,7 @@ class PolicyParamEvolver(JsonStateStore):
     fitness 評価に基づいてパラメータを更新またはロールバックする。
     """
 
+    FORMAT = POLICY_EVOLVER_FORMAT
     _state_logger = logger
 
     def __init__(
@@ -385,6 +425,20 @@ class PolicyParamEvolver(JsonStateStore):
         # だけで行う (旧値で採ったデータと新値のデータを混ぜない、L-A4)。
         self._last_evolved_at: dict[tuple[str, str], str] = {}
 
+        # params の世代 (パーティション全体で 1 本の通番)。進化 (evolved) かロール
+        # バックで適用中の params を動かすたびに 1 進む。経験の
+        # ``gen_config.policy_generation`` に刻み、どの params の下で得た経験かを
+        # 記録する (帰属の読み手はまだ無い、記録のみ)。
+        self._generation: int = 0
+
+        # 読んだファイルのトップの未知キー (書き戻しで戻す、c_05 §0.5.2)。
+        self._payload_extra: dict[str, Any] | None = None
+
+    @property
+    def generation(self) -> int:
+        """適用中の params の世代 (0 = このパーティションでまだ動かしていない)。"""
+        return self._generation
+
     # ── SemMem 書き戻しヘルパ ───────────────────────────
 
     @property
@@ -436,6 +490,8 @@ class PolicyParamEvolver(JsonStateStore):
         self._best_params.clear()
         self._survived_count.clear()
         self._last_evolved_at.clear()
+        self._generation = 0
+        self._payload_extra = None
 
     @staticmethod
     def _build_subject(base_model_id: str, mode: str, domain: str, key: str) -> str:
@@ -575,6 +631,8 @@ class PolicyParamEvolver(JsonStateStore):
             rolled_back = self._policy.rollback(domain, mode)
             if rolled_back:
                 self._policy.save()
+        if rolled_back:
+            self._generation += 1
         if rolled_back and self.is_semmem_writeback_active():
             # SemMem 履歴を evolved → rollback のチェーンとして残す。
             self._writeback_rollback_facts(domain, mode, fitness, sigma, phase)
@@ -666,6 +724,7 @@ class PolicyParamEvolver(JsonStateStore):
 
         self._policy.apply_delta(domain, delta, mode)
         self._policy.save()
+        self._generation += 1
         delta_keys = list(delta.keys())
 
         # SemMem に新規 policy ファクトを書き戻し
@@ -944,8 +1003,15 @@ class PolicyParamEvolver(JsonStateStore):
 
     @staticmethod
     def _latest_timestamp(experiences: list[dict]) -> str:
-        """経験集合の最新 ``timestamp`` (ISO 文字列、無ければ空)。"""
-        return max((str(e.get("timestamp") or "") for e in experiences), default="")
+        """経験集合の最新 ``timestamp`` (ISO 文字列、無ければ空)。
+
+        最大は ``datetime`` で取る (文字列の辞書順で比べない、c_05 §0.5.4)。
+        """
+        stamps = [
+            (dt, str(e["timestamp"])) for e in experiences
+            if (dt := parse_utc(e.get("timestamp"))) is not None
+        ]
+        return max(stamps, key=lambda pair: pair[0])[1] if stamps else ""
 
     def _window_since_last_evolved(
         self, key: tuple[str, str], experiences: list[dict],
@@ -955,13 +1021,15 @@ class PolicyParamEvolver(JsonStateStore):
         ``timestamp`` を持たないエントリは新規扱いで残す (テスト用の合成経験 /
         旧フォーマット。実データは FeedbackCollector が必ず刻む)。
         """
-        since = self._last_evolved_at.get(key)
-        if not since:
+        since = parse_utc(self._last_evolved_at.get(key))
+        if since is None:
             return experiences
-        return [
-            e for e in experiences
-            if not e.get("timestamp") or str(e["timestamp"]) > since
-        ]
+        out = []
+        for e in experiences:
+            stamp = parse_utc(e.get("timestamp"))
+            if stamp is None or stamp > since:
+                out.append(e)
+        return out
 
     def _mark_evolved(self, key: tuple[str, str], experiences: list[dict]) -> None:
         """params を動かした時点の観測境界を記録する。"""
@@ -1026,46 +1094,29 @@ class PolicyParamEvolver(JsonStateStore):
             }
         return status
 
-    # ── 永続化 (JsonStateStore) ──
+    # ── 永続化 (VersionedJsonFile) ──
 
     def _to_payload(self) -> JsonPayload:
-        return {
-            "fitness_schema_version": FITNESS_SCHEMA_VERSION,
-            "fitness_history": {
-                f"{d}:{m}": h
-                for (d, m), h in self._fitness_history.items()
-            },
-            "decline_count": {
-                f"{d}:{m}": c
-                for (d, m), c in self._decline_count.items()
-            },
-            "best_fitness": {
-                f"{d}:{m}": f
-                for (d, m), f in self._best_fitness.items()
-            },
-            "best_params": {
-                f"{d}:{m}": p
-                for (d, m), p in self._best_params.items()
-            },
-            "survived_count": {
-                f"{d}:{m}": c
-                for (d, m), c in self._survived_count.items()
-            },
-            "last_evolved_at": {
-                f"{d}:{m}": ts
-                for (d, m), ts in self._last_evolved_at.items()
-            },
-        }
+        def keyed(table: dict[tuple[str, str], Any]) -> dict[str, Any]:
+            return {f"{d}:{m}": v for (d, m), v in table.items()}
+
+        return codec_for(PolicyEvolverFile).encode(PolicyEvolverFile(
+            fitness_schema_version=FITNESS_SCHEMA_VERSION,
+            generation=self._generation,
+            fitness_history=keyed(self._fitness_history),
+            decline_count=keyed(self._decline_count),
+            best_fitness=keyed(self._best_fitness),
+            best_params=keyed(self._best_params),
+            survived_count=keyed(self._survived_count),
+            last_evolved_at=keyed(self._last_evolved_at),
+            _extra=self._payload_extra,
+        ))
 
     def _from_payload(self, payload: JsonPayload) -> None:
-        if not isinstance(payload, dict):
-            raise TypeError(
-                f"policy_evolver_state.json must be a dict, "
-                f"got {type(payload).__name__}"
-            )
-
-        stored_version = payload.get("fitness_schema_version", 1)
-        if stored_version != FITNESS_SCHEMA_VERSION:
+        data = codec_for(PolicyEvolverFile).decode(payload)
+        # 世代は params の通番で fitness の定義とは独立 — 評価状態を捨てても戻さない
+        # (戻すと別の params に同じ世代番号が付く)。
+        if data.fitness_schema_version != FITNESS_SCHEMA_VERSION:
             # fitness の定義が変わった = 旧履歴を新定義の履歴として続けられない。
             # 続けると (a) 恒真ガードが旧値の平坦さを見て新 fitness を誤って凍結し、
             # (b) 尺度の違う best_fitness が更新されない基準として残り、
@@ -1075,46 +1126,29 @@ class PolicyParamEvolver(JsonStateStore):
             logger.info(
                 "PolicyEvolver fitness schema changed (%s -> %s): "
                 "discarding stored evaluation state (params are left untouched)",
-                stored_version, FITNESS_SCHEMA_VERSION,
+                data.fitness_schema_version, FITNESS_SCHEMA_VERSION,
             )
             self.reset_evaluation_state()
+            self._generation = data.generation
+            self._payload_extra = data._extra
             return
 
-        self._fitness_history.clear()
-        for key_str, history in payload.get("fitness_history", {}).items():
-            parts = key_str.split(":", 1)
-            if len(parts) == 2:
-                self._fitness_history[(parts[0], parts[1])] = history
+        def unkeyed(table: dict[str, Any]) -> dict[tuple[str, str], Any]:
+            out: dict[tuple[str, str], Any] = {}
+            for key, value in table.items():
+                pair = _split_key(key)
+                if pair is not None:
+                    out[pair] = value
+            return out
 
-        self._decline_count.clear()
-        for key_str, count in payload.get("decline_count", {}).items():
-            parts = key_str.split(":", 1)
-            if len(parts) == 2:
-                self._decline_count[(parts[0], parts[1])] = count
-
-        self._best_fitness.clear()
-        for key_str, fitness in payload.get("best_fitness", {}).items():
-            parts = key_str.split(":", 1)
-            if len(parts) == 2:
-                self._best_fitness[(parts[0], parts[1])] = fitness
-
-        self._best_params.clear()
-        for key_str, params in payload.get("best_params", {}).items():
-            parts = key_str.split(":", 1)
-            if len(parts) == 2 and isinstance(params, dict):
-                self._best_params[(parts[0], parts[1])] = params
-
-        self._survived_count.clear()
-        for key_str, count in payload.get("survived_count", {}).items():
-            parts = key_str.split(":", 1)
-            if len(parts) == 2:
-                self._survived_count[(parts[0], parts[1])] = count
-
-        self._last_evolved_at.clear()
-        for key_str, ts in payload.get("last_evolved_at", {}).items():
-            parts = key_str.split(":", 1)
-            if len(parts) == 2 and isinstance(ts, str) and ts:
-                self._last_evolved_at[(parts[0], parts[1])] = ts
+        self._generation = data.generation
+        self._fitness_history = unkeyed(data.fitness_history)
+        self._decline_count = unkeyed(data.decline_count)
+        self._best_fitness = unkeyed(data.best_fitness)
+        self._best_params = unkeyed(data.best_params)
+        self._survived_count = unkeyed(data.survived_count)
+        self._last_evolved_at = {k: ts for k, ts in unkeyed(data.last_evolved_at).items() if ts}
+        self._payload_extra = data._extra
 
     def _on_save_success(self, path: Path) -> None:
         logger.debug("PolicyEvolver state saved: %s", path)

@@ -6,7 +6,8 @@
 処理は ``HistoryManager.index.sessions`` のうち ``summary is None`` かつ
 ``session.turns`` が存在するセッションを対象に、補助タスクで 1-2 文の要約を
 生成し、 続いて embedder で要約埋め込みベクトルを計算する。
-生成した要約とベクトルはセッションファイル + インデックスに永続化する。
+生成した要約はセッションファイル + インデックスに、ベクトルは埋め込みモデルごとの
+束 (``history/embeddings/<model>.npy`` + id 表) に永続化する (c_05 §2.1)。
 
 本 module は EvorefMem pillar 内部扱いで、LLM 呼び出しは caller から受け取った
 ``llm_client`` に閉じる (EvorefGen pillar の Protocol に準拠する抽象 client)。
@@ -77,10 +78,11 @@ async def summarize_unsummarized_sessions(
        (1 サイクルあたり ``batch_size`` 件まで)。
     3. LLM に「以下の会話を 1-2 文で要約してください」プロンプトを投げ、
        末尾 20 ターン (各 200 文字まで) を入力とする。
-    4. 生成された要約をセッションオブジェクトに保存し、続けて embedder で
-       埋め込みベクトルを作り ``summary_embedding`` に格納する。
-    5. :meth:`HistoryManager.save_session` で永続化、インデックス更新。
-    6. 最後に ``_save_index`` で index.json を再書き込み。
+    4. 生成された要約を :meth:`HistoryManager.update_session_fields` で
+       セッションへ書く (書き手スレッドの上で追記ログと一緒に畳むので、要約中に
+       届いたターンを落とさない。索引も同時に更新される)。
+    5. embedder で要約の埋め込みを作り
+       :meth:`HistoryManager.put_summary_embedding` で束へ入れる。
 
     Args:
         llm_client: 要約生成に使う LLM クライアント。``generate`` async メソッド
@@ -161,24 +163,22 @@ async def summarize_unsummarized_sessions(
                 purpose="summarize",
                 id_slot=getattr(llm_client, "background_slot", -1),
             )
-            session.summary = (
-                result["choices"][0]["message"]["content"].strip()
-            )
+            summary = result["choices"][0]["message"]["content"].strip()
+            emb = await embedder.embed([summary], is_query=False)
             # 要約の基にしたターン数を刻む。会話がここから伸びたら次回作り直す。
-            session.summary_turn_count = len(session.turns)
-
-            emb = await embedder.embed([session.summary], is_query=False)
-            session.summary_embedding = emb[0].tolist()
-            # ベクトルにモデル名を添える。無記名だと埋め込みモデルを替えた後、
-            # 新旧のベクトルが次元一致だけで見分けられず類似度が黙って壊れる。
-            session.summary_embedding_model = embedder.model_name()
+            fields: dict[str, Any] = {
+                "summary": summary, "summary_turn_count": len(session.turns),
+            }
             if not session.lang:
-                session.lang = detect_lang(session.summary)
-
-            mgr.save_session(session)
-
-            entry.summary = session.summary
-            entry.summary_turn_count = session.summary_turn_count
+                fields["lang"] = detect_lang(summary)
+            if not mgr.update_session_fields(entry.session_id, **fields):
+                continue
+            # ベクトルは埋め込みモデルごとの束へ (埋め込みモデルの model_key が鍵、無い構成は
+            # model_name。無記名だと替えた後に新旧のベクトルが次元一致だけで見分けられない)。
+            mgr.put_summary_embedding(
+                entry.session_id, emb[0].tolist(),
+                getattr(embedder, "model_key", "") or embedder.model_name(),
+            )
             summarized += 1
         except Exception as exc:
             logger.warning(
@@ -186,7 +186,6 @@ async def summarize_unsummarized_sessions(
             )
 
     if summarized > 0:
-        mgr._save_index(index)
         logger.info("Summarized %d sessions in step 8-9", summarized)
 
     return summarized

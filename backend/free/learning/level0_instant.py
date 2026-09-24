@@ -1,11 +1,20 @@
 """Level 0 即時学習: 経験バッファ"""
 
-import uuid
-from dataclasses import asdict, dataclass, field, fields
+import os
+import threading
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal, get_args
 
+from backend.free.core.correction_verdict import VERDICT_CODES, VerdictCode
 from backend.free.learning.fitness import DEFECT_WEIGHTS, signal_is_defect
-from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
+from backend.io import jsoncodec
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.id_registry import new_id
+from backend.io.readonly import DataReadonlyError
+from backend.io.writer_thread import ChatWriter, default_writer
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -17,9 +26,13 @@ MAX_ENTRIES = 1000
 RESPONSE_SUMMARY_CAP = 200
 #: few-shot 採用時に保持する全文応答の上限。response_summary (200字) では
 #: 文の途中で切れた応答が few-shot 例として注入されるため、採用候補向けに
-#: より長い全文を文境界で切り詰めて保持する。experience.json 肥大を避けるため
+#: より長い全文を文境界で切り詰めて保持する。experience.json (experience.jsonl) の肥大を避けるため
 #: 青天井にはしない (cap × MAX_ENTRIES が永続化サイズの上限)。
 RESPONSE_FULL_CAP = 4000
+
+#: ターン成否の語彙 (``FeedbackSignals.turn_outcome``)。台帳では ``open`` の列挙。
+TurnOutcome = Literal["success", "partial", "failed"]
+TURN_OUTCOMES: frozenset[str] = frozenset(get_args(TurnOutcome))
 
 
 def _has_defect(signals: "FeedbackSignals") -> bool:
@@ -68,6 +81,7 @@ def truncate_at_boundary(text: str, cap: int) -> str:
     return head[: best + 1] if best >= floor else head
 
 
+@persisted()
 @dataclass
 class FeedbackSignals:
     """暗黙的フィードバックシグナル"""
@@ -77,7 +91,7 @@ class FeedbackSignals:
     # false_positive から FeedbackCollector が決定論導出する。
     # tool_routing_success / long_form_success と矛盾する場合は failed 側に
     # 倒し、偽成功が Level 1 の正例学習へ伝播しないようにする。
-    turn_outcome: str = "success"
+    turn_outcome: TurnOutcome = "success"
     #: ``turn_outcome`` の導出理由 (``FeedbackCollector._derive_turn_outcome_with_reason``
     #: の文字列)。few-shot の curate が「手本に帰属できる失敗か」を理由で
     #: 選別する (f_04 §3.2.2)。旧レコードは None。
@@ -107,8 +121,8 @@ class FeedbackSignals:
     """
     correction_verified_at: str | None = None
     """``correction_candidate`` を検証した時刻 (ISO 8601 UTC)。冪等性の鍵。"""
-    correction_verdict: str | None = None
-    """検証結果。``assistant`` / ``self`` / ``third_party`` / ``premise_change``
+    correction_verdict: VerdictCode | None = None
+    """検証結果 (語彙は :data:`~backend.free.core.correction_verdict.VerdictCode`)。``assistant`` / ``self`` / ``third_party`` / ``premise_change``
     / ``none`` (LLM の判定) と、コード側で付ける ``no_context`` (直前応答を
     解決できない) / ``invalid_span`` (逐語検証に落ちた) / ``no_verdict``
     (補助タスクが空を返した)。``assistant`` のみが昇格する。"""
@@ -208,7 +222,7 @@ class FeedbackSignals:
     #: 実行順 ``[{"tool", "success", "reason"}]``。3 つの疑義は ``None`` = ツール
     #: 判定を通っていない (reactive 経路等)、``[]`` / ``False`` = 判定してクリーン。
     #: 「未判定」と「クリーン」を混ぜない (c_05 §0.5)。
-    tool_uses: list[dict] = field(default_factory=list)
+    tool_uses: list[dict[str, Any]] = field(default_factory=list)
     unexplained_numbers: list[str] | None = None
     expression_issues: list[str] | None = None
     unexplained_date_math: bool | None = None
@@ -220,14 +234,12 @@ class FeedbackSignals:
     long_form_false_positive: bool = False
     long_form_false_negative: bool = False
     # MDP ステップクレジット
-    step_credits: list[dict] = field(default_factory=list)
+    step_credits: list[dict[str, Any]] = field(default_factory=list)
+    #: この版が知らないシグナル (書き戻しで元の位置へ戻す、c_05 §0.5.2)。
+    _extra: dict[str, Any] | None = None
 
 
-#: ``_from_payload`` で JSON から復元するシグナルのキー集合。FeedbackSignals の
-#: 全フィールドにデフォルト値がある前提 (欠損キーは dataclass 既定にフォールバック)。
-_SIGNAL_FIELD_NAMES = frozenset(f.name for f in fields(FeedbackSignals))
-
-
+@persisted()
 @dataclass
 class GenerationConfigRef:
     """その応答を生んだ構成の参照 (c_05 §0.6 ID 連鎖)。
@@ -244,10 +256,14 @@ class GenerationConfigRef:
     """注入した few-shot 例の ID (``FewShotExample.id``)。"""
 
     policy_generation: int | None = None
-    """ポリシーパラメータの世代 (``PolicyParamEvolver`` の generation)。"""
+    """ポリシーパラメータの世代 (``PolicyParamEvolver.generation``。パーティション内で
+    params を動かすたびに 1 進む通番)。"""
 
-    lora_version: int | None = None
-    """有効だった base LoRA のスナップショット版 (未適用なら ``None``)。"""
+    adapters: list[dict[str, Any]] = field(default_factory=list)
+    """有効だったアダプタ ``[{"kind": "lora" | "cvector", "version": int}]``。
+
+    記録のみ (帰属の読み手はまだ無い)。llama-server が実際に載せたアダプタは起動時に
+    決まり、backend はその版を追跡していないので、今は常に空で記録する。"""
 
     locale: str = ""
     """UI ロケール。プロンプト本文と few-shot の言語を決める軸。"""
@@ -260,8 +276,8 @@ class GenerationConfigRef:
     pseudo_derived_count: int = 0
     """採用した corpus チャンクのうち疑似クエリ索引経由で拾った件数。"""
 
-    sampling: dict[str, float] = field(default_factory=dict)
-    """temperature / top_p / max_tokens 等、生成時に効いたパラメータ。"""
+    sampling: dict[str, Any] = field(default_factory=dict)
+    """temperature / top_p / max_tokens 等、生成時に効いたパラメータ (自由形、opaque)。"""
 
     evidence_ids: list[str] = field(default_factory=list)
     """このターンで **実際に注入した** Evidence の id (c_16 §5.5)。
@@ -285,7 +301,10 @@ class GenerationConfigRef:
     未適用のターンは空文字のまま (``None`` で埋めない既定と同じ扱い)。
     """
 
+    _extra: dict[str, Any] | None = None
 
+
+@persisted()
 @dataclass
 class ExperienceEntry:
     """経験バッファの1エントリ"""
@@ -313,6 +332,10 @@ class ExperienceEntry:
     # fewshot_pool.add_from_experiences が切れていない応答例を採るためだけに使う。
     response_full: str = ""
     base_model: str = ""
+    """応答を生んだモデルの表示名 (GGUF のファイル名)。照合には使わない。"""
+    model_key: str | None = None
+    """応答を生んだモデルの ``model_key`` (c_05 §0.5.7。create は create_model の key)。
+    Level 2 の経験の絞り込みはこれで行う。"""
     embedding_model: str = ""
     lang: str = ""
     """応答本文の言語 (``ja`` / ``en`` / 未判定は空)。決定論判定で埋める。"""
@@ -322,35 +345,264 @@ class ExperienceEntry:
 
     signals: FeedbackSignals = field(default_factory=FeedbackSignals)
 
+    #: この版が知らないキー (各階層の未知キーはその階層の ``_extra``)。
+    _extra: dict[str, Any] | None = None
+
     @staticmethod
     def new_id() -> str:
-        """``exp_<hex12>`` 形式の ID を発行する。"""
-        return f"exp_{uuid.uuid4().hex[:12]}"
+        """``exp_<hex16>`` 形式の ID を発行する (ID 台帳、c_05 §0.5.5)。"""
+        return new_id("exp_")
 
 
-#: ``_entry_from_dict`` で復元する ``GenerationConfigRef`` のキー集合。
-_GEN_CONFIG_FIELD_NAMES = frozenset(f.name for f in fields(GenerationConfigRef))
+EXPERIENCE_FORMAT = register_format(FormatSpec(
+    format_id="learning.experience",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/experience.jsonl",
+    retention="max_entries (1000), trimmed by compaction",
+    export=True,
+    encodings=("jsonl",),
+    enums={"turn_outcome": "open", "correction_verdict": "open"},
+    records=(ExperienceEntry,),
+))
+
+#: 行の版 (c_05 §0.5.1 の ``_v``)。形式の版と同じ。
+ROW_VERSION = EXPERIENCE_FORMAT.version
+#: patch 行の ``op``。これ以外 (``op`` 無し) は記録の行。
+PATCH_OP = "patch"
+#: 階層ごとに畳む入れ子 (patch の ``fields`` はこの 2 つを 1 段だけ merge する)。
+_NESTED = ("gen_config", "signals")
+_ENTRY_CODEC = codec_for(ExperienceEntry)
+_TOP_FIELDS = tuple(f.name for f in _ENTRY_CODEC.fields if f.name not in _NESTED)
+_GEN_CONFIG_FIELDS = tuple(f.name for f in codec_for(GenerationConfigRef).fields)
+_SIGNAL_FIELDS = tuple(f.name for f in codec_for(FeedbackSignals).fields)
+#: ``record`` のたびに差分を見る直近の件数 (前ターンへの遡及の印・自己撤回・
+#: 保留した訂正の確定は、どれも直近のエントリに付く)。それより古いエントリの
+#: 変更は :meth:`ExperienceBuffer.touch` か、全件を見る :meth:`ExperienceBuffer.flush`。
+_RECENT_WINDOW = 8
 
 
-class ExperienceBuffer(JsonStateStore):
-    """経験バッファ: 毎応答時にエントリを記録し、その場で永続化する。
+def _copied(value: Any) -> Any:
+    """list / dict の値は浅く複写する (差分の基準がメモリ上の値と同じ実体を持たない)。"""
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
 
-    **耐久性はこのストア自身の責務**。以前は ``save()`` の呼出元が
-    ``memory.sleep_update`` と ``core.model_migration`` しか無く、記録された
-    エントリはアイドル窓の sleep-time サイクルが回るまでディスクに存在しな
-    かった。``FeedbackCollector`` は記録のたびに "Recorded experience" を
-    ログへ出すため、**ログ上は記録済みに見えて実体が無い** 窓が常時開いて
-    いる (2026-09-06 監査 F-04: 50 ターン完走直後、メモリ 50 件に対しファイル
-    49 件)。Level 2 の発火判定はこのバッファの失敗件数を見るので、再起動や
-    クラッシュの時刻次第で学習データが目減りする。
 
-    c_05 §0.5 は「各ストアは保持方針を宣言する」と定めており、保持を他の
-    サブシステムのスケジュールに預ける形はその趣旨から外れる。
+def _level_dict(obj: Any, names: tuple[str, ...]) -> dict:
+    """1 階層を dict にする (既知フィールド + ``_extra`` をその階層のトップへ)。
+
+    ``asdict`` の深い複写はしない (c_05 §0.5.2)。シグナルと構成参照の中身は
+    スカラーか、スカラー / dict の list だけ。
+    """
+    out = {name: _copied(getattr(obj, name)) for name in names}
+    extra = obj._extra
+    if extra:
+        for key, value in extra.items():
+            if key not in out:
+                out[key] = value
+    return out
+
+
+def entry_to_dict(entry: ExperienceEntry) -> dict:
+    """1 エントリの永続形 (``gen_config`` / ``signals`` は入れ子の dict。未知キーは各階層のトップ)。"""
+    out = {name: getattr(entry, name) for name in _TOP_FIELDS}
+    out["gen_config"] = _level_dict(entry.gen_config, _GEN_CONFIG_FIELDS)
+    out["signals"] = _level_dict(entry.signals, _SIGNAL_FIELDS)
+    extra = entry._extra
+    if extra:
+        for key, value in extra.items():
+            if key not in out:
+                out[key] = value
+    return out
+
+
+def entry_from_dict(data: dict) -> ExperienceEntry:
+    """永続形 (記録の dict) を ``ExperienceEntry`` へ読む。読めなければ :class:`CodecError`。"""
+    return _ENTRY_CODEC.decode(data)
+
+
+def _level_unchanged(obj: Any, names: tuple[str, ...], persisted: Any, *, nested: int = 0) -> bool:
+    """1 階層が最後に出した永続形と同じか (複写しない比較。``nested`` は別に比べる入れ子の数)。"""
+    if not isinstance(persisted, dict):
+        return False
+    extra = obj._extra or {}
+    if len(persisted) != len(names) + nested + sum(1 for k in extra if k not in names):
+        return False
+    return all(getattr(obj, n) == persisted.get(n, _MISSING) for n in names) and all(
+        persisted.get(k, _MISSING) == v for k, v in extra.items() if k not in names
+    )
+
+
+def _unchanged(entry: ExperienceEntry, persisted: dict) -> bool:
+    """``entry`` が最後に出した永続形 ``persisted`` と同じか (複写しない比較)。"""
+    return (
+        _level_unchanged(entry, _TOP_FIELDS, persisted, nested=len(_NESTED))
+        and _level_unchanged(entry.gen_config, _GEN_CONFIG_FIELDS, persisted.get("gen_config"))
+        and _level_unchanged(entry.signals, _SIGNAL_FIELDS, persisted.get("signals"))
+    )
+
+
+def _diff(old: dict, new: dict) -> dict:
+    """``old`` → ``new`` の変更だけを patch の ``fields`` にする。"""
+    fields_: dict = {}
+    for key, value in new.items():
+        if key in _NESTED:
+            sub = {k: v for k, v in value.items() if old.get(key, {}).get(k, _MISSING) != v}
+            if sub:
+                fields_[key] = sub
+        elif old.get(key, _MISSING) != value:
+            fields_[key] = value
+    return fields_
+
+
+_MISSING = object()
+
+
+def _row_line(record: dict) -> str:
+    return jsoncodec.dumps({"_v": ROW_VERSION, **record})
+
+
+def rows_text(records: Iterable[dict]) -> str:
+    """記録の dict の列を JSONL の本文にする (コンパクション・別パスへの保存)。"""
+    return "".join(_row_line(r) + "\n" for r in records)
+
+
+def _patch_line(entry_id: str, fields_: dict) -> str:
+    return jsoncodec.dumps({"_v": ROW_VERSION, "op": PATCH_OP, "id": entry_id, "fields": fields_})
+
+
+def _apply_patch(record: dict, fields_: dict) -> None:
+    for key, value in fields_.items():
+        if key in _NESTED and isinstance(value, dict):
+            nested = record.get(key)
+            if not isinstance(nested, dict):
+                nested = record[key] = {}
+            nested.update(value)
+        else:
+            record[key] = value
+
+
+def unknown_enums(record: dict) -> tuple[str, ...]:
+    """記録の dict が持つ未知の列挙値の名前 (空なら学習に使える、c_05 §0.5.3)。
+
+    未知の値の行は **原形のまま保持して使わない** (few-shot・fitness・Level 1 / 2 の
+    選択・訂正ペア・件数上限の対象外)。``turn_outcome`` の null も未知として扱う —
+    既定値 (success) へ寄せると、読めない成否が成功として数えられる。
+    """
+    signals = record.get("signals")
+    if not isinstance(signals, dict):
+        return ()
+    out: list[str] = []
+    outcome = signals.get("turn_outcome", "success")
+    if not (isinstance(outcome, str) and outcome in TURN_OUTCOMES):
+        out.append("turn_outcome")
+    verdict = signals.get("correction_verdict")
+    if verdict is not None and not (isinstance(verdict, str) and verdict in VERDICT_CODES):
+        out.append("correction_verdict")
+    return tuple(out)
+
+
+def fold_experience_file(path: Path | str) -> tuple[list[dict], dict[str, int]]:
+    """JSONL を id ごとに畳んで記録の dict を並べて返す (記録の行の順)。
+
+    patch 行はその id の記録へ (``gen_config`` / ``signals`` は 1 段だけ) merge する。
+    途中で切れた行・NUL・壊れた JSON・知らない版の行は飛ばして数える
+    (c_05 §0.5.2 / §0.5.8)。宛先の無い patch も数える。
+
+    Returns:
+        ``(records, stats)``。``stats`` は ``lines`` / ``bad`` / ``newer`` / ``orphan``。
+    """
+    records: dict[str, dict] = {}
+    anonymous = 0
+    stats = {"lines": 0, "bad": 0, "newer": 0, "orphan": 0}
+    try:
+        raw = Path(path).read_bytes()
+    except FileNotFoundError:
+        return [], stats
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        stats["lines"] += 1
+        if b"\x00" in line:
+            stats["bad"] += 1
+            continue
+        try:
+            obj = jsoncodec.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            stats["bad"] += 1
+            continue
+        if not isinstance(obj, dict):
+            stats["bad"] += 1
+            continue
+        version = obj.pop("_v", 1)
+        if not isinstance(version, int) or version > ROW_VERSION:
+            stats["newer"] += 1
+            continue
+        if obj.get("op") == PATCH_OP:
+            target = records.get(obj.get("id") or "")
+            fields_ = obj.get("fields")
+            if target is None or not isinstance(fields_, dict):
+                stats["orphan"] += 1
+                continue
+            _apply_patch(target, fields_)
+            continue
+        entry_id = obj.get("id") or ""
+        if not entry_id:
+            # id 以前の行は patch の宛先にならない (上書きもしない)。
+            anonymous += 1
+            entry_id = f"\x00anon{anonymous}"
+        # 同じ id の記録がもう 1 度来たら後勝ち (位置は最初のまま)。
+        records[entry_id] = obj
+    return list(records.values()), stats
+
+
+def compacted_body(path: Path, max_entries: int) -> tuple[str, int]:
+    """``path`` を畳み、直近 ``max_entries`` 件の記録だけの本文と行数を返す。
+
+    書き手スレッドで呼ぶ (この操作より前の追記は全て書かれている) ので、メモリ上の
+    バッファを直列化し直さない。未知の列挙値の行は件数に数えず、全て原形のまま残す
+    (c_05 §0.5.3)。
+    """
+    records, stats = fold_experience_file(path)
+    if stats["newer"]:
+        # 新しい版の行を落として書き戻さない (c_05 §0.4.5)。
+        raise RuntimeError(f"{path} has {stats['newer']} row(s) of a newer version; not compacting")
+    known = [r for r in records if not unknown_enums(r)]
+    trimmed = {id(r) for r in known[:-max_entries]} if max_entries > 0 else set()
+    kept = [r for r in records if id(r) not in trimmed]
+    return rows_text(kept), len(kept)
+
+
+class ExperienceBuffer:
+    """経験バッファ: 毎応答時にエントリを記録し、JSONL へ追記する (c_05 §5.3)。
+
+    - ``record()`` は記録の行を 1 行、**書き手スレッド** (c_05 §0.5.9) へ出すだけ。
+      G0 は毎ターン ``done`` の前にバッファ全体 (最大 1000 件・約 7〜9MB) を
+      置き換えており、上限時に 1 ターン約 60ms ループを止めていた。
+    - 後からの変更 (前ターンへの遡及の印・``mark_user_feedback``・
+      ``conversation_ended``・訂正の昇格・sleep-time の書き戻し) は全て
+      ``{"op": "patch", "id": ..., "fields": {...}}`` の行。最後に書いた内容を
+      メモリに持ち (``_shadow``)、変わったフィールドだけを書く。G0 は書き手が
+      3 つあり、互いに全置換していた。
+    - 読むときは id ごとに畳む (:func:`fold_experience_file`)。1000 件への刈り込みと
+      全体の書き直しは **コンパクション** だけ (行数が上限の 2 倍超 / sleep-time の
+      :meth:`save` / 起動時の :meth:`load`)。
+
+    **耐久性はこのストア自身の責務** (2026-09-06 監査 F-04: 保存を sleep-time に
+    預けていた間、ログ上は記録済みでも実体が無い窓が常時開いていた)。追記は
+    ターンの終わりに fsync される (書き手スレッドの契約)。
     """
 
-    _state_logger = logger
+    FORMAT = EXPERIENCE_FORMAT
 
-    def __init__(self, max_entries: int = MAX_ENTRIES, *, autosave: bool = True):
+    def __init__(
+        self, max_entries: int = MAX_ENTRIES, *, autosave: bool = True,
+        writer: ChatWriter | None = None,
+    ):
         self.max_entries = max_entries
         self.entries: list[ExperienceEntry] = []
         # 直近に load / save したパーティションのファイル (rebind 時の退避先)。
@@ -358,14 +610,28 @@ class ExperienceBuffer(JsonStateStore):
         #: ``record`` / ``flush`` で :attr:`bound_path` へ自動保存するか。
         #: 単体テストが一時ディレクトリを汚さないよう無効化できる。
         self.autosave = autosave
+        self._writer = writer
+        #: id → 最後にディスクへ出した永続形 (差分の基準)。
+        self._shadow: dict[str, dict] = {}
+        #: id を持たないエントリで記録の行を出したもの (patch できない)。
+        self._anonymous_written: set[int] = set()
+        #: 明示的に変更を知らされたエントリ (:meth:`touch`)。
+        self._touched: dict[int, ExperienceEntry] = {}
+        #: :attr:`bound_path` の物理行数 (コンパクションの判定)。
+        self._lines = 0
+        #: 新しい版の行を見つけたら書かない (c_05 §0.4.5)。
+        self._newer_on_disk = False
+        #: 未知の列挙値を持つ記録 (原形の dict)。学習には使わず、書き直しで保つ。
+        self._ignored: list[dict] = []
+        # 差分の計算と enqueue を 1 つにする (sleep-time の executor とループの
+        # 両方から来る。先に差分を取った方が後から enqueue すると古い値が勝つ)。
+        self._persist_lock = threading.RLock()
 
-    def save(self, path: str | Path) -> None:
-        super().save(path)
-        self.bound_path = Path(path)
+    @property
+    def writer(self) -> ChatWriter:
+        return self._writer if self._writer is not None else default_writer()
 
-    def load(self, path: str | Path) -> None:
-        super().load(path)
-        self.bound_path = Path(path)
+    # ── 束縛・読み込み・保存 ──
 
     def bind(self, path: str | Path) -> None:
         """保存先だけを設定する (読み込みはしない)。
@@ -375,7 +641,94 @@ class ExperienceBuffer(JsonStateStore):
         **初回セッションのあいだ自動保存が無効** になり、F-04 が新規環境で
         そのまま再現する。
         """
-        self.bound_path = Path(path)
+        with self._persist_lock:
+            if self.bound_path is None or not self._same(path, self.bound_path):
+                self._reset_tracking()
+            self.bound_path = Path(path)
+
+    def load(self, path: str | Path) -> None:
+        """``path`` を畳んで読み込み、以後の保存先にする。
+
+        読み込んだエントリは ``conversation_ended`` を確定させ
+        (:meth:`_mark_loaded_conversations_ended`)、畳めた行が記録数より多ければ
+        (patch 行・刈り込み待ち・印の付け直し) 起動時のコンパクションとして書き直す。
+        """
+        target = Path(path)
+        records, stats = fold_experience_file(target)
+        parsed: list[ExperienceEntry] = []
+        ignored: list[dict] = []
+        skipped = 0
+        for d in records:
+            if unknown_enums(d):
+                ignored.append(d)
+                continue
+            try:
+                parsed.append(entry_from_dict(d))
+            except CodecError as exc:
+                skipped += 1
+                logger.warning(
+                    "Skipping malformed experience entry on load: %s (%r)", exc, str(d)[:120],
+                )
+        broken = stats["bad"] + stats["orphan"] + skipped
+        if broken:
+            logger.warning(
+                "Skipped %d unreadable experience line(s) in %s (bad=%d, orphan patch=%d, "
+                "malformed=%d; kept %d)",
+                broken, target, stats["bad"], stats["orphan"], skipped, len(parsed),
+            )
+        if stats["newer"]:
+            logger.error(
+                "%s has %d experience row(s) of a newer version; not writing to it",
+                target, stats["newer"],
+            )
+        if ignored:
+            logger.warning(
+                "Kept %d experience row(s) with unknown enum values in %s unchanged; "
+                "they are not used for learning",
+                len(ignored), target,
+            )
+        if len(parsed) > self.max_entries:
+            parsed = parsed[-self.max_entries:]
+        with self._persist_lock:
+            self.entries = parsed
+            self.bound_path = target
+            self._reset_tracking()
+            self._newer_on_disk = bool(stats["newer"])
+            self._ignored = ignored
+            marked = self._mark_loaded_conversations_ended()
+            self._shadow = {e.id: entry_to_dict(e) for e in self.entries if e.id}
+            self._anonymous_written = {id(e) for e in self.entries if not e.id}
+            self._lines = stats["lines"]
+            if stats["lines"] and (marked or stats["lines"] > self._record_count):
+                self._rewrite(target)
+        if stats["lines"] or parsed:
+            logger.info("Loaded %d experience entries from %s", len(self.entries), target)
+
+    def save(self, path: str | Path) -> None:
+        """保存する。
+
+        ``path`` が束縛先なら、変わったエントリを patch 行で出してから
+        (sleep-time / shutdown の書き戻し)、行が記録数より多ければコンパクションを
+        書き手スレッドへ出す。別のパス (rebind の退避・移行先) なら今のエントリで
+        そのファイルを書き直す。
+        """
+        target = Path(path)
+        if self.bound_path is not None and self._same(target, self.bound_path):
+            self.flush()
+            if self._lines > self._record_count:
+                self._compact()
+            return
+        if self._newer_on_disk:
+            return
+        try:
+            self.writer.replace(
+                target, rows_text([*self._ignored, *(entry_to_dict(e) for e in self.entries)]),
+                format_id=EXPERIENCE_FORMAT.format_id, fsync=True,
+            )
+        except DataReadonlyError:
+            logger.debug("Experience buffer not saved to %s: data root is read-only", target)
+            return
+        logger.info("Saved %d experience entries to %s", len(self.entries), target)
 
     def rebind(self, path: str | Path, *, previous: str | Path | None = None) -> None:
         """base モデル切替で経験バッファを新パーティションへ向け直す。
@@ -389,11 +742,12 @@ class ExperienceBuffer(JsonStateStore):
             self.save(prev)
         self.entries = []
         self.load(path)
-        self.bound_path = Path(path)
         logger.info(
             "Experience buffer rebound: %s -> %s (%d entries)",
             prev, self.bound_path, len(self.entries),
         )
+
+    # ── 記録・変更 ──
 
     def record(self, entry: ExperienceEntry) -> None:
         """エントリを追加 (同じターンの二重記録は無視する)"""
@@ -414,25 +768,143 @@ class ExperienceBuffer(JsonStateStore):
 
         self.entries.append(entry)
 
-        # ローテーション
+        # ローテーション (ファイルからの刈り込みはコンパクションで)
         if len(self.entries) > self.max_entries:
             overflow = len(self.entries) - self.max_entries
+            for old in self.entries[:overflow]:
+                self._shadow.pop(old.id, None)
             self.entries = self.entries[overflow:]
             logger.info("Rotated %d old entries", overflow)
 
-        self.flush()
+        self._persist(self.entries[-_RECENT_WINDOW:])
 
-    def flush(self) -> None:
-        """バインド済みパーティションへ書き出す (未バインド / 無効時は no-op)。
+    def touch(self, *entries: ExperienceEntry) -> None:
+        """エントリを書き換えたことを知らせる (次の保存で patch 行を出す)。"""
+        for entry in entries:
+            self._touched[id(entry)] = entry
 
-        ``record`` から毎ターン呼ぶ。書き込みは ``AtomicWriter`` 経由で、
-        失敗しても ``JsonStateStore.save`` が WARNING を出して縮退するため
-        チャット応答は止まらない。まとめ書き (デバウンス) はしない —
-        「直近の 1 ターンだけ落ちる」窓を残すと、それが F-04 そのものになる。
+    def flush(self, *, touched_only: bool = False) -> None:
+        """変わったエントリを patch 行で出す (未バインド / 無効時は no-op)。
+
+        既定は全件の差分を取る (呼出元が印を付けたエントリを知らせなくても落とさない。
+        sleep-time の書き戻し・Level 1 の訂正の昇格)。``touched_only=True`` は
+        :meth:`touch` で知らされたエントリだけを見る (ループ上の経路)。
         """
-        if not self.autosave or self.bound_path is None:
+        self._persist([] if touched_only else self.entries)
+
+    def _persist(self, candidates: list[ExperienceEntry]) -> None:
+        if not self.autosave or self.bound_path is None or self._newer_on_disk:
             return
-        super().save(self.bound_path)
+        with self._persist_lock:
+            path = self.bound_path
+            if path is None:
+                return
+            touched = list(self._touched.values())
+            self._touched.clear()
+            lines: list[str] = []
+            seen: set[int] = set()
+            for entry in (*touched, *candidates):
+                if id(entry) in seen:
+                    continue
+                seen.add(id(entry))
+                line = self._line_for(entry)
+                if line is not None:
+                    lines.append(line)
+            if not lines:
+                return
+            try:
+                self.writer.append(path, lines, format_id=EXPERIENCE_FORMAT.format_id)
+            except DataReadonlyError:
+                # readonly は起動側で学習を止めている。ここは最後の砦で、ターンごとに
+                # WARNING を出さない (G1 設計 §16.2 #14)。
+                logger.debug("Experience not saved: data root is read-only")
+                return
+            self._lines += len(lines)
+            overfull = self._lines > 2 * self.max_entries
+        if overfull:
+            self._compact()
+
+    def _line_for(self, entry: ExperienceEntry) -> str | None:
+        """未出力なら記録の行、出力済みで変わっていれば patch 行、無変更なら ``None``。"""
+        previous = self._shadow.get(entry.id) if entry.id else None
+        if previous is not None and _unchanged(entry, previous):
+            # 複写を作らずに比べる (全件の差分を取る flush で 1000 件を複写しない)。
+            return None
+        current = entry_to_dict(entry)
+        if not entry.id:
+            if id(entry) in self._anonymous_written:
+                return None
+            self._anonymous_written.add(id(entry))
+            return _row_line(current)
+        previous = self._shadow.get(entry.id)
+        self._shadow[entry.id] = current
+        if previous is None:
+            return _row_line(current)
+        changed = _diff(previous, current)
+        if not changed:
+            return None
+        return _patch_line(entry.id, changed)
+
+    def _compact(self) -> None:
+        """書き手スレッドでファイルを畳んで書き直す (完了を待たない)。"""
+        path = self.bound_path
+        if path is None or not self.autosave or self._newer_on_disk:
+            return
+        with self._persist_lock:
+            lines_at_enqueue = self._lines
+
+        def build() -> str:
+            body, kept = compacted_body(path, self.max_entries)
+            with self._persist_lock:
+                if self.bound_path is not None and self._same(path, self.bound_path):
+                    # enqueue 後に追記された行はコンパクションの後ろに積まれる。
+                    self._lines = kept + max(0, self._lines - lines_at_enqueue)
+            logger.info("Compacted experience log %s to %d entries", path, kept)
+            return body
+
+        try:
+            self.writer.replace(path, build, format_id=EXPERIENCE_FORMAT.format_id, fsync=True)
+        except DataReadonlyError:
+            logger.debug("Experience compaction skipped: data root is read-only")
+
+    def _rewrite(self, path: Path) -> None:
+        """今のエントリでファイルを書き直す (起動時のコンパクション)。
+
+        未知の列挙値の記録は先頭に原形のまま置く (使わないので位置に意味は無い)。
+        """
+        if not self.autosave or self._newer_on_disk:
+            return
+        rows = [*self._ignored, *(self._shadow.get(e.id) or entry_to_dict(e) for e in self.entries)]
+        try:
+            self.writer.replace(
+                path, rows_text(rows), format_id=EXPERIENCE_FORMAT.format_id, fsync=True,
+            )
+        except DataReadonlyError:
+            logger.debug("Experience rewrite skipped: data root is read-only")
+            return
+        self._lines = len(rows)
+
+    @property
+    def _record_count(self) -> int:
+        """ファイルに残るべき記録の数 (使う記録 + 未知の列挙値の記録)。"""
+        return len(self.entries) + len(self._ignored)
+
+    @property
+    def ignored_count(self) -> int:
+        """未知の列挙値のため学習に使わず保持している記録の数 (c_05 §0.5.3)。"""
+        return len(self._ignored)
+
+    def _reset_tracking(self) -> None:
+        self._shadow = {}
+        self._anonymous_written = set()
+        self._touched = {}
+        self._lines = 0
+        self._newer_on_disk = False
+        self._ignored = []
+
+    @staticmethod
+    def _same(a: str | Path, b: str | Path) -> bool:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
     def get_recent(self, n: int = 10) -> list[ExperienceEntry]:
         """直近 n 件取得"""
@@ -445,7 +917,7 @@ class ExperienceBuffer(JsonStateStore):
         """セッションの最新 (または ``query`` が一致する最新) の経験に明示評価を刻む。
 
         ``negative=None`` は評価の取り消し。見つからなければ ``None``
-        (private ターン等、経験が無い応答)。書き込みは flush する。
+        (private ターン等、経験が無い応答)。変更は patch 行で出す。
         """
         wanted = " ".join((query or "").split())
         for entry in reversed(self.entries):
@@ -455,7 +927,7 @@ class ExperienceBuffer(JsonStateStore):
                 continue
             entry.signals.user_negative = negative
             entry.signals.user_note = (note or "").strip()[:400]
-            self.flush()
+            self._persist([entry])
             return entry
         return None
 
@@ -508,98 +980,9 @@ class ExperienceBuffer(JsonStateStore):
         """FadeMem ガード用: 空リスト（将来拡張）"""
         return []
 
-    # ── 永続化 (JsonStateStore) ──
-
     def as_dicts(self) -> list[dict]:
         """全エントリを dict 化して返す (時系列順)。学習側の純粋関数の入力用。"""
-        return list(self._to_payload())
-
-    def _to_payload(self) -> JsonPayload:
-        return [
-            {
-                "id": entry.id,
-                "session_id": entry.session_id,
-                "turn_id": entry.turn_id,
-                "trace_id": entry.trace_id,
-                "timestamp": entry.timestamp,
-                "mode": entry.mode,
-                "query": entry.query,
-                "response_summary": entry.response_summary,
-                "response_full": entry.response_full,
-                "base_model": entry.base_model,
-                "embedding_model": entry.embedding_model,
-                "lang": entry.lang,
-                "gen_config": asdict(entry.gen_config),
-                "signals": asdict(entry.signals),
-            }
-            for entry in self.entries
-        ]
-
-    def _from_payload(self, payload: JsonPayload) -> None:
-        if not isinstance(payload, list):
-            raise TypeError(
-                f"experience.json must be a list, got {type(payload).__name__}"
-            )
-        # 一時リストへ復元し、全件通ったあとで差し替える。以前は live の
-        # entries を先に clear してから逐次 append していたため、壊れた要素
-        # 1 件で途中の例外 → 半分だけ読んだ状態 → 次の save がそれをファイルへ
-        # 書き戻して残りを失っていた (2026-09-02 監査 R-B1)。壊れた要素は
-        # WARNING を出して飛ばす (黙って削らない)。
-        parsed: list[ExperienceEntry] = []
-        skipped = 0
-        for d in payload:
-            try:
-                parsed.append(self._entry_from_dict(d))
-            except (AttributeError, KeyError, TypeError, ValueError) as exc:
-                skipped += 1
-                logger.warning(
-                    "Skipping malformed experience entry on load: %s (%r)",
-                    exc, str(d)[:120],
-                )
-        if skipped:
-            logger.warning(
-                "Skipped %d malformed experience entr%s on load (kept %d)",
-                skipped, "y" if skipped == 1 else "ies", len(parsed),
-            )
-        self.entries = parsed
-        self._mark_loaded_conversations_ended()
-
-    @staticmethod
-    def _entry_from_dict(d: dict) -> ExperienceEntry:
-        """JSON の 1 要素を ``ExperienceEntry`` へ復元する (壊れていれば例外)。"""
-        signals_data = d.get("signals", {})
-        if not isinstance(signals_data, dict):
-            raise TypeError("signals must be a dict")
-        gen_data = d.get("gen_config") or {}
-        if not isinstance(gen_data, dict):
-            gen_data = {}
-        return ExperienceEntry(
-            # 旧レコードは id を持たない。**ここで採番しない** — 読むたびに別 ID に
-            # なると重複検出の役に立たないので、空のままにして「ID 以前のレコード」
-            # と分かるようにする。
-            id=d.get("id", ""),
-            session_id=d.get("session_id", ""),
-            turn_id=d.get("turn_id", ""),
-            trace_id=d.get("trace_id", ""),
-            timestamp=d.get("timestamp", ""),
-            mode=d.get("mode", "chat"),
-            query=d.get("query", ""),
-            response_summary=d.get("response_summary", ""),
-            response_full=d.get("response_full", ""),
-            base_model=d.get("base_model") or "",
-            embedding_model=d.get("embedding_model", ""),
-            lang=d.get("lang", ""),
-            gen_config=GenerationConfigRef(**{
-                k: gen_data[k] for k in _GEN_CONFIG_FIELD_NAMES if k in gen_data
-            }),
-            # JSON に存在するキーのみ採用 (欠損キーは FeedbackSignals の
-            # 既定値に委ねる)。新シグナル追加時もここの編集は不要。
-            signals=FeedbackSignals(**{
-                k: signals_data[k]
-                for k in _SIGNAL_FIELD_NAMES
-                if k in signals_data
-            }),
-        )
+        return [entry_to_dict(e) for e in self.entries]
 
     def _mark_loaded_conversations_ended(self) -> int:
         """読み込んだエントリの ``conversation_ended`` を確定させる。
@@ -630,9 +1013,3 @@ class ExperienceBuffer(JsonStateStore):
                 marked,
             )
         return marked
-
-    def _on_save_success(self, path: Path) -> None:
-        logger.info("Saved %d experience entries to %s", len(self.entries), path)
-
-    def _on_load_success(self, path: Path) -> None:
-        logger.info("Loaded %d experience entries from %s", len(self.entries), path)

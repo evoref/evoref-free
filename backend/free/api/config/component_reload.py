@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 logger = get_logger("api.component_reload")
 
 # backend/free/api/config/component_reload.py から見て parents[4] がリポジトリルート。
-# parents[3] (= backend/) を渡すと cache_dir 等の相対パスが backend/local/ に解決され、
+# parents[3] (= backend/) を渡すと埋め込みキャッシュ等のデータ根が backend/userdata/ に解決され、
 # 正規の起動経路 (_pillar_wirer / component_rebind) とずれた迷子データを生む。
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
@@ -62,16 +62,14 @@ def follow_base_model_rebind(state: "AppState", new_model_filename: str) -> dict
 
     llama-server を新 base で再起動して ``state.local_client`` を差し替えた直後
     (``/api/model/reload``) に呼ぶ。experience / base prompts / fewshot / policy
-    等を新モデルの (model×mode) パーティションへ再バインドし、旧パーティションへは
+    等を新モデルの (model_key×mode) パーティションへ再バインドし、旧パーティションへは
     先に退避する (``backend.factory._learning_rebind.rebind_base_learning``)。
     失敗しても呼出側 (モデル reload 自体) は成功扱いにし、WARNING で残す。
     """
     from backend.factory._learning_rebind import rebind_base_learning
 
     try:
-        result = rebind_base_learning(
-            state, get_config(), new_model_filename=new_model_filename,
-        )
+        result = rebind_base_learning(state, new_model_filename=new_model_filename)
     except Exception as e:
         logger.warning("Learning partition rebind failed after base swap: %s", e)
         return {"rebound": False, "reason": f"error: {e}"}
@@ -130,7 +128,7 @@ async def reload_prompt_manager(state: AppState) -> None:
 
     cfg = get_config()
     resolver = get_path_resolver()
-    # base システムプロンプトは (model×mode) パーティション配下 (resolve_learning)。
+    # base システムプロンプトは (model_key×mode) パーティション配下 (resolve_learning)。
     prompt_dir = resolver.resolve_learning("prompts_dir")
     instance_name = cfg.get("instance", {}).get("name", "evoref")
     state.prompt_manager = SystemPromptManager(prompt_dir, instance_name=instance_name)

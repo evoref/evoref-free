@@ -20,15 +20,18 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from backend.free.rag.evidence._json_state import JsonStateFile
 from backend.io import JSONLAppendStore
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.id_registry import id_pattern, is_valid_id
+from backend.io.jsonl_store import ROW_VERSION_FIELD
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 from backend.utils import parse_utc, utc_now, utc_now_dt
 
@@ -46,8 +49,10 @@ ActivityState = Literal["running", "blocked", "exited"]
 ExitKind = Literal["done", "timeout", "cancelled", "disconnected", "error", "resumed"]
 RunStatus = Literal["working", "needs_input", "done", "failed", "cancelled", "timeout"]
 
-#: run_id (= workspace_id) の形式。``uuid4().hex[:12]`` 由来 (chat_stream_staged.py)。
-RUN_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+#: run_id (= workspace_id) の接頭辞 (ID 台帳 ``run_``、c_05 §0.5.5)。
+RUN_ID_PREFIX = "run_"
+#: run_id の文法 (発番時と API 入口の検査用)。
+RUN_ID_PATTERN = id_pattern(RUN_ID_PREFIX)
 
 #: 時刻が壊れて読めない run を GC のソート先頭 (= 最初に削除対象) へ寄せる番兵。
 _EPOCH_MIN = datetime.min.replace(tzinfo=timezone.utc)
@@ -58,8 +63,13 @@ def _sort_key(iso: str) -> datetime:
 
 
 def is_valid_run_id(run_id: str) -> bool:
-    """``run_id`` が ``create_workspace_dir`` 配下の安全な相対パスか (traversal 防止)。"""
-    return bool(RUN_ID_RE.match(run_id))
+    """``run_id`` が ID 台帳の文法に合うか (API 入口の検査。traversal 防止を兼ねる)。"""
+    return is_valid_id(run_id, RUN_ID_PREFIX)
+
+
+def _is_run_dir(entry: Path) -> bool:
+    """``create_dir`` 直下の run の作業場か (読み手の判定。長さでは弾かない、c_05 §0.5.5)。"""
+    return entry.is_dir() and entry.name.startswith(RUN_ID_PREFIX)
 
 
 # ===========================================================================
@@ -110,13 +120,47 @@ _RUN_RECORD_REQUIRED = {
 }
 
 
-class RunRecordStore(JsonStateFile):
-    """``run.json`` (封筒付き、``AtomicWriter(fsync=True)``、FingerprintStore に倣う)。"""
+CREATE_RUN_FORMAT = register_format(FormatSpec(
+    format_id="create.run",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free", "pro"}),
+    path_key=f"store/create/<run>/{RUN_FILE}",
+    retention="kept with the run workspace",
+))
 
-    SCHEMA_VERSION = 1
+#: 作業場の工程間ハンドオフ (``WorkspaceManager`` の ``manifest.json``、封筒付き)。
+#: ``create.workspace`` の木より具体的な path_key なので台帳ではこちらに分類される。
+CREATE_WORKSPACE_MANIFEST_FORMAT = register_format(FormatSpec(
+    format_id="create.workspace_manifest",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free", "pro"}),
+    path_key="store/create/<run>/manifest.json",
+    retention="kept with the run workspace",
+))
+
+#: run の作業ディレクトリの残り (隔離 SemMem ``.semmem``・仕様 / 計画・生成物)。create の run は export しない (G1 設計 §8.6)。
+CREATE_WORKSPACE_FORMAT = register_format(FormatSpec(
+    format_id="create.workspace",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free", "pro"}),
+    path_key="store/create/<run>/**",
+    retention="create.runs_keep newest runs (by ended_at); running runs are never removed",
+    encodings=("dir",),
+))
+
+
+class RunRecordStore(VersionedJsonFile):
+    """``run.json`` (封筒付き、SoT なので fsync)。"""
+
+    FORMAT = CREATE_RUN_FORMAT
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
 
     def __init__(self, workspace_root: Path | str) -> None:
-        super().__init__(Path(workspace_root) / RUN_FILE, fsync=True)
+        super().__init__(Path(workspace_root) / RUN_FILE)
         self.record: RunRecord | None = None
 
     # ── 書き手 API (run_staged_pipeline / LongFormHarness のみ) ──────────
@@ -178,7 +222,7 @@ class RunRecordStore(JsonStateFile):
             self.record.template = template
         self.save()
 
-    # ── JsonStateFile 抽象メソッド ──────────────────────────────────────
+    # ── VersionedJsonFile 抽象メソッド ──────────────────────────────────────
 
     def _to_payload(self) -> dict[str, Any]:
         return self.record.to_dict() if self.record is not None else {}
@@ -199,31 +243,47 @@ class RunRecordStore(JsonStateFile):
 # ===========================================================================
 
 
-@dataclass(frozen=True)
+@persisted()
+@dataclass
 class RunEvent:
-    """1 イベント行 (``{seq, at, kind, payload}``)。"""
+    """1 イベント行 (``{_v, seq, at, kind, payload}`` の ``_v`` 以外。未知キーは ``_extra``)。"""
 
     seq: int
     at: str
     kind: str
     payload: dict[str, Any]
+    #: この版が知らないキー (追記し直すときにそのまま戻す)。
+    _extra: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
+        """API 応答の形 (``{seq, at, kind, payload}``)。"""
         return {"seq": self.seq, "at": self.at, "kind": self.kind, "payload": self.payload}
 
 
+#: run の事象ログ (``events.jsonl``、行は ``{"_v", ...}`` の追記だけ)。``create.workspace``
+#: の木より具体的な path_key なので台帳ではこちらに分類される。
+CREATE_RUN_EVENTS_FORMAT = register_format(FormatSpec(
+    format_id="create.run_events",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free", "pro"}),
+    path_key=f"store/create/<run>/{EVENTS_FILE}",
+    retention="append-only; kept with the run workspace",
+    encodings=("jsonl",),
+    records=(RunEvent,),
+))
+_RUN_EVENT_CODEC = codec_for(RunEvent)
+
+
 def _serialize_event(evt: RunEvent) -> str:
-    return json.dumps(evt.to_dict(), ensure_ascii=False)
+    row = {ROW_VERSION_FIELD: CREATE_RUN_EVENTS_FORMAT.version, **_RUN_EVENT_CODEC.encode(evt)}
+    return json.dumps(row, ensure_ascii=False)
 
 
 def _deserialize_event(line: str) -> RunEvent:
     obj = json.loads(line)
-    if not isinstance(obj, dict):
-        raise ValueError("event line is not an object")
-    return RunEvent(
-        seq=int(obj["seq"]), at=str(obj["at"]),
-        kind=str(obj["kind"]), payload=dict(obj.get("payload") or {}),
-    )
+    obj.pop(ROW_VERSION_FIELD, None)  # 版はストアが確かめ済み
+    return _RUN_EVENT_CODEC.decode(obj)
 
 
 class RunEventLog:
@@ -245,6 +305,7 @@ class RunEventLog:
             deserialize=_deserialize_event,
             key_of=lambda evt: str(evt.seq),
             debug_logger=debug_logger,
+            row_version=CREATE_RUN_EVENTS_FORMAT.version,
         )
         existing = self._store.load_all().values()
         self._next_seq = max((e.seq for e in existing), default=0) + 1
@@ -358,9 +419,7 @@ def list_runs(
     out: list[tuple[RunRecord, RunStatus]] = []
     skipped = 0
     for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or entry.name.startswith(TRASH_PREFIX):
-            continue
-        if not is_valid_run_id(entry.name):
+        if not _is_run_dir(entry):
             continue
         # run.json の無い作業場は run record 導入前の workspace で、壊れた run ではない。
         if not (entry / RUN_FILE).is_file():
@@ -439,9 +498,7 @@ def gc_old_runs(
 
     exited: list[tuple[str, str, Path]] = []  # (ended_at, run_id, dir)
     for entry in root.iterdir():
-        if not entry.is_dir() or entry.name.startswith(TRASH_PREFIX):
-            continue
-        if not is_valid_run_id(entry.name):
+        if not _is_run_dir(entry):
             continue
         store = RunRecordStore(entry)
         if not store.load() or store.record is None:

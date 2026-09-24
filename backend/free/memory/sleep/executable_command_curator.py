@@ -14,10 +14,11 @@ CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定�
 - 新 FactType を追加せず ``world_fact`` を流用する (CLAUDE.md §3 / §6 #2)。
 - subject = ``idx.command.<mode>.<sha1_12(command_normalized)>``。
   同一コマンドの決定論的キーで既存 fact を引き当て可能。
-- ``_extra`` にコマンド専用メタ (command / command_normalized / mode /
+- コマンド専用メタ (command / command_normalized / mode /
   success_history / success_avg / exec_count / last_query /
-  last_executed_at) を載せる。SemanticFact の round-trip でそのまま JSONL に
-  保持される。
+  last_executed_at) はレコードの ``attrs`` に載る
+  (``semantic.fact.FACT_CURATOR_ATTR_FIELDS``)。作業型では ``SemanticFact._extra``
+  から読み書きし、更新は変わったキーだけの ``patch`` になる。
 - url_curator と違い **補助タスク採点はしない**。``MemoryNote.tool_command_success``
   (run_command 戻り値が "Error:" prefix でないか) を真偽として記録する。
   ``success=False`` は既存 fact を penalize するのみで新規作成しない。
@@ -45,6 +46,7 @@ from backend.free.core.session_mode import normalize_session_mode
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
+from backend.utils import epoch_to_utc
 
 if TYPE_CHECKING:
     from backend.free.memory.semantic.store import SemanticFactStore
@@ -155,7 +157,7 @@ def _record_success(
             "success_history": history,
             "success_avg": round(success_avg, 4),
             "last_query": _truncate(redact_for_store(query), 200),
-            "last_executed_at": now,
+            "last_executed_at": epoch_to_utc(now),
         },
     )
     return extra
@@ -273,7 +275,7 @@ async def curate_executable_command_facts(
                     "success_history": [1.0],
                     "success_avg": 1.0,
                     "last_query": topic,
-                    "last_executed_at": now,
+                    "last_executed_at": epoch_to_utc(now),
                 }
                 fact = fact_from_note(
                     assistant_note,

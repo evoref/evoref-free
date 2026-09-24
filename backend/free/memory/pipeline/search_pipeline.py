@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import zlib
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -451,6 +452,7 @@ async def _search_episodic_layer(
             )
     else:
         hits = _answers_for_question_only_hits(episodic, hits)
+    hits = _latest_statement_per_slot(hits)
 
     entries: list[StoreEntry] = []
     n_dropped = n_cleaned = 0
@@ -498,8 +500,58 @@ def episodic_session_scope(query: str, session_id: str) -> str | None:
 def _hit_session(hit) -> str:
     """ヒットのノートが書かれたセッション id (provenance[0].session_id、無ければ "")。"""
     prov = getattr(hit.record, "provenance", None) or []
-    first = prov[0] if prov and isinstance(prov[0], dict) else {}
+    first = prov[0] if prov and isinstance(prov[0], Mapping) else {}
     return str(first.get("session_id") or "")
+
+
+def _latest_statement_per_slot(hits: list) -> list:
+    """同じ単値の属性スロットを述べるノートは、**最新の利用者の発言** だけ残す。
+
+    版を作る前・Full の抽出前は、言い直した値 (「好きな飲み物は紅茶です」) と
+    前の値 (「…コーヒーです」) が両方ノートとして当たり、cosine がほぼ同じなら
+    古い方が先に並んでモデルがそれを答える (2026-09-23 実機: 別セッションで
+    言い直した後も「コーヒーです」)。ファクト側の「1 スロット 1 値」(注入前の
+    畳み込み) と同じ規則をノートに掛ける。
+
+    アシスタントのノートは勝者にしない — 古い値を答えた応答がいちばん新しい
+    ノートになり、それが次の想起で勝つと誤りが自己増幅する。スロットに利用者の
+    発言があれば、同じスロットのアシスタントのノートは落とす。利用者の発言が
+    無いスロットはそのまま (比べる根拠が無い)。
+    """
+    if len(hits) < 2:
+        return hits
+    from backend.free.memory.notes.note_builder import restated_attribute_slot
+    from backend.utils import parse_utc
+
+    def stamp(hit) -> float:
+        try:
+            parsed = parse_utc(str(getattr(hit.record, "observed_at", "") or ""))
+        except (TypeError, ValueError):
+            return 0.0
+        return parsed.timestamp() if parsed is not None else 0.0
+
+    slot_of = {hit.id: restated_attribute_slot(hit.text) for hit in hits}
+    latest: dict[str, tuple[float, str]] = {}
+    for hit in hits:
+        slot = slot_of[hit.id]
+        if slot is None or hit.record.origin != "user":
+            continue
+        when = stamp(hit)
+        if slot not in latest or when > latest[slot][0]:
+            latest[slot] = (when, hit.id)
+    if not latest:
+        return hits
+    kept = [
+        hit for hit in hits
+        if slot_of[hit.id] not in latest or latest[slot_of[hit.id]][1] == hit.id
+    ]
+    if len(kept) != len(hits):
+        logger.info(
+            "Episodic: kept the latest user statement per attribute slot "
+            "(%s); dropped %d older or echoed note(s)",
+            ", ".join(sorted(latest)), len(hits) - len(kept),
+        )
+    return kept
 
 
 def _answers_for_question_only_hits(episodic, hits: list) -> list:
@@ -1769,7 +1821,7 @@ async def unified_search(
             final_sources, merged_raw,
             body_entries=[*epi_entries, *corpus_entries], pseudo_ids=pseudo_ids,
         ),
-        evidence_ids=evidence_ids_of(final_sources),
+        evidence_ids=evidence_ids_of(final_sources, _corpus_versions(cartridge_mgr)),
         corpus_gated=corpus_gated,
         pseudo_derived=sum(1 for cid, _, _ in final_sources if cid in pseudo_ids),
         lexical_candidate_ids=lexical_candidate_ids,
@@ -1891,18 +1943,42 @@ def _store_of(chunk_id: str) -> str:
     return "corpus" if ":" in chunk_id else "episodic"
 
 
-def evidence_ids_of(sources: list[tuple[str, float, str]]) -> list[str]:
-    """注入した ``sources`` を ``<store>:<evidence_id>`` へ写す (c_16 §5.5)。
+def _corpus_versions(cartridge_mgr) -> dict[str, str]:
+    """ロード中の corpus パッケージ id → 版 (参照 ``corpus:<pkg>@<ver>:<id>`` 用)。"""
+    loaded = getattr(cartridge_mgr, "loaded", None) if cartridge_mgr is not None else None
+    if not isinstance(loaded, dict):
+        return {}
+    out: dict[str, str] = {}
+    for package_id, package in loaded.items():
+        version = getattr(getattr(package, "meta", None), "version", None)
+        if isinstance(version, str):
+            out[str(package_id)] = version
+    return out
 
-    corpus の chunk id は ``<package_id>:<evidence_id>`` なので、後ろ半分を
-    evidence_id として採る (パッケージ id は package 側の台帳から引ける)。
+
+def evidence_ids_of(
+    sources: list[tuple[str, float, str]],
+    corpus_versions: dict[str, str] | None = None,
+) -> list[str]:
+    """注入した ``sources`` を Evidence の参照形式へ写す (c_16 §5.5 / c_05 §0.5.5)。
+
+    会話ノートは ``episodic:<evidence_id>``。corpus は **必ず**
+    ``corpus:<package_id>@<version>:<evidence_id>`` — チャンク id は内容由来で
+    版を跨いで同じ値になり、code_node はルートを跨ぐと同じ id になるので、
+    パッケージと版を持たない bare な id 参照は禁止 (c_05 §0.5.5)。検索結果の
+    chunk id は ``<package_id>:<evidence_id>`` なので、版は ``corpus_versions``
+    (ロード中のパッケージ) から引く。引けなければ版は空にする (``@:``)。
     """
+    versions = corpus_versions or {}
     out: list[str] = []
     seen: set[str] = set()
     for chunk_id, _score, _text in sources:
         store = _store_of(chunk_id)
-        evidence_id = chunk_id.split(":", 1)[1] if store == "corpus" else chunk_id
-        tagged = f"{store}:{evidence_id}"
+        if store == "corpus":
+            package_id, _, evidence_id = chunk_id.partition(":")
+            tagged = f"corpus:{package_id}@{versions.get(package_id, '')}:{evidence_id}"
+        else:
+            tagged = f"{store}:{chunk_id}"
         if tagged not in seen:
             seen.add(tagged)
             out.append(tagged)

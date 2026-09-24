@@ -167,12 +167,43 @@ def _shutdown_semmem_index_flush(state: AppState) -> None:
 
 
 def _shutdown_experience_save(exp_buf: "ExperienceBuffer", exp_file: Path) -> None:
-    """経験バッファを保存"""
+    """経験バッファの残りの変更を patch 行で出す (書き手スレッドへ。停止時に drain)"""
     try:
         exp_buf.save(exp_file)
         logger.info("Experience buffer saved: %d entries", len(exp_buf.entries))
     except Exception as e:
         logger.warning("Experience buffer save failed: %s", e)
+
+
+def _shutdown_history_fold() -> None:
+    """アクティブなセッションの追記ログをセッション JSON へ畳む (c_05 §2.1)。
+
+    畳まなくても次の起動で畳まれる (追記ログは SoT) ので、ここは最適化。
+    """
+    from backend.free.history import history_manager as hm
+
+    mgr = hm._manager_cache
+    if mgr is None:
+        return
+    try:
+        mgr.fold_active_sessions()
+    except Exception as e:
+        logger.warning("History fold on shutdown failed: %s", e)
+
+
+def _shutdown_chat_writer() -> None:
+    """書き手スレッドを drain して止める (未同期の追記を fsync、索引を書く)。"""
+    from backend.io.writer_thread import default_writer
+
+    writer = default_writer()
+    try:
+        if not writer.stop(timeout=20.0):
+            logger.warning("Chat writer did not finish on shutdown")
+    except Exception as e:
+        logger.warning("Chat writer stop failed: %s", e)
+    degraded = writer.degraded()
+    if degraded:
+        logger.warning("Formats degraded during this run: %s", sorted(degraded))
 
 
 def _shutdown_patterns_save(
@@ -277,7 +308,38 @@ async def _run_lifespan_startup(
     state: AppState, project_root: Path,
 ) -> tuple[_LifespanContext, dict[str, float]]:
     """起動シーケンス全体を実行する"""
-    return await wire_pillars(state, project_root)
+    # 版の組み立て (畳み込み・版ファイル・転置索引) を子プロセスへ出す
+    # (G1 設計 §11-2)。子プロセスは最初の版の生成で起きる。
+    from backend.free.rag.evidence.snapshot_build import (
+        enable_process_pool,
+        set_busy_probe,
+    )
+
+    from backend.factory._data_gate import open_data_root, report_data_gate
+
+    from backend.io.writer_thread import default_writer
+
+    open_data_root(state, project_root)
+    # チャット経路の書き手スレッド (c_05 §0.5.9)。配線中の読み込み (経験の起動時
+    # コンパクション・履歴の取り残しの畳み込み) からこのスレッドで書く。
+    default_writer().start()
+    enable_process_pool()
+    ctx, timings = await wire_pillars(state, project_root)
+    report_data_gate(state)
+    if state.data_readonly_reason is not None and ctx.sleep_scheduler is not None:
+        ctx.sleep_scheduler.suspend(f"data root is read-only ({state.data_readonly_reason})")
+    # 版の差し替え (L2) を応答の生成中・生成前のリクエストに重ねない
+    if ctx.sleep_scheduler is not None and state.data_readonly_reason is None:
+        set_busy_probe(ctx.sleep_scheduler.is_serving_request)
+        # tail 索引はメモリにしか無いので、起動直後に埋め直す (c_16 §6.4)。
+        # 版を作る条件を満たしていれば裏で作る (c_16 §5.7)。
+        ctx.sleep_scheduler.arm_tail_refresh()
+        ctx.sleep_scheduler.arm_snapshot()
+        # 埋め込みサーバの調停: 利用者がアクティブな間は一括処理 (P3) を半分に抑える
+        from backend.free.rag.embed_scheduler import default_scheduler
+
+        default_scheduler().set_user_active_probe(ctx.sleep_scheduler.is_user_active)
+    return ctx, timings
 
 
 async def _run_lifespan_shutdown(
@@ -323,10 +385,22 @@ async def _run_lifespan_shutdown(
                 tracer.close()
             except Exception as e:
                 logger.warning("AgentTracer close failed: %s", e)
+    with _timed(shutdown_timings, "history_fold"):
+        _shutdown_history_fold()
+    with _timed(shutdown_timings, "chat_writer_stop"):
+        _shutdown_chat_writer()
     with _timed(shutdown_timings, "llm_client_close"):
         await _shutdown_llm_client(state)
     with _timed(shutdown_timings, "embedder_close"):
         await _shutdown_embedder(state)
+    with _timed(shutdown_timings, "snapshot_worker_stop"):
+        from backend.free.rag.evidence.snapshot_build import (
+            set_busy_probe,
+            shutdown_process_pool,
+        )
+
+        set_busy_probe(None)
+        shutdown_process_pool()
     with _timed(shutdown_timings, "pro_shutdown"):
         await _shutdown_pro(ctx.pro_shutdown, state)
     with _timed(shutdown_timings, "develop_shutdown"):
@@ -337,6 +411,10 @@ async def _run_lifespan_shutdown(
                 state.llama_manager.shutdown_all()
             except Exception as e:
                 logger.warning("llama_manager shutdown_all failed: %s", e)
+    # 書き手ロックは最後に手放す (プロセス終了でも OS が解放する)
+    gate = state.data_gate
+    if gate is not None:
+        gate.lock.release()
     return shutdown_timings
 
 

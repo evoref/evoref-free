@@ -12,6 +12,7 @@ import re
 import subprocess
 
 from pathlib import Path
+from backend.data_root import DEFAULT_DIRNAME, ISOLATED_DIRNAME
 from backend.log_config import get_logger
 from backend.free.constants import READ_FILE_META_PREFIX
 
@@ -23,6 +24,12 @@ logger = get_logger("agent.tools.builtin")
 # 別スレッド実行下でもイベントループを事実上ブロックする (実インシデントで確認済み)。
 # 通常のソースファイルはこれより十分小さい。
 _TOOL_MAX_FILE_READ_BYTES = 2_000_000
+
+#: search_code の走査で降りないディレクトリ (隠しディレクトリは別に除く)。
+_WALK_EXCLUDED_DIRS = frozenset({
+    "node_modules", "__pycache__", ".git", "models", "local",
+    DEFAULT_DIRNAME, ISOLATED_DIRNAME,
+})
 
 #: read_file のデコード候補 (先頭から順に厳格デコードを試す)。BOM 付きは
 #: utf-8-sig、Windows 既定のメモ帳 / 旧ツール出力は cp932。
@@ -431,11 +438,12 @@ def search_code(pattern: str, directory: str = ".", max_results: int = 20) -> st
 
     for root, dirs, files in os.walk(base):
         # 隠しディレクトリ・一般的な除外 + モデル/ローカルデータ (数十GB級バイナリ/
-        # 大量の実行時データを含み、ソースコードではない) をスキップ
+        # 大量の実行時データを含み、ソースコードではない) をスキップ。データ根
+        # (userdata / userdata-isolated) は利用者の記憶ストアなので走査しない。
         dirs[:] = [
             d for d in dirs
             if not d.startswith(".")
-            and d not in {"node_modules", "__pycache__", ".git", "models", "local"}
+            and d not in _WALK_EXCLUDED_DIRS
         ]
         for fname in files:
             fpath = Path(root) / fname

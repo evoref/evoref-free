@@ -281,7 +281,7 @@ class AuxClient:
         self.local = local
         self._debug_logger = debug_logger
         self._model_filename = ""
-        self._calibration_path = "local/aux_calibration.json"
+        self._calibration_path = ""
         self._calibrated: dict[str, float] = {}
         #: purpose → 直近の成功所要秒 (p95 較正の母集団)。
         self._samples: dict[str, deque[float]] = {}
@@ -293,15 +293,13 @@ class AuxClient:
         """config からモデル名 / 較正ファイルを解決し、較正値とサンプルを読み込む。"""
         #: 較正値の永続化キー (ベースモデルの GGUF ファイル名)。空なら永続化しない。
         self._model_filename = _resolve_base_model_filename(config)
-        self._calibration_path = str(
-            (config.get("local_paths") or {}).get(
-                "aux_calibration_file", "local/aux_calibration.json",
-            ),
-        )
+        self._calibration_path = ""
         self._calibrated = {}
         self._samples = {}
         if not self._model_filename:
             return
+        # 置き場はベースモデルの model_key パーティション (c_05 §0.7.1)。
+        self._calibration_path = str(_calibration_file_for(config))
         from backend.free.llm.aux_calibration_store import AuxCalibrationStore
 
         self._calibrated = AuxCalibrationStore.load_timeouts(
@@ -849,6 +847,23 @@ def _finish_reason_of(result: dict) -> str:
         if isinstance(fr, str):
             return fr
     return ""
+
+
+def _calibration_file_for(config: dict) -> Path:
+    """ベースモデルの model_key パーティションの ``aux_calibration.json``。
+
+    config 未ロード (単体テスト等) でも、渡された config から同じ規則で解決する。
+    """
+    from backend.config import PathResolver, get_path_resolver, get_project_root
+
+    try:
+        resolver = get_path_resolver()
+    except RuntimeError:
+        resolver = PathResolver(config, get_project_root())
+    base_model = (config.get("model_paths") or {}).get("base_model", "")
+    return resolver.learning_path_for(
+        "aux_calibration_file", resolver.model_key_for(base_model),
+    )
 
 
 def _resolve_base_model_filename(config: dict) -> str:

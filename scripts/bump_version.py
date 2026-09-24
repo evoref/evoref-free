@@ -26,8 +26,9 @@ frontend のファイルを一切書き換えない。
 エディションを個別に切るとき (例: Pro だけ先行 release) は ``--edition``
 で対象を絞る。``--edition all`` のときは Free / Pro を同じ値に揃える。
 
-スキーマバージョン (``__schema_version__``) は本スクリプトでは触らない。
-data layout 互換破壊時のみ手動で bump する (ユーザー承認必須)。
+データ世代 (``DATA_GENERATION`` / ``PRO_DATA_GENERATION``) は本スクリプトでは触らない。
+形式の版を上げたときに手で 1 上げる (ユーザー承認必須)。上げ忘れは
+``python -m backend.formats --check`` が lock との突き合わせで止める。
 """
 
 from __future__ import annotations

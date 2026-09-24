@@ -59,7 +59,7 @@ from backend.free.llm.json_extract import extract_json_object
 from backend.free.llm.json_schemas import resolve_response_format_for_purpose
 from backend.free.llm.slot_prefix import shared_prefix_messages
 from backend.log_config import get_logger
-from backend.utils import utc_now_dt
+from backend.utils import utc_now_dt, utc_to_epoch
 
 # --- 責務別モジュール ---------------------------------------------------------
 # 判定に使う正規表現・純粋関数は責務ごとに分割してある。本モジュールは判定フロー
@@ -260,6 +260,17 @@ if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend
 
 logger = get_logger("agent.tool_call_judge")
+
+#: カートリッジの tool_hints が誘導してよいツール (読み取り専用で、外へ何も送らないもの)。
+#: パッケージは第三者が作れるので、fetch_url / run_command / write_file / read_file 等の
+#: 副作用・外部送信・任意ファイル読み取りにつながるツールへは誘導させない (docs/c_06 §1.5)。
+PACKAGE_HINT_TOOLS = frozenset({
+    "calculate", "search_code", "project_map", "search_history",
+    "summarize", "translate", "system_hardware_info", "evoref_runtime_info",
+    "verify_syntax",
+})
+#: これより短いパターンは無視する (1 文字で全クエリを誘導させない)。
+_MIN_HINT_PATTERN_CHARS = 2
 
 # executable command リコールの **索引件数** (``count_by_subject_prefix``) が
 # この件数未満のとき、類似度閾値を ``_RECALL_SMALL_POOL_MARGIN`` だけ嵩上げする。学習初期は top-K も success_avg も
@@ -2662,7 +2673,7 @@ class ToolCallJudge:
             # の状況で min_record を下げて運用すれば引けるようにするため。
             effective_score = score_avg
             if ttl_seconds > 0.0:
-                last_fetched = float(extra.get("last_fetched_at") or 0.0)
+                last_fetched = utc_to_epoch(extra.get("last_fetched_at"), 0.0)
                 if last_fetched > 0.0:
                     age_sec = now - last_fetched
                     if age_sec > ttl_seconds:
@@ -2870,7 +2881,7 @@ class ToolCallJudge:
             # 鮮度ペナルティ: TTL 超過なら success_avg を半減して閾値判定。
             effective_score = success_avg
             if ttl_seconds > 0.0:
-                last_exec = float(extra.get("last_executed_at") or 0.0)
+                last_exec = utc_to_epoch(extra.get("last_executed_at"), 0.0)
                 if last_exec > 0.0:
                     age_sec = now - last_exec
                     if age_sec > ttl_seconds:
@@ -3084,7 +3095,13 @@ class ToolCallJudge:
             tool = hint.get("tool", "")
             if not tool or not patterns:
                 continue
+            if tool not in PACKAGE_HINT_TOOLS:
+                # 外から持ち込んだパッケージは副作用のあるツールへ誘導できない (docs/c_06 §1.5)
+                logger.warning("Ignoring cartridge tool hint for non read-only tool %r", tool)
+                continue
             for pattern in patterns:
+                if len(pattern.strip()) < _MIN_HINT_PATTERN_CHARS:
+                    continue
                 if pattern.lower() in q_lower:
                     if tools_registry.has(tool):
                         logger.debug(

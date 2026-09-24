@@ -7,6 +7,10 @@
 # 詳細は docs/02_system_architecture.md セクション 2.3 を参照。
 # ============================================================
 
+# 設定ファイルの版 (c_05 §7.6)。版の無い旧形式 (0.0.98 以前) の config.yaml は
+# `evoref config normalize` が一度だけ直してこの行を付ける。
+config_version: 1
+
 # ===== 個体名称 =====
 # PC単位で動作する個体としての設定。
 # 名前はシステムプロンプト・UI・CLIに反映される。
@@ -16,7 +20,8 @@ instance:
 
 # ===== サーバー設定 =====
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1                 # 待ち受け先。既定はこの PC からだけ (c_06 §1.2)
+  allow_remote: false             # true で LAN から使う。全リクエストで <data_root>/run/api_token のトークンが必要
   port: 8000                      # FastAPI バックエンドのポート
   frontend_port: 5173             # SvelteKit 開発サーバーのポート
   timeout: 30                     # リクエストタイムアウト（秒）
@@ -309,7 +314,7 @@ model_paths:
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
 model_migration:
-  # true にすると local/model_state.json と model_paths.base_model の
+  # true にすると <data_root>/store/model_state.json と model_paths.base_model の
   # ファイル名不一致を検出したとき RuntimeError で起動をブロックする。
   # false の場合は ERROR ログ + /api/model/state 経由で警告のみ。
   # ベースモデル切替は必ず /migrate-model 経由で行うこと。
@@ -340,51 +345,18 @@ auto_serve:
   timeout_backend: 30      # FastAPI が /api/health を返すまでの待機上限 (秒)
   timeout_llama: 120       # llama-server 群が /health を返すまでの待機上限 (秒)。大きい GGUF のロードを待てる値
 
-# ===== ローカルパス（読み書き）=====
-# データ・状態ファイルのパス。
+# ===== データの置き場 =====
+# データ・状態は全てデータ根 (--data-root → 環境変数 EVOREF_DATA_ROOT → 既定
+# <install_root>/userdata) の下に置く (c_05 §0.2)。置き場は設定キーでは決めない。
+# 利用者が変えられるのは outputs_dir だけ (相対ならデータ根基準、絶対パスも可)。
 # LocalPathsConfig は extra='forbid' のため、未定義キーや typo は起動時に
 # ValidationError で検出される。
 local_paths:
-  themes_dir: local/themes/              # テーマパッケージディレクトリ
-  # LoRA / 補助タスク LoRA / 埋め込み LoRA (Pro 限定機能 — Free では未使用だが PathResolver が参照する)
-  lora_adapter: local/models/adapter.gguf                          # ベース LoRA アダプタ
-  lora_versions_dir: local/lora_versions/                          # ベース LoRA スナップショット
-  lora_spsa_checkpoint: local/models/lora_spsa_checkpoint.json     # ベース LoRA SPSA の再開チェックポイント
-  lora_archive_dir: local/lora_archive/                            # ベース LoRA アーカイブ (古い世代)
-  control_vector_adapter: local/models/control_vector.gguf            # base=C control vector 本体 (Pro)
-  control_vector_versions_dir: local/models/control_vector_versions/  # control vector スナップショット (Pro)
-  cvector_work_dir: local/cvector/                                 # control vector 生成の positive/negative 作業用 (Pro)
-  embed_lora_adapter: local/models/embed_adapter.gguf              # 埋め込み LoRA アダプタ
-  embed_lora_versions_dir: local/models/embed_lora_versions/       # 埋め込み LoRA スナップショット
-  # RAG / メモリ
-  knowledge_dir: local/knowledge/            # RAG 用ソースドキュメント
-  outputs_dir: local/outputs/                # ディレクトリ指定の無い生成物の既定の書込み先 (明示パス指定時はそちらが優先)
-  memory_dir: local/memory/                  # メモリシステム永続化 (episodic / semantic / corpus)
-  agent_trace_dir: local/memory/agent_trace/ # MDP トレース常設ストア (エピソード記憶の入力、30 日で自動削除)
-  prompts_dir: local/prompts/                # モード別システムプロンプト
-  history_dir: local/history/                # 会話履歴アーカイブ
-  triggers_dir: local/triggers/              # EvorefMem トリガ辞書の user override 先 (任意、空ディレクトリで可)
-  create_workspace_dir: local/create/        # staged クリエイトの一時ワークスペース (spec/code/test 中間成果物 + manifest)
-  # 学習・経験・状態
-  learning_dir: local/learning/                      # base 学習データの (モデル×モード) パーティションルート (learning.partition_by_base_model=true 時に使用)
-  experience_file: local/experience.json             # ベースモデル経験バッファ
-  eval_core_file: local/eval_core.json               # ベースモデル コア評価セット
-  aux_prompts_dir: local/aux_prompts/                # 補助タスクのタスク別プロンプト (partition 有効時は base モデル配下へ rebase)
-  aux_calibration_file: local/aux_calibration.json   # 補助タスク purpose 別 timeout の反応的自己較正値 (モデル切替後に自動調整)
-  liveness_file: local/liveness.json                 # 効果の死活監視 (段ごとの到達・効果・失敗の streak、c_07 §7.1)
-  learned_patterns_file: local/learned_patterns.json # 学習済みパターン検出キーワード
-  generation_deltas_file: local/generation_deltas.json # Level 1 生成パラメータデルタ (base モデル別パーティション配下へ配置)
-  log_ingestor_file: local/state/log_ingestor.json  # develop=evolve の LogIngestor 進捗
-  model_state_file: local/model_state.json           # モデル切替・LoRA 装着状態の永続化
-  model_quality_file: local/model_quality.json       # モデル切替時の出力品質プローブ結果
-  local_state_file: local/state.json                 # EvorefMem ローカル状態
-  # マイグレーション
-  migration_archive_dir: local/migration_archive/    # SchemaMigrator バックアップ / 旧 prompts 退避先 (EvorefMem 移行で 30 日保持)
+  outputs_dir: outputs/                # ディレクトリ指定の無い生成物の既定の書込み先 (明示パス指定時はそちらが優先)
 
 # ===== 会話履歴設定 =====
 history:
   auto_save: true                 # 自動保存の有効/無効
-  checkpoint_interval: 10         # チェックポイント間隔（ターン数）
   retention_full_days: 90         # 原文保持期間（日）
   retention_compressed_days: 365  # 圧縮保持期間（日）
   max_storage_mb: 200             # 履歴全体の上限サイズ（MB）
@@ -412,7 +384,7 @@ rag:
   # 順位式は 3 ストア (episodic / semantic / corpus) 共通の 1 本:
   #   score = cos × freshness × confidence × store_prior
   # 係数は memory.evidence.ranking.store_prior、corpus のパッケージ別上書きは
-  # local/memory/corpus/manifest.json の store_prior_overrides。
+  # <data_root>/store/corpus/manifest.json の store_prior_overrides。
   # ゲートは **素の cosine のみ** (合成スコアを閾値に流すと store_prior が閾値を
   # 偽装する)。語彙側は numpy CSR の転置索引 (memory.evidence.lexical) が
   # **候補生成器としてだけ** 働き、スコアを持ち込まない。
@@ -561,7 +533,7 @@ rag:
     # の決め方。
     #   auto   : 実ストアのスコア分布から較正した値を使う (既定)。較正結果は
     #            埋め込みモデル指紋 (model_id + 次元) をキーに
-    #            local/memory/threshold_calibration.json へキャッシュされ、
+    #            <data_root>/store/memory/threshold_calibration.json へキャッシュされ、
     #            モデルを替えると自動的に無効化されて再較正される。
     #            較正がまだ無い場合は下の静的値へ縮退する。
     #   manual : 下の静的値をそのまま使う (較正を無視)。
@@ -635,8 +607,7 @@ embedding:
   # チャンクテキストのハッシュをキーに埋め込みベクトルをディスクにキャッシュ。
   # 再登録・rebuild 時に同一チャンクの埋め込み計算をスキップする。
   cache_enabled: true             # 永続埋め込みキャッシュの有効/無効
-  cache_max_mb: 100               # キャッシュ上限サイズ（MB、超過時は LRU eviction）
-  cache_dir: local/cache/embeddings/  # キャッシュ保存先ディレクトリ
+  cache_max_mb: 100               # キャッシュ上限サイズ（MB、超過時は LRU eviction）。置き場は <data_root>/cache/embeddings/ 固定
   # 起動時に embedder dim と既存ベクトルの不整合を検出した際の自動再構築。
   # false (既定): WARNING ログのみ出して embedding_dim_mismatch フラグを立て、
   #              運用者の `evoref reindex` 手動実行を待つ。
@@ -666,11 +637,9 @@ embedding:
 
 # ===== メモリシステム設定 =====
 memory:
-  schema_version: 1               # EvorefMem スキーマバージョン
   # --- Subject 正規化辞書 ---
   subject_dictionary:
-    enabled: true                                              # 正規化を有効化
-    file: local/memory/semantic/subject_dictionary.json        # 辞書ファイルのパス
+    enabled: true                                              # 正規化を有効化 (辞書は <data_root>/store/memory/semantic/subject_dictionary.json)
   # --- ファクト抽出 ---
   facts:
     extraction_skip_subject_canonicalize_regex: '^(loop|learn|mem)\.'   # pillar が機械的に命名した subject は辞書スキップ
@@ -689,7 +658,7 @@ memory:
   # --- Pin 機能 ---
   # トリガ辞書 (pin_triggers.yaml / fact_triggers.yaml / classify_triggers.yaml) は
   # 同梱 default を backend/free/memory/_defaults/triggers/ に配置し、user override
-  # は local/triggers/<name>.yaml に置く 2 段階解決 (override 優先)。config では指定しない。
+  # は <data_root>/store/overrides/triggers/<name>.yaml に置く 2 段階解決 (override 優先)。config では指定しない。
   pin:
     auto_detect: true                                          # 自動 Pin 検出 (覚えて/重要/忘れないで等)
   # --- プライベートセッション ---
@@ -909,9 +878,8 @@ schedule:
 
 # ===== 学習サイクル設定 =====
 learning:
-  # base モデルの自己学習データを (base モデル識別子 × モード) で分離する。
-  partition_by_base_model: true   # true: local/learning/<base_model_stem>/ 配下へ分離しモデル切替で差し替え（未知モデルはゼロから学習）。false: レガシー flat（即ロールバック用）
-  level2_adapter_partition: model_mode # LoRA限定(cvectorは常にモデル単位・対象外)。model_mode（既定=chat/createで別アダプタ・切替時にLoRAパスが変わればサーバ再起動、partition_by_base_model=true必須）/ model（レガシー=モデル単位でchat/create共有・mode切替で再起動なし）
+  # base モデルの自己学習データは <data_root>/store/learning/<model_key>/ に分離される（モデル切替で差し替え、未知モデルはゼロから学習）。
+  level2_adapter_partition: model_mode # LoRA / control vector (Pro)。model_mode（既定=chat/createで別アダプタ・切替時に当てるアダプタが変わればサーバ再起動）/ model（レガシー=モデル単位でchat/create共有・mode切替で再起動なし）
   level1_min_experiences: 8       # Level 1 トリガーに必要な最小経験数 (前回実行以降の新規件数にも同じ値)
   level1_generations: 5           # Level 1 の世代数 (停滞 3 世代で打ち切り。選択圧は採用ゲート側)
   level1_population_size: 5       # Level 1 の集団サイズ
@@ -986,7 +954,7 @@ learning:
   # PolicyInterpreter / PolicyParamEvolver / FewShotPool の永続化先と進化挙動。
   #
   # - source:
-  #     yaml   : 従来通り local/policies/*.json のみを参照 (既定)
+  #     yaml   : 従来通り <data_root>/store/learning/shared/policies/*.json のみを参照 (既定)
   #     hybrid : YAML を seed としてロード後、SemMem の active な policy ファクト
   #              (subject 先頭が `learn.policy.`) で上書き
   #     semmem : 導入予定 (現状は hybrid と同等)
@@ -995,7 +963,7 @@ learning:
   #   PolicyInterpreter / LoopFactView / MetaCognitiveAgent / SelfCartridge /
   #   bootstrap_loop_context_at_startup が共通参照する。
   # - evolve_writeback: 進化結果の書き戻し先
-  #     yaml   : local/prompts/policy_evolver_state.json / fewshot_pool.json (既定)
+  #     yaml   : <prompts_dir>/policy_evolver_state.json / fewshot_pool.json (既定)
   #     semmem : SemMem の policy / fewshot ファクトに書き戻し
   policy:
     source: yaml                      # yaml | hybrid | semmem
@@ -1124,7 +1092,7 @@ widget_proxy:
   # apis:
   #   - name: weather
   #     base_url: https://api.openweathermap.org
-  #     api_key_env: OPENWEATHER_API_KEY
+  #     api_key_env: EVOREF_OPENWEATHER_API_KEY   # EVOREF_ で始まる環境変数だけを読む
   #     rate_limit: 10/min
   #     allowed_paths:
   #       - /data/2.5/weather
@@ -1139,8 +1107,8 @@ i18n:
 # ===== デバッグ設定 =====
 # 旧 `debug:` セクションは削除されました。develop モードのログ制御は
 # CLI フラグ `--develop=<level>` (debug | investigate | evolve) の SSOT に
-# 集約されています。`config.yaml` に `debug:` セクションを書くと起動時
-# (Pydantic バリデーション) で ValidationError になります。
+# 集約されています。旧形式の config.yaml に残った `debug:` セクションは
+# `evoref config normalize` が取り除きます。
 #
 # レベル別仕様:
 #   - debug       : Free / Pro 共通。requests.jsonl のみ。即時 BUG 解析向け。

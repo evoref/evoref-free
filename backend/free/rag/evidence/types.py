@@ -6,27 +6,42 @@
 
 ## この型を触るときの規約 (c_05 §0.5)
 
-- **シリアライズはキーの手書き列挙をしない**。:func:`Evidence.to_record` は
-  ``dataclasses.fields()`` から機械的に組む (列挙だと新フィールドの書き漏れで
-  値が黙って消える)。
-- **未知キーは捨てずに** :attr:`Evidence._extra` へ退避し、書き戻しで復元する。
+- **シリアライズはキーの手書き列挙をしない**。:func:`from_record` /
+  :meth:`Evidence.to_record` は前計算表のコーデック (:mod:`backend.io.codec`) を
+  なぞる (列挙だと新フィールドの書き漏れで値が黙って消える)。
+- **未知キーは捨てずに階層ごとの ``_extra`` へ退避**し、書き戻しでその階層の
+  トップへ戻す — レコード直下は :attr:`Evidence._extra`、``provenance`` の要素・
+  ``structured``・``structured.value`` は型付きの入れ子 (:class:`ProvenanceEntry` /
+  :class:`Structured` / :class:`StructuredValue`) の ``_extra``。kind 別 ``attrs`` は
+  キー単位で patch される素の dict のまま持ち、未知キーはその dict のトップに
+  そのまま残る (既知キーの型は :data:`ATTRS_SCHEMAS` の表で検査する)。メモリ上の
+  ``_extra`` は空なら ``None``。
+- 入れ子の型付き階層は読み手に dict と同じ面 (``.get`` / ``[k]`` / ``in``) を見せる。
 - **必須キー欠損はそのレコードだけ落とす** — :class:`EvidenceRecordError` を
   上げ、呼び出し側が件数を WARNING に出す。
+- **既知の版で未知の列挙値** (kind / store / origin / veracity / confidentiality /
+  note の tier / mode) は落とさない。行を原形のまま保持し、使わない
+  (:attr:`Evidence.ignored`。除外の関門は ``is_active`` / ``active_mask`` と
+  ``SemanticStore`` のロードの 2 箇所だけ、c_05 §0.4.5 / §0.5.3)。書き手側
+  (``EvidenceStore.put``) は未知値を拒否する。
 - 時刻は ISO 8601 UTC μs ``Z`` の 1 形式 (``backend.utils.format_utc``)。
   文字列のまま辞書順で比較しない。
-- ID は ``ev_`` + 12 hex のランダム値 (:func:`new_evidence_id`)。位置カウンタを
-  鍵にしない。
+- ID は ``ev_`` + 16 hex のランダム値 (:func:`new_evidence_id`、ID 台帳
+  ``backend.io.id_registry``)。位置カウンタを鍵にしない。
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
-import secrets
 import unicodedata
-from dataclasses import dataclass, field, fields
-from typing import Any, Literal
+from collections.abc import Iterator, Mapping
+from dataclasses import MISSING, dataclass, field, fields
+from typing import Any, ClassVar, Literal
 
+from backend.io import jsoncodec
+from backend.io.codec import CodecError, codec_for, intern_str, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.id_registry import fits_id_column, new_id
 from backend.log_config import get_logger
 
 logger = get_logger("rag.evidence.types")
@@ -44,6 +59,10 @@ Veracity = Literal[
 ]
 Confidentiality = Literal["normal", "secret"]
 Tier = Literal["working", "short", "long"]
+#: claim (``kind="claim"``) の ``structured.predicate`` — **誰が言ったか** の 4 段 (c_16 §3.3)。
+#: 書き手は Pro の取得器だが語彙は Free に置く (Pro は import して使う、
+#: 抽出のプロンプトとアルゴリズムは Pro に残す)。
+ClaimPredicate = Literal["states", "reports", "rumors", "measures"]
 
 #: ``columns.npz`` の uint8 カラムへ落とすための文字列↔id テーブル。
 #: **値は永続化されるので既存の割当を変えない** (追加は末尾へ)。
@@ -60,6 +79,8 @@ VERACITY_IDS: dict[str, int] = {
     "retracted": 4,
 }
 TIER_IDS: dict[str, int] = {"working": 0, "short": 1, "long": 2}
+#: ``confidentiality`` の既知値 (カラムは持たず ``flags`` の secret ビットで表す)。
+CONFIDENTIALITY_VALUES: frozenset[str] = frozenset({"normal", "secret"})
 
 #: 未知値 / 未設定を表す id (uint8 カラムでは 255、int16 カラムでは -1)。
 UNKNOWN_U8 = 255
@@ -74,20 +95,31 @@ TIER_NAMES: dict[int, str] = {v: k for k, v in TIER_IDS.items()}
 #: 欠けたらそのレコードを落とす必須キー (c_16 §3)。
 REQUIRED_KEYS: frozenset[str] = frozenset(
     {
-        "_version", "id", "kind", "store", "text", "origin",
+        "_v", "id", "kind", "store", "text", "origin",
         "observed_at", "created_at",
     },
 )
 
-#: ``patch`` 事象で変更してよいフィールド (c_16 §5.2)。
+#: ``patch`` 事象で変更してよいフィールド (c_16 §5.2 / G1 の patch op)。
+#:
+#: - ``attrs`` / ``_extra`` はキー単位で重ねる (浅いマージ)。``attrs`` の中の階層の
+#:   ``_extra`` もキーとして重なる。``text`` / ``structured`` / ``provenance`` は丸ごと置換。
+#: - **値の削除は null ではなく明示の ``unset``** (:data:`UNSETTABLE_PREFIXES`)。null は
+#:   「値が無い」を書く (``superseded_by=None`` 等)。
+#: - ``touch`` 事象も ``last_used_at`` を必ず運ぶ (superseded の保持期間の起点)。
 PATCHABLE_FIELDS: frozenset[str] = frozenset(
     {
         "tier",  # attrs.tier のショートカット (episodic の tier 遷移)
         "veracity", "superseded_by", "contradicts", "pinned", "valid_until",
         "confidence", "as_of", "half_life_days", "claim_key", "last_used_at",
         "attrs", "private", "confidentiality", "scope", "lang",
+        "text", "structured", "provenance", "_extra",
     },
 )
+
+#: ``unset`` で **キーを消せる** 入れ子 (``"attrs.<key>"`` / ``"_extra.<key>"``)。
+#: それ以外の ``unset`` の名前は :data:`PATCHABLE_FIELDS` のフィールド名で、既定値へ戻す。
+UNSETTABLE_PREFIXES: frozenset[str] = frozenset({"attrs", "_extra"})
 
 
 class EvidenceRecordError(ValueError):
@@ -99,7 +131,7 @@ class EvidenceRecordError(ValueError):
 
 
 class EvidenceVersionError(EvidenceRecordError):
-    """レコードの ``_version`` がコードの :data:`RECORD_VERSION` より新しい。
+    """レコード (または事象の行) の ``_v`` がコードの版より新しい。
 
     「1 レコードだけ飛ばす」で済ませてはいけない唯一の読み取り失敗
     (c_05 §0.5.1)。新しい版を旧いコードで畳んで書き戻すと、知らない
@@ -109,9 +141,140 @@ class EvidenceVersionError(EvidenceRecordError):
     """
 
 
+# ── 型付きの入れ子 (c_16 §3.1 / §3.2、c_05 §0.5.2) ──────────────────────
+
+
+class _NestedLevel(Mapping[str, Any]):
+    """型付きの入れ子の階層を、読み手には dict と同じ面で見せる。
+
+    キーは値のある (``None`` でない) 既知フィールドと ``_extra`` のキー — 書き出し
+    (既定値を省く) と同じ集合。``.get`` / ``[k]`` / ``in`` / ``dict(...)`` / ``==``
+    (dict とも比べられる) はこの集合で動く。
+    """
+
+    __slots__ = ()
+    _KEYS: ClassVar[frozenset[str]] = frozenset()
+    _ORDER: ClassVar[tuple[str, ...]] = ()
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._KEYS:
+            value = getattr(self, key)
+            if value is not None:
+                return value
+            raise KeyError(key)
+        extra = getattr(self, "_extra")
+        if extra and key in extra:
+            return extra[key]
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._KEYS:
+            value = getattr(self, key)
+            return default if value is None else value
+        extra = getattr(self, "_extra")
+        if extra:
+            return extra.get(key, default)
+        return default
+
+    def __iter__(self) -> Iterator[str]:
+        for name in self._ORDER:
+            if getattr(self, name) is not None:
+                yield name
+        extra = getattr(self, "_extra")
+        if extra:
+            for key in extra:
+                if key not in self._KEYS:
+                    yield key
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+
+def plain_value(value: Any) -> Any:
+    """型付きの入れ子 (``ProvenanceEntry`` 等) を書き出しと同じ素の dict / list に戻す。
+
+    patch 事象の ``fields`` はそのまま JSON に書かれるので、常駐レコードから写した
+    階層オブジェクトを渡されても素の形にしてから追記する。
+    """
+    if isinstance(value, _NestedLevel):
+        return codec_for(type(value)).encode(value)
+    if isinstance(value, list):
+        return [plain_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: plain_value(v) for k, v in value.items()}
+    return value
+
+
+def _level_keys(cls: type) -> type:
+    """階層クラスの既知キー (フィールド順) を ``_NestedLevel`` の表に載せる。"""
+    names = tuple(f.name for f in fields(cls) if f.name != "_extra")
+    cls._ORDER = names  # type: ignore[attr-defined]
+    cls._KEYS = frozenset(names)  # type: ignore[attr-defined]
+    return cls
+
+
+@_level_keys
+@persisted(omit_defaults=True)
+@dataclass(slots=True, kw_only=True, eq=False)
+class StructuredValue(_NestedLevel):
+    """``structured.value`` — 値の種類と数量 (c_16 §3.2)。"""
+
+    kind: Literal["text", "number", "date", "list"] | None = None
+    number: float | None = None
+    unit: str | None = None
+    _extra: dict[str, Any] | None = None
+
+
+@_level_keys
+@persisted(omit_defaults=True, intern=("subject", "predicate"))
+@dataclass(slots=True, kw_only=True, eq=False)
+class Structured(_NestedLevel):
+    """fact / claim の ``structured`` (c_16 §3.2)。namespace は ``subject`` の先頭要素。"""
+
+    subject: str | None = None
+    predicate: str | None = None
+    #: 発話原文 (証拠)。提示・比較の本文は ``Evidence.text``
+    object: str | None = None
+    value: StructuredValue | None = None
+    _extra: dict[str, Any] | None = None
+
+
+@_level_keys
+@persisted(omit_defaults=True, intern=("extractor", "model", "mode"))
+@dataclass(slots=True, kw_only=True, eq=False)
+class ProvenanceEntry(_NestedLevel):
+    """``provenance`` の 1 要素 (c_16 §3.1)。値の無いキーは書かない。"""
+
+    session_id: str | None = None
+    turn_id: str | None = None
+    trace_id: str | None = None
+    note_id: str | None = None
+    #: 文書 / 取得単位 (``doc:<pkg>/<doc>`` / ``item:ki_…``)
+    source_id: str | None = None
+    extractor: str | None = None
+    extractor_version: int | None = None
+    captured_at: str | None = None
+    mode: str | None = None
+    project_id: str | None = None
+    source: str | None = None
+    model: str | None = None
+    _extra: dict[str, Any] | None = None
+
+
+def _nested(cls: type, value: Any) -> Any:
+    """書き手が素の dict で渡した入れ子を型付きの階層にする。"""
+    if type(value) is not dict:
+        return value
+    try:
+        return codec_for(cls).decode(value)
+    except CodecError as e:
+        raise EvidenceRecordError(str(e)) from e
+
+
 # ── レコード本体 ────────────────────────────────────────────────────────
 
 
+@persisted(intern=("scope", "lang"))
 @dataclass(slots=True, kw_only=True)
 class Evidence:
     """注入材料の統一レコード (c_16 §3)。
@@ -120,9 +283,14 @@ class Evidence:
     ようにするため。**準凍結** として扱い、更新は :func:`dataclasses.replace`
     (または :func:`apply_patch`) で新しいインスタンスを作る — snapshot 行と
     カラム配列は位置で対応しているので、その場書き換えは索引との整合を壊す。
+
+    常駐は Evidence 1 本 (G1 設計 §17.4): ``slots`` で、低カーディナリティの文字列
+    (scope / lang / structured の subject・predicate / provenance の extractor・model・
+    mode / attrs の tier・mode・fact_type) は読み込み時に 1 つの実体へ寄せる。
     """
 
-    _version: int = RECORD_VERSION
+    #: 行の版 (c_05 §0.5.1 の ``_v``)
+    _v: int = RECORD_VERSION
     id: str
     kind: Kind
     store: StoreName
@@ -130,11 +298,11 @@ class Evidence:
 
     text: str
     lang: str | None = None
-    #: fact / claim のみ。``{"subject", "predicate", "object", "value"}`` (§3.2)
-    structured: dict[str, Any] | None = None
+    #: fact / claim のみ (§3.2)
+    structured: Structured | None = None
 
     origin: Origin
-    provenance: list[dict[str, Any]] = field(default_factory=list)
+    provenance: list[ProvenanceEntry] = field(default_factory=list)
 
     #: 「こちらが知った時刻」(必須)。内容が真だった時点は ``as_of``。
     observed_at: str
@@ -158,24 +326,38 @@ class Evidence:
     updated_at: str | None = None
     last_used_at: str | None = None
 
-    #: kind 別の拡張 (§3.5)。
+    #: kind 別の拡張 (§3.5)。キー単位で patch するので素の dict のまま持ち、
+    #: 既知キーの型は :data:`ATTRS_SCHEMAS` の表で検査する。
     attrs: dict[str, Any] = field(default_factory=dict)
-    #: 未知キーの退避先 (前方互換)。
-    _extra: dict[str, Any] = field(default_factory=dict)
+    #: 未知キーの退避先 (前方互換)。書き出しでレコード直下へ戻す。空なら ``None``。
+    _extra: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        # 書き手が素の dict で渡した入れ子を型付きの階層へ (読み手の decode は型付き済み)
+        structured = self.structured
+        if type(structured) is dict:
+            self.structured = _nested(Structured, structured)
+        for entry in self.provenance:
+            if type(entry) is dict:
+                self.provenance = [_nested(ProvenanceEntry, p) for p in self.provenance]
+                break
+        if self._extra is not None and not self._extra:
+            self._extra = None
 
     # ── シリアライズ ──
 
     def to_record(self) -> dict[str, Any]:
         """JSON レコード (dict) にする。
 
-        キーは :func:`dataclasses.fields` から機械生成する。**手書きで列挙
-        しないこと** — フィールドを足したときに書き漏れて値が消える。
+        キーは前計算表 (``dataclasses.fields()`` から機械生成) をなぞる。**手書きで
+        列挙しないこと** — フィールドを足したときに書き漏れて値が消える。未知キーは
+        各階層のトップへ戻す (``_extra`` という名のキーは書かない)。
         """
-        return {f.name: getattr(self, f.name) for f in fields(self)}
+        return _EVIDENCE_CODEC.encode(self)
 
     def to_json_line(self) -> str:
         """``records.jsonl`` / 事象ログの 1 行分 (改行を含まない JSON)。"""
-        return json.dumps(self.to_record(), ensure_ascii=False)
+        return jsoncodec.dumps(self.to_record())
 
     @property
     def namespace(self) -> str:
@@ -183,12 +365,13 @@ class Evidence:
 
         構造化されていないレコードは空文字。
         """
-        if not isinstance(self.structured, dict):
+        structured = self.structured
+        if structured is None:
             return ""
-        subject = self.structured.get("subject")
+        subject = structured.get("subject")
         if not isinstance(subject, str) or not subject:
             return ""
-        return subject.split(".", 1)[0]
+        return intern_str(subject.split(".", 1)[0])
 
     @property
     def tier(self) -> str:
@@ -196,119 +379,139 @@ class Evidence:
         value = self.attrs.get("tier")
         return value if isinstance(value, str) else ""
 
+    def unknown_enums(self) -> tuple[str, ...]:
+        """このコードが知らない列挙値を持つフィールド名 (無ければ空)。
+
+        読み手の規則 (c_05 §0.4.5): 未知値の行は原形のまま保持し、検索・注入・
+        学習・GC・件数上限の対象にしない。``closed`` / ``open`` の区別は書き手の
+        版上げの義務だけで、読み手の挙動は同じ。
+        """
+        unknown = [
+            name for name, value, table in (
+                ("kind", self.kind, KIND_IDS),
+                ("store", self.store, STORE_IDS),
+                ("origin", self.origin, ORIGIN_IDS),
+                ("veracity", self.veracity, VERACITY_IDS),
+                ("confidentiality", self.confidentiality, CONFIDENTIALITY_VALUES),
+            )
+            if value not in table
+        ]
+        if self.kind == "note":
+            tier = self.attrs.get("tier")
+            if tier is not None and (not isinstance(tier, str) or tier not in TIER_IDS):
+                unknown.append("attrs.tier")
+            mode = self.attrs.get("mode")
+            if mode is not None and (not isinstance(mode, str) or mode not in NOTE_MODES):
+                unknown.append("attrs.mode")
+        return tuple(unknown)
+
+    @property
+    def ignored(self) -> bool:
+        """未知の列挙値を持つ (保持するが使わない行、c_05 §0.4.5)。"""
+        return bool(self.unknown_enums())
+
+
+_EVIDENCE_CODEC = codec_for(Evidence)
+
 
 def from_record(data: dict[str, Any]) -> Evidence:
-    """JSON レコードから :class:`Evidence` を復元する。
+    """JSON レコードから :class:`Evidence` を復元する (前計算表のコーデック)。
 
-    - 必須キー (:data:`REQUIRED_KEYS`) が欠けていれば
-      :class:`EvidenceRecordError`
-    - 未知キーは ``_extra`` へ退避する (捨てない)
-    - kind 別 ``attrs`` を :func:`validate_attrs` で検査する
+    - 版がコードより新しければ :class:`EvidenceVersionError` (飛ばさない)
+    - 必須キー (:data:`REQUIRED_KEYS`) の欠損・null、既知フィールドの型違いは
+      :class:`EvidenceRecordError` (呼出側がそのレコードだけ飛ばして数える)
+    - 未知キーは各階層の ``_extra`` へ退避する (捨てない)。G0 の書き手が入れ子の
+      ``_extra`` として書いた未知キーはレコード直下の ``_extra`` へ開く
+    - kind 別 ``attrs`` の既知キーは :data:`ATTRS_SCHEMAS` の表で **形だけ** 検査する
+    - 未知の列挙値は値のまま保持する (落とさない。:attr:`Evidence.ignored`)
     """
     if not isinstance(data, dict):
         raise EvidenceRecordError(f"record must be a dict, got {type(data).__name__}")
 
-    version = data.get("_version")
+    version = data.get("_v")
+    if version is None:
+        raise EvidenceRecordError("missing required keys: _v")
     if isinstance(version, int) and version > RECORD_VERSION:
         raise EvidenceVersionError(
-            f"record {data.get('id')!r} has _version {version}, newer than the "
+            f"record {data.get('id')!r} has _v {version}, newer than the "
             f"supported {RECORD_VERSION}",
         )
 
-    missing = sorted(key for key in REQUIRED_KEYS if data.get(key) is None)
-    if missing:
-        raise EvidenceRecordError(f"missing required keys: {', '.join(missing)}")
-
-    known = {f.name for f in fields(Evidence)}
-    extra = dict(data.get("_extra") or {})
-    for key, value in data.items():
-        if key not in known:
-            extra[key] = value
-
-    kind = str(data["kind"])
-    attrs = dict(data.get("attrs") or {})
-    validate_attrs(kind, attrs)
-
-    provenance = data.get("provenance") or []
-    if not isinstance(provenance, list):
-        raise EvidenceRecordError("provenance must be a list")
-    contradicts = data.get("contradicts") or []
-    if not isinstance(contradicts, list):
-        raise EvidenceRecordError("contradicts must be a list")
-    structured = data.get("structured")
-    if structured is not None and not isinstance(structured, dict):
-        raise EvidenceRecordError("structured must be an object or null")
-
-    _require_enum("kind", kind, KIND_IDS)
-    _require_enum("store", str(data["store"]), STORE_IDS)
-    _require_enum("origin", str(data["origin"]), ORIGIN_IDS)
-    veracity = str(data.get("veracity") or "stated")
-    _require_enum("veracity", veracity, VERACITY_IDS)
-    confidentiality = str(data.get("confidentiality") or "normal")
-    if confidentiality not in ("normal", "secret"):
-        raise EvidenceRecordError(f"invalid confidentiality: {confidentiality!r}")
-
-    return Evidence(
-        _version=int(data.get("_version") or RECORD_VERSION),
-        id=str(data["id"]),
-        kind=kind,  # type: ignore[arg-type]
-        store=str(data["store"]),  # type: ignore[arg-type]
-        scope=str(data.get("scope") or "global"),
-        text=str(data["text"]),
-        lang=_opt_str(data.get("lang")),
-        structured=dict(structured) if structured is not None else None,
-        origin=str(data["origin"]),  # type: ignore[arg-type]
-        provenance=[dict(p) for p in provenance if isinstance(p, dict)],
-        observed_at=str(data["observed_at"]),
-        as_of=_opt_str(data.get("as_of")),
-        valid_until=_opt_str(data.get("valid_until")),
-        half_life_days=_opt_float(data.get("half_life_days")),
-        confidence=float(data.get("confidence", 1.0)),
-        veracity=veracity,  # type: ignore[arg-type]
-        claim_key=_opt_str(data.get("claim_key")),
-        contradicts=[str(c) for c in contradicts],
-        superseded_by=_opt_str(data.get("superseded_by")),
-        private=bool(data.get("private", False)),
-        confidentiality=confidentiality,  # type: ignore[arg-type]
-        pinned=bool(data.get("pinned", False)),
-        created_at=str(data["created_at"]),
-        updated_at=_opt_str(data.get("updated_at")),
-        last_used_at=_opt_str(data.get("last_used_at")),
-        attrs=attrs,
-        _extra=extra,
-    )
-
-
-def _require_enum(name: str, value: str, table: dict[str, int]) -> None:
-    if value not in table:
-        raise EvidenceRecordError(
-            f"invalid {name}: {value!r} (expected one of {sorted(table)})",
-        )
-
-
-def _opt_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    return text or None
-
-
-def _opt_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
     try:
-        return float(value)
-    except (TypeError, ValueError) as e:
-        raise EvidenceRecordError(f"not a number: {value!r}") from e
+        record = _EVIDENCE_CODEC.decode(data)
+    except CodecError as e:
+        raise EvidenceRecordError(str(e)) from e
+
+    extra = record._extra
+    if extra is not None and "_extra" in extra:
+        record._extra = _unfold_g0_extra(extra)
+    _share_equal_stamps(record)
+    if record.attrs:
+        record.attrs = _decode_attrs(record.kind, record.attrs)
+    elif ATTRS_SPEC.get(record.kind, _NO_ATTRS)[0]:
+        validate_attrs(record.kind, record.attrs, values=False)  # 必須 attrs の欠損
+    return record
+
+
+def _share_equal_stamps(record: Evidence) -> None:
+    """1 行の中で同じ値の時刻を 1 つの実体にする (常駐メモリ、G1 設計 §17.4)。
+
+    書き手は ``observed_at`` / ``as_of`` / ``created_at`` / ``last_used_at`` /
+    ``provenance[].captured_at`` に同じ時刻を入れることが多い。時刻は高カーディナリティ
+    なので全体の intern 表には入れず、行の中だけで寄せる。
+    """
+    base = record.observed_at
+    if record.as_of == base:
+        record.as_of = base
+    if record.created_at == base:
+        record.created_at = base
+    if record.last_used_at == base:
+        record.last_used_at = base
+    if record.updated_at == base:
+        record.updated_at = base
+    for entry in record.provenance:
+        if entry.captured_at == base:
+            entry.captured_at = base
+
+
+def _unfold_g0_extra(extra: dict[str, Any]) -> dict[str, Any] | None:
+    """G0 の書き手が ``"_extra": {...}`` と入れ子で書いた未知キーを直下へ開く。"""
+    out = {k: v for k, v in extra.items() if k != "_extra"}
+    nested = extra["_extra"]
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            if key not in _EVIDENCE_CODEC.known:  # 既知フィールドが勝つ
+                out.setdefault(key, value)
+    else:
+        out["_extra"] = nested
+    return out or None
+
+
+def check_writable(record: Evidence) -> None:
+    """書き手側の検査 (発番時): 未知の列挙値・列に入らない id・attrs の値域を拒否する。
+
+    読み手は未知値の行を保持して使わない (:attr:`Evidence.ignored`) が、このコードが
+    自分で未知値を書くのは誤り (``closed`` の列挙に値を足すなら版上げ、c_05 §0.5.3)。
+    """
+    if not fits_id_column(record.id):
+        raise EvidenceRecordError(
+            f"evidence id {record.id!r} does not fit the id column (ASCII, <= 24 bytes)",
+        )
+    unknown = record.unknown_enums()
+    if unknown:
+        raise EvidenceRecordError(
+            f"evidence {record.id} has unknown enum value(s): {', '.join(unknown)}",
+        )
+    validate_attrs(record.kind, record.attrs)
 
 
 def new_evidence_id() -> str:
-    """``ev_`` + 12 hex のランダム ID を発番する。
+    """``ev_`` + 16 hex のランダム ID を発番する (c_05 §0.5.5)。
 
     位置カウンタを使わない — 削除後に再発行されると、既存レコードを別内容で
     上書きする (2026-09-05 監査で VectorStore の chunk id が実際にそうなった)。
     """
-    return f"ev_{secrets.token_hex(6)}"
+    return new_id("ev_")
 
 
 # ── kind 別 attrs の検査 (c_16 §3.5) ────────────────────────────────────
@@ -318,36 +521,157 @@ def new_evidence_id() -> str:
 #: 埋め込み) だけで、kind に依らず効く。
 EMBED_SIDE_ATTRS: frozenset[str] = frozenset({"embed_as_query", "embed_mode"})
 
-#: kind → (必須 attrs, 任意 attrs)。未知キーは **落とさず通す** (前方互換)。
-#: 値域違反だけを :class:`EvidenceRecordError` にする。
-ATTRS_SPEC: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    "note": (
-        frozenset(),
-        frozenset({"tier", "turn_index", "summary_of", "mode"}),
-    ),
-    "fact": (frozenset(), EMBED_SIDE_ATTRS),
-    "claim": (
-        frozenset(),
-        frozenset({"source_kind", "published_at", "region"}),
-    ),
-    "doc_chunk": (
-        frozenset({"package_id", "package_version", "doc_id", "position"}),
-        frozenset({"heading"}) | EMBED_SIDE_ATTRS,
-    ),
-    # 疑似クエリ (f_01 §6): 対象チャンクの id を持ち、埋め込みは query 側。
-    "doc_pseudo_query": (
-        frozenset({"target_id", "package_id"}),
-        EMBED_SIDE_ATTRS,
-    ),
-    # ProjectMap の code グラフノード (c_16 §3.5 / §4.4)。埋め込みは持たない。
-    "code_node": (
-        frozenset({"package_id", "package_version", "node_type", "path"}),
-        frozenset({
-            "name", "qualname", "lang", "line_start", "line_end",
-            "parent_id", "signature", "external_imports", "fan_in", "fan_out",
-        }),
-    ),
+#: kind 別 attrs の表 (キー名・型・既定値の SSOT、台帳 lock R1 で凍結)。
+#:
+#: attrs はキー単位で patch するので **メモリ上は素の dict** のまま持ち、この表は
+#: 読み込み時の型検査と intern、書き手の既定値 (入れ子は既定と同じ値を書かなくて
+#: よい、c_05 §0.5.2) にだけ使う。表に無いキーはその dict のトップに原形のまま
+#: 残る (この階層の ``_extra``)。キーを足すときはフィールドを 1 行足す (既定値を
+#: 持つ任意フィールドの追加は同じ版のまま許される、c_05 §0.4.4)。
+
+
+@dataclass(slots=True, kw_only=True, eq=False)
+class _EmbedSideAttrs:
+    """全 kind 共通の任意 attrs — 埋め込み側の宣言 (c_16 §3.5 / §6.1)。"""
+
+    embed_as_query: bool = False
+    embed_mode: str = "chat"
+    _extra: dict[str, Any] | None = None
+
+
+@persisted(omit_defaults=True)
+@dataclass(slots=True, kw_only=True, eq=False)
+class NoteAttrs(_EmbedSideAttrs):
+    """note の骨格 (c_16 §3.5)。sleep-time 工程の作業欄 (``NOTE_ATTR_FIELDS``) は表の外。"""
+
+    tier: Literal["working", "short", "long"] | None = None
+    turn_index: int | None = None
+    summary_of: list[str] | None = None
+    mode: Literal["chat", "coding"] | None = None
+
+
+@persisted(
+    omit_defaults=True,
+    intern=("fact_type", "mode_origin", "profile_id", "embed_mode"),
+)
+@dataclass(slots=True, kw_only=True, eq=False)
+class FactAttrs(_EmbedSideAttrs):
+    """fact の attrs (c_16 §3.5)。名前は ``SemanticFact`` の属性名と同じ。
+
+    ``fact_type`` は fact の層で必須 (欠けた行は ``FactRecordError``)。Evidence の
+    読み込みでは落とさない。
+    """
+
+    fact_type: str | None = None
+    mode_origin: str = "chat"
+    profile_id: str = "default"
+    pin_locked_until: str | None = None
+    auto_evolved: bool = False
+    from_correction: bool = False
+    failure_signature: str | None = None
+    eval_metric: dict[str, Any] | None = None
+    session_ids: list[str] = field(default_factory=list)
+    retired_note_ids: list[str] = field(default_factory=list)
+
+
+@persisted(omit_defaults=True, intern=("fact_type",))
+@dataclass(slots=True, kw_only=True, eq=False)
+class ClaimAttrs(_EmbedSideAttrs):
+    """claim (``know.*``) の attrs (c_16 §3.5)。``source_kind`` は自由文。"""
+
+    fact_type: str | None = None
+    source_kind: str | None = None
+    published_at: str | None = None
+    region: list[str] | None = None
+    #: 注入の出所ヘッダ (§7.4) の表示名
+    source_name: str | None = None
+
+
+@persisted(omit_defaults=True)
+@dataclass(slots=True, kw_only=True, eq=False)
+class DocChunkAttrs(_EmbedSideAttrs):
+    """doc_chunk の attrs (c_16 §3.5)。"""
+
+    package_id: str
+    package_version: str
+    doc_id: str
+    position: int
+    heading: str | None = None
+
+
+@persisted(omit_defaults=True)
+@dataclass(slots=True, kw_only=True, eq=False)
+class DocPseudoQueryAttrs(_EmbedSideAttrs):
+    """疑似クエリ (f_01 §6) の attrs。対象チャンクの id を持ち、埋め込みは query 側。"""
+
+    target_id: str
+    package_id: str
+    from_hint: bool = False
+
+
+@persisted(omit_defaults=True)
+@dataclass(slots=True, kw_only=True, eq=False)
+class CodeNodeAttrs(_EmbedSideAttrs):
+    """ProjectMap の code グラフノード (c_16 §3.5 / §4.4)。``node_type`` は自由文。"""
+
+    package_id: str
+    package_version: str
+    node_type: str
+    path: str
+    name: str | None = None
+    qualname: str | None = None
+    lang: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    parent_id: str | None = None
+    signature: str | None = None
+    external_imports: list[str] | None = None
+    fan_in: int | None = None
+    fan_out: int | None = None
+
+
+#: kind → attrs の表。
+ATTRS_SCHEMAS: dict[str, type] = {
+    "note": NoteAttrs,
+    "fact": FactAttrs,
+    "claim": ClaimAttrs,
+    "doc_chunk": DocChunkAttrs,
+    "doc_pseudo_query": DocPseudoQueryAttrs,
+    "code_node": CodeNodeAttrs,
 }
+
+
+#: kind → attrs の表のコーデック (読み込みごとに引き直さない)。
+_ATTRS_CODECS = {kind: codec_for(cls) for kind, cls in ATTRS_SCHEMAS.items()}
+
+
+def attrs_defaults(kind: str) -> dict[str, Any]:
+    """kind の attrs の既定値 (必須キーは含まない)。書き手が既定と同じ値を省くのに使う。"""
+    out: dict[str, Any] = {}
+    for f in fields(ATTRS_SCHEMAS[kind]):
+        if f.name == "_extra":
+            continue
+        if f.default is not MISSING:
+            out[f.name] = f.default
+        elif f.default_factory is not MISSING:
+            out[f.name] = f.default_factory()
+    return out
+
+
+def _attrs_spec(cls: type) -> tuple[frozenset[str], frozenset[str]]:
+    names = [f for f in fields(cls) if f.name != "_extra"]
+    required = frozenset(
+        f.name for f in names if f.default is MISSING and f.default_factory is MISSING
+    )
+    return required, frozenset(f.name for f in names) - required
+
+
+#: kind → (必須 attrs, 任意 attrs)。:data:`ATTRS_SCHEMAS` から導く。未知キーは
+#: **落とさず通す** (前方互換)。値域違反だけを :class:`EvidenceRecordError` にする。
+ATTRS_SPEC: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    kind: _attrs_spec(cls) for kind, cls in ATTRS_SCHEMAS.items()
+}
+_NO_ATTRS: tuple[frozenset[str], frozenset[str]] = (frozenset(), frozenset())
 
 #: claim の ``attrs.source_kind`` に許す値 (§3.5)。
 CLAIM_SOURCE_KINDS: frozenset[str] = frozenset(
@@ -364,31 +688,25 @@ CODE_NODE_TYPES: frozenset[str] = frozenset({
 })
 
 
-def validate_attrs(kind: str, attrs: dict[str, Any]) -> None:
+def validate_attrs(kind: str, attrs: dict[str, Any], *, values: bool = True) -> None:
     """kind 別 ``attrs`` を検査する (違反は :class:`EvidenceRecordError`)。
 
     未知キーは **通す** — 新しい版が足したフィールドを旧版が弾くと、読めた
     はずのレコードが丸ごと落ちる。値域が壊れている既知フィールドだけを弾く。
+
+    ``values=False`` は読み手の検査 (:func:`from_record`): 形 (型・必須キー) だけを
+    見て、列挙の値 (未知の kind / tier / mode) と自由文 (claim の ``source_kind`` /
+    code_node の ``node_type``) の値は問わない (未知値の行は保持して使わない、
+    c_05 §0.4.5 / §0.5.3)。
     """
-    spec = ATTRS_SPEC.get(kind)
-    if spec is None:
+    if kind not in ATTRS_SCHEMAS:
+        if not values:
+            return
         raise EvidenceRecordError(f"unknown kind: {kind!r}")
-    required, _optional = spec
-    missing = sorted(k for k in required if attrs.get(k) in (None, ""))
-    if missing:
-        raise EvidenceRecordError(
-            f"{kind}.attrs missing required keys: {', '.join(missing)}",
-        )
+    _check_attrs(kind, attrs)
 
-    # 埋め込み側の宣言は kind 共通 (§3.5)。型を外すと snapshot 生成が黙って
-    # document 側へ倒れるので、ここで弾いておく。
-    embed_as_query = attrs.get("embed_as_query")
-    if embed_as_query is not None and not isinstance(embed_as_query, bool):
-        raise EvidenceRecordError("attrs.embed_as_query must be a bool")
-    embed_mode = attrs.get("embed_mode")
-    if embed_mode is not None and not isinstance(embed_mode, str):
-        raise EvidenceRecordError("attrs.embed_mode must be a string")
-
+    if not values:
+        return
     if kind == "note":
         tier = attrs.get("tier")
         if tier is not None and tier not in TIER_IDS:
@@ -396,34 +714,72 @@ def validate_attrs(kind: str, attrs: dict[str, Any]) -> None:
         mode = attrs.get("mode")
         if mode is not None and mode not in NOTE_MODES:
             raise EvidenceRecordError(f"invalid note mode: {mode!r}")
-        turn_index = attrs.get("turn_index")
-        if turn_index is not None and not isinstance(turn_index, int):
-            raise EvidenceRecordError("note turn_index must be an int")
-        summary_of = attrs.get("summary_of")
-        if summary_of is not None and not isinstance(summary_of, list):
-            raise EvidenceRecordError("note summary_of must be a list")
     elif kind == "claim":
         source_kind = attrs.get("source_kind")
         if source_kind is not None and source_kind not in CLAIM_SOURCE_KINDS:
             raise EvidenceRecordError(f"invalid claim source_kind: {source_kind!r}")
-        region = attrs.get("region")
-        if region is not None and not isinstance(region, list):
-            raise EvidenceRecordError("claim region must be a list")
-    elif kind == "doc_chunk":
-        position = attrs.get("position")
-        if not isinstance(position, int):
-            raise EvidenceRecordError("doc_chunk position must be an int")
     elif kind == "code_node":
         node_type = attrs.get("node_type")
         if node_type not in CODE_NODE_TYPES:
             raise EvidenceRecordError(f"invalid code_node node_type: {node_type!r}")
-        for key in ("line_start", "line_end", "fan_in", "fan_out"):
-            value = attrs.get(key)
-            if value is not None and not isinstance(value, int):
-                raise EvidenceRecordError(f"code_node {key} must be an int")
-        external_imports = attrs.get("external_imports")
-        if external_imports is not None and not isinstance(external_imports, list):
-            raise EvidenceRecordError("code_node external_imports must be a list")
+
+
+def _check_attrs(kind: str, attrs: dict[str, Any]) -> dict[str, Any]:
+    """必須キーと既知キーの型を表で検査し、intern 済みの dict を返す。
+
+
+    埋め込み側の宣言 (kind 共通) の型を外すと snapshot 生成が黙って document 側へ
+    倒れるので、ここで弾く。
+    """
+    if not isinstance(attrs, dict):
+        raise EvidenceRecordError(f"{kind}.attrs must be an object")
+    required = ATTRS_SPEC[kind][0]
+    if required:
+        missing = sorted(k for k in required if attrs.get(k) in (None, ""))
+        if missing:
+            raise EvidenceRecordError(
+                f"{kind}.attrs missing required keys: {', '.join(missing)}",
+            )
+    try:
+        return _ATTRS_CODECS[kind].check_mapping(attrs)
+    except CodecError as e:
+        raise EvidenceRecordError(f"{kind}.attrs: {e}") from e
+
+
+def _decode_attrs(kind: str, attrs: dict[str, Any]) -> dict[str, Any]:
+    """読み手の attrs: 既知の kind は表で検査・intern、未知の kind は形を問わず保持。"""
+    if kind not in _ATTRS_CODECS:
+        return attrs
+    return _check_attrs(kind, attrs)
+
+
+#: Evidence レコードの形式 (c_05 §0.7.1)。列挙の ``closed`` / ``open`` は書き手の
+#: 義務 (``closed`` へ値を足すなら版上げ) で、読み手はどちらも「未知値の行は保持して
+#: 使わない」(§0.4.5 / §0.5.3)。``fact_type`` は ``attrs.fact_type``、``namespace`` は
+#: ``structured.subject`` の先頭要素、``tier`` / ``mode`` は note の ``attrs``。
+#: ``records`` の表 (中核 + 型付きの入れ子 + kind 別 attrs) は lock (R1) で凍結する。
+EVIDENCE_RECORD_FORMAT = register_format(FormatSpec(
+    format_id="evidence.record",
+    version=RECORD_VERSION,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/memory/<store>/snapshot/<ver>/records.jsonl",
+    retention="per store (c_16 §5.4)",
+    export=True,
+    encodings=("jsonl",),
+    enums={
+        "kind": "open",
+        "store": "closed",
+        "origin": "open",
+        "veracity": "closed",
+        "confidentiality": "closed",
+        "tier": "closed",
+        "mode": "open",
+        "fact_type": "open",
+        "namespace": "open",
+    },
+    records=(Evidence, *ATTRS_SCHEMAS.values()),
+))
 
 
 # ── claim_key (c_16 §3.4) ───────────────────────────────────────────────
@@ -562,7 +918,7 @@ def corroboration_count(provenance: list[dict[str, Any]] | None) -> int:
         return 0
     sources: set[str] = set()
     for entry in provenance:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, Mapping):
             continue
         value = entry.get("source_id") or entry.get("session_id")
         if isinstance(value, str) and value:
@@ -571,9 +927,11 @@ def corroboration_count(provenance: list[dict[str, Any]] | None) -> int:
 
 
 __all__ = [
+    "ATTRS_SCHEMAS",
     "ATTRS_SPEC",
     "CLAIM_SOURCE_KINDS",
     "CODE_NODE_TYPES",
+    "CONFIDENTIALITY_VALUES",
     "EMBED_SIDE_ATTRS",
     "KIND_IDS",
     "KIND_NAMES",
@@ -582,6 +940,7 @@ __all__ = [
     "ORIGIN_IDS",
     "ORIGIN_NAMES",
     "PATCHABLE_FIELDS",
+    "UNSETTABLE_PREFIXES",
     "RECORD_VERSION",
     "REQUIRED_KEYS",
     "STORE_IDS",
@@ -592,15 +951,27 @@ __all__ = [
     "UNKNOWN_U8",
     "VERACITY_IDS",
     "VERACITY_NAMES",
+    "ClaimAttrs",
+    "ClaimPredicate",
+    "CodeNodeAttrs",
     "Confidentiality",
+    "DocChunkAttrs",
+    "DocPseudoQueryAttrs",
     "Evidence",
     "EvidenceRecordError",
     "EvidenceVersionError",
+    "FactAttrs",
     "Kind",
+    "NoteAttrs",
     "Origin",
+    "ProvenanceEntry",
     "StoreName",
+    "Structured",
+    "StructuredValue",
     "Tier",
     "Veracity",
+    "attrs_defaults",
+    "check_writable",
     "claim_hash64",
     "compute_claim_key",
     "compute_claim_key_structured",

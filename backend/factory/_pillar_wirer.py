@@ -566,8 +566,8 @@ def _make_probe_embed_fn(embedder: Any) -> Any:
 def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> None:
     """6b. corpus パッケージストア初期化 (c_16 §4.3)
 
-    パッケージは ``local_paths.memory_dir`` 配下の ``corpus/`` にある
-    (旧 ``local_paths.cartridges_dir`` は廃止)。``rag`` セクションには
+    パッケージは ``PathResolver.resolve_corpus_dir()`` (``<data_root>/store/corpus/``)
+    にある (旧 ``local_paths.cartridges_dir`` は廃止)。``rag`` セクションには
     c_16 §9 の ``memory.evidence.*`` を重ねて渡す — ``EvidenceStore`` が
     量子化 / memmap / クラスタ索引 (``rag.*``) と語彙索引 / 順位
     (``memory.evidence.*``) を同じオブジェクトから読むため。
@@ -634,7 +634,8 @@ def _load_learned_patterns(
     from backend.free.agent.learned_patterns import LearnedPatternStore
 
     learned_patterns_store = LearnedPatternStore(cfg, policy=policy_interpreter)
-    patterns_file = resolver.resolve_learning("learned_patterns_file")
+    # 利用者の語彙の学習なのでモデル非依存 (learning/shared/、c_05 §0.5.12)
+    patterns_file = resolver.resolve_local("learned_patterns_file")
     if patterns_file.exists():
         try:
             learned_patterns_store.load(patterns_file)
@@ -675,9 +676,8 @@ def _init_learning_core(
     if state.cartridge_manager is not None:
         state.cartridge_manager.set_learned_patterns(learned_patterns_store)
 
-    # 経験に現在ロード中のモデル名 (GGUF ファイル名) を刻む。Level 2 base=C の
-    # build_contrastive_pairs は current_model でこの base_model を一致フィルタする
-    # ため、空のままだと母集団が seed のみに縮退する (cvector が学習信号を失う)。
+    # 経験に表示用のモデル名 (GGUF ファイル名) を刻む。Level 2 の経験の絞り込みは
+    # FeedbackCollector が記録時に解決する model_key で行う (c_05 §0.5.7)。
     _model_paths = cfg.get("model_paths", {})
     _base_model_name = Path(_model_paths.get("base_model") or "").name
     _embed_model_name = Path(_model_paths.get("embed_model") or "").name
@@ -1037,11 +1037,7 @@ def _init_sleep_time_worker(
             mem_cfg = (cfg or {}).get("memory", {}) or {}
             sd_cfg = mem_cfg.get("subject_dictionary", {}) or {}
             if bool(sd_cfg.get("enabled", True)):
-                resolver = get_path_resolver()
-                dict_file_rel = sd_cfg.get(
-                    "file", "local/memory/semantic/subject_dictionary.json",
-                )
-                dict_path = resolver.root / dict_file_rel
+                dict_path = get_path_resolver().resolve_local("subject_dictionary_file")
                 facts_cfg = mem_cfg.get("facts", {}) or {}
                 bypass = facts_cfg.get(
                     "extraction_skip_subject_canonicalize_regex",
@@ -1391,39 +1387,37 @@ def _wire_sleep_scheduler_models(
 
     sleep_scheduler.set_learning_scheduler(learning_scheduler)
 
-    # LoRA パスは不在でも常に設定する: Level 2 初回 full-train (bootstrap) が
-    # この位置に初期アダプタを書き込むため、存在判定は trainer 側で行う。
-    # resolve_learning 経由に統一 (Issue #251 修正): 従来 resolve_local (flat)
-    # で構築していたため、partition_by_base_model=true 環境でもここだけモデル
-    # パーティションから孤立していた。mode は明示せず resolver.active_mode
-    # (起動時既定 "chat") に委ねる — レガシー "model" スキームでは mode を無視して
-    # 従来と同じ flat 相当のパスを返すため、この変更で挙動が変わるのは
-    # partition_by_base_model=true のユーザーのみ (元々 partition される "べき"
-    # だった箇所の是正)。
-    lora_path = resolver.resolve_learning("lora_adapter")
-    sleep_scheduler.set_lora_path(lora_path)
-
     base_model_path = resolver.resolve_model("base_model")
     if base_model_path.exists():
         sleep_scheduler.set_base_model_path(base_model_path)
 
-    # Level 2 (base) の version_manager / eval_core_manager を running scheduler に
-    # 後注入する (Pro 限定、未注入だと _check_and_run_base が None で停止する)。
+    # Level 2 (base) の LoRA パス / version_manager / eval_core_manager を running
+    # scheduler に後注入する (Pro 限定、未注入だと _check_and_run_base が None で
+    # 停止する)。Pro のデータ (store/pro/) のパスは Pro のハンドラから引く。
     from backend.edition import get_pro_handler
+
+    pro_path = get_pro_handler("pro_learning_path")
+    if pro_path is None:
+        return
+    # LoRA パスは不在でも常に設定する: Level 2 初回 full-train (bootstrap) が
+    # この位置に初期アダプタを書き込むため、存在判定は trainer 側で行う。
+    # mode は明示せず resolver.active_mode (起動時既定 "chat") に委ねる。
+    lora_path = pro_path("lora_adapter")
+    sleep_scheduler.set_lora_path(lora_path)
 
     vm_cls = get_pro_handler("lora_version_manager")
     if vm_cls is not None:
         try:
-            versions_dir = resolver.resolve_learning("lora_versions_dir")
-            learning_scheduler.set_version_manager(vm_cls(versions_dir, lora_path))
+            learning_scheduler.set_version_manager(
+                vm_cls(pro_path("lora_versions_dir"), lora_path),
+            )
         except Exception as e:
             logger.debug("Base LoRA version_manager injection skipped: %s", e)
 
     ecm_cls = get_pro_handler("eval_core_manager")
     if ecm_cls is not None:
         try:
-            eval_core_path = resolver.resolve_learning("eval_core_file")
-            learning_scheduler.set_eval_core_manager(ecm_cls(eval_core_path))
+            learning_scheduler.set_eval_core_manager(ecm_cls(pro_path("eval_core_file")))
         except Exception as e:
             logger.debug("eval_core_manager injection skipped: %s", e)
 
@@ -1761,55 +1755,6 @@ def _init_theme_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> 
     logger.info("ThemeManager initialized: themes_dir=%s", themes_dir)
 
 
-def _served_model_filename(state: Any) -> str:
-    """llama-server が **実際にロードしているモデル**のファイル名を返す。
-
-    ``/props`` 由来の ``ModelMetadata.model_id`` (model_alias → model_path →
-    default_generation_settings.model の順で解決済み) を basename 化する。
-    取得できない (degraded / 未接続) 場合は空文字。
-    """
-    client = getattr(state, "local_client", None) if state is not None else None
-    model_id = getattr(getattr(client, "metadata", None), "model_id", "") or ""
-    return Path(model_id).name if model_id else ""
-
-
-def _validate_served_model(
-    cfg: dict[str, Any], state: Any, expected_filename: str,
-) -> None:
-    """9a. 実際に serve 中のモデルが config / model_state と一致するか検証する。
-
-    モデル移行 (`/migrate-model`) は ``model_state.json`` と学習パーティションを
-    切り替えるが、**稼働中の llama-server は差し替えない** (再起動が要る)。
-    2026-08-12 の調査では、この乖離に気付かないまま **62.8 時間**別モデルが
-    serve され、学習パーティションが別モデルの出力で汚染されていた。config と
-    ``model_state.json`` が一致していても発生するため、3 者目として ``/props``
-    を照合する。
-
-    起動をブロックはしない (再起動すれば解消する運用上の乖離であり、degraded で
-    ``model_id`` が取れないケースもあるため)。WARNING + ``AppState`` へ記録する。
-    """
-    served = _served_model_filename(state)
-    if not served or not expected_filename or served == expected_filename:
-        return
-
-    recommendation = (
-        "Restart llama-server (scripts/evoref-ctl.bat stop && start) so the "
-        "served model matches the configured one. Until then, chat responses "
-        "and any learning written to the active partition come from "
-        f"'{served}', not '{expected_filename}'."
-    )
-    logger.warning(
-        "Served model mismatch: llama-server /props=%s, expected=%s. %s",
-        served, expected_filename, recommendation,
-    )
-    if state is not None:
-        state.served_model_mismatch = {
-            "served_filename": served,
-            "expected_filename": expected_filename,
-            "recommendation": recommendation,
-        }
-
-
 def _validate_model_state(
     cfg: dict[str, Any], resolver: Any, state: Any = None,
 ) -> None:
@@ -1822,7 +1767,7 @@ def _validate_model_state(
     RuntimeError を送出して起動をブロックする。
 
     加えて **実際に serve 中のモデル** (`/props`) を第 3 の照合先として見る
-    (`_validate_served_model`)。config と model_state が一致していても、
+    (:func:`backend.factory._served_model.check_served_model`)。config と model_state が一致していても、
     llama-server が古いモデルを掴んだままのことがある。
     """
     try:
@@ -1838,7 +1783,9 @@ def _validate_model_state(
 
         # config が意図するモデルを基準に、実際の serve 状態を照合する
         # (config 未設定なら model_state を基準にする)。
-        _validate_served_model(cfg, state, config_filename or ms.current_filename)
+        from backend.factory._served_model import check_served_model
+
+        check_served_model(state, config_base_model or ms.current_filename, resolver.root)
 
         mismatch = (
             ms.current_filename
@@ -1970,7 +1917,6 @@ def _auto_migrate_base_model(
     prompt_manager / experience_buf / learning_scheduler / エピソード記憶を取り出して
     `ModelMigrator.migrate()` を実行する。
     """
-    from backend.edition import get_pro_handler
     from backend.free.core.model_migration import ModelMigrator
 
     project_root = resolver.root
@@ -1982,15 +1928,6 @@ def _auto_migrate_base_model(
 
     prompt_manager = getattr(state, "prompt_manager", None)
     learning_scheduler = getattr(state, "learning_scheduler", None)
-
-    eval_core_mgr = None
-    EvalCoreManager = get_pro_handler("eval_core_manager")
-    if EvalCoreManager is not None:
-        try:
-            eval_core_path = resolver.resolve_learning("eval_core_file")
-            eval_core_mgr = EvalCoreManager(eval_core_path)
-        except Exception as exc:
-            logger.debug("eval_core_manager unavailable during auto-migrate: %s", exc)
 
     episodic = None
     get_memory_system = getattr(state, "get_memory_system", None)
@@ -2010,13 +1947,11 @@ def _auto_migrate_base_model(
         model_state=model_state,
         experience_buf=experience_buf,
         prompt_manager=prompt_manager,
-        eval_core_manager=eval_core_mgr,
         learning_scheduler=learning_scheduler,
         episodic_memory=episodic,
     )
     result = migrator.migrate(
         new_model_path=new_model_path,
-        try_lora=False,
         regenerate_context=False,
         dry_run=False,
     )
@@ -2024,13 +1959,6 @@ def _auto_migrate_base_model(
         "Auto-migrate on startup completed: %s -> %s (lora=%s)",
         result.old_model, result.new_model, result.lora_action,
     )
-
-
-def _check_edition_downgrade(resolver: Any) -> None:
-    """10. エディションダウングレード検出"""
-    from backend.edition import check_downgrade
-    local_dir = resolver.resolve_local("memory_dir").parent  # local/
-    check_downgrade(local_dir)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2643,14 +2571,13 @@ async def _init_evolve_pipeline(
 
     from backend.config import PathResolver, get_config
 
-    debug_log_dir = project_root / "local" / "logs" / "debug"
     try:
         _cfg_for_paths = get_config() or {}
     except Exception:
         _cfg_for_paths = {}
-    state_path = PathResolver(_cfg_for_paths, project_root).resolve_local(
-        "log_ingestor_file",
-    )
+    _paths = PathResolver(_cfg_for_paths, project_root)
+    debug_log_dir = _paths.resolve_local("logs_dir") / "debug"
+    state_path = _paths.resolve_local("log_ingestor_file")
 
     # LearnFactView: PolicyParamEvolver と同じ scope 戦略 (global + project)
     global_store = state.get_semantic_store("global")
@@ -2698,27 +2625,13 @@ async def _init_evolve_pipeline(
     )
 
 
-def _migrate_mode_rename(base: "_BaseContext") -> None:
-    """旧モード名 ``"coding"`` のローカルデータを ``"create"`` へ一度きり移行する。
-
-    マーカー (``local/.mode_renamed_create_v1``) 済みなら即 no-op。移行はユーザー
-    データの整形であって起動要件ではないため、失敗しても WARNING で継続する。
-    """
-    from backend.free.core.mode_rename_migrator import ModeRenameMigrator
-
-    try:
-        ModeRenameMigrator(base.resolver).migrate_if_needed()
-    except Exception as exc:
-        logger.warning("Mode rename migration skipped: %s", exc)
-
-
 def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
-    """base 学習パーティションを有効化する (active stem 確定 + flat→partition 移行)。
+    """base 学習パーティションを有効化する (active model_key の確定 = モデルへの束縛)。
 
-    resolver の active モデル stem を ``ModelState.current_filename`` から確定し、
-    SemMem ``learn.*`` 用スラグを ``state.active_base_model_slug`` に保持、構築済
-    PolicyInterpreter を当該モデルへ再スコープし、一度きりの flat→partition 非破壊
-    移行を実行する。``partition_by_base_model=false`` 時は no-op (レガシー flat)。
+    resolver の active model_key を config の ``model_paths.base_model`` から確定し、
+    SemMem ``learn.*`` 用スラグ (= model_key) を ``state.active_base_model_slug`` に
+    保持、構築済 PolicyInterpreter を当該モデルへ再スコープする。G0 の
+    flat→partition 移行は持たない (G1 は G0 の学習データを読まない、c_05 §0.3)。
 
     **必ず Learn pillar 構築 (_build_learn_pillar) の前に呼ぶこと** —
     experience / SystemPromptManager / FewShotPool / PolicyParamEvolver が
@@ -2726,33 +2639,23 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
     """
     cfg = base.cfg
     resolver = base.resolver
-    if not resolver.partition_enabled:
-        logger.info("Learning partition disabled (legacy flat layout)")
-        return
 
     # embed_instruction は embedding モデル単位のパーティション (base モデルとは
     # 独立軸)。以降の base モデル identity 依存の早期 return に影響されないよう
     # ここで確定する。
-    embed_filename = Path(cfg.get("model_paths", {}).get("embed_model") or "").name
-    resolver.set_active_embedding_model_stem(
-        Path(embed_filename).stem if embed_filename else None,
-    )
-
-    from backend.free.core.learning_partition_migrator import LearningPartitionMigrator
-    from backend.free.core.model_migration import ModelState
-    from backend.free.memory.notes.subject_ns import model_slug
+    resolver.bind_active_embedding_model(cfg.get("model_paths", {}).get("embed_model") or None)
 
     # active モデル = config の base_model (= 実際に起動する llama-server のモデル)。
     # 学習コンポーネントはこのモデルのパーティションを指す。
-    active_filename = Path(cfg.get("model_paths", {}).get("base_model") or "").name
-    if not active_filename:
-        logger.warning("Learning partition: no base model identity; staying flat")
+    base_model = cfg.get("model_paths", {}).get("base_model") or ""
+    if not base_model:
+        logger.warning("Learning partition: no base model identity")
         return
 
-    # stem / slug の確定は _learning_rebind と共有 (ランタイム切替でも同じ規則で束ねる)
+    # model_key / slug の確定は _learning_rebind と共有 (ランタイム切替でも同じ規則で束ねる)
     from backend.factory._learning_rebind import bind_active_base_model
 
-    bound = bind_active_base_model(resolver, state, active_filename)
+    bound = bind_active_base_model(resolver, state, base_model)
     if bound is None:
         return
     stem, _ = bound
@@ -2761,35 +2664,19 @@ def _activate_learning_partition(base: "_BaseContext", state: AppState) -> None:
     if base.policy_interpreter is not None:
         base.policy_interpreter.set_base_model_id(state.active_base_model_slug)
 
-    # 一度きり flat→partition 非破壊移行。producer = flat データの生成元
-    # (model_state.current_filename、前回起動モデル)。active(config) と異なる場合、
-    # flat データは producer のパーティションへ移り active(新) は空 = ゼロから学習。
-    producer_filename = active_filename
-    try:
-        ms = ModelState(resolver.resolve_local("model_state_file"))
-        if ms.current_filename:
-            producer_filename = ms.current_filename
-    except Exception as exc:
-        logger.debug("partition activation: ModelState read failed: %s", exc)
-
-    migrator = LearningPartitionMigrator(
-        resolver, cfg, develop_level=state.develop_level,
-    )
-    migrator.migrate_if_needed(producer_filename)
-    # level2_adapter_partition=="model_mode" 初回有効化時、既存の (model のみ)
-    # パーティション済みアダプタを "chat" バケットへ移す (独立マーカー、
-    # partition_by_base_model の移行タイミングとは非同期に発火しうる)。
-    migrator.migrate_adapter_partition_mode_if_needed(stem)
     logger.info(
-        "Learning partition active: stem=%s slug=%s (migration producer=%s)",
-        stem, state.active_base_model_slug, Path(producer_filename).stem,
+        "Learning partition active: model=%s model_key=%s", stem, state.active_base_model_slug,
     )
 
 
 def _finalize_base(
     state: AppState, base: _BaseContext, timings: dict[str, float],
 ) -> None:
-    """横断基盤の仕上げ (テーマ / model_state 検証 / エディションダウングレード)。"""
+    """横断基盤の仕上げ (テーマ / model_state 検証)。
+
+    エディションの切替は起動ゲートが世代印の ``last_edition`` で検出して報告する
+    (:func:`backend.factory._data_gate.report_data_gate`)。
+    """
     cfg = base.cfg
     resolver = base.resolver
 
@@ -2798,8 +2685,6 @@ def _finalize_base(
     with _timed(timings, "model_state"):
         _validate_model_state(cfg, resolver, state)
         _validate_component_model_state(cfg, resolver, state)
-    with _timed(timings, "edition_check"):
-        _check_edition_downgrade(resolver)
 
 
 async def _setup_pro_knowledge(state: AppState, cfg: dict) -> None:
@@ -2825,8 +2710,9 @@ def _bind_liveness_ledger(base: Any) -> None:
     """保存先付きの死活監視台帳を読み込み、プロセス既定へ差し替える。
 
     前回の streak を読み戻すので「何サイクル効果ゼロか」が再起動を跨いで続く。
-    読み込みの失敗 (壊れたファイル / 未対応の新しい版) は JsonStateStore が
-    WARNING を出して空で始める — 監視の失敗で起動は止めない。
+    読み込みの失敗 (壊れたファイル / 未対応の新しい版) は VersionedJsonFile が
+    WARNING を出して空で始める (volatile なので捨てて作り直す) — 監視の失敗で
+    起動は止めない。
     """
     from backend.liveness import LivenessLedger, bind_ledger
 
@@ -2868,14 +2754,7 @@ async def wire_pillars(
     # 判定点の warmup や sleep-time の初回サイクルの記録も保存先付きの台帳へ入る。
     _bind_liveness_ledger(base)
 
-    # 旧モード名 "coding" → "create" の一度きり移行。パーティション有効化より前に
-    # 行い、以降のパス解決 (prompts/<mode>.md や <stem>/<mode>/) が現行名で当たる
-    # ようにする。partition_by_base_model の有無や base モデル identity には
-    # 依存しないため _activate_learning_partition の内側には置かない。
-    with _timed(timings, "mode_rename_migration"):
-        _migrate_mode_rename(base)
-
-    # base 学習パーティション有効化 (active stem 確定 + flat→partition 一度きり移行)。
+    # base 学習パーティション有効化 (active stem の確定)。
     # Learn pillar 構築より前に行い、experience / base prompts / fewshot / policy が
     # 当該 (model×mode) パーティションを指すようにする。
     with _timed(timings, "learning_partition"):

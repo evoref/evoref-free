@@ -21,8 +21,11 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.free.rag.evidence.events import EventPosition
+from backend.free.rag.evidence.snapshot_build import ConstantShardKey
 from backend.free.rag.evidence.store import EvidenceStore
 from backend.free.rag.evidence.types import Evidence, derive_confidence
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.id_registry import derived_id
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -33,6 +36,16 @@ logger = get_logger("rag.corpus.pseudo_queries")
 
 #: パッケージ版ディレクトリ配下の索引ディレクトリ名。
 PSEUDO_QUERIES_DIR = "pseudo_queries"
+#: 補助タスクが作る (再生成は数時間・非決定的)。パッケージ本体の索引とは別に宣言する。
+PSEUDO_QUERIES_FORMAT = register_format(FormatSpec(
+    format_id="corpus.pseudo_queries",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key=f"store/corpus/packages/<id>/<version>/{PSEUDO_QUERIES_DIR}/**",
+    retention="follows the package version",
+    encodings=("dir",),
+))
 #: 疑似クエリレコードの kind。
 PSEUDO_QUERY_KIND = "doc_pseudo_query"
 #: 検索時のクエリと同じ instruction を使う embed mode。
@@ -42,7 +55,7 @@ PSEUDO_QUERY_EMBED_MODE = "chat"
 def pseudo_query_id(target_id: str, position: int, text: str) -> str:
     """``(対象チャンク id, 位置, 問い)`` から内容由来の決定論 id を導く。"""
     payload = f"{target_id}\x00{position}\x00{text}"
-    return "pq_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    return derived_id("pq_", hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
 
 class PseudoQueryIndex:
@@ -70,7 +83,7 @@ class PseudoQueryIndex:
             embedding_backend=embedding_backend,
             rag_config=rag_config,
             by="pseudo_query_gen",
-            shard_key_for=lambda _record, key=package_id: key,
+            shard_key_for=ConstantShardKey(package_id),
         )
         self._loaded = False
         #: put 済みで未 commit の対象チャンク id (同じサイクル内の二重生成を防ぐ)。
@@ -142,9 +155,8 @@ class PseudoQueryIndex:
         cached = self._target_ids_cache.get(key)
         if cached is not None:
             return set(cached)
-        for row in range(len(snapshot)):
-            raw = snapshot.raw_at(row) or {}
-            target = (raw.get("attrs") or {}).get("target_id")
+        for _row, raw in snapshot.iter_raw():
+            target = ((raw or {}).get("attrs") or {}).get("target_id")
             if isinstance(target, str) and target and (not live_only or self._is_live(target)):
                 out.add(target)
         self._target_ids_cache = {key: frozenset(out)}

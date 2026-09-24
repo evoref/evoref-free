@@ -18,18 +18,22 @@ start_all() {
     activate_venv
     setup_utf8
 
+    # 版 (config_version) の無い旧形式の config.yaml は起動前に一度だけ直す
+    # (config.yaml.g0-<stamp> へ退避)。別の evoref がロックを持っていれば拒否。
+    python -m backend.free.cli.main config normalize --if-needed || exit 1
+
     echo "[start] Starting llama-server (base + embedding)..."
     python scripts/launch_llama.py config.yaml --all &
     PIDS+=($!)
     sleep 3
 
     echo "[start] Starting FastAPI backend on :8000..."
-    uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
+    uvicorn backend.main:app --host 127.0.0.1 --port 8000 &
     PIDS+=($!)
 
     echo "[start] Starting SvelteKit dev server on :5173..."
     cd frontend
-    npm run dev -- --host 0.0.0.0 &
+    npm run dev -- --host 127.0.0.1 &
     PIDS+=($!)
     cd "$PROJECT_ROOT"
 

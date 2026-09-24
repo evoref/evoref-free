@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,7 @@ from backend.free.rag.corpus import (
     PACKAGES_DIR,
     CorpusManifest,
     PackageMeta,
-    meta_from_record,
+    read_package_meta,
 )
 from backend.free.rag.projectmap import project_map_package_id
 from backend.free.rag.projectmap.fingerprint import load_fingerprint_store
@@ -48,10 +47,9 @@ def _version_written_at(directory: Path) -> str | None:
 
 
 def _read_package_meta(directory: Path) -> PackageMeta | None:
-    """版ディレクトリの ``package.json`` を読む (壊れていれば ``None``)。"""
-    path = directory / "package.json"
+    """版ディレクトリの ``package.json`` を読む (読めなければ ``None``)。"""
     try:
-        return meta_from_record(json.loads(path.read_text(encoding="utf-8")))
+        return read_package_meta(directory)
     except (OSError, ValueError) as e:
         logger.warning("project_map: unreadable package.json at %s: %s", directory, e)
         return None

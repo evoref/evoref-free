@@ -260,7 +260,17 @@ def ingest_new_turns(
     triggers_dir: str | Path | None = None,
     config: dict[str, Any] | None = None,
 ) -> int:
-    """未ノート化のターンを全セッション分ノートにする。作った件数を返す。"""
+    """未ノート化のターンを全セッション分ノートにする。作った件数を返す。
+
+    進捗ファイルが readonly (書き戻すと壊す) の間は取り込まない — 進捗を残せない
+    まま取り込むと、再起動のたびに同じターンを二度ノートにする。
+    """
+    if store.progress.readonly:
+        logger.warning(
+            "Episodic ingest skipped: progress %s cannot be written back (%s)",
+            store.progress.path, store.progress.last_status,
+        )
+        return 0
     pin_cfg = ((config or {}).get("memory") or {}).get("pin") or {}
     auto_pin = bool(pin_cfg.get("auto_detect", True))
     total = 0

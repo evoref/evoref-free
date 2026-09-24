@@ -10,7 +10,7 @@ import numpy as np
 from backend.exceptions import VectorDimensionMismatchError
 from backend.io import atomic_write_text
 from backend.log_config import get_logger
-from backend.utils import utc_now_dt
+from backend.utils import utc_now
 
 logger = get_logger("rag.vector_store")
 
@@ -416,7 +416,7 @@ class VectorStore:
     def _bump_chunk_seq(self, value: int) -> None:
         """採番カウンタを ``value`` まで進める (後退させない)。"""
         if not self.store_info:
-            self.store_info = {"created_at": utc_now_dt().isoformat()}
+            self.store_info = {"created_at": utc_now()}
         current = self.store_info.get("next_chunk_seq")
         if not isinstance(current, int) or value > current:
             self.store_info["next_chunk_seq"] = int(value)
@@ -485,7 +485,7 @@ class VectorStore:
                 "embedding_model": embedding_model,
                 "embedding_backend": embedding_backend,
                 "embedding_dim": int(embedding_dim),
-                "created_at": utc_now_dt().isoformat(),
+                "created_at": utc_now(),
                 "last_reindex_at": None,
             }
             return True
@@ -508,7 +508,7 @@ class VectorStore:
         embedding_dim: int,
     ) -> None:
         """reindex 完了時に store_info を更新する"""
-        now = utc_now_dt().isoformat()
+        now = utc_now()
         if not self.store_info:
             self.store_info = {"created_at": now}
         self.store_info["embedding_model"] = embedding_model
@@ -586,7 +586,7 @@ class VectorStore:
 
         start_id = self._next_chunk_seq()
         chunk_ids = []
-        now = utc_now_dt().isoformat()
+        now = utc_now()
 
         for i, chunk in enumerate(chunks):
             chunk_id = f"{start_id + i:04d}"
@@ -760,7 +760,7 @@ class VectorStore:
         results = []
         for local_idx in local_top:
             global_idx = candidate_indices[local_idx]
-            chunk_id = self.metadata[global_idx]["id"]
+            chunk_id = self._row_id(int(global_idx))
             score = float(similarities[local_idx])
             chunk_text = self.load_chunk(chunk_id)
             results.append((chunk_id, score, chunk_text))
@@ -772,6 +772,10 @@ class VectorStore:
             ", ".join(f"{s:.3f}" for _, s, _ in results),
         )
         return results
+
+    def _row_id(self, row: int) -> str:
+        """行 → チャンク id (行 id の持ち方が違うサブクラスが上書きする)。"""
+        return self.metadata[row]["id"]
 
     def similarity_for(
         self, query_vec: np.ndarray, chunk_ids: Iterable[str],

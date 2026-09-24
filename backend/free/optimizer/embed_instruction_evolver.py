@@ -15,9 +15,33 @@ from backend.free.optimizer.prompt_evolver import (
     PromptCandidate,
     PromptEvolver,
 )
+from backend.io.format_registry import FormatSpec, register_format
 from backend.log_config import get_logger
 
 logger = get_logger("optimizer.embed_instruction_evolver")
+
+#: 進化した検索指示 (``embed_instruction.md``)。埋め込みモデルの model_key 単位
+#: (``PathResolver.resolve_embed_instruction_dir``)。本文 ``.md`` と ``history/`` は
+#: 封筒を持たない (``learning.prompt`` の本文と同じ扱い)。
+EMBED_INSTRUCTION_FORMAT = register_format(FormatSpec(
+    format_id="learning.embed_instruction",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/embed/<embed_mk>/embed_instruction.md",
+    retention="one per embedding model (history/ keeps every body version)",
+    encodings=("md",),
+))
+#: 検索指示の過去版 (``history/embed_instruction_v<NNN>.md``)。
+EMBED_INSTRUCTION_HISTORY_FORMAT = register_format(FormatSpec(
+    format_id="learning.embed_instruction_history",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/embed/<embed_mk>/history/embed_instruction_v<n>.md",
+    retention="unbounded (text only)",
+    encodings=("md",),
+))
 
 # デフォルトの検索指示プロンプト
 DEFAULT_EMBED_INSTRUCTION = """\
@@ -151,7 +175,7 @@ class EmbedInstructionEvolver(PromptEvolver):
             signals = exp.get("signals", {})
             top1 = signals.get("rag_top1_score")
             if top1 is not None and top1 < 0.3:
-                query = exp.get("query", "")[:80]
+                query = (exp.get("query") or "")[:80]
                 hints.append(
                     f"Low search score ({top1:.2f}) for query: \"{query}\""
                 )

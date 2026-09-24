@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
+from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.log_config import get_logger
 
 logger = get_logger("agent.tool_gate_knn")
@@ -146,8 +147,13 @@ class ToolGateKNN:
         if embedder is not None:
             self._embedder = embedder
 
+    @with_embed_priority(P2_LEARNING)
     async def warmup(self) -> bool:
-        """exemplar を埋め込む。成功で ``True``。失敗しても例外は投げない。"""
+        """exemplar を埋め込む。成功で ``True``。失敗しても例外は投げない。
+
+        起動直後の下ごしらえなので埋め込みは P2 (c_16 §6.5。クエリ扱いの既定 P0 に
+        すると最初のチャットのクエリと並ぶ)。
+        """
         if self._vectors is not None:
             return True
         if self._embedder is None or not self._exemplars:

@@ -27,13 +27,12 @@ class SessionState:
     token_used: int = 0
     token_limit: int = 4096
     should_exit: bool = False
-    session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     turns: list[dict] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     sessions_dir: Path | None = None
     history_dir: Path | None = None
     auto_save_enabled: bool = True
-    checkpoint_interval: int = 10
     manually_saved: bool = False
     cli_theme: "CLITheme | None" = None
     ttft_history: list[float] = field(default_factory=list)
@@ -45,6 +44,8 @@ class SessionState:
     # `default_cli_mode()` でエディション既定が解決される。Pro=create / Free=chat。
     # `_build_chat_payload` / `_register_session` / `_save_session` 等で参照する。
     mode: str = field(default_factory=lambda: _resolve_default_mode())
+    #: ``/load`` で読んだ手動保存セッション。次の ``/save`` がその未知キーを書き戻す。
+    loaded_session: "CliSession | None" = None
 
     def add_turn(self, role: str, content: str) -> None:
         """対話ターンを追加"""

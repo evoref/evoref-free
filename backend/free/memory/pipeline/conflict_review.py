@@ -31,8 +31,6 @@
 """
 from __future__ import annotations
 
-import json
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -42,15 +40,20 @@ from backend.free.memory.pipeline.injector import (
     is_internal_index_subject,
 )
 from backend.free.memory.pipeline.semantic_conflict_resolver import (
+    CONFLICT_ROW_VERSION,
     CONFLICTS_PENDING_FILENAME,
     CONFLICTS_RESOLVED_FILENAME,
     DEFAULT_ATTRIBUTE_SIMILARITY_THRESHOLD,
+    ConflictLogRow,
+    append_conflict_row,
+    decode_conflict_row,
     distinct_conflict_objects,
     split_by_attribute_similarity,
 )
+from backend.io.atomic import AtomicWriter
 from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.i18n_helper import prompt_locale
-from backend.utils import estimate_tokens
+from backend.utils import estimate_tokens, utc_now
 from backend.free.memory.types import Provenance, SemanticFact, make_fact
 from backend.log_config import get_logger
 
@@ -302,28 +305,24 @@ def append_resolution_log(
     pending TTL 自動解消)。``reason`` は user 経路では ``"user_<action>"``、
     それ以外の経路では ``"<decision>_<action>"`` (例 ``"ttl_auto_keep_new"``)。
     """
-    path = store.root_dir / CONFLICTS_RESOLVED_FILENAME
-    path.parent.mkdir(parents=True, exist_ok=True)
     reason = (
         f"user_{action}"
         if decision in ("user", "user_chat")
         else f"{decision}_{action}"
     )
-    entry: dict = {
-        "ts": time.time(),
-        "scope": scope,
-        "subject": winner.subject,
-        "predicate": winner.predicate,
-        "type": winner.type,
-        "winner_id": new_fact_id or winner.id,
-        "loser_ids": loser_ids if not new_fact_id else [winner.id, *loser_ids],
-        "decision": decision,
-        "reason": reason,
-    }
-    if trace_id:
-        entry["trace_id"] = trace_id
-    with path.open("a", encoding="utf-8") as fp:
-        fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    append_conflict_row(store.root_dir / CONFLICTS_RESOLVED_FILENAME, ConflictLogRow(
+        _v=CONFLICT_ROW_VERSION,
+        ts=utc_now(),
+        scope=scope,
+        subject=winner.subject,
+        predicate=winner.predicate,
+        type=winner.type,
+        winner_id=new_fact_id or winner.id,
+        loser_ids=loser_ids if not new_fact_id else [winner.id, *loser_ids],
+        decision=decision,
+        reason=reason,
+        trace_id=trace_id or None,
+    ))
 
 
 def remove_pending_lines(
@@ -331,34 +330,30 @@ def remove_pending_lines(
 ) -> None:
     """``conflicts.jsonl`` から ``fact_ids`` を含むエントリを削除する。
 
-    ファイル全体を書き換える (規模的に十分実用範囲)。
+    ファイル全体を atomic に書き換える (規模的に十分実用範囲)。残す行は原文のまま
+    書く — 壊れた行・版が新しい行・読めない行も消さない。消す行が無ければ書かない。
     """
     path = store.root_dir / CONFLICTS_PENDING_FILENAME
-    if not path.exists():
-        return
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = [line.strip() for line in f]
+    except FileNotFoundError:
+        return
     except OSError as exc:
         logger.warning("read conflicts.jsonl failed: %s", exc)
         return
     kept: list[str] = []
     for line in lines:
-        s = line.strip()
-        if not s:
+        if not line:
             continue
-        try:
-            entry = json.loads(s)
-        except json.JSONDecodeError:
-            kept.append(s)
+        row = decode_conflict_row(line)
+        if row is not None and {row.winner_id, *row.loser_ids} & fact_ids:
             continue
-        ids = {entry.get("winner_id"), *(entry.get("loser_ids") or [])}
-        if ids & fact_ids:
-            continue
-        kept.append(s)
-    path.write_text(
-        ("\n".join(kept) + "\n") if kept else "",
-        encoding="utf-8",
-    )
+        kept.append(line)
+    if len(kept) == sum(1 for line in lines if line):
+        return
+    with AtomicWriter(path) as f:
+        f.write("".join(line + "\n" for line in kept))
 
 
 def apply_resolution(

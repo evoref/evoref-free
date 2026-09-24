@@ -11,6 +11,15 @@
 - ファイルが線形に伸びるため、定期的な :meth:`maybe_compact` で物理サイズと
   読込時間を縮小する (閾値超過時のみ ``AtomicWriter`` で再書き出し)
 
+行の版 (c_05 §0.5.1):
+
+- ``row_version`` を渡したストアは全ての行 (tombstone 行を含む) に ``_v`` を持つ。
+  追記する行は ``serialize`` が現行の ``_v`` を刻む (刻んでいなければ ``ValueError``)。
+- 読むとき ``_v`` の無い / 整数でない行は壊れた行として飛ばす。``_v`` がこの版より
+  新しい行は読まずに数え (:meth:`newer_rows`)、そのファイルを **readonly** にする —
+  追記・tombstone は :class:`DataReadonlyError`、compaction は書き直さない
+  (新しい版の行を落として畳まない、c_05 §0.4.5)。
+
 スレッド安全性:
 
 - プロセス内の並行 ``append`` / ``tombstone`` / ``maybe_compact`` /
@@ -26,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Generic, TypeVar
 
 from backend.io.atomic import AtomicWriter
+from backend.io.readonly import DataReadonlyError, guard_write
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -35,6 +45,7 @@ logger = get_logger("io.jsonl_store")
 
 __all__ = [
     "JSONLAppendStore",
+    "ROW_VERSION_FIELD",
     "TOMBSTONE_KEY_FIELD",
     "TOMBSTONE_MARKER",
     "TOMBSTONE_REASON_FIELD",
@@ -53,6 +64,10 @@ TOMBSTONE_KEY_FIELD = "_key"
 #: (2026-09-05 監査)。
 TOMBSTONE_TS_FIELD = "_deleted_at"
 TOMBSTONE_REASON_FIELD = "_reason"
+#: 行の版 (c_05 §0.5.1。``row_version`` を渡したストアの全行が持つ)。
+ROW_VERSION_FIELD = "_v"
+
+_ROW_OK, _ROW_BAD, _ROW_NEWER = 0, 1, 2
 
 
 class JSONLAppendStore(Generic[T]):
@@ -70,6 +85,8 @@ class JSONLAppendStore(Generic[T]):
             compaction を実行する閾値。デフォルト 2.0 (= live が全行の 50% 未満)。
         debug_logger: 注入された ``DebugLogger`` があれば compaction 時に
             ``log_memory_op("jsonl_compact", ...)`` で観測情報を流す。
+        row_version: 行の版 (``_v``、形式の版と同じ値)。渡すと全行が ``_v`` を持つ
+            前提で読み書きする (モジュールの docstring)。
 
     Usage:
         >>> store = JSONLAppendStore[dict](
@@ -95,6 +112,7 @@ class JSONLAppendStore(Generic[T]):
         compact_threshold_lines: int = 1000,
         compact_threshold_ratio: float = 2.0,
         debug_logger: "DebugLogger | None" = None,
+        row_version: int | None = None,
     ) -> None:
         if compact_threshold_lines < 1:
             raise ValueError("compact_threshold_lines must be >= 1")
@@ -107,12 +125,17 @@ class JSONLAppendStore(Generic[T]):
         self._compact_threshold_lines = compact_threshold_lines
         self._compact_threshold_ratio = compact_threshold_ratio
         self._debug_logger = debug_logger
+        self._row_version = row_version
+        #: 版が新しい行の数 (最後の走査 / 読み込みの時点)。1 以上ならこのファイルは readonly。
+        self._newer_rows = 0
         self._lock = threading.Lock()
         # 行数 / 生存キー集合をファイルから走査して初期化する。
         # 起動コストはファイル行数に比例 (O(N))。本ストアの典型用途 (数百-
         # 数千行) では問題にならない。
         self._total_lines = 0
         self._live_keys: set[str] = set()
+        #: 末尾の途中切れを検査済みか (追記の前に 1 回だけ、c_05 §0.5.8)。
+        self._tail_checked = False
         self._scan_existing()
 
     # ── 内部: 状態走査 ─────────────────────────────────────────────────
@@ -123,7 +146,10 @@ class JSONLAppendStore(Generic[T]):
             return
         live: set[str] = set()
         total = 0
-        with self._path.open("r", encoding="utf-8") as f:
+        newer = 0
+        # 途中で切れた行は多バイト文字の途中で終わりうる。strict だと
+        # UnicodeDecodeError で全体が読めなくなるので置換し、その行は壊れた行として飛ばす。
+        with self._path.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.rstrip("\n").rstrip("\r")
                 if not line:
@@ -135,6 +161,11 @@ class JSONLAppendStore(Generic[T]):
                     logger.warning(
                         "skipping malformed JSONL line in %s: %s", self._path, e,
                     )
+                    continue
+                row = self._row_state(obj)
+                if row == _ROW_NEWER:
+                    newer += 1
+                if row != _ROW_OK:
                     continue
                 if isinstance(obj, dict) and obj.get(TOMBSTONE_MARKER):
                     key = obj.get(TOMBSTONE_KEY_FIELD)
@@ -151,6 +182,56 @@ class JSONLAppendStore(Generic[T]):
                 live.add(self._key_of(item))
         self._total_lines = total
         self._live_keys = live
+        self._set_newer(newer)
+
+    def _row_state(self, obj: object) -> int:
+        """行の版を判定する (``row_version`` を持たないストアは常に読む)。"""
+        if self._row_version is None:
+            return _ROW_OK
+        version = obj.get(ROW_VERSION_FIELD) if isinstance(obj, dict) else None
+        if type(version) is not int or version < 1:
+            logger.warning("skipping a JSONL line without an integer _v in %s", self._path)
+            return _ROW_BAD
+        return _ROW_NEWER if version > self._row_version else _ROW_OK
+
+    def _set_newer(self, count: int) -> None:
+        if count and count != self._newer_rows:
+            logger.warning(
+                "%s has %d row(s) newer than _v %s; the file is read-only and is not folded",
+                self._path, count, self._row_version,
+            )
+        self._newer_rows = count
+
+    def _guard_newer(self) -> None:
+        """版が新しい行を持つファイルへは書かない (c_05 §0.4.5)。"""
+        if self._newer_rows:
+            raise DataReadonlyError(self._path, f"{self._newer_rows} row(s) of a newer _v")
+
+    def _terminate_torn_tail(self) -> None:
+        """末尾が改行で終わっていなければ改行を 1 つ足す (ロックの下で最初の追記の前に 1 回)。
+
+        途中で切れた行 (kill・電源断) を **切り詰めず** 改行で終端する — 断片は壊れた行
+        として読み手が飛ばし、物理行の位置は保たれる。切り詰めると、行番号で位置を
+        持つ読み手 (事象ログの ``folded_through``) がずれて以後の事象を畳まなくなる
+        (c_05 §0.5.8)。readonly の間は ``guard_write`` が先に止めるので修復もしない。
+        """
+        if self._tail_checked:
+            return
+        self._tail_checked = True
+        try:
+            size = self._path.stat().st_size
+        except FileNotFoundError:
+            return
+        if size == 0:
+            return
+        with self._path.open("rb") as f:
+            f.seek(size - 1)
+            last = f.read(1)
+        if last == b"\n":
+            return
+        with self._path.open("ab") as f:
+            f.write(b"\n")
+        logger.warning("Terminated a torn last line in %s (%d bytes)", self._path, size)
 
     # ── 書き込み API ──────────────────────────────────────────────────
 
@@ -166,6 +247,10 @@ class JSONLAppendStore(Generic[T]):
             obj = json.loads(line)
         except json.JSONDecodeError as e:
             raise ValueError(f"serialize() did not produce valid JSON: {e}") from e
+        if self._row_version is not None and (
+            not isinstance(obj, dict) or obj.get(ROW_VERSION_FIELD) != self._row_version
+        ):
+            raise ValueError(f"serialize() must stamp {ROW_VERSION_FIELD}={self._row_version}")
         if isinstance(obj, dict):
             for reserved in (
                 TOMBSTONE_MARKER,
@@ -179,8 +264,11 @@ class JSONLAppendStore(Generic[T]):
                         f"{reserved!r}",
                     )
         key = self._key_of(item)
+        guard_write(self._path)
         with self._lock:
+            self._guard_newer()
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._terminate_torn_tail()
             with self._path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
             self._total_lines += 1
@@ -197,15 +285,19 @@ class JSONLAppendStore(Generic[T]):
         """
         from backend.utils import utc_now
 
-        record: dict[str, object] = {
-            TOMBSTONE_MARKER: True,
-            TOMBSTONE_KEY_FIELD: key,
-            TOMBSTONE_TS_FIELD: utc_now(),
-        }
+        record: dict[str, object] = {}
+        if self._row_version is not None:
+            record[ROW_VERSION_FIELD] = self._row_version
+        record[TOMBSTONE_MARKER] = True
+        record[TOMBSTONE_KEY_FIELD] = key
+        record[TOMBSTONE_TS_FIELD] = utc_now()
         if reason:
             record[TOMBSTONE_REASON_FIELD] = reason
         marker = json.dumps(record, ensure_ascii=False)
+        guard_write(self._path)
         with self._lock:
+            self._guard_newer()
+            self._terminate_torn_tail()
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8") as f:
                 f.write(marker + "\n")
@@ -225,7 +317,7 @@ class JSONLAppendStore(Generic[T]):
             return self._maybe_compact_locked()
 
     def compact(self) -> None:
-        """強制 compaction (閾値チェックを行わずに必ず再書き出し)。"""
+        """強制 compaction (閾値チェックを行わずに再書き出し。版が新しい行があれば書かない)。"""
         with self._lock:
             self._rewrite_locked()
 
@@ -237,11 +329,12 @@ class JSONLAppendStore(Generic[T]):
         # live * ratio < total → dead row の割合が ratio に応じて大きい
         if live * self._compact_threshold_ratio >= total:
             return False
-        self._rewrite_locked()
-        return True
+        return self._rewrite_locked()
 
-    def _rewrite_locked(self) -> None:
+    def _rewrite_locked(self) -> bool:
         items = self._load_locked()
+        if self._newer_rows:
+            return False  # 新しい版の行を落として書き直さない (c_05 §0.4.5)
         before_lines = self._total_lines
         before_dead = before_lines - len(items)
         with AtomicWriter(self._path, debug_logger=self._debug_logger) as f:
@@ -262,6 +355,7 @@ class JSONLAppendStore(Generic[T]):
                 )
             except Exception as log_err:
                 logger.warning("DebugLogger.log_memory_op failed: %s", log_err)
+        return True
 
     # ── 読み込み API ──────────────────────────────────────────────────
 
@@ -276,9 +370,11 @@ class JSONLAppendStore(Generic[T]):
 
     def _load_locked(self) -> dict[str, T]:
         if not self._path.exists():
+            self._set_newer(0)
             return {}
         result: dict[str, T] = {}
-        with self._path.open("r", encoding="utf-8") as f:
+        newer = 0
+        with self._path.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.rstrip("\n").rstrip("\r")
                 if not line:
@@ -289,6 +385,11 @@ class JSONLAppendStore(Generic[T]):
                     logger.warning(
                         "skipping malformed JSONL line in %s: %s", self._path, e,
                     )
+                    continue
+                row = self._row_state(obj)
+                if row == _ROW_NEWER:
+                    newer += 1
+                if row != _ROW_OK:
                     continue
                 if isinstance(obj, dict) and obj.get(TOMBSTONE_MARKER):
                     key = obj.get(TOMBSTONE_KEY_FIELD)
@@ -303,6 +404,7 @@ class JSONLAppendStore(Generic[T]):
                     )
                     continue
                 result[self._key_of(item)] = item
+        self._set_newer(newer)
         return result
 
     # ── 統計 / 観測 ──────────────────────────────────────────────────
@@ -316,6 +418,11 @@ class JSONLAppendStore(Generic[T]):
         """物理行数 (tombstone 行を含む)。"""
         with self._lock:
             return self._total_lines
+
+    def newer_rows(self) -> int:
+        """版 (``_v``) がこのストアより新しい行の数。1 以上ならこのファイルは readonly。"""
+        with self._lock:
+            return self._newer_rows
 
     @property
     def path(self) -> Path:

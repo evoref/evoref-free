@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.command_parser import (
     CommandResult,
     SessionState,
@@ -17,18 +19,62 @@ from backend.free.cli.renderer import (
     render_info,
 )
 from backend.free.cli.session_persistence import (
+    _apply_session_data,
     _load_from_history,
-    _restore_session,
-    auto_save_session,
     finalize_session,
 )
 from backend.free.history.utils import parse_iso
 from backend.i18n_helper import msg
-from backend.io import atomic_write_text
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
-from backend.utils import utc_now_dt
+from backend.utils import utc_now
 
 logger = get_logger("cli.command_handlers")
+
+
+@persisted()
+@dataclass
+class CliSessionTokenInfo:
+    """手動保存セッションの ``token_info``。"""
+
+    used: int = 0
+    limit: int = 4096
+    pct: int = 0
+    _extra: dict[str, Any] | None = None
+
+
+@persisted()
+@dataclass
+class CliSession:
+    """``/save`` が書く手動保存セッションのペイロード (未知キーは各階層の ``_extra``)。"""
+
+    session_id: str
+    name: str
+    saved_at: str
+    mode: str
+    source: str = "manual"
+    instance_name: str = "evoref"
+    turns: list[dict[str, Any]] = field(default_factory=list)
+    context_files: list[str] = field(default_factory=list)
+    token_info: CliSessionTokenInfo = field(default_factory=CliSessionTokenInfo)
+    _extra: dict[str, Any] | None = None
+
+
+_CLI_SESSION_CODEC = codec_for(CliSession)
+
+#: ``/save <name>`` が書く手動保存セッション (``PathResolver.LAYOUT["cli_sessions_dir"]``)。
+CLI_SESSION_FORMAT = register_format(FormatSpec(
+    format_id="cli.session",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/cli_sessions/<name>.json",
+    retention="kept until the user overwrites it",
+    export=True,
+    records=(CliSession, CliSessionTokenInfo),
+))
 
 
 def _cmd_help(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
@@ -115,8 +161,6 @@ def _cmd_clear(args: str, state: SessionState, console) -> CommandResult:  # noq
         "/clear: clearing %d context files, %d turns, resetting tokens",
         len(state.context_files), len(state.turns),
     )
-    # /clear 前に自動保存（設計書 23.3.1: リセットされるターンを保存）
-    auto_save_session(state)
     state.context_files.clear()
     state.file_chunks.clear()
     state.turns.clear()
@@ -136,37 +180,42 @@ def _cmd_save(args: str, state: SessionState, console) -> CommandResult:
     state.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     pct = int(state.token_used / state.token_limit * 100) if state.token_limit > 0 else 0
-    session_data = {
-        "session_id": state.session_id,
-        "name": name,
-        "saved_at": utc_now_dt().isoformat(),
-        "mode": state.mode,
-        "source": "manual",
-        "instance_name": state.instance_name,
-        "turns": state.turns,
+    # /load で読んだセッションの未知キー (新しい版の任意フィールド) は書き戻す。
+    loaded = state.loaded_session
+    session = CliSession(
+        session_id=state.session_id,
+        name=name,
+        saved_at=utc_now(),
+        mode=state.mode,
+        instance_name=state.instance_name,
+        turns=state.turns,
         # ``active_note_ids`` は常に空配列を書いていた死にフィールドなので落とす。
         # セッション ↔ STM ノートの対応は ``MemoryNote.session_id`` が持つ
         # (逆引きが必要ならそちらを走査する)。
-        "context_files": list(state.context_files),
-        "token_info": {
-            "used": state.token_used,
-            "limit": state.token_limit,
-            "pct": pct,
-        },
-    }
+        context_files=list(state.context_files),
+        token_info=CliSessionTokenInfo(
+            used=state.token_used, limit=state.token_limit, pct=pct,
+            _extra=loaded.token_info._extra if loaded is not None else None,
+        ),
+        _extra=loaded._extra if loaded is not None else None,
+    )
 
     path = state.sessions_dir / f"{name}.json"
-    try:
-        atomic_write_text(
-            path, json.dumps(session_data, ensure_ascii=False, indent=2),
-        )
-        logger.debug("/save: wrote %s (%d turns)", path, len(state.turns))
-        state.manually_saved = True
-        render_info(console, msg("cli.history_saved", name=name))
-    except OSError as e:
-        logger.debug("/save: failed to write %s: %s", path, e)
-        render_error(console, f"Failed to save session: {e}")
+    session_file = _session_file(path)
+    if path.exists():
+        session_file.load()  # 新しい版・G1 でないファイルは readonly (上書きしない)
+    session_file.payload = _CLI_SESSION_CODEC.encode(session)
+    if not session_file.save():
+        render_error(console, f"Failed to save session: {session_file.last_status or path}")
+        return CommandResult()
+    logger.debug("/save: wrote %s (%d turns)", path, len(state.turns))
+    state.manually_saved = True
+    render_info(console, msg("cli.history_saved", name=name))
     return CommandResult()
+
+
+def _session_file(path: Path) -> VersionedPayloadFile:
+    return VersionedPayloadFile(CLI_SESSION_FORMAT, path, component="cli.save", state_logger=logger)
 
 
 def _cmd_load(args: str, state: SessionState, console) -> CommandResult:
@@ -187,7 +236,19 @@ def _cmd_load(args: str, state: SessionState, console) -> CommandResult:
         render_error(console, f"Session not found: {name}")
         return CommandResult()
 
-    return _restore_session(path, state, console)
+    session_file = _session_file(path)
+    if not session_file.load():
+        render_error(console, f"Failed to load session: {session_file.last_status}")
+        return CommandResult()
+    try:
+        session = _CLI_SESSION_CODEC.decode(session_file.payload)
+    except CodecError as e:
+        logger.debug("/load: unreadable session %s: %s", path, e)
+        render_error(console, f"Failed to load session: {e}")
+        return CommandResult()
+    result = _apply_session_data(_CLI_SESSION_CODEC.encode(session), path, state, console)
+    state.loaded_session = session
+    return result
 
 
 async def _cmd_history(args: str, state: SessionState, console) -> CommandResult:
@@ -279,7 +340,7 @@ async def _cmd_page(args: str, state: SessionState, console) -> CommandResult:  
     """最後の run_command 全文出力をページャーで表示"""
     logger.debug("/page: fetching last command output from backend")
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=30.0) as client:
             resp = await client.get(f"{state.backend_url}/api/commands/last-output")
             resp.raise_for_status()
             data = resp.json()
@@ -331,7 +392,7 @@ async def _cmd_status(args: str, state: SessionState, console) -> CommandResult:
     # /api/status からバックエンド情報を取得
     status_data: dict | None = None
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=10.0) as client:
             resp = await client.get(f"{state.backend_url}/api/status")
             resp.raise_for_status()
             status_data = resp.json()
@@ -431,7 +492,7 @@ async def _cmd_pin(args: str, state: SessionState, console) -> CommandResult:
         "mode_origin": state.mode,
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=10.0) as client:
             resp = await client.post(
                 f"{state.backend_url}/api/memory/pin", json=payload,
             )
@@ -460,7 +521,7 @@ async def _cmd_unpin(args: str, state: SessionState, console) -> CommandResult:
     force = "--force" in parts[1:]
     payload = {"fact_id": fact_id, "scope": "global", "force": force}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=10.0) as client:
             resp = await client.post(
                 f"{state.backend_url}/api/memory/unpin", json=payload,
             )
@@ -509,7 +570,7 @@ async def _cmd_private(args: str, state: SessionState, console) -> CommandResult
 async def _cmd_pinned(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     """/pinned — pin 済みファクト一覧を表示する"""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=10.0) as client:
             resp = await client.get(
                 f"{state.backend_url}/api/memory/pinned",
                 params={"scope": "global"},
@@ -679,7 +740,6 @@ async def _cmd_migrate_model(args: str, state: SessionState, console) -> Command
     Usage:
         /migrate-model --new-model <path>           — 新モデルに移行
         /migrate-model --new-model <path> --dry-run — プレビューのみ
-        /migrate-model --new-model <path> --try-lora — LoRA 互換テスト付き
         /migrate-model --rollback [--to <model>]    — ロールバック
     """
     import argparse as _argparse
@@ -690,7 +750,6 @@ async def _cmd_migrate_model(args: str, state: SessionState, console) -> Command
         prog="/migrate-model", exit_on_error=False,
     )
     parser.add_argument("--new-model")
-    parser.add_argument("--try-lora", action="store_true")
     parser.add_argument("--regenerate-context", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--rollback", action="store_true")
@@ -700,7 +759,7 @@ async def _cmd_migrate_model(args: str, state: SessionState, console) -> Command
     if not stripped:
         render_info(
             console,
-            "Usage: /migrate-model --new-model <path> [--try-lora] [--dry-run] [--regenerate-context]\n"
+            "Usage: /migrate-model --new-model <path> [--dry-run] [--regenerate-context]\n"
             "       /migrate-model --rollback [--to <model>]",
         )
         return CommandResult()
@@ -710,7 +769,7 @@ async def _cmd_migrate_model(args: str, state: SessionState, console) -> Command
     except (SystemExit, _argparse.ArgumentError):
         render_error(
             console,
-            "Usage: /migrate-model --new-model <path> [--try-lora] [--dry-run]",
+            "Usage: /migrate-model --new-model <path> [--dry-run]",
         )
         return CommandResult()
 
@@ -727,7 +786,6 @@ async def _cmd_migrate_model(args: str, state: SessionState, console) -> Command
     _handle_migrate(
         backend_url,
         new_model_path=parsed.new_model,
-        try_lora=parsed.try_lora,
         regenerate_context=parsed.regenerate_context,
         dry_run=parsed.dry_run,
     )
@@ -756,7 +814,7 @@ async def _cmd_web(args: str, state: SessionState, console) -> CommandResult:
     render_info(console, msg("cli.web_fetching", url=url))
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=15.0) as client:
             r = await client.get(url, follow_redirects=True)
             r.raise_for_status()
     except httpx.ConnectError:
@@ -842,7 +900,7 @@ def _handle_httpx_error(e: Exception, console) -> None:
 async def _learn_status(state: SessionState, console) -> CommandResult:
     """学習状態を表示"""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=30.0) as client:
             resp = await client.get(f"{state.backend_url}/api/learning/status")
             resp.raise_for_status()
             data = resp.json()
@@ -879,7 +937,7 @@ async def _learn_trigger(state: SessionState, console, level: str) -> CommandRes
     """学習サイクルを手動トリガー"""
     render_info(console, f"Triggering {level}...")
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=300.0) as client:
             resp = await client.post(
                 f"{state.backend_url}/api/learning/trigger",
                 json={"level": level},
@@ -932,7 +990,7 @@ async def _cmd_reindex(args: str, state: SessionState, console) -> CommandResult
         params["cartridge"] = cartridge
 
     try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=600.0) as client:
             # まずドライランで対象件数を取得
             preview_params = dict(params)
             preview_params["dry_run"] = "true"

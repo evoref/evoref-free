@@ -4,11 +4,12 @@ sleep-time の一部の工程 — 競合解決 (Step 6) / ノート進化 (Step 
 ファクト抽出 (Step 8) / キュレーター (Step 8.4-8.6) — は、ノートを **その場で
 書き換える** 前提で書かれている (``notes`` dict を触り、処理済みマーカーを
 立てる)。事象ログは追記のみなので、その間の変更をここで受け止め、サイクルの
-最後に :meth:`flush` が ``put`` / ``retract`` へ落とす。
+最後に :meth:`flush` が ``create`` / ``patch`` / ``retract`` へ落とす。
 
 - 読み込むのは ``short`` tier のアクティブノートだけ (``long`` は畳んだ後の
   ものなので工程の入力にしない)
-- 変わったノートは ``put`` (全置換)、消えたノートは ``retract``
+- 変わったノートは変わったフィールドだけの ``patch`` (全置換しない、c_05 §1.4)、
+  作業領域で足したノートは ``create``、消えたノートは ``retract``
   (物理削除しない、c_16 §3 の状態遷移)
 - private ノートは既定で読み込まない — 会話履歴に private ターンは残らない
   ので、そもそもストアにも入らない
@@ -36,13 +37,13 @@ logger = get_logger("memory.episodic.workspace")
 _VOLATILE_FIELDS: frozenset[str] = frozenset({"embedding", "accessed_at"})
 
 
-def _fingerprint(note: MemoryNote) -> tuple:
-    """ノートの内容指紋 (差分検出用)。ndarray は含めない。"""
-    return tuple(
-        repr(getattr(note, f.name, None))
+def _fingerprint(note: MemoryNote) -> dict[str, str]:
+    """ノートの内容指紋 (フィールド名 → repr、差分検出用)。ndarray は含めない。"""
+    return {
+        f.name: repr(getattr(note, f.name, None))
         for f in fields(MemoryNote)
         if f.name not in _VOLATILE_FIELDS
-    )
+    }
 
 
 class EpisodicWorkspace:
@@ -63,7 +64,7 @@ class EpisodicWorkspace:
         self.store = store
         self.notes: dict[str, MemoryNote] = notes
         self.max_notes = max_notes
-        self._baseline: dict[str, tuple] = {
+        self._baseline: dict[str, dict[str, str]] = {
             note_id: _fingerprint(note) for note_id, note in notes.items()
         }
         self._dirty = False
@@ -97,7 +98,7 @@ class EpisodicWorkspace:
         return self._dirty
 
     def add(self, note: MemoryNote) -> MemoryNote:
-        """作業領域へノートを足す (``flush`` で ``put`` になる)。"""
+        """作業領域へノートを足す (``flush`` で ``create`` になる)。"""
         self.notes[note.id] = note
         self.mark_dirty()
         return note
@@ -133,13 +134,24 @@ class EpisodicWorkspace:
     # ── 書き戻し ──
 
     def flush(self) -> dict[str, int]:
-        """変更を事象へ落とす。``{"put": n, "retracted": m}`` を返す。"""
+        """変更を事象へ落とす。``{"put": n, "retracted": m}`` を返す。
+
+        ``put`` は書いたノート数 (新規の ``create`` と既存への ``patch`` の和)。
+        """
         put = 0
         for note_id, note in self.notes.items():
             fingerprint = _fingerprint(note)
-            if self._baseline.get(note_id) == fingerprint:
+            baseline = self._baseline.get(note_id)
+            if baseline == fingerprint:
                 continue
-            self.store.put_note(note, tier=note.tier or "short")
+            if self.store.get(note_id) is None:
+                self.store.put_note(note, tier=note.tier or "short")
+            else:
+                changed = [
+                    name for name, value in fingerprint.items()
+                    if (baseline or {}).get(name) != value
+                ]
+                self.store.update_note(note, changed)
             self._baseline[note_id] = fingerprint
             put += 1
         retracted = 0

@@ -11,7 +11,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 #: verify の承認済み argv で許す置換プレースホルダ (c_16 §4.5.4)。要素単位の
 #: 一致だけを許し、文字列連結 (``--out={file}``) は受けない — manifest 側の
@@ -56,18 +56,6 @@ def _validate_verify_command(argv: object) -> list[str]:
                 "{file}/{workspace} or contain no braces (no string concatenation)",
             )
     return [executable, *args]
-
-#: c_16 の ``_REMOVED_MEMORY_KEYS_REJECTED`` と同じ作法 (CLAUDE.md §7):
-#: 機能ごと消えたキーは黙って捨てず、理由付きで起動時に拒否する。
-#: ``create.dispatch`` は 3a-2 (2026-09-19) で撤去 — create のディスパッチは
-#: meta の production_stage 経路の 1 本になった (f_03_agent_engine.md §4.4)。
-_REMOVED_CREATE_KEYS_REJECTED: dict[str, str] = {
-    "dispatch": (
-        "create dispatch is unified onto the meta production_stage path; "
-        "the legacy \"legacy\" dispatch (_dispatch_long_form / "
-        "stream_staged_create) was removed"
-    ),
-}
 
 
 class StagedVerifyConfig(BaseModel):
@@ -280,23 +268,6 @@ class CreateConfig(BaseModel):
     """``create:`` トップレベル設定。"""
 
     model_config = ConfigDict(extra="forbid")
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_removed_keys(cls, data):
-        """撤去済みキー (:data:`_REMOVED_CREATE_KEYS_REJECTED`) を理由付きで拒否する。
-
-        ``MemoryConfig.reject_removed_keys`` (backend/schemas/memory.py) と同じ作法。
-        """
-        if isinstance(data, dict):
-            for key, reason in _REMOVED_CREATE_KEYS_REJECTED.items():
-                if key in data:
-                    raise ValueError(
-                        f"create.{key} was removed: {reason}. "
-                        "Remove the line from config.yaml "
-                        "(see docs/f_03_agent_engine.md §4.4).",
-                    )
-        return data
 
     pipeline: Literal["staged", "longform"] = Field(
         default="longform",

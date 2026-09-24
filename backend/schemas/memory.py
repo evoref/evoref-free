@@ -61,15 +61,15 @@ class SubjectDictionaryConfig(BaseModel):
     """Subject 正規化辞書設定
 
     EvorefMem 統合仕様 における意味記憶 subject の表記ゆれ吸収
-    に使う辞書ファイルの位置付けと挙動を定義する。
-    自動拡張は仕様で禁止 (旧 ``auto_expand`` キーは撤去済み、
-    :data:`REMOVED_MEMORY_KEYS` 参照)。
+    に使う辞書の挙動を定義する。辞書ファイルの置き場はデータ根の
+    ``store/memory/semantic/subject_dictionary.json`` 固定 (旧 ``file`` キーは撤去済み)。
+    自動拡張は仕様で禁止 (旧 ``auto_expand`` キーは撤去済み。G0 の config からは
+    ``evoref config normalize`` が落とす)。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    file: str = "local/memory/semantic/subject_dictionary.json"
 
 
 class FactsExtractionMaxPerSession(BaseModel):
@@ -454,60 +454,6 @@ class SemMemProjectConfig(BaseModel):
     auto_archive_inactive_days: int = Field(default=180, ge=0)
 
 
-#: 宣言だけがあって値を読むコードが 1 つも無かった config キー (2026-09-02 監査
-#: で撤去)。サブモデルは ``extra="forbid"`` なので、そのまま消すと既存の
-#: config.yaml が起動不能になる。:meth:`MemoryConfig.drop_removed_keys` が
-#: 検証前に取り除き、キーごとに 1 行 WARNING を出す。
-#: ``(サブセクションの path, キー名)``。path は ``memory`` 直下からのドット区切り。
-REMOVED_MEMORY_KEYS: tuple[tuple[str, str], ...] = (
-    ("pin", "unlimited"),
-    ("pin", "auto_detect_confirm"),
-    ("facts", "trigger"),
-    ("subject_dictionary", "auto_expand"),
-    ("conflict.chat_review", "max_judge_per_session"),
-    # c_16 でスコープが Evidence.scope になり、semantic/projects/<id>/ という
-    # 実体が無くなった。移動先ディレクトリを指す設定は読み手が消えた。
-    ("project", "archive_dir"),
-)
-
-
-#: c_16 (2026-09-07) の永続層全面置換で **機能ごと** 消えた ``memory`` 直下の
-#: キーと、その理由。:data:`REMOVED_MEMORY_KEYS` (宣言だけで読み手が無かった
-#: キー) と違い、これらは実際に順位付けを動かしていた値なので黙って捨てると
-#: 「設定したのに効かない」状態になる。``_REMOVED_LOCAL_PATH_KEYS`` と同じく
-#: 起動時に理由付きで拒否する。
-_REMOVED_MEMORY_KEYS_REJECTED: dict[str, str] = {
-    "fade_alpha": (
-        "the FadeMem score was removed with the LightMem/FadeMem ranking "
-        "(c_16 §8.2); ranking is now the single formula "
-        "cos x freshness x confidence x store_prior (c_16 §7.2)"
-    ),
-    "fade_beta": (
-        "the FadeMem score was removed with the LightMem/FadeMem ranking "
-        "(c_16 §8.2); ranking is now the single formula "
-        "cos x freshness x confidence x store_prior (c_16 §7.2)"
-    ),
-    "fade_gamma": (
-        "the FadeMem score was removed with the LightMem/FadeMem ranking "
-        "(c_16 §8.2); ranking is now the single formula "
-        "cos x freshness x confidence x store_prior (c_16 §7.2)"
-    ),
-    "fade_threshold": (
-        "the FadeMem score was removed with the LightMem/FadeMem ranking "
-        "(c_16 §8.2); ranking is now the single formula "
-        "cos x freshness x confidence x store_prior (c_16 §7.2)"
-    ),
-    "lightmem_decay_days": (
-        "time decay moved to memory.evidence.know_half_life_days and the "
-        "per-record half_life_days field (c_16 §8.2)"
-    ),
-    "half_life_days_by_tag": (
-        "per-tag decay moved to memory.evidence.know_half_life_days and the "
-        "per-record half_life_days field (c_16 §8.2)"
-    ),
-}
-
-
 class EvidenceRetentionConfig(BaseModel):
     """Evidence Store の保持方針 (c_16 §5.4)。
 
@@ -608,64 +554,6 @@ class MemoryConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    @model_validator(mode="before")
-    @classmethod
-    def drop_removed_keys(cls, data):
-        """撤去済みキー (:data:`REMOVED_MEMORY_KEYS`) を検証前に取り除く。
-
-        サブモデルが ``extra="forbid"`` のため、キーを残した既存 config は
-        ``ValidationError`` で起動が止まる。互換のためここで黙って捨てるのでは
-        なく、キーごとに WARNING を 1 行出して config.yaml からの削除を促す。
-        """
-        if not isinstance(data, dict):
-            return data
-        cleaned = data
-        for section_path, key in REMOVED_MEMORY_KEYS:
-            segs = section_path.split(".")
-            node = data
-            for seg in segs:
-                node = node.get(seg) if isinstance(node, dict) else None
-            if not (isinstance(node, dict) and key in node):
-                continue
-            # 呼出側の dict は変更しない (copy-on-write で該当パスだけ差し替える)。
-            if cleaned is data:
-                cleaned = dict(data)
-            parent = cleaned
-            for seg in segs:
-                parent[seg] = dict(parent[seg])
-                parent = parent[seg]
-            parent.pop(key)
-            logger.warning(
-                "memory.%s.%s was removed and is ignored; delete it from "
-                "config.yaml", section_path, key,
-            )
-        return cleaned
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_removed_keys(cls, data):
-        """c_16 で機能ごと消えた ``memory`` 直下のキーを理由付きで拒否する。
-
-        ``extra="forbid"`` の素のエラーだと「どのキーをなぜ消すのか」が
-        伝わらないため、``LocalPathsConfig.reject_removed_keys`` と同じ形で
-        キー名と c_16 の該当節を示す。
-        """
-        if isinstance(data, dict):
-            for key, reason in _REMOVED_MEMORY_KEYS_REJECTED.items():
-                if key in data:
-                    raise ValueError(
-                        f"memory.{key} was removed: {reason}. "
-                        "Remove the line from config.yaml "
-                        "(see docs/c_16_evidence_store.md §8.2).",
-                    )
-        return data
-
-    # EvorefMem スキーマバージョン
-    # 不一致時は scripts/init_evorefmem.py による初期化を促す。
-    # code 側の backend.free.memory.init_evorefmem.SCHEMA_VERSION が最終的な
-    # source of truth で、cfg 値は参考情報として扱われる。divergent な場合は
-    # 起動時に WARN ログを出した上で code 側の値が採用される。
-    schema_version: int = Field(default=1, ge=1)
     # Subject 正規化辞書
     subject_dictionary: SubjectDictionaryConfig = Field(
         default_factory=SubjectDictionaryConfig,
@@ -734,7 +622,7 @@ class MemoryConfig(BaseModel):
     # LightMem スコアと FadeMem の重み (``lightmem_decay_days`` /
     # ``half_life_days_by_tag`` / ``fade_alpha`` / ``fade_beta`` /
     # ``fade_gamma`` / ``fade_threshold``) は廃止 (残存キーは
-    # :data:`_REMOVED_MEMORY_KEYS_REJECTED` が起動時に拒否する)。順位式は
+    # ``evoref config normalize`` が G0 の config から落とす)。順位式は
     # ``cos × freshness × confidence × store_prior`` の 1 本になり (c_16 §7.2)、
     # 減衰は ``memory.evidence.know_half_life_days`` とレコードの
     # ``half_life_days`` が持つ。保持順は ``last_used_at`` (c_16 §5.4)。

@@ -23,6 +23,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.free.rag.evidence.types import ClaimPredicate
+
 
 class _StrictModel(BaseModel):
     """``additionalProperties: false`` を強制する基底。"""
@@ -445,7 +447,7 @@ class KnowledgeClaim(_StrictModel):
 
     statement: str = Field(max_length=300)
     subject_topic: str = Field(max_length=40)
-    predicate: Literal["states", "reports", "rumors", "measures"]
+    predicate: ClaimPredicate
     value: KnowledgeClaimValue | None
     published_at: str | None
     region: list[str]

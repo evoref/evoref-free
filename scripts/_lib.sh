@@ -35,29 +35,18 @@ setup_utf8() {
     export PYTHONUTF8=1
 }
 
-# ── ローカルディレクトリ一括作成 ──
+# ── データ根のディレクトリ一括作成 ──
+# データ根は backend.data_root が決める (EVOREF_DATA_ROOT → <install_root>/userdata)。
+# 不正な指定はそこで拒否される。local/ (G0) は作らない・動かさない・消さない。
 ensure_directories() {
-    local dirs=(
-        "local/models"
-        "local/models/embed_lora_versions"
-        "local/knowledge"
-        "local/outputs"
-        "local/memory"
-        "local/memory/corpus/packages"
-        "local/memory/episodic"
-        "local/memory/semantic"
-        "local/prompts"
-        "local/history"
-        "local/lora_archive"
-        "local/lora_versions"
-        "local/migration_archive"
-        "local/profiles"
-        "local/themes"
-        "local/triggers"
-        "local/logs"
-        "local/logs/debug"
-    )
+    local data_root
+    data_root="$(cd "$PROJECT_ROOT" && python -c 'from backend.data_root import resolve_data_root; print(resolve_data_root())')" || {
+        echo "ERROR: could not resolve the data root (check EVOREF_DATA_ROOT)"
+        return 1
+    }
+    echo "  Data root: $data_root"
+    local dirs=(store logs outputs themes profiles tmp run cache)
     for dir in "${dirs[@]}"; do
-        mkdir -p "$PROJECT_ROOT/$dir"
+        mkdir -p "$data_root/$dir"
     done
 }

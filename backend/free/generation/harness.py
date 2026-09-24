@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, Awaitable, Callable
-from uuid import uuid4
 
 from backend.free.llm.editor_filename import derive_editor_filename_stem
+from backend.io.id_registry import new_id
 from backend.log_config import get_logger
 from backend.trace_context import get_trace_id
 from backend.utils import estimate_tokens
@@ -191,7 +191,7 @@ class LongFormHarness:
                 existing_content = ""
         queue: asyncio.Queue[dict] = asyncio.Queue()
 
-        run_id = uuid4().hex[:12]
+        run_id = new_id("run_")
         recorder: "RunRecorder | None" = None
         if self._run_recorder_factory is not None:
             try:

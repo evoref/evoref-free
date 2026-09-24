@@ -23,6 +23,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from backend.error_handlers import register_exception_handlers
+from backend.factory._access_guard import register_access_guard
 from backend.factory._health import (
     _compose_app_version,
     _register_cors,
@@ -54,7 +55,13 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     _register_cors(app)
+    # CORS より外側で Host / Origin / クライアントヘッダを検査する (c_06 §1.5)
+    register_access_guard(app)
     register_exception_handlers(app)
+    # readonly 中に書こうとした応答を 423 / E0423 へ揃える (c_05 §0.4.2)
+    from backend.factory._readonly_guard import register_readonly_guard
+
+    register_readonly_guard(app)
     _register_plugins(app)
     # Pro プラグイン登録後にバージョン情報を解決し、FastAPI と app.state の
     # 双方に反映する。current_edition() は setup_pro() で _pro_handlers が

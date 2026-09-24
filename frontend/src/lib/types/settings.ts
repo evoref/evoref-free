@@ -57,29 +57,13 @@ export interface ModelPathsConfig {
 }
 
 export interface LocalPathsConfig {
-	lora_adapter: string;
-	lora_versions_dir: string;
-	lora_archive_dir: string;
-	embed_lora_adapter: string;
-	embed_lora_versions_dir: string;
-	knowledge_dir: string;
-	experience_file: string;
-	eval_core_file: string;
-	model_state_file: string;
-	local_state_file: string;
-	memory_dir: string;
-	prompts_dir: string;
-	history_dir: string;
-	learned_patterns_file: string;
-	themes_dir: string;
-	migration_archive_dir: string;
-	triggers_dir: string;
+	/** ディレクトリ指定の無い生成物の既定の書込み先 (相対ならデータ根基準) */
+	outputs_dir: string;
 	[key: string]: unknown;
 }
 
 export interface HistoryConfig {
 	auto_save: boolean;
-	checkpoint_interval: number;
 	retention_full_days: number;
 	retention_compressed_days: number;
 	max_storage_mb: number;
@@ -126,7 +110,6 @@ export interface EmbeddingConfig {
 	model_name: string;
 	cache_enabled: boolean;
 	cache_max_mb: number;
-	cache_dir: string;
 }
 
 export interface MemoryConfig {

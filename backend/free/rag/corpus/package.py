@@ -27,8 +27,10 @@ zip の中身は次の形に固定する:
 
 - **展開先の外へ書かせない** (zip slip)。エントリ名に ``..`` / 絶対パス /
   ドライブレターが混ざっていれば :class:`PackageError` で弾く。
-- ``package.json`` は :class:`~backend.io.AtomicWriter` 経由で書く。docs の
-  本体はレコードではない (壊れても形式で気付ける) のでそのまま書く。
+- ``package.json`` は G1 の封筒 (``evoref.package`` v1、c_16 §4.3 / c_05 §0.4.10) に
+  包んで原子的に書く。封筒の無い ``package.json`` は G0 として案内付きで、新しい版は
+  それと分かる案内付きで拒否する (:class:`PackageFormatError`)。docs の本体は
+  レコードではない (壊れても形式で気付ける) のでそのまま書く。
 - 未知キーは捨てずに :attr:`PackageMeta._extra` へ退避し、書き戻しで復元する
   (c_05 §0.5)。
 """
@@ -44,13 +46,30 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from backend.io import AtomicWriter, atomic_write_text
+from backend.io.safe_extract import (
+    ExtractBudget,
+    ExtractLimits,
+    UnsafeArchiveError,
+    check_zip_members,
+    normalize_member_name,
+    resolve_under,
+)
+from backend.io import AtomicWriter, atomic_write_text, jsoncodec
+from backend.io.versioned import (
+    ReadResult,
+    build_envelope,
+    read_versioned,
+    read_versioned_bytes,
+    write_versioned,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("rag.corpus.package")
 
-#: パッケージレコードの版。意味を変える変更で上げ、migrator を用意する。
-PACKAGE_SCHEMA_VERSION = 1
+#: ``package.json`` の封筒 (c_16 §4.3)。配布物 (``.evocart``) の中でもインストール先の
+#: 版ディレクトリでも同じ形。台帳の宣言は ``corpus.store`` (インストール先の置き場)。
+PACKAGE_FORMAT_ID = "evoref.package"
+PACKAGE_FORMAT_VERSION = 1
 
 #: 配布ファイルの拡張子。
 PACKAGE_SUFFIX = ".evocart"
@@ -90,8 +109,11 @@ LANGUAGE_VERIFY_FEATURE = "language.verify/1"
 EDITION_PRO_FEATURE = "edition/pro"
 
 #: パッケージ id。ディレクトリ名・シャード名・検索結果の接頭辞に素で入るので
-#: 小文字英数 + ``_`` / ``-`` だけに絞る (2〜64 文字)。
-PACKAGE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,63}$")
+#: 小文字英数 + ``_`` / ``-`` だけに絞る (2〜40 文字)。長さは Windows の MAX_PATH
+#: の予算 (c_05 §0.7.2 R11: インストール根 60 文字 + 組み立てパス ≤ 240) で決まる。
+PACKAGE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,39}$")
+#: 版文字列の最大長 (版ディレクトリ名になる。R11 と同じ予算)。
+MAX_VERSION_LENGTH = 24
 
 #: semver 2.0.0 (prerelease / build metadata まで許す)。
 SEMVER_RE = re.compile(
@@ -104,6 +126,18 @@ SEMVER_RE = re.compile(
 
 class PackageError(ValueError):
     """`.evocart` として読めない / 書けない (形式違反・不正な id・zip slip)。"""
+
+
+class PackageFormatError(PackageError):
+    """``package.json`` / セクションの ``manifest.json`` が G1 の封筒でない (G0) / 新しい版。
+
+    メッセージ (ログ用、英語) とは別に、利用者への案内の i18n キーを持つ。
+    """
+
+    def __init__(self, message: str, i18n_key: str, **context: Any) -> None:
+        super().__init__(message)
+        self.i18n_key = i18n_key
+        self.context = context
 
 
 # ── メタデータ ──────────────────────────────────────────────────────────
@@ -141,7 +175,6 @@ class PackageMeta:
     #: ``docs/`` / ``prebuilt/`` 以外のセクションディレクトリのダイジェスト
     #: (:func:`compute_section_digests`)。``{section: sha256}``。
     section_digests: dict[str, str] = field(default_factory=dict)
-    schema_version: int = PACKAGE_SCHEMA_VERSION
     #: 未知キーの退避先 (前方互換)。
     _extra: dict[str, Any] = field(default_factory=dict)
 
@@ -167,7 +200,12 @@ class PackageMeta:
         return record
 
     def to_json(self) -> str:
-        return json.dumps(self.to_record(), ensure_ascii=False, indent=2)
+        """``package.json`` の本文 (G1 の封筒、手で読めるよう字下げ)。"""
+        envelope = build_envelope(
+            format_id=PACKAGE_FORMAT_ID, format_version=PACKAGE_FORMAT_VERSION,
+            payload=self.to_record(), component="corpus.package",
+        )
+        return jsoncodec.dumps(envelope, indent=2)
 
 
 def validate_package_id(package_id: str) -> str:
@@ -184,24 +222,58 @@ def validate_version(version: str) -> str:
     """semver を検査して返す (違反は :class:`PackageError`)。"""
     if not isinstance(version, str) or not SEMVER_RE.match(version):
         raise PackageError(f"invalid package version: {version!r} (expected semver)")
+    if len(version) > MAX_VERSION_LENGTH:
+        raise PackageError(
+            f"package version {version!r} is longer than {MAX_VERSION_LENGTH} characters",
+        )
     return version
 
 
-def meta_from_record(data: Any) -> PackageMeta:
-    """``package.json`` の dict から :class:`PackageMeta` を復元する。
+def _meta_from_read(result: ReadResult, source: str) -> PackageMeta:
+    """封筒の分類から :class:`PackageMeta` を作る (読めなければ :class:`PackageError`)。"""
+    if result.ok:
+        return meta_from_record(result.payload)
+    if result.status == "foreign" and result.detail == "not a G1 envelope":
+        raise PackageFormatError(
+            f"{source} has no format_id (a G0 package)", "api.cartridge_g0_package",
+        )
+    if result.status == "newer":
+        raise PackageFormatError(
+            f"{source} format_version {result.version} is newer than {PACKAGE_FORMAT_VERSION}",
+            "api.cartridge_newer_package", version=result.version,
+        )
+    raise PackageError(f"{source} is unreadable ({result.status}: {result.detail})")
 
-    未対応の新しい ``schema_version`` は読まない (c_05 §0.5.1) — 旧版で読んで
-    書き戻すと新版のフィールドを落として壊すため。
+
+def meta_from_json(data: bytes | str, source: str = PACKAGE_FILE) -> PackageMeta:
+    """``package.json`` の本文 (G1 の封筒) から :class:`PackageMeta` を復元する。
+
+    Raises:
+        PackageFormatError: 封筒が無い (G0) / 新しい版。
+        PackageError: 読めない / 別の形式 / 中身が不正。
     """
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    result = read_versioned_bytes(
+        raw, format_id=PACKAGE_FORMAT_ID, format_version=PACKAGE_FORMAT_VERSION,
+    )
+    return _meta_from_read(result, source)
+
+
+def read_package_meta(directory: Path | str) -> PackageMeta:
+    """版ディレクトリ / 展開先の ``package.json`` を読む (:func:`meta_from_json` と同じ規則)。"""
+    path = Path(directory) / PACKAGE_FILE
+    result = read_versioned(
+        path, format_id=PACKAGE_FORMAT_ID, format_version=PACKAGE_FORMAT_VERSION,
+    )
+    if result.status == "absent":
+        raise PackageError(f"{PACKAGE_FILE} not found under {directory}")
+    return _meta_from_read(result, str(path))
+
+
+def meta_from_record(data: Any) -> PackageMeta:
+    """``package.json`` のペイロード (dict) から :class:`PackageMeta` を復元する。"""
     if not isinstance(data, dict):
         raise PackageError("package.json must be a JSON object")
-
-    schema_version = int(data.get("schema_version") or PACKAGE_SCHEMA_VERSION)
-    if schema_version > PACKAGE_SCHEMA_VERSION:
-        raise PackageError(
-            f"package.json schema_version {schema_version} is newer than "
-            f"supported {PACKAGE_SCHEMA_VERSION}",
-        )
 
     package_id = validate_package_id(str(data.get("id") or ""))
     version = validate_version(str(data.get("version") or "1.0.0"))
@@ -219,16 +291,11 @@ def meta_from_record(data: Any) -> PackageMeta:
     if not isinstance(tool_hints, list):
         raise PackageError("package.json tool_hints must be a list")
 
-    # 旧形の読み取り互換 (c_16 §4.3): `kind` がまだ第一級フィールドでは
-    # なかった頃の package.json は `_extra` 経由で読まれていた (開発機に
-    # 残った旧 ProjectMap パッケージがこの形)。トップレベルに無ければ
-    # そちらを持ち上げる。持ち上げたら `_extra` 側には残さない (二重持ち防止)。
-    legacy_kind = extra.get("kind")
     # 既知のフィールド名は `_extra` に残さない (to_record は第一級フィールドを
     # 優先するので、残しても書き出されず黙って消える)。
     for name in known:
         extra.pop(name, None)
-    kind = data.get("kind") or legacy_kind
+    kind = data.get("kind")
     kind = str(kind) if kind else PACKAGE_KIND_DEFAULT
     if kind not in PACKAGE_KINDS:
         logger.warning(
@@ -267,7 +334,6 @@ def meta_from_record(data: Any) -> PackageMeta:
         compatibility=str(data.get("compatibility") or ">=0.1.0"),
         content_digest=str(data.get("content_digest") or ""),
         section_digests={str(k): str(v) for k, v in section_digests.items()},
-        schema_version=schema_version,
         _extra=extra,
     )
 
@@ -430,6 +496,54 @@ def validate_requires(requires: Sequence[str]) -> None:
         )
 
 
+def section_manifest_payload(
+    result: ReadResult,
+    *,
+    section: str,
+    source: str,
+    format_version: int,
+    error: type[PackageError] = PackageError,
+) -> Any:
+    """セクションの ``manifest.json`` の封筒の分類から ``payload`` を返す (c_16 §4.5.1)。
+
+    封筒の無い (G0 / 独自の ``schema_version``) manifest と新しい版は、
+    ``package.json`` と同じく案内付きの :class:`PackageFormatError` で拒否する。
+    それ以外の読めない manifest は ``error`` (セクションの例外型) で送出する。
+    """
+    if result.ok:
+        return result.payload
+    if result.status == "foreign" and result.detail == "not a G1 envelope":
+        raise PackageFormatError(
+            f"{source} has no format_id (a G0 section manifest)",
+            "api.cartridge_g0_section_manifest", section=section,
+        )
+    if result.status == "newer":
+        raise PackageFormatError(
+            f"{source} format_version {result.version} is newer than {format_version}",
+            "api.cartridge_newer_section_manifest", section=section, version=result.version,
+        )
+    raise error(f"{source} is unreadable ({result.status}: {result.detail})")
+
+
+def validate_section_feature(
+    requires: Sequence[str], section: str, manifest_version: int, package_id: str,
+) -> None:
+    """セクション manifest の ``format_version`` と ``requires`` の ``<section>/<N>`` を突き合わせる。
+
+    ``requires`` はそのセクションのフラグをちょうど 1 つ、manifest と同じ版で
+    宣言しなければならない (c_16 §4.5.1)。``language.verify/1`` のような
+    セクション内の機能フラグは別の名前なので数えない。
+    """
+    expected = f"{section}/{manifest_version}"
+    declared = [flag for flag in requires if flag.partition("/")[0] == section]
+    if declared != [expected]:
+        raise PackageError(
+            f"package '{package_id}' provides {section}/manifest.json with format_version "
+            f"{manifest_version} but requires declares {declared or 'no ' + section + ' flag'} "
+            f"(expected exactly {expected!r})",
+        )
+
+
 # ── 読み込み ────────────────────────────────────────────────────────────
 
 
@@ -460,18 +574,13 @@ class PackageContents:
 def _safe_member_path(name: str) -> PurePosixPath | None:
     """zip エントリ名を展開先相対の安全なパスへ正規化する。
 
-    ``..`` / 絶対パス / ドライブレター混じりは ``None`` (呼出側が弾く)。
-    ディレクトリエントリも ``None``。
+    規則は全アーカイブ共通の ``backend.io.safe_extract`` (docs/c_06 §1.5)。危険な名前は
+    :class:`PackageError`、ディレクトリエントリは ``None``。
     """
-    normalized = name.replace("\\", "/")
-    if not normalized or normalized.endswith("/"):
-        return None
-    if normalized.startswith("/") or ":" in normalized.split("/")[0]:
-        return None
-    parts = [p for p in PurePosixPath(normalized).parts if p not in (".", "")]
-    if any(p == ".." for p in parts):
-        return None
-    return PurePosixPath(*parts) if parts else None
+    try:
+        return normalize_member_name(name)
+    except UnsafeArchiveError as e:
+        raise PackageError(f"unsafe entry in package: {name!r}") from e
 
 
 def _strip_single_root(members: list[PurePosixPath]) -> list[PurePosixPath]:
@@ -510,6 +619,7 @@ def read_package(
         max_unpacked_bytes: 展開後の合計サイズ上限 (zip bomb 対策)。``None`` で無検査。
 
     Raises:
+        PackageFormatError: ``package.json`` が G1 の封筒でない (G0) / 新しい版。
         PackageError: zip でない / ``package.json`` が無い / id・版が不正 /
             zip slip を検出した / サイズ上限を超えた。
     """
@@ -529,23 +639,22 @@ def read_package(
     destination = Path(extract_to) if extract_to is not None else None
 
     with zipfile.ZipFile(str(path), "r") as zf:
+        limits = ExtractLimits(max_total_bytes=max_unpacked_bytes)
         if max_unpacked_bytes is not None:
+            # 自己申告の file_size で早めに断る (実際の展開量は下の budget でも数える)
             unpacked = sum(info.file_size for info in zf.infolist())
             if unpacked > max_unpacked_bytes:
                 raise PackageError(
                     f"package unpacks to more than max_unpacked_bytes: "
                     f"{unpacked} > {max_unpacked_bytes}",
                 )
-        members: list[PurePosixPath] = []
-        source_names: list[str] = []
-        for raw_name in zf.namelist():
-            member = _safe_member_path(raw_name)
-            if member is None:
-                if raw_name.endswith("/"):
-                    continue
-                raise PackageError(f"unsafe entry in package: {raw_name!r}")
-            members.append(member)
-            source_names.append(raw_name)
+        try:
+            checked = check_zip_members(zf, limits)
+        except UnsafeArchiveError as e:
+            raise PackageError(f"unsafe entry in package: {e}") from e
+        members: list[PurePosixPath] = [member for _, member in checked]
+        source_names: list[str] = [info.filename for info, _ in checked]
+        infos_by_name = {info.filename: info for info, _ in checked}
         #: 展開先相対のパス → zip 内の元の名前。
         remap: dict[PurePosixPath, str] = dict(
             zip(_strip_single_root(members), source_names),
@@ -554,7 +663,7 @@ def read_package(
         meta_key = PurePosixPath(PACKAGE_FILE)
         if meta_key not in remap:
             raise PackageError(f"{PACKAGE_FILE} not found in package")
-        meta = meta_from_record(json.loads(zf.read(remap[meta_key])))
+        meta = meta_from_json(zf.read(remap[meta_key]))
 
         doc_names = sorted(
             str(PurePosixPath(*m.parts[1:]))
@@ -571,14 +680,15 @@ def read_package(
 
         if destination is not None:
             destination.mkdir(parents=True, exist_ok=True)
+            budget = ExtractBudget(limits)
             for member, source_name in sorted(remap.items()):
-                target = destination / Path(*member.parts)
-                # 念のための二重確認: 正規化後に展開先の外を指していないか。
-                resolved = target.resolve()
-                if not str(resolved).startswith(str(destination.resolve())):
-                    raise PackageError(f"unsafe entry in package: {source_name!r}")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(zf.read(source_name))
+                try:
+                    target = resolve_under(destination, member)
+                    info = infos_by_name[source_name]
+                    with zf.open(info) as src:
+                        budget.copy(src, target, compressed_size=info.compress_size, overwrite=True)
+                except UnsafeArchiveError as e:
+                    raise PackageError(f"unsafe entry in package: {source_name!r}: {e}") from e
 
     logger.info(
         "Read package %s v%s: %d doc(s), prebuilt=%s",
@@ -621,10 +731,12 @@ def iter_prebuilt_chunks(prebuilt_dir: Path | str) -> Iterator[dict[str, Any]]:
 
 
 def write_package_meta(directory: Path | str, meta: PackageMeta) -> Path:
-    """``package.json`` を原子的に書く (壊れると版が読めないので ``fsync``)。"""
+    """``package.json`` を G1 の封筒で原子的に書く (壊れると版が読めないので ``fsync``)。"""
     path = Path(directory) / PACKAGE_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, meta.to_json(), fsync=True)
+    write_versioned(
+        path, format_id=PACKAGE_FORMAT_ID, format_version=PACKAGE_FORMAT_VERSION,
+        payload=meta.to_record(), component="corpus.package", fsync=True, indent=2,
+    )
     return path
 
 
@@ -704,10 +816,7 @@ def write_package(
         raise PackageError(f"package source directory not found: {root}")
 
     if meta is None:
-        meta_path = root / PACKAGE_FILE
-        if not meta_path.exists():
-            raise PackageError(f"{PACKAGE_FILE} not found under {root}")
-        meta = meta_from_record(json.loads(meta_path.read_text(encoding="utf-8")))
+        meta = read_package_meta(root)
     validate_package_id(meta.id)
     validate_version(meta.version)
 
@@ -757,11 +866,13 @@ __all__ = [
     "KNOWN_FEATURES",
     "LANGUAGE_DIR",
     "LANGUAGE_VERIFY_FEATURE",
+    "MAX_VERSION_LENGTH",
     "PACKAGE_FILE",
     "PACKAGE_ID_RE",
     "PACKAGE_KIND_DEFAULT",
+    "PACKAGE_FORMAT_ID",
+    "PACKAGE_FORMAT_VERSION",
     "PACKAGE_KINDS",
-    "PACKAGE_SCHEMA_VERSION",
     "PACKAGE_SUFFIX",
     "PREBUILT_BUILD_FILE",
     "PREBUILT_CHUNKS_FILE",
@@ -772,6 +883,7 @@ __all__ = [
     "TEMPLATES_DIR",
     "PackageContents",
     "PackageError",
+    "PackageFormatError",
     "PackageMeta",
     "PrebuiltInfo",
     "compute_content_digest",
@@ -779,12 +891,16 @@ __all__ = [
     "discover_sections",
     "has_any_section_content",
     "iter_prebuilt_chunks",
+    "meta_from_json",
     "meta_from_record",
     "package_filename",
     "prebuilt_from_record",
     "read_package",
+    "read_package_meta",
     "validate_package_id",
+    "section_manifest_payload",
     "validate_requires",
+    "validate_section_feature",
     "validate_version",
     "write_package",
     "write_package_meta",

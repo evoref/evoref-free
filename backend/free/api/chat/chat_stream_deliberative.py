@@ -69,11 +69,20 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+#: 画面が空だったときに記録する生成の先頭の文字数。
+_RAW_HEAD_CHARS = 60
+
 @dataclass
 class _DeliberativeStreamState:
     """`stream_deliberative` のループ mutable 状態を集約。"""
 
     tokens_generated: int = 0
+    #: フィルタに通す前の生成の文字数と先頭 (画面が空だったときの診断用)。
+    #: raw が 0 = モデルが何も返していない / raw があって画面が空 = フィルタが
+    #: 全部落とした (復唱・推論だけ)。2026-09-23 に 1 回だけ出た 503 は、この
+    #: 区別が付かず原因を絞れなかった。
+    raw_chars: int = 0
+    raw_head: str = ""
     #: フィルタ通過後に実際にユーザーへ出た文字数。``tokens_generated`` は
     #: tok/s 指標用に raw トークンを数えるため、フィルタが全部落としても 0 に
     #: ならず、ゼロトークン再試行が発火しない。復唱だけの応答を落とすと画面が
@@ -214,6 +223,9 @@ async def _stream_filtered_token_pipeline(
         # HeadBufferFilter によるバッファリングで SSE フレーム数と乖離するため、
         # フィルタ出力の有無にかかわらず受信トークンをそのまま数える。
         state.tokens_generated += 1
+        state.raw_chars += len(token)
+        if len(state.raw_head) < _RAW_HEAD_CHARS:
+            state.raw_head += token[: _RAW_HEAD_CHARS - len(state.raw_head)]
         # TTFT は **モデルから最初のトークンが届いた時刻** で止める。
         # 以前は filtered (フィルタが実際に吐いた瞬間) で止めていたため、
         # HeadBufferFilter が最後までバッファする短い応答では
@@ -343,8 +355,13 @@ async def _retry_zero_tokens_deliberative(
         return
     logger.warning(
         "No content tokens from llama-server, "
-        "retrying with fresh request (reasoning-only or stale cache)",
+        "retrying with fresh request (reasoning-only or stale cache): "
+        "raw_tokens=%d raw_chars=%d raw_head=%r",
+        state.tokens_generated, state.raw_chars, state.raw_head,
     )
+    first_tokens = state.tokens_generated
+    state.raw_chars = 0
+    state.raw_head = ""
     # 本流と同じ生成パラメータで撃つ (以前は温度 / ペナルティが既定値に
     # 戻っていた)。
     gen_kwargs: dict = {
@@ -368,7 +385,10 @@ async def _retry_zero_tokens_deliberative(
     if state.emitted_chars > 0:
         logger.info("Retry succeeded: tokens=%d", state.tokens_generated)
         return
-    logger.error("Retry also returned 0 content tokens")
+    logger.error(
+        "Retry also returned 0 content tokens: raw_tokens=%d raw_chars=%d raw_head=%r",
+        state.tokens_generated - first_tokens, state.raw_chars, state.raw_head,
+    )
     yield sse.error(
         "No content generated after retry. "
         "The model may be stuck in a reasoning loop."

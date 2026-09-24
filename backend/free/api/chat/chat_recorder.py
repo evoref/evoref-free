@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,14 +16,16 @@ from backend.free.api.chat._artifact import remember_artifact
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.history import history_manager as _history_manager_module
 from backend.free.history.history_manager import (
-    SessionData,
+    active_base_model_key,
     active_base_model_name,
     get_history_manager,
 )
 from backend.free.history.utils import parse_iso
 from backend.free.core.text_quality import extract_calculate_result, extract_measured_values
+from backend.io.readonly import DataReadonlyError
+from backend.io.writer_thread import default_writer
 from backend.log_config import get_logger
-from backend.trace_context import get_trace_id, run_in_executor_with_context
+from backend.trace_context import get_trace_id
 from backend.utils import format_utc, utc_now_dt
 
 if TYPE_CHECKING:
@@ -147,9 +147,8 @@ class SessionLedger:
     had_private: bool = False
     #: 会話単位の根拠台帳 (``[参考情報]`` に注入した資料の所在、ターン順)。
     sources: list[dict] = field(default_factory=list)
-    #: 最後に保存した ``SessionData``。**履歴保存ワーカーだけが触る** —
-    #: 毎ターン保存前にファイルを読み直さないためのキャッシュ。
-    saved: "SessionData | None" = None
+    #: ``turns`` のうち履歴の追記ログへ出し済みの件数 (次に出すターンの ``seq``)。
+    persisted: int = 0
 
 
 _ledgers: dict[str, SessionLedger] = {}
@@ -160,14 +159,6 @@ def _ledger(session_id: str, *, create: bool = True) -> SessionLedger | None:
     if led is None and create:
         led = _ledgers[session_id] = SessionLedger()
     return led
-
-#: 履歴ファイル書き出し用の 1 スレッド executor。``HistoryManager.save_session``
-#: はセッション JSON 全体 + index.json を毎ターン書き直す同期 I/O で、非同期
-#: ハンドラの中でそのまま走らせるとストリーミングの末尾がその分止まる。
-#: 1 スレッドなので同一セッションの連続保存が追い越さない。
-_HISTORY_SAVE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="history-save",
-)
 
 
 def _recorded_body(response: str) -> str:
@@ -311,6 +302,8 @@ def _ensure_session_restored(session_id: str, mgr=None) -> bool:
                 entry[key] = value
         restored.append(entry)
     led.turns = restored + list(led.turns)
+    # 復元したターンはディスクにある (追記ログの seq はこの続きから)。
+    led.persisted += len(restored)
     logger.info(
         "Restored %d turn(s) of session %s from history (started_at=%s)",
         len(restored), session_id, started,
@@ -534,118 +527,30 @@ def turn_fewshot_ids(session_id: str) -> list[str]:
     return list(rec.fewshot_ids) if rec is not None else []
 
 
-def _existing_session(mgr, session_id: str) -> "SessionData | None":
-    """保存済みセッションを読む (無ければ ``None``)。
-
-    自動保存は毎ターン走る。以前は ``SessionData`` を 9 / 19 フィールドで
-    作り直しており、sleep-time が書いた ``summary_embedding`` /
-    ``summary_turn_count`` / ``promoted_to_semmem`` と ``project_id`` /
-    ``cartridge_ids`` / ``token_info`` / ``duration_sec`` / ``archived_at`` が
-    **次のターンで消えていた** (2026-09-05 監査)。既存レコードを土台にして
-    このターンで確定する値だけ差し替える。
-    """
-    try:
-        # 索引に無いセッション (初回ターン) はファイルも無いので読みに行かない。
-        if not mgr.get_session_started_at(session_id):
-            return None
-        session = mgr.get_session(session_id)
-    except Exception as exc:
-        logger.debug("history load failed for %s: %s", session_id, exc)
-        return None
-    return session if isinstance(session, SessionData) else None
-
-
-def _existing_summary(mgr, session_id: str) -> str | None:
-    """既に生成済みのセッション要約を引き継ぐ (未生成なら ``None``)。
-
-    自動保存は毎ターン走るため、sleep-time の LLM 要約器が書いた要約を
-    次ターンの保存で消さないよう索引から読み直す (``HistoryManager.get_summary``)。
-    """
-    try:
-        summary = mgr.get_summary(session_id)
-    except Exception:
-        return None
-    return summary if isinstance(summary, str) else None
-
-
 def _submit_history_persist(
     mgr, ledger: SessionLedger, history_turns: list[dict], meta: dict,
 ) -> None:
-    """:func:`_persist_session` をワーカースレッドへ投げる (ループ外なら同期実行)。
+    """未出力のターンを履歴の追記ログへ出す (c_05 §2.1 / §0.5.9)。
 
-    ファイル I/O は ``_HISTORY_SAVE_EXECUTOR`` (1 スレッド) で直列に走る。
-    非同期ハンドラの外 (CLI / テスト) から呼ばれた場合はその場で書く。
+    ループで行うのは行の直列化と enqueue だけ (書き手スレッドが書く)。以前は
+    毎ターンセッション JSON 全体と index.json を書き直していた。要約・昇格印は
+    セッション JSON の側にあり、畳むときに引き継がれる (追記ログは触らない) ので、
+    sleep-time の要約器が書いた値を次のターンで消さない。
+
+    ``history_turns`` は ``ledger.turns[ledger.persisted:]`` を履歴の形にしたもの。
     """
-    def _log_result(fut) -> None:
-        try:
-            path = fut.result()
-        except Exception as exc:
-            logger.warning("Failed to save session to history: %s", exc)
-            return
-        if path:
-            logger.debug(
-                "Session saved to history: %s (%d turns)",
-                meta["session_id"], len(history_turns),
-            )
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-    if loop is None:
-        path = _persist_session(mgr, ledger, history_turns, meta)
-        if path:
-            logger.debug(
-                "Session saved to history: %s (%d turns)",
-                meta["session_id"], len(history_turns),
-            )
-        return
-    fut = run_in_executor_with_context(
-        loop, _HISTORY_SAVE_EXECUTOR, _persist_session, mgr, ledger, history_turns, meta,
+    contents = tuple(
+        (str(t.get("role", "")), str(t.get("content", ""))) for t in ledger.turns
     )
-    fut.add_done_callback(_log_result)
-
-
-def _persist_session(
-    mgr, ledger: SessionLedger, history_turns: list[dict], meta: dict,
-):
-    """履歴ファイルと索引の読み書き (**履歴保存ワーカーだけが走らせる**)。
-
-    以前は毎ターン、イベントループ側で既存セッション JSON を全読みして
-    ``SessionData`` を組み直し (会話 1 本で O(n²))、書込みだけをワーカーへ
-    逃がしていた。読み手 (ループ) と書き手 (ワーカー) が
-    ``HistoryManager._index`` を無同期で触るので、負けた側の 1 ターンで
-    sleep-time が書いた要約や昇格印が消えた。ここでは読みも書きもこのスレッド
-    に閉じ、既存レコードは ``ledger.saved`` に持って再読しない。要約だけは
-    sleep-time の要約器が索引へ書くので毎回引き直す。
-    """
-    session_id = meta["session_id"]
-    session = ledger.saved or _existing_session(mgr, session_id) or SessionData()
-    modes_used = list(session.modes_used or [])
-    if meta["mode"] not in modes_used:
-        modes_used.append(meta["mode"])
-
-    session.session_id = session_id
-    session.started_at = meta["started_at"]
-    session.ended_at = meta["ended_at"]
-    session.mode = meta["mode"]
-    session.modes_used = modes_used
-    session.instance_name = meta["instance_name"]
-    session.base_model = meta["base_model"]
-    session.source = "auto"
-    session.turns = history_turns
-    session.turn_count = len(history_turns)
-    # summary は書かない (None のまま残す)。sleep-time の LLM 要約器は
-    # ``summary is None`` のセッションだけを対象にするため、ここで最初の
-    # 発話などを書くと要約器が永久に発火しない (2026-07-26 実測)。既に要約が
-    # 付いているセッションは上書きせず引き継ぐ。
-    session.summary = _existing_summary(mgr, session_id) or session.summary
-    if meta.get("project_id") and not session.project_id:
-        session.project_id = meta["project_id"]
-
-    path = mgr.save_session(session)
-    ledger.saved = session
-    return path
+    mgr.append_turns(
+        meta["session_id"], history_turns, meta,
+        first_seq=ledger.persisted, contents=contents,
+    )
+    ledger.persisted += len(history_turns)
+    logger.debug(
+        "Session turns queued for history: %s (+%d, %d total)",
+        meta["session_id"], len(history_turns), ledger.persisted,
+    )
 
 
 def _save_session_to_history(
@@ -657,9 +562,9 @@ def _save_session_to_history(
     同一 session_id のファイルは上書きされるため冪等。WorkingMemory ではなく
     台帳の全ターンを使い、WM のエビクションで古いターンが失われる問題を回避する。
 
-    このスレッド (イベントループ) では **ターン列のスナップショットと
-    メタ情報を組むだけ** にし、ファイル / 索引の読み書きは
-    :func:`_persist_session` (ワーカー 1 本) に閉じる。
+    このスレッド (イベントループ) では **まだ出していないターンとメタ情報の
+    行を組んで enqueue するだけ** にし、ファイル / 索引の読み書きは書き手スレッド
+    (:mod:`backend.io.writer_thread`) に閉じる。
 
     ``state`` からは ``current_project_id`` だけを読む (create モードの
     プロジェクト紐付け。以前は書かれておらず全セッションが ``None`` だった)。
@@ -688,6 +593,11 @@ def _save_session_to_history(
             )
             return
 
+        from backend.io.readonly import is_readonly
+
+        if is_readonly():
+            logger.debug("History not saved: data root is read-only")
+            return
         mgr = get_history_manager()
 
         # 再起動を跨いだ続きなら、索引の開始時刻と既存ターンを先に引き継ぐ
@@ -710,9 +620,9 @@ def _save_session_to_history(
             else:
                 ledger.started_at = format_utc(utc_now_dt())
 
-        # ターンを履歴用フォーマットに変換
+        # まだ出していないターンだけを履歴用フォーマットに変換
         history_turns = []
-        for t in turns:
+        for t in turns[ledger.persisted:]:
             entry = {"role": t["role"], "content": t["content"]}
             ts = t.get("timestamp")
             if ts:
@@ -731,9 +641,12 @@ def _save_session_to_history(
             "mode": mode,
             "instance_name": cfg.get("instance", {}).get("name", "evoref"),
             "base_model": active_base_model_name(cfg),
+            "model_key": active_base_model_key(),
             "project_id": project_id,
         }
         _submit_history_persist(mgr, ledger, history_turns, meta)
+    except DataReadonlyError:
+        logger.debug("History not saved: data root is read-only")
     except Exception as e:
         logger.warning("Failed to save session to history: %s", e)
 
@@ -759,6 +672,13 @@ def end_session(state: AppState, session_id: str) -> bool:
     if registry is not None:
         dropped = registry.drop(session_id) is not None
     release_session_turns(session_id)
+    # 閉じたセッションの追記ログをセッション JSON へ畳む (書き手スレッドで、待たない)。
+    mgr = _history_manager_module._manager_cache
+    if mgr is not None:
+        try:
+            mgr.close_session(session_id)
+        except Exception as exc:
+            logger.warning("Failed to close history session %s: %s", session_id, exc)
     for tracker in (
         getattr(state, "judge_tracker", None),
         getattr(state, "conflict_judge_tracker", None),
@@ -1099,9 +1019,8 @@ def _active_gen_config(
         generation = getattr(evolver, "generation", None)
         if isinstance(generation, int):
             ref.policy_generation = generation
-    lora_version = getattr(state, "active_lora_version", None)
-    if isinstance(lora_version, int):
-        ref.lora_version = lora_version
+    # adapters は記録しない (空のまま): llama-server が載せたアダプタは起動時に決まり、
+    # backend はその版を追跡していない (GenerationConfigRef.adapters)。
     ref.evidence_ids = turn_evidence_ids(session_id) if session_id else []
     rag_meta = turn_rag_meta(session_id) if session_id else None
     if rag_meta is not None:
@@ -1196,6 +1115,8 @@ def _finish_turn_bookkeeping(
     # 会話履歴をディスクに保存 (private なら蓄積されていないので no-op)
     if not private:
         _save_session_to_history(state, session_id, mode)
+    # このターンの追記 (経験・履歴) をファイルごとに 1 回 fsync する (書き手スレッド)。
+    default_writer().end_turn()
 
 
 def record_response(

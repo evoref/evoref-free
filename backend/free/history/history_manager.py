@@ -1,24 +1,36 @@
 """会話履歴の自動保存・アーカイブ・検索・圧縮
 
-セッション終了時に自動保存し、sleep-time で要約・圧縮を行う。
+アクティブなセッションはターンごとの追記ログに書き、閉じたときにセッション JSON へ
+畳む (c_05 §2.1 / §0.5.9)。sleep-time で要約・圧縮を行う。
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
+import io
 import math
 import os
-import threading
-from dataclasses import dataclass, field, asdict
+import re
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 from backend.free.history.utils import parse_iso, snippet_around
 from backend.free.rag.evidence.tokenize import tokenize_ja
-from backend.io import atomic_write_text
+from backend.io import jsoncodec
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.readonly import DataReadonlyError, is_readonly
+from backend.io.versioned import ReadResult, build_envelope, read_versioned
+from backend.io.writer_thread import ChatWriter, default_writer
 from backend.log_config import get_logger
-from backend.utils import utc_now_dt
+from backend.utils import utc_now, utc_now_dt
 
 logger = get_logger("history.manager")
 
@@ -121,9 +133,10 @@ def _text_matches_query(text: str, query_lower: str) -> bool:
     return overlap >= required
 
 
+@persisted()
 @dataclass
 class SessionData:
-    """セッションデータ"""
+    """セッションデータ (``history.session`` の payload。コーデックの表、c_05 §0.5.2)"""
     session_id: str = ""
     started_at: str = ""
     ended_at: str = ""
@@ -131,14 +144,16 @@ class SessionData:
     mode: str = "chat"
     modes_used: list[str] = field(default_factory=list)
     instance_name: str = "evoref"
+    #: 表示用のモデル名 (GGUF のファイル名)。
     base_model: str = ""
+    #: base モデルの ``model_key`` (c_05 §0.5.7)。モデルの照合はこちらで行う。
+    model_key: str | None = None
     source: str = "auto"  # "auto" | "manual"
-    turns: list[dict] = field(default_factory=list)
+    turns: list[dict[str, Any]] = field(default_factory=list)
     turn_count: int = 0
     context_files: list[str] = field(default_factory=list)
-    token_info: dict = field(default_factory=dict)
+    token_info: dict[str, Any] = field(default_factory=dict)
     summary: str | None = None
-    summary_embedding: list[float] | None = None
     #: ``summary`` を生成した時点の ``turn_count``。会話が進んで turn_count が
     #: これを上回ったら sleep-time が要約を作り直す (会話途中で要約が固定され、
     #: 後半の訂正が要約に反映されないのを防ぐ)。
@@ -149,39 +164,50 @@ class SessionData:
     project_id: str | None = None
     #: 会話の主言語 (``ja`` / ``en`` / 未判定は空)。横断検索の重み付け用。
     lang: str = ""
-    #: ``summary_embedding`` を作った埋め込みモデル。無記名だとモデル切替後に
-    #: 新旧のベクトルを区別できず、類似度が黙って壊れる (2026-09-05 監査)。
-    summary_embedding_model: str = ""
-    #: レコード版 (c_05 §0.5)。
-    schema_version: int = 1
+    # 要約の埋め込みはセッションに持たない (G0 の履歴ファイルの 81% がこの JSON
+    # 文字列だった)。埋め込みモデルごとの束 ``embeddings/<model>.npy`` + id 表
+    # (``history.summary_embeddings``) に置く (c_05 §2.1)。版は封筒が持つ。
+    #: この版が知らないキー (同じ版で足された任意フィールド)。書き戻しでトップへ戻す。
+    _extra: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> SessionData:
-        """dict から SessionData を復元"""
-        return cls(
-            session_id=data.get("session_id", ""),
-            started_at=data.get("started_at", ""),
-            ended_at=data.get("ended_at", ""),
-            duration_sec=data.get("duration_sec", 0),
-            mode=data.get("mode", "chat"),
-            modes_used=data.get("modes_used", []),
-            instance_name=data.get("instance_name", "evoref"),
-            base_model=data.get("base_model") or "",
-            source=data.get("source", "auto"),
-            turns=data.get("turns", []),
-            turn_count=data.get("turn_count", 0),
-            context_files=data.get("context_files", []),
-            token_info=data.get("token_info", {}),
-            summary=data.get("summary"),
-            summary_embedding=data.get("summary_embedding"),
-            summary_turn_count=int(data.get("summary_turn_count", 0) or 0),
-            archived_at=data.get("archived_at", ""),
-            promoted_to_semmem=bool(data.get("promoted_to_semmem", False)),
-            project_id=data.get("project_id"),
-            lang=data.get("lang", ""),
-            summary_embedding_model=data.get("summary_embedding_model", ""),
-            schema_version=int(data.get("schema_version", 1) or 1),
-        )
+        """payload の dict から復元する (null / 欠損は既定値、未知キーは ``_extra``)。
+
+        型の違う値は :class:`~backend.io.codec.CodecError`。
+        """
+        return _SESSION_CODEC.decode(data)
+
+    def to_dict(self) -> dict[str, Any]:
+        """payload の dict (``_extra`` はトップへ戻す)。"""
+        return _SESSION_CODEC.encode(self)
+
+
+_SESSION_CODEC = codec_for(SessionData)
+
+
+@persisted()
+@dataclass
+class TurnRow:
+    """ターンの追記ログ (``history.turns``) の ``op: turn`` の行 (``_v`` / ``op`` を除く)。
+
+    ``seq`` はセッション全体での位置。畳み込みは ``seq < len(セッション JSON のターン)``
+    の行を飛ばすので、JSON を書いた後・ログを消す前に落ちても二重に畳まない。
+    """
+
+    seq: int
+    turn: dict[str, Any]
+    #: この版が知らない行のキー。畳むときはそのターンへ移す (ターン側のキーが勝つ)。
+    _extra: dict[str, Any] | None = None
+
+    def folded_turn(self) -> dict[str, Any]:
+        """セッション JSON の ``turns`` に入れるターン (行の未知キーを含む)。"""
+        return {**self._extra, **self.turn} if self._extra else self.turn
+
+
+_TURN_ROW_CODEC = codec_for(TurnRow)
+#: 行の封筒のキー (行のレコードには含めない)。
+_ROW_KEYS = ("_v", "op")
 
 
 @dataclass
@@ -219,14 +245,58 @@ class HistoryIndex:
 _SEARCH_TEXT_MAX = 5000  # インデックスに保存する検索テキストの最大文字数
 _FIRST_USER_PREVIEW_MAX = 100  # 一覧見出しフォールバックに使う先頭文字数
 
+#: アクティブなセッションのターン追記ログの置き場 (``<history_dir>/active/``)。
+ACTIVE_DIR = "active"
+TURNS_SUFFIX = ".turns.jsonl"
+#: 要約の埋め込みの束の置き場 (``<history_dir>/embeddings/``)。
+EMBEDDINGS_DIR = "embeddings"
+INDEX_FILE = "index.json"
+#: 索引の遅延書き出し: 最後の変更からこの秒数静かなら書く。
+_INDEX_IDLE_SECONDS = 5.0
+#: 索引の遅延書き出し: 最初の変更からこの秒数で必ず書く。
+_INDEX_MAX_DELAY_SECONDS = 30.0
 
-def _atomic_write_json(filepath: Path, data: dict) -> None:
-    """JSON を atomic に書き込む (:func:`backend.io.atomic_write_text` 経由)。
-
-    書き込み中のクラッシュでもデータが失われないことを保証する。Windows の
-    書き込み競合時リトライは ``backend.io._retry`` が担う。
-    """
-    atomic_write_text(filepath, json.dumps(data, ensure_ascii=False, indent=2))
+SESSION_FORMAT = register_format(FormatSpec(
+    format_id="history.session",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/history/<yyyy-mm>/<yyyymmdd_hhmmss>_<session_id>.json",
+    retention="retention_full_days -> compressed -> summarized -> max_storage_mb",
+    export=True,
+    records=(SessionData,),
+))
+TURNS_FORMAT = register_format(FormatSpec(
+    format_id="history.turns",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/history/active/<sid>.turns.jsonl",
+    retention="folded into history.session on close / startup / shutdown / idle",
+    # 停止中の export では畳まれていない最後のターンがここにだけある (取り込み先の起動時に畳む)
+    export=True,
+    encodings=("jsonl",),
+    # メタ行はセッションの表 (SessionData) の部分集合を patch する素の dict
+    records=(TurnRow,),
+))
+INDEX_FORMAT = register_format(FormatSpec(
+    format_id="history.index",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key="store/history/index.json",
+    retention="rebuilt from history.session when built_from mismatches",
+))
+SUMMARY_EMBEDDINGS_FORMAT = register_format(FormatSpec(
+    format_id="history.summary_embeddings",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key="store/history/embeddings/<model>.npy",
+    retention="one bundle (vectors .npy + id table .ids.json) per embedding model",
+    encodings=("npy", "json"),
+    keep_on_reset=True,
+))
 
 
 def _build_first_user_preview(
@@ -335,31 +405,21 @@ def _find_matched_turns(session: SessionData, query_lower: str) -> list[dict]:
     return matched
 
 
-def _summarize_session_file(filepath: Path) -> float:
-    """要約化（ターン削除）、解放 MB を返す"""
-    with open(filepath, encoding="utf-8") as f:
-        data = json.load(f)
+def _summarize_session_data(data: dict) -> bool:
+    """要約化 (ターン削除)。変えたら ``True``。"""
     if not data.get("turns"):
-        return 0.0
-    old_size = filepath.stat().st_size
+        return False
     data["turns"] = []
-    _atomic_write_json(filepath, data)
-    new_size = filepath.stat().st_size
-    return (old_size - new_size) / (1024 * 1024)
+    return True
 
 
-def _compress_session_file(
-    filepath: Path,
-    preview_chars: int = 100,
-) -> float:
-    """圧縮保持（アシスタントターン切り詰め）、解放 MB を返す
+def _compress_session_data(data: dict, preview_chars: int = 100) -> bool:
+    """圧縮保持 (アシスタントターンの切り詰め)。変えたら ``True``。
 
     Args:
-        filepath: セッションファイルのパス
+        data: セッションの dict (``SessionData`` の永続形)
         preview_chars: 圧縮時に保持する先頭文字数
     """
-    with open(filepath, encoding="utf-8") as f:
-        data = json.load(f)
     compressed = False
     for turn in data.get("turns", []):
         if turn.get("role") == "assistant" and not turn.get("compressed"):
@@ -369,71 +429,444 @@ def _compress_session_file(
                 turn["compressed"] = True
                 turn["original_length"] = len(content)
                 compressed = True
-    if not compressed:
-        return 0.0
-    old_size = filepath.stat().st_size
-    _atomic_write_json(filepath, data)
-    new_size = filepath.stat().st_size
-    return (old_size - new_size) / (1024 * 1024)
+    return compressed
+
+
+# ── 永続形 (封筒・ターンの追記ログ) ──
+
+
+def session_bytes(session: SessionData) -> bytes:
+    """セッションを ``history.session`` の封筒にしたバイト列。"""
+    envelope = build_envelope(
+        format_id=SESSION_FORMAT.format_id, format_version=SESSION_FORMAT.version,
+        payload=session.to_dict(), component="HistoryManager",
+    )
+    return jsoncodec.dumps_bytes(envelope)
+
+
+def read_session_file(path: Path) -> ReadResult:
+    """セッションファイルを読んで分類する (``read_versioned``)。
+
+    payload がセッションの表で読めない (型の違う値) なら ``corrupt``。読めたときの
+    ``payload`` は素の dict のまま (型付きにするのは :meth:`SessionData.from_dict`)。
+    """
+    result = read_versioned(
+        path, format_id=SESSION_FORMAT.format_id, format_version=SESSION_FORMAT.version,
+    )
+    if result.ok:
+        try:
+            SessionData.from_dict(result.payload)
+        except CodecError as e:
+            return ReadResult("corrupt", version=result.version, detail=f"payload: {e}")
+    return result
+
+
+def turn_log_lines(meta: dict, rows: Iterable[TurnRow]) -> list[str]:
+    """ターンの追記ログに足す行 (メタ 1 行 + ターンごとに 1 行)。"""
+    version = TURNS_FORMAT.version
+    lines = [jsoncodec.dumps({"_v": version, "op": "meta", **meta})]
+    for row in rows:
+        lines.append(jsoncodec.dumps({"_v": version, "op": "turn", **_TURN_ROW_CODEC.encode(row)}))
+    return lines
+
+
+@dataclass
+class TurnLog:
+    """ターンの追記ログを畳んだもの。"""
+
+    meta: dict = field(default_factory=dict)
+    modes: list[str] = field(default_factory=list)
+    #: ターンの行 (書いた順)。
+    turns: list[TurnRow] = field(default_factory=list)
+    bad_lines: int = 0
+
+
+def fold_turn_log(path: Path) -> TurnLog:
+    """``<sid>.turns.jsonl`` を畳む。途中で切れた行・壊れた行・知らない版は飛ばす。
+
+    メタ行の値の型はセッションの表 (:class:`SessionData`) で検査する。
+    """
+    log = TurnLog()
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return log
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        if b"\x00" in line:
+            log.bad_lines += 1
+            continue
+        try:
+            obj = jsoncodec.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            log.bad_lines += 1
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("_v"), int) or obj["_v"] > TURNS_FORMAT.version:
+            log.bad_lines += 1
+            continue
+        op = obj.get("op")
+        body = {k: v for k, v in obj.items() if k not in _ROW_KEYS}
+        try:
+            if op == "meta":
+                meta = _SESSION_CODEC.check_mapping(body)
+                mode = meta.get("mode")
+                if isinstance(mode, str) and mode and mode not in log.modes:
+                    log.modes.append(mode)
+                log.meta.update(meta)
+            elif op == "turn":
+                log.turns.append(_TURN_ROW_CODEC.decode(body))
+            else:
+                log.bad_lines += 1
+        except CodecError:
+            log.bad_lines += 1
+    if log.bad_lines:
+        logger.warning("Skipped %d unreadable line(s) in %s", log.bad_lines, path)
+    return log
+
+
+def merge_turn_log(base: SessionData | None, log: TurnLog) -> SessionData:
+    """セッション JSON (無ければ新規) にターンの追記ログを重ねる。
+
+    ``seq`` が既存のターン数より小さい行は畳み込み済みなので飛ばす。
+    開始時刻は既存の JSON が勝つ (保存先ファイル名を決める)。メタ行のうちセッションの
+    表に無いキーはセッションの ``_extra`` へ、ターンの行の未知キーはそのターンへ移す
+    (同じ版で足された任意フィールドを畳み込みで落とさない、c_05 §0.4.4)。
+    """
+    session = base if base is not None else SessionData()
+    meta = log.meta
+    session.session_id = meta.get("session_id") or session.session_id
+    if not session.started_at:
+        session.started_at = meta.get("started_at") or ""
+    session.ended_at = meta.get("ended_at") or session.ended_at
+    session.mode = meta.get("mode") or session.mode
+    modes = list(session.modes_used or [])
+    for mode in log.modes:
+        if mode not in modes:
+            modes.append(mode)
+    session.modes_used = modes
+    session.instance_name = meta.get("instance_name") or session.instance_name
+    session.base_model = meta.get("base_model") or session.base_model
+    session.model_key = meta.get("model_key") or session.model_key
+    if meta.get("project_id") and not session.project_id:
+        session.project_id = meta["project_id"]
+    extra = {k: v for k, v in meta.items() if k not in _SESSION_CODEC.known}
+    if extra:
+        session._extra = {**(session._extra or {}), **extra}
+    turns = list(session.turns)
+    for row in log.turns:
+        if row.seq < len(turns):
+            continue
+        turns.append(row.folded_turn())
+    session.turns = turns
+    session.turn_count = len(turns)
+    return session
+
+
+def _model_file_key(model: str) -> str:
+    """埋め込みモデル名をファイル名の鍵にする。
+
+    G1 の埋め込み ``model_key`` (c_05 §0.5.7) が入るまでの暫定: 埋め込みモデル名を
+    ファイル名に使える文字へ寄せる。
+    """
+    key = re.sub(r"[^A-Za-z0-9._-]+", "_", model or "").strip("._")
+    return key or "unknown"
+
+
+def _files_digest(files: dict[str, tuple[int, int]]) -> str:
+    """原本 (セッション JSON) の一覧の指紋 (``built_from``)。"""
+    h = hashlib.sha256()
+    for rel in sorted(files):
+        size, mtime = files[rel]
+        h.update(f"{rel}\t{size}\t{mtime}\n".encode())
+    return h.hexdigest()[:32]
 
 
 class HistoryManager:
-    """会話履歴のアーカイブ管理"""
+    """会話履歴のアーカイブ管理
 
-    def __init__(self, history_dir: Path, config: dict | None = None):
+    書き込みは全てチャット経路の書き手スレッド (c_05 §0.5.9、
+    :mod:`backend.io.writer_thread`) の上で行う:
+
+    - アクティブなセッションはターンごとの追記ログ ``active/<sid>.turns.jsonl``
+      (``history.turns``) に書き、閉じたとき (:meth:`close_session`)・起動時・停止時・
+      sleep-time (しばらく追記の無いもの) にセッション JSON (``history.session``) へ
+      畳む。
+    - 索引 ``index.json`` (``history.index``、derived) はメモリ上の不変スナップショットで、
+      読み手はロックを取らずに読む (書き換えは書き手スレッドだけが新しいスナップショットを
+      差し込む)。ファイルへの書き出しは遅延 (最後の変更から 5 秒 / 最初の変更から最長
+      30 秒 / 停止時)。``built_from`` に原本の一覧の指紋を持ち、起動時に合わなければ
+      原本から作り直す。書き順は常に原本が先。
+    """
+
+    def __init__(
+        self, history_dir: Path, config: dict | None = None, *,
+        writer: ChatWriter | None = None,
+    ):
         self.history_dir = history_dir
         self.history_dir.mkdir(parents=True, exist_ok=True)
 
         history_cfg = (config or {}).get("history", {})
         self.auto_save: bool = history_cfg.get("auto_save", True)
-        self.checkpoint_interval: int = history_cfg.get("checkpoint_interval", 10)
         self.retention_full_days: int = history_cfg.get("retention_full_days", 90)
         self.retention_compressed_days: int = history_cfg.get("retention_compressed_days", 365)
         self.max_storage_mb: float = history_cfg.get("max_storage_mb", 200)
         self.compress_preview_chars: int = history_cfg.get("compress_preview_chars", 100)
 
-        self._checkpoint_dir = history_dir / ".checkpoint"
+        self._writer = writer if writer is not None else default_writer()
+        self._active_dir = history_dir / ACTIVE_DIR
+        self._embeddings_dir = history_dir / EMBEDDINGS_DIR
+        #: 公開中の索引 (差し替えるだけで書き換えない)。``None`` なら次の読みで読む。
         self._index: HistoryIndex | None = None
-        # 索引の読み書きを直列化する (履歴保存ワーカー / sleep-time の要約器 /
-        # API のリスト取得が別スレッドから触る)。再入可 (save_session →
-        # _update_index → _load_index / _save_index)。
-        self._lock = threading.RLock()
-        #: ``_index`` を読んだ時点の ``index.json`` の mtime (ns)。
-        self._index_mtime: int | None = None
+        #: 原本の相対パス → (サイズ, mtime_ns)。``built_from`` の元。
+        self._files: dict[str, tuple[int, int]] = {}
+        #: 索引の書き出し待ち: (最初の変更, 最後の変更) の monotonic 時刻。
+        self._index_dirty: tuple[float, float] | None = None
+        #: 埋め込みのサイドカー (鍵 → (id 列, 行列))。書き手が丸ごと差し替える。
+        self._embeddings: dict[str, tuple[list[str], np.ndarray]] = {}
+        self._writer.add_tick(self._tick)
+
+    # ── 書き手スレッドで実行する ──
+
+    def _run(
+        self, fn: Callable[[], Any], *, format_id: str = "history.session",
+        paths: tuple[Path, ...] = (), wait: bool = True,
+    ) -> Any:
+        """``fn`` を書き手スレッドで実行する (``wait`` なら結果を待つ)。"""
+        if self._writer.is_writer_thread():
+            return fn()
+        future = self._writer.call(fn, format_id=format_id, paths=paths)
+        return future.result() if wait else None
+
+    def _turns_path(self, session_id: str) -> Path:
+        return self._active_dir / f"{session_id}{TURNS_SUFFIX}"
 
     # ── 保存 ──
 
     def save_session(self, session: SessionData) -> Path | None:
-        """セッションをアーカイブに保存
+        """セッション全体をアーカイブに保存 (渡された内容が正)。
 
         Returns:
             保存先パス（保存しなかった場合は None）
+
+        データ根が readonly なら書かない (チャットは動かし続ける、c_05 §0.4.2)。
         """
-        with self._lock:
-            skip_reason = _should_skip_session(session, self.auto_save)
-            if skip_reason:
-                logger.debug(skip_reason)
-                return None
+        if is_readonly():
+            logger.debug("History not saved: data root is read-only")
+            return None
+        skip_reason = _should_skip_session(session, self.auto_save)
+        if skip_reason:
+            logger.debug(skip_reason)
+            return None
+        _complete_session_metadata(session)
+        return self._run(lambda: self._write_session(session, None))
 
-            _complete_session_metadata(session)
-            filepath = self._resolve_session_path(session)
-            _atomic_write_json(filepath, asdict(session))
+    def append_turns(
+        self, session_id: str, turns: list[dict], meta: dict, *,
+        first_seq: int, contents: tuple[tuple[str, str], ...],
+    ) -> None:
+        """アクティブなセッションのターンを追記ログへ出す (イベントループから)。
 
-            entry = self._build_index_entry(session, filepath)
-            self._update_index(entry)
-            self._clear_checkpoint(session.session_id)
+        ループで行うのは行の直列化と enqueue だけ。索引の項目は書き手スレッドが
+        追記の後に差し替える (``contents`` は一覧の見出し・検索テキスト用の
+        ``(role, content)`` の列 — セッション全体)。
 
-            logger.info("Session saved: %s (%d turns, %d bytes)",
-                         session.session_id, session.turn_count, entry.size_bytes)
-            return filepath
+        readonly なら :class:`~backend.io.readonly.DataReadonlyError`。
+        """
+        lines = turn_log_lines(meta, (TurnRow(first_seq + i, turn) for i, turn in enumerate(turns)))
+        self._writer.append(self._turns_path(session_id), lines, format_id=TURNS_FORMAT.format_id)
+        self._writer.call(
+            lambda: self._refresh_active_entry(session_id, meta, contents),
+            format_id=INDEX_FORMAT.format_id,
+        )
+
+    def close_session(self, session_id: str, *, wait: bool = False) -> None:
+        """セッションを閉じる: 追記ログをセッション JSON へ畳む。"""
+        if is_readonly():
+            return
+        # ログの有無は書き手スレッドで見る (ここでは先に出した追記がまだ書かれて
+        # いないことがある)。
+        self._run(lambda: self._fold(session_id), paths=(self._turns_path(session_id),), wait=wait)
+
+    def fold_active_sessions(self, *, idle_seconds: float | None = None) -> int:
+        """追記ログを畳む (起動時の取り残し・停止時・sleep-time の放置分)。
+
+        ``idle_seconds`` を指定したら、最後の追記からその秒数を過ぎたログだけ。
+        畳んだ件数を返す。readonly なら畳まない (読み手はログを重ねて読む)。
+        """
+        if is_readonly() or not self._active_dir.is_dir():
+            return 0
+        now = time.time()
+        targets: list[str] = []
+        for path in sorted(self._active_dir.glob(f"*{TURNS_SUFFIX}")):
+            if idle_seconds is not None:
+                try:
+                    if now - path.stat().st_mtime < idle_seconds:
+                        continue
+                except OSError:
+                    continue
+            targets.append(path.name[: -len(TURNS_SUFFIX)])
+        if not targets:
+            return 0
+
+        def run() -> int:
+            self._index_or_load()
+            return sum(1 for sid in targets if self._fold(sid) is not None)
+
+        folded = self._run(run, paths=tuple(self._turns_path(s) for s in targets))
+        if folded:
+            logger.info("Folded %d active session log(s) into history", folded)
+        return folded
+
+    def update_session_fields(self, session_id: str, **fields: Any) -> bool:
+        """セッションのフィールドを書き換える (要約・言語・昇格印)。
+
+        追記ログがあれば一緒に畳む (書き手スレッドの上で追記と直列になるので、
+        読んでから書くまでの間に届いたターンを落とさない)。
+        """
+        if is_readonly():
+            return False
+        return bool(self._run(
+            lambda: self._fold(session_id, updates=fields, require_log=False) is not None,
+            paths=(self._turns_path(session_id),),
+        ))
+
+    def mark_promoted_to_semmem(self, session_id: str) -> bool:
+        """セッションを SemMem 昇格済としてマーク
+
+        索引とセッション本体の両方に反映する (再起動後に再昇格しないため)。
+
+        Returns:
+            マークに成功したら ``True``、未存在なら ``False``。
+        """
+        if self._find_entry(session_id) is None:
+            return False
+        if self.update_session_fields(session_id, promoted_to_semmem=True):
+            return True
+
+        # 本体が無い (索引だけの) セッションは索引の印だけ付ける。
+        def mark_index() -> bool:
+            entry = self._find_entry(session_id)
+            if entry is None:
+                return False
+            self._put_entry(replace(entry, promoted_to_semmem=True))
+            return True
+
+        return bool(self._run(mark_index, format_id=INDEX_FORMAT.format_id))
+
+    # ── 書き手スレッドの中身 ──
+
+    def _write_session(self, session: SessionData, path: Path | None) -> Path:
+        target = path or self._resolve_session_path(session)
+        self._writer.write_now(target, session_bytes(session), fsync=True)
+        self._note_file(target)
+        entry = self._build_index_entry(session, target)
+        self._put_entry(entry)
+        logger.info("Session saved: %s (%d turns, %d bytes)",
+                    session.session_id, session.turn_count, entry.size_bytes)
+        return target
+
+    def _read_existing(self, session_id: str) -> tuple[SessionData | None, Path | None, bool]:
+        """索引の指すセッション JSON を読む。``(session, path, writable)``。
+
+        読めない (新しい版・別形式・壊れている) ファイルは上書きしない (``writable=False``)。
+        """
+        entry = self._find_entry(session_id)
+        if entry is None:
+            return None, None, True
+        path = self.history_dir / entry.file
+        result = read_session_file(path)
+        if result.status == "absent":
+            return None, None, True
+        if not result.ok:
+            logger.warning(
+                "History session %s is not readable (%s: %s); not writing to it",
+                path, result.status, result.detail,
+            )
+            return None, path, False
+        return SessionData.from_dict(result.payload), path, True
+
+    def _fold(
+        self, session_id: str, *, updates: dict | None = None, require_log: bool = True,
+    ) -> Path | None:
+        log_path = self._turns_path(session_id)
+        has_log = log_path.exists()
+        if require_log and not has_log:
+            return None
+        base, path, writable = self._read_existing(session_id)
+        if not writable:
+            return None
+        log = fold_turn_log(log_path) if has_log else TurnLog()
+        if base is None and not log.turns:
+            if has_log:
+                self._writer.remove_now(log_path)
+            return None
+        session = merge_turn_log(base, log)
+        for key, value in (updates or {}).items():
+            setattr(session, key, value)
+        skip_reason = _should_skip_session(session, self.auto_save)
+        if skip_reason and base is None:
+            logger.debug(skip_reason)
+            self._writer.remove_now(log_path)
+            return None
+        _complete_session_metadata(session)
+        target = self._write_session(session, path)
+        if has_log:
+            # 原本を書いた後で消す (間で落ちても seq で二重に畳まない)。
+            self._writer.remove_now(log_path)
+        return target
+
+    def _refresh_active_entry(
+        self, session_id: str, meta: dict, contents: tuple[tuple[str, str], ...],
+    ) -> None:
+        """追記の後に索引の項目を差し替える (書き手スレッド)。"""
+        entry = self._find_entry(session_id)
+        started_at = (entry.started_at if entry is not None and entry.started_at
+                      else meta.get("started_at") or "")
+        rel = entry.file if entry is not None else self._session_rel_path(started_at, session_id)
+        size = 0
+        for p in (self.history_dir / rel, self._turns_path(session_id)):
+            try:
+                size += p.stat().st_size
+            except OSError:
+                pass
+        view = SessionData(
+            summary=entry.summary if entry is not None else None,
+            turns=[{"role": r, "content": c} for r, c in contents],
+        )
+        fresh = IndexEntry(
+            session_id=session_id,
+            file=rel,
+            started_at=started_at,
+            duration_sec=entry.duration_sec if entry is not None else 0,
+            mode=meta.get("mode") or (entry.mode if entry is not None else "chat"),
+            turn_count=len(contents),
+            summary=view.summary,
+            summary_turn_count=entry.summary_turn_count if entry is not None else 0,
+            first_user_preview=_build_first_user_preview(view),
+            size_bytes=size,
+            search_text=_build_search_text(view),
+            promoted_to_semmem=entry.promoted_to_semmem if entry is not None else False,
+            project_id=(entry.project_id if entry is not None and entry.project_id
+                        else meta.get("project_id")),
+        )
+        self._put_entry(fresh)
+
+    def _session_rel_path(self, started_at: str, session_id: str) -> str:
+        """``<yyyy-mm>/<stamp>_<session_id>.json`` (session_id は全体、c_05 §0.5.5)。
+
+        先頭 8 文字に切ると、uuid4 の先頭が一致するセッション同士が同じファイル名になる。
+        session_id は API で ``[a-z0-9-]`` に限っているのでファイル名に使える。
+        """
+        started = parse_iso(started_at) or utc_now_dt()
+        return (f"{started.strftime('%Y-%m')}/"
+                f"{started.strftime('%Y%m%d_%H%M%S')}_{session_id}.json")
 
     def _resolve_session_path(self, session: SessionData) -> Path:
         """保存先パスの決定"""
-        started = parse_iso(session.started_at) or utc_now_dt()
-        month_dir = self.history_dir / started.strftime("%Y-%m")
-        month_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{started.strftime('%Y%m%d_%H%M%S')}_{session.session_id[:8]}.json"
-        return month_dir / filename
+        path = self.history_dir / self._session_rel_path(session.started_at, session.session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _build_index_entry(self, session: SessionData, filepath: Path) -> IndexEntry:
         """インデックスエントリ構築"""
@@ -455,103 +888,43 @@ class HistoryManager:
             project_id=session.project_id,
         )
 
-    def _refresh_index_entry(self, entry: IndexEntry, filepath: Path) -> None:
+    def _refresh_index_entry(self, entry: IndexEntry, filepath: Path) -> IndexEntry:
         """圧縮 / 要約化でファイルを書き換えた後、索引側を実ファイルへ揃える。
 
         揃えないと索引が「削除済みの本文」を持ち続け、検索がヒットするのに
         開くと無い状態になる。さらに保持ポリシーで消したはずの発話が
         ``index.json`` に原文のまま残る (2026-09-05 監査)。
         """
+        result = read_session_file(filepath)
+        if not result.ok:
+            logger.warning("Failed to refresh index entry for %s: %s", filepath, result.detail)
+            return entry
+        session = SessionData.from_dict(result.payload)
         try:
-            with open(filepath, encoding="utf-8") as f:
-                data = json.load(f)
-            session = SessionData.from_dict(data)
-        except (OSError, ValueError) as exc:
-            logger.warning("Failed to refresh index entry for %s: %s", filepath, exc)
-            return
-        entry.turn_count = session.turn_count or len(session.turns)
-        entry.search_text = _build_search_text(session)
-        entry.first_user_preview = _build_first_user_preview(session)
-        entry.summary = session.summary
-        entry.summary_turn_count = session.summary_turn_count
-        try:
-            entry.size_bytes = filepath.stat().st_size
+            size = filepath.stat().st_size
         except OSError:
-            pass
-
-    def mark_promoted_to_semmem(self, session_id: str) -> bool:
-        """セッションを SemMem 昇格済としてマーク
-
-        index 上のフラグを更新するとともに、セッション本体ファイルも
-        書き戻す (再起動後に再昇格しないため)。
-
-        Returns:
-            マークに成功したら ``True``、未存在なら ``False``。
-        """
-        index = self._load_index()
-        entry = next(
-            (e for e in index.sessions if e.session_id == session_id),
-            None,
+            size = entry.size_bytes
+        return replace(
+            entry,
+            turn_count=session.turn_count or len(session.turns),
+            search_text=_build_search_text(session),
+            first_user_preview=_build_first_user_preview(session),
+            summary=session.summary,
+            summary_turn_count=session.summary_turn_count,
+            size_bytes=size,
         )
-        if entry is None:
-            return False
-        entry.promoted_to_semmem = True
-        self._save_index(index)
-        # セッションファイル本体にも反映 (再起動耐性)
+
+    def _note_file(self, path: Path) -> None:
+        rel = path.relative_to(self.history_dir).as_posix()
         try:
-            session = self.get_session(session_id)
-            if session is not None:
-                session.promoted_to_semmem = True
-                filepath = self.history_dir / entry.file
-                if filepath.exists():
-                    _atomic_write_json(filepath, asdict(session))
-        except Exception as e:
-            logger.warning(
-                "mark_promoted_to_semmem: failed to update session file %s: %s",
-                session_id, e,
-            )
-        return True
+            st = path.stat()
+        except OSError:
+            self._files.pop(rel, None)
+            return
+        self._files[rel] = (st.st_size, st.st_mtime_ns)
 
-    # ── チェックポイント ──
-
-    def save_checkpoint(self, session: SessionData) -> Path:
-        """チェックポイントを保存"""
-        self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        filepath = self._checkpoint_dir / f"{session.session_id}.json"
-
-        data = asdict(session)
-        _atomic_write_json(filepath, data)
-
-        logger.debug("Checkpoint saved: %s", session.session_id)
-        return filepath
-
-    def promote_checkpoints(self) -> int:
-        """残存チェックポイントを正式アーカイブに昇格（起動時に呼ばれる）"""
-        if not self._checkpoint_dir.exists():
-            return 0
-
-        promoted = 0
-        for cp_file in self._checkpoint_dir.glob("*.json"):
-            try:
-                with open(cp_file, encoding="utf-8") as f:
-                    data = json.load(f)
-                session = SessionData.from_dict(data)
-                if session.turns:
-                    self.save_session(session)
-                    promoted += 1
-                cp_file.unlink()
-            except Exception as e:
-                logger.warning("Failed to promote checkpoint %s: %s", cp_file.name, e)
-
-        if promoted:
-            logger.info("Promoted %d checkpoints to archive", promoted)
-        return promoted
-
-    def _clear_checkpoint(self, session_id: str) -> None:
-        """チェックポイントを削除"""
-        cp = self._checkpoint_dir / f"{session_id}.json"
-        if cp.exists():
-            cp.unlink()
+    def _forget_file(self, rel: str) -> None:
+        self._files.pop(rel, None)
 
     # ── 取得 ──
 
@@ -570,7 +943,7 @@ class HistoryManager:
             (エントリリスト, 総件数)
         """
         index = self._load_index()
-        entries = index.sessions
+        entries = list(index.sessions)
 
         # フィルタ
         if mode:
@@ -601,14 +974,9 @@ class HistoryManager:
         return entries[offset:offset + limit], total
 
     def get_summary(self, session_id: str) -> str | None:
-        """索引上の要約を返す (未登録 / 未要約なら ``None``)。
-
-        毎ターンの自動保存が sleep-time の要約を消さないよう、保存側は
-        これで既存要約を引き継ぐ (``_load_index`` を外から触らせない)。
-        """
-        with self._lock:
-            entry = self._find_entry(session_id)
-            return entry.summary if entry is not None else None
+        """索引上の要約を返す (未登録 / 未要約なら ``None``)。"""
+        entry = self._find_entry(session_id)
+        return entry.summary if entry is not None else None
 
     def get_session_started_at(self, session_id: str) -> str | None:
         """索引上の開始時刻 (ISO 8601) を返す。未登録なら ``None``。
@@ -617,9 +985,8 @@ class HistoryManager:
         セッションが続くと、in-process の開始時刻が失われて別ファイルが
         できる — 保存側はまずこれで既存の開始時刻を引き継ぐ。
         """
-        with self._lock:
-            entry = self._find_entry(session_id)
-            return entry.started_at if entry is not None and entry.started_at else None
+        entry = self._find_entry(session_id)
+        return entry.started_at if entry is not None and entry.started_at else None
 
     def _find_entry(self, session_id: str) -> IndexEntry | None:
         index = self._load_index()
@@ -628,20 +995,25 @@ class HistoryManager:
         )
 
     def get_session(self, session_id: str) -> SessionData | None:
-        """セッション詳細を取得"""
-        with self._lock:
-            index = self._load_index()
-            entry = next((e for e in index.sessions if e.session_id == session_id), None)
-            if entry is None:
-                return None
-
-            filepath = self.history_dir / entry.file
-            if not filepath.exists():
-                return None
-
-            with open(filepath, encoding="utf-8") as f:
-                data = json.load(f)
-            return SessionData.from_dict(data)
+        """セッション詳細を取得 (アクティブなら追記ログを重ねて返す)。"""
+        entry = self._find_entry(session_id)
+        base: SessionData | None = None
+        if entry is not None:
+            result = read_session_file(self.history_dir / entry.file)
+            if result.ok:
+                base = SessionData.from_dict(result.payload)
+            elif result.status != "absent":
+                logger.warning(
+                    "History session %s is not readable (%s: %s)",
+                    entry.file, result.status, result.detail,
+                )
+        # 原本の後にログを読む (畳み込みと入れ違っても seq で二重にならない)。
+        log_path = self._turns_path(session_id)
+        if log_path.exists():
+            log = fold_turn_log(log_path)
+            if log.turns or base is not None:
+                base = merge_turn_log(base, log)
+        return base
 
     def search_sessions(
         self,
@@ -719,54 +1091,46 @@ class HistoryManager:
             results.sort(key=lambda r: r["relevance_score"], reverse=True)
         return results
 
+    # ── 削除 ──
+
     def delete_session(self, session_id: str) -> bool:
         """セッションを削除"""
-        index = self._load_index()
-        entry = next((e for e in index.sessions if e.session_id == session_id), None)
-        if entry is None:
-            return False
-
-        filepath = self.history_dir / entry.file
-        if filepath.exists():
-            filepath.unlink()
-
-        index.sessions = [e for e in index.sessions if e.session_id != session_id]
-        self._save_index(index)
-
-        logger.info("Session deleted: %s", session_id)
-        return True
+        return self.delete_sessions_batch([session_id]) > 0
 
     def delete_sessions_batch(self, session_ids: list[str]) -> int:
-        """複数セッションを一括削除
+        """複数セッションを一括削除 (本体・追記ログ・要約の埋め込み)
 
         Returns:
             削除したセッション数
         """
-        index = self._load_index()
         target_ids = set(session_ids)
-        to_delete = [e for e in index.sessions if e.session_id in target_ids]
-
+        to_delete = [e for e in self._load_index().sessions if e.session_id in target_ids]
         if not to_delete:
             return 0
+        logs = tuple(self._turns_path(e.session_id) for e in to_delete)
 
-        # インデックスから先に除去
-        delete_ids = {e.session_id for e in to_delete}
-        index.sessions = [
-            e for e in index.sessions if e.session_id not in delete_ids
-        ]
-        self._save_index(index)
+        def run() -> int:
+            delete_ids = {e.session_id for e in to_delete}
+            # 索引から先に除去 (公開は差し替え 1 回)
+            index = self._index_or_load()
+            self._publish(replace(
+                index, sessions=[e for e in index.sessions if e.session_id not in delete_ids],
+            ))
+            for entry in to_delete:
+                try:
+                    self._writer.remove_now(self.history_dir / entry.file)
+                    self._forget_file(entry.file)
+                    self._writer.remove_now(self._turns_path(entry.session_id))
+                except OSError as e:
+                    logger.warning("Failed to delete %s: %s", entry.file, e)
+            self._drop_embeddings(delete_ids)
+            # 利用者の削除操作は索引もすぐに書く (消した発話を index.json に残さない)。
+            self._write_index()
+            return len(to_delete)
 
-        # ファイル削除
-        for entry in to_delete:
-            filepath = self.history_dir / entry.file
-            try:
-                if filepath.exists():
-                    filepath.unlink()
-            except OSError as e:
-                logger.warning("Failed to delete %s: %s", filepath, e)
-
-        logger.info("Batch deleted %d sessions", len(to_delete))
-        return len(to_delete)
+        deleted = self._run(run, paths=logs)
+        logger.info("Deleted %d session(s): %s", deleted, sorted(target_ids)[:5])
+        return deleted
 
     # ── 圧縮 ──
 
@@ -776,37 +1140,61 @@ class HistoryManager:
         Returns:
             {"compressed": int, "summarized": int, "deleted": int, "freed_mb": float}
         """
+        return self._run(self._compact_sessions)
+
+    def _compact_sessions(self) -> dict:
         result = {"compressed": 0, "summarized": 0, "deleted": 0, "freed_mb": 0.0}
         now = utc_now_dt()
         compress_cutoff = now - timedelta(days=self.retention_full_days)
         summary_cutoff = now - timedelta(days=self.retention_compressed_days)
-        index = self._load_index()
+        index = self._index_or_load()
+        sessions = list(index.sessions)
 
-        for entry in index.sessions:
+        for i, entry in enumerate(sessions):
             started = parse_iso(entry.started_at)
             if started is None:
                 continue
             filepath = self.history_dir / entry.file
             if not filepath.exists():
                 continue
-
             if started < summary_cutoff:
-                freed = _summarize_session_file(filepath)
-                if freed > 0:
-                    result["summarized"] += 1
-                    result["freed_mb"] += freed
-                    self._refresh_index_entry(entry, filepath)
+                kind, change = "summarized", _summarize_session_data
             elif started < compress_cutoff:
-                freed = _compress_session_file(filepath, self.compress_preview_chars)
-                if freed > 0:
-                    result["compressed"] += 1
-                    result["freed_mb"] += freed
-                    self._refresh_index_entry(entry, filepath)
+                kind = "compressed"
 
-        result["deleted"] += self._enforce_storage_limit(index)
-        self._save_index(index)
+                def change(data: dict) -> bool:
+                    return _compress_session_data(data, self.compress_preview_chars)
+            else:
+                continue
+            freed = self._rewrite_session_file(filepath, change)
+            if freed > 0:
+                result[kind] += 1
+                result["freed_mb"] += freed
+                sessions[i] = self._refresh_index_entry(entry, filepath)
+
+        index = replace(index, sessions=sessions)
+        index, deleted = self._enforce_storage_limit(index)
+        result["deleted"] += deleted
+        self._publish(index)
+        self._write_index()
         logger.info("Compact completed: %s", result)
         return result
+
+    def _rewrite_session_file(self, filepath: Path, change: Callable[[dict], bool]) -> float:
+        """セッション JSON を ``change`` で書き換える。解放 MB を返す (変更なしは 0)。"""
+        result = read_session_file(filepath)
+        if not result.ok or not isinstance(result.payload, dict):
+            return 0.0
+        data = result.payload
+        if not change(data):
+            return 0.0
+        old_size = filepath.stat().st_size
+        self._writer.write_now(
+            filepath, session_bytes(SessionData.from_dict(data)), fsync=True,
+        )
+        self._note_file(filepath)
+        new_size = filepath.stat().st_size
+        return (old_size - new_size) / (1024 * 1024)
 
     def get_stats(self) -> dict:
         """統計情報を取得"""
@@ -826,108 +1214,258 @@ class HistoryManager:
             ),
         }
 
+    # ── 要約の埋め込み (history/embeddings/<model>.npy + id 表の 1 束) ──
+
+    def put_summary_embedding(
+        self, session_id: str, vector: list[float], model: str,
+    ) -> None:
+        """要約の埋め込みを束へ入れる (書き手スレッドで書く。待たない)。"""
+        if is_readonly():
+            return
+        key = _model_file_key(model)
+        vec = np.asarray(vector, dtype=np.float32)
+        self._run(
+            lambda: self._put_embedding(key, model, session_id, vec),
+            format_id=SUMMARY_EMBEDDINGS_FORMAT.format_id, wait=False,
+        )
+
+    def get_summary_embedding(self, session_id: str, model: str) -> list[float] | None:
+        """要約の埋め込み (無ければ ``None``)。"""
+        ids, matrix = self._embedding_bundle(_model_file_key(model))
+        try:
+            row = ids.index(session_id)
+        except ValueError:
+            return None
+        return matrix[row].tolist()
+
+    def _embedding_paths(self, key: str) -> tuple[Path, Path]:
+        return (self._embeddings_dir / f"{key}.npy",
+                self._embeddings_dir / f"{key}.ids.json")
+
+    def _embedding_bundle(self, key: str) -> tuple[list[str], np.ndarray]:
+        cached = self._embeddings.get(key)
+        if cached is not None:
+            return cached
+        npy, ids_path = self._embedding_paths(key)
+        bundle: tuple[list[str], np.ndarray] = ([], np.zeros((0, 0), dtype=np.float32))
+        result = read_versioned(
+            ids_path, format_id=SUMMARY_EMBEDDINGS_FORMAT.format_id,
+            format_version=SUMMARY_EMBEDDINGS_FORMAT.version,
+        )
+        if result.ok and isinstance(result.payload, dict):
+            ids = [str(i) for i in result.payload.get("ids") or []]
+            try:
+                matrix = np.load(npy, allow_pickle=False)
+            except (OSError, ValueError) as exc:
+                logger.warning("Summary embeddings %s unreadable; dropping them: %s", npy, exc)
+            else:
+                # 束が揃っていなければ捨てる (derived。id 表が最後に書かれる)。
+                if matrix.ndim == 2 and matrix.shape[0] == len(ids):
+                    bundle = (ids, matrix)
+                else:
+                    logger.warning(
+                        "Summary embeddings %s do not match their id table (%s rows vs %d ids); "
+                        "dropping them", npy, matrix.shape, len(ids),
+                    )
+        self._embeddings[key] = bundle
+        return bundle
+
+    def _put_embedding(self, key: str, model: str, session_id: str, vec: np.ndarray) -> None:
+        ids, matrix = self._embedding_bundle(key)
+        ids = list(ids)
+        if matrix.size and matrix.shape[1] != vec.shape[0]:
+            logger.warning(
+                "Summary embedding dimension changed for %s (%d -> %d); starting a new bundle",
+                key, matrix.shape[1], vec.shape[0],
+            )
+            ids, matrix = [], np.zeros((0, vec.shape[0]), dtype=np.float32)
+        if not matrix.size:
+            matrix = np.zeros((0, vec.shape[0]), dtype=np.float32)
+        if session_id in ids:
+            matrix = matrix.copy()
+            matrix[ids.index(session_id)] = vec
+        else:
+            ids.append(session_id)
+            matrix = np.vstack([matrix, vec[None, :]])
+        self._write_embeddings(key, model, ids, matrix)
+
+    def _drop_embeddings(self, session_ids: set[str]) -> None:
+        if not self._embeddings_dir.is_dir():
+            return
+        for ids_path in self._embeddings_dir.glob("*.ids.json"):
+            key = ids_path.name[: -len(".ids.json")]
+            ids, matrix = self._embedding_bundle(key)
+            keep = [i for i, sid in enumerate(ids) if sid not in session_ids]
+            if len(keep) == len(ids):
+                continue
+            model = ""
+            result = read_versioned(
+                ids_path, format_id=SUMMARY_EMBEDDINGS_FORMAT.format_id,
+                format_version=SUMMARY_EMBEDDINGS_FORMAT.version,
+            )
+            if result.ok and isinstance(result.payload, dict):
+                model = str(result.payload.get("model") or "")
+            self._write_embeddings(key, model, [ids[i] for i in keep], matrix[keep])
+
+    def _write_embeddings(self, key: str, model: str, ids: list[str], matrix: np.ndarray) -> None:
+        npy, ids_path = self._embedding_paths(key)
+        buf = io.BytesIO()
+        np.save(buf, matrix.astype(np.float32, copy=False), allow_pickle=False)
+        # 行列を先に、id 表を後に書く (id 表が束の確定。行数が合わなければ読み手が捨てる)。
+        self._writer.write_now(npy, buf.getvalue(), fsync=False)
+        envelope = build_envelope(
+            format_id=SUMMARY_EMBEDDINGS_FORMAT.format_id,
+            format_version=SUMMARY_EMBEDDINGS_FORMAT.version,
+            payload={"model": model, "rows": len(ids), "ids": ids},
+            component="HistoryManager",
+        )
+        self._writer.write_now(ids_path, jsoncodec.dumps_bytes(envelope), fsync=False)
+        self._embeddings[key] = (ids, matrix)
+
     # ── インデックス管理 ──
 
     def _load_index(self) -> HistoryIndex:
-        """インデックスを読込み（mtime が変わっていたら読み直す）。
+        """公開中の索引を返す (ロックを取らない)。未読なら書き手スレッドで読む。"""
+        index = self._index
+        if index is not None:
+            return index
+        return self._run(self._index_or_load, format_id=INDEX_FORMAT.format_id)
 
-        以前はプロセス内キャッシュを一度読んだら二度と更新しなかった。
-        サーバと CLI が同時に動く構成では両者が全体を書き戻すため、
-        **後に書いた側が相手のセッションを黙って消していた**
-        (2026-09-05 監査)。atomic 書き込みは壊れたファイルを防ぐだけで、
-        ロストアップデートは防がない。mtime を見て読み直す。
-        """
-        with self._lock:
-            index_path = self.history_dir / "index.json"
-            try:
-                mtime = index_path.stat().st_mtime_ns
-            except OSError:
-                mtime = None
-
-            if self._index is not None and mtime == self._index_mtime:
-                return self._index
-
-            if mtime is None:
-                self._index = HistoryIndex()
-                self._index_mtime = None
-                return self._index
-
-            with open(index_path, encoding="utf-8") as f:
-                data = json.load(f)
-            self._index_mtime = mtime
-
-            sessions = [
-                IndexEntry(
-                    session_id=s["session_id"],
-                    file=s["file"],
-                    started_at=s.get("started_at", ""),
-                    duration_sec=s.get("duration_sec", 0),
-                    mode=s.get("mode", "chat"),
-                    turn_count=s.get("turn_count", 0),
-                    summary=s.get("summary"),
-                    summary_turn_count=int(s.get("summary_turn_count", 0) or 0),
-                    first_user_preview=s.get("first_user_preview", ""),
-                    size_bytes=s.get("size_bytes", 0),
-                    search_text=s.get("search_text", ""),
-                    promoted_to_semmem=bool(s.get("promoted_to_semmem", False)),
-                    project_id=s.get("project_id"),
-                )
-                for s in data.get("sessions", [])
-            ]
-
-            self._index = HistoryIndex(
-                updated_at=data.get("updated_at", ""),
-                total_sessions=data.get("total_sessions", len(sessions)),
-                total_turns=data.get("total_turns", 0),
-                total_size_mb=data.get("total_size_mb", 0.0),
-                sessions=sessions,
-            )
+    def _index_or_load(self) -> HistoryIndex:
+        """(書き手スレッド) 索引を読む。``built_from`` が原本と合わなければ作り直す。"""
+        if self._index is not None:
             return self._index
+        files = self._scan_originals()
+        digest = _files_digest(files)
+        self._files = files
+        index_path = self.history_dir / INDEX_FILE
+        result = read_versioned(
+            index_path, format_id=INDEX_FORMAT.format_id, format_version=INDEX_FORMAT.version,
+        )
+        payload = result.payload if result.ok and isinstance(result.payload, dict) else None
+        if payload is not None and payload.get("built_from") == digest:
+            self._index = _index_from_payload(payload)
+            return self._index
+        reason = (result.status if payload is None else "built_from mismatch")
+        index = self._build_index_from_files(files)
+        self._index = index
+        if result.status != "absent" or files:
+            logger.info("History index rebuilt from %d session file(s) (%s)", len(files), reason)
+            try:
+                self._write_index()
+            except DataReadonlyError:
+                logger.debug("History index not written: data root is read-only")
+        return index
 
-    def _update_index(self, entry: IndexEntry) -> None:
-        """インデックスにエントリを追加"""
-        with self._lock:
-            index = self._load_index()
+    def _scan_originals(self) -> dict[str, tuple[int, int]]:
+        files: dict[str, tuple[int, int]] = {}
+        if not self.history_dir.is_dir():
+            return files
+        for month_dir in self.history_dir.iterdir():
+            if not month_dir.is_dir() or month_dir.name in (ACTIVE_DIR, EMBEDDINGS_DIR) \
+                    or month_dir.name.startswith("."):
+                continue
+            for path in month_dir.glob("*.json"):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                files[f"{month_dir.name}/{path.name}"] = (st.st_size, st.st_mtime_ns)
+        return files
 
-            # 重複チェック
-            index.sessions = [
-                e for e in index.sessions if e.session_id != entry.session_id
-            ]
-            index.sessions.append(entry)
-            self._save_index(index)
+    def _build_index_from_files(self, files: dict[str, tuple[int, int]]) -> HistoryIndex:
+        index = HistoryIndex()
+        for rel in sorted(files):
+            path = self.history_dir / rel
+            result = read_session_file(path)
+            if not result.ok or not isinstance(result.payload, dict):
+                logger.warning("Failed to index %s: %s %s", path, result.status, result.detail)
+                continue
+            sd = SessionData.from_dict(result.payload)
+            index.sessions.append(IndexEntry(
+                session_id=sd.session_id,
+                file=rel,
+                started_at=sd.started_at,
+                duration_sec=sd.duration_sec,
+                mode=sd.mode,
+                turn_count=sd.turn_count,
+                summary=sd.summary,
+                summary_turn_count=sd.summary_turn_count,
+                first_user_preview=_build_first_user_preview(sd),
+                size_bytes=files[rel][0],
+                search_text=_build_search_text(sd),
+                promoted_to_semmem=sd.promoted_to_semmem,
+                project_id=sd.project_id,
+            ))
+        index.sessions = _dedupe_by_session_id(index.sessions)
+        _recount(index)
+        return index
+
+    def _put_entry(self, entry: IndexEntry) -> None:
+        """(書き手スレッド) 1 件を差し替えた新しい索引を公開する。"""
+        index = self._index_or_load()
+        sessions = [e for e in index.sessions if e.session_id != entry.session_id]
+        sessions.append(entry)
+        self._publish(replace(index, sessions=sessions))
+
+    def _publish(self, index: HistoryIndex) -> None:
+        """(書き手スレッド) 集計を引き直して差し込み、書き出しを予約する。
+
+        集計は **公開のたびに引き直す** (削除の経路が総数・総容量を陳腐化させて
+        いた、2026-09-05 監査)。
+        """
+        _recount(index)
+        self._index = index
+        if not self._writer.running:
+            # 書き手スレッドが無い (テスト・CLI) なら遅延させずにすぐ書く。
+            self._write_index()
+            return
+        now = time.monotonic()
+        first = self._index_dirty[0] if self._index_dirty is not None else now
+        self._index_dirty = (first, now)
+
+    def _tick(self, final: bool) -> None:
+        """(書き手スレッド) 索引の遅延書き出し。"""
+        dirty = self._index_dirty
+        if dirty is None:
+            return
+        now = time.monotonic()
+        first, last = dirty
+        if final or now - last >= _INDEX_IDLE_SECONDS or now - first >= _INDEX_MAX_DELAY_SECONDS:
+            self._write_index()
+
+    def _write_index(self) -> None:
+        """(書き手スレッド) 公開中の索引を ``index.json`` へ書く (原本の後)。"""
+        index = self._index
+        self._index_dirty = None
+        if index is None:
+            return
+        index.updated_at = _now_iso()
+        payload = {
+            "built_from": _files_digest(self._files),
+            "updated_at": index.updated_at,
+            "total_sessions": index.total_sessions,
+            "total_turns": index.total_turns,
+            "total_size_mb": round(index.total_size_mb, 4),
+            "sessions": [asdict(s) for s in index.sessions],
+        }
+        envelope = build_envelope(
+            format_id=INDEX_FORMAT.format_id, format_version=INDEX_FORMAT.version,
+            payload=payload, component="HistoryManager",
+        )
+        self._writer.write_now(
+            self.history_dir / INDEX_FILE, jsoncodec.dumps_bytes(envelope), fsync=False,
+        )
 
     def _save_index(self, index: HistoryIndex) -> None:
-        """インデックスを保存
+        """索引を公開して書く (保守・テスト用)。"""
 
-        集計は **保存のたびに引き直す**。以前は ``_update_index`` でしか
-        更新しておらず、``delete_session`` / ``delete_sessions_batch`` /
-        ``_delete_oldest`` の 3 経路が総数・総ターン・総容量を陳腐化させ、
-        ``get_stats`` がそれをそのまま返していた (2026-09-05 監査)。
-        """
-        with self._lock:
-            index.total_sessions = len(index.sessions)
-            index.total_turns = sum(e.turn_count for e in index.sessions)
-            index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
-            index.updated_at = _now_iso()
+        def run() -> None:
+            self._index_or_load()  # 原本の一覧 (built_from) を揃えてから差し替える
+            self._publish(index)
+            self._write_index()
 
-            data = {
-                "updated_at": index.updated_at,
-                "total_sessions": index.total_sessions,
-                "total_turns": index.total_turns,
-                "total_size_mb": round(index.total_size_mb, 4),
-                "sessions": [asdict(s) for s in index.sessions],
-            }
-
-            index_path = self.history_dir / "index.json"
-            _atomic_write_json(index_path, data)
-
-            self._index = index
-            # 自分が書いた版を「読み済み」として覚える (次の _load_index で
-            # 無駄に読み直さない)。他プロセスが書けば mtime が変わって読み直す。
-            try:
-                self._index_mtime = index_path.stat().st_mtime_ns
-            except OSError:
-                self._index_mtime = None
+        self._run(run, format_id=INDEX_FORMAT.format_id)
 
     def ensure_search_text(self) -> int:
         """search_text が未設定のエントリにターン本文を補完
@@ -936,29 +1474,11 @@ class HistoryManager:
         Returns:
             補完したエントリ数
         """
-        index = self._load_index()
-        updated = 0
-        for entry in index.sessions:
-            if entry.search_text:
-                continue
-            filepath = self.history_dir / entry.file
-            if not filepath.exists():
-                continue
-            try:
-                with open(filepath, encoding="utf-8") as f:
-                    data = json.load(f)
-                entry.search_text = _build_search_text(
-                    SessionData.from_dict(data),
-                )
-                updated += 1
-            except Exception as e:
-                logger.warning("Failed to build search_text for %s: %s",
-                               entry.session_id, e)
-
-        if updated:
-            self._save_index(index)
-            logger.info("Backfilled search_text for %d sessions", updated)
-        return updated
+        return self._backfill_entries(
+            lambda e: not e.search_text,
+            lambda e, s: replace(e, search_text=_build_search_text(s)),
+            "search_text",
+        )
 
     def ensure_first_user_preview(self) -> int:
         """``first_user_preview`` が未設定のエントリをセッション本体から補完
@@ -969,81 +1489,69 @@ class HistoryManager:
         Returns:
             補完したエントリ数
         """
-        index = self._load_index()
-        updated = 0
-        for entry in index.sessions:
-            if entry.first_user_preview:
-                continue
-            filepath = self.history_dir / entry.file
-            if not filepath.exists():
-                continue
-            try:
-                with open(filepath, encoding="utf-8") as f:
-                    data = json.load(f)
-                preview = _build_first_user_preview(SessionData.from_dict(data))
-                if preview:
-                    entry.first_user_preview = preview
-                    updated += 1
-            except Exception as e:
-                logger.warning("Failed to build first_user_preview for %s: %s",
-                               entry.session_id, e)
+        def fill(entry: IndexEntry, session: SessionData) -> IndexEntry | None:
+            preview = _build_first_user_preview(session)
+            return replace(entry, first_user_preview=preview) if preview else None
 
-        if updated:
-            self._save_index(index)
-            logger.info("Backfilled first_user_preview for %d sessions", updated)
-        return updated
+        return self._backfill_entries(lambda e: not e.first_user_preview, fill, "first_user_preview")
+
+    def _backfill_entries(
+        self,
+        wanted: Callable[[IndexEntry], bool],
+        fill: Callable[[IndexEntry, SessionData], IndexEntry | None],
+        label: str,
+    ) -> int:
+        if not any(wanted(e) for e in self._load_index().sessions):
+            return 0
+
+        def run() -> int:
+            index = self._index_or_load()
+            sessions = list(index.sessions)
+            updated = 0
+            for i, entry in enumerate(sessions):
+                if not wanted(entry):
+                    continue
+                filepath = self.history_dir / entry.file
+                if not filepath.exists():
+                    continue
+                result = read_session_file(filepath)
+                if not result.ok:
+                    logger.warning("Failed to build %s for %s: %s",
+                                   label, entry.session_id, result.detail)
+                    continue
+                new = fill(entry, SessionData.from_dict(result.payload))
+                if new is not None:
+                    sessions[i] = new
+                    updated += 1
+            if updated:
+                self._publish(replace(index, sessions=sessions))
+                logger.info("Backfilled %s for %d sessions", label, updated)
+            return updated
+
+        return self._run(run, format_id=INDEX_FORMAT.format_id)
 
     def rebuild_index(self) -> HistoryIndex:
         """ファイルスキャンでインデックスを再構築"""
-        index = HistoryIndex()
 
-        for month_dir in sorted(self.history_dir.iterdir()):
-            if not month_dir.is_dir() or month_dir.name.startswith("."):
-                continue
+        def run() -> HistoryIndex:
+            files = self._scan_originals()
+            self._files = files
+            index = self._build_index_from_files(files)
+            self._publish(index)
+            self._write_index()
+            logger.info("Index rebuilt: %d sessions", index.total_sessions)
+            return index
 
-            for session_file in sorted(month_dir.glob("*.json")):
-                try:
-                    with open(session_file, encoding="utf-8") as f:
-                        data = json.load(f)
-                    sd = SessionData.from_dict(data)
-                    entry = IndexEntry(
-                        session_id=sd.session_id,
-                        file=f"{month_dir.name}/{session_file.name}",
-                        started_at=sd.started_at,
-                        duration_sec=sd.duration_sec,
-                        mode=sd.mode,
-                        turn_count=sd.turn_count,
-                        summary=sd.summary,
-                        summary_turn_count=sd.summary_turn_count,
-                        first_user_preview=_build_first_user_preview(sd),
-                        size_bytes=session_file.stat().st_size,
-                        search_text=_build_search_text(sd),
-                        promoted_to_semmem=sd.promoted_to_semmem,
-                        project_id=sd.project_id,
-                    )
-                    index.sessions.append(entry)
-                except Exception as e:
-                    logger.warning("Failed to index %s: %s", session_file, e)
-
-        index.sessions = _dedupe_by_session_id(index.sessions)
-        index.total_sessions = len(index.sessions)
-        index.total_turns = sum(e.turn_count for e in index.sessions)
-        index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
-
-        self._save_index(index)
-        logger.info("Index rebuilt: %d sessions", index.total_sessions)
-        return index
+        return self._run(run, format_id=INDEX_FORMAT.format_id)
 
     # ── ユーティリティ ──
 
-    def _enforce_storage_limit(self, index: HistoryIndex) -> int:
-        """ストレージ上限チェック＋古い順削除"""
+    def _enforce_storage_limit(self, index: HistoryIndex) -> tuple[HistoryIndex, int]:
+        """(書き手スレッド) ストレージ上限チェック＋古い順削除"""
         total_mb = self._calc_total_size_mb()
         if total_mb <= self.max_storage_mb:
-            return 0
-        deleted = self._delete_oldest(index, total_mb - self.max_storage_mb)
-        self._save_index(index)
-        return deleted
+            return index, 0
+        return self._delete_oldest(index, total_mb - self.max_storage_mb)
 
     def _calc_total_size_mb(self) -> float:
         """history_dir 配下の総サイズ (MB)"""
@@ -1053,12 +1561,11 @@ class HistoryManager:
                 total += os.path.getsize(os.path.join(root, f))
         return total / (1024 * 1024)
 
-    def _delete_oldest(self, index: HistoryIndex, target_mb: float) -> int:
+    def _delete_oldest(self, index: HistoryIndex, target_mb: float) -> tuple[HistoryIndex, int]:
         """ストレージ上限超過分を最古から削除
 
         安全な順序: 削除対象を特定 → インデックス更新 → ファイル削除
         """
-        # 古い順にソートして削除対象を特定
         sorted_entries = sorted(index.sessions, key=lambda e: e.started_at)
         to_delete: list[IndexEntry] = []
         freed = 0.0
@@ -1072,23 +1579,53 @@ class HistoryManager:
                 to_delete.append(entry)
 
         if not to_delete:
-            return 0
+            return index, 0
 
         # インデックスから先に除去
         delete_ids = {e.session_id for e in to_delete}
-        index.sessions = [
+        index = replace(index, sessions=[
             e for e in index.sessions if e.session_id not in delete_ids
-        ]
+        ])
+        self._publish(index)
 
         # ファイル削除（インデックス更新後なので失敗しても不整合にならない）
         for entry in to_delete:
-            filepath = self.history_dir / entry.file
             try:
-                filepath.unlink()
+                self._writer.remove_now(self.history_dir / entry.file)
+                self._forget_file(entry.file)
             except OSError as e:
-                logger.warning("Failed to delete %s: %s", filepath, e)
+                logger.warning("Failed to delete %s: %s", entry.file, e)
+        self._drop_embeddings(delete_ids)
 
-        return len(to_delete)
+        return index, len(to_delete)
+
+
+def _index_from_payload(data: dict) -> HistoryIndex:
+    known = {f.name for f in fields(IndexEntry)}
+    sessions = []
+    for s in data.get("sessions", []):
+        if not isinstance(s, dict) or "session_id" not in s or "file" not in s:
+            continue
+        sessions.append(IndexEntry(
+            session_id=s["session_id"],
+            file=s["file"],
+            started_at=s.get("started_at", ""),
+            duration_sec=s.get("duration_sec", 0),
+            mode=s.get("mode", "chat"),
+            turn_count=s.get("turn_count", 0),
+            **{k: v for k, v in s.items() if k in known and k not in (
+                "session_id", "file", "started_at", "duration_sec", "mode", "turn_count",
+            )},
+        ))
+    index = HistoryIndex(updated_at=data.get("updated_at", ""), sessions=sessions)
+    _recount(index)
+    return index
+
+
+def _recount(index: HistoryIndex) -> None:
+    index.total_sessions = len(index.sessions)
+    index.total_turns = sum(e.turn_count for e in index.sessions)
+    index.total_size_mb = sum(e.size_bytes for e in index.sessions) / (1024 * 1024)
 
 
 def _dedupe_by_session_id(entries: list[IndexEntry]) -> list[IndexEntry]:
@@ -1109,7 +1646,7 @@ def _dedupe_by_session_id(entries: list[IndexEntry]) -> list[IndexEntry]:
 
 
 def _now_iso() -> str:
-    return utc_now_dt().isoformat()
+    return utc_now()
 
 
 # ── シングルトンファクトリ ──
@@ -1123,6 +1660,9 @@ def get_history_manager() -> HistoryManager:
     API・CLI・sleep-time update など全レイヤーから共有で使用する。
     同一インスタンスを共有することで、セッション保存後のインデックス
     キャッシュが即座に一覧取得に反映される。
+
+    初回構築で前回の取り残しの追記ログ (落ちたプロセスのアクティブなセッション) を
+    畳む (G0 のチェックポイントの昇格の置き換え)。
     """
     global _manager_cache
     if _manager_cache is not None:
@@ -1132,15 +1672,11 @@ def get_history_manager() -> HistoryManager:
     cfg = get_config()
     history_dir = resolver.resolve_local("history_dir")
     mgr = HistoryManager(history_dir, cfg)
-    mgr.promote_checkpoints()
+    mgr.fold_active_sessions()
     mgr.ensure_search_text()
     mgr.ensure_first_user_preview()
     _manager_cache = mgr
     return mgr
-
-
-
-
 
 
 def active_base_model_name(config: dict | None) -> str:
@@ -1164,3 +1700,18 @@ def active_base_model_name(config: dict | None) -> str:
     """
     raw = ((config or {}).get("model_paths", {}) or {}).get("base_model") or ""
     return Path(raw).name
+
+
+def active_base_model_key() -> str | None:
+    """アーカイブに刻む base モデルの ``model_key`` (学習パーティションの active key)。
+
+    ``ExperienceEntry.model_key`` と同じ値。解決できない (config 未ロード等) ときは
+    ``None``。
+    """
+    try:
+        from backend.config import get_path_resolver
+
+        return get_path_resolver().active_model_key
+    except Exception as exc:  # noqa: BLE001 — 保存自体は止めない
+        logger.debug("model_key unavailable for the session: %s", exc)
+        return None

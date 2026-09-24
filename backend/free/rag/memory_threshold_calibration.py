@@ -28,13 +28,14 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 
 logger = get_logger("rag.memory_threshold_calibration")
@@ -48,8 +49,16 @@ BACKGROUND_PAIRS = 4000
 SUPPORT_MARGIN = 0.05
 #: 較正キャッシュのファイル名 (``local_paths.memory_dir`` 配下)。
 CALIBRATION_FILENAME = "threshold_calibration.json"
-#: 保存フォーマットのバージョン。式を変えたら上げてキャッシュを無効化する。
-SCHEMA_VERSION = 1
+#: 式を変えたら版を上げてキャッシュを無効化する (移行器は置かない — 旧版は捨てて
+#: 較正し直す)。
+THRESHOLD_CALIBRATION_FORMAT = register_format(FormatSpec(
+    format_id="threshold_calibration",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key="store/memory/threshold_calibration.json",
+    retention="one per data root; recomputed when the embedder fingerprint changes",
+))
 
 
 #: プロセス共通のアクティブ較正値。起動時に一度だけ解決し、
@@ -263,19 +272,14 @@ def load_calibration(
     memory_dir: Path | str, fingerprint: str,
 ) -> dict[str, float] | None:
     """指紋が一致する較正済み閾値を返す。無い / 不一致 / 壊れていれば ``None``。"""
-    path = calibration_path(memory_dir)
-    if not path.exists():
+    file = VersionedPayloadFile(
+        THRESHOLD_CALIBRATION_FORMAT, calibration_path(memory_dir),
+        component="memory_threshold_calibration", state_logger=logger,
+    )
+    if not file.load():
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("Threshold calibration cache unreadable (%s): %s", path, e)
-        return None
-    if data.get("schema_version") != SCHEMA_VERSION:
-        logger.info(
-            "Threshold calibration cache schema %s != %s; ignoring",
-            data.get("schema_version"), SCHEMA_VERSION,
-        )
+    data = file.payload
+    if not isinstance(data, dict):
         return None
     if data.get("fingerprint") != fingerprint:
         logger.info(
@@ -300,20 +304,15 @@ def save_calibration(
     """較正結果を保存する。``ok=False`` の結果は保存しない。"""
     if not result.get("ok"):
         return
-    path = calibration_path(memory_dir)
-    payload = {
-        "schema_version": SCHEMA_VERSION,
+    file = VersionedPayloadFile(
+        THRESHOLD_CALIBRATION_FORMAT, calibration_path(memory_dir),
+        component="memory_threshold_calibration", state_logger=logger,
+    )
+    file.payload = {
         "fingerprint": fingerprint,
         "n_notes": result.get("n_notes"),
         "n_queries": result.get("n_queries"),
         "distribution": result.get("distribution"),
         "thresholds": result.get("thresholds"),
     }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        from backend.io.atomic import AtomicWriter
-
-        with AtomicWriter(path) as f:
-            f.write(json.dumps(payload, ensure_ascii=False, indent=2))
-    except OSError as e:
-        logger.warning("Failed to persist threshold calibration to %s: %s", path, e)
+    file.save()

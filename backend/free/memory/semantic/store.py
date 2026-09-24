@@ -29,8 +29,10 @@ c_16 §6.2)。競合の勝ち方・減衰・注入先も namespace で決まる
 ## 在メモリの写し
 
 ``all_facts`` / ``search_by_type`` / 競合検出 / GC は **全件を列挙する**
-消費者なので、事象と snapshot から畳んだ現在状態を
-:class:`SemanticFact` の dict として在メモリに持つ (旧ストアと同じ形)。
+消費者なので、事象と snapshot から畳んだ現在状態を在メモリに持つ。常駐は
+id → ``Evidence`` 1 本 (:class:`~backend.free.memory.semantic.fact_view.FactTable`)
+で、消費者へ渡す :class:`SemanticFact` はそこから作る読み取りビュー
+(G1 設計 §17.4。G0 は作業型の dict を持っていた)。未知の列挙値の行は id だけ。
 ノート (数万件) と違ってファクトは数百〜数千件で、しかも消費者が
 「全部を見る」前提で書かれている。行を選んでから本文を読む episodic の
 やり方 (c_16 §5.3) はここでは費用が合わない。
@@ -45,10 +47,13 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.free.memory.semantic.fact import (
+    FACT_EVIDENCE_FIELDS,
     FactRecordError,
-    evidence_to_fact,
+    fact_patch,
     fact_to_evidence,
+    is_ignored_fact_record,
 )
+from backend.free.memory.semantic.fact_view import FactTable, check_fact_record
 from backend.free.memory.semantic.namespaces import (
     know_half_life_days,
     namespace_of,
@@ -133,7 +138,7 @@ SUPERSEDED_GC_SNAPSHOTS = 3
 
 def semantic_shard_key(record: Evidence) -> str:
     """``Evidence`` → 転置索引のシャード名 = namespace (c_16 §6.2)。"""
-    structured = record.structured if isinstance(record.structured, dict) else {}
+    structured = record.structured if record.structured is not None else {}
     return namespace_of(str(structured.get("subject") or ""))
 
 
@@ -189,7 +194,7 @@ class SemanticStore:
             rag_config=rag_config,
             by=WRITER,
             shard_key_for=semantic_shard_key,
-            gc_filter=self._keep_in_snapshot,
+            gc_drop_ids=self._physical_gc_ids,
         )
         self.sources = SourceRegistry(self.store_dir / SOURCES_FILENAME)
         self.items = ItemRegistry(self.store_dir / ITEMS_FILENAME)
@@ -204,8 +209,13 @@ class SemanticStore:
         self._prior_cache_key: tuple[str, int] | None = None
         self._prior_cache: np.ndarray | None = None
 
-        #: 畳み込み済みの現在状態 (id → ファクト)。
-        self._facts: dict[str, SemanticFact] = {}
+        #: 畳み込み済みの現在状態。常駐は id → ``Evidence`` 1 本で、``get`` /
+        #: ``values`` は読み取りビュー (``FactView``) を返す (G1 設計 §17.4)。
+        self._facts: FactTable = FactTable()
+        #: 未知の列挙値を持つ fact / claim の id。行は実体化しない — 原形は snapshot /
+        #: 事象に残り、索引・注入・学習・GC・件数上限に入れない (c_05 §0.4.5 の関門、
+        #: ``data_health`` の計数用)。
+        self._ignored: set[str] = set()
         self._by_subject: dict[str, set[str]] = {}
         self._by_type: dict[str, set[str]] = {}
         self._by_namespace: dict[str, set[str]] = {}
@@ -241,30 +251,39 @@ class SemanticStore:
         """``EvidenceStore`` の現在状態から在メモリの写しを作り直す。
 
         読めないレコード (``attrs.fact_type`` 欠損等) は **そのレコードだけ**
-        飛ばして件数を WARNING に出す (c_05 §0.5.2)。
+        飛ばして件数を WARNING に出す (c_05 §0.5.2)。未知の列挙値の行 (未知の
+        kind / FactType 等) は ``_ignored`` に分けて索引に入れない (§0.4.5)。
         """
-        self._facts = {}
+        self._facts = FactTable()
+        self._ignored = set()
         self._by_subject = {}
         self._by_type = {}
         self._by_namespace = {}
         self._pinned = set()
         skipped = 0
         for record in self.evidence.iter_records():
+            if is_ignored_fact_record(record):
+                self._ignored.add(record.id)
+                continue
             if record.kind not in ("fact", "claim"):
                 continue
             if record.veracity == "retracted":
                 continue
             try:
-                fact = evidence_to_fact(record)
+                check_fact_record(record)
             except FactRecordError as e:
                 skipped += 1
                 logger.debug("skipping unreadable semantic record: %s", e)
                 continue
-            self._facts[fact.id] = fact
-            self._add_to_indexes(fact)
+            self._add_to_indexes(self._facts.put(record))
         if skipped:
             logger.warning(
                 "Semantic store: skipped %d unreadable record(s)", skipped,
+            )
+        if self._ignored:
+            logger.warning(
+                "Semantic store: kept %d record(s) with unknown enum values unused",
+                len(self._ignored),
             )
         self._break_supersede_cycles()
         self._invalidate_vectors()
@@ -338,6 +357,11 @@ class SemanticStore:
     def __len__(self) -> int:
         return len(self._facts)
 
+    @property
+    def ignored_count(self) -> int:
+        """未知の列挙値で使っていない行の数 (``data_health`` の計数、c_05 §0.4.5)。"""
+        return len(self._ignored)
+
     # ── スコープ束縛 ────────────────────────────────────────────────
 
     def scoped(self, scope: str = "global") -> "ScopedSemanticStore":
@@ -377,9 +401,9 @@ class SemanticStore:
     # ── 書き込み ────────────────────────────────────────────────────
 
     def add_fact(self, fact: SemanticFact) -> SemanticFact:
-        """新規ファクトを ``put`` する。
+        """新規ファクトを ``create`` する (既存の id は拒否、c_16 §5.2)。
 
-        - ``id`` が未設定なら発番する (``ev_`` + hex12)
+        - ``id`` が未設定なら発番する (``ev_`` + hex16)
         - 既存 ID と衝突したら ``ValueError``
         - ``created_at`` / ``accessed_at`` が 0 なら現在時刻で埋める
         - ``know.<domain>`` は namespace 既定の半減期を載せる (c_16 §4.2)
@@ -397,31 +421,53 @@ class SemanticStore:
             fact,
             half_life_days=know_half_life_days(fact.subject, self._know_half_life),
         )
-        self.evidence.put(record)
-        self._facts[fact.id] = fact
-        self._add_to_indexes(fact)
+        self.evidence.create(record)
+        view = self._facts.put(record, working=fact)  # 永続形に載らない値は作業値
+        self._add_to_indexes(view)
         self._revision += 1
         self._invalidate_vectors()
         logger.debug(
             "add_fact: id=%s subject=%s type=%s scope=%s",
             fact.id, fact.subject, fact.type, fact.scope,
         )
-        return fact
+        return view
 
     def add_fact_bulk(self, facts: Sequence[SemanticFact]) -> list[SemanticFact]:
         """複数ファクトを ``put`` する (アトミックではない)。"""
         return [self.add_fact(fact) for fact in facts]
 
     def put_record(self, record: Evidence) -> SemanticFact:
-        """組み立て済みの ``Evidence`` をそのまま ``put`` する。
+        """組み立て済みの **新しい** ``Evidence`` をそのまま ``create`` する。
 
         ``know.*`` の claim (:class:`~backend.free.memory.semantic.sources.KnowledgeIngest`)
         のように、``SemanticFact`` では表せないコアフィールド (``valid_until`` /
-        ``origin=web``) を持つレコード用の入口。
+        ``origin=web``) を持つレコード用の入口。既存レコードの更新は
+        :meth:`patch_record` (全置換で書き直さない、c_05 §1.4)。
         """
-        self.evidence.put(record)
-        fact = evidence_to_fact(record)
-        self._facts[fact.id] = fact
+        check_fact_record(record)
+        self.evidence.create(record)
+        fact = self._facts.put(record)
+        self._add_to_indexes(fact)
+        self._revision += 1
+        self._invalidate_vectors()
+        return fact
+
+    def patch_record(
+        self, record_id: str, *, unset: Sequence[str] = (), **fields: Any,
+    ) -> SemanticFact | None:
+        """既存レコードへ ``Evidence`` のフィールドで差分を当てる (``patch`` 事象)。
+
+        ``SemanticFact`` に写らないフィールド (claim の ``attrs`` / ``observed_at``
+        以外のコア) を直接変える入口。適用後のレコードへ握られているビューを付け替え、
+        索引を張り替える。取り下げ済み / 未知の id は ``None``。
+        """
+        record = self.evidence.patch(record_id, unset=unset, **fields)
+        if record is None:
+            return None
+        previous = self._facts.get(record_id)
+        if previous is not None:
+            self._remove_from_indexes(previous)
+        fact = self._facts.put(record)
         self._add_to_indexes(fact)
         self._revision += 1
         self._invalidate_vectors()
@@ -444,7 +490,13 @@ class SemanticStore:
         flush_embedding: bool = True,  # noqa: ARG002 — 呼出側互換 (版で一括保存)
         **changes: Any,
     ) -> SemanticFact:
-        """既存ファクトのフィールドを差分更新する (``patch`` 事象)。
+        """既存ファクトのフィールドを差分更新する (``patch`` 事象、c_05 §1.4)。
+
+        変わったフィールドだけを :func:`fact_patch` で ``Evidence`` の差分にして
+        当てる。レコード全体を組み直して ``put`` しないので、作業型に写らない
+        フィールド (claim の ``kind`` / ``valid_until`` / ``confidentiality`` /
+        ``observed_at`` / ``structured.value`` / 各階層の未知キー) は保たれる。
+        差分が無ければ事象を書かない。
 
         Args:
             touch: ``accessed_at`` を現在時刻へ更新するか。既定 True。
@@ -461,21 +513,31 @@ class SemanticStore:
         for key in changes:
             if not hasattr(fact, key):
                 raise AttributeError(f"unknown SemanticFact field: {key}")
+        stored = self.evidence.get(fact_id)
+        if stored is None:
+            raise KeyError(fact_id)
 
+        names = list(changes)
         self._remove_from_indexes(fact)
+        # 常駐はビューなので、今の属性値 (作業値を含む) の作業型に変更を当てて組み直す
+        working = fact.materialize()
         for key, val in changes.items():
-            setattr(fact, key, val)
+            setattr(working, key, val)
         if touch:
-            fact.accessed_at = utc_now_dt().timestamp()
-        self._add_to_indexes(fact)
-        # ``patch`` 事象は差分だけを書く。``subject`` / ``object`` /
-        # ``fact_type`` のようなコア側の変更はレコード全体を組み直す必要が
-        # あるので ``put`` で置き換える (同じ id への put は全置換)。
-        record = fact_to_evidence(
-            fact,
-            half_life_days=know_half_life_days(fact.subject, self._know_half_life),
+            working.accessed_at = utc_now_dt().timestamp()
+            names.append("accessed_at")
+        # 差分だけを ``patch`` 事象にする (全置換の put はしない、c_05 §1.4)。
+        # 見るのは対応表の全フィールド — 呼出側がビューを直接書き換えてから
+        # update_fact を呼ぶ G0 の使い方 (``fact.session_ids.add(...)``) の変更も落とさない。
+        # 変わっていないフィールドは書かないので、差分の無い更新は事象を書かない。
+        fields, unset = fact_patch(
+            working, stored, [*names, *FACT_EVIDENCE_FIELDS],
+            half_life_days=know_half_life_days(working.subject, self._know_half_life),
         )
-        self.evidence.put(record)
+        record = self.evidence.patch(fact_id, unset=unset, **fields) if (fields or unset) else stored
+        # 握られているビューも新しい Evidence へ付け替わる (永続形に載らない値は作業値)
+        self._facts.put(record, working=working)
+        self._add_to_indexes(fact)
         self._revision += 1
         self._invalidate_vectors()
         logger.debug("update_fact: id=%s changes=%s", fact_id, sorted(changes.keys()))
@@ -854,8 +916,7 @@ class SemanticStore:
             return {}
         rows: list[int] = []
         ids: list[str] = []
-        for row, meta in enumerate(store.metadata):
-            record_id = str(meta.get("id") or "")
+        for row, record_id in enumerate(store.row_ids):
             if record_id in wanted:
                 rows.append(row)
                 ids.append(record_id)
@@ -891,18 +952,21 @@ class SemanticStore:
         埋め込みを持たないファクトはキーに現れない (呼出側は従来どおり
         「判定不能なので通す」の分岐へ落ちる)。
         """
-        snapshot = self.evidence.snapshot
-        if snapshot is None or len(snapshot) == 0:
-            return {}
-        rows = np.arange(len(snapshot), dtype=np.int64)
-        cosines = self.evidence.cosines_for_rows(query, rows)
         out: dict[str, float] = {}
-        for row in range(len(snapshot)):
-            value = cosines[row]
-            if not np.isfinite(value):
-                continue
-            record_id = snapshot.id_at(row)
-            if record_id in self._facts:
+        snapshot = self.evidence.snapshot
+        if snapshot is not None and len(snapshot) > 0:
+            rows = np.arange(len(snapshot), dtype=np.int64)
+            cosines = self.evidence.cosines_for_rows(query, rows)
+            for row in range(len(snapshot)):
+                value = cosines[row]
+                if not np.isfinite(value):
+                    continue
+                record_id = snapshot.id_at(row)
+                if record_id in self._facts:
+                    out[record_id] = float(value)
+        # まだ版に入っていないファクト (tail、c_16 §6.4)
+        for record_id, value in self.evidence.tail_cosines(query).items():
+            if record_id in self._facts and np.isfinite(value):
                 out[record_id] = float(value)
         return out
 
@@ -950,27 +1014,38 @@ class SemanticStore:
 
         埋め込みを持たないファクトはキーに現れない。
         """
-        snapshot = self.evidence.snapshot
-        if snapshot is None or len(snapshot) == 0:
-            return {}
-        rows = np.arange(len(snapshot), dtype=np.int64)
-        cosines = self.evidence.cosines_for_rows(query, rows)
-        finite = np.isfinite(cosines)
-        if not np.any(finite):
-            return {}
-        columns = RankColumns.from_columns(snapshot.columns)
-        now_epoch = utc_now_dt().timestamp()
-        target = rows[finite]
-        scores = score_rows(
-            np.nan_to_num(cosines[finite]), target, columns, now_epoch,
-            self.store_prior_per_row(),
-        )
         out: dict[str, float] = {}
-        for i, row in enumerate(target):
-            record_id = snapshot.id_at(int(row))
-            if record_id in self._facts:
-                out[record_id] = float(scores[i])
+        now_epoch = utc_now_dt().timestamp()
+        snapshot = self.evidence.snapshot
+        if snapshot is not None and len(snapshot) > 0:
+            rows = np.arange(len(snapshot), dtype=np.int64)
+            cosines = self.evidence.cosines_for_rows(query, rows)
+            finite = np.isfinite(cosines)
+            if np.any(finite):
+                columns = RankColumns.from_columns(snapshot.columns)
+                target = rows[finite]
+                scores = score_rows(
+                    np.nan_to_num(cosines[finite]), target, columns, now_epoch,
+                    self.store_prior_per_row(),
+                )
+                for i, row in enumerate(target):
+                    record_id = snapshot.id_at(int(row))
+                    if record_id in self._facts:
+                        out[record_id] = float(scores[i])
+        # まだ版に入っていないファクト (tail)。ゲートは掛けない (全件の順位)
+        for record, _cosine, score in self.evidence.search_tail(
+            query, threshold=-1.0, now=now_epoch, include_private=True,
+            store_prior=self._prior_for_record,
+        ):
+            if record.id in self._facts:
+                out[record.id] = score
         return out
+
+    def _prior_for_record(self, record: Evidence) -> float:
+        """1 レコードの ``store_prior`` (:meth:`store_prior_per_row` と同じ規則)。"""
+        return (
+            self._prior_know if semantic_shard_key(record) == KNOW_NAMESPACE else self._prior_mem
+        )
 
     def search_by_embedding(
         self,
@@ -1022,25 +1097,33 @@ class SemanticStore:
         self, query: np.ndarray, ids: set[str],
     ) -> dict[str, float]:
         """``ids`` に限った素の cosine (snapshot 行から引く)。"""
+        out: dict[str, float] = {}
         snapshot = self.evidence.snapshot
-        if snapshot is None:
-            return {}
         rows: list[int] = []
         row_ids: list[str] = []
+        missing: list[str] = []
         for fact_id in ids:
-            row = snapshot.row_of(fact_id)
+            row = snapshot.row_of(fact_id) if snapshot is not None else None
             if row is None:
+                missing.append(fact_id)
                 continue
             rows.append(row)
             row_ids.append(fact_id)
-        if not rows:
-            return {}
-        cosines = self.evidence.cosines_for_rows(query, np.asarray(rows, dtype=np.int64))
-        return {
-            row_ids[i]: float(cosines[i])
-            for i in range(len(row_ids))
-            if np.isfinite(cosines[i])
-        }
+        if rows:
+            cosines = self.evidence.cosines_for_rows(query, np.asarray(rows, dtype=np.int64))
+            out = {
+                row_ids[i]: float(cosines[i])
+                for i in range(len(row_ids))
+                if np.isfinite(cosines[i])
+            }
+        if missing:
+            # まだ版に入っていないファクト (tail、c_16 §6.4)
+            tail = self.evidence.tail_cosines(query)
+            for fact_id in missing:
+                value = tail.get(fact_id)
+                if value is not None and np.isfinite(value):
+                    out[fact_id] = float(value)
+        return out
 
     def search(
         self,
@@ -1082,17 +1165,32 @@ class SemanticStore:
             shards=namespaces,
             store_prior=prior,
         )
-        snapshot = self.evidence.snapshot
-        if snapshot is None:
-            return []
         hits: list[SemanticHit] = []
-        for row, cosine, score in raw:
-            fact = self._facts.get(snapshot.id_at(row))
+        snapshot = self.evidence.snapshot
+        if snapshot is not None:
+            for row, cosine, score in raw:
+                fact = self._facts.get(snapshot.id_at(row))
+                if fact is None or fact.superseded_by:
+                    continue
+                if scope is not None and fact.scope != scope:
+                    continue
+                hits.append(SemanticHit(fact, cosine, score))
+        # まだ版に入っていないファクト (tail、c_16 §6.4) も同じ順位式で混ぜる
+        tail: list[SemanticHit] = []
+        for record, cosine, score in self.evidence.search_tail(
+            query_vec, threshold=threshold, now=now, include_private=include_private,
+            store_prior=store_prior if store_prior is not None and not isinstance(
+                store_prior, np.ndarray,
+            ) else self._prior_for_record,
+        ):
+            fact = self._facts.get(record.id)
             if fact is None or fact.superseded_by:
                 continue
             if scope is not None and fact.scope != scope:
                 continue
-            hits.append(SemanticHit(fact, cosine, score))
+            tail.append(SemanticHit(fact, cosine, score))
+        if tail:
+            hits = sorted(hits + tail, key=lambda hit: hit.score, reverse=True)[:top_k]
         return hits
 
     # ── 保持方針 (c_16 §5.4) ────────────────────────────────────────
@@ -1163,9 +1261,9 @@ class SemanticStore:
         既に死んでいたレコード** がちょうど「3 版経過した死者」になる。
 
         これは **公開の問い合わせ** (「今この瞬間、何件が対象か」)。実際に
-        落とすのは :meth:`_keep_in_snapshot` — :meth:`create_snapshot` が
-        ``EvidenceStore`` の ``gc_filter`` として渡すので、ここが返した id は
-        次の版の ``records.jsonl`` に書かれず、ディスクから消える。
+        落とすのは :meth:`_physical_gc_ids` — ``EvidenceStore`` の
+        ``gc_drop_ids`` として渡すので、ここが返した id は次の版の
+        ``records.jsonl`` に書かれず、ディスクから消える。
 
         pinned は落とさない (他の GC 経路と同じ扱い。
         :mod:`~backend.free.memory.semantic.gc`)。
@@ -1189,7 +1287,7 @@ class SemanticStore:
             if record.veracity != "retracted" and not record.superseded_by:
                 continue
             current = self.evidence.get(record.id)
-            if current is None or current.pinned:
+            if current is None or current.pinned or is_ignored_fact_record(current):
                 continue
             if current.veracity == "retracted" or current.superseded_by:
                 out.append(record.id)
@@ -1208,10 +1306,6 @@ class SemanticStore:
             self._gc_ids_key = key
         return self._gc_ids
 
-    def _keep_in_snapshot(self, record: Evidence) -> bool:
-        """``EvidenceStore`` の ``gc_filter``。``False`` で新しい版から落とす。"""
-        return record.id not in self._physical_gc_ids()
-
     def _invalidate_gc_cache(self) -> None:
         """物理 GC 対象のキャッシュを落とす。"""
         self._gc_ids = None
@@ -1226,7 +1320,7 @@ class SemanticStore:
     async def create_snapshot(self) -> str | None:
         """未畳み込みの事象があるときだけ版を作る。
 
-        畳み込みの結果には :meth:`_keep_in_snapshot` が掛かるので、この版で
+        畳み込みの結果には :meth:`_physical_gc_ids` が掛かるので、この版で
         「3 版経過した死者」(:meth:`pending_physical_gc`) は物理的に消える。
 
         Returns:

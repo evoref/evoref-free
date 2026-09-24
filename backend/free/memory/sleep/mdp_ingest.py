@@ -107,6 +107,11 @@ def ingest_mdp_traces(
     for episode in episodes:
         try:
             note = ingester.to_memory_note(episode, project_id=current_project_id)
+            if episodic.get(note.id) is not None:
+                # id は episode 由来で決定論 (c_16 §12)。取り込み済みのノートを全置換で
+                # 書き直すと、その後に付いた attrs (リンク・抽出済み id 等) が消える。
+                logger.debug("Step 7.5: mdp episode %s already ingested", episode.episode_id)
+                continue
             episodic.put_note(note, tier="long")
             ingested += 1
         except Exception as exc:  # noqa: BLE001 — 1 件の失敗で sleep-time を止めない

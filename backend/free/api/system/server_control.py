@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from backend.app_state import AppState, get_app_state
 from backend.config import get_config
+from backend.free.core.launch_adapters import LaunchAdapters, adapters_for_launch
 from backend.log_config import get_logger
 
 logger = get_logger("api.server_control")
@@ -96,15 +97,13 @@ def _build_cmd(
     project_root: Path,
     *,
     model_override: str | None = None,
-    lora_override: str | Path | None = None,
-    lora_fallback: bool = True,
+    adapters: LaunchAdapters | None = None,
 ) -> tuple[list[str], str, int] | None:
     """サーバー名から起動コマンドと (host, port) を構築
 
-    ``lora_override``/``lora_fallback`` は base のみ有効
-    (``build_llama_cmd`` にそのまま透過する)。呼出元
-    (``mode.py``) が exists/arch 互換チェック済みの絶対パスを解決して渡す
-    責務を持ち、本関数はただの配管に徹する。
+    ``adapters`` は base のみ有効 (``build_llama_cmd`` にそのまま透過する)。
+    モード切替 (``mode.py``) は新モードの分を渡す。省略時は現在のモードの
+    アダプタを ``adapters_for_launch`` から得る (Free では無し)。
 
     Returns:
         (cmd, host, port) or None（設定なし / モデル未指定）
@@ -115,9 +114,18 @@ def _build_cmd(
         llama_cfg = cfg.get("llama", {})
         host = llama_cfg.get("host", "127.0.0.1")
         port = llama_cfg.get("port", 8080)
+        if adapters is None:
+            from backend.config import get_path_resolver
+
+            try:
+                mode = get_path_resolver().active_mode
+            except RuntimeError:
+                mode = "chat"  # config 未ロード (単体テスト等)
+            adapters = adapters_for_launch(cfg, project_root, mode)
         cmd = build_llama_cmd(
             cfg, project_root, model_override=model_override,
-            lora_override=lora_override, lora_fallback=lora_fallback,
+            lora_override=adapters.lora,
+            control_vector_override=adapters.control_vector,
         )
         return (cmd, host, port)
 
@@ -139,9 +147,11 @@ def _open_stderr_log(project_root: Path, name: ServerName):
     `_spawn_server` が stderr=DEVNULL で完全にエラーを捨てていた問題に対し、
     UI 経由起動時も CLI 起動時と同じファイルへ stderr を書き出す。
     起動失敗の原因 (port 競合 / モデル不在 / Vulkan 初期化失敗 等) が
-    `local/logs/llama-{name}.stderr.log` に残るようになる。
+    `<data_root>/logs/llama-{name}.stderr.log` に残るようになる。
     """
-    log_dir = project_root / "local" / "logs"
+    from backend.config import resolve_data_path
+
+    log_dir = resolve_data_path("logs_dir", project_root)
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"llama-{name}.stderr.log"
     # 追記モードなので、上限を超えたら 1 世代だけ退避してから開き直す。
@@ -202,14 +212,13 @@ def _spawn_server_with_override(
     cfg: dict,
     *,
     model_override: str | None = None,
-    lora_override: str | Path | None = None,
-    lora_fallback: bool = True,
+    adapters: LaunchAdapters | None = None,
 ) -> ManagedProcess | None:
-    """model_override / lora_override 対応版の llama-server プロセス起動"""
+    """model_override / adapters 対応版の llama-server プロセス起動"""
     project_root = _find_project_root()
     result = _build_cmd(
         name, cfg, project_root, model_override=model_override,
-        lora_override=lora_override, lora_fallback=lora_fallback,
+        adapters=adapters,
     )
     if result is None:
         logger.warning("server_control: no config for %s", name)

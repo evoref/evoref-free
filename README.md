@@ -171,7 +171,7 @@ evoref gui     # 既定ブラウザで Web UI を開く
 
 ### データを初期化する
 
-会話・記憶・学習データをすべて消して初期状態に戻すには、サービスを停止したうえで `python scripts/reset_local_data.py --no-restart` を実行します (`models/` のモデルと `config.yaml` は消えません)。
+会話・記憶・学習データをすべて消して初期状態に戻すには、サービスを停止したうえで `evoref reset` を実行します (`models/` のモデル・`config.yaml`・生成物 (`userdata/outputs/`) は消えません)。
 
 ---
 

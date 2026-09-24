@@ -11,17 +11,42 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from backend.free.rag.evidence._json_state import JsonStateFile
+from backend.free.rag.projectmap.ids import _PACKAGE_ID_PREFIX
 from backend.free.rag.projectmap.scanner import ScannedFile
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 
 FINGERPRINTS_FILE = "fingerprints.json"
+
+#: ProjectMap のパッケージ (``pm-<hash>``) は丸ごと走査したソースから作り直せる。
+_PROJECTMAP_PACKAGE_KEY = f"store/corpus/packages/{_PACKAGE_ID_PREFIX}<hash>"
+
+PROJECTMAP_FORMAT = register_format(FormatSpec(
+    format_id="projectmap",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key=f"{_PROJECTMAP_PACKAGE_KEY}/<version>/{FINGERPRINTS_FILE}",
+    retention="rebuilt from the scanned sources",
+))
+
+#: 版ディレクトリの残り (package.json / snapshot / graph / 埋め込み)。
+PROJECTMAP_PACKAGE_FORMAT = register_format(FormatSpec(
+    format_id="projectmap.package",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key=f"{_PROJECTMAP_PACKAGE_KEY}/**",
+    retention="rebuilt from the scanned sources",
+    encodings=("dir",),
+))
 
 
 #: ``{path: [(qualname, signature), ...]}``。cosmetic 判定 (前版と定義の形が同じか) の材料。
 Shapes = dict[str, list[tuple[str, str]]]
 
 
-class FingerprintStore(JsonStateFile):
+class FingerprintStore(VersionedJsonFile):
     """1 パッケージ版の ``fingerprints.json`` (封筒付き、``AtomicWriter``)。
 
     fingerprint に加えて、次版の cosmetic 判定に要る **定義の形** (path ごとの
@@ -30,10 +55,11 @@ class FingerprintStore(JsonStateFile):
     読み直すことになる。
     """
 
-    SCHEMA_VERSION = 1
+    FORMAT = PROJECTMAP_FORMAT
+    RAISE_ON_SAVE_ERROR = True
 
     def __init__(self, directory: Path | str) -> None:
-        super().__init__(Path(directory) / FINGERPRINTS_FILE, fsync=False)
+        super().__init__(Path(directory) / FINGERPRINTS_FILE)
         self.fingerprints: dict[str, str] = {}
         self.shapes: Shapes = {}
         self.node_count: int = 0

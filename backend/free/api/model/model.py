@@ -1,9 +1,12 @@
 """モデル情報 API + ベースモデル移行 API"""
 
+import asyncio
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.free.api.model._model_helpers import (
     build_model_detail_response,
     map_migration_history_items,
@@ -11,7 +14,6 @@ from backend.free.api.model._model_helpers import (
     migration_error,
     model_health_check_failed_error,
     model_reload_failed_error,
-    resolve_lora_path,
 )
 from backend.free.api.schemas import (
     ComponentMigrateRequest,
@@ -33,8 +35,7 @@ from backend.free.api.schemas import (
     RollbackResponse,
 )
 from backend.app_state import AppState, get_app_state
-from backend.config import get_config, get_path_resolver, resolve_context_size
-from backend.edition import get_pro_handler
+from backend.config import get_config, get_path_resolver, get_project_root, resolve_context_size
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
 
@@ -64,10 +65,7 @@ def _get_model_state():
     from backend.free.core.model_migration import ModelState
 
     cfg = get_config()
-    resolver = get_path_resolver()
-    state_dir = resolver.resolve_local("memory_dir")
-    state_path = state_dir.parent / "model_state.json"
-    ms = ModelState(state_path)
+    ms = ModelState(get_path_resolver().resolve_local("model_state_file"))
     if not ms.current_filename:
         ms.initialize_from_config(cfg)
     return ms
@@ -92,13 +90,6 @@ def _get_migrator(state: AppState):
     prompt_manager = state.prompt_manager
     learning_scheduler = state.learning_scheduler
 
-    # EvalCoreManager（Pro 機能: Free では None）
-    eval_core_mgr = None
-    EvalCoreManager = get_pro_handler("eval_core_manager")
-    if EvalCoreManager is not None:
-        eval_core_path = resolver.resolve_learning("eval_core_file")
-        eval_core_mgr = EvalCoreManager(eval_core_path)
-
     # エピソード記憶 (移行時に context_description の再生成印を立てる)
     episodic = None
     mem = state.get_memory_system()
@@ -111,7 +102,6 @@ def _get_migrator(state: AppState):
         model_state=model_state,
         experience_buf=experience_buf,
         prompt_manager=prompt_manager,
-        eval_core_manager=eval_core_mgr,
         learning_scheduler=learning_scheduler,
         episodic_memory=episodic,
     )
@@ -121,8 +111,8 @@ def _get_migrator(state: AppState):
 async def migrate_model(req: MigrateRequest, state: AppState = Depends(get_app_state)):
     """ベースモデル移行を実行（§22.8.1）"""
     logger.info(
-        "POST /api/model/migrate: new_model=%s, dry_run=%s, try_lora=%s",
-        req.new_model_path, req.dry_run, req.try_lora,
+        "POST /api/model/migrate: new_model=%s, dry_run=%s",
+        req.new_model_path, req.dry_run,
     )
 
     from backend.free.core.model_migration import (
@@ -134,7 +124,6 @@ async def migrate_model(req: MigrateRequest, state: AppState = Depends(get_app_s
         migrator = _get_migrator(state)
         result = migrator.migrate(
             new_model_path=req.new_model_path,
-            try_lora=req.try_lora,
             regenerate_context=req.regenerate_context,
             dry_run=req.dry_run,
         )
@@ -179,7 +168,6 @@ async def get_model_state(state: AppState = Depends(get_app_state)):
         config_filename=config_filename,
         config_base_model=config_base_model,
         config_mismatch=is_mismatch,
-        lora_compatible=model_state.lora_compatible,
         strict_startup_check=bool(
             cfg.get("model_migration", {}).get("strict_startup_check", False),
         ),
@@ -213,15 +201,8 @@ async def get_migration_history():
     """移行履歴を取得（§22.8.2）"""
     logger.debug("GET /api/model/migration-history")
     model_state = _get_model_state()
-
-    # LoRA の存在確認
-    cfg = get_config()
-    project_root = Path(__file__).parent.parent.parent
-    lora_path = resolve_lora_path(cfg.get("local_paths", {}), project_root)
-
     return MigrationHistoryResponse(
         current_model=model_state.current_filename,
-        lora_available=lora_path.exists(),
         history=map_migration_history_items(model_state.migration_history),
     )
 
@@ -445,7 +426,6 @@ async def rollback_component(
     return ComponentRollbackResponse(
         component=component,
         rolled_back_to=result["rolled_back_to"],
-        lora_restored=result["lora_restored"],
     )
 
 
@@ -591,6 +571,7 @@ async def process_restart(
 
 
 @router.post("/reembed-facts")
+@with_embed_priority(P3_BULK)
 async def reembed_facts(
     state: AppState = Depends(get_app_state),
     dry_run: bool = False,
@@ -664,6 +645,8 @@ async def reembed_facts(
         except OSError as exc:
             logger.warning("reembed-facts: failed to drop %s: %s", embeddings_dir, exc)
     store.load()
+    # 埋め直しの明示の指示なので、埋め込みモデルの変更の確認も兼ねる (c_05 §0.5.7)。
+    store.evidence.confirm_reembed()
     # 版を積む前に 1 事象も無いと ``create_snapshot`` は何もしないので、
     # 索引の作り直しだけを目的に直接呼ぶ。
     try:
@@ -686,6 +669,58 @@ async def reembed_facts(
         "new_model_id": current_model_id or None,
         "snapshot": version,
     }
+
+
+def evidence_stores(state: AppState) -> list[tuple[str, Any]]:
+    """埋め込み索引を持つ Evidence Store (episodic / semantic / corpus の各版) と表示名。"""
+    stores: list[tuple[str, Any]] = []
+    for name, attr in (("episodic", "episodic_memory"), ("semantic", "semantic_memory")):
+        evidence = getattr(getattr(state, attr, None), "evidence", None)
+        if evidence is not None:
+            stores.append((name, evidence))
+    manager = getattr(state, "cartridge_manager", None)
+    if manager is not None:
+        for package in manager.corpus.list_packages():
+            stores.append((f"corpus:{package.id}@{package.version}", package.store))
+    return stores
+
+
+#: 裏で走る再埋め込み (参照を持たないと GC で消える)。
+_reembed_tasks: set[asyncio.Task] = set()
+
+
+async def _reembed_stores(stores: list[tuple[str, Any]]) -> None:
+    for name, store in stores:
+        try:
+            count = await store.embed_and_index_snapshot()
+        except Exception as exc:  # noqa: BLE001 — 1 ストアの失敗で残りを止めない
+            logger.warning("Re-embedding %s after the model change failed: %s", name, exc)
+            continue
+        logger.info("Re-embedded %s with the new embedding model: %d row(s)", name, count)
+
+
+@router.post("/reembed-confirm")
+@with_embed_priority(P3_BULK)
+async def confirm_reembed(state: AppState = Depends(get_app_state)):
+    """埋め込みモデルの変更を確認し、確認待ちのストアを現在のモデルで埋め直す (c_05 §0.5.7)。
+
+    埋め込みモデルの ``model_key`` が変わると全ストアの再埋め込みになるので、
+    自動では行わず ``data_health.reembed_pending`` に出して確認を待つ (その間の
+    版の索引を読まず、記憶の検索は版に畳まれていない新しい行だけになる)。
+    埋め直しは裏で走らせ、確認したストアをすぐ返す。
+    """
+    pending = [
+        (name, store) for name, store in evidence_stores(state)
+        if store.embedding_model_pending
+    ]
+    for _, store in pending:
+        store.confirm_reembed()
+    if pending:
+        task = asyncio.create_task(_reembed_stores(pending), name="reembed-confirmed")
+        _reembed_tasks.add(task)
+        task.add_done_callback(_reembed_tasks.discard)
+    logger.info("Re-embedding confirmed for %d store(s)", len(pending))
+    return {"confirmed": [name for name, _ in pending]}
 
 
 @router.post("/reload", response_model=ReloadResponse)
@@ -724,6 +759,13 @@ async def reload_model(state: AppState = Depends(get_app_state)):
             has_system_role=metadata.has_system_role,
         )
         model_state.save()
+
+        # 実際に載ったモデルを config と照合する (c_05 §0.5.7、data_health に出る)
+        from backend.factory._served_model import check_served_model
+
+        check_served_model(
+            state, cfg.get("model_paths", {}).get("base_model") or "", get_project_root(),
+        )
 
         # base 切替が成立したので Learn pillar を新パーティションへ束ね直す
         # (experience / base prompts / fewshot / policy)。同一モデルの再接続なら

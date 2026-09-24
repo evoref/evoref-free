@@ -10,6 +10,7 @@ from pathlib import Path
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.cli_theme import CLITheme
 from backend.log_config import get_logger
 
@@ -49,7 +50,7 @@ async def load_cli_theme(
 async def _load_from_api(backend_url: str) -> CLITheme | None:
     """バックエンド API からアクティブテーマの CLI テーマを取得"""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=5.0) as client:
             resp = await client.get(f"{backend_url}/api/themes/active-cli")
             if resp.status_code == 200:
                 data = resp.json()

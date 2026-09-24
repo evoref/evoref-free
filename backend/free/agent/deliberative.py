@@ -1866,7 +1866,8 @@ class DeliberativeAgent:
             logger.debug("today's sessions fact skipped", exc_info=True)
             return False
         rows: list[str] = []
-        for e in sorted(entries, key=lambda e: e.started_at):
+        epoch_min = utc_now_dt().replace(year=1, month=1, day=1)
+        for e in sorted(entries, key=lambda e: parse_utc(e.started_at) or epoch_min):
             if session_id and e.session_id == session_id:
                 continue
             heading = (e.summary or e.first_user_preview or "").strip().replace("\n", " ")

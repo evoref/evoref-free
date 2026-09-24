@@ -69,6 +69,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Literal
 
 import numpy as np
@@ -77,8 +78,12 @@ from backend.free.memory.attribute_key import attribute_key
 from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.free.memory.semantic.namespaces import namespace_of, policy_for
 from backend.free.memory.types import SemanticFact
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.jsonl_store import JSONLAppendStore
 from backend.log_config import get_logger
 from backend.free.core.inference import SUMMARY_TAIL_RE
+from backend.utils import epoch_to_utc
 
 logger = get_logger("memory.semantic.conflict")
 
@@ -245,6 +250,92 @@ def split_by_attribute_similarity(
 
 CONFLICTS_PENDING_FILENAME = "conflicts.jsonl"
 CONFLICTS_RESOLVED_FILENAME = "conflicts_resolved.jsonl"
+
+#: 競合ログの行の版 (``_v``)。行の形を変えるときに上げる (2 つの形式で共通)。
+CONFLICT_ROW_VERSION = 1
+
+
+@persisted(omit_defaults=True)
+@dataclass
+class ConflictLogRow:
+    """``conflicts.jsonl`` / ``conflicts_resolved.jsonl`` の 1 行 (未知キーは ``_extra``)。
+
+    ``trace_id`` は解決の経路が持つときだけ書く (既定値は書かない)。
+    """
+
+    _v: int
+    ts: str
+    scope: str
+    subject: str
+    predicate: str
+    type: str
+    winner_id: str
+    loser_ids: list[str]
+    decision: str
+    reason: str
+    trace_id: str | None = None
+    _extra: dict[str, Any] | None = None
+
+
+CONFLICT_ROW_CODEC = codec_for(ConflictLogRow)
+
+
+def decode_conflict_row(line: str) -> ConflictLogRow | None:
+    """1 行を読む。壊れた行・版が新しい行・読めない行は ``None`` (呼出側は原文のまま扱う)。"""
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    version = obj.get("_v") if isinstance(obj, dict) else None
+    if not isinstance(version, int) or isinstance(version, bool) or version > CONFLICT_ROW_VERSION:
+        return None
+    try:
+        return CONFLICT_ROW_CODEC.decode(obj)
+    except CodecError:
+        return None
+
+
+def _conflict_row_object(line: str) -> dict[str, Any]:
+    obj = json.loads(line)
+    if not isinstance(obj, dict):
+        raise ValueError("a conflict log row must be an object")
+    return obj
+
+
+def append_conflict_row(path: Path, row: ConflictLogRow) -> None:
+    """競合ログへ 1 行追記する (途中で切れた最終行は改行で終端してから、c_05 §0.5.8)。"""
+    store: JSONLAppendStore[dict[str, Any]] = JSONLAppendStore(
+        path,
+        serialize=lambda obj: json.dumps(obj, ensure_ascii=False),
+        deserialize=_conflict_row_object,
+        key_of=lambda obj: f"{obj.get('ts')}|{obj.get('winner_id')}",
+        row_version=CONFLICT_ROW_VERSION,
+    )
+    store.append(CONFLICT_ROW_CODEC.encode(row))
+
+#: スコープ別 (``global/`` と ``projects/<project>/``) の競合ログ。
+CONFLICTS_FORMAT = register_format(FormatSpec(
+    format_id="semantic.conflicts",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key=f"store/memory/semantic/**/{CONFLICTS_PENDING_FILENAME}",
+    retention="append-only; pending entries are closed by conflicts_resolved",
+    export=True,
+    encodings=("jsonl",),
+    records=(ConflictLogRow,),
+))
+CONFLICTS_RESOLVED_FORMAT = register_format(FormatSpec(
+    format_id="semantic.conflicts_resolved",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key=f"store/memory/semantic/**/{CONFLICTS_RESOLVED_FILENAME}",
+    retention="append-only (compaction target)",
+    export=True,
+    encodings=("jsonl",),
+    records=(ConflictLogRow,),
+))
 
 # 自動解決を許可しない (基本) タグ集合
 _MANUAL_BASE_TAGS: frozenset[str] = frozenset({"project", "policy"})
@@ -740,21 +831,18 @@ class SemanticConflictResolver:
     # ── 永続化 ────────────────────────────────────────────────────────
 
     def _write_jsonl(self, filename: str, decision: ConflictDecision) -> None:
-        path = self.store.root_dir / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        entry: dict[str, Any] = {
-            "ts": float(self._now_provider()),
-            "scope": self._infer_scope(),
-            "subject": decision.winner.subject,
-            "predicate": decision.winner.predicate,
-            "type": decision.winner.type,
-            "winner_id": decision.winner.id,
-            "loser_ids": [f.id for f in decision.losers],
-            "decision": decision.decision,
-            "reason": decision.reason,
-        }
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        append_conflict_row(self.store.root_dir / filename, ConflictLogRow(
+            _v=CONFLICT_ROW_VERSION,
+            ts=epoch_to_utc(self._now_provider()),
+            scope=self._infer_scope(),
+            subject=decision.winner.subject,
+            predicate=decision.winner.predicate,
+            type=decision.winner.type,
+            winner_id=decision.winner.id,
+            loser_ids=[f.id for f in decision.losers],
+            decision=decision.decision,
+            reason=decision.reason,
+        ))
 
     def _infer_scope(self) -> str:
         """ストアの scope 文字列。

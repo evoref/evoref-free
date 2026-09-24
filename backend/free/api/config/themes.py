@@ -170,16 +170,21 @@ async def delete_theme(theme_id: str, state: AppState = Depends(get_app_state)):
 
 @router.post("/{theme_id}/trust")
 async def trust_theme(theme_id: str, state: AppState = Depends(get_app_state)):
-    """テーマを信頼済みとしてマーク"""
-    logger.debug("POST /api/themes/%s/trust", theme_id)
+    """テーマの信頼は API から付与しない (docs/c_11 §1)。
+
+    信頼済みテーマの JS はアプリのオリジン内で動くので、付与できる経路を API に置くと
+    オリジン内のコードが別のテーマを信頼させられる。付与は PC の持ち主が端末で
+    ``evoref theme trust <id>`` を実行する経路だけにし、ここでは案内付きで 403 を返す。
+    取り消し (DELETE) は安全側の操作なので API に残す。
+    """
+    logger.debug("POST /api/themes/%s/trust (refused: CLI only)", theme_id)
     mgr = _get_manager(state)
-    try:
-        mgr.trust_theme(theme_id)
-    except KeyError:
+    if not mgr.theme_exists(theme_id):
         raise theme_not_found_error(theme_id)
-    except RuntimeError as e:
-        raise config_persist_error(str(e))
-    return {"theme_id": theme_id, "trusted": True}
+    raise theme_error(
+        403, "E0403", f"Theme trust is granted only from the CLI: evoref theme trust {theme_id}",
+        "api.theme_trust_cli_only", theme_id=theme_id,
+    )
 
 
 @router.delete("/{theme_id}/trust", status_code=200)

@@ -861,14 +861,13 @@ class FeedbackCollector:
         # 出口で書き戻す (``_load_session_state`` / ``_store_session_state``)。
         # セッション未指定 ("") は単一セッション運用として 1 枠に畳む。
         self._sessions: OrderedDict[str, _SessionTurnState] = OrderedDict()
-        # 現在ロード中のモデル名 (GGUF ファイル名)。record() の base_model /
+        # 現在ロード中のモデル名 (GGUF ファイル名、表示用)。record() の base_model /
         # embedding_model が明示指定されないとき既定値として埋める。
         #
         # base_model は **モードで変わる**: create は model_paths.create_model を
-        # ロードするため、chat と同じ名前を刻むとモデル隔離フィルタ (Level 2 が
-        # current_model で経験を絞る) の意味が壊れる。実際 2026-07-26 時点の
-        # 経験 182 件は create 分 2 件も chat のモデル名で記録されていた。
-        # _base_model_name は chat 既定として保持し、record() 時に mode から解決する。
+        # ロードする。_base_model_name は chat 既定として保持し、record() 時に mode
+        # から解決する。Level 2 の経験の絞り込みは model_key で行う
+        # (:meth:`_resolve_model_key`)。
         self._base_model_name = base_model_name
         self._embedding_model_name = embedding_model_name
         # 現会話セッションで record した entry の参照。会話終了時に
@@ -894,9 +893,8 @@ class FeedbackCollector:
     def _resolve_base_model_name(self, mode: str) -> str:
         """記録時のモードで実際にロードされている base モデルの GGUF 名を返す。
 
-        create は ``model_paths.create_model`` を読み込むため、chat と同じ名前を
-        刻むと Level 2 のモデル隔離フィルタ (``current_model`` で経験を絞る) が
-        別モデルの経験を混ぜてしまう。解決経路はモード切替が使う
+        表示用の名前で、照合には使わない (照合は :meth:`_resolve_model_key`)。
+        create は ``model_paths.create_model`` を読み込む。解決経路はモード切替が使う
         ``get_mode_generation_params`` に揃える (実際にロードされるモデルと
         刻む名前を同じ関数から採る)。
 
@@ -910,6 +908,28 @@ class FeedbackCollector:
         except Exception:
             return self._base_model_name
         return Path(raw).name if raw else self._base_model_name
+
+    @staticmethod
+    def _resolve_model_key(mode: str) -> str | None:
+        """記録時のモードで実際にロードされているモデルの ``model_key`` (c_05 §0.5.7)。
+
+        chat は学習パーティションの active key (ランタイムのモデル切替に追随する)、
+        create は ``model_paths.create_model`` の key (未指定なら active と同じ)。
+        Level 2 の経験の絞り込みはこの値で行う。解決できない (config 未ロード等)
+        ときは ``None`` で、その経験は Level 2 の絞り込みに載らない。
+        """
+        try:
+            from backend.config import get_config, get_path_resolver
+
+            resolver = get_path_resolver()
+            if is_create_mode(mode):
+                create_model = (get_config().get("model_paths") or {}).get("create_model")
+                if create_model:
+                    return resolver.model_key_for(create_model)
+            return resolver.active_model_key
+        except Exception as exc:  # noqa: BLE001 — 記録自体は止めない
+            logger.debug("model_key unavailable for the experience: %s", exc)
+            return None
 
     def record(
         self,
@@ -1107,6 +1127,7 @@ class FeedbackCollector:
             response_summary=response[:RESPONSE_SUMMARY_CAP],
             response_full=truncate_at_boundary(response, RESPONSE_FULL_CAP),
             base_model=base_model or self._resolve_base_model_name(mode),
+            model_key=self._resolve_model_key(mode),
             embedding_model=embedding_model or self._embedding_model_name,
             lang=lang,
             gen_config=gen_config or GenerationConfigRef(),
@@ -1133,9 +1154,11 @@ class FeedbackCollector:
         if explicit_correction and self._prev_entry is not None:
             if current_routed_tool and not self._prev_routed_tool:
                 self._prev_entry.signals.tool_routing_false_negative = True
+                self._touch(self._prev_entry)
                 self._learn_tool_routing_from_false_negative(self._prev_entry.query)
             if long_form_used and not self._prev_used_long_form:
                 self._prev_entry.signals.long_form_false_negative = True
+                self._touch(self._prev_entry)
                 self._learn_long_form_from_signal(self._prev_entry.query)
 
         # 訂正・言い直し検出からのパターン学習は行わない (2026-07-21 廃止)。
@@ -1213,8 +1236,9 @@ class FeedbackCollector:
             entry.signals.conversation_ended = True
         # entry 群を書き換えたので永続化する。record 経由の自動保存が
         # 掛からない唯一の変更点 (次の record まで待つと会話終了フラグが
-        # 落ちる)。
-        self.buffer.flush()
+        # 落ちる)。書き換えた分だけ patch 行で出す (全件の差分はループで取らない)。
+        self._touch(*self._session_entries)
+        self.buffer.flush(touched_only=True)
         self._session_entries.clear()
         self._prev_query = None
         self._prev_entry = None
@@ -1224,6 +1248,12 @@ class FeedbackCollector:
         self._pending_correction = None
         self._prev_response = ""
         self._sessions.clear()
+
+    def _touch(self, *entries: ExperienceEntry) -> None:
+        """記録済みのエントリを書き換えたことを経験バッファへ知らせる (patch 行の対象)。"""
+        touch = getattr(self.buffer, "touch", None)
+        if callable(touch):
+            touch(*entries)
 
     # ── セッション別の直前ターン状態 ──
 
@@ -1563,6 +1593,7 @@ class FeedbackCollector:
             return
         prev.signals.turn_outcome = "failed"
         prev.signals.turn_outcome_reason = "retracted by assistant"
+        self._touch(prev)
         logger.info(
             "Assistant retracted its previous answer; marking the previous "
             "turn as failed (prev_query=%s)", (self._prev_query or "")[:60],
@@ -1646,6 +1677,7 @@ class FeedbackCollector:
         entry.signals.correction_candidate = None
         entry.signals.user_correction = None
         entry.signals.correction_detected_by = "retracted_not_accepted"
+        self._touch(entry)
         logger.info(
             "Correction retracted: the assistant kept its original value "
             "(prior=%s) instead of the user's claim (%s); not learning from it",

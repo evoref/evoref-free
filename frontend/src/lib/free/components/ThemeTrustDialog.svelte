@@ -3,16 +3,28 @@
 	import DialogShell from './DialogShell.svelte';
 
 	interface Props {
+		themeId: string;
 		themeName: string;
 		themeAuthor: string;
 		themeVersion: string;
 		componentCount: number;
-		onConfirm: () => void;
+		/** カスタムコードなし (色とレイアウトだけ) で適用する */
+		onApplyWithoutCode: () => void;
 		onCancel: () => void;
 	}
 
-	let { themeName, themeAuthor, themeVersion, componentCount, onConfirm, onCancel }: Props =
-		$props();
+	let {
+		themeId,
+		themeName,
+		themeAuthor,
+		themeVersion,
+		componentCount,
+		onApplyWithoutCode,
+		onCancel
+	}: Props = $props();
+
+	// 信頼の付与は端末からだけ (docs/c_11 §1)。ここでは手順を案内する。
+	let command = $derived(`evoref theme trust ${themeId}`);
 </script>
 
 <DialogShell
@@ -42,14 +54,16 @@
 		</div>
 	</div>
 
-	<p class="confirm-message">{$t('theme_manager.trust_confirm')}</p>
+	<p class="confirm-message">{$t('theme_manager.trust_cli_required')}</p>
+	<pre class="trust-command"><code>{command}</code></pre>
+	<p class="confirm-message">{$t('theme_manager.trust_cli_restart')}</p>
 
 	<div class="dialog-actions">
 		<button class="btn btn-cancel" onclick={onCancel}>
 			{$t('common.cancel')}
 		</button>
-		<button class="btn btn-trust" onclick={onConfirm}>
-			{$t('theme_manager.trust_accept')}
+		<button class="btn btn-trust" onclick={onApplyWithoutCode}>
+			{$t('theme_manager.trust_apply_without_code')}
 		</button>
 	</div>
 </DialogShell>
@@ -86,6 +100,15 @@
 		font-size: 1rem;
 		line-height: 1.5;
 		margin: 0 0 20px;
+	}
+	.trust-command {
+		background-color: var(--bg-secondary);
+		border-radius: var(--border-radius);
+		padding: 8px 12px;
+		margin: 0 0 12px;
+		font-size: 0.9rem;
+		user-select: all;
+		overflow-x: auto;
 	}
 	.dialog-actions {
 		display: flex;

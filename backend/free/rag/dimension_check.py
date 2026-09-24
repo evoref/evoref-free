@@ -16,13 +16,14 @@ store_info の embedding_model と現行 embedder のモデル名も突合する
 
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from backend.io.atomic import atomic_write_text
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import READONLY_STATUSES, ReadResult, read_versioned, write_versioned
 from backend.log_config import get_logger
-from backend.utils import utc_now
 
 if TYPE_CHECKING:
     from backend.app_state import AppState
@@ -34,6 +35,29 @@ logger = get_logger("rag.dimension_check")
 _EMBED_REINDEX_MARKER = ".embed_reindex_required"
 
 
+@persisted()
+@dataclass
+class ReindexMarker:
+    """reindex 要求マーカーの payload。"""
+
+    new_model: str = ""
+    #: この版が知らないキー (マーカーを立て直すときもそのまま戻す)。
+    _extra: dict[str, Any] | None = None
+
+
+_MARKER_CODEC = codec_for(ReindexMarker)
+
+EMBED_REINDEX_MARKER_FORMAT = register_format(FormatSpec(
+    format_id="memory.embed_reindex_required",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key=f"store/memory/{_EMBED_REINDEX_MARKER}",
+    retention="removed by a successful reindex",
+    records=(ReindexMarker,),
+))
+
+
 def _embed_reindex_marker_path() -> Path | None:
     """reindex 要求マーカーの絶対パス (resolver 未初期化時は ``None``)。"""
     try:
@@ -42,6 +66,18 @@ def _embed_reindex_marker_path() -> Path | None:
         return get_path_resolver().resolve_local("memory_dir") / _EMBED_REINDEX_MARKER
     except Exception:
         return None
+
+
+def _read_marker(path: Path) -> ReadResult:
+    """マーカーを読む。読めたときの ``payload`` は :class:`ReindexMarker` (表で読めなければ ``corrupt``)。"""
+    spec = EMBED_REINDEX_MARKER_FORMAT
+    result = read_versioned(path, format_id=spec.format_id, format_version=spec.version)
+    if not result.ok:
+        return result
+    try:
+        return ReadResult(result.status, _MARKER_CODEC.decode(result.payload), result.version)
+    except CodecError as e:
+        return ReadResult("corrupt", version=result.version, detail=f"payload: {e}")
 
 
 def set_embed_reindex_required(new_model: str) -> None:
@@ -55,11 +91,20 @@ def set_embed_reindex_required(new_model: str) -> None:
     p = _embed_reindex_marker_path()
     if p is None:
         return
+    current = _read_marker(p)
+    if current.status in READONLY_STATUSES:
+        # 新しい版 / G1 でないマーカーは上書きしない (有る限り reindex 要求は立ったまま)
+        logger.warning("Leaving embed reindex marker %s untouched (%s)", p, current.status)
+        return
+    # 立っているマーカーを立て直すときは未知キーを残す
+    marker = replace(current.payload, new_model=new_model) if current.ok else ReindexMarker(new_model)
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(
+        write_versioned(
             p,
-            json.dumps({"new_model": new_model, "at": utc_now()}, ensure_ascii=False),
+            format_id=EMBED_REINDEX_MARKER_FORMAT.format_id,
+            format_version=EMBED_REINDEX_MARKER_FORMAT.version,
+            payload=_MARKER_CODEC.encode(marker),
+            component="dimension_check",
         )
         logger.info(
             "Embed reindex marker set (model changed to %s); search results are "
@@ -72,9 +117,16 @@ def set_embed_reindex_required(new_model: str) -> None:
 
 
 def clear_embed_reindex_required() -> None:
-    """reindex 要求マーカーを消す (reindex 成功後に呼ぶ)。"""
+    """reindex 要求マーカーを消す (reindex 成功後に呼ぶ)。
+
+    新しい版 / G1 でないマーカーは消さない (readonly、c_05 §0.4)。
+    """
     p = _embed_reindex_marker_path()
     if p is None:
+        return
+    status = _read_marker(p).status
+    if status in READONLY_STATUSES:
+        logger.warning("Leaving embed reindex marker %s untouched (%s)", p, status)
         return
     try:
         p.unlink(missing_ok=True)
@@ -140,12 +192,15 @@ def check_embedding_dim_consistency(state: "AppState") -> bool:
 
     # embed モデル切替マーカー: dim が一致していてもモデルが変われば既存ベクトルは
     # stale。dim のみの比較では検知できない同一性変化をマーカーで補う。
+    # 読めないマーカー (新しい版 / G1 でない / 壊れた) も有る限り要求は立ったまま扱う。
     marker = _embed_reindex_marker_path()
-    if marker is not None and marker.exists():
+    marker_status = _read_marker(marker).status if marker is not None else "absent"
+    if marker_status != "absent":
         logger.warning(
-            "EMBED MODEL CHANGED since last index (reindex marker present). "
+            "EMBED MODEL CHANGED since last index (reindex marker present, %s). "
             "Existing vectors are stale; search results are unreliable. "
             "Run 'evoref reindex' to rebuild.",
+            marker_status,
         )
         mismatch = True
 

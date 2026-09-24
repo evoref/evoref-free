@@ -14,7 +14,7 @@
 トークナイザは :mod:`backend.free.rag.evidence.tokenize` の
 :func:`~backend.free.rag.evidence.tokenize.tokenize_ja` (文字 bi-gram + ASCII 語分割 +
 ストップワード) をそのまま流用する。索引側と検索側で切り方がずれると語が一致
-しなくなるため、切り方のパラメータは索引に保存し :meth:`LexicalIndex.load` で
+しなくなるため、切り方のパラメータは索引に保存し :meth:`LexicalIndex.from_arrays` で
 復元する。
 
 **スコアの位置付け (c_16 §6.3)**: 本モジュールが返すスコアは
@@ -25,11 +25,11 @@ lexical スコアと cosine を足したり混ぜたりしてはならない。
 
 from __future__ import annotations
 
-import io
 import json
 import time
+import zipfile
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +40,7 @@ from backend.free.rag.evidence.tokenize import (
     TOKENIZER_VERSION,
     tokenize_ja,
 )
-from backend.io import atomic_write_bytes, atomic_write_text
+from backend.io import AtomicWriter, atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("rag.evidence.lexical_index")
@@ -53,8 +53,15 @@ LEXICAL_INDEX_VERSION: int = 1
 #: これ以下なら ``n_docs`` 長の密アキュムレータ (``np.bincount``) を確保する方が速い。
 DENSE_ACCUMULATOR_MAX_DOCS: int = 200_000
 
-_INDEX_NPZ_NAME = "index.npz"
-_META_JSON_NAME = "meta.json"
+#: 全シャードの配列を 1 ファイルに pack したもの (c_16 §6.2)。
+LEXICAL_PACK_FILE = "lexical.npz"
+#: シャード名 → pack 内の配列の鍵 / 件数 / meta。
+SHARD_MAP_FILE = "shards.json"
+#: 1 シャードが pack に持つ配列 (鍵は ``<シャード鍵>.<配列名>``)。``rows`` は
+#: シャードのローカル行 → snapshot 全体の行の写像。
+SHARD_ARRAYS: tuple[str, ...] = (
+    "indptr", "indices", "impacts", "idf", "vocab", "vocab_ends", "rows",
+)
 
 
 @dataclass(frozen=True)
@@ -293,54 +300,58 @@ class LexicalIndex:
 
     # ------------------------------------------------------------ 永続化
 
-    def save(self, directory: Path | str) -> None:
-        """``index.npz`` + ``meta.json`` を原子的に書く。"""
-        target = Path(directory)
-        target.mkdir(parents=True, exist_ok=True)
-        buffer = io.BytesIO()
-        np.savez(
-            buffer,
-            indptr=self.indptr,
-            indices=self.indices,
-            impacts=self.impacts,
-            idf=self.idf,
-        )
-        atomic_write_bytes(target / _INDEX_NPZ_NAME, buffer.getvalue())
-        meta = {
+    def to_arrays(self) -> dict[str, np.ndarray]:
+        """pack (``lexical.npz``) に入れる配列 (c_16 §6.2)。
+
+        語彙は term_id 順に連結した UTF-8 本文 (``vocab``) と、各語の **文字数の
+        累積** (``vocab_ends``) で持つ — JSON の dict にすると読むたびに全シャードの
+        語彙を解析することになる。
+        """
+        terms = sorted(self.vocab, key=self.vocab.__getitem__)
+        blob = "".join(terms).encode("utf-8")
+        return {
+            "indptr": self.indptr,
+            "indices": self.indices,
+            "impacts": self.impacts,
+            "idf": self.idf,
+            "vocab": np.frombuffer(blob, dtype=np.uint8),
+            "vocab_ends": np.cumsum([len(t) for t in terms], dtype=np.int64),
+        }
+
+    def meta(self) -> dict[str, object]:
+        """``shards.json`` に載せるシャードの meta。"""
+        return {
             "lexical_version": LEXICAL_INDEX_VERSION,
             "n_docs": self.n_docs,
             "params": self.params.to_json(),
-            "vocab": self.vocab,
         }
-        atomic_write_text(
-            target / _META_JSON_NAME,
-            json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
-        )
 
     @classmethod
-    def load(cls, directory: Path | str) -> "LexicalIndex":
-        """:meth:`save` の逆。形式版が新しい場合は読まずに落とす。"""
-        source = Path(directory)
-        meta = json.loads((source / _META_JSON_NAME).read_text(encoding="utf-8"))
-        version = int(meta.get("lexical_version", 0))
+    def from_arrays(
+        cls, arrays: Mapping[str, np.ndarray], meta: Mapping[str, object],
+    ) -> "LexicalIndex":
+        """:meth:`to_arrays` / :meth:`meta` の逆。形式版が新しい場合は読まずに落とす。"""
+        version = int(meta.get("lexical_version", 0))  # type: ignore[arg-type]
         if version > LEXICAL_INDEX_VERSION:
             raise ValueError(
                 f"lexical index version {version} is newer than supported "
-                f"{LEXICAL_INDEX_VERSION}: {source}"
+                f"{LEXICAL_INDEX_VERSION}"
             )
-        with np.load(source / _INDEX_NPZ_NAME) as arrays:
-            indptr = arrays["indptr"]
-            indices = arrays["indices"]
-            impacts = arrays["impacts"]
-            idf = arrays["idf"]
+        text = np.asarray(arrays["vocab"], dtype=np.uint8).tobytes().decode("utf-8")
+        vocab: dict[str, int] = {}
+        start = 0
+        for term_id, end in enumerate(np.asarray(arrays["vocab_ends"]).tolist()):
+            vocab[text[start:end]] = term_id
+            start = end
+        params = meta.get("params")
         return cls(
-            indptr=indptr,
-            indices=indices,
-            impacts=impacts,
-            idf=idf,
-            vocab={str(k): int(v) for k, v in meta["vocab"].items()},
-            n_docs=int(meta["n_docs"]),
-            params=LexicalParams.from_json(meta.get("params") or {}),
+            indptr=arrays["indptr"],
+            indices=arrays["indices"],
+            impacts=arrays["impacts"],
+            idf=arrays["idf"],
+            vocab=vocab,
+            n_docs=int(meta["n_docs"]),  # type: ignore[arg-type]
+            params=LexicalParams.from_json(params if isinstance(params, dict) else {}),
         )
 
 
@@ -530,6 +541,17 @@ class LexicalShardSet:
             name: np.asarray(mapping, dtype=np.int64) for name, mapping in rows.items()
         }
 
+    def add(self, name: str, index: LexicalIndex, rows: np.ndarray) -> None:
+        """シャードを 1 つ足す (:class:`LexicalPack` が読んだ分だけ積む)。"""
+        mapping = np.asarray(rows, dtype=np.int64)
+        if mapping.shape[0] != index.n_docs:
+            raise ValueError(
+                f"shard {name!r}: row mapping has {mapping.shape[0]} entries "
+                f"but index has {index.n_docs} docs"
+            )
+        self.shards[name] = index
+        self.rows[name] = mapping
+
     def candidates_in(
         self,
         shards: Iterable[str],
@@ -581,6 +603,125 @@ class LexicalShardSet:
         all_rows = np.concatenate(row_parts).astype(np.int64, copy=False)
         all_scores = np.concatenate(score_parts).astype(np.float32, copy=False)
         return _top_k_desc(all_rows, all_scores, top_k)
+
+
+def save_lexical_pack(
+    directory: Path | str,
+    shards: Mapping[str, tuple[Mapping[str, np.ndarray], Mapping[str, object]]],
+    *,
+    lexical_version: int,
+) -> None:
+    """全シャードを ``lexical.npz`` 1 ファイル + ``shards.json`` に書く (c_16 §6.2)。
+
+    Args:
+        shards: シャード名 → (:data:`SHARD_ARRAYS` の配列, シャードの meta)。
+            meta は ``shards.json`` にそのまま載る (``n_docs`` / ``params`` 等)。
+        lexical_version: manifest の ``lexical_version``。
+
+    どちらも derived なので fsync しない (壊れていれば作り直す、c_16 §5.6)。
+    """
+    target = Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {}
+    entries: dict[str, dict[str, object]] = {}
+    for position, (name, (shard_arrays, meta)) in enumerate(shards.items()):
+        key = f"s{position}"
+        for array_name in SHARD_ARRAYS:
+            arrays[f"{key}.{array_name}"] = np.asarray(shard_arrays[array_name])
+        entries[name] = {"key": key, **meta}
+    with AtomicWriter(target / LEXICAL_PACK_FILE, mode="wb") as f:
+        np.savez(f, **arrays)
+    atomic_write_text(
+        target / SHARD_MAP_FILE,
+        json.dumps(
+            {
+                "lexical_version": int(lexical_version),
+                "file": LEXICAL_PACK_FILE,
+                "shards": entries,
+            },
+            ensure_ascii=False, separators=(",", ":"),
+        ),
+    )
+
+
+class LexicalPack:
+    """版ディレクトリの ``lexical.npz`` + ``shards.json`` を遅延で読む (c_16 §6.2)。
+
+    開いた時点で読むのは ``shards.json`` だけ。配列は :meth:`shard_set` に渡された
+    (= ゲートを通った) シャードの分だけ npz から鍵ごとに読む。npz のハンドルは
+    読み終えたら閉じる — 保持すると Windows で版ディレクトリを prune できない。
+
+    Raises:
+        OSError / ValueError: ``shards.json`` が読めない / 形が違う。
+    """
+
+    def __init__(self, directory: Path | str) -> None:
+        self.directory = Path(directory)
+        raw = json.loads((self.directory / SHARD_MAP_FILE).read_text(encoding="utf-8"))
+        entries = raw.get("shards") if isinstance(raw, dict) else None
+        if not isinstance(entries, dict):
+            raise ValueError(f"{self.directory / SHARD_MAP_FILE} has no shards")
+        self.lexical_version = int(raw.get("lexical_version") or 0)
+        self.entries: dict[str, dict[str, object]] = {
+            str(name): entry for name, entry in entries.items()
+            if isinstance(entry, dict) and entry.get("key")
+        }
+        self._set = LexicalShardSet({}, {})
+        #: 読めなかったシャード (同じ版のうちは読み直さない)。
+        self._failed: set[str] = set()
+
+    @property
+    def names(self) -> list[str]:
+        """シャード名 (配列は読まない)。"""
+        return list(self.entries)
+
+    def params(self, name: str) -> LexicalParams:
+        """シャードの構築パラメータ (``shards.json`` から、配列は読まない)。"""
+        params = self.entries[name].get("params")
+        return LexicalParams.from_json(params if isinstance(params, dict) else {})
+
+    def read_arrays(self, names: Iterable[str]) -> dict[str, dict[str, np.ndarray]]:
+        """指定シャードの生の配列を読む (前版の未変更シャードを写すため)。"""
+        wanted = [name for name in dict.fromkeys(names) if name in self.entries]
+        out: dict[str, dict[str, np.ndarray]] = {}
+        if not wanted:
+            return out
+        with np.load(self.directory / LEXICAL_PACK_FILE, allow_pickle=False) as npz:
+            for name in wanted:
+                key = str(self.entries[name]["key"])
+                try:
+                    out[name] = {a: npz[f"{key}.{a}"] for a in SHARD_ARRAYS}
+                except (KeyError, ValueError) as e:
+                    logger.warning("lexical shard %s unreadable in %s: %s",
+                                   name, self.directory, e)
+        return out
+
+    def shard_set(self, names: Iterable[str]) -> LexicalShardSet:
+        """``names`` のうち未読のシャードを読み足し、読めた分の束を返す。"""
+        missing = [
+            name for name in dict.fromkeys(names)
+            if name in self.entries and name not in self._set.shards
+            and name not in self._failed
+        ]
+        if not missing:
+            return self._set
+        try:
+            loaded = self.read_arrays(missing)
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            logger.warning("lexical pack unreadable at %s: %s", self.directory, e)
+            self._failed.update(missing)
+            return self._set
+        for name in missing:
+            arrays = loaded.get(name)
+            try:
+                if arrays is None:
+                    raise ValueError("arrays missing")
+                index = LexicalIndex.from_arrays(arrays, self.entries[name])
+                self._set.add(name, index, arrays["rows"])
+            except (KeyError, ValueError, UnicodeDecodeError) as e:
+                logger.warning("failed to load lexical shard %s: %s", name, e)
+                self._failed.add(name)
+        return self._set
 
 
 def max_postings_scanned(index: LexicalIndex, query: str) -> int:

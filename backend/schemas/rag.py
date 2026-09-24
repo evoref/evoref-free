@@ -212,32 +212,6 @@ class SelfRagConfig(BaseModel):
         default_factory=SelfRagContentGateConfig,
     )
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_removed_judge_sections(cls, data: object) -> object:
-        """LLM 再判定とその決定リコールの旧セクションを明示的に拒否する。
-
-        専用アシストモデル撤去 (2026-08-14) で LLM 版の検索必要性 / 品質判定は
-        消え、残っていた決定リコール (``*_recall``) も供給元が無いまま読み側
-        だけが動いていたため 2026-08-26 に削除した。``extra="forbid"`` の
-        素のエラーだと「どのキーを消せばよいか」が伝わらないので、
-        ``reject_legacy_reranker_section`` と同じ形で理由を示す。
-        """
-        removed = [
-            k for k in ("quality_judge", "necessity_judge",
-                        "necessity_recall", "quality_recall")
-            if isinstance(data, dict) and k in data
-        ]
-        if removed:
-            raise ValueError(
-                "rag.self_rag must not contain "
-                f"{', '.join(removed)} anymore. LLM-based retrieval "
-                "necessity/quality judging and its decision recall were "
-                "removed; retrieval necessity is decided by rules and quality "
-                "by vector thresholds. Remove these keys from config.yaml.",
-            )
-        return data
-
 
 class RAGConfig(BaseModel):
     """RAG 設定"""
@@ -282,26 +256,6 @@ class RAGConfig(BaseModel):
     # --- code グラフ (c_16 §4.4) ---
     project_map: ProjectMapConfig = Field(default_factory=ProjectMapConfig)
 
-    @model_validator(mode="before")
-    @classmethod
-    def reject_removed_contextual_prefix(cls, data: object) -> object:
-        """撤去した ``rag.contextual_prefix`` を明示的に拒否する (c_16 §8.2)。
-
-        Contextual Retrieval (eager / lazy) は書き戻し先の旧 ``VectorStore`` が
-        無く毎 Full 0 件で死んでいたため 2026-09-12 に撤去した (f_01 §5)。
-        ``extra="forbid"`` の素のエラーだと理由が伝わらないので、他の撤去キーと
-        同じ形でキー名と行き先を示す。
-        """
-        if isinstance(data, dict) and "contextual_prefix" in data:
-            raise ValueError(
-                "rag.contextual_prefix was removed (2026-09-12): Contextual "
-                "Retrieval prefixes had no store to write to since the Evidence "
-                "Store rewrite (c_16 §8.2). Question-side context now comes from "
-                "the pseudo-query index (rag.pseudo_query) and exact-term recall "
-                "from the inverted-index seat (rag.lexical_seats). Remove the "
-                "rag.contextual_prefix section from config.yaml.",
-            )
-        return data
     # --- ベクトル量子化 ---
     quantization: str = Field(default="int8", pattern=r"^(none|int8)$")
     # int8 粗検索後に float32 で rescore する候補数。チャット応答経路の LTM /
@@ -438,7 +392,6 @@ class EmbeddingConfig(BaseModel):
     # --- 永続埋め込みキャッシュ ---
     cache_enabled: bool = True
     cache_max_mb: int = Field(default=100, ge=1)
-    cache_dir: str = "local/cache/embeddings/"
     # 起動時に embedder dim と既存ベクトルの dim 不整合を検出した際、
     # 自動で ``run_reindex`` を実行するか。``false`` (既定) では
     # ``state.embedding_dim_mismatch`` を立てて WARNING ログのみ。

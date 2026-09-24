@@ -13,10 +13,10 @@ import hashlib
 import json
 import re
 from collections import Counter
-from dataclasses import asdict, fields
+from dataclasses import dataclass, field
 from math import sqrt
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -24,6 +24,7 @@ import numpy as np
 # (agent) 所属の純粋 util に移動済。Learn 側はここから import する。
 # format_fewshot_section は他モジュール (tests / 一部呼出元) が本モジュール経由で
 # import するため re-export として保持する。
+from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.free.core.date_math_cue import query_has_date_math_cue
 from backend.free.agent.prompt_utils import (
     FewShotExample,
@@ -55,7 +56,9 @@ from backend.free.core.text_quality import (
     violates_length_constraint,
 )
 from backend.free.learning.fitness import defect_rate_fitness
-from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import JsonPayload, VersionedJsonFile
 from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
@@ -637,17 +640,11 @@ _QUALITY_SYSTEM_PROMPT = (
     "(5) で、案内文やメールに質問に無い具体的な日時・会場などを書き込んだ回答も 0.3 以下にしてください。"
 )
 
-#: fewshot_pool.json 上で追い出し済み hash (墓標) を持つ予約キー。
-_EVICTED_KEY = "_evicted"
-#: 墓標の上限 (モード別、FIFO)。16 byte hex × 2000 で数十 KB。
+#: 墓標 (追い出し済み hash) の上限 (モード別、FIFO)。16 byte hex × 2000 で数十 KB。
 _EVICTED_CAP = 2000
-#: 退避した例 (本文ごと保持、``restore`` で戻せる) の予約キーと上限 (モード別 FIFO)。
+#: 退避した例 (本文ごと保持、``restore`` で戻せる) の上限 (モード別 FIFO)。
 #: 追い出しは削除ではない (f_04 §3.2.2)。墓標は従来どおり立てて自動再採用を防ぐ。
-_ARCHIVED_KEY = "_archived"
 _ARCHIVED_CAP = 500
-#: curate の集計位置 (最後に集計した経験の timestamp) を持つ予約キー。
-_CURATION_KEY = "_curation"
-_RESERVED_KEYS = frozenset({_EVICTED_KEY, _ARCHIVED_KEY, _CURATION_KEY})
 
 #: 使用実績からの遷移 (f_04 §3.2.2)。
 DEFAULT_STALE_AFTER_DAYS = 30
@@ -683,10 +680,6 @@ DEFAULT_FEWSHOT_PREDICATE: str = "example_for"
 
 EvolveWriteback = Literal["yaml", "semmem"]
 
-#: _from_payload で JSON から復元する FewShotExample のキー集合。
-#: 未知キー (旧スキーマ / フィールド削除) を無視して TypeError によるプール
-#: 全消失を防ぐ (level0_instant の FeedbackSignals 復元と対称)。
-_EXAMPLE_FIELD_NAMES = frozenset(f.name for f in fields(FewShotExample))
 
 
 def _resolve_dense_min_sim() -> float:
@@ -781,13 +774,60 @@ def _calc_experience_fitness(signals: dict) -> float:
 QUALITY_SCORER_VERSION = 2
 
 
-class FewShotPool(JsonStateStore):
+@persisted()
+@dataclass
+class FewShotCuration:
+    """curate の集計位置 (``_curation``)。"""
+
+    #: 最後に集計した経験の timestamp (ISO 8601 UTC)。空 = 未集計。
+    watermark: str = ""
+    _extra: dict[str, Any] | None = None
+
+
+@persisted(omit_defaults=True)
+@dataclass
+class FewShotPoolFile:
+    """``fewshot_pool.json`` のペイロード。
+
+    プールはモード (``chat`` / ``create``、:data:`~backend.free.core.session_mode.SessionMode`)
+    ごとの宣言フィールドで、この版が知らないトップのキーは ``_extra`` に残る (モードとして
+    読まない)。モードを足すのは任意フィールドの追加 (同じ版)。空の表と既定値は書かない。
+    """
+
+    chat: list[FewShotExample] = field(default_factory=list)
+    create: list[FewShotExample] = field(default_factory=list)
+    #: モード → 追い出した例の content hash (墓標、FIFO)。
+    _evicted: dict[str, list[str]] = field(default_factory=dict)
+    #: モード → 退避した例 (本文ごと、FIFO)。
+    _archived: dict[str, list[FewShotExample]] = field(default_factory=dict)
+    _curation: FewShotCuration | None = None
+    _extra: dict[str, Any] | None = None
+
+
+#: プールを持つモード (:class:`FewShotPoolFile` の宣言フィールド)。
+_POOL_MODES: tuple[str, ...] = ("chat", "create")
+
+
+FEWSHOT_POOL_FORMAT = register_format(FormatSpec(
+    format_id="learning.fewshot_pool",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/fewshot_pool.json",
+    retention="per-mode pool caps",
+    export=True,
+    records=(FewShotPoolFile,),
+))
+
+
+class FewShotPool(VersionedJsonFile):
     """Few-shot 候補プール
 
     経験バッファから高品質な応答例を収集し、多様性を維持しながら
     候補プールを管理する。進化時のソースとして使用される。
     """
 
+    FORMAT = FEWSHOT_POOL_FORMAT
     _state_logger = logger
 
     def __init__(
@@ -863,6 +903,9 @@ class FewShotPool(JsonStateStore):
         self._archived: dict[str, list[FewShotExample]] = {}
         # curate が最後に集計した経験の timestamp (ISO 8601 UTC)。空 = 未集計。
         self._curation_watermark: str = ""
+        # 読んだファイルの未知キー (トップ / ``_curation``)。書き戻しで元の位置へ戻す。
+        self._payload_extra: dict[str, Any] | None = None
+        self._curation_extra: dict[str, Any] | None = None
 
     # ── SemMem 書き戻しヘルパ ───────────────────────────
 
@@ -920,6 +963,8 @@ class FewShotPool(JsonStateStore):
         self._rejected_hashes = {}
         self._archived = {}
         self._curation_watermark = ""
+        self._payload_extra = None
+        self._curation_extra = None
 
     @staticmethod
     def _build_subject(base_model_id: str, mode: str, example_id: str) -> str:
@@ -989,15 +1034,15 @@ class FewShotPool(JsonStateStore):
         )
         return FewShotExample(
             id=id_part,
-            query=str(payload.get("query", "")),
-            response=str(payload.get("response", "")),
-            mode=str(payload.get("mode", mode_part)),
+            query=str(payload.get("query") or ""),
+            response=str(payload.get("response") or ""),
+            mode=str(payload.get("mode") or mode_part),
             fitness=float(payload.get("fitness", 0.0)),
-            added_at=str(payload.get("added_at", "")),
+            added_at=str(payload.get("added_at") or ""),
             quality_score=quality_score,
             quality_scorer_version=payload.get("quality_scorer_version"),
-            source_experience_id=str(payload.get("source_experience_id", "")),
-            lang=str(payload.get("lang", "")),
+            source_experience_id=str(payload.get("source_experience_id") or ""),
+            lang=str(payload.get("lang") or ""),
         )
 
     def _writeback_example_fact(
@@ -1256,6 +1301,7 @@ class FewShotPool(JsonStateStore):
             sims.append(float(q @ (v / n)) if n and np.isfinite(n) else 0.0)
         return sims
 
+    @with_embed_priority(P2_LEARNING)
     async def backfill_embeddings(self, embedder) -> int:
         """埋め込みが無い例の ``query`` を遡って埋め込む。
 
@@ -2244,74 +2290,67 @@ class FewShotPool(JsonStateStore):
             "delegated_to_semmem": False,
         }
 
-    # ── 永続化 (JsonStateStore) ──
+    # ── 永続化 (VersionedJsonFile) ──
 
     def _to_payload(self) -> JsonPayload:
-        # ``embedding`` は永続化しない。1024 次元 × プール件数を状態ファイルへ
-        # 書くと肥大するうえ、埋め込みモデルを替えた瞬間に **次元が合わない
-        # ベクトル** が復元されて黙って類似度 0 になる (=「手本が 1 件も
-        # 選ばれない」という気づきにくい壊れ方)。プールは高々 pool_size 件
-        # なので、起動後の背景タスクと sleep-time で張り直す方が安全。
-        payload: dict = {
-            mode: [
-                {k: v for k, v in asdict(ex).items() if k != "embedding"}
-                for ex in pool
-            ]
-            for mode, pool in self._pools.items()
-        }
-        evicted = {m: list(t) for m, t in self._evicted_hashes.items() if t}
-        if evicted:
-            payload[_EVICTED_KEY] = evicted
-        archived = {
-            mode: [
-                {k: v for k, v in asdict(ex).items() if k != "embedding"}
-                for ex in bucket
-            ]
-            for mode, bucket in self._archived.items() if bucket
-        }
-        if archived:
-            payload[_ARCHIVED_KEY] = archived
-        if self._curation_watermark:
-            payload[_CURATION_KEY] = {"watermark": self._curation_watermark}
-        return payload
+        # ``embedding`` は永続化しない (``FewShotExample`` の transient)。1024 次元 ×
+        # プール件数を状態ファイルへ書くと肥大するうえ、埋め込みモデルを替えた瞬間に
+        # **次元が合わないベクトル** が復元されて黙って類似度 0 になる (=「手本が 1 件も
+        # 選ばれない」という気づきにくい壊れ方)。プールは高々 pool_size 件なので、
+        # 起動後の背景タスクと sleep-time で張り直す方が安全。
+        unknown = sorted(set(self._pools) - set(_POOL_MODES))
+        if unknown:
+            logger.warning("Fewshot pool has undeclared mode(s) %s; they are not saved", unknown)
+        curation = (
+            FewShotCuration(watermark=self._curation_watermark, _extra=self._curation_extra)
+            if self._curation_watermark or self._curation_extra else None
+        )
+        return codec_for(FewShotPoolFile).encode(FewShotPoolFile(
+            chat=self._pools.get("chat", []),
+            create=self._pools.get("create", []),
+            _evicted={m: list(t) for m, t in self._evicted_hashes.items() if t},
+            _archived={m: bucket for m, bucket in self._archived.items() if bucket},
+            _curation=curation,
+            _extra=self._payload_extra,
+        ))
 
     def _from_payload(self, payload: JsonPayload) -> None:
         if not isinstance(payload, dict):
             raise TypeError(
                 f"fewshot_pool.json must be a dict, got {type(payload).__name__}"
             )
-        # 一時構造へ復元し、全件通ったあとで live 状態と差し替える。以前は
-        # live を先に clear してから逐次 append していたため、壊れた要素 1 件
-        # (dict でない / 型不一致) で途中の例外 → 半分だけ読んだ状態 → 次の
-        # save がそれを書き戻して残りを失っていた (2026-09-02 監査 R-B1)。
-        # 壊れた要素は WARNING を出して飛ばす。
+        # 例のリストは 1 件ずつ読む (壊れた要素 1 件でプール全体を失わない、2026-09-02
+        # 監査 R-B1)。それ以外 (墓標・集計位置・未知キー) は表で読む。一時構造へ復元し、
+        # 全件通ったあとで live 状態と差し替える。
+        example_codec = codec_for(FewShotExample)
+        head = codec_for(FewShotPoolFile).decode({
+            k: v for k, v in payload.items() if k not in (*_POOL_MODES, "_archived")
+        })
+        malformed = 0
+
+        def examples(raw: Any) -> list[FewShotExample]:
+            nonlocal malformed
+            if raw is None:
+                return []
+            items, bad = example_codec.decode_many(raw)
+            malformed += bad
+            return items
+
+        raw_archived = payload.get("_archived")
+        if raw_archived is not None and not isinstance(raw_archived, dict):
+            raise CodecError(f"_archived must be an object, got {type(raw_archived).__name__}")
         new_pools: dict[str, list[FewShotExample]] = {}
         new_hashes: dict[str, set[str]] = {}
         dropped: Counter[str] = Counter()
-        malformed = 0
-        raw_evicted = payload.get(_EVICTED_KEY)
         # 初見の時計は now (f_04 §3.2.2): 旧ファイルの例は使用実績を持たないので、
         # ``added_at`` を anchor にすると最初の tick で一斉に stale になる。
         loaded_at = utc_now()
-        for mode, entries in payload.items():
-            if mode in _RESERVED_KEYS:
+        for mode in _POOL_MODES:
+            if mode not in payload:
                 continue
             pool: list[FewShotExample] = []
             seen: set[str] = set()
-            for entry in entries if isinstance(entries, list) else []:
-                try:
-                    # 未知キーを無視して復元 (旧スキーマ耐性、TypeError 全消失を防ぐ)。
-                    ex = FewShotExample(**{
-                        k: v for k, v in entry.items() if k in _EXAMPLE_FIELD_NAMES
-                    })
-                    query, response = str(ex.query), str(ex.response)
-                except (AttributeError, TypeError, ValueError) as exc:
-                    malformed += 1
-                    logger.warning(
-                        "Skipping malformed fewshot example on load (mode=%s): %s",
-                        mode, exc,
-                    )
-                    continue
+            for ex in examples(payload[mode]):
                 # 採用ゲート追加前に混入した手本を読み込み時に落とす。採用時の
                 # ゲートだけでは既存プールが永久に汚染されたままになる
                 # (実測 2026-08-02: 25 件中 17 件が語間空白の混入で、全ゲートを
@@ -2320,7 +2359,7 @@ class FewShotPool(JsonStateStore):
                 # 自然に消えるよう、採用時と同じ判定を通す。件数と理由を必ず
                 # ログへ出す (黙って削らない)。
                 reject = (
-                    None if ex.pinned else find_content_rejection(query, response)
+                    None if ex.pinned else find_content_rejection(ex.query, ex.response)
                 )
                 if reject is not None:
                     dropped[reject.split(":")[0]] += 1
@@ -2330,40 +2369,27 @@ class FewShotPool(JsonStateStore):
                 if ex.state == "archived":
                     ex.state = "active"
                 pool.append(ex)
-                seen.add(self._content_hash(query, response))
+                seen.add(self._content_hash(ex.query, ex.response))
             new_pools[mode] = pool
             new_hashes[mode] = seen
+        archived: dict[str, list[FewShotExample]] = {}
+        for mode, entries in (raw_archived or {}).items():
+            bucket = examples(entries)
+            if bucket:
+                archived[str(mode)] = bucket[-_ARCHIVED_CAP:]
         # 二重 load / bootstrap 後 load で旧モードが残らないよう全状態を差し替える。
         self._pools = new_pools
         self._seen_hashes = new_hashes
         self._bigram_cache.clear()
-        self._evicted_hashes = {}
-        if isinstance(raw_evicted, dict):
-            for mode, hashes in raw_evicted.items():
-                if isinstance(hashes, list):
-                    self._evicted_hashes[str(mode)] = {
-                        str(h): None for h in hashes[-_EVICTED_CAP:]
-                    }
-        self._archived = {}
-        raw_archived = payload.get(_ARCHIVED_KEY)
-        if isinstance(raw_archived, dict):
-            for mode, entries in raw_archived.items():
-                bucket: list[FewShotExample] = []
-                for entry in entries if isinstance(entries, list) else []:
-                    try:
-                        bucket.append(FewShotExample(**{
-                            k: v for k, v in entry.items()
-                            if k in _EXAMPLE_FIELD_NAMES
-                        }))
-                    except (AttributeError, TypeError, ValueError):
-                        malformed += 1
-                if bucket:
-                    self._archived[str(mode)] = bucket[-_ARCHIVED_CAP:]
-        raw_curation = payload.get(_CURATION_KEY)
-        self._curation_watermark = (
-            str(raw_curation.get("watermark") or "")
-            if isinstance(raw_curation, dict) else ""
-        )
+        self._evicted_hashes = {
+            mode: {h: None for h in hashes[-_EVICTED_CAP:]}
+            for mode, hashes in head._evicted.items()
+        }
+        self._archived = archived
+        curation = head._curation
+        self._curation_watermark = curation.watermark if curation is not None else ""
+        self._curation_extra = curation._extra if curation is not None else None
+        self._payload_extra = head._extra
         if malformed:
             logger.warning(
                 "Skipped %d malformed fewshot example(s) on load", malformed,

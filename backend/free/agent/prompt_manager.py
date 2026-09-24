@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from backend.free.agent._prompt_store_helpers import (
     archive_to_history,
@@ -12,9 +14,9 @@ from backend.free.agent._prompt_store_helpers import (
     list_history_entries,
     read_body,
     read_history_version,
-    read_meta_dict,
+    read_meta,
     write_body,
-    write_meta_dict,
+    write_meta,
 )
 from backend.free.agent.prompt_utils import (
     FewShotExample,
@@ -26,6 +28,7 @@ from backend.free.agent.prompt_utils import (
     validate_protected_sections,
 )
 from backend.free.agent.prompt_ledger import (
+    LEDGER_FORMAT,
     Ledger,
     apply_default_verifiers,
     load_ledger,
@@ -37,6 +40,8 @@ from backend.free.agent.prompt_ledger import (
     sync_protected,
 )
 from backend.i18n_helper import prompt_locale
+from backend.io.codec import persisted
+from backend.io.format_registry import FormatSpec, register_format
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
 from backend.utils import utc_now as _now
@@ -132,16 +137,17 @@ def _normalized_equal(a: str, b: str) -> bool:
     return _WS_RE.sub(" ", a).strip().lower() == _WS_RE.sub(" ", b).strip().lower()
 
 
+@persisted()
 @dataclass
 class PromptMeta:
-    """プロンプトメタ情報"""
+    """プロンプトメタ情報 (``{mode}.meta.json`` のペイロード。未知キーは ``_extra``)"""
     mode: str
     version: int = 1
     updated_at: str = ""
     source: str = "default"  # "default" | "manual" | "evolution"
     model_calibrated_for: str = ""
     locale_calibrated_for: str = ""  # "ja" | "en"
-    candidates: list[dict] = field(default_factory=list)
+    candidates: list[dict[str, Any]] = field(default_factory=list)
     #: この版の親 (直前の版番号)。系譜を辿るための鍵。
     parent_version: int | None = None
     #: この版を作った操作 ("manual" / "mutate" / "crossover" / "rollback")。
@@ -152,6 +158,42 @@ class PromptMeta:
     fitness: float | None = None
     #: 採用判定に使った eval セットの ``updated_at`` (再現性の鍵)。
     eval_set_version: str = ""
+    _extra: dict[str, Any] | None = None
+
+
+#: ``{mode}.meta.json`` (``PromptMeta``) の形式。本文 ``.md`` と ``history/`` は封筒を持たない。
+PROMPT_META_FORMAT = register_format(FormatSpec(
+    format_id="learning.prompt",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/<mode>.meta.json",
+    retention="one per mode (history/ keeps every body version)",
+    export=True,
+    records=(PromptMeta,),
+))
+#: 本文 ``<mode>.md`` (Level 1 進化と手動編集の対象。封筒を持たない)。
+PROMPT_BODY_FORMAT = register_format(FormatSpec(
+    format_id="learning.prompt_body",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/<mode>.md",
+    retention="one per mode",
+    export=True,
+    encodings=("md",),
+))
+#: 本文の過去版 (``history/<mode>_v<NNN>.md``)。
+PROMPT_HISTORY_FORMAT = register_format(FormatSpec(
+    format_id="learning.prompt_history",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/history/<mode>_v<n>.md",
+    retention="unbounded (text only)",
+    export=True,
+    encodings=("md",),
+))
 
 
 # インスタンス名プレフィックス（言語別）
@@ -195,64 +237,16 @@ _PREFIX_TEMPLATES: dict[str, str] = {
     ),
 }
 
-# 旧プレフィックス形式。既存インストールで Level 1 進化がこの旧形式のまま本文へ
-# 焼き込んで汚染しているケースの自己修復 (_strip_name_prefix) を、現行の
-# _PREFIX_TEMPLATES 変更後も継続できるよう別枠で保持する。
-# キーは locale ではなく世代識別子 (_strip_name_prefix は values() のみ使う)。
-_LEGACY_PREFIX_TEMPLATES: dict[str, str] = {
-    # v1: ベースモデル秘匿指示より前
-    "ja_v1": "あなたの名前は「{name}」です。ユーザーに名前を聞かれたらこの名前を答えてください。\n\n",
-    "en_v1": "Your name is \"{name}\". When asked your name, respond with this name.\n\n",
-    # v2: 人称指示より前
-    "ja_v2": (
-        "あなたの名前は「{name}」です。ユーザーに名前を聞かれた場合や"
-        "自己紹介を求められた場合は、この名前で答えてください。"
-        "あなた自身の基盤モデル名や開発元 (例: Gemma、Google DeepMind等) を"
-        "尋ねられても開示せず、「{name}」として応答してください。\n\n"
-    ),
-    "en_v2": (
-        "Your name is \"{name}\". When asked your name, or asked to introduce "
-        "yourself, respond with this name. Do not disclose the underlying base "
-        "model's name or provider (e.g. Gemma, Google DeepMind) even if asked "
-        "directly; always respond as \"{name}\".\n\n"
-    ),
-    # v3: モデル名の秘匿指示が、``deliberative._MODEL_IDENTITY_FACT`` の
-    # 確定事実注入と正面から矛盾していた頃の形。実インシデント
-    # (2026-08-31 ライブ監査 T05#1): 「あなたが今使っているベースモデルの
-    # 名前は？」に対し ``Model identity fact pinned: Qwen3.8-27B-Q4_K_M.gguf``
-    # がログに出ている (= 正しいモデル名を注記で渡している) にもかかわらず、
-    # 回答は「基盤モデルの詳細については開示しておりません」だった。
-    # system の常設指示が、末尾の注記より強い。
-    "ja_v3": (
-        "あなたの名前は「{name}」です。ユーザーに名前を聞かれた場合や"
-        "自己紹介を求められた場合は、この名前で答えてください。"
-        "あなた自身の基盤モデル名や開発元 (例: Gemma、Google DeepMind等) を"
-        "尋ねられても開示せず、「{name}」として応答してください。"
-        "ユーザーの発言に現れる一人称 (私 / 僕 / 自分) はユーザー自身を指します。"
-        "ユーザーのことを述べるときは、一人称ではなく二人称 (「あなた」または"
-        "ユーザーの名前) に置き換えて述べてください。\n\n"
-    ),
-    "en_v3": (
-        "Your name is \"{name}\". When asked your name, or asked to introduce "
-        "yourself, respond with this name. Do not disclose the underlying base "
-        "model's name or provider (e.g. Gemma, Google DeepMind) even if asked "
-        "directly; always respond as \"{name}\". First-person pronouns in the "
-        "user's messages (I, me, my) refer to the user; when referring to the "
-        "user use second person (\"you\", \"your\"), never first person.\n\n"
-    ),
-}
-
-
 def _strip_name_prefix(body: str) -> str:
     """本文先頭に焼き込まれた名前プレフィックス段落を 1 個だけ除去する。
 
     名前プレフィックスは get_prompt() がランタイムで付与するため、本文 (.md) 側に
     含まれていてはならない。過去に Level 1 進化が get_prompt() の出力 (プレフィックス
     付き) を誤って本文へ保存した汚染を、load / 保存時に自己修復する。
-    現行 (_PREFIX_TEMPLATES) と旧形式 (_LEGACY_PREFIX_TEMPLATES) の両方から
-    locale 非依存のパターンを生成し、先頭一致分のみ取り除く。
+    現行 (_PREFIX_TEMPLATES) から locale 非依存のパターンを生成し、先頭一致分のみ
+    取り除く (G0 の旧世代の形は G1 のデータに現れないので持たない)。
     """
-    for template in (*_PREFIX_TEMPLATES.values(), *_LEGACY_PREFIX_TEMPLATES.values()):
+    for template in _PREFIX_TEMPLATES.values():
         pattern = re.escape(template).replace(re.escape("{name}"), ".*?")
         match = re.match(pattern, body, re.DOTALL)
         if match:
@@ -463,9 +457,9 @@ class SystemPromptManager:
         for mode in self.MODES:
             if body_exists(self.prompt_dir, mode):
                 body = _strip_name_prefix(read_body(self.prompt_dir, mode))
-                meta_data = read_meta_dict(self.prompt_dir, mode)
-                if meta_data is not None:
-                    self.metas[mode] = self._meta_from_dict(meta_data, mode)
+                meta = read_meta(self.prompt_dir, mode, PromptMeta, spec=PROMPT_META_FORMAT)
+                if meta is not None:
+                    self.metas[mode] = meta
                 else:
                     self.metas[mode] = PromptMeta(mode=mode)
                     self._save_meta(mode)
@@ -536,9 +530,20 @@ class SystemPromptManager:
         return self.ledgers[mode]
 
     def save_ledger_counts(self, mode: str) -> None:
-        """計数の更新だけを永続化する (レンダ結果は変わらないので .md は触らない)。"""
-        if mode in self.ledgers:
-            save_ledger(self.prompt_dir, self.ledgers[mode])
+        """計数の更新だけを永続化する (レンダ結果は変わらないので .md は触らない)。
+
+        チャット経路 (毎ターンの規則の計数) から呼ばれるので、書き込みは書き手
+        スレッドへ出す (c_05 §0.5.9)。台帳はその時点の複製を渡す。
+        """
+        if mode not in self.ledgers:
+            return
+        from backend.io.writer_thread import default_writer
+
+        prompt_dir = self.prompt_dir
+        ledger = copy.deepcopy(self.ledgers[mode])
+        default_writer().call(
+            lambda: save_ledger(prompt_dir, ledger), format_id=LEDGER_FORMAT.format_id,
+        )
 
     def can_delete_rule_text(self, line: str, *, min_turns: int) -> bool:
         """規則 1 行の削除を台帳の計数が正当化するか (f_04 §4.5.2)。
@@ -898,6 +903,7 @@ class SystemPromptManager:
                 model_calibrated_for=meta.model_calibrated_for if meta else "",
                 locale_calibrated_for=new_locale,
                 candidates=[],
+                _extra=meta._extra if meta else None,
             )
             self.metas[mode] = new_meta
             self._save_meta(mode)
@@ -937,22 +943,4 @@ class SystemPromptManager:
 
     def _save_meta(self, mode: str) -> None:
         """メタ情報を JSON ファイルに保存 (infra 層 `_prompt_store_helpers` に委譲)"""
-        write_meta_dict(self.prompt_dir, mode, asdict(self.metas[mode]))
-
-    @staticmethod
-    def _meta_from_dict(data: dict, mode: str) -> PromptMeta:
-        """`read_meta_dict` の結果を `PromptMeta` にハイドレートする (純粋関数)"""
-        return PromptMeta(
-            mode=data.get("mode", mode),
-            version=data.get("version", 1),
-            updated_at=data.get("updated_at", ""),
-            source=data.get("source", "default"),
-            model_calibrated_for=data.get("model_calibrated_for", ""),
-            locale_calibrated_for=data.get("locale_calibrated_for", ""),
-            candidates=data.get("candidates", []),
-            parent_version=data.get("parent_version"),
-            op=data.get("op", ""),
-            fitness=data.get("fitness"),
-            eval_set_version=data.get("eval_set_version", ""),
-        )
-
+        write_meta(self.prompt_dir, mode, self.metas[mode], spec=PROMPT_META_FORMAT)

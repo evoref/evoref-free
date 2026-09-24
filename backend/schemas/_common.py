@@ -27,7 +27,9 @@ class ServerConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
+    #: LAN から使う構成。true のときは全リクエストで起動時生成のトークンを必須にする (c_06 §1.2)
+    allow_remote: bool = False
     port: int = Field(default=8000, ge=1024, le=65535)
     frontend_port: int = Field(default=5173, ge=1024, le=65535)
     timeout: int = Field(default=30, ge=1)
@@ -170,7 +172,6 @@ class HistoryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     auto_save: bool = True
-    checkpoint_interval: int = Field(default=10, ge=1)
     retention_full_days: int = Field(default=90, ge=1)
     retention_compressed_days: int = Field(default=365, ge=1)
     max_storage_mb: float = Field(default=200, ge=1)
@@ -188,39 +189,10 @@ class StreamingConfig(BaseModel):
     keepalive_interval_sec: float = Field(default=15.0, ge=1.0, le=120.0)
 
 
-#: 3a-2 (2026-09-19) で機能ごと撤去した ``agent`` 直下のキー。schemas/memory.py の
-#: ``_REMOVED_MEMORY_KEYS_REJECTED`` と同じ作法 (CLAUDE.md §7): 黙って捨てず
-#: 理由付きで起動時に拒否する。
-_REMOVED_AGENT_KEYS_REJECTED: dict[str, str] = {
-    "delegate_codegen_to_longform": (
-        "create's code generation delegation (code_generator) was removed; "
-        "create dispatch is unified onto the meta production_stage path "
-        "(f_03_agent_engine.md §4.4)"
-    ),
-}
-
-
 class AgentConfig(BaseModel):
     """エージェント設定"""
 
     model_config = ConfigDict(extra="forbid")
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_removed_keys(cls, data):
-        """撤去済みキー (:data:`_REMOVED_AGENT_KEYS_REJECTED`) を理由付きで拒否する。
-
-        ``MemoryConfig.reject_removed_keys`` (backend/schemas/memory.py) と同じ作法。
-        """
-        if isinstance(data, dict):
-            for key, reason in _REMOVED_AGENT_KEYS_REJECTED.items():
-                if key in data:
-                    raise ValueError(
-                        f"agent.{key} was removed: {reason}. "
-                        "Remove the line from config.yaml "
-                        "(see docs/f_03_agent_engine.md §4.4).",
-                    )
-        return data
 
     step_compaction_enabled: bool = True
     step_compaction_rag_lines: int = Field(default=2, ge=1)
@@ -601,23 +573,6 @@ class ProConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    @model_validator(mode="before")
-    @classmethod
-    def drop_removed_terminal(cls, data):
-        """撤去済みの ``pro.terminal`` 節を検証前に取り除く。
-
-        Web ターミナルは機能ごと撤去した。旧 config.yaml.example 由来の節は
-        ほぼ全ての config.yaml に残っているため、``extra="forbid"`` で起動を
-        止めずに WARNING 1 行で削除を促す。
-        """
-        if not (isinstance(data, dict) and "terminal" in data):
-            return data
-        logger.warning(
-            "pro.terminal was removed with the web terminal feature and is "
-            "ignored; delete it from config.yaml",
-        )
-        return {k: v for k, v in data.items() if k != "terminal"}
-
     url_recall: ProUrlRecallConfig = Field(default_factory=ProUrlRecallConfig)
     knowledge: ProKnowledgeConfig = Field(default_factory=ProKnowledgeConfig)
 
@@ -626,14 +581,14 @@ class ModelMigrationConfig(BaseModel):
     """ベースモデル移行 / 起動時整合性チェック設定
 
     `strict_startup_check=True` にすると、起動時に
-    `local/model_state.json` の `current_filename` と
+    `<data_root>/store/model_state.json` の `current_filename` と
     `config.yaml.model_paths.base_model` のファイル名が一致しない場合に
     `RuntimeError` を送出して起動をブロックする。
 
     `auto_migrate_on_startup=True` にすると、起動時 mismatch を検出した際に
-    `ModelMigrator.migrate()` を自動実行し、LoRA アーカイブ / 経験バッファ
-    base_model 付与 / プロンプト meta 更新 / eval_core リセット /
-    model_state.json 更新を行ってから起動を継続する
+    `ModelMigrator.migrate()` を自動実行し、config.yaml と model_state.json を
+    更新してから起動を継続する (学習データは model_key ごとのパーティションに
+    残るので退避・初期化はしない)。
     両方 true の場合は auto_migrate を優先し、失敗したときのみ strict 側の
     RuntimeError にフォールバックする。
     """

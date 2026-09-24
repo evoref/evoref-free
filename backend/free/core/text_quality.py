@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable, Sequence
+from functools import cache
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
     HIRAGANA,
@@ -24,6 +25,7 @@ from backend.free.core.script_ranges import (
     KANJI,
     KANJI_MARKS,
     KATAKANA_WORD,
+    simplified_only_hanzi,
 )
 
 #: 日本語の語間に混じった空白。
@@ -131,9 +133,6 @@ def detect_lang(text: str) -> str:
     return ""
 
 
-#: 日本語文に混じる簡体字。日本の常用漢字・人名用漢字には存在しない字形だけを
-#: 挙げる (旧字体・異体字として日本語文に現れうる字は入れない)。
-_SIMPLIFIED_ONLY_CHARS = "们这说认从个时么没很吗呢东车门问间语谁际现实发对开关书长风"
 
 #: 中国語の繋辞「是」。日本語では ``是非`` / ``是正`` / ``是認`` / ``国是`` /
 #: ``是々非々`` のような熟語でしか使われず、単独で名詞と名詞をつなぐ用法は無い。
@@ -141,7 +140,11 @@ _SIMPLIFIED_ONLY_CHARS = "们这说认从个时么没很吗呢东车门问间语
 _JA_ZE_COMPOUND_RE = re.compile(r"是[非正認々]|[国是]是")
 _BARE_COPULA_ZE_RE = re.compile(r"是")
 
-_SIMPLIFIED_ONLY_RE = re.compile(f"[{_SIMPLIFIED_ONLY_CHARS}]")
+
+@cache
+def _simplified_only_re() -> re.Pattern[str]:
+    """日本語文に混じる簡体字 (符号表から導出、``script_ranges.simplified_only_hanzi``)。"""
+    return re.compile(f"[{simplified_only_hanzi()}]")
 
 
 def has_chinese_token_leak(text: str) -> bool:
@@ -156,7 +159,8 @@ def has_chinese_token_leak(text: str) -> bool:
 
     誤検出を避けるため、判定はコードブロックの外に限り、かつ
 
-    - 日本の漢字に存在しない **簡体字**
+    - 日本の漢字に存在しない **簡体字** (GB2312 にあり cp932 に無い字を符号表から
+      導出する。手書きの 30 字は「处」「细」を見逃し「没頭」を誤検出していた)
     - 熟語 (是非 / 是正 / 是認 / 国是) の構成要素でない **単独の「是」**
 
     という「日本語文には現れえない」形だけを見る。実測 (2026-08-16 監査の
@@ -169,7 +173,7 @@ def has_chinese_token_leak(text: str) -> bool:
     outside = _CODE_FENCE_RE.sub("\n", text)
     if not _JA_CHAR_RE.search(outside):
         return False
-    if _SIMPLIFIED_ONLY_RE.search(outside):
+    if _simplified_only_re().search(outside):
         return True
     return bool(_BARE_COPULA_ZE_RE.search(_JA_ZE_COMPOUND_RE.sub("", outside)))
 

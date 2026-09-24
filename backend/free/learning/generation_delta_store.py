@@ -15,13 +15,31 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from backend.io import atomic_write_text
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 
 logger = get_logger("learning.generation_delta_store")
+
+#: ``generation_deltas.json`` の形式。ペイロードはモード別デルタ辞書 (``DeltaMap``)。
+GENERATION_DELTAS_FORMAT = register_format(FormatSpec(
+    format_id="learning.generation_deltas",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/generation_deltas.json",
+    retention="one per partition",
+    export=True,
+))
+
+
+def _deltas_file(path: str | Path) -> VersionedPayloadFile:
+    return VersionedPayloadFile(
+        GENERATION_DELTAS_FORMAT, path,
+        component="GenerationDeltaStore", state_logger=logger,
+    )
 
 
 # モード -> {param_delta: float} の入れ子辞書型エイリアス
@@ -70,16 +88,20 @@ class GenerationDeltaStore:
 
     @staticmethod
     def save(deltas: DeltaMap, path: str | Path) -> None:
-        """`deltas` を JSON ファイルに書き出す。親ディレクトリは自動作成。"""
+        """`deltas` を版付き封筒で書き出す。親ディレクトリは自動作成。
+
+        ディスク上のファイルが G1 の封筒でない / 版が新しいなら上書きしない
+        (WARNING)。書き込みの失敗は従来どおり送出する。
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = GenerationDeltaStore.serialize(deltas)
-        atomic_write_text(
-            path,
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.info("Saved generation deltas (%d modes) to %s", len(payload), path)
+        f = _deltas_file(path)
+        f.RAISE_ON_SAVE_ERROR = True
+        f.load()
+        f.payload = payload
+        if f.save():
+            logger.info("Saved generation deltas (%d modes) to %s", len(payload), path)
 
     @staticmethod
     def load(path: str | Path) -> DeltaMap | None:
@@ -87,17 +109,13 @@ class GenerationDeltaStore:
 
         ファイルが存在しない場合は `None` を返す (空辞書とは区別する)。
         呼び出し側は `None` を「ファイル未存在 = 既存状態を保持」と解釈できる。
-        パース失敗時も `None` を返し、警告ログを出力する。
+        読めない場合 (G1 の封筒でない / 版が新しい / 壊れている) も `None`。
         """
         path = Path(path)
-        if not path.exists():
+        f = _deltas_file(path)
+        if not f.load():
             return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("Failed to load generation deltas from %s: %s", path, e)
-            return None
-        deltas = GenerationDeltaStore.deserialize(data)
+        deltas = GenerationDeltaStore.deserialize(f.payload)
         # 起動時に一度だけ読むファイルではなく、生成パラメータ解決のたびに
         # 参照される (キャッシュミス時のみここへ来る)。INFO で出すと
         # learning.log がこの 1 行で埋まるため DEBUG に置く。

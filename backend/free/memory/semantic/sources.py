@@ -21,12 +21,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import secrets
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from backend.free.memory.semantic.namespaces import know_half_life_days
 from backend.free.memory.types import Provenance, SemanticFact
@@ -38,10 +37,16 @@ from backend.free.rag.evidence import (
 )
 from backend.free.rag.evidence.types import corroboration_count
 from backend.io import JSONLAppendStore
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.id_registry import new_id
+from backend.io.jsonl_store import ROW_VERSION_FIELD
 from backend.log_config import get_logger
 from backend.utils import parse_utc, utc_now, utc_now_dt
 
 logger = get_logger("memory.semantic.sources")
+
+T = TypeVar("T")
 
 SOURCES_FILENAME = "sources.jsonl"
 ITEMS_FILENAME = "items.jsonl"
@@ -66,12 +71,12 @@ MANUAL_SOURCE_RELIABILITY = 0.8
 
 def new_source_id() -> str:
     """``ks_`` + 12 hex。位置カウンタを鍵にしない (c_05 §0.5)。"""
-    return f"ks_{secrets.token_hex(6)}"
+    return new_id("ks_")
 
 
 def new_item_id() -> str:
     """``ki_`` + 12 hex。"""
-    return f"ki_{secrets.token_hex(6)}"
+    return new_id("ki_")
 
 
 #: 取得の当て方 (``FetchPolicy.kind``)。``page`` = 1 URL をそのまま、
@@ -79,6 +84,7 @@ def new_item_id() -> str:
 FetchKind = Literal["page", "rss"]
 
 
+@persisted()
 @dataclass
 class FetchPolicy:
     """取得器の動かし方 (Pro 限定)。Free では宣言だけ持つ。"""
@@ -92,10 +98,11 @@ class FetchPolicy:
     #: 取得先はここで別に持つ (空なら ``url_pattern`` にワイルドカードが
     #: 無いときだけそれを使う)。
     url: str = ""
-    #: 未知キーの退避先 (c_05 §0.5)。入れ子の dataclass も往復で落とさない。
-    _extra: dict[str, Any] = field(default_factory=dict)
+    #: 未知キーの退避先 (c_05 §0.5.2)。入れ子の dataclass も往復で落とさない。
+    _extra: dict[str, Any] | None = None
 
 
+@persisted()
 @dataclass
 class KnowledgeSource:
     """取得元 1 件 (``sources.jsonl`` の 1 行)。"""
@@ -116,13 +123,14 @@ class KnowledgeSource:
     #: 最後に取得器が回した時刻 (ISO 8601 UTC)。``fetch_policy.interval_sec``
     #: の判定に使う。台帳が後勝ちなので、別ファイルに状態を分けない。
     last_fetched_at: str = ""
-    _extra: dict[str, Any] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
 
     def clamped_reliability(self) -> float:
         """``reliability`` を許容域へ丸める (c_16 §3.3)。"""
         return min(RELIABILITY_MAX, max(RELIABILITY_MIN, float(self.reliability)))
 
 
+@persisted()
 @dataclass
 class KnowledgeItem:
     """取得単位 1 件 (``items.jsonl`` の 1 行)。"""
@@ -134,80 +142,58 @@ class KnowledgeItem:
     status: ItemStatus = "active"
     fetched_at: str = ""
     raw_ref: str | None = None
-    _extra: dict[str, Any] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
 
 
-def _to_record(obj: Any) -> dict[str, Any]:
-    """dataclass → JSON レコード。キーは ``fields()`` から機械生成する。
-
-    手書きで列挙しないこと — フィールドを足したときに書き漏れて値が消える
-    (c_05 §0.5)。``_extra`` は先に展開し、既知フィールドで上書きする。
-    """
-    out: dict[str, Any] = dict(getattr(obj, "_extra", None) or {})
-    for f in fields(obj):
-        if f.name == "_extra":
-            continue
-        value = getattr(obj, f.name)
-        if isinstance(value, FetchPolicy):
-            value = _policy_to_record(value)
-        out[f.name] = value
-    return out
-
-
-def _policy_to_record(policy: FetchPolicy) -> dict[str, Any]:
-    """``FetchPolicy`` → JSON レコード。``_extra`` を展開してから既知キーを載せる。"""
-    out: dict[str, Any] = dict(policy._extra or {})
-    for f in fields(policy):
-        if f.name == "_extra":
-            continue
-        out[f.name] = getattr(policy, f.name)
-    return out
-
-
-def _policy_from_record(data: dict[str, Any]) -> FetchPolicy:
-    """JSON レコード → ``FetchPolicy``。未知キーは ``_extra`` へ退避する。
-
-    キーは ``fields()`` から引く。手書きで列挙すると新フィールドを足したときに
-    読み落として黙って既定へ倒れる (c_05 §0.5)。入れ子だからといって未知キーを
-    捨ててよいわけではない — 捨てると往復で消える。
-    """
-    known = {f.name for f in fields(FetchPolicy)} - {"_extra"}
-    extra: dict[str, Any] = dict(data.get("_extra") or {})
-    kwargs = {k: v for k, v in data.items() if k in known}
-    for key, value in data.items():
-        if key not in known and key != "_extra":
-            extra[key] = value
-    return FetchPolicy(**kwargs, _extra=extra)
+#: 共有形式 (c_05 §0.8): Pro の取得器も Free の API で書く。行は ``{"_v", ...}``
+#: (``_v`` は形式の版、c_05 §0.5.1)。
+SOURCES_FORMAT = register_format(FormatSpec(
+    format_id="semantic.sources",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free", "pro"}),
+    path_key=f"store/memory/semantic/{SOURCES_FILENAME}",
+    retention="unbounded; disabled sources are blocked, not deleted",
+    export=True,
+    encodings=("jsonl",),
+    records=(KnowledgeSource,),
+))
+ITEMS_FORMAT = register_format(FormatSpec(
+    format_id="semantic.items",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free", "pro"}),
+    path_key=f"store/memory/semantic/{ITEMS_FILENAME}",
+    retention="expired / retracted items become tombstones after pro.knowledge.items_keep_days",
+    export=True,
+    encodings=("jsonl",),
+    records=(KnowledgeItem,),
+))
 
 
-def _from_record(cls: type, data: dict[str, Any]) -> Any:
-    """JSON レコード → dataclass。未知キーは ``_extra`` へ退避する。"""
-    known = {f.name for f in fields(cls)}
-    kwargs: dict[str, Any] = {}
-    extra: dict[str, Any] = dict(data.get("_extra") or {})
-    for key, value in data.items():
-        if key == "_extra":
-            continue
-        if key not in known:
-            extra[key] = value
-            continue
-        if key == "fetch_policy" and isinstance(value, dict):
-            value = _policy_from_record(value)
-        kwargs[key] = value
-    kwargs["_extra"] = extra
-    return cls(**kwargs)
+def _registry_store(path: Path | str, cls: type[T], version: int) -> JSONLAppendStore[T]:
+    """台帳の追記ストア (行 = ``{"_v", ...}`` + ``cls`` の表。未知キーは各階層の ``_extra``)。"""
+    codec = codec_for(cls)
+
+    def deserialize(line: str) -> T:
+        obj = json.loads(line)
+        obj.pop(ROW_VERSION_FIELD, None)  # 版はストアが確かめ済み
+        return codec.decode(obj)
+
+    return JSONLAppendStore(
+        path,
+        serialize=lambda obj: json.dumps({ROW_VERSION_FIELD: version, **codec.encode(obj)}, ensure_ascii=False),
+        deserialize=deserialize,
+        key_of=lambda obj: obj.id,
+        row_version=version,
+    )
 
 
 class SourceRegistry:
     """``sources.jsonl`` (追記式・後勝ち)。"""
 
     def __init__(self, path: Path | str) -> None:
-        self._store: JSONLAppendStore[KnowledgeSource] = JSONLAppendStore(
-            path,
-            serialize=lambda s: json.dumps(_to_record(s), ensure_ascii=False),
-            deserialize=lambda line: _from_record(KnowledgeSource, json.loads(line)),
-            key_of=lambda s: s.id,
-        )
+        self._store = _registry_store(path, KnowledgeSource, SOURCES_FORMAT.version)
         self._sources: dict[str, KnowledgeSource] = {}
 
     def load(self) -> None:
@@ -254,12 +240,7 @@ class ItemRegistry:
     """
 
     def __init__(self, path: Path | str) -> None:
-        self._store: JSONLAppendStore[KnowledgeItem] = JSONLAppendStore(
-            path,
-            serialize=lambda i: json.dumps(_to_record(i), ensure_ascii=False),
-            deserialize=lambda line: _from_record(KnowledgeItem, json.loads(line)),
-            key_of=lambda i: i.id,
-        )
+        self._store = _registry_store(path, KnowledgeItem, ITEMS_FORMAT.version)
         self._items: dict[str, KnowledgeItem] = {}
         self._by_url_hash: dict[str, set[str]] = {}
 
@@ -523,9 +504,8 @@ class KnowledgeIngest:
     ) -> bool:
         """既存 claim に取得単位を 1 件足して確度と時刻を更新する。
 
-        ``update_fact`` は通さない — ``SemanticFact`` 経由で往復すると
-        ``kind="claim"`` と ``attrs`` (source_kind / region / published_at) が
-        ``fact`` 側の形へ潰れる。レコードを直接組み替えて put し直す。
+        レコードへ差分を当てる (``patch_record``)。``observed_at`` は最初に知った
+        時刻のまま — 今回の観測時刻は足した ``provenance`` の ``captured_at`` が持つ。
         """
         record = self._store.evidence.get(fact_id)
         if record is None:
@@ -540,20 +520,16 @@ class KnowledgeIngest:
                 "extractor_version": 1,
                 "captured_at": now,
             })
-        record.provenance = provenance
-        record.observed_at = now
-        record.updated_at = now
+        fields: dict[str, Any] = {"provenance": provenance}
         if published_at and _is_newer(published_at, record.as_of):
-            record.as_of = published_at
-            attrs = dict(record.attrs or {})
-            attrs["published_at"] = published_at
-            record.attrs = attrs
-        record.confidence = derive_confidence(
+            fields["as_of"] = published_at
+            fields["attrs"] = {"published_at": published_at}
+        fields["confidence"] = derive_confidence(
             "web",
             corroboration_count(provenance),
             source_reliability=self._reliability_of(item_id),
         )
-        self._store.put_record(record)
+        self._store.patch_record(fact_id, **fields)
         return True
 
     def retire_item_claims(
@@ -612,35 +588,29 @@ class KnowledgeIngest:
         original = list(record.provenance or [])
         kept = [
             p for p in original
-            if str(p.get("source_id", "")).removeprefix("item:") not in expired
+            if str(p.get("source_id") or "").removeprefix("item:") not in expired
         ]
         if not kept or len(kept) == len(original):
             return False
-        record.provenance = kept
-        record.updated_at = utc_now()
-        record.confidence = derive_confidence(
-            "web",
-            corroboration_count(kept),
-            source_reliability=self._reliability_of(
-                str(kept[0].get("source_id", "")).removeprefix("item:"),
+        self._store.patch_record(
+            fact_id,
+            provenance=kept,
+            confidence=derive_confidence(
+                "web",
+                corroboration_count(kept),
+                source_reliability=self._reliability_of(
+                    str(kept[0].get("source_id") or "").removeprefix("item:"),
+                ),
             ),
         )
-        self._store.put_record(record)
         return True
 
     def _mark_superseded(self, old_id: str, new_id: str) -> None:
-        """敗者の ``superseded_by`` をレコード側で立てる。
-
-        ``SemanticStore.supersede`` は ``update_fact`` 経由なので claim の
-        ``kind`` / ``attrs`` を潰す。claim は本文ではなくレコードが正なので、
-        ここで直接書く。
-        """
+        """敗者の ``superseded_by`` をレコード側で立てる (``patch_record``)。"""
         record = self._store.evidence.get(old_id)
         if record is None or record.superseded_by:
             return
-        record.superseded_by = new_id
-        record.updated_at = utc_now()
-        self._store.put_record(record)
+        self._store.patch_record(old_id, superseded_by=new_id)
 
     def _reliability_of(self, item_id: str) -> float:
         """取得単位 → 取得元 → ``reliability``。辿れなければ下端。"""

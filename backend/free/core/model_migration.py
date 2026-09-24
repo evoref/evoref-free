@@ -6,14 +6,16 @@
 from __future__ import annotations
 
 import json
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
 
 from backend.io import atomic_write_text
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 from backend.utils import utc_now as _now
 
@@ -32,19 +34,6 @@ COMPONENT_CONFIG_KEY: dict[str, str] = {
     "embedding": "embed_model",
 }
 
-# コンポーネント別 LoRA 設定キー: (adapter_key, versions_key, archive_root, default_adapter_path)。
-# base 用 (local_paths.lora_adapter / lora_versions_dir / local/lora_archive/)
-# とは別キー・別アーカイブ先を使う (base の flat な lora_archive/<stem>/ との
-# ファイル名衝突を避けるため component 別サブディレクトリに分離する)。
-# default_adapter_path は backend/schemas/paths.py::LocalPathsConfig の
-# デフォルト値と一致させる。
-_COMPONENT_LORA_KEYS: dict[str, tuple[str, str, str, str]] = {
-    "embedding": (
-        "embed_lora_adapter", "embed_lora_versions_dir", "lora_archive/embedding",
-        "local/models/embed_adapter.gguf",
-    ),
-}
-
 # config.yaml の model_paths 配下で model_state.json と同期されるキー。
 # これらは migrate API (POST /api/model/migrate, /api/model/{component}/migrate)
 # 経由でしか変更できない。config を直書きすると model_state.json と desync し、
@@ -56,10 +45,11 @@ MODEL_STATE_TRACKED_KEYS: frozenset[str] = frozenset(
 
 
 # ────────────────────────────────────────────
-# ModelState: local/model_state.json 管理
+# ModelState: <data_root>/store/model_state.json 管理
 # ────────────────────────────────────────────
 
 
+@persisted()
 @dataclass
 class ModelCurrent:
     """現在のベースモデル情報"""
@@ -67,36 +57,104 @@ class ModelCurrent:
     chat_template_name: str = ""
     has_system_role: bool = True
     activated_at: str = ""
+    #: この版が知らないキー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
 
 
+@persisted()
 @dataclass
 class MigrationHistoryEntry:
-    """移行履歴の 1 エントリ"""
+    """移行履歴の 1 エントリ (ディスク上のキーは ``from`` / ``to``、:data:`_HISTORY_KEYS`)"""
     from_model: str = ""
     to_model: str = ""
     migrated_at: str = ""
-    lora_archived_to: str = ""
+    _extra: dict[str, Any] | None = None
 
 
+@persisted()
 @dataclass
 class ComponentState:
     """embedding の current + history"""
     current: ModelCurrent = field(default_factory=ModelCurrent)
     history: list[MigrationHistoryEntry] = field(default_factory=list)
+    _extra: dict[str, Any] | None = None
 
 
-class ModelState:
-    """local/model_state.json の読み書き管理"""
+@persisted()
+@dataclass
+class ModelStatePayload:
+    """``model_state.json`` の payload (コーデックの表)。"""
+    current: ModelCurrent = field(default_factory=ModelCurrent)
+    migration_history: list[MigrationHistoryEntry] = field(default_factory=list)
+    components: dict[str, ComponentState] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
+
+
+_PAYLOAD_CODEC = codec_for(ModelStatePayload)
+
+#: 移行履歴の項目のディスク上のキー → フィールド名 (``from`` は Python の予約語で
+#: フィールド名にできないので、コーデックの前後で付け替える)。
+_HISTORY_KEYS: dict[str, str] = {"from": "from_model", "to": "to_model"}
+
+MODEL_STATE_FORMAT = register_format(FormatSpec(
+    format_id="model_state",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/model_state.json",
+    retention="rewritten in place; migration history is kept",
+    records=(ModelStatePayload,),
+))
+
+
+def _rename_history(payload: Any, keys: dict[str, str]) -> Any:
+    """payload の移行履歴の項目 (トップと各コンポーネント) のキーを ``keys`` で付け替えた写し。"""
+    if not isinstance(payload, dict):
+        return payload
+
+    def with_entries(obj: dict[str, Any], key: str) -> dict[str, Any]:
+        value = obj.get(key)
+        if not isinstance(value, list):
+            return obj
+        renamed = [
+            {keys.get(k, k): v for k, v in item.items()} if isinstance(item, dict) else item
+            for item in value
+        ]
+        return {**obj, key: renamed}
+
+    out = with_entries(payload, "migration_history")
+    components = out.get("components")
+    if isinstance(components, dict):
+        out = {**out, "components": {
+            name: with_entries(comp, "history") if isinstance(comp, dict) else comp
+            for name, comp in components.items()
+        }}
+    return out
+
+
+class ModelState(VersionedJsonFile):
+    """``model_state.json`` (``PathResolver`` の ``model_state_file``) の読み書き管理 (封筒付き、c_05 §0.7.1 ``model_state``)。
+
+    G1 の封筒でないファイル (G0 の素の JSON) / 新しい版は読まずに readonly で
+    続け、``save`` はファイルを書き換えない。壊れたファイルは
+    ``model_state.json.corrupt-<stamp>`` へ退避して空の状態から始める。
+    保存の失敗 (OSError 等) は従来どおり送出する。
+    """
+
+    FORMAT = MODEL_STATE_FORMAT
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
 
     def __init__(self, state_path: Path):
-        self.path = state_path
+        super().__init__(state_path)
         self._current = ModelCurrent()
-        self._lora_compatible = True
         self._migration_history: list[MigrationHistoryEntry] = []
         self._components: dict[str, ComponentState] = {
             name: ComponentState() for name in ALL_COMPONENTS
         }
-        self._load()
+        #: payload の未知キー (書き戻しでそのまま戻す)。
+        self._extra: dict[str, Any] | None = None
+        self.load()
 
     # ── プロパティ ──
 
@@ -107,14 +165,6 @@ class ModelState:
     @property
     def current(self) -> ModelCurrent:
         return self._current
-
-    @property
-    def lora_compatible(self) -> bool:
-        return self._lora_compatible
-
-    @lora_compatible.setter
-    def lora_compatible(self, value: bool) -> None:
-        self._lora_compatible = value
 
     @property
     def migration_history(self) -> list[MigrationHistoryEntry]:
@@ -134,16 +184,12 @@ class ModelState:
         comp = self.get_component(name)
         comp.current = ModelCurrent(filename=filename, activated_at=_now())
 
-    def add_component_migration(
-        self, name: str, from_model: str, to_model: str,
-        lora_archived_to: str = "",
-    ) -> None:
+    def add_component_migration(self, name: str, from_model: str, to_model: str) -> None:
         comp = self.get_component(name)
         comp.history.append(MigrationHistoryEntry(
             from_model=from_model,
             to_model=to_model,
             migrated_at=_now(),
-            lora_archived_to=lora_archived_to,
         ))
 
     def get_component_last_migration(
@@ -152,100 +198,29 @@ class ModelState:
         comp = self.get_component(name)
         return comp.history[-1] if comp.history else None
 
-    # ── 永続化 ──
+    # ── 永続化 (VersionedJsonFile) ──
 
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            current = data.get("current", {})
-            self._current = ModelCurrent(
-                filename=current.get("filename", ""),
-                chat_template_name=current.get("chat_template_name", ""),
-                has_system_role=current.get("has_system_role", True),
-                activated_at=current.get("activated_at", ""),
-            )
-            self._lora_compatible = data.get("lora_compatible", True)
-            for h in data.get("migration_history", []):
-                self._migration_history.append(MigrationHistoryEntry(
-                    from_model=h.get("from", ""),
-                    to_model=h.get("to", ""),
-                    migrated_at=h.get("migrated_at", ""),
-                    lora_archived_to=h.get("lora_archived_to", ""),
-                ))
-            # コンポーネント
-            comps = data.get("components", {}) or {}
-            for name in ALL_COMPONENTS:
-                raw = comps.get(name, {}) or {}
-                cur = raw.get("current", {}) or {}
-                comp = ComponentState(
-                    current=ModelCurrent(
-                        filename=cur.get("filename", ""),
-                        chat_template_name=cur.get("chat_template_name", ""),
-                        has_system_role=cur.get("has_system_role", True),
-                        activated_at=cur.get("activated_at", ""),
-                    ),
-                    history=[
-                        MigrationHistoryEntry(
-                            from_model=h.get("from", ""),
-                            to_model=h.get("to", ""),
-                            migrated_at=h.get("migrated_at", ""),
-                            lora_archived_to=h.get("lora_archived_to", ""),
-                        )
-                        for h in (raw.get("history", []) or [])
-                    ],
-                )
-                self._components[name] = comp
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning("Failed to load model_state.json: %s", e)
+    def _from_payload(self, payload: Any) -> None:
+        """封筒の payload から状態を復元する (形が違えば送出して corrupt 扱い)。
 
-    def save(self) -> None:
-        """model_state.json をディスクに保存"""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "current": {
-                "filename": self._current.filename,
-                "chat_template_name": self._current.chat_template_name,
-                "has_system_role": self._current.has_system_role,
-                "activated_at": self._current.activated_at,
-            },
-            "lora_compatible": self._lora_compatible,
-            "migration_history": [
-                {
-                    "from": h.from_model,
-                    "to": h.to_model,
-                    "migrated_at": h.migrated_at,
-                    "lora_archived_to": h.lora_archived_to,
-                }
-                for h in self._migration_history
-            ],
-            "components": {
-                name: {
-                    "current": {
-                        "filename": comp.current.filename,
-                        "chat_template_name": comp.current.chat_template_name,
-                        "has_system_role": comp.current.has_system_role,
-                        "activated_at": comp.current.activated_at,
-                    },
-                    "history": [
-                        {
-                            "from": h.from_model,
-                            "to": h.to_model,
-                            "migrated_at": h.migrated_at,
-                            "lora_archived_to": h.lora_archived_to,
-                        }
-                        for h in comp.history
-                    ],
-                }
-                for name, comp in self._components.items()
-            },
-        }
-        atomic_write_text(
-            self.path,
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        知らないコンポーネントも未知キーと同じく持ち続けて書き戻す。
+        """
+        data = _PAYLOAD_CODEC.decode(_rename_history(payload, _HISTORY_KEYS))
+        for name in ALL_COMPONENTS:
+            data.components.setdefault(name, ComponentState())
+        self._current = data.current
+        self._migration_history = data.migration_history
+        self._components = data.components
+        self._extra = data._extra
+
+    def _to_payload(self) -> dict[str, Any]:
+        payload = _PAYLOAD_CODEC.encode(ModelStatePayload(
+            current=self._current,
+            migration_history=self._migration_history,
+            components=self._components,
+            _extra=self._extra,
+        ))
+        return _rename_history(payload, {v: k for k, v in _HISTORY_KEYS.items()})
 
     # ── 更新操作 ──
 
@@ -263,18 +238,12 @@ class ModelState:
             activated_at=_now(),
         )
 
-    def add_migration(
-        self,
-        from_model: str,
-        to_model: str,
-        lora_archived_to: str = "",
-    ) -> None:
+    def add_migration(self, from_model: str, to_model: str) -> None:
         """移行履歴にエントリを追加"""
         self._migration_history.append(MigrationHistoryEntry(
             from_model=from_model,
             to_model=to_model,
             migrated_at=_now(),
-            lora_archived_to=lora_archived_to,
         ))
 
     def get_last_migration(self) -> MigrationHistoryEntry | None:
@@ -383,7 +352,6 @@ class ModelMigrator:
         model_state: ModelState,
         experience_buf=None,
         prompt_manager=None,
-        eval_core_manager=None,
         learning_scheduler=None,
         episodic_memory=None,
         vector_store=None,
@@ -394,7 +362,6 @@ class ModelMigrator:
         self.model_state = model_state
         self.experience_buf = experience_buf
         self.prompt_manager = prompt_manager
-        self.eval_core_manager = eval_core_manager
         self.learning_scheduler = learning_scheduler
         self.episodic_memory = episodic_memory
         self._vector_store = vector_store
@@ -404,7 +371,6 @@ class ModelMigrator:
         self,
         new_model_path: str,
         *,
-        try_lora: bool = False,
         regenerate_context: bool = False,
         dry_run: bool = False,
     ) -> MigrationResult:
@@ -412,7 +378,6 @@ class ModelMigrator:
 
         Args:
             new_model_path: 新モデルの GGUF ファイルパス
-            try_lora: LoRA 互換性テストを試みるか
             regenerate_context: context_description を再生成するか
             dry_run: ドライラン（変更しない）
 
@@ -442,47 +407,16 @@ class ModelMigrator:
         # データ集計
         result.data_summary = self._gather_data_summary()
 
+        # 学習データ (LoRA・経験・プロンプト) は model_key ごとのパーティションで
+        # 保全される (c_05 §0.5.12)。旧モデルのものを退避・初期化する処理は無い —
+        # 新しいモデルのパーティションは起動時 / rebind で束ねられ、空なら一から学習する。
+        result.lora_action = "kept"
         if dry_run:
-            # partition 有効時 (既定) は実 migrate が LoRA アーカイブを skip する
-            # ため dry_run も "kept" を返す (過大表示防止)。data_summary も
-            # _gather_data_summary 側で partition-aware に集計済み。
-            result.lora_action = (
-                "kept" if (self._is_partitioned() or try_lora) else "archived"
-            )
             result.recommendations = (
                 self._known_issue_recommendations(resolved_path)
                 + self._build_recommendations(dry_run=True)
             )
             return result
-
-        # base 学習パーティション有効時は、Step 3-5 の flat 無効化 (LoRA アーカイブ /
-        # 経験 perplexity リセット / プロンプト候補クリア) を行わない。学習データは
-        # モデル別パーティションで保全されており、これらは旧モデルの保全データを
-        # 破壊する (戻したとき復元できなくなる)。新モデルのパーティションは別途
-        # 起動時 _activate_learning_partition で activate され、空なら一から学習する。
-        partitioned = self._is_partitioned()
-
-        if partitioned:
-            logger.info(
-                "Migration under partition_by_base_model: skipping flat "
-                "LoRA-archive / experience-reset / prompt-meta-clear "
-                "(per-model partitions preserve old-model learning)",
-            )
-            lora_action = "kept"
-            result.lora_action = lora_action
-        else:
-            # Step 3: LoRA アーカイブ
-            lora_action = self._archive_lora(old_model_filename, try_lora)
-            result.lora_action = lora_action
-
-            # Step 4: 経験バッファ更新
-            self._update_experience_buffer(old_model_filename)
-
-            # Step 5: プロンプトメタ情報更新
-            self._update_prompt_meta(old_model_filename)
-
-            # Step 6: コア評価セット準備
-            self._reset_eval_core()
 
         # Step 7 (部分): config.yaml 更新
         self._update_config(new_model_path)
@@ -492,14 +426,11 @@ class ModelMigrator:
             self._mark_context_regeneration()
 
         # Step 9: model_state 更新
-        archive_dir = f"local/lora_archive/{Path(old_model_filename).stem}/"
         self.model_state.add_migration(
             from_model=old_model_filename,
             to_model=new_model_filename,
-            lora_archived_to=archive_dir if lora_action != "kept" else "",
         )
         self.model_state.update_current(filename=new_model_filename)
-        self.model_state.lora_compatible = (try_lora and lora_action == "kept")
         self.model_state.save()
 
         known_issues = self._known_issue_recommendations(resolved_path)
@@ -513,7 +444,7 @@ class ModelMigrator:
             )
         logger.info(
             "Migration completed: %s -> %s (lora: %s)",
-            old_model_filename, new_model_filename, lora_action,
+            old_model_filename, new_model_filename, result.lora_action,
         )
         return result
 
@@ -524,7 +455,7 @@ class ModelMigrator:
             target_model: ロールバック先モデル名。省略時は直前の移行元
 
         Returns:
-            {"rolled_back_to": str, "lora_restored": bool}
+            {"rolled_back_to": str}
 
         Raises:
             MigrationError: 履歴なし / ロールバック不能
@@ -536,9 +467,6 @@ class ModelMigrator:
         rollback_target = target_model or last.from_model
         if not rollback_target:
             raise MigrationError("Cannot determine rollback target model")
-
-        # LoRA 復元
-        lora_restored = self._restore_lora(rollback_target)
 
         # config.yaml 更新
         old_base_model = self.config.get("model_paths", {}).get("base_model") or ""
@@ -558,17 +486,10 @@ class ModelMigrator:
 
         # model_state 更新
         self.model_state.update_current(filename=rollback_target)
-        self.model_state.lora_compatible = lora_restored
         self.model_state.save()
 
-        logger.info(
-            "Rollback completed: -> %s (lora_restored=%s)",
-            rollback_target, lora_restored,
-        )
-        return {
-            "rolled_back_to": rollback_target,
-            "lora_restored": lora_restored,
-        }
+        logger.info("Rollback completed: -> %s", rollback_target)
+        return {"rolled_back_to": rollback_target}
 
     # ── コンポーネント移行 ──
 
@@ -584,10 +505,9 @@ class ModelMigrator:
         base モデルと違い、経験バッファ・プロンプトメタなどのパーティション系
         付帯処理は不要 (embed の学習データは f_04_self_learning.md
         §1.2 のとおり元々 flat 共有でモデル別パーティション化されない)。
-        LoRA のみ :meth:`_archive_component_lora_if_incompatible` で新モデルとの
-        arch 整合性を確認し、不一致時のみアーカイブする。config.yaml 更新と
-        model_state 記録も行う。実際の llama-server 再起動とクライアント
-        差し替えは L2 で対応する。
+        埋め込みモデルは LoRA を持たない (embed LoRA は G1 で撤去) ので
+        ``lora_action`` は常に ``"n/a"``。config.yaml 更新と model_state 記録を行う。
+        実際の llama-server 再起動とクライアント差し替えは L2 で対応する。
         """
         if component not in ALL_COMPONENTS:
             raise MigrationError(
@@ -630,23 +550,8 @@ class ModelMigrator:
         # config.yaml 更新
         self._update_component_config(component, new_model_path)
 
-        # LoRA: 新モデルと不適合 (arch / hidden size 不一致、または判定不能) の
-        # 場合のみアーカイブ。適合時は f_04_self_learning.md §1.2 の flat 共有
-        # 方針どおり persist する。
-        lora_action = self._archive_component_lora_if_incompatible(
-            component, old_filename, resolved,
-        )
-        result.lora_action = lora_action
-
         # model_state 更新
-        self.model_state.add_component_migration(
-            component, old_filename, new_filename,
-            lora_archived_to=(
-                f"local/{_COMPONENT_LORA_KEYS[component][2]}/"
-                f"{Path(old_filename).stem}/"
-                if lora_action == "archived" else ""
-            ),
-        )
+        self.model_state.add_component_migration(component, old_filename, new_filename)
         self.model_state.update_component_current(component, new_filename)
         self.model_state.save()
 
@@ -694,26 +599,13 @@ class ModelMigrator:
 
         self._update_component_config(component, rollback_path)
 
-        adapter_key, versions_key, archive_root, _default_adapter = (
-            _COMPONENT_LORA_KEYS[component]
-        )
-        lora_restored = self._restore_lora(
-            rollback_target,
-            adapter_key=adapter_key, versions_key=versions_key,
-            archive_root=archive_root,
-        )
-
         self.model_state.update_component_current(component, rollback_target)
         self.model_state.save()
 
         logger.info(
-            "Component rollback completed: %s -> %s (lora_restored=%s)",
-            component, rollback_target, lora_restored,
+            "Component rollback completed: %s -> %s", component, rollback_target,
         )
-        return {
-            "rolled_back_to": rollback_target,
-            "lora_restored": lora_restored,
-        }
+        return {"rolled_back_to": rollback_target}
 
     def _get_component_current(self, component: str) -> str:
         cur = self.model_state.get_component_current_filename(component)
@@ -722,81 +614,6 @@ class ModelMigrator:
         cfg_key = COMPONENT_CONFIG_KEY[component]
         raw = self.config.get("model_paths", {}).get(cfg_key, "")
         return Path(raw).name if raw else "unknown"
-
-    def _archive_component_lora_if_incompatible(
-        self, component: str, old_model_name: str, new_model_path: Path,
-    ) -> str:
-        """新モデルと既存 LoRA の互換性を判定し、不適合 (または判定不能) の
-        ときのみ退避する。
-
-        適合時は f_04_self_learning.md §1.2 の「embed の学習は
-        モデル別パーティション化されず flat に共有される」方針どおり LoRA を
-        persist させる (無条件アーカイブだと同一 arch 内でのモデル切替
-        (量子化違い等) でも毎回学習を破棄してしまい、この設計意図を壊す)。
-
-        判定は launch_llama.py の :func:`lora_compatible_with_model` を起動側
-        ガード (``_lora_compatible``) と共有する。``general.architecture`` の
-        一致に加え、adapter の全 ``*.lora_a`` / ``*.lora_b`` テンソルをモデル
-        側の対応 weight 実形状と突合する — 同一 arch でもサイズ違い
-        (例: gemma-4-E2B 1536 vs E4B 2560) や head 構成違いの LoRA を残すと
-        llama-server が tensor 形状不一致でプロセスごと落ちるため、arch
-        文字列の一致だけでは適合と言えない。arch 判定不能を安全側で
-        アーカイブするのは起動側の fail-closed 方針と対称。
-        """
-        adapter_key, versions_key, archive_root, default_adapter = (
-            _COMPONENT_LORA_KEYS[component]
-        )
-        lp = self.config.get("local_paths", {})
-        lora_path = self._resolve_path(lp.get(adapter_key, default_adapter))
-        if not lora_path.exists():
-            return "n/a"
-
-        try:
-            from scripts.launch_llama import (
-                lora_compatible_with_model,
-                read_gguf_metadata,
-            )
-        except Exception as exc:
-            logger.warning(
-                "component LoRA compatibility check: launch_llama import "
-                "failed: %s", exc,
-            )
-            return self._archive_lora(
-                old_model_name, False,
-                adapter_key=adapter_key, versions_key=versions_key,
-                archive_root=archive_root,
-            )
-
-        compatible, reason = lora_compatible_with_model(
-            new_model_path, lora_path,
-        )
-        if compatible:
-            logger.info(
-                "Component LoRA compatible (%s), keeping: %s",
-                reason, lora_path,
-            )
-            # 系統 stamp の無いレガシーアダプタは arch/形状しか検証できて
-            # いない。モデルが実際に変わる切替では「学習元不明のまま持ち
-            # 越す」ことを観測可能にする (挙動は従来どおり keep)。
-            if (
-                old_model_name != new_model_path.name
-                and not read_gguf_metadata(lora_path).get("trained_on_model")
-            ):
-                logger.warning(
-                    "Component LoRA lineage unverifiable (no trained-on "
-                    "stamp); kept by arch/shape check only: %s", lora_path,
-                )
-            return "kept"
-
-        logger.info(
-            "Component LoRA incompatible (%s), archiving: %s",
-            reason, lora_path,
-        )
-        return self._archive_lora(
-            old_model_name, False,
-            adapter_key=adapter_key, versions_key=versions_key,
-            archive_root=archive_root,
-        )
 
     def _target_known_issues(self, resolved_path: Path) -> list[str]:
         """切替先モデルのプロファイルに宣言された既知の弱点を返す。
@@ -1100,8 +917,7 @@ class ModelMigrator:
             )
             recs.append(
                 "SemMem ファクトの埋め込みも再構築が必要です。"
-                "'python scripts/evorefmem_cli.py reembed-facts --apply' "
-                "を実行してください。",
+                "POST /api/model/reembed-facts を実行してください。",
             )
         return recs
 
@@ -1127,27 +943,14 @@ class ModelMigrator:
         if self.learning_scheduler and self.learning_scheduler.running:
             raise MigrationBusyError("Learning cycle is currently running")
 
-    def _is_partitioned(self) -> bool:
-        """base 学習パーティション有効か (既定 True)。
-
-        有効時は migrate() が flat 無効化 (LoRA アーカイブ / 経験 perplexity
-        リセット / プロンプト候補クリア) を skip する。dry_run の lora_action と
-        data_summary もこれに合わせて非破壊側へ倒し、過大表示を防ぐ。
-        """
-        return bool(
-            self.config.get("learning", {}).get("partition_by_base_model", True),
-        )
-
     def _gather_data_summary(self) -> dict:
         """移行対象データの集計
 
-        partition_by_base_model 有効時 (既定) は flat 無効化を skip するため、
-        破壊対象カウント (perplexity_reset / prompts_modes) は 0 / 空で返す。
-        migrate() の partitioned 分岐と一致させ dry_run の過大表示を防ぐ。
+        学習データは model_key のパーティションで保全され移行で壊さないので、
+        破壊対象カウント (perplexity_reset / prompts_modes) は常に 0 / 空。
         experience_entries / memory_notes / rag_chunks / cartridges は保持
-        データ件数の情報表示なので partition に依らず集計する。
+        データ件数の情報表示。
         """
-        partitioned = self._is_partitioned()
         summary: dict = {
             "memory_notes": 0,
             "experience_entries": 0,
@@ -1159,14 +962,6 @@ class ModelMigrator:
 
         if self.experience_buf:
             summary["experience_entries"] = self.experience_buf.count
-            if not partitioned:
-                summary["perplexity_reset"] = sum(
-                    1 for e in self.experience_buf.entries
-                    if e.signals.perplexity is not None
-                )
-
-        if self.prompt_manager and not partitioned:
-            summary["prompts_modes"] = list(self.prompt_manager.MODES)
 
         if self.episodic_memory is not None:
             summary["memory_notes"] = len(self.episodic_memory)
@@ -1178,142 +973,6 @@ class ModelMigrator:
             summary["cartridges"] = len(getattr(self._cartridge_manager, "installed", {}))
 
         return summary
-
-    def _archive_lora(
-        self,
-        old_model_name: str,
-        try_lora: bool,
-        *,
-        adapter_key: str = "lora_adapter",
-        versions_key: str = "lora_versions_dir",
-        archive_root: str = "lora_archive",
-    ) -> str:
-        """Step 3: LoRA アーカイブ
-
-        base 用の既定キーワード引数はそのまま (完全後方互換)。embed
-        用は :data:`_COMPONENT_LORA_KEYS` のキーを渡して呼ぶ。
-        """
-        lp = self.config.get("local_paths", {})
-        lora_path = self._resolve_path(
-            lp.get(adapter_key, "local/models/adapter.gguf")
-        )
-        lora_versions_dir = self._resolve_path(
-            lp.get(versions_key, "local/lora_versions/")
-        )
-
-        if not lora_path.exists():
-            logger.info("No LoRA adapter found, skipping archive")
-            return "archived"
-
-        if try_lora:
-            logger.info("--try-lora: keeping LoRA for compatibility test")
-            return "kept"
-
-        archive_dir = (
-            self.project_root / "local" / archive_root
-            / Path(old_model_name).stem
-        )
-        archive_dir.mkdir(parents=True, exist_ok=True)
-
-        # adapter.gguf コピー
-        shutil.copy2(str(lora_path), str(archive_dir / "adapter.gguf"))
-        logger.info(
-            "LoRA archived: %s -> %s",
-            lora_path, archive_dir / "adapter.gguf",
-        )
-
-        # lora_versions/ コピー
-        if lora_versions_dir.exists() and any(lora_versions_dir.iterdir()):
-            versions_archive = archive_dir / "versions"
-            if versions_archive.exists():
-                shutil.rmtree(str(versions_archive))
-            shutil.copytree(str(lora_versions_dir), str(versions_archive))
-            logger.info(
-                "LoRA versions archived: %s -> %s",
-                lora_versions_dir, versions_archive,
-            )
-
-        # 元の LoRA を削除
-        lora_path.unlink()
-        logger.info("Original LoRA adapter removed: %s", lora_path)
-
-        # lora_versions を空にする (.gitkeep は tracked な構造保持ファイルのため残す)
-        if lora_versions_dir.exists():
-            for f in lora_versions_dir.iterdir():
-                if f.is_file():
-                    if f.name == ".gitkeep":
-                        continue
-                    f.unlink()
-                elif f.is_dir():
-                    shutil.rmtree(str(f))
-            logger.info("LoRA versions cleared: %s", lora_versions_dir)
-
-        return "archived"
-
-    def _update_experience_buffer(self, old_model_name: str) -> None:
-        """Step 4: 経験バッファ更新"""
-        if self.experience_buf is None:
-            return
-
-        for entry in self.experience_buf.entries:
-            if not entry.base_model:
-                entry.base_model = old_model_name
-            entry.signals.perplexity = None
-
-        # 永続化。in-memory バッファは **active パーティション** の内容なので、
-        # flat パス (local/experience.json) へ書くとパーティション側が古いまま
-        # 残り、shutdown で上書きされて移行結果が消える (2026-09-05 監査)。
-        # active パーティションへ書く。flat パス (local/experience.json) へ書くと
-        # パーティション側が古いまま残り、shutdown で上書きされて移行結果が
-        # 消える (2026-09-05 監査)。グローバル resolver 未初期化 (単体テスト等)
-        # では従来の flat パスへ倒す。
-        try:
-            from backend.config import get_path_resolver
-
-            exp_file = get_path_resolver().resolve_learning("experience_file")
-        except RuntimeError:
-            exp_file = self._resolve_path(
-                self.config.get("local_paths", {}).get(
-                    "experience_file", "local/experience.json",
-                ),
-            )
-        self.experience_buf.save(exp_file)
-
-        logger.info(
-            "Experience buffer updated: %d entries, perplexity reset",
-            self.experience_buf.count,
-        )
-
-    def _update_prompt_meta(self, old_model_name: str) -> None:
-        """Step 5: プロンプトメタ情報更新"""
-        if self.prompt_manager is None:
-            return
-
-        for mode in self.prompt_manager.MODES:
-            try:
-                meta = self.prompt_manager.get_meta(mode)
-                meta.model_calibrated_for = old_model_name
-                meta.candidates = []
-                self.prompt_manager._save_meta(mode)
-                logger.info(
-                    "Prompt meta updated: %s.meta.json "
-                    "(model_calibrated_for=%s)",
-                    mode, old_model_name,
-                )
-            except ValueError:
-                continue
-
-    def _reset_eval_core(self) -> None:
-        """Step 6: コア評価セット準備"""
-        if self.eval_core_manager is None:
-            return
-
-        eval_set = self.eval_core_manager.load()
-        for case in eval_set.cases:
-            case.max_perplexity = None
-        eval_set.version += 1
-        self.eval_core_manager.save(eval_set)
-        logger.info("Eval core reset: %d cases", len(eval_set.cases))
 
     def _update_config(self, new_model_path: str) -> None:
         """Step 7 (部分): config.yaml の base_model を更新"""
@@ -1373,59 +1032,6 @@ class ModelMigrator:
             logger.info(
                 "Marked %d notes for context regeneration", count,
             )
-
-    def _restore_lora(
-        self,
-        target_model: str,
-        *,
-        adapter_key: str = "lora_adapter",
-        versions_key: str = "lora_versions_dir",
-        archive_root: str = "lora_archive",
-    ) -> bool:
-        """ロールバック時の LoRA 復元
-
-        base 用の既定キーワード引数はそのまま (完全後方互換)。embed
-        用は :data:`_COMPONENT_LORA_KEYS` のキーを渡して呼ぶ。
-        """
-        lp = self.config.get("local_paths", {})
-        lora_path = self._resolve_path(
-            lp.get(adapter_key, "local/models/adapter.gguf")
-        )
-        lora_versions_dir = self._resolve_path(
-            lp.get(versions_key, "local/lora_versions/")
-        )
-
-        archive_dir = (
-            self.project_root / "local" / archive_root
-            / Path(target_model).stem
-        )
-
-        if not archive_dir.exists():
-            logger.info("No LoRA archive found for %s", target_model)
-            return False
-
-        lora_restored = False
-
-        # adapter.gguf 復元
-        archived_adapter = archive_dir / "adapter.gguf"
-        if archived_adapter.exists():
-            lora_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(archived_adapter), str(lora_path))
-            lora_restored = True
-            logger.info(
-                "LoRA adapter restored: %s -> %s",
-                archived_adapter, lora_path,
-            )
-
-        # versions 復元
-        archived_versions = archive_dir / "versions"
-        if archived_versions.exists():
-            if lora_versions_dir.exists():
-                shutil.rmtree(str(lora_versions_dir))
-            shutil.copytree(str(archived_versions), str(lora_versions_dir))
-            logger.info("LoRA versions restored: %s", lora_versions_dir)
-
-        return lora_restored
 
     def _build_recommendations(self, *, dry_run: bool) -> list[str]:
         """推奨アクションを生成"""

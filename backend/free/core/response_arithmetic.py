@@ -70,13 +70,17 @@ def _evaluate(a: float, op: str, b: float) -> float | None:
 def find_arithmetic_contradictions(text: str) -> list[str]:
     """本文中の算術主張のうち、計算が合わないものを列挙する (純粋関数)。
 
+    式 (``A op B = C``) と、箇条書きの内訳 (:func:`find_breakdown_contradictions`)
+    の 2 形を見る。ターン成否と few-shot の足切りが同じ入口を呼ぶので、形を
+    足すときはここに足す (片方だけ直る状態を作らない)。
+
     Returns:
         ``"42.195 ÷ 1.609 ≈ 26.195 (正しくは 26.2244)"`` 形式の説明のリスト。
         検算可能な式が無い / すべて一致する場合は空リスト。
     """
     if not text:
         return []
-    found: list[str] = []
+    found: list[str] = find_breakdown_contradictions(text)
     for m in _CLAIM_RE.finditer(text):
         if _CHAIN_LEFT_RE.search(text[: m.start()]):
             continue
@@ -116,11 +120,12 @@ def has_arithmetic_contradiction(text: str) -> bool:
 
 #: 漢数字単位付きの数値 (「1,096万4,771」「3,200万」「1億2,000万」)。
 #: 桁区切りだけを見る素の数値抽出だと ``1,096万4,771`` が ``1,096`` と
-#: ``4,771`` の 2 値に割れ、冒頭の主張値を復元できない。
+#: ``4,771`` の 2 値に割れ、冒頭の主張値を復元できない。万の前の小数
+#: (「1.5万」) も受ける — 受けないと 15000 が 1.5 と読まれていた。
 _JA_NUMBER_RE = re.compile(
     r"(?<![\d.,])(?=\d)"
     r"(?:(?P<oku>\d[\d,]*)\s*億\s*)?"
-    r"(?:(?P<man>\d[\d,]*)\s*万\s*)?"
+    r"(?:(?P<man>\d[\d,]*(?:\.\d+)?)\s*万\s*)?"
     r"(?P<base>\d[\d,]*(?:\.\d+)?)?",
 )
 
@@ -260,3 +265,124 @@ def find_conclusion_contradiction(text: str) -> str | None:
         f"reaches that value (computed values include "
         f"{', '.join(f'{v:g}' for v in others[:3])})"
     )
+
+
+# ---------------------------------------------------------------------------
+# 箇条書きの内訳 vs 親項目の合計
+# ---------------------------------------------------------------------------
+#
+# 上の 2 判定はどちらも **式** (``A op B = C`` / ``= 値``) を手掛かりにする。
+# ところが家計・時間配分・見積もりの応答は、式を書かずに箇条書きの入れ子で
+# 合計と内訳を並べるのが普通で、そこでの誤りを 1 件も捕まえていなかった
+# (2026-09-21 ライブ監査 C07 turn2、``turn_outcome`` は success のまま):
+#
+#     *   **固定費**: 11万4000円
+#         *   家賃: 9万円
+#         *   光熱費: 1.5万円
+#         *   通信費: 1.2万円
+#
+# 内訳の和は 11万7000円。判定は構造と数値だけで決まり、語彙を持たない。
+
+#: 箇条書きの 1 行 (``-`` / ``*`` / ``+`` / ``・`` / ``1.`` / ``1)``)。
+_LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)(?:[-*+・•]|\d{1,2}[.)])\s+(?P<body>\S.*)$")
+
+#: 「<ラベル>: <値>」の区切り。ラベル側は短い語に限る (文を拾わない)。
+_LABEL_VALUE_RE = re.compile(r"^(?P<label>[^:：\n]{1,30}?)\s*[:：]\s*(?P<rest>.+)$")
+
+#: 値の直後の単位 (「円」「時間」「kg」)。数値の続き・括弧・区切りは単位でない。
+_UNIT_RE = re.compile(r"\s*(?P<unit>[^\s\d（(、。,，/／:：)）〜~\-+×]{1,4})")
+
+#: 強調記号。値が ``**11万円**`` のように装飾されていても同じに読む。
+_EMPHASIS_RE = re.compile(r"\*{1,3}|__?")
+
+#: 足し上げの意味を持たない単位。比率の内訳は親の値の和にならない。
+_NON_ADDITIVE_UNITS = frozenset({"%", "％", "倍", "割"})
+
+
+def _literal_scale(match: re.Match) -> float:
+    """``_JA_NUMBER_RE`` のマッチが表す値の最小桁 (「11.4万」→ 1000)。"""
+    for group, unit in (("base", 1.0), ("man", 10_000.0), ("oku", 100_000_000.0)):
+        literal = match.group(group)
+        if literal is not None:
+            decimals = len(literal.split(".")[1]) if "." in literal else 0
+            return unit * 10.0 ** -decimals
+    return 1.0
+
+
+def _parse_amount_item(body: str) -> tuple[str, float, str, float, bool] | None:
+    """「<ラベル>: <数値><単位>」の項目を ``(label, value, unit, scale, approx)`` へ。
+
+    値の後ろに別の数値が続く項目 (「1.5h × 5日」「3〜5万円」「(年 120万円)」) は
+    内訳の 1 項として読めないので ``None``。
+    """
+    m = _LABEL_VALUE_RE.match(_EMPHASIS_RE.sub("", body).strip())
+    if m is None:
+        return None
+    rest = m.group("rest").strip()
+    approx = _APPROX_RE.match(rest)
+    if approx is not None:
+        rest = rest[approx.end():].lstrip()
+    num = _JA_NUMBER_RE.match(rest)
+    if num is None or not num.group(0):
+        return None
+    value = _parse_ja_number(num)
+    unit = _UNIT_RE.match(rest, num.end())
+    if value is None or unit is None or unit.group("unit") in _NON_ADDITIVE_UNITS:
+        return None
+    if re.search(r"\d", rest[unit.end():]):
+        return None
+    return m.group("label").strip(), value, unit.group("unit"), _literal_scale(num), approx is not None
+
+
+def find_breakdown_contradictions(text: str) -> list[str]:
+    """箇条書きの内訳の和が親項目の値を **超える** ものを列挙する (純粋関数)。
+
+    親項目 (「固定費: 11万4000円」) の直下の子項目がすべて同じ単位の
+    「<ラベル>: <値>」で 2 つ以上あるときだけ照合する。
+
+    **超過だけを報告する**。和が足りないのは「主なものだけ挙げた」内訳で
+    普通に起こるが、部分の和が全体を超えることは内訳である限り起こらない。
+    許容誤差は親の値の表記桁 (「12万円」なら ±0.75万) で、子の値は問いに
+    与えられた入力なので丸めを見込まない。「約」がどこかに付けば相対 5%。
+    """
+    lines = [line.expandtabs(4) for line in (text or "").splitlines()]
+    found: list[str] = []
+    for i, line in enumerate(lines):
+        head = _LIST_ITEM_RE.match(line)
+        if head is None:
+            continue
+        parent = _parse_amount_item(head.group("body"))
+        if parent is None:
+            continue
+        parent_indent = len(head.group("indent"))
+        child_indent: int | None = None
+        children: list[tuple[str, float, str, float, bool] | None] = []
+        for below in lines[i + 1:]:
+            if not below.strip():
+                continue
+            indent = len(below) - len(below.lstrip())
+            if indent <= parent_indent:
+                break
+            item = _LIST_ITEM_RE.match(below)
+            if item is None:
+                continue
+            if child_indent is None:
+                child_indent = indent
+            if indent == child_indent:
+                children.append(_parse_amount_item(item.group("body")))
+        if len(children) < 2 or any(c is None for c in children):
+            continue
+        label, value, unit, scale, approx = parent
+        parts = [c for c in children if c is not None]
+        if any(c[2] != unit for c in parts):
+            continue
+        total = sum(c[1] for c in parts)
+        if approx or any(c[4] for c in parts):
+            tolerance = abs(value) * _APPROX_REL_TOLERANCE
+        else:
+            tolerance = 0.5 * scale * _ROUNDING_SLACK + abs(value) * 1e-9
+        if total - value > tolerance:
+            found.append(
+                f"breakdown of {label} ({value:g}{unit}) sums to {total:g}{unit}"
+            )
+    return found

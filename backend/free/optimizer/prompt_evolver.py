@@ -6,11 +6,10 @@ import difflib
 import hashlib
 import json
 import re
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -26,6 +25,11 @@ from backend.free.agent.prompt_utils import (
     validate_protected_sections,
 )
 from backend.free.llm.json_extract import extract_json_object
+from backend.io import JSONLAppendStore
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.id_registry import new_id
+from backend.io.readonly import DataReadonlyError
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -45,6 +49,53 @@ from backend.free.core.script_ranges import (
 )
 
 logger = get_logger("optimizer.prompt_evolver")
+
+@persisted()
+@dataclass(kw_only=True)
+class PromptCandidateRecord:
+    """``candidates.jsonl`` の 1 行 (候補の系譜。本文は持たず長さと sha だけ)。
+
+    ``_v`` は行の版 (c_05 §0.5.1、形式 ``learning.prompt_candidates`` の版と同じ)。
+    """
+
+    _v: int = 1
+    written_at: str = ""
+    id: str
+    parent_ids: list[str] = field(default_factory=list)
+    op: str = "seed"
+    generation: int = 0
+    fitness: float = 0.0
+    scores: dict[str, float] = field(default_factory=dict)
+    text_len: int = 0
+    text_sha: str = ""
+    _extra: dict[str, Any] | None = None
+
+
+#: 変異候補のアーカイブ (:attr:`PromptEvolver.candidates_archive`、プロンプト版と同じ
+#: パーティション)。行は :class:`PromptCandidateRecord` の追記 (``JSONLAppendStore``)。
+CANDIDATES_FILE = "candidates.jsonl"
+PROMPT_CANDIDATES_FORMAT = register_format(FormatSpec(
+    format_id="learning.prompt_candidates",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key=f"store/learning/<mk>/prompts/{CANDIDATES_FILE}",
+    retention="append-only audit of every mutation candidate",
+    encodings=("jsonl",),
+    records=(PromptCandidateRecord,),
+))
+
+
+def candidate_store(path: Path) -> JSONLAppendStore[PromptCandidateRecord]:
+    """``candidates.jsonl`` の追記ストア (Level 1 の背景処理が書く。チャット経路ではない)。"""
+    codec = codec_for(PromptCandidateRecord)
+    return JSONLAppendStore(
+        path,
+        serialize=lambda record: json.dumps(codec.encode(record), ensure_ascii=False),
+        deserialize=lambda line: codec.decode(json.loads(line)),
+        key_of=lambda record: record.id,
+        row_version=PROMPT_CANDIDATES_FORMAT.version,
+    )
 
 # 突然変異リトライ上限
 MAX_MUTATION_RETRIES = 3
@@ -382,7 +433,7 @@ class PromptCandidate:
     fitness: float = 0.0
     generation: int = 0
 
-    id: str = field(default_factory=lambda: f"pc_{uuid.uuid4().hex[:12]}")
+    id: str = field(default_factory=lambda: new_id("pc_"))
     """候補 ID。系譜を辿るための鍵 (c_05 §0.6)。"""
 
     parent_ids: list[str] = field(default_factory=list)
@@ -444,33 +495,33 @@ class PromptEvolver:
     #: いること** を確認してから (f_04 §4.4 の有効化条件)。選択圧が無い状態で
     #: アーカイブを増やしても「保存されるが選ばれない」集合が育つだけ。
     candidates_archive: "Path | None" = None
+    #: :attr:`candidates_archive` の追記ストア (パスが変わったら作り直す)。
+    _candidate_store: "JSONLAppendStore[PromptCandidateRecord] | None" = None
 
     def _archive_candidate(self, candidate: PromptCandidate) -> None:
         """候補 1 件を ``candidates.jsonl`` へ追記する (失敗しても進化は止めない)。"""
         path = self.candidates_archive
         if path is None:
             return
-        try:
-            from backend.utils import utc_now
+        from backend.utils import utc_now
 
-            record = {
-                "schema_version": 1,
-                "written_at": utc_now(),
-                "id": candidate.id,
-                "parent_ids": list(candidate.parent_ids),
-                "op": candidate.op,
-                "generation": candidate.generation,
-                "fitness": candidate.fitness,
-                "scores": dict(candidate.scores),
-                "text_len": len(candidate.text),
-                "text_sha": hashlib.sha256(
-                    candidate.text.encode("utf-8"),
-                ).hexdigest()[:16],
-            }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError as exc:
+        record = PromptCandidateRecord(
+            written_at=utc_now(),
+            id=candidate.id,
+            parent_ids=list(candidate.parent_ids),
+            op=candidate.op,
+            generation=candidate.generation,
+            fitness=candidate.fitness,
+            scores=dict(candidate.scores),
+            text_len=len(candidate.text),
+            text_sha=hashlib.sha256(candidate.text.encode("utf-8")).hexdigest()[:16],
+        )
+        try:
+            store = self._candidate_store
+            if store is None or store.path != Path(path):
+                store = self._candidate_store = candidate_store(Path(path))
+            store.append(record)
+        except (OSError, DataReadonlyError) as exc:
             logger.warning("Failed to archive prompt candidate: %s", exc)
 
     def _calc_fitness(
@@ -536,7 +587,7 @@ class PromptEvolver:
                 signal_is_defect(signals, key) for key in PROMPT_DEFECT_WEIGHTS
             ):
                 failure_keywords.update(
-                    _extract_query_terms(str(exp.get("query", ""))),
+                    _extract_query_terms(str(exp.get("query") or "")),
                 )
         if failure_keywords:
             covered = sum(1 for w in failure_keywords if w in candidate_lower)

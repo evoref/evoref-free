@@ -8,12 +8,14 @@
 	import { appVersion } from '$lib/free/stores/app';
 	import { currentMode, clearMessages, switchMode, modeRestartStatus, corpusMode, isStreaming } from '$lib/free/stores/chat';
 	import { addToast } from '$lib/free/stores/toast';
-	import { serverState } from '$lib/free/stores/server';
+	import { serverState, backendEdition } from '$lib/free/stores/server';
 
 	let { instanceName = 'evoref' }: { instanceName?: string } = $props();
 	let position = $derived($layout.sidebar.position);
 	let collapsed = $derived($sidebarCollapsed);
 	let debugEnabled = $derived($serverState.debug?.enabled === true);
+	// Pro ビルドでもバックエンドが Free なら Pro の導線を出さない (Pro の API が無い)
+	let showPro = $derived(isPro && $backendEdition !== 'free');
 
 	function isActive(href: string): boolean {
 		if (href === '/') return page.url.pathname === '/';
@@ -55,7 +57,7 @@
 				</div>
 				<a href="/history" class="nav-item" class:active={isActive('/history')}>{$t('sidebar.history')}</a>
 				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')}>{$t('sidebar.cartridges')}</a>
-				{#if isPro}
+				{#if showPro}
 					<a href="/knowledge" class="nav-item" class:active={isActive('/knowledge')}>{$t('sidebar.knowledge_sources')}</a>
 				{/if}
 				<a href="/themes" class="nav-item" class:active={isActive('/themes')}>{$t('sidebar.themes')}</a>
@@ -132,7 +134,7 @@
 						</select>
 					</div>
 				</div>
-				{#if isPro}
+				{#if showPro}
 					<div class="footer-row">
 						<span class="footer-label">{$t('sidebar.mode')}</span>
 						<div class="mode-select-wrapper">

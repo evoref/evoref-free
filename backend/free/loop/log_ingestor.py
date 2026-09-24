@@ -24,7 +24,9 @@ pillar) に供給する Loop pillar コンポーネント。
 * 一定時間 (デフォルト 5 分) outcome が来ない decision は orphan として
   PolicyAdjuster に送る (フォールバック後にクラッシュした等の解析用)
 * offset 永続化先は ``local/state/log_ingestor.json`` (再起動後の続き
-  から読む)
+  から読む)。封筒付き (形式 ``log_ingestor``)。G1 の封筒でない / 新しい版の
+  ファイルは読まず書き戻さない (readonly: その回は先頭から読み、offset は
+  保存しない)
 
 JoinedPair の構造:
 
@@ -47,7 +49,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from backend.io import atomic_write_text
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 
 logger = get_logger("loop.log_ingestor")
@@ -127,18 +131,7 @@ class _BufferedDecisions:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    """``path`` に JSON を原子的に書き込む (:func:`backend.io.atomic_write_text` 経由)。
-
-    途中クラッシュで壊れた JSON を残さないため。Windows の書き込み競合時
-    リトライと並行プロセス間の tmp 名衝突回避は ``backend.io`` が担う。
-    """
-    atomic_write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-    )
-
-
+@persisted()
 @dataclass
 class _FileOffset:
     """1 ファイルの追跡情報。
@@ -158,38 +151,70 @@ class _FileOffset:
 
     inode: int
     offset: int
+    #: この版が知らないキー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
 
 
-def _load_offsets(state_path: Path) -> dict[str, _FileOffset]:
-    """``state_path`` から offset map を読み込む。存在しない / 壊れて
-    いる場合は空 dict を返す (起動時自然デフォルト)。"""
-    if not state_path.exists():
-        return {}
-    try:
-        with open(state_path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "LogIngestor offset state unreadable, starting from scratch: %s",
-            exc,
-        )
-        return {}
-    raw = data.get("offsets", {})
-    if not isinstance(raw, dict):
-        return {}
-    result: dict[str, _FileOffset] = {}
-    for key, value in raw.items():
-        if not isinstance(key, str):
-            continue
-        # 新形式: {"inode": int, "offset": int}
-        if isinstance(value, dict):
-            inode = value.get("inode")
-            offset = value.get("offset")
-            if isinstance(inode, (int, float)) and isinstance(offset, (int, float)):
-                result[key] = _FileOffset(inode=int(inode), offset=int(offset))
-        # 旧形式 (互換破棄、空オフセット扱い)
-        # ※ 後方互換不要 (CLAUDE.md) のため bare int は読まない。
-    return result
+@persisted()
+@dataclass
+class _OffsetPayload:
+    """``log_ingestor.json`` の payload。"""
+
+    offsets: dict[str, _FileOffset] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
+
+
+_OFFSET_CODEC = codec_for(_FileOffset)
+_PAYLOAD_CODEC = codec_for(_OffsetPayload)
+
+LOG_INGESTOR_FORMAT = register_format(FormatSpec(
+    format_id="log_ingestor",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/state/log_ingestor.json",
+    retention="rewritten in place; one entry per followed log file",
+    records=(_OffsetPayload,),
+))
+
+
+class _OffsetState(VersionedJsonFile):
+    """offset map の永続化 (``local/state/log_ingestor.json``)。
+
+    payload は ``{"offsets": {filename: {"inode": int, "offset": int}}}``。
+    形の崩れたエントリだけを読み飛ばし (件数を WARNING に出す)、payload /
+    ``offsets`` 自体がオブジェクトでなければ壊れたファイルとして退避する。
+    """
+
+    FORMAT = LOG_INGESTOR_FORMAT
+    #: 保存の失敗はポーリングループのバックオフ (``_run_loop``) へ伝える。
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.offsets: dict[str, _FileOffset] = {}
+        #: payload の未知キー (書き戻しでそのまま戻す)。
+        self._extra: dict[str, Any] | None = None
+
+    def _to_payload(self) -> dict[str, Any]:
+        return _PAYLOAD_CODEC.encode(_OffsetPayload(offsets=self.offsets, _extra=self._extra))
+
+    def _from_payload(self, payload: Any) -> None:
+        if not isinstance(payload, dict) or not isinstance(payload.get("offsets", {}), dict):
+            raise TypeError("log_ingestor payload must be an object with an offsets map")
+        # 項目は 1 件ずつ読む (形の崩れた項目だけを飛ばす)
+        data = _PAYLOAD_CODEC.decode({k: v for k, v in payload.items() if k != "offsets"})
+        skipped = 0
+        for key, value in payload.get("offsets", {}).items():
+            try:
+                data.offsets[key] = _OFFSET_CODEC.decode(value)
+            except CodecError:
+                skipped += 1
+        if skipped:
+            logger.warning("Skipped %d malformed offset entry(ies) in %s", skipped, self.path)
+        self.offsets = data.offsets
+        self._extra = data._extra
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -233,6 +258,9 @@ class LogIngestor:
             )
         self.debug_log_dir = debug_log_dir
         self.state_path = state_path
+        self._state_file = _OffsetState(state_path)
+        # 直近に保存した offset map (変化の無いポーリングで fsync を重ねない)。
+        self._saved_offsets: dict[str, tuple[int, int]] | None = None
         self.poll_interval_sec = poll_interval_sec
         self.lru_max = lru_max
         self.orphan_timeout_sec = orphan_timeout_sec
@@ -268,7 +296,8 @@ class LogIngestor:
         """offset を読み込み、ポーリングループを bg task として起動する。"""
         if self._task is not None:
             raise RuntimeError("LogIngestor already started")
-        self._offsets = _load_offsets(self.state_path)
+        self._state_file.load()
+        self._offsets = self._state_file.offsets
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop())
         logger.info(
@@ -455,7 +484,10 @@ class LogIngestor:
             return
 
         new_offset = offset + len(data)
-        self._offsets[path.name] = _FileOffset(inode=inode, offset=new_offset)
+        prev = self._offsets.get(path.name)
+        # 同じファイルを読み進めただけなら項目の未知キーを残す (ローテーション後は新しい項目)
+        extra = prev._extra if prev is not None and prev.inode == inode else None
+        self._offsets[path.name] = _FileOffset(inode=inode, offset=new_offset, _extra=extra)
 
         await self._dispatch_lines(data, category, path.name)
 
@@ -597,15 +629,20 @@ class LogIngestor:
     # ------------------------------------------------------------------
 
     def _save_offsets(self) -> None:
-        """現在の offset map を ``state_path`` に atomic 書き込みする。"""
-        payload = {
-            "schema_version": SUPPORTED_SCHEMA_VERSION,
-            "offsets": {
-                name: {"inode": fo.inode, "offset": fo.offset}
-                for name, fo in self._offsets.items()
-            },
-        }
-        _atomic_write_json(self.state_path, payload)
+        """現在の offset map を ``state_path`` に封筒付きで atomic 書き込みする。
+
+        ファイルが readonly (書き戻すと壊す) なら黙って飛ばす — 理由はロード時に
+        1 度だけ ERROR で出ている (ポーリング毎に警告を重ねない)。SoT なので
+        fsync するため、前回の保存から変化が無ければ書かない。
+        """
+        if self._state_file.readonly:
+            return
+        current = {name: (fo.inode, fo.offset) for name, fo in self._offsets.items()}
+        if current == self._saved_offsets:
+            return
+        self._state_file.offsets = self._offsets
+        if self._state_file.save():
+            self._saved_offsets = current
 
 
 __all__ = [

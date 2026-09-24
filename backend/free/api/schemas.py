@@ -5,7 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from backend.free.__version__ import (
-    __schema_version__ as _FREE_SCHEMA_VERSION,
+    DATA_GENERATION as _DATA_GENERATION,
     __version__ as _FREE_VERSION,
 )
 
@@ -150,6 +150,51 @@ class CapabilityInfo(BaseModel):
     probed_at: str = ""
 
 
+class FormatHealthInfo(BaseModel):
+    """読み手が current として読めなかった形式 1 つ (``data_health.formats`` の値)。
+
+    ``state`` は ``newer`` / ``foreign`` / ``unmigratable`` / ``corrupt`` (版付きファイルの
+    読み取りの分類) か ``readonly`` (Evidence ストア)。``reason`` は英語 (ファイル名と理由)。
+    """
+    state: str
+    reason: str = ""
+
+
+class DataHealthInfo(BaseModel):
+    """データ根の状態 (c_05 §0.9、起動ゲートの結果)。
+
+    ``readonly`` の間は記憶・学習・履歴・設定を保存しない (UI は入力欄に常時表示する)。
+    ``reason`` / ``warnings`` は英語 (ログと同じ文)。``g0_found`` は ``local/`` に
+    旧形式 (0.0.98 以前) のデータが残っていること (このバージョンは読まない)。
+
+    ``reembed_pending`` は埋め込みモデルが変わって再埋め込みの確認待ちのストア
+    (``episodic`` / ``semantic`` / ``corpus:<id>@<version>``)。確認
+    (``POST /api/model/reembed-confirm``) までは版の索引を読まない (c_05 §0.5.7)。
+    ``served_model_mismatch`` は llama-server が実際に載せているモデル (``/props``)
+    が config と違うこと。``served_model`` / ``expected_model`` は表示名
+    (ファイル名の stem、digest は出さない)。
+    ``degraded`` はこの起動中にチャット経路の保存に失敗した形式 (``format_id``、
+    c_05 §0.5.9)。応答は落とさずに続けているが、その形式の保存は欠けている。
+    ``formats`` は読み手が開いたときに current でなかった形式だけ (健全なら空)。
+    全件の照合はしない (``evoref doctor``)。
+    """
+    data_root: str = ""
+    readonly: bool = False
+    reason: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    g0_found: bool = False
+    reembed_pending: list[str] = Field(default_factory=list)
+    served_model_mismatch: bool = False
+    served_model: str = ""
+    expected_model: str = ""
+    degraded: list[str] = Field(default_factory=list)
+    #: 前回と違うエディションで起動した (世代印の ``last_edition``)。Free → Pro は
+    #: Pro の形式を作った、Pro → Free は Pro 専用のデータを残したまま使わない。
+    edition_switched_from: str | None = None
+    edition_switched_to: str | None = None
+    formats: dict[str, FormatHealthInfo] = Field(default_factory=dict)
+
+
 class StatusResponse(BaseModel):
     status: str = "ok"
     edition: str = "free"
@@ -157,7 +202,7 @@ class StatusResponse(BaseModel):
     version: str = _FREE_VERSION
     free_version: str = _FREE_VERSION
     pro_version: str | None = None
-    schema_version: int = _FREE_SCHEMA_VERSION
+    data_generation: int = _DATA_GENERATION
     uptime_seconds: float = 0
     llama_server: LlamaServerInfo
     model: ModelInfo | None = None
@@ -168,6 +213,7 @@ class StatusResponse(BaseModel):
     capabilities: list[CapabilityInfo] = Field(default_factory=list)
     #: 効果の死活監視で現在立っている警告 (c_07 §7.1)。空なら異常なし。
     liveness: list[LivenessAlertModel] = Field(default_factory=list)
+    data_health: DataHealthInfo = Field(default_factory=DataHealthInfo)
 
 
 # ===== Aux Model =====
@@ -372,7 +418,6 @@ class ModelDetailResponse(BaseModel):
 
 class MigrateRequest(BaseModel):
     new_model_path: str
-    try_lora: bool = False
     regenerate_context: bool = False
     dry_run: bool = False
 
@@ -405,12 +450,10 @@ class MigrationHistoryItem(BaseModel):
     from_model: str
     to_model: str
     migrated_at: str
-    lora_archived: bool
 
 
 class MigrationHistoryResponse(BaseModel):
     current_model: str
-    lora_available: bool
     history: list[MigrationHistoryItem] = Field(default_factory=list)
 
 
@@ -420,7 +463,6 @@ class RollbackRequest(BaseModel):
 
 class RollbackResponse(BaseModel):
     rolled_back_to: str
-    lora_restored: bool
 
 
 # --- Component (embedding) migration ---
@@ -454,9 +496,6 @@ class ComponentRollbackRequest(BaseModel):
 class ComponentRollbackResponse(BaseModel):
     component: str
     rolled_back_to: str
-    # base の RollbackResponse.lora_restored に相当。アーカイブされていた
-    # LoRA を実際に復元できたか。
-    lora_restored: bool = False
 
 
 class ComponentMigrationHistoryItem(BaseModel):
@@ -490,7 +529,6 @@ class ModelStateResponse(BaseModel):
     config_filename: str = ""
     config_base_model: str = ""
     config_mismatch: bool = False
-    lora_compatible: bool = True
     strict_startup_check: bool = False
     recommendation: str = ""
     # llama-server が実際にロードしているモデル (/props)。モデル移行は稼働中の

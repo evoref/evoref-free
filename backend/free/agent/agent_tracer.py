@@ -9,10 +9,10 @@
 from __future__ import annotations
 
 import time
-import uuid
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
+from backend.io.id_registry import new_id
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ class AgentTracer:
         MDP ingest (``mdp_ingester``) が STM の private ノートの残存に依らず
         当該エピソードをエピソード記憶へ昇格させないための一次情報にする。
         """
-        episode_id = f"ep_{uuid.uuid4().hex[:8]}"
+        episode_id = new_id("ep_")
         self._episodes[episode_id] = []
         self._conversation_of[episode_id] = conversation_id
 

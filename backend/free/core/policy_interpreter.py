@@ -15,7 +15,8 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from backend.io import atomic_write_text
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -38,6 +39,21 @@ _POLICY_FILES: dict[str, str] = {
     "long_form_policy.json": "long_form",
     "learning_policy.json": "learning",
 }
+
+#: PolicyParamEvolver の進化対象ドメイン。ファイルはベースモデルの model_key
+#: パーティションに置く (c_05 §0.5.12)。残りのドメインはモデル非依存で共有。
+EVOLVED_POLICY_DOMAINS: frozenset[str] = frozenset({"agent", "long_form"})
+
+#: 6 つの ``*_policy.json`` に共通の形式 (ペイロードは 1 ドメイン分の dict)。
+ROUTER_POLICIES_FORMAT = register_format(FormatSpec(
+    format_id="learning.router_policies",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<scope>/policies/<domain>_policy.json",
+    retention="one per domain; <scope> is <mk> for agent / long_form, shared for the rest",
+    export=True,
+))
 
 # 型変換関数
 _TYPE_CONVERTERS: dict[str, type] = {
@@ -144,7 +160,6 @@ def _default_policies() -> dict[str, dict]:
     """全ドメインのデフォルトポリシー定義を返す"""
     return {
         "router": {
-            "version": 1,
             "domain": "router",
             "params": {
                 "chat": {
@@ -168,7 +183,6 @@ def _default_policies() -> dict[str, dict]:
             },
         },
         "memory": {
-            "version": 1,
             "domain": "memory",
             "params": {
                 # LightMem / FadeMem の係数 (``fade_*`` / ``decay_days`` /
@@ -191,7 +205,6 @@ def _default_policies() -> dict[str, dict]:
             },
         },
         "search": {
-            "version": 1,
             "domain": "search",
             "params": {
                 "chat": {
@@ -236,7 +249,6 @@ def _default_policies() -> dict[str, dict]:
             },
         },
         "agent": {
-            "version": 1,
             "domain": "agent",
             "params": {
                 "chat": {
@@ -260,7 +272,6 @@ def _default_policies() -> dict[str, dict]:
             },
         },
         "long_form": {
-            "version": 1,
             "domain": "long_form",
             "params": {
                 "chat": {
@@ -294,7 +305,6 @@ def _default_policies() -> dict[str, dict]:
         # 実機テストで level1_min_experiences が 8 に下がらず発覚)。
         # 一致は test_policy_interpreter.py が検証する。
         "learning": {
-            "version": 1,
             "domain": "learning",
             "params": {
                 "_default": {
@@ -344,6 +354,7 @@ class PolicyInterpreter:
         self,
         policies_dir: str | Path,
         *,
+        evolved_policies_dir: str | Path | None = None,
         policy_source: PolicySource = "yaml",
         semmem_stores: list[SemanticFactStore] | None = None,
         policy_activation_min_confidence: float = 0.7,
@@ -353,7 +364,10 @@ class PolicyInterpreter:
     ):
         """
         Args:
-            policies_dir: ``local/policies/*.json`` のディレクトリ
+            policies_dir: 共有ドメインの ``*_policy.json`` のディレクトリ
+            evolved_policies_dir: 進化対象ドメイン (:data:`EVOLVED_POLICY_DOMAINS`)
+                のディレクトリ (base モデルの model_key パーティション)。省略時は
+                ``policies_dir`` と同じ
             config: config.yaml 全体。``_CONFIG_SEEDED_KEYS`` の初回生成 seed と、
                 既存ファイルが config と食い違うときの INFO ログに使う
             policy_source: ``yaml`` (従来動作) / ``hybrid`` (YAML seed +
@@ -373,10 +387,16 @@ class PolicyInterpreter:
                 記録する。``evolve`` レベル限定で実発火、それ以外は no-op。
         """
         self._policies_dir = Path(policies_dir)
+        self._evolved_dir = (
+            Path(evolved_policies_dir) if evolved_policies_dir is not None
+            else self._policies_dir
+        )
         self._lock = threading.Lock()
 
         # ドメイン → { params: {mode: {key: value}}, constraints: {...}, ... }
         self._data: dict[str, dict] = {}
+        # ドメイン → 版付きファイル (読み取りの分類 = readonly を save まで持ち越す)
+        self._files: dict[str, VersionedPayloadFile] = {}
 
         # ロールバック用スナップショット: (domain, mode) → params snapshot
         self._snapshots: dict[tuple[str, str], dict] = {}
@@ -411,6 +431,22 @@ class PolicyInterpreter:
         """
         with self._lock:
             self._base_model_id = base_model_id or ""
+            if self._policy_source != "yaml":
+                self._apply_semmem_overrides()
+
+    def rebind_partition(self, evolved_policies_dir: str | Path, base_model_id: str) -> None:
+        """ランタイムの base モデル切替: 進化対象ポリシーの置き場とスラグを差し替えて読み直す。
+
+        ``backend.factory._learning_rebind.rebind_base_learning`` が呼ぶ。ファイルを
+        読み直してから新モデルの SemMem override を当てる (前モデルの override を
+        残さない)。
+        """
+        with self._lock:
+            self._evolved_dir = Path(evolved_policies_dir)
+            self._base_model_id = base_model_id or ""
+            self._files.clear()
+            self._snapshots.clear()
+            self._load_all()
             if self._policy_source != "yaml":
                 self._apply_semmem_overrides()
 
@@ -821,34 +857,50 @@ class PolicyInterpreter:
     def save(self) -> None:
         """全ポリシーをファイルに保存する"""
         self._policies_dir.mkdir(parents=True, exist_ok=True)
+        self._evolved_dir.mkdir(parents=True, exist_ok=True)
 
         with self._lock:
             for filename, domain in _POLICY_FILES.items():
                 if domain not in self._data:
                     continue
-                path = self._policies_dir / filename
-                atomic_write_text(
-                    path,
-                    json.dumps(self._data[domain], ensure_ascii=False, indent=2),
-                )
+                f = self._files.get(domain) or self._policy_file(filename, domain)
+                f.payload = self._data[domain]
+                f.save()
 
         logger.info("Policies saved to %s", self._policies_dir)
 
+    def _policy_file(self, filename: str, domain: str) -> VersionedPayloadFile:
+        directory = self._evolved_dir if domain in EVOLVED_POLICY_DOMAINS else self._policies_dir
+        f = VersionedPayloadFile(
+            ROUTER_POLICIES_FORMAT, directory / filename,
+            component="PolicyInterpreter", state_logger=logger,
+        )
+        # 書き込みの失敗は従来どおり送出する (readonly の見送りは WARNING のみ)。
+        f.RAISE_ON_SAVE_ERROR = True
+        return f
+
     def _load_all(self) -> None:
-        """全ポリシーファイルを読み込む（存在しない場合はデフォルト生成）"""
+        """全ポリシーファイルを読み込む（存在しない場合はデフォルト生成）
+
+        G1 の封筒でない / 版が新しいファイルは読まずに既定値で動き、上書きもしない
+        (その domain の :meth:`save` は見送られる)。壊れたファイルは退避して既定値を書く。
+        """
         defaults = _default_policies()
         _seed_defaults_from_config(defaults, self._config)
         self._policies_dir.mkdir(parents=True, exist_ok=True)
+        self._evolved_dir.mkdir(parents=True, exist_ok=True)
 
         for filename, domain in _POLICY_FILES.items():
-            path = self._policies_dir / filename
-            if path.exists():
+            f = self._policy_file(filename, domain)
+            self._files[domain] = f
+            path = f.path
+            if f.load():
                 try:
-                    with open(path, encoding="utf-8") as f:
-                        data = json.load(f)
+                    if not isinstance(f.payload, dict):
+                        raise TypeError(f"expected a JSON object, got {type(f.payload).__name__}")
                     # デフォルトとマージ（新しいキーの追加に対応）
                     self._data[domain] = self._merge_with_defaults(
-                        data, defaults.get(domain, {}),
+                        f.payload, defaults.get(domain, {}),
                     )
                     # 既に壊れた状態で保存されているファイルは apply_delta を
                     # 通らないので、読込時にも順序不変則を掛ける。
@@ -865,21 +917,21 @@ class PolicyInterpreter:
                             )
                     logger.debug("Loaded policy: %s", path)
                     self._log_config_divergence(domain, defaults.get(domain, {}))
-                except (json.JSONDecodeError, OSError) as e:
+                except (TypeError, AttributeError) as e:
                     logger.warning(
                         "Failed to load %s, using defaults: %s", path, e,
                     )
                     self._data[domain] = copy.deepcopy(defaults[domain])
-            else:
-                # デフォルトで生成
+            elif f.readonly:
                 self._data[domain] = copy.deepcopy(defaults[domain])
+            else:
+                # デフォルトで生成 (無い / 壊れていて退避した)
+                self._data[domain] = copy.deepcopy(defaults[domain])
+                f.payload = self._data[domain]
                 try:
-                    atomic_write_text(
-                        path,
-                        json.dumps(self._data[domain], ensure_ascii=False, indent=2),
-                    )
-                    logger.info("Created default policy: %s", path)
-                except OSError as e:
+                    if f.save():
+                        logger.info("Created default policy: %s", path)
+                except (OSError, TypeError, ValueError) as e:
                     logger.warning("Failed to write default policy %s: %s", path, e)
 
     def _log_config_divergence(self, domain: str, seeded_defaults: dict) -> None:

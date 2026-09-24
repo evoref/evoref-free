@@ -11,6 +11,7 @@ import asyncio
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.config_loader import _find_project_root, _setup_encoding
 from backend.free.cli.renderer import (
     create_console,
@@ -89,7 +90,7 @@ async def _run_reindex_async(args: argparse.Namespace) -> int:
     console = create_console()
     backend_url = args.backend_url.rstrip("/")
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+    async with httpx.AsyncClient(headers=backend_headers(), timeout=_TIMEOUT) as client:
         # 1. dry-run でターゲット件数を取得
         try:
             params = {"dry_run": "true"}

@@ -28,11 +28,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from backend.free.agent.prompt_utils import PROTECTED_CLOSE, PROTECTED_OPEN
-from backend.io import atomic_write_text
+from backend.io.codec import codec_for, decode_skipping, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
 from backend.free.core.script_ranges import (
@@ -41,8 +44,6 @@ from backend.free.core.script_ranges import (
 )
 
 logger = get_logger("agent.prompt_ledger")
-
-LEDGER_SCHEMA_VERSION = 1
 
 #: レンダで **衝突の優先規則** を足すときの定型文 (locale 別)。
 _OVERRIDE_NOTES: dict[str, str] = {
@@ -53,6 +54,7 @@ _OVERRIDE_NOTES: dict[str, str] = {
 _WS_RE = re.compile(r"\s+")
 
 
+@persisted()
 @dataclass
 class Rule:
     """台帳の 1 項目。計数 (helpful / harmful / last_fired) はレンダに出ない。"""
@@ -69,16 +71,17 @@ class Rule:
     helpful: int = 0
     harmful: int = 0
     last_fired: str = ""
+    _extra: dict[str, Any] | None = None
 
 
 @dataclass
 class Ledger:
-    """1 モードぶんの台帳。"""
+    """1 モードぶんの台帳。``_extra`` はファイルのトップの未知キー (書き戻しで戻す)。"""
 
     mode: str
     locale: str
     rules: list[Rule] = field(default_factory=list)
-    schema_version: int = LEDGER_SCHEMA_VERSION
+    _extra: dict[str, Any] | None = None
 
     def by_id(self, rule_id: str) -> Rule | None:
         for rule in self.rules:
@@ -93,6 +96,32 @@ class Ledger:
             for r in self.rules
         ]
         return hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()[:12]
+
+
+@persisted()
+@dataclass
+class LedgerFile:
+    """``{mode}.rules.json`` のペイロード (``rules_hash`` は書くときに台帳から作る)。"""
+
+    mode: str
+    locale: str = "ja"
+    rules_hash: str = ""
+    rules: list[Rule] = field(default_factory=list)
+    _extra: dict[str, Any] | None = None
+
+
+#: ``{mode}.rules.json`` の形式。版は封筒の ``format_version`` が持つ
+#: (旧ペイロードの ``schema_version`` は読み手が無く、封筒へ置き換えた)。
+LEDGER_FORMAT = register_format(FormatSpec(
+    format_id="learning.rules",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/<mode>.rules.json",
+    retention="one per mode",
+    export=True,
+    records=(LedgerFile,),
+))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -177,7 +206,10 @@ def parse_markdown(
         # 見出しの外の平文 (冒頭の方針文など)
         intro_lines.append(stripped)
     flush_intro()
-    return Ledger(mode=mode, locale=locale, rules=rules)
+    return Ledger(
+        mode=mode, locale=locale, rules=rules,
+        _extra=existing._extra if existing is not None else None,
+    )
 
 
 def _make_rule(
@@ -192,6 +224,7 @@ def _make_rule(
             protected=protected, verifier=prior.verifier,
             overrides=list(prior.overrides), source_incident=prior.source_incident,
             helpful=prior.helpful, harmful=prior.harmful, last_fired=prior.last_fired,
+            _extra=prior._extra,
         )
     return Rule(
         id=mint_id(category, text, kind), category=category, text=text,
@@ -377,15 +410,16 @@ def sync_protected(ledger: Ledger, default: Ledger) -> Ledger:
         if not r.protected:
             continue
         prior = counts.get(r.id)
-        rule = Rule(**asdict(r))
+        rule = replace(r, overrides=list(r.overrides))
         if prior is not None:
             rule.helpful, rule.harmful, rule.last_fired = prior.helpful, prior.harmful, prior.last_fired
             rule.verifier = rule.verifier or prior.verifier
+            rule._extra = prior._extra
         synced.append(rule)
     others = [r for r in ledger.rules if not r.protected]
     # 元の位置関係 (title / intro → 非 protected → protected) は render 側が
     # 決めるので、ここでは単に連結する。
-    return Ledger(mode=ledger.mode, locale=ledger.locale, rules=others + synced)
+    return Ledger(mode=ledger.mode, locale=ledger.locale, rules=others + synced, _extra=ledger._extra)
 
 
 def record_rule_outcome(ledger: Ledger, violated_ids: set[str], *, fired_at: str) -> None:
@@ -412,32 +446,52 @@ def ledger_path(prompt_dir: Path, mode: str) -> Path:
     return prompt_dir / f"{mode}.rules.json"
 
 
+def _decode_ledger(payload: Any) -> Ledger:
+    """ペイロードを台帳にする。読めない規則はそれだけ飛ばして数える (c_05 §0.5.2)。"""
+    data, skipped = decode_skipping(LedgerFile, payload, each=("rules",))
+    if skipped:
+        logger.warning("Skipped %d unreadable rule(s) in the %s ledger", skipped, data.mode)
+    return Ledger(mode=data.mode, locale=data.locale, rules=data.rules, _extra=data._extra)
+
+
+def _encode_ledger(ledger: Ledger) -> dict[str, Any]:
+    return codec_for(LedgerFile).encode(LedgerFile(
+        mode=ledger.mode, locale=ledger.locale, rules_hash=ledger.content_hash(),
+        rules=ledger.rules, _extra=ledger._extra,
+    ))
+
+
+def _ledger_file(prompt_dir: Path, mode: str) -> VersionedPayloadFile:
+    """型の合わない台帳は読み込みで退避する (SoT)。"""
+    return VersionedPayloadFile(
+        LEDGER_FORMAT, ledger_path(prompt_dir, mode),
+        component="prompt_ledger", state_logger=logger,
+        decode=_decode_ledger, encode=_encode_ledger,
+    )
+
+
 def load_ledger(prompt_dir: Path, mode: str) -> Ledger | None:
-    path = ledger_path(prompt_dir, mode)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        rules = [Rule(**{k: v for k, v in r.items() if k in Rule.__dataclass_fields__}) for r in data.get("rules", [])]
-        return Ledger(
-            mode=data.get("mode", mode), locale=data.get("locale", "ja"),
-            rules=rules, schema_version=int(data.get("schema_version", 1)),
-        )
-    except (OSError, ValueError, TypeError) as e:
-        logger.warning("Failed to load rules ledger %s: %s", path, e)
-        return None
+    """台帳を読む。無い / 読めない (G1 の封筒でない・版が新しい・壊れている) なら ``None``。
+
+    読めない規則はその規則だけ飛ばして数える (c_05 §0.5.2)。
+    """
+    f = _ledger_file(prompt_dir, mode)
+    return f.payload if f.load() else None
 
 
 def save_ledger(prompt_dir: Path, ledger: Ledger) -> None:
+    """台帳を書く。ディスク上のファイルが G1 の封筒でない / 版が新しいなら上書きしない。
+
+    書き込みの失敗は従来どおり送出する。データ根が readonly なら書かない
+    (チャット経路から呼ばれるので、拒否でチャットの応答を落とさない、c_05 §0.4.2)。
+    """
+    from backend.io.readonly import is_readonly
+
+    if is_readonly():
+        return
     prompt_dir.mkdir(parents=True, exist_ok=True)
-    data = {
-        "schema_version": ledger.schema_version,
-        "mode": ledger.mode,
-        "locale": ledger.locale,
-        "rules_hash": ledger.content_hash(),
-        "rules": [asdict(r) for r in ledger.rules],
-    }
-    atomic_write_text(
-        ledger_path(prompt_dir, ledger.mode),
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
+    f = _ledger_file(prompt_dir, ledger.mode)
+    f.RAISE_ON_SAVE_ERROR = True
+    f.load()
+    f.payload = ledger
+    f.save()

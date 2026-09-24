@@ -9,16 +9,17 @@
 
 コスト標本の入手経路は 2 つ:
 
-1. ``local/learning/<model>/experience.json`` の ``prompt_tokens`` /
+1. ``<data_root>/store/learning/<model>/experience.jsonl`` の ``prompt_tokens`` /
    ``cached_prompt_tokens`` (2026-08-18 に配線)。本命だが、配線以降に蓄積した
    ぶんしか無い。
-2. ``local/logs/llama-base.stderr.log`` の ``slot print_timing``。配線以前の
+2. ``<data_root>/logs/llama-base.stderr.log`` の ``slot print_timing``。配線以前の
    履歴からも再プリフィル率を復元できる。1 が足りないときの代替。
 
 使い方::
 
     python scripts/calibrate_cost_weight.py
     python scripts/calibrate_cost_weight.py --experience <path> --llama-log <path>
+    python scripts/calibrate_cost_weight.py --data-root <path>
 
 ``COST_WEIGHT`` を変更したら ``FITNESS_SCHEMA_VERSION`` も上げること
 (旧尺度の best_fitness が更新不能な基準として残るため)。
@@ -28,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import re
 import statistics
 import sys
@@ -36,6 +36,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from backend.config import PathResolver  # noqa: E402
+from backend.data_root import resolve_data_root  # noqa: E402
 from backend.free.learning.policy_evolver import (  # noqa: E402
     COST_WEIGHT,
     EVOLVABLE_DOMAINS,
@@ -155,9 +157,13 @@ def _fmt(res: tuple[float, int] | None) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--experience", type=Path, help="experience.json のパス")
+    ap.add_argument("--experience", type=Path, help="experience.jsonl のパス")
     ap.add_argument("--llama-log", type=Path, help="llama-base.stderr.log のパス")
     ap.add_argument("--mode", default="chat", help="対象モード (既定 chat)")
+    ap.add_argument(
+        "--data-root", default=None,
+        help="既定パスを引くデータ根 (既定: EVOREF_DATA_ROOT → <repo>/userdata)",
+    )
     ap.add_argument(
         "--chat-slot", type=int, default=0,
         help="チャット側の llama スロット ID (既定 0)。背景タスクと分離する",
@@ -165,11 +171,13 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
+    resolver = PathResolver({}, root, data_root=resolve_data_root(args.data_root, root=root))
     exp_path = args.experience
     if exp_path is None:
-        found = sorted((root / "local" / "learning").glob("*/experience.json"))
-        exp_path = found[0] if found else root / "local" / "experience.json"
-    log_path = args.llama_log or root / "local" / "logs" / "llama-base.stderr.log"
+        # model_key パーティションの経験バッファ (無ければ既定の base モデルの置き場)。
+        found = sorted(resolver.resolve_local("learning_dir").glob("*/experience.jsonl"))
+        exp_path = found[0] if found else resolver.resolve_learning("experience_file")
+    log_path = args.llama_log or resolver.resolve_local("logs_dir") / "llama-base.stderr.log"
 
     print(f"experience : {exp_path}")
     print(f"llama log  : {log_path}")
@@ -178,8 +186,10 @@ def main() -> int:
 
     experiences: list[dict] = []
     if exp_path.exists():
+        from backend.free.learning.level0_instant import fold_experience_file
+
         experiences = [
-            e for e in json.loads(exp_path.read_text(encoding="utf-8"))
+            e for e in fold_experience_file(exp_path)[0]
             if e.get("mode") == args.mode
         ]
     print(f"経験 ({args.mode}): {len(experiences)} 件")

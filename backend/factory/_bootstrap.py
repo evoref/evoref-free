@@ -5,7 +5,7 @@
 - :func:`_init_config`     : config.yaml 読込み + Pydantic バリデーション
 - :func:`_init_logging`    : log_config + DebugLogger 初期化
 - :func:`_init_i18n`       : i18n locale / fallback 設定
-- :func:`_init_local_dirs` : local 配下のディレクトリ作成 + PolicyInterpreter 構築
+- :func:`_init_local_dirs` : データ根のディレクトリ作成 + PolicyInterpreter 構築
 
 純粋な move であり、関数本体・引数・default 値は変更していない。
 """
@@ -113,14 +113,20 @@ def _init_logging(state: AppState, cfg: dict[str, Any], project_root: Path) -> "
     """2. ログ設定 + 2b. DebugLogger 初期化"""
     develop_level = _resolve_develop_level()
     state.develop_level = develop_level  # type: ignore[assignment]
-    state.learning_disabled = _resolve_learning_disabled()
-    if state.learning_disabled:
+    state.learning_disabled = _resolve_learning_disabled() or state.data_readonly_reason is not None
+    if state.data_readonly_reason is not None:
+        logger.warning(
+            "Data root is read-only (%s): learning, sleep-time and every write to "
+            "store/ are stopped; chat keeps working",
+            state.data_readonly_reason,
+        )
+    elif state.learning_disabled:
         logger.info(
             "Self-learning disabled by --no-learning flag "
             "(Level 0/1/2 + Pro learn injection are no-op; reads continue)",
         )
 
-    # Pro 同梱時のみ data isolation 等の overrides を適用
+    # Pro 同梱時のみ develop モードの overrides を適用 (データ分離は別のデータ根で行う)
     if develop_level != "off":
         try:
             from backend.pro.develop_mode import apply_develop_overrides  # type: ignore[import-not-found]
@@ -157,12 +163,18 @@ def _init_i18n(cfg: dict[str, Any]) -> None:
 
 
 def _init_local_dirs(
-    state: AppState, project_root: Path, cfg: dict[str, Any] | None = None,
+    state: AppState, project_root: Path, cfg: dict[str, Any] | None = None,  # noqa: ARG001
 ) -> tuple[Any, "PolicyInterpreter"]:
-    """4. ローカルディレクトリ作成 + 4b. PolicyInterpreter 初期化"""
+    """4. データ根のディレクトリ作成 + 4b. PolicyInterpreter 初期化"""
     resolver = get_path_resolver()
     resolver.ensure_local_dirs()
     logger.info("Local directories ensured")
+
+    # model_key の計算結果を model_registry (derived) に残す。以降の配線
+    # (ポリシー・補助タスクの較正・埋め込み・学習パーティション) が引く (c_05 §0.5.7)。
+    from backend.model_key import use_model_registry
+
+    use_model_registry(resolver.resolve_local("model_registry_file"))
 
     # 4b. PolicyInterpreter 初期化
     # learning.policy.source を反映。SemMem ストアは
@@ -174,9 +186,11 @@ def _init_local_dirs(
     policy_source = learning_policy_cfg.get("source", "yaml")
     min_conf = float(learning_policy_cfg.get("activation_min_confidence", 0.7))
 
-    policies_dir = project_root / "local" / "policies"
+    policies_dir = resolver.resolve_local("policies_dir")
     policy_interpreter = PolicyInterpreter(
         policies_dir,
+        # 進化対象ドメインは base モデルの model_key パーティション (c_05 §0.5.12)
+        evolved_policies_dir=resolver.resolve_learning("evolved_policies_dir"),
         policy_source=policy_source,
         policy_activation_min_confidence=min_conf,
         debug_logger=state.debug_logger,

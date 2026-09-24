@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import shutil
 from collections.abc import Callable, Sequence
@@ -21,10 +20,11 @@ from backend.free.rag.corpus.language import ImportRule
 from backend.free.rag.corpus.package import (
     PackageError,
     PackageMeta,
-    meta_from_record,
+    read_package_meta,
     write_package_meta,
 )
 from backend.free.rag.corpus.store import PACKAGES_DIR, CorpusManifest, LanguageOverlay
+from backend.free.rag.evidence.snapshot_build import ConstantShardKey
 from backend.free.rag.evidence.store import EvidenceStore
 from backend.free.rag.evidence.types import Evidence
 from backend.free.rag.projectmap import graph_io
@@ -280,10 +280,8 @@ class ProjectMapBuilder:
         丸めない — 丸めると文字列版が常に ``None`` に落ち、パック無しに戻った
         版との比較で誤って毎回全再抽出になる。
         """
-        path = self._package_dir(version) / "package.json"
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            meta = meta_from_record(data)
+            meta = read_package_meta(self._package_dir(version))
         except (OSError, ValueError, PackageError):
             return None
         value = meta._extra.get("extractor_version")
@@ -545,7 +543,7 @@ class ProjectMapBuilder:
         store = EvidenceStore(
             directory, store_name="corpus", embedding_backend=None,
             rag_config=self.rag_config, by="projectmap_builder",
-            shard_key_for=lambda _record, key=self.package_id: key,
+            shard_key_for=ConstantShardKey(self.package_id),
         )
         store.load()
         fan_in, fan_out = self._fan_counts(graph)

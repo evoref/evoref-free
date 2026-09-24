@@ -11,7 +11,6 @@ import { request } from './_client';
 
 export interface BaseMigrateRequest {
 	new_model_path: string;
-	try_lora?: boolean;
 	regenerate_context?: boolean;
 	dry_run?: boolean;
 }
@@ -37,7 +36,6 @@ export interface BaseMigrateResponse {
 
 export interface BaseRollbackResponse {
 	rolled_back_to: string;
-	lora_restored: boolean;
 }
 
 export interface ReloadResponse {
@@ -125,6 +123,19 @@ export async function rollbackComponent(
 		`/model/${component}/rollback`,
 		target_model ? { target_model } : {}
 	);
+}
+
+// ── 埋め込みモデル変更の確認 (docs/c_05 §0.5.7) ──
+
+/** 再埋め込みの確認レスポンス */
+export interface ReembedConfirmResponse {
+	/** 確認して裏で埋め直しを始めたストア */
+	confirmed: string[];
+}
+
+/** 埋め込みモデルの変更を確認し、確認待ちのストアを現在のモデルで埋め直す */
+export async function confirmReembed(): Promise<ReembedConfirmResponse> {
+	return request<ReembedConfirmResponse>('POST', '/model/reembed-confirm');
 }
 
 // ── SemMem fact 再 embed ──

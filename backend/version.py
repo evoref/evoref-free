@@ -4,7 +4,8 @@ Free / Pro のバージョンを独立して管理するためのヘルパー。
 
 - `backend/free/__version__.py` は必須 (Free 配布物に必ず含まれる)
 - `backend/pro/__version__.py` は Pro 配布のみ存在
-- `__schema_version__` は Free / Pro 共通のデータ互換性軸
+- データ世代は共有形式の ``DATA_GENERATION`` (Free) と Pro 専用形式の
+  ``PRO_DATA_GENERATION`` (Pro) の 2 本 (リリース用の定数、ディスクには持たない)
 
 `backend.edition` の `pro_available()` と協調し、Pro 未同梱の Free 配布でも
 安全に動作する。
@@ -23,8 +24,8 @@ from backend.edition import (
     pro_available,
 )
 from backend.free.__version__ import (
+    DATA_GENERATION,
     __build__ as FREE_BUILD,
-    __schema_version__ as SCHEMA_VERSION,
     __version__ as FREE_VERSION,
 )
 
@@ -36,7 +37,8 @@ class VersionInfo:
     Attributes:
         free: Free 配布のバージョン文字列
         pro: Pro 配布のバージョン文字列 (未同梱時 None)
-        schema: データ互換性軸 (Free / Pro 共通)
+        generation: 共有形式のデータ世代 (``DATA_GENERATION``)
+        pro_generation: Pro 専用形式のデータ世代 (未同梱時 None)
         edition: 現在の実行エディション ("free" | "pro" | "develop")
         free_build: Free のビルド識別子 (任意)
         pro_build: Pro のビルド識別子 (未同梱時 None)
@@ -44,7 +46,8 @@ class VersionInfo:
 
     free: str
     pro: str | None
-    schema: int
+    generation: int
+    pro_generation: int | None
     edition: str
     free_build: str
     pro_build: str | None
@@ -72,14 +75,17 @@ def get_version_info() -> VersionInfo:
 
     pro_ver: str | None = None
     pro_build: str | None = None
+    pro_generation: int | None = None
     if cur >= Edition.PRO and pro_available():
         try:
             from backend.pro.__version__ import (  # type: ignore[import-not-found]
+                PRO_DATA_GENERATION as _PRO_GENERATION,
                 __build__ as _PRO_BUILD,
                 __version__ as _PRO_VERSION,
             )
             pro_ver = _PRO_VERSION
             pro_build = _PRO_BUILD
+            pro_generation = _PRO_GENERATION
         except Exception:
             pro_ver = None
             pro_build = None
@@ -87,7 +93,8 @@ def get_version_info() -> VersionInfo:
     return VersionInfo(
         free=FREE_VERSION,
         pro=pro_ver,
-        schema=SCHEMA_VERSION,
+        generation=DATA_GENERATION,
+        pro_generation=pro_generation,
         edition=cur.name.lower(),
         free_build=FREE_BUILD,
         pro_build=pro_build,

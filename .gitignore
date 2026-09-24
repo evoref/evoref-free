@@ -11,14 +11,12 @@ models/*
 # arch 別プロファイル (models/profiles/<arch>.yaml) は同梱ベースとして tracked
 !models/profiles/
 
-# Local data (PC-specific, not shared)
-# EvorefMem トリガ辞書の user override (local/triggers/*.yaml) もここに含まれる。
-# 同梱 default は backend/free/memory/_defaults/triggers/ 配下で tracked。
-# ディレクトリ構造のみ保持するため .gitkeep のみ git 管理する。
-local/**
-!local/
-!local/**/
-!local/**/.gitkeep
+# User data (PC-specific, not shared): データ根 (c_05 §0.2)。
+# userdata-isolated/ は --isolate-data の別根。どちらも丸ごと git 管理外。
+userdata/
+userdata-isolated/
+# 0.0.98 以前 (G0) のデータ置き場。G1 は開かない・動かさない・消さない (c_05 §0.3)。
+local/
 # 相対パス解決が cwd=backend/ で起きた際に生成される迷子データの保険。
 backend/local/
 

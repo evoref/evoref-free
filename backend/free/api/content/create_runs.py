@@ -16,15 +16,15 @@ from fastapi import APIRouter, HTTPException, Path, Query
 
 from backend.config import get_path_resolver
 from backend.error_handlers import ErrorResponse
-from backend.free.loop.staged.run_record import RunRecord
+from backend.free.loop.staged.run_record import RUN_ID_PATTERN, RunRecord
 from backend.log_config import get_logger
 
 logger = get_logger("api.create_runs")
 
 router = APIRouter(prefix="/api/create/runs", tags=["create"])
 
-#: run_id (= workspace_id) の形式。traversal 防止のため FastAPI 側でも検証する。
-_RUN_ID_PATTERN = r"^[0-9a-f]{12}$"
+#: run_id (= workspace_id) の形式 (ID 台帳の ``run_``)。traversal 防止のため FastAPI 側でも検証する。
+_RUN_ID_PATTERN = RUN_ID_PATTERN
 
 
 def _create_runs_error(status_code: int, code: str, message: str, i18n_key: str, **context: Any) -> HTTPException:

@@ -28,7 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import JsonPayload, VersionedJsonFile
 from backend.log_config import get_logger
 from backend.utils import format_utc, utc_now_dt
 
@@ -75,14 +76,25 @@ def _stalled_after(stage: str) -> int:
     return STALLED_AFTER
 
 
-class LivenessLedger(JsonStateStore):
+LIVENESS_FORMAT = register_format(FormatSpec(
+    format_id="liveness",
+    version=1,
+    klass="volatile",
+    writers=frozenset({"free"}),
+    path_key="logs/liveness.json",
+    retention="rewritten in place",
+    export=False,
+))
+
+
+class LivenessLedger(VersionedJsonFile):
     """段ごとの到達・効果・失敗・判定の台帳。
 
     段の記録は素の dict で持つ — 読めないキーも捨てずに次の保存へ書き戻す
     (c_05 §0.5: 未知キーを黙って落とさない)。
     """
 
-    SCHEMA_VERSION = 1
+    FORMAT = LIVENESS_FORMAT
     _state_logger = logger
 
     def __init__(
@@ -204,7 +216,7 @@ class LivenessLedger(JsonStateStore):
             return
         with self._lock:
             rec = self._stage(stage)
-            window = str(rec.get("bands", "")) + code
+            window = str(rec.get("bands") or "") + code
             rec["bands"] = window[-GATE_WINDOW:]
             labels = list(rec.get("labels") or []) + [str(label)]
             rec["labels"] = labels[-GATE_WINDOW:]
@@ -289,7 +301,7 @@ def _alerts_for(stage: str, rec: Mapping[str, Any]) -> list[LivenessAlert]:
     missed = int(rec.get("missed_streak", 0))
     if missed >= STARVED_AFTER:
         out.append(LivenessAlert(
-            stage, "starved", str(rec.get("missed_since", "")),
+            stage, "starved", str(rec.get("missed_since") or ""),
             f"not reached in the last {missed} cycles "
             f"(last reached {rec.get('last_reached_at', 'never')})",
         ))
@@ -297,7 +309,7 @@ def _alerts_for(stage: str, rec: Mapping[str, Any]) -> list[LivenessAlert]:
     zero = int(rec.get("zero_effect_streak", 0))
     if zero >= _stalled_after(stage):
         out.append(LivenessAlert(
-            stage, "stalled", str(rec.get("zero_effect_since", "")),
+            stage, "stalled", str(rec.get("zero_effect_since") or ""),
             f"no effect in {zero} consecutive runs with input "
             f"(last input {rec.get('last_input', '?')}, "
             f"last effect {rec.get('last_effect_at', 'never')}"
@@ -309,14 +321,14 @@ def _alerts_for(stage: str, rec: Mapping[str, Any]) -> list[LivenessAlert]:
     if errors >= FAILING_AFTER:
         last = rec.get("last_error") or {}
         out.append(LivenessAlert(
-            stage, "failing", str(rec.get("error_since", "")),
+            stage, "failing", str(rec.get("error_since") or ""),
             f"{errors} consecutive failures "
             f"(last: {last.get('code', '?')}, {last.get('class', '?')})",
         ))
 
     labels = rec.get("labels") or []
     if len(labels) >= GATE_MIN_DECISIONS and len(set(labels)) == 1:
-        bands = str(rec.get("bands", ""))
+        bands = str(rec.get("bands") or "")
         out.append(LivenessAlert(
             stage, "degenerate", "",
             f"always '{labels[0]}' in the last {len(labels)} decisions "
@@ -325,7 +337,7 @@ def _alerts_for(stage: str, rec: Mapping[str, Any]) -> list[LivenessAlert]:
 
     if rec.get("emptied_at"):
         out.append(LivenessAlert(
-            stage, "emptied", str(rec.get("emptied_at", "")),
+            stage, "emptied", str(rec.get("emptied_at") or ""),
             f"record count dropped from {rec.get('emptied_from', '?')} to 0",
         ))
     return out

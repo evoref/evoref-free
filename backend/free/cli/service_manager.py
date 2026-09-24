@@ -15,8 +15,9 @@ from pathlib import Path
 import httpx
 import yaml
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.config_loader import _find_project_root
-from backend.free.cli.develop_mode_setup import setup_develop_mode
+from backend.free.cli.develop_mode_setup import add_data_root_flag, setup_develop_mode
 from backend.free.cli.edition_validator import validate_edition_arg
 from backend.free.cli.pid_manager import (
     _run_windows_console_command,
@@ -39,6 +40,7 @@ from backend.free.cli.startup_checks import (
     run_serve_checks,
     validate_config,
 )
+from backend.config import resolve_data_path
 from backend.error_handlers import E6003
 from backend.i18n_helper import init_i18n, msg
 from backend.log_config import get_logger
@@ -69,7 +71,7 @@ class AutoServeState:
 
 def _open_stderr_log(project_root: Path, name: str):
     """サブプロセスの stderr をキャプチャするログファイルを開く"""
-    log_dir = project_root / "local" / "logs"
+    log_dir = resolve_data_path("logs_dir", project_root)
     log_dir.mkdir(parents=True, exist_ok=True)
     return open(log_dir / f"{name}.stderr.log", "w", encoding="utf-8")
 
@@ -95,8 +97,8 @@ def _build_serve_parser() -> argparse.ArgumentParser:
         description="Start llama-server and FastAPI backend",
     )
     parser.add_argument(
-        "--host", default="0.0.0.0",
-        help="Backend bind host (default: 0.0.0.0)",
+        "--host", default="127.0.0.1",
+        help="Backend bind host (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port", default=8000, type=int,
@@ -123,6 +125,7 @@ def _build_serve_parser() -> argparse.ArgumentParser:
             "Useful with --develop=evolve to observe initial behavior."
         ),
     )
+    add_data_root_flag(parser)
     _add_develop_flag(parser)
     return parser
 
@@ -396,7 +399,7 @@ def _monitor_serve_processes(
                     _show_stderr_tail(console, project_root, "backend")
                     render_info(
                         console,
-                        msg("cli.hint_check_stderr", path=str(project_root / "local" / "logs")),
+                        msg("cli.hint_check_stderr", path=str(resolve_data_path("logs_dir", project_root))),
                     )
                     cleanup()
                     return 1
@@ -412,6 +415,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     フェーズごとに 11 個のヘルパー関数へ責務を分割している:
         1. `_setup_develop_mode` (--develop / --isolate-data 検証)
         2. `_handle_pid_collision` (既存 PID チェック / --force kill)
+           + `normalize_before_start` (版の無い config.yaml を一度だけ直す)
         3. `_resolve_startup_config` (config 読込 + 前提チェック + ポート競合)
         4. `_validate_edition_arg` (--edition + --develop 整合性)
         5. `acquire_pid` + `_make_serve_cleanup` + signal ハンドラ登録
@@ -429,6 +433,12 @@ def _run_serve(args: argparse.Namespace) -> int:
     force = getattr(args, "force", False)
 
     if (rc := _handle_pid_collision(project_root, console, force)) is not None:
+        return rc
+
+    # 版の無い (G0 の) config.yaml は起動前に一度だけ直す (c_05 §7.6)。
+    from backend.free.cli.config_command import normalize_before_start
+
+    if (rc := normalize_before_start(project_root, console)) is not None:
         return rc
 
     config = _resolve_startup_config(project_root, args, console, force)
@@ -471,7 +481,7 @@ def _run_serve(args: argparse.Namespace) -> int:
 
 def _show_stderr_tail(console, project_root: Path, name: str, lines: int = 10) -> None:
     """stderr ログファイルの末尾を表示して障害診断を支援"""
-    log_file = project_root / "local" / "logs" / f"{name}.stderr.log"
+    log_file = resolve_data_path("logs_dir", project_root) / f"{name}.stderr.log"
     if not log_file.exists():
         return
     try:
@@ -516,22 +526,19 @@ def _load_config(project_root: Path) -> dict:
 def _build_llama_cmd(project_root: Path, cfg: dict | None = None) -> list[str]:
     """config.yaml から llama-server 起動コマンドを構築
 
-    学習済み base LoRA は ``local/learning/<model>/[<mode>/]models/adapter.gguf``
-    に置かれるため、``build_llama_cmd`` 内の flat フォールバック
-    (``local_paths.lora_adapter``) では拾えない。CLI プロセスにはグローバル
-    ``PathResolver`` の active stem が無いので、cfg だけで解決できる
-    ``resolve_base_lora_for_launch`` を経由する (起動時モードは既定の "chat")。
+    学習済みアダプタ (Pro) は ``adapters_for_launch`` から得る (起動時モードは
+    既定の "chat"、Free では無し)。
     """
-    from backend.config import resolve_base_lora_for_launch
+    from backend.free.core.launch_adapters import adapters_for_launch
     from scripts.launch_llama import build_llama_cmd
 
     if cfg is None:
         cfg = _load_config(project_root)
-    lora_override, lora_fallback = resolve_base_lora_for_launch(cfg, project_root)
+    adapters = adapters_for_launch(cfg, project_root, "chat")
     return build_llama_cmd(
         cfg, project_root,
-        lora_override=lora_override,
-        lora_fallback=lora_fallback,
+        lora_override=adapters.lora,
+        control_vector_override=adapters.control_vector,
     )
 
 
@@ -808,7 +815,7 @@ def _spawn_all_servers(
 async def _check_llama_health(llama_url: str) -> bool:
     """llama-server に直接ヘルスチェック"""
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             resp = await client.get(f"{llama_url}/health", timeout=3.0)
             healthy = resp.status_code == 200
             logger.debug("llama-server direct health check: %s → %s", llama_url, healthy)
@@ -822,7 +829,7 @@ async def _check_backend(url: str) -> bool:
     """バックエンド接続確認"""
     logger.debug("Checking backend at %s/api/health", url)
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             resp = await client.get(f"{url}/api/health", timeout=5.0)
             logger.debug("Backend health check: status=%d", resp.status_code)
             return resp.status_code == 200
@@ -844,7 +851,7 @@ async def _register_session(
         from backend.free.cli.cli_mode import default_cli_mode
         mode = default_cli_mode()
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             resp = await client.post(
                 f"{url}/api/sessions/register",
                 json={"session_id": session_id, "mode": mode, "client_type": "cli"},
@@ -877,7 +884,7 @@ async def _sync_server_mode(url: str, mode: str) -> None:
     あるため read timeout を長めに取る)。
     """
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             resp = await client.post(
                 f"{url}/api/mode/switch",
                 json={"mode": mode},
@@ -903,7 +910,7 @@ async def _sync_server_mode(url: str, mode: str) -> None:
 async def _unregister_session(url: str, session_id: str) -> None:
     """バックエンドからセッションを解除（ベストエフォート）"""
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             await client.delete(
                 f"{url}/api/sessions/{session_id}",
                 timeout=5.0,
@@ -969,7 +976,7 @@ def _check_procs_alive(state: AutoServeState) -> bool:
             )
             logger.error(
                 "auto-serve: %s process died during startup (pid=%d); "
-                "check local/logs/%s.stderr.log",
+                "check <data_root>/logs/%s.stderr.log",
                 name, p.pid, name,
             )
             return False
@@ -1058,7 +1065,7 @@ async def _wait_backend_llama_bridge_phase(
             spinner.clear()
             return False
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(headers=backend_headers()) as client:
                 resp = await client.get(
                     f"{backend_url}/api/status", timeout=5.0,
                 )
@@ -1308,7 +1315,7 @@ async def _auto_serve_start(
         return state
 
     # 失敗時: stderr ログのパスをヒント表示
-    log_dir = project_root / "local" / "logs"
+    log_dir = resolve_data_path("logs_dir", project_root)
     render_error(console, msg("cli.auto_serve_failed"))
     render_info(console, msg("cli.auto_serve_stderr_hint", path=str(log_dir)))
     _auto_serve_cleanup(state, console)

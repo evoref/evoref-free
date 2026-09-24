@@ -1,8 +1,8 @@
 """`manifest.json` — ストアの現在状態 (c_16 §5.1)
 
-``fsync=True`` で書く。壊れると active 版が分からず起動不能になるため。
-未対応の新しい ``schema_version`` は **読まず、書き戻しもしない**
-(c_05 §0.5.1 / :mod:`backend.free.rag.evidence._json_state`)。
+SoT なので fsync する。壊れると active 版が分からず起動不能になるため。
+未対応の新しい版は **読まず、書き戻しもしない** (c_05 §0.5.1 /
+:mod:`backend.io.versioned`)。
 
 payload:
 
@@ -22,9 +22,9 @@ payload:
 版番号 ``next_snapshot_seq`` も同じ理由で持つ (ディレクトリの ``max + 1`` は
 GC で版が消えると後戻りし、既存の版名を再利用してしまう)。
 
-payload の **既知でないキーは捨てずに ``_extra`` へ退避** し、書き戻しでその
-まま復元する (c_05 §0.5.2)。物理 GC の記録 (``_extra["gc"]``) のように、
-version をまたいで足される小さな注記もここに載る。
+payload の **既知でないキーは捨てずに退避** し、書き戻しで同じトップレベルへ
+そのまま戻す (c_05 §0.5.2)。物理 GC の記録 (``_extra["gc"]``) のような小さな
+注記は ``_extra`` に載る。
 """
 
 from __future__ import annotations
@@ -32,15 +32,26 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from backend.free.rag.evidence._json_state import JsonStateFile
 from backend.free.rag.evidence.events import EventPosition
 from backend.free.rag.evidence.snapshot import version_name
 from backend.free.rag.evidence.types import RECORD_VERSION
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 
 logger = get_logger("rag.evidence.manifest")
 
 MANIFEST_FILE = "manifest.json"
+
+EVIDENCE_MANIFEST_FORMAT = register_format(FormatSpec(
+    format_id="evidence.manifest",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/memory/<store>/manifest.json",
+    retention="one per store",
+    export=True,
+))
 
 #: 保持方針の既定 (c_16 §5.4)。**無宣言は監査で落とす**ので、必ず manifest に
 #: 書き出す。
@@ -53,7 +64,7 @@ DEFAULT_RETENTION: dict[str, Any] = {
 }
 
 
-#: payload のトップレベル既知キー。これ以外は ``_extra`` へ退避する。
+#: payload のトップレベル既知キー。これ以外は :attr:`EvidenceManifest.unknown` へ退避する。
 _KNOWN_PAYLOAD_KEYS = frozenset({
     "store",
     "record_version",
@@ -70,13 +81,15 @@ _KNOWN_PAYLOAD_KEYS = frozenset({
 })
 
 
-class EvidenceManifest(JsonStateFile):
+class EvidenceManifest(VersionedJsonFile):
     """1 ストア分の manifest。"""
 
-    SCHEMA_VERSION = 1
+    FORMAT = EVIDENCE_MANIFEST_FORMAT
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
 
     def __init__(self, store_dir: Path | str, store_name: str = "episodic") -> None:
-        super().__init__(Path(store_dir) / MANIFEST_FILE, fsync=True)
+        super().__init__(Path(store_dir) / MANIFEST_FILE)
         self.store = store_name
         self.record_version: int = RECORD_VERSION
         self.active_snapshot: str = ""
@@ -91,8 +104,10 @@ class EvidenceManifest(JsonStateFile):
         self.events_since_snapshot: int = 0
         self.next_snapshot_seq: int = 1
         self.folded_through: EventPosition = EventPosition()
-        #: payload の ``_extra`` (未知キーの退避先 + 小さな注記)。
+        #: payload の ``_extra`` (小さな注記)。
         self.extra: dict[str, Any] = {}
+        #: payload の既知でないトップレベルキー (新しいコードが足したもの)。書き戻しで同じ位置へ戻す。
+        self.unknown: dict[str, Any] = {}
 
     # ── 便宜 API ──
 
@@ -119,6 +134,7 @@ class EvidenceManifest(JsonStateFile):
 
     def _to_payload(self) -> dict[str, Any]:
         return {
+            **self.unknown,
             "store": self.store,
             "record_version": int(self.record_version),
             "active_snapshot": self.active_snapshot,
@@ -156,9 +172,10 @@ class EvidenceManifest(JsonStateFile):
         extra = payload.get("_extra")
         self.extra = dict(extra) if isinstance(extra, dict) else {}
         # 既知でないトップレベルキーも落とさずに退避する (c_05 §0.5.2)。
-        for key, value in payload.items():
-            if key not in _KNOWN_PAYLOAD_KEYS and key != "_extra":
-                self.extra[key] = value
+        self.unknown = {
+            key: value for key, value in payload.items()
+            if key not in _KNOWN_PAYLOAD_KEYS and key != "_extra"
+        }
 
 
 __all__ = ["DEFAULT_RETENTION", "MANIFEST_FILE", "EvidenceManifest"]

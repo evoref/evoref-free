@@ -15,20 +15,38 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from backend.io.atomic import atomic_write_text
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
 logger = get_logger("llm.aux_calibration_store")
 
+#: ``aux_calibration.json`` の形式。読めなければ捨てて観測から作り直す (derived)。
+AUX_CALIBRATION_FORMAT = register_format(FormatSpec(
+    format_id="learning.aux_calibration",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/aux_calibration.json",
+    retention="one entry per base model; samples capped per purpose",
+    keep_on_reset=True,
+))
+
+
+def _calibration_file(path: str | Path) -> VersionedPayloadFile:
+    return VersionedPayloadFile(
+        AUX_CALIBRATION_FORMAT, path,
+        component="AuxCalibrationStore", state_logger=logger,
+    )
+
 
 class AuxCalibrationStore:
     """補助タスク較正値の純粋な永続化担当 (model-keyed)
 
-    JSON 構造::
+    ペイロード構造 (版付き封筒の ``payload``)::
 
         {
           "<base_model_filename>": {
@@ -48,16 +66,15 @@ class AuxCalibrationStore:
 
     @staticmethod
     def load_all(path: str | Path) -> dict:
-        """JSON 全体を読み込む。未存在 / 破損 / 型不一致時は空 dict を返す。"""
-        p = Path(path)
-        if not p.exists():
+        """ペイロード全体を読み込む。未存在 / 読めない / 型不一致時は空 dict を返す。
+
+        derived なので、G1 の封筒でない / 壊れているファイルは捨てて次の保存で
+        作り直す (:class:`VersionedPayloadFile` の規則)。
+        """
+        f = _calibration_file(path)
+        if not f.load():
             return {}
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("Failed to load aux calibration from %s: %s", p, e)
-            return {}
-        return data if isinstance(data, dict) else {}
+        return f.payload if isinstance(f.payload, dict) else {}
 
     @staticmethod
     def load_timeouts(path: str | Path, model_filename: str) -> dict[str, float]:
@@ -122,7 +139,7 @@ class AuxCalibrationStore:
         """指定モデルの purpose 別 timeout 較正値を書き出す。
 
         他モデルの entry は保持したまま当該モデルの entry を更新する。親
-        ディレクトリは自動作成。書き込みは ``atomic_write_text`` (tmp +
+        ディレクトリは自動作成。書き込みは版付き封筒の原子的な書き込み (tmp +
         ``os.replace``) で部分書き込みを防止する。``samples`` を渡すと p95 較正の
         母集団も併せて保存する (省略時は既存の samples を保持)。
 
@@ -160,11 +177,10 @@ class AuxCalibrationStore:
         }
         if merged_samples:
             data[model_filename]["samples"] = merged_samples
-        atomic_write_text(
-            p,
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        f = _calibration_file(p)
+        f.RAISE_ON_SAVE_ERROR = True
+        f.payload = data
+        f.save()
         logger.info(
             "Saved aux calibration for model=%s (%d purposes, %d updated) to %s",
             model_filename, len(merged_timeouts), len(timeouts), p,

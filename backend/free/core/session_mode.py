@@ -28,21 +28,15 @@ VALID_SESSION_MODES: frozenset[str] = frozenset({"chat", "create"})
 
 DEFAULT_SESSION_MODE: SessionMode = "chat"
 
-#: 旧名 → 現行名。``"coding"`` は ``"create"`` へ改名された (旧称の永続データ /
-#: 旧クライアントからの受信を読めるようにするための入口互換)。移行済みデータでは
-#: 出現しないが、移行漏れと外部クライアントの両方を安全側へ倒す。
-LEGACY_SESSION_MODES: dict[str, SessionMode] = {"coding": "create"}
-
-
 def canonicalize_session_mode(mode: str | None) -> SessionMode | None:
-    """既知の mode を現行名へ正規化する。未知なら ``None``。
+    """既知の mode ならそのまま返す。未知 (旧名 ``"coding"`` を含む) なら ``None``。
 
-    現行名はそのまま、旧名 (:data:`LEGACY_SESSION_MODES`) は現行名へマップする。
-    永続データの読み込みや API 受信など **入口** で使う。
+    API 受信など **入口** の検証で使う。G1 は旧名の読み替えを持たない
+    (G0 の永続データは読まない、c_05 §0.3)。
     """
     if mode in VALID_SESSION_MODES:
         return mode  # type: ignore[return-value]
-    return LEGACY_SESSION_MODES.get(mode or "")
+    return None
 
 
 def is_create_mode(mode: str | None) -> bool:
@@ -63,9 +57,5 @@ def is_valid_session_mode(mode: str | None) -> bool:
 def normalize_session_mode(
     mode: str | None, default: SessionMode = DEFAULT_SESSION_MODE,
 ) -> SessionMode:
-    """未知/None の mode を ``default`` へフォールバックさせる。
-
-    旧名 (:data:`LEGACY_SESSION_MODES`) は現行名へマップしてから返すため、
-    改名前に書かれた永続データをそのまま読める。
-    """
+    """未知/None の mode を ``default`` へフォールバックさせる。"""
     return canonicalize_session_mode(mode) or default

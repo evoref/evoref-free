@@ -1014,10 +1014,10 @@ def build_text_unit_messages(
             f"「{unit.verbatim}」"
         )
     if _FINAL_INSTRUCTION_MARKER in user:
-        user = user.replace(
-            _FINAL_INSTRUCTION_MARKER,
-            f"# 分量・継続の指示\n{unit_instructions}\n\n{_FINAL_INSTRUCTION_MARKER}",
-        )
+        # 目印はテンプレート末尾の 1 つだけが本物。参考情報の本文に同じ文が
+        # 紛れていても、そこへは差し込まない。
+        head, marker, tail = user.rpartition(_FINAL_INSTRUCTION_MARKER)
+        user = f"{head}# 分量・継続の指示\n{unit_instructions}\n\n{marker}{tail}"
     elif user:
         user = f"{user}\n\n# 分量・継続の指示\n{unit_instructions}"
     else:

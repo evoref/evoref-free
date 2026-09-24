@@ -139,8 +139,8 @@ class PseudoQueryEmbedEval:
             snapshot = index.store.snapshot
             if snapshot is None:
                 continue
-            for row in range(len(snapshot)):
-                raw = snapshot.raw_at(row) or {}
+            for _row, found in snapshot.iter_raw():
+                raw = found or {}
                 target = (raw.get("attrs") or {}).get("target_id")
                 text = str(raw.get("text") or "")
                 if isinstance(target, str) and target and text:

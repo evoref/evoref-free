@@ -54,8 +54,12 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         query_template: str = "Instruct: {task}\nQuery: {query}",
         doc_template: str = "",
         debug_logger=None,
+        model_key: str = "",
     ):
         super().__init__(timeout=timeout)
+        #: 埋め込みモデルの GGUF の model_key (ストアのディレクトリ名、c_05 §0.5.7)。
+        #: ``model_name_str`` は llama-server へ送る名前で、識別子には使わない。
+        self.model_key = model_key
         # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
         self._health_log_gate = HealthLogGate()
         self._url = f"http://{host}:{port}/v1/embeddings"

@@ -13,7 +13,6 @@ from backend.log_config import get_logger
 
 logger = get_logger("cli.pid_manager")
 
-PID_DIR = "local/run"
 PID_FILE = "evoref.pid"
 
 
@@ -92,8 +91,10 @@ class PortOccupant:
 # ────────────────────────────────────────────
 
 def _pid_path(project_root: Path) -> Path:
-    """PID ファイルのパスを返す"""
-    return project_root / PID_DIR / PID_FILE
+    """PID ファイルのパスを返す (データ根の ``run/``)"""
+    from backend.config import resolve_data_path
+
+    return resolve_data_path("run_dir", project_root) / PID_FILE
 
 
 def _is_process_alive(pid: int) -> bool:

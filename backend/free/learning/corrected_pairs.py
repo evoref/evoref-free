@@ -38,6 +38,7 @@ from backend.free.core.correction_target import (
     STOP_IDENTIFIERS,
     wrong_side_tokens,
 )
+from backend.free.core.correction_verdict import VERDICT_CODES
 from backend.free.core.intent_vocab import (
     asks_quantity_without_operands,
     is_plain_statement,
@@ -433,7 +434,8 @@ def build_demoted_pairs(experiences: list[dict], mode: str | None = None) -> lis
         if signals.get("user_correction"):
             continue
         candidate = signals.get("correction_candidate")
-        if not candidate or not signals.get("correction_verdict"):
+        # 検証済み = 既知の判定語が付いている (未知の語は検証の有無が分からない)。
+        if not candidate or signals.get("correction_verdict") not in VERDICT_CODES:
             continue
         prev = resolve_corrected_turn(scoped, i)
         if prev is None:

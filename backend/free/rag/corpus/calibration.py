@@ -25,7 +25,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -37,15 +36,24 @@ from backend.free.rag.memory_threshold_calibration import (
     _l2_normalize,
     compute_calibration,
 )
-from backend.io import AtomicWriter
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
-from backend.utils import utc_now
 
 logger = get_logger("rag.corpus.calibration")
 
 #: 保存ファイル (``local/memory/corpus/`` 配下)。
 CALIBRATION_FILENAME = "calibration.json"
-SCHEMA_VERSION = 1
+
+#: 式を変えたら版を上げる (移行器は置かない — 旧版は捨てて較正し直す)。
+CORPUS_CALIBRATION_FORMAT = register_format(FormatSpec(
+    format_id="corpus.calibration",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key="store/corpus/calibration.json",
+    retention="one per data root; recomputed when the signature changes",
+))
 
 #: 正側 (leave-one-out top1) から採る分位。5% の正当な問いを落とす側に倒す。
 POSITIVE_QUANTILE = 0.05
@@ -176,18 +184,14 @@ def load_corpus_calibration(
     corpus_dir: Path | str, signature: str,
 ) -> dict[str, Any] | None:
     """署名が一致する較正結果を返す。無い / 不一致 / 壊れていれば ``None``。"""
-    path = calibration_path(corpus_dir)
-    if not path.exists():
+    file = VersionedPayloadFile(
+        CORPUS_CALIBRATION_FORMAT, calibration_path(corpus_dir),
+        component="corpus_calibration", state_logger=logger,
+    )
+    if not file.load():
         return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("Corpus calibration cache unreadable (%s): %s", path, e)
-        return None
-    if data.get("schema_version") != SCHEMA_VERSION:
-        return None
-    payload = data.get("payload") or {}
-    if payload.get("signature") != signature:
+    payload = file.payload
+    if not isinstance(payload, dict) or payload.get("signature") != signature:
         return None
     thresholds = payload.get("thresholds")
     if not isinstance(thresholds, dict):
@@ -205,29 +209,23 @@ def save_corpus_calibration(
     """較正結果を c_05 §0.5 の封筒で保存する (``ok=False`` は保存しない)。"""
     if not result.get("ok"):
         return
-    path = calibration_path(corpus_dir)
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "written_at": utc_now(),
-        "producer": "corpus_calibration",
-        "payload": {
-            "signature": signature,
-            "n_chunks": result.get("n_chunks"),
-            "n_pq": result.get("n_pq"),
-            "distribution": result.get("distribution"),
-            "thresholds": result.get("thresholds"),
-        },
+    file = VersionedPayloadFile(
+        CORPUS_CALIBRATION_FORMAT, calibration_path(corpus_dir),
+        component="corpus_calibration", state_logger=logger,
+    )
+    file.payload = {
+        "signature": signature,
+        "n_chunks": result.get("n_chunks"),
+        "n_pq": result.get("n_pq"),
+        "distribution": result.get("distribution"),
+        "thresholds": result.get("thresholds"),
     }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with AtomicWriter(path) as f:
-            f.write(json.dumps(payload, ensure_ascii=False, indent=2))
-    except OSError as e:
-        logger.warning("Failed to persist corpus calibration to %s: %s", path, e)
+    file.save()
 
 
 __all__ = [
     "CANARY_UTTERANCES",
+    "CORPUS_CALIBRATION_FORMAT",
     "MIN_NOTES",
     "MIN_QUERIES",
     "calibration_signature",

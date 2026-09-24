@@ -34,7 +34,6 @@ snapshot は 1 版だけ持つ。corpus は事象ログを持たない — 版�
 
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import threading
@@ -47,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.free.rag.corpus.chunking import CHUNKER_VERSION, chunk_documents
 from backend.free.rag.corpus.office_inspect import inspect_office_file
 from backend.free.rag.corpus.package import (
@@ -54,10 +54,13 @@ from backend.free.rag.corpus.package import (
     LANGUAGE_DIR,
     LANGUAGE_VERIFY_FEATURE,
     PACKAGE_FILE,
+    PACKAGE_FORMAT_ID,
+    PACKAGE_FORMAT_VERSION,
     PREBUILT_DIR,
     PREBUILT_EMBEDDINGS_DIR,
     TEMPLATES_DIR,
     PackageError,
+    PackageFormatError,
     PackageMeta,
     PrebuiltInfo,
     compute_content_digest,
@@ -65,8 +68,8 @@ from backend.free.rag.corpus.package import (
     discover_sections,
     has_any_section_content,
     iter_prebuilt_chunks,
-    meta_from_record,
     read_package,
+    read_package_meta,
     validate_requires,
     write_package_meta,
     write_prebuilt_build,
@@ -82,6 +85,9 @@ from backend.free.rag.corpus.calibration import (
 from backend.free.rag.corpus.language import (
     BUNDLED_EXTENSIONS,
     BUNDLED_GRAMMAR_NAMES,
+    LANGUAGE_FORMAT_ID,
+    LANGUAGE_FORMAT_VERSION,
+    LANGUAGE_MANIFEST_FILE,
     ImportRule,
     LanguageEntry,
     VerifyCommand,
@@ -91,14 +97,21 @@ from backend.free.rag.corpus.language import (
 )
 from backend.free.rag.corpus.pseudo_queries import PSEUDO_QUERIES_DIR, PseudoQueryIndex
 from backend.free.rag.corpus.templates import (
+    TEMPLATES_FORMAT_ID,
+    TEMPLATES_FORMAT_VERSION,
+    TEMPLATES_MANIFEST_FILE,
     TemplateCandidate,
     TemplateEntry,
     load_templates_for_package,
     validate_templates_install,
 )
-from backend.free.rag.evidence._json_state import JsonStateFile
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.free.rag.evidence.config import merge_rag_evidence_config
 from backend.free.rag.evidence.ranking import RankColumns, score_rows
+from backend.free.rag.evidence.snapshot_build import ConstantShardKey
+from backend.free.rag.embedding_backend import embedding_store_id
 from backend.free.rag.evidence.store import EvidenceStore, UsageBuffer
 from backend.free.rag.vector_store import dequantize_int8
 from backend.free.rag.evidence.types import (
@@ -208,6 +221,22 @@ def resolve_cartridge_gate_threshold(gate_cfg: dict | None) -> float:
 # ── 埋め込みバックエンドのアダプタ ──────────────────────────────────────
 
 
+
+#: このプロセスが内部で作るパッケージの id 接頭辞 (手動取り込み / ProjectMap)。
+#: 外から持ち込んだパッケージが名乗ると、内部のパッケージを黙って置き換えられる。
+RESERVED_PACKAGE_ID_PREFIXES = ("manual-", "pm-", "_")
+#: 外から宣言できない kind (機械生成専用)。
+RESERVED_PACKAGE_KINDS = frozenset({"project_map"})
+
+
+def _reject_reserved_identity(meta: PackageMeta) -> None:
+    """外部パッケージが予約された id / kind を名乗っていれば拒否する。"""
+    if meta.id.startswith(RESERVED_PACKAGE_ID_PREFIXES):
+        raise PackageError(f"package id '{meta.id}' uses a reserved prefix")
+    if meta.kind in RESERVED_PACKAGE_KINDS:
+        raise PackageError(f"package '{meta.id}' declares reserved kind '{meta.kind}'")
+
+
 class _AttrEmbedder:
     """``EmbeddingBackend`` (メソッド形) を属性形へ薄く包む。
 
@@ -254,51 +283,125 @@ def adapt_embedding_backend(backend: Any) -> Any:
 
 
 def embedding_model_id_of(backend: Any) -> str:
-    """埋め込みバックエンドのモデル id (取れなければ空文字)。"""
-    adapted = adapt_embedding_backend(backend)
-    return "" if adapted is None else str(getattr(adapted, "model_name", "") or "")
+    """埋め込みバックエンドのモデル id (model_key、無ければ model_name。取れなければ空文字)。"""
+    return "" if backend is None else embedding_store_id(backend)
 
 
 # ── corpus manifest ────────────────────────────────────────────────────
 
 
-class CorpusManifest(JsonStateFile):
+@persisted()
+@dataclass
+class CorpusManifestPayload:
+    """``corpus/manifest.json`` の payload (コーデックの表、c_05 §0.5.2)。"""
+
+    active: dict[str, str] = field(default_factory=dict)
+    store_prior_overrides: dict[str, float] = field(default_factory=dict)
+    loaded: list[str] = field(default_factory=list)
+    #: この版が知らないキー (同じ版で足された任意フィールド)。書き戻しでトップへ戻す。
+    _extra: dict[str, Any] | None = None
+
+
+_MANIFEST_CODEC = codec_for(CorpusManifestPayload)
+
+CORPUS_MANIFEST_FORMAT = register_format(FormatSpec(
+    format_id="corpus.manifest",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/corpus/manifest.json",
+    retention="one per data root",
+    export=True,
+    records=(CorpusManifestPayload,),
+))
+
+#: パッケージの版ディレクトリ (c_16 §4.3)。手動取り込みでは元 zip が残らないので
+#: ``package.json`` と各セクション (docs / templates / language) が唯一の原本。
+_PACKAGE_VERSION_KEY = f"store/corpus/{PACKAGES_DIR}/<id>/<version>"
+CORPUS_PACKAGE_FORMAT = register_format(FormatSpec(
+    format_id=PACKAGE_FORMAT_ID,
+    version=PACKAGE_FORMAT_VERSION,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key=f"{_PACKAGE_VERSION_KEY}/{PACKAGE_FILE}",
+    retention="latest 2 versions per package",
+    export=True,
+))
+CORPUS_PACKAGE_SECTION_FORMATS = tuple(
+    register_format(FormatSpec(
+        format_id=f"corpus.package.{section}",
+        version=1,
+        klass="sot",
+        writers=frozenset({"free"}),
+        path_key=f"{_PACKAGE_VERSION_KEY}/{section}/**",
+        retention="latest 2 versions per package",
+        export=True,
+        encodings=("dir",),
+    ))
+    for section in (DOCS_DIR, TEMPLATES_DIR, LANGUAGE_DIR)
+)
+#: セクションの manifest (c_16 §4.5.1)。版は ``requires`` の ``<section>/<N>`` と一致する。
+#: セクションの木 (``/**``) より具体的な宣言なので、manifest はこちらに分類される。
+CORPUS_PACKAGE_MANIFEST_FORMATS = tuple(
+    register_format(FormatSpec(
+        format_id=format_id,
+        version=version,
+        klass="sot",
+        writers=frozenset({"free"}),
+        path_key=f"{_PACKAGE_VERSION_KEY}/{section}/{manifest_file}",
+        retention="latest 2 versions per package",
+        export=True,
+    ))
+    for format_id, version, section, manifest_file in (
+        (TEMPLATES_FORMAT_ID, TEMPLATES_FORMAT_VERSION, TEMPLATES_DIR, TEMPLATES_MANIFEST_FILE),
+        (LANGUAGE_FORMAT_ID, LANGUAGE_FORMAT_VERSION, LANGUAGE_DIR, LANGUAGE_MANIFEST_FILE),
+    )
+)
+#: 版ディレクトリのうち原本以外 (EvidenceStore の索引・埋め込み・prebuilt・重心)。
+#: 原本から作り直せる (:func:`_clean_derived`)。
+CORPUS_PACKAGE_INDEX_FORMAT = register_format(FormatSpec(
+    format_id="corpus.package.index",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key=f"{_PACKAGE_VERSION_KEY}/**",
+    retention="latest 2 versions per package",
+    encodings=("dir",),
+))
+
+
+class CorpusManifest(VersionedJsonFile):
     """``corpus/manifest.json`` (c_16 §4.3)。
 
     ``active`` だけが版切替の唯一の権威。install は最後にここを書き替える。
     """
 
-    SCHEMA_VERSION = 1
+    FORMAT = CORPUS_MANIFEST_FORMAT
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
 
     def __init__(self, corpus_dir: Path | str) -> None:
-        super().__init__(Path(corpus_dir) / CORPUS_MANIFEST_FILE, fsync=True)
+        super().__init__(Path(corpus_dir) / CORPUS_MANIFEST_FILE)
         self.active: dict[str, str] = {}
         self.store_prior_overrides: dict[str, float] = {}
         self.loaded: list[str] = []
+        #: payload の未知キー (書き戻しでそのまま戻す)。
+        self._extra: dict[str, Any] | None = None
 
     def _to_payload(self) -> dict[str, Any]:
-        return {
-            "active": dict(self.active),
-            "store_prior_overrides": {
-                k: float(v) for k, v in self.store_prior_overrides.items()
-            },
-            "loaded": list(self.loaded),
-        }
+        return _MANIFEST_CODEC.encode(CorpusManifestPayload(
+            active=dict(self.active),
+            store_prior_overrides={k: float(v) for k, v in self.store_prior_overrides.items()},
+            loaded=list(self.loaded),
+            _extra=self._extra,
+        ))
 
     def _from_payload(self, payload: Any) -> None:
-        if not isinstance(payload, dict):
-            raise TypeError("corpus manifest payload must be an object")
-        active = payload.get("active")
-        self.active = {
-            str(k): str(v) for k, v in (active or {}).items()
-        } if isinstance(active, dict) else {}
-        overrides = payload.get("store_prior_overrides")
-        self.store_prior_overrides = {
-            str(k): float(v) for k, v in (overrides or {}).items()
-            if isinstance(v, (int, float))
-        } if isinstance(overrides, dict) else {}
-        loaded = payload.get("loaded")
-        self.loaded = [str(v) for v in loaded] if isinstance(loaded, list) else []
+        data = _MANIFEST_CODEC.decode(payload)
+        self.active = data.active
+        self.store_prior_overrides = data.store_prior_overrides
+        self.loaded = data.loaded
+        self._extra = data._extra
 
 
 # ── 1 パッケージ版 ─────────────────────────────────────────────────────
@@ -630,8 +733,7 @@ class CorpusStore:
 
     @property
     def embedding_model_id(self) -> str:
-        backend = self._embedding_backend
-        return "" if backend is None else str(getattr(backend, "model_name", "") or "")
+        return embedding_model_id_of(self._embedding_backend)
 
     # ── 起動時の走査 ──
 
@@ -666,6 +768,11 @@ class CorpusStore:
                 continue
             try:
                 package = self._open_package(directory)
+            except PackageFormatError as e:
+                # G1 でない / 新しい版の package.json・セクションの manifest は開かず、active からも外さない
+                # (readonly と同じく触らずに残す)
+                logger.error("Skipping corpus package %s: %s", directory, e)
+                continue
             except (PackageError, OSError, ValueError) as e:
                 logger.warning("Failed to open corpus package %s: %s", directory, e)
                 stale.append(package_id)
@@ -687,9 +794,7 @@ class CorpusStore:
 
     def _open_package(self, directory: Path) -> CorpusPackage:
         """版ディレクトリを開いて :class:`CorpusPackage` にする。"""
-        meta = meta_from_record(
-            json.loads((directory / PACKAGE_FILE).read_text(encoding="utf-8")),
-        )
+        meta = read_package_meta(directory)
         if not meta.provides:
             # セクション化 (c_16 §4.3) 以前の package.json は provides を
             # 宣言していない。ディスクには書き戻さず、実行時の判定
@@ -752,7 +857,7 @@ class CorpusStore:
             embedding_backend=self._embedding_backend,
             rag_config=self.rag_config,
             by="corpus_install",
-            shard_key_for=lambda _record, key=package_id: key,
+            shard_key_for=ConstantShardKey(package_id),
         )
 
     # ── 目録 ──
@@ -1109,12 +1214,14 @@ class CorpusStore:
 
     # ── install ──
 
+    @with_embed_priority(P3_BULK)
     async def install(
         self,
         zip_path: Path | str,
         *,
         progress_cb: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        internal: bool = False,
     ) -> InstallResult:
         """`.evocart` をインストールする (c_16 §4.3)。
 
@@ -1135,6 +1242,10 @@ class CorpusStore:
 
         7 を最後にするのは、途中で落ちても manifest が「完成している版」を
         指したままにするため。
+        
+        ``internal=True`` はこのプロセスが自分で作ったパッケージ (手動取り込み・
+        テンプレート登録) だけが渡す。外から持ち込んだパッケージ (既定) は、予約された
+        id / kind を名乗れず、同梱の ``prebuilt/`` 埋め込みも採用しない (docs/c_06 §1.5)。
         """
         source = Path(zip_path)
         await _emit(progress_cb, {"phase": "extract", "status": "running"})
@@ -1146,6 +1257,8 @@ class CorpusStore:
             max_unpacked_bytes=self._max_unpacked_bytes,
         )
         meta = contents.meta
+        if not internal:
+            _reject_reserved_identity(meta)
         directory = self.package_dir(meta.id, meta.version)
         if directory.exists():
             # 未完成の版が残っている / 同じ版の入れ直し。active は最後まで
@@ -1213,21 +1326,26 @@ class CorpusStore:
             raise PackageError(f"package '{meta.id}' rejected: {rejection}")
 
         try:
-            validate_templates_install(directory, meta.id)
+            validate_templates_install(directory, meta.id, meta.requires)
         except PackageError:
             shutil.rmtree(str(directory), ignore_errors=True)
             raise
 
         try:
-            validate_language_install(directory, meta.id)
+            validate_language_install(directory, meta.id, meta.requires)
         except PackageError:
             shutil.rmtree(str(directory), ignore_errors=True)
             raise
 
         write_package_meta(directory, meta)
 
+        if contents.prebuilt is not None and not internal:
+            # 署名が無いので、同梱の埋め込み・scales・重心が docs と対応している保証が無い
+            # (敵対的なベクトルで全クエリに当たるよう細工できる)。外から持ち込んだ
+            # パッケージは docs/ から手元で作り直す (docs/c_06 §1.5 / c_16 §4.3)。
+            logger.info("Ignoring prebuilt embeddings of external package %s", meta.id)
         result = await self._build_version(
-            directory, meta, contents.prebuilt,
+            directory, meta, contents.prebuilt if internal else None,
             progress_cb=progress_cb, cancel_check=cancel_check,
         )
 
@@ -1335,7 +1453,6 @@ class CorpusStore:
                 docs_dir,
                 package_id=meta.id,
                 package_version=meta.version,
-                content_digest=meta.content_digest,
                 language=meta.language,
                 rag_config=self.rag_config,
                 on_document=report,
@@ -1454,6 +1571,7 @@ class CorpusStore:
 
     # ── rebuild / uninstall / GC ──
 
+    @with_embed_priority(P3_BULK)
     async def rebuild(
         self,
         package_id: str,
@@ -1616,7 +1734,6 @@ class CorpusStore:
             docs_dir,
             package_id=meta.id,
             package_version=meta.version,
-            content_digest=digest,
             language=meta.language,
             rag_config=self.rag_config,
         )
@@ -1995,6 +2112,7 @@ class CorpusStore:
         return {
             "package_id": package_id,
             "package_name": package.meta.name or package_id,
+            "version": package.meta.version,
             "doc_id": str(attrs.get("doc_id") or ""),
             "heading": str(attrs.get("heading") or ""),
         }
@@ -2190,7 +2308,7 @@ class CorpusStore:
             chunk_vecs = dequantize_int8(np.asarray(store.vectors_q8), np.asarray(store.scales))
             if chunk_vecs.ndim != 2 or chunk_vecs.shape[0] == 0:
                 continue
-            row_of = {str(m.get("id")): i for i, m in enumerate(store.metadata)}
+            row_of = {record_id: i for i, record_id in enumerate(store.row_ids)}
             chunk_blocks.append(chunk_vecs)
             index = package.pseudo_queries
             if index is not None and len(index) > 0:
@@ -2204,8 +2322,8 @@ class CorpusStore:
                         np.asarray(pq_store.vectors_q8), np.asarray(pq_store.scales),
                     )
                     keep: list[int] = []
-                    for i, meta in enumerate(pq_store.metadata):
-                        row = snapshot.row_of(str(meta.get("id")))
+                    for i, record_id in enumerate(pq_store.row_ids):
+                        row = snapshot.row_of(record_id)
                         raw = snapshot.raw_at(row) if row is not None else None
                         target = ((raw or {}).get("attrs") or {}).get("target_id")
                         chunk_row = row_of.get(str(target)) if target else None

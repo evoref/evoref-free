@@ -9,24 +9,25 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import asdict
+from datetime import datetime, timezone
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.i18n_helper import msg
 from backend.io import atomic_write_text
 from backend.liveness import ledger as liveness_ledger
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
-from backend.utils import utc_now
+from backend.utils import format_utc, parse_utc, utc_now
 from backend.free.core.session_mode import is_chat_mode, is_create_mode
 from backend.free.learning.fitness import defect_rate_fitness
 from backend.free.learning.learning_state_store import (
     LearningState,
     LearningStateStore,
 )
-from backend.free.learning.level0_instant import ExperienceBuffer, used_corpus_evidence
+from backend.free.learning.level0_instant import ExperienceBuffer, entry_to_dict, used_corpus_evidence
 from backend.free.learning.level1_session import (
     Level1Session,
     PriorityRequest,
@@ -36,6 +37,7 @@ from backend.free.learning.level1_session import (
     save_active_session,
 )
 from backend.free.optimizer.prompt_evolver import (
+    CANDIDATES_FILE,
     PROMPT_DEFECT_WEIGHTS,
     PromptEvolver,
 )
@@ -50,6 +52,14 @@ if TYPE_CHECKING:
     from backend.free.learning.critique_synthesizer import CritiqueResult
 
 logger = get_logger("learning.scheduler")
+
+#: 読めない時刻を最古へ寄せる番兵 (時刻は ``datetime`` で比べる、c_05 §0.5.4)。
+_TIME_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _parsed_time(value: object) -> datetime:
+    """永続化された時刻を ``datetime`` へ (読めなければ最古)。"""
+    return parse_utc(value) or _TIME_MIN  # type: ignore[arg-type]
 
 
 #: 後方互換の別名 (実体は ``level0_instant.used_corpus_evidence``)。
@@ -359,6 +369,8 @@ class LearningScheduler:
         self._prev_rag_usage_rate: float | None = None
         # mode → 採用直後プロンプトの事後監視レコード (L-A7、learning_state に永続化)
         self._prompt_adoptions: dict[str, dict] = {}
+        # learning_state.json のトップの未知キー (書き戻しで戻す、c_05 §0.5.2)
+        self._state_extra: dict | None = None
         # _get_filtered_experiences のメモ化 (バッファ長 / 末尾 timestamp /
         # ロード済みカートリッジ集合が変わらない限り再変換しない、L-D1)
         self._exp_cache_key: tuple | None = None
@@ -401,8 +413,7 @@ class LearningScheduler:
     ):
         self._policy = policy
         # embed_instruction の保存先解決用 (embedding モデル単位パーティション)。
-        # 未注入 (レガシー構築 / 一部テスト) 時は prompt_manager.prompt_dir
-        # (base パーティション) にフォールバックする。
+        # 未注入ならグローバルの PathResolver を使う。
         self._resolver = resolver
         learning = config.get("learning", {})
 
@@ -427,7 +438,7 @@ class LearningScheduler:
         # (base モデルが変われば候補の意味も変わる)。
         if prompt_manager is not None:
             self._evolver.candidates_archive = (
-                Path(prompt_manager.prompt_dir) / "candidates.jsonl"
+                Path(prompt_manager.prompt_dir) / CANDIDATES_FILE
             )
 
         # 自己学習無効化フラグ (--no-learning 経由)。True の場合 Level 1/2 サイクルは
@@ -473,6 +484,7 @@ class LearningScheduler:
         self._prev_correction_rate = state.prev_correction_rate
         self._prev_rag_usage_rate = state.prev_rag_usage_rate
         self._prompt_adoptions = dict(state.prompt_adoptions)
+        self._state_extra = state._extra
         # 優先キューを復元
         self._priority_queue = state.priority_queue
         logger.info(
@@ -496,6 +508,7 @@ class LearningScheduler:
                     prev_rag_usage_rate=self._prev_rag_usage_rate,
                     priority_queue=list(self._priority_queue),
                     prompt_adoptions=dict(self._prompt_adoptions),
+                    _extra=self._state_extra,
                 ),
                 self._state_file,
             )
@@ -503,12 +516,16 @@ class LearningScheduler:
             logger.warning("Failed to save learning state: %s (path=%s)", e, self._state_file)
 
     def _eval_set_version(self) -> str:
-        """採用判定に使った eval セットの ``updated_at`` (取れなければ空)。"""
+        """採用判定に使った eval セットの版 (取れなければ空)。
+
+        版は有効ケースと合格基準の内容ハッシュで、Pro の ``EvalCoreManager.version``
+        が計算する (Free は eval_core のファイルを読まない)。
+        """
         manager = getattr(self, "eval_core_manager", None)
         if manager is None:
             return ""
         try:
-            return str(manager.load().updated_at or "")
+            return str(manager.version())
         except Exception as exc:
             logger.debug("eval set version unavailable: %s", exc)
             return ""
@@ -583,6 +600,7 @@ class LearningScheduler:
         self._prev_correction_rate = None
         self._prev_rag_usage_rate = None
         self._prompt_adoptions = {}
+        self._state_extra = None
         self._priority_queue = []
         self._exp_cache_key = None
         self._exp_cache = []
@@ -1701,10 +1719,10 @@ class LearningScheduler:
         rolled_back: set[str] = set()
         min_samples = max(1, self.min_experiences // 2)
         for mode, rec in list(self._prompt_adoptions.items()):
-            since = str(rec.get("window_since") or "")
+            since = _parsed_time(rec.get("window_since"))
             new_exp = [
                 e for e in experiences
-                if e.get("mode") == mode and str(e.get("timestamp") or "") > since
+                if e.get("mode") == mode and _parsed_time(e.get("timestamp")) > since
             ]
             if len(new_exp) < min_samples:
                 continue
@@ -1714,7 +1732,7 @@ class LearningScheduler:
             windows = list(rec.get("windows") or [])
             windows.append(round(fitness, 4))
             rec["windows"] = windows
-            rec["window_since"] = max(str(e.get("timestamp") or "") for e in new_exp)
+            rec["window_since"] = format_utc(max(_parsed_time(e.get("timestamp")) for e in new_exp))
             if len(windows) < PROMPT_ROLLBACK_WINDOWS:
                 continue
             baseline = rec.get("baseline")
@@ -2148,20 +2166,18 @@ class LearningScheduler:
     def _filter_experiences_for_level2(
         self,
         experiences: list[dict],
-        current_model: str,
+        model_key: str,
         mode: str | None = None,
     ) -> list[dict]:
-        """Level 2 用: カートリッジフィルタ + ベースモデルフィルタ（§22.5.4）
+        """Level 2 用: 学習対象モデルで収集された経験だけに絞る（§22.5.4）
 
         旧モデルで収集された経験は新モデルの LoRA 微調整に適さないため、
-        現在のベースモデルで収集された経験のみを使用する。``mode`` 指定時は
-        さらにそのモード ("chat"/"create") の経験のみに絞る (省略時は全モード
-        横断、後方互換)。
+        ``model_key`` (c_05 §0.5.7) が一致する経験のみを使う。ファイル名では
+        照合しない (量子化違い・同名の別モデルを区別できない)。``model_key`` の
+        無い経験は使わない。``mode`` 指定時はさらにそのモード ("chat"/"create")
+        の経験のみに絞る (省略時は全モード横断)。
         """
-        filtered = [
-            e for e in experiences
-            if e.get("base_model", current_model) == current_model
-        ]
+        filtered = [e for e in experiences if e.get("model_key") == model_key]
         if mode is not None:
             filtered = [e for e in filtered if e.get("mode") == mode]
         return filtered
@@ -2188,7 +2204,7 @@ class LearningScheduler:
         # snapshot (``compact_experience``) にも id が届かず、採用ゲートの
         # ``corrected_entry_id`` 解決が **実運用では常に失敗** していた
         # (2026-09-08 検証: 検証済み訂正 1 件が no_selection_pressure に化けた)。
-        raw_experiences = [asdict(e) for e in entries]
+        raw_experiences = [entry_to_dict(e) for e in entries]
         filtered = raw_experiences
         self._exp_cache_key = key
         self._exp_cache = filtered
@@ -2200,23 +2216,18 @@ class LearningScheduler:
     ) -> list[dict]:
         """``cutoff`` (epoch 秒) より新しい経験だけを返す。0.0 なら全件。
 
-        比較は ``_get_new_experience_count`` と同じ ISO タイムスタンプ文字列の
-        辞書順比較。
+        比較は ``datetime`` 同士 (文字列の辞書順で比べない、c_05 §0.5.4)。秒精度の
+        cutoff 文字列と比べると同じ秒の経験を取りこぼしていた。
         """
         if cutoff <= 0.0:
             return experiences
-        cutoff_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cutoff))
-        return [e for e in experiences if e.get("timestamp", "") > cutoff_str]
+        return [e for e in experiences if _parsed_time(e.get("timestamp")).timestamp() > cutoff]
 
     def _get_new_experience_count(self) -> int:
         """前回 Level 1 実行以降の新規経験数を返す"""
         if self._last_run <= 0.0:
             return len(self._get_filtered_experiences())
-        cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_run))
-        return sum(
-            1 for e in self._get_filtered_experiences()
-            if e.get("timestamp", "") > cutoff
-        )
+        return len(self._select_new_experiences(self._get_filtered_experiences(), self._last_run))
 
     def get_status(self) -> dict:
         """現在の学習状態を返す"""
@@ -2549,6 +2560,7 @@ class LearningScheduler:
                 continue
         return prompt_texts
 
+    @with_embed_priority(P2_LEARNING)
     async def _level1_phase3_embed_instruction(
         self,
         experiences: list[dict],
@@ -3042,23 +3054,18 @@ class LearningScheduler:
         logger.info("Applied evolved embed instruction to live embedder")
 
     def _embed_instruction_dir(self) -> Path:
-        """embed_instruction.md 系データの保存先ディレクトリ (embedding モデル単位)。
-
-        resolver 未注入 (レガシー構築 / 一部テスト) の場合は従来通り
-        ``prompt_manager.prompt_dir`` (base パーティション) にフォールバックする。
-        """
+        """embed_instruction.md 系データの保存先ディレクトリ (embedding モデル単位)。"""
         if self._resolver is not None:
             return self._resolver.resolve_embed_instruction_dir()
-        return self.prompt_manager.prompt_dir
+        from backend.config import get_path_resolver
+
+        return get_path_resolver().resolve_embed_instruction_dir()
 
     def _load_embed_instruction(self) -> str:
         """embed_instruction.md を読み込む（なければデフォルト生成）
 
-        2026-07-18: 保存先を base モデルパーティションから embedding モデル
-        パーティションへ変更 (embed_instruction は埋め込みモデル向けのクエリ
-        指示であり base モデル切替と無関係に保持されるべきだったため)。旧
-        base パーティションに残る従来データがあれば一度だけ新パスへコピーして
-        引き継ぐ (非破壊: 旧ファイルは残置)。
+        置き場は埋め込みモデルのパーティション (embed_instruction は埋め込み
+        モデル向けのクエリ指示で、base モデル切替とは無関係)。
         """
         from backend.free.optimizer.embed_instruction_evolver import (
             DEFAULT_EMBED_INSTRUCTION,
@@ -3069,47 +3076,10 @@ class LearningScheduler:
             return path.read_text(encoding="utf-8")
 
         embed_dir.mkdir(parents=True, exist_ok=True)
-        legacy_path = self._find_legacy_embed_instruction_source()
-        if embed_dir != self.prompt_manager.prompt_dir and legacy_path is not None:
-            content = legacy_path.read_text(encoding="utf-8")
-            atomic_write_text(path, content, encoding="utf-8")
-            logger.info(
-                "Migrated embed_instruction.md from legacy base partition "
-                "(%s) to %s", legacy_path, path,
-            )
-            return content
-
         # デフォルトを書き込んで返す
         atomic_write_text(path, DEFAULT_EMBED_INSTRUCTION, encoding="utf-8")
         logger.info("Created default embed_instruction.md")
         return DEFAULT_EMBED_INSTRUCTION
-
-    def _find_legacy_embed_instruction_source(self) -> Path | None:
-        """旧 base パーティション群から embed_instruction.md の移行元を探す。
-
-        embed_instruction は本来 base モデルと独立のはずが、旧実装では base
-        パーティション (prompt_manager.prompt_dir) に同居していた。base モデルを
-        複数回切り替えた履歴がある場合、active なモデルのものだけを見ると、
-        過去に切り替えた別モデル配下でより進化した instruction を見落とし
-        永久に不可視化する (2026-07-18 のレビューで判明)。resolver が使える
-        場合は全 base パーティションを走査し、更新日時が最も新しいものを選ぶ
-        (どのモデルが「最も進化しているか」を厳密には判定できないため、直近の
-        Level 1 サイクルで更新されたものを優先する近似)。
-        """
-        legacy_path = self.prompt_manager.prompt_dir / "embed_instruction.md"
-        candidates: set[Path] = set()
-        if legacy_path.exists():
-            candidates.add(legacy_path.resolve())
-        if self._resolver is not None:
-            learning_dir = self._resolver.resolve_local("learning_dir")
-            if learning_dir.is_dir():
-                candidates.update(
-                    p.resolve()
-                    for p in learning_dir.glob("*/prompts/embed_instruction.md")
-                )
-        if not candidates:
-            return None
-        return max(candidates, key=lambda p: p.stat().st_mtime)
 
     def _save_embed_instruction(self, content: str) -> None:
         """embed_instruction.md を保存（保護セクション検証付き）"""
@@ -3199,7 +3169,7 @@ class LearningScheduler:
         try:
             from backend.config import get_path_resolver
             resolver = get_path_resolver()
-            patterns_file = resolver.resolve_learning("learned_patterns_file")
+            patterns_file = resolver.resolve_local("learned_patterns_file")
             store.save(patterns_file)
         except Exception:
             logger.warning("tool routing pattern persistence failed")
@@ -3269,7 +3239,7 @@ class LearningScheduler:
         try:
             from backend.config import get_path_resolver
             resolver = get_path_resolver()
-            patterns_file = resolver.resolve_learning("learned_patterns_file")
+            patterns_file = resolver.resolve_local("learned_patterns_file")
             store.save(patterns_file)
         except Exception:
             logger.warning("long_form pattern persistence failed")
@@ -3291,7 +3261,6 @@ class LearningScheduler:
         self,
         is_user_active: bool,
         lora_path: Path | None = None,
-        current_model: str = "",
         base_model_path: Path | None = None,
         force: bool = False,
     ) -> bool:
@@ -3303,8 +3272,8 @@ class LearningScheduler:
         Args:
             is_user_active: ユーザーがアクティブかどうか
             lora_path: ベースモデル LoRA アダプタパス
-            current_model: 現在のベースモデルファイル名（base_model フィルタ用）
-            base_model_path: ベースモデル GGUF パス（LoRA ターゲット自動判定用）
+            base_model_path: ベースモデル GGUF パス（LoRA ターゲット自動判定用。
+                経験の絞り込みに使う ``model_key`` もこのモデルから導く）
             force: overdue クールダウンを無視して即時試行する（手動トリガ用）。
                 データ量・実行中・アダプタ互換の各ゲートは維持する。
 
@@ -3320,7 +3289,6 @@ class LearningScheduler:
         return self._level2_runner.check_and_run(
             is_user_active=is_user_active,
             lora_path=lora_path,
-            current_model=current_model,
             base_model_path=base_model_path,
             force=force,
         )

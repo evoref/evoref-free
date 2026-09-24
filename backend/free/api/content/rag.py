@@ -42,6 +42,7 @@ from backend.free.rag.text_extractor import (
     extract_text_from_bytes,
     parse_csv_bytes_to_chunks,
 )
+from backend.utils import parse_utc
 
 logger = get_logger("api.rag")
 
@@ -69,14 +70,14 @@ _KEEP_SUFFIXES = {".txt", ".md", ".csv"}
 _UNSAFE_NAME_RE = re.compile(r'[\\/:*?"<>|]+')
 
 
-def _content_sha8(text: str) -> str:
-    """文書本文の sha256 (UTF-8) の先頭 8 hex。
+def manual_package_id(text: str) -> str:
+    """手動投入のパッケージ id: ``manual-`` + 文書本文の sha256 (UTF-8) の先頭 8 hex。
 
     ``compute_content_digest`` ではなく :mod:`hashlib` を直接使う。あちらは
     ``docs/`` 配下の**相対パスも**ハッシュに食わせるので、同じ本文でも
     ファイル名が違えば別の値になり、「同じ文書は同じパッケージ」にならない。
     """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    return f"{MANUAL_PACKAGE_PREFIX}{hashlib.sha256(text.encode('utf-8')).hexdigest()[:8]}"
 
 
 def _safe_doc_name(filename: str, suffix: str) -> str:
@@ -142,7 +143,7 @@ async def ingest_document(
 
     cfg = get_config()
     meta = PackageMeta(
-        id=f"{MANUAL_PACKAGE_PREFIX}{_content_sha8(doc_text)}",
+        id=manual_package_id(doc_text),
         name=file.filename,
         version=MANUAL_PACKAGE_VERSION,
         language=str((cfg.get("i18n") or {}).get("locale") or "ja"),
@@ -156,7 +157,7 @@ async def ingest_document(
         zip_path = Path(tmp) / package_filename(meta)
         try:
             write_package({doc_name: doc_text}, zip_path, meta)
-            info = await manager.install(zip_path, embedder=state.embedder)
+            info = await manager.install(zip_path, embedder=state.embedder, internal=True)
         except PackageError as exc:
             # 「文書が無い」「チャンクが 0 件」はどちらも投入内容の問題。
             logger.warning("Manual ingest rejected %s: %s", file.filename, exc)
@@ -213,7 +214,11 @@ async def get_rag_stats(state: AppState = Depends(get_app_state)):
     stored_model = next(
         (p.embedding_model_id for p in packages if p.embedding_model_id), None,
     )
-    stamps = sorted(p.installed_at for p in packages if p.installed_at)
+    # 文字列の辞書順で並べない (c_05 §0.5.4) — datetime で並べて元の文字列を返す。
+    stamps = sorted(
+        (p.installed_at for p in packages if parse_utc(p.installed_at) is not None),
+        key=parse_utc,
+    )
 
     sources = [
         RagSourceInfo(

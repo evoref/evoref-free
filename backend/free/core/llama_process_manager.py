@@ -81,24 +81,21 @@ def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | Non
     spec.loader.exec_module(mod)
 
     if component == "base":
-        # 学習済み base LoRA は (モデル×モード) パーティション配下にあるため、
-        # build_llama_cmd 内の flat フォールバックでは拾えない。解決 + 互換検証を
-        # 共有述語へ委譲し、モード切替経路 (backend.free.api.config.mode) と
-        # 同じ判断で --lora を付与する。
-        from backend.config import get_path_resolver, resolve_base_lora_for_launch
+        # 学習済みアダプタ (Pro) はモード切替経路 (backend.free.api.config.mode)
+        # と同じ取得口から、現在のモードの分を当てる (Free では無し)。
+        from backend.config import get_path_resolver
+        from backend.free.core.launch_adapters import adapters_for_launch
 
         try:
             mode = get_path_resolver().active_mode
         except RuntimeError:
             # config 未ロード (単体テスト等)。起動時の既定モードへ倒す。
             mode = "chat"
-        lora_override, lora_fallback = resolve_base_lora_for_launch(
-            cfg, project_root, mode,
-        )
+        adapters = adapters_for_launch(cfg, project_root, mode)
         return mod.build_llama_cmd(
             cfg, project_root,
-            lora_override=lora_override,
-            lora_fallback=lora_fallback,
+            lora_override=adapters.lora,
+            control_vector_override=adapters.control_vector,
         )
     if component == "embedding":
         return mod.build_embed_cmd(cfg, project_root)
