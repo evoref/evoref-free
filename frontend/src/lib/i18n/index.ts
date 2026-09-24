@@ -4,6 +4,7 @@ import en from './en.json';
 import { getLocales } from '$lib/free/api';
 import { performPromptLocaleSwitch } from '$lib/free/services/configService';
 import { addToast } from '$lib/free/stores/toast';
+import { loggedFetch as fetch } from '$lib/devlog';
 
 const messages: Record<string, Record<string, unknown>> = { ja, en };
 

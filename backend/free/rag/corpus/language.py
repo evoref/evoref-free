@@ -22,19 +22,29 @@ tree-sitter を使った 1 エントリぶんの実行可能性検証
 
 from __future__ import annotations
 
-import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from backend.free.rag.corpus.package import PACKAGE_ID_RE, PackageError
+from backend.free.rag.corpus.package import (
+    LANGUAGE_DIR,
+    PACKAGE_ID_RE,
+    PackageError,
+    PackageFormatError,
+    section_manifest_payload,
+    validate_section_feature,
+)
+from backend.io.versioned import read_versioned, read_versioned_bytes, write_versioned
 from backend.log_config import get_logger
 
 logger = get_logger("rag.corpus.language")
 
-#: セクション独自の manifest 版。``requires`` の ``"language/1"`` と一致させる
-#: (c_16 §4.5.1)。
-LANGUAGE_SCHEMA_VERSION = 1
+#: ``language/manifest.json`` の封筒 (c_16 §4.5.1)。版は ``requires`` の
+#: ``"language/<N>"`` と一致させる。``language.verify/1`` はこの manifest の中の
+#: 機能フラグで、manifest の版とは別に数える (c_16 §4.5.4)。台帳の宣言は ``corpus.store``。
+LANGUAGE_FORMAT_ID = "evoref.package.language"
+LANGUAGE_FORMAT_VERSION = 1
 
 LANGUAGE_MANIFEST_FILE = "manifest.json"
 
@@ -159,9 +169,8 @@ class LanguageEntry:
 
 @dataclass(frozen=True, slots=True)
 class LanguageManifest:
-    """``language/manifest.json`` 全体 (有効なエントリだけを持つ)。"""
+    """``language/manifest.json`` の ``payload`` (有効なエントリだけを持つ)。"""
 
-    schema_version: int
     entries: tuple[LanguageEntry, ...]
 
 
@@ -477,22 +486,16 @@ def _parse_entry(raw: Any, section_dir: Path, package_id: str) -> LanguageEntry 
 def parse_language_manifest(
     data: Any, section_dir: Path, package_id: str,
 ) -> LanguageManifest:
-    """``language/manifest.json`` の dict を検証済みの :class:`LanguageManifest` にする。
+    """``language/manifest.json`` の ``payload`` を検証済みの :class:`LanguageManifest` にする。
 
     無効なエントリはそのエントリだけ飛ばして件数を WARNING に出す (c_05 §0.5.2)。
+    封筒 (版) の検査は呼出側 (:func:`load_language_manifest` /
+    :func:`validate_language_install`) が済ませている。
     """
     if not isinstance(data, dict):
         raise LanguageManifestError(
             f"language manifest of package '{package_id}' must be a JSON object",
         )
-    schema_version = int(data.get("schema_version") or LANGUAGE_SCHEMA_VERSION)
-    if schema_version > LANGUAGE_SCHEMA_VERSION:
-        logger.warning(
-            "corpus package %s: language manifest schema_version %d is newer "
-            "than supported %d; ignoring language section",
-            package_id, schema_version, LANGUAGE_SCHEMA_VERSION,
-        )
-        return LanguageManifest(schema_version=schema_version, entries=())
 
     raw_entries = data.get("languages") or []
     if not isinstance(raw_entries, list):
@@ -514,26 +517,44 @@ def parse_language_manifest(
             "corpus package %s: skipped %d invalid language entry(ies)",
             package_id, skipped,
         )
-    return LanguageManifest(schema_version=schema_version, entries=tuple(entries))
+    return LanguageManifest(entries=tuple(entries))
+
+
+def write_language_manifest(section_dir: Path, languages: Sequence[dict[str, Any]]) -> Path:
+    """``<section_dir>/manifest.json`` を G1 の封筒で書く (パッケージを組む側、c_16 §4.5.1)。"""
+    path = Path(section_dir) / LANGUAGE_MANIFEST_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_versioned(
+        path, format_id=LANGUAGE_FORMAT_ID, format_version=LANGUAGE_FORMAT_VERSION,
+        payload={"languages": list(languages)}, component="corpus.language",
+        fsync=False, indent=2,
+    )
+    return path
 
 
 def load_language_manifest(
     section_dir: Path, package_id: str,
 ) -> LanguageManifest | None:
-    """``<section_dir>/manifest.json`` を読む (寛容: 開けなければ ``None``)。"""
+    """``<section_dir>/manifest.json`` を読む (無い・壊れていれば ``None``)。
+
+    封筒の無い (G0) / 新しい版の manifest は黙って空にせず
+    :class:`PackageFormatError` を送出する — 呼出側はパッケージの読み込みを
+    拒否する (c_16 §4.5.1)。
+    """
     path = section_dir / LANGUAGE_MANIFEST_FILE
-    if not path.is_file():
+    result = read_versioned(
+        path, format_id=LANGUAGE_FORMAT_ID, format_version=LANGUAGE_FORMAT_VERSION,
+    )
+    if result.status == "absent":
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(
-            "corpus package %s: unreadable language manifest %s: %s",
-            package_id, path, e,
+        payload = section_manifest_payload(
+            result, section=LANGUAGE_DIR, source=str(path),
+            format_version=LANGUAGE_FORMAT_VERSION, error=LanguageManifestError,
         )
-        return None
-    try:
-        return parse_language_manifest(data, section_dir, package_id)
+        return parse_language_manifest(payload, section_dir, package_id)
+    except PackageFormatError:
+        raise
     except LanguageManifestError as e:
         logger.warning(
             "corpus package %s: invalid language manifest: %s", package_id, e,
@@ -541,39 +562,51 @@ def load_language_manifest(
         return None
 
 
-def validate_language_install(directory: Path, package_id: str) -> None:
+def validate_language_install(
+    directory: Path, package_id: str, requires: Sequence[str],
+) -> None:
     """install 時の拒否判定 (c_16 §4.5.1)。
 
     ``language/`` セクションを ``provides`` しているのに ``manifest.json`` が
-    無い、または JSON として壊れている場合は install を拒否する。
+    無い / 壊れている / G1 の封筒でない / 新しい版 / 版が ``requires`` の
+    ``language/<N>`` と一致しない場合は install を拒否する。
     """
-    from backend.free.rag.corpus.package import LANGUAGE_DIR
-
     section_dir = directory / LANGUAGE_DIR
     if not section_dir.is_dir():
         return
+    source = f"{LANGUAGE_DIR}/{LANGUAGE_MANIFEST_FILE}"
     manifest_path = section_dir / LANGUAGE_MANIFEST_FILE
     if not manifest_path.is_file():
         raise LanguageManifestError(
-            f"package '{package_id}' provides language but "
-            f"{LANGUAGE_DIR}/{LANGUAGE_MANIFEST_FILE} is missing",
+            f"package '{package_id}' provides language but {source} is missing",
         )
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+        data = manifest_path.read_bytes()
+    except OSError as e:
         raise LanguageManifestError(
             f"package '{package_id}' has an unreadable language manifest: {e}",
         ) from e
+    # 取り込み中の版は data_health に載せない (拒否すれば版ごと消える)
+    result = read_versioned_bytes(
+        data, format_id=LANGUAGE_FORMAT_ID, format_version=LANGUAGE_FORMAT_VERSION,
+    )
+    payload = section_manifest_payload(
+        result, section=LANGUAGE_DIR, source=source,
+        format_version=LANGUAGE_FORMAT_VERSION, error=LanguageManifestError,
+    )
+    validate_section_feature(requires, LANGUAGE_DIR, LANGUAGE_FORMAT_VERSION, package_id)
     # ここは検証だけ (結果は _open_package / _build_version が改めて読む)。
-    parse_language_manifest(data, section_dir, package_id)
+    parse_language_manifest(payload, section_dir, package_id)
 
 
 def load_language_for_package(
     directory: Path, package_id: str,
 ) -> tuple[LanguageEntry, ...]:
-    """版ディレクトリの ``language/`` を開く (open 時に常駐させる、c_16 §4.5.1)。"""
-    from backend.free.rag.corpus.package import LANGUAGE_DIR
+    """版ディレクトリの ``language/`` を開く (open 時に常駐させる、c_16 §4.5.1)。
 
+    Raises:
+        PackageFormatError: manifest が G1 の封筒でない (G0) / 新しい版。
+    """
     section_dir = directory / LANGUAGE_DIR
     if not section_dir.is_dir():
         return ()
@@ -693,8 +726,9 @@ __all__ = [
     "BUNDLED_GRAMMAR_NAMES",
     "IMPORT_RESOLVE_VALUES",
     "IMPORT_SPECIFIER_VALUES",
+    "LANGUAGE_FORMAT_ID",
+    "LANGUAGE_FORMAT_VERSION",
     "LANGUAGE_MANIFEST_FILE",
-    "LANGUAGE_SCHEMA_VERSION",
     "MAX_QUERY_BYTES",
     "VERIFY_ARG_PLACEHOLDERS",
     "ImportRule",
@@ -711,4 +745,5 @@ __all__ = [
     "parse_verify_command",
     "resolve_pack_language_entry",
     "validate_language_install",
+    "write_language_manifest",
 ]

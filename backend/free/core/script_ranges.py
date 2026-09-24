@@ -18,8 +18,9 @@
 内容語抽出の「漢字の連なりか」は別の判定)。禁じるのは **名前を持たない生の
 レンジ** で、それが偶然の差分の温床だった。
 
-このモジュールは **import を一切持たない**。`core/text_quality.py` のように
-意図的に無依存なモジュールからも引けるようにするため (循環を作らない)。
+このモジュールは **プロジェクト内の import を一切持たない** (標準ライブラリのみ)。
+`core/text_quality.py` のように意図的に無依存なモジュールからも引けるように
+するため (循環を作らない)。
 値は文字クラス ``[...]`` の **中身** (角括弧なし) なので、そのまま連結できる::
 
     from backend.free.core.script_ranges import HIRAGANA, KATAKANA, KANJI
@@ -32,6 +33,7 @@
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Final
 
 #: ひらがな (U+3041 ぁ 〜 U+3096 ゖ)。``ゔ`` ``ゕ`` ``ゖ`` を含む。
@@ -74,6 +76,36 @@ KATAKANA_BLOCK: Final = "゠-ヿ"
 #: 和文文字 (ひらがな + カタカナ + 漢字)。「日本語で書かれているか」の既定。
 JAPANESE: Final = HIRAGANA + KATAKANA + KANJI
 
+
+def _encodable(ch: str, codec: str) -> bool:
+    try:
+        ch.encode(codec)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+@cache
+def simplified_only_hanzi() -> str:
+    """日本語の文字集合に無い簡体字 (文字クラスの中身、約 3,400 字)。
+
+    **GB2312 にあり cp932 (JIS X 0208 + NEC/IBM 拡張) に無い** 統合漢字を
+    符号表から導出する。以前は手書きの 30 字だったが、網目が粗く「处」「细」を
+    見逃し (2026-09-21 ライブ監査 C04「处理后」)、逆に常用漢字の「没」を載せて
+    「没頭」「出没」を中国語混入と誤判定していた。語を 1 字ずつ足す方向では
+    直さない (不変則 #12 / #14)。
+
+    JIS X 0213 (第 3・4 水準) は基準に採らない — 「么」「你」「关」のような
+    中国語の高頻度字がそこに入っており、除外すると検出が落ちる。日本語の
+    文書 (docs/ / i18n / 既定トリガ) では導出集合の字は 0 件だった。
+    初回呼出で約 40 ms かかるので遅延評価してキャッシュする。
+    """
+    return "".join(
+        ch for ch in map(chr, range(0x4E00, 0xA000))
+        if _encodable(ch, "gb2312") and not _encodable(ch, "cp932")
+    )
+
+
 __all__ = [
     "HALFWIDTH_KATAKANA",
     "HIRAGANA",
@@ -88,4 +120,5 @@ __all__ = [
     "KATAKANA_BLOCK",
     "KATAKANA_WORD",
     "PROLONGED",
+    "simplified_only_hanzi",
 ]

@@ -3,13 +3,12 @@
 `backend/free/api/model.py` の各ハンドラに直書きされていた以下のロジックを
 純粋関数群として抽出:
 - `ModelDetailResponse` の構築 (client metadata 有無の 2 分岐)
-- LoRA アダプタファイルの絶対パス解決
 - migration history の `MigrationHistoryItem` マッピング
 - `MigrationError` / `MigrationBusyError` → `HTTPException` 変換
 
 レイヤー責務:
 - `model.py` (API 層)         — HTTP / FastAPI / ModelMigrator / ModelState 取得
-- `_model_helpers.py` (helper) — 純粋構築 / パス解決 / マッピング / エラー変換
+- `_model_helpers.py` (helper) — 純粋構築 / マッピング / エラー変換
 
 `HTTPException` ビルダーは FastAPI に依存するが、`detail` dict 構築自体は
 `_theme_errors.theme_error_detail` と同じパターン (純粋関数 + HTTPException
@@ -18,8 +17,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -28,9 +26,6 @@ from backend.free.api.schemas import (
     MigrationHistoryItem,
     ModelDetailResponse,
 )
-
-if TYPE_CHECKING:
-    pass
 
 
 # ── ModelDetailResponse ビルダー ──────────────────────────────────────
@@ -71,22 +66,7 @@ def build_model_detail_response(
     )
 
 
-# ── LoRA パス解決 + Migration History ──────────────────────────────────
-
-
-def resolve_lora_path(
-    local_paths: dict[str, Any],
-    project_root: Path,
-) -> Path:
-    """`config.local_paths.lora_adapter` を絶対パスとして解決する純粋関数。
-
-    既に絶対パスならそのまま `Path` 化、相対パスなら `project_root` 配下に解決。
-    既定値は `local/models/adapter.gguf`。
-    """
-    lora_path = Path(local_paths.get("lora_adapter", "local/models/adapter.gguf"))
-    if lora_path.is_absolute():
-        return lora_path
-    return project_root / lora_path
+# ── Migration History ──────────────────────────────────────────────
 
 
 def map_migration_history_items(
@@ -94,15 +74,12 @@ def map_migration_history_items(
 ) -> list[MigrationHistoryItem]:
     """`ModelState.migration_history` を `MigrationHistoryItem` リストに
     変換する純粋関数。
-
-    各要素の `lora_archived_to` 属性の真偽で `lora_archived` を決定する。
     """
     return [
         MigrationHistoryItem(
             from_model=h.from_model,
             to_model=h.to_model,
             migrated_at=h.migrated_at,
-            lora_archived=bool(h.lora_archived_to),
         )
         for h in history
     ]

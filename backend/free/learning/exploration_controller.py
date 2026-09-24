@@ -8,12 +8,15 @@ LLM 不要。numpy のみ。
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from backend.free.learning.json_state_store import JsonPayload, JsonStateStore
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import JsonPayload, VersionedJsonFile
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -38,7 +41,31 @@ DROP_THRESHOLD: float = 0.1
 WINDOW_SIZE: int = 5
 
 
-class ExplorationController(JsonStateStore):
+@persisted()
+@dataclass
+class ExplorationState:
+    """1 つの ``(domain, mode)`` の探索状態 (ペイロードの ``"<domain>:<mode>"`` の値)。"""
+
+    sigma: float = SIGMA_MAX
+    phase: str = "explore"
+    _extra: dict[str, Any] | None = None
+
+
+#: ペイロードは ``{"<domain>:<mode>": ExplorationState}``。``:`` を含まないキーは
+#: この版が知らないトップのキーとして原形のまま書き戻す。
+EXPLORATION_FORMAT = register_format(FormatSpec(
+    format_id="learning.exploration",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/exploration_state.json",
+    retention="one per partition",
+    export=True,
+    records=(ExplorationState,),
+))
+
+
+class ExplorationController(VersionedJsonFile):
     """探索/活用バランスの適応制御
 
     PolicyEvolver および Darwinian Evolver の変異スケール（σ）を
@@ -49,35 +76,33 @@ class ExplorationController(JsonStateStore):
     - 遷移モード: 中間（分散に基づく線形補間）
     """
 
+    FORMAT = EXPLORATION_FORMAT
     _state_logger = logger
 
     def __init__(self, debug_logger: DebugLogger | None = None) -> None:
         self._debug_logger = debug_logger
-        # (domain, mode) → {"sigma": float, "phase": str}
-        self._state: dict[tuple[str, str], dict] = {}
+        # (domain, mode) → 探索状態
+        self._state: dict[tuple[str, str], ExplorationState] = {}
+        # 読んだファイルの ``domain:mode`` でないトップのキー (書き戻しで戻す)。
+        self._payload_extra: dict[str, Any] = {}
 
     def reset(self) -> None:
         """全 (domain, mode) の探索状態を初期化する (パーティション切替用)。"""
         self._state.clear()
+        self._payload_extra = {}
 
     def get_mutation_scale(self, domain: str, mode: str) -> float:
         """現在の変異スケール（σ）を返す
 
         初期状態（履歴なし）は SIGMA_MAX（探索モード）を返す。
         """
-        key = (domain, mode)
-        state = self._state.get(key)
-        if state is None:
-            return SIGMA_MAX
-        return state.get("sigma", SIGMA_MAX)
+        state = self._state.get((domain, mode))
+        return SIGMA_MAX if state is None else state.sigma
 
     def get_phase(self, domain: str, mode: str) -> str:
         """現在のフェーズを返す（"explore" | "exploit" | "transition" | "explore_reset"）"""
-        key = (domain, mode)
-        state = self._state.get(key)
-        if state is None:
-            return "explore"
-        return state.get("phase", "explore")
+        state = self._state.get((domain, mode))
+        return "explore" if state is None else state.phase
 
     def update(
         self,
@@ -95,7 +120,7 @@ class ExplorationController(JsonStateStore):
         key = (domain, mode)
 
         if len(fitness_history) < 2:
-            self._state[key] = {"sigma": SIGMA_MAX, "phase": "explore"}
+            self._set(key, SIGMA_MAX, "explore")
             return
 
         recent = fitness_history[-min(WINDOW_SIZE, len(fitness_history)):]
@@ -127,7 +152,7 @@ class ExplorationController(JsonStateStore):
             sigma = SIGMA_MIN + ratio * (SIGMA_MAX - SIGMA_MIN)
             phase = "transition"
 
-        self._state[key] = {"sigma": sigma, "phase": phase}
+        self._set(key, sigma, phase)
         logger.debug(
             "Exploration updated: domain=%s, mode=%s, "
             "sigma=%.4f, phase=%s, variance=%.6f",
@@ -148,19 +173,28 @@ class ExplorationController(JsonStateStore):
                 "history_len": len(fitness_history),
             })
 
+    def _set(self, key: tuple[str, str], sigma: float, phase: str) -> None:
+        """状態を更新する (読んだ状態の未知キーは残す)。"""
+        state = self._state.get(key)
+        if state is None:
+            self._state[key] = ExplorationState(sigma=sigma, phase=phase)
+        else:
+            state.sigma, state.phase = sigma, phase
+
     def get_status(self) -> dict[str, dict]:
         """全ドメイン・モードの状態を返す"""
         return {
-            f"{d}:{m}": s
+            f"{d}:{m}": {"sigma": s.sigma, "phase": s.phase}
             for (d, m), s in self._state.items()
         }
 
-    # ── 永続化 (JsonStateStore) ──
+    # ── 永続化 (VersionedJsonFile) ──
 
     def _to_payload(self) -> JsonPayload:
+        codec = codec_for(ExplorationState)
         return {
-            f"{d}:{m}": s
-            for (d, m), s in self._state.items()
+            **{f"{d}:{m}": codec.encode(s) for (d, m), s in self._state.items()},
+            **self._payload_extra,
         }
 
     def _from_payload(self, payload: JsonPayload) -> None:
@@ -169,11 +203,23 @@ class ExplorationController(JsonStateStore):
                 f"exploration_state.json must be a dict, "
                 f"got {type(payload).__name__}"
             )
-        self._state.clear()
-        for key_str, state in payload.items():
-            parts = key_str.split(":", 1)
-            if len(parts) == 2:
-                self._state[(parts[0], parts[1])] = state
+        codec = codec_for(ExplorationState)
+        state: dict[tuple[str, str], ExplorationState] = {}
+        extra: dict[str, Any] = {}
+        skipped = 0
+        for key_str, value in payload.items():
+            domain, sep, mode = key_str.partition(":")
+            if not sep:
+                extra[key_str] = value
+                continue
+            try:
+                state[(domain, mode)] = codec.decode(value)
+            except CodecError:
+                skipped += 1
+        if skipped:
+            logger.warning("Skipped %d unreadable exploration state(s)", skipped)
+        self._state = state
+        self._payload_extra = extra
 
     def _on_save_success(self, path: Path) -> None:
         logger.debug("Exploration state saved: %s", path)

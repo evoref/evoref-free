@@ -1,4 +1,4 @@
-"""``local/`` に保存済みの「出力上限」注記をアシスタント本文から取り除く。
+"""データ根に保存済みの「出力上限」注記をアシスタント本文から取り除く。
 
 2026-08-25 まで、``finish_reason="length"`` の開示注記は content ストリームへ
 ``yield`` されており、応答本文の一部として履歴 / STM / 経験バッファへ保存されて
@@ -16,7 +16,9 @@
     python scripts\\strip_truncation_notice.py            # dry-run (既定)
     python scripts\\strip_truncation_notice.py --apply    # 実際に書き換える
 
-``--apply`` は書き換え前に ``<file>.bak`` を作る。
+``--apply`` は書き換え前に ``<file>.bak`` を作る。走査の既定はデータ根
+(``--data-root`` → ``EVOREF_DATA_ROOT`` → ``<repo>/userdata``)。``local/`` (G0) は
+走査しない。
 """
 
 from __future__ import annotations
@@ -27,6 +29,12 @@ from pathlib import Path
 import re
 import shutil
 import sys
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from backend.data_root import resolve_data_root  # noqa: E402
 
 #: 注記の JSON エスケープ表記パターン。保存形は必ず
 #: ``…本文\n\n> ⚠ <警告文>`` で、値の終端 (``"``) か次の ``\n`` の手前で終わる。
@@ -43,7 +51,7 @@ NOTICE_RE = re.compile(
     r"[^\"\\]*",
 )
 
-#: 走査対象。``local/logs`` は診断記録なので触らない (注記が出た事実の証跡)。
+#: 走査対象。データ根の ``logs/`` は診断記録なので触らない (注記が出た事実の証跡)。
 SCAN_SUFFIXES = (".json", ".jsonl")
 
 
@@ -79,12 +87,16 @@ def main(argv: list[str] | None = None) -> int:
         help="実際に書き換える (既定は dry-run)",
     )
     parser.add_argument(
-        "--root", default="local",
-        help="走査するルート (既定: local)",
+        "--root", default=None,
+        help="走査するルート (既定: データ根)",
+    )
+    parser.add_argument(
+        "--data-root", default=None,
+        help="データ根 (既定: EVOREF_DATA_ROOT → <repo>/userdata)。--root 省略時に走査する",
     )
     args = parser.parse_args(argv)
 
-    root = Path(args.root)
+    root = Path(args.root) if args.root else resolve_data_root(args.data_root, root=REPO_ROOT)
     if not root.is_dir():
         print(f"not a directory: {root}", file=sys.stderr)
         return 1

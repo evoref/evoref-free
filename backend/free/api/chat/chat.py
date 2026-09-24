@@ -88,6 +88,7 @@ from backend.free.api.chat._continuation import (
 )
 from backend.edition import is_pro
 from backend.free.core.inference import latest_turn_truncation
+from backend.free.core.turn_text import neutralize_frame_markers
 from backend.free.core.intent_vocab import is_today_scope_query, is_whole_session_scope_query
 from backend.free.core.session_mode import (
     is_create_mode,
@@ -217,13 +218,6 @@ def _validate_chat_request(req: ChatRequest) -> None:
             detail=f"Message too long: {len(req.message)} chars (max {MAX_MESSAGE_LENGTH})",
         )
 
-    # 旧名 ("coding") は現行名へ正規化してから通す。``canonicalize_session_mode``
-    # の docstring が「API 受信など入口で使う」と定めている互換で、
-    # ``LEGACY_SESSION_MODES`` も「旧クライアントからの受信を読めるように
-    # するための入口互換」と書いているのに、**どの入口でも呼ばれていなかった**
-    # (2026-09-03 ライブ監査: mode="coding" が 10 ターンすべて
-    # ``HTTP 400 Invalid mode: coding``)。req.mode を現行名へ書き換えるので
-    # 下流の ``is_create_mode`` 等はそのまま効く。
     canonical_mode = canonicalize_session_mode(req.mode)
     if canonical_mode is None:
         raise HTTPException(status_code=400, detail=f"Invalid mode: {req.mode}")
@@ -1454,9 +1448,11 @@ def _build_sources_frame(
     items: list[dict] = []
     for chunk_id, score, content in scored_chunks:
         is_corpus = ":" in chunk_id
-        evidence_id = chunk_id.split(":", 1)[1] if is_corpus else chunk_id
+        package_id, _, evidence_id = chunk_id.partition(":") if is_corpus else ("", "", chunk_id)
         item: dict = {
-            "id": f"{'corpus' if is_corpus else 'episodic'}:{evidence_id}",
+            # corpus は ``corpus:<pkg>@<ver>:<id>`` (bare な id 参照は禁止、c_05 §0.5.5)。
+            # 版は所在を引けたときに埋める。
+            "id": f"corpus:{package_id}@:{evidence_id}" if is_corpus else f"episodic:{evidence_id}",
             "store": "corpus" if is_corpus else "episodic",
             "package_id": "",
             "package_name": "",
@@ -1474,6 +1470,7 @@ def _build_sources_frame(
                 item.update({k: described.get(k, "") for k in (
                     "package_id", "package_name", "doc_id", "heading",
                 )})
+                item["id"] = f"corpus:{package_id}@{described.get('version', '')}:{evidence_id}"
         items.append(item)
     if session_id:
         # 「この会話で参照した資料は」に答える台帳 (chat_service の会話計量)。
@@ -1525,7 +1522,7 @@ def _format_rag_block_for_meta(
     for i, (_chunk_id, score, text) in enumerate(
         scored_chunks[:_META_RAG_MAX_CHUNKS]
     ):
-        snippet = (text or "")[:_META_RAG_CHAR_CAP]
+        snippet = neutralize_frame_markers((text or "")[:_META_RAG_CHAR_CAP])
         if not snippet:
             continue
         parts.append(f"[参考情報 {i + 1}] (score={score:.2f})\n{snippet}")
@@ -2042,7 +2039,7 @@ class _ProductionStageSelector:
         """
         from pathlib import Path
         from types import SimpleNamespace
-        from uuid import uuid4
+        from backend.io.id_registry import new_id
 
         from backend.free.loop.staged import WorkspaceManager
 
@@ -2051,7 +2048,7 @@ class _ProductionStageSelector:
             or names_creation_target(req.instruction)
         ):
             return None
-        run_id = uuid4().hex[:12]
+        run_id = new_id("run_")
         create_dir = Path(get_path_resolver().resolve_local("create_workspace_dir"))
         ws = WorkspaceManager.open_or_create(
             create_dir, workspace_id=run_id, session_id=req.session_id,

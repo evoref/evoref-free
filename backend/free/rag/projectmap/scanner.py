@@ -13,12 +13,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.data_root import DEFAULT_DIRNAME, ISOLATED_DIRNAME
 from backend.free.rag.projectmap.aliases import ALIAS_CONFIG_BASENAMES
 
-#: 既定の除外ディレクトリ (c_16 §4.4)。
+#: 既定の除外ディレクトリ (c_16 §4.4)。データ根 (``userdata`` /
+#: ``userdata-isolated``、c_03 §10.1) と G0 の ``local`` は利用者の記憶ストアなので
+#: 索引しない。
 DEFAULT_EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".git", "node_modules", "__pycache__", ".venv", "venv", "models",
-    "local", "dist", "build", "htmlcov", "coverage",
+    "local", DEFAULT_DIRNAME, ISOLATED_DIRNAME, "dist", "build", "htmlcov", "coverage",
 })
 
 #: 拡張子 → tree-sitter 言語名 (c_16 §4.4 の対応言語)。

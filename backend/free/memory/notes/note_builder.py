@@ -29,15 +29,15 @@ import unicodedata
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
 
 import yaml
 
 from backend.free.core.correction_verdict import mask_quoted_speech
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.session_mode import is_create_mode
-from backend.free.core.text_quality import states_no_user_value
+from backend.free.core.text_quality import carries_no_assertion, states_no_user_value
 from backend.free.memory.types import MemoryMode, NoteSource
+from backend.io.id_registry import new_id
 from backend.log_config import get_logger
 from backend.free.core.script_ranges import (
     KANJI,
@@ -275,18 +275,24 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
     - ``slug: [trigger, ...]`` — ガード無し (従来形)
     - ``slug: {triggers: [...], requires_self_possessor: true, single_valued: true}``
 
+    ``requires_self_possessor: explicit`` は明示の所有格 (「X の色は」) だけを見る
+    (話題語からの推定をしない、:func:`_possessor_is_self`)。
+
     trigger が 1 つも無ければ ``None`` (呼出側がスキップする)。
     """
     patterns: tuple[re.Pattern[str], ...] = ()
     if isinstance(raw, dict):
         words = _coerce_triggers(raw.get("triggers"))
-        requires_self = bool(raw.get("requires_self_possessor", False))
+        guard = raw.get("requires_self_possessor", False)
+        requires_self = bool(guard)
+        explicit_only = guard == "explicit"
         single_valued = bool(raw.get("single_valued", False))
         multi_valued = bool(raw.get("multi_valued", False))
         patterns = _coerce_patterns(slug, raw.get("patterns"))
     else:
         words = _coerce_triggers(raw)
         requires_self = False
+        explicit_only = False
         single_valued = False
         multi_valued = False
     if not words and not patterns:
@@ -295,6 +301,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         slug=slug,
         triggers=words,
         requires_self_possessor=requires_self,
+        possessor_explicit_only=explicit_only,
         single_valued=single_valued,
         multi_valued=multi_valued,
         patterns=patterns,
@@ -531,7 +538,7 @@ def _last_topic_noun(before: str) -> str | None:
     return noun or None
 
 
-def _possessor_is_self(haystack: str, start: int) -> bool:
+def _possessor_is_self(haystack: str, start: int, *, explicit_only: bool = False) -> bool:
     """``haystack[start:]`` の trigger がユーザー自身のものか (純粋関数)。
 
     2 段で見る:
@@ -550,10 +557,14 @@ def _possessor_is_self(haystack: str, start: int) -> bool:
     どちらの段も **括弧の中身を見ない** (:func:`_mask_bracketed`)。読み仮名の
     「くが やま」の ``が`` を主題マーカーと読むと、自己紹介の名前が丸ごと
     落ちる。
+
+    ``explicit_only`` なら 1 だけを見る (所有格が無ければ本人のものとする)。
     """
     before = _mask_bracketed(haystack[:start])
     if _has_explicit_possessor(before):
         return bool(_SELF_POSSESSOR_RE.search(before))
+    if explicit_only:
+        return True
     topic = _last_topic_noun(before)
     return topic is None or topic in _SELF_NOUNS
 
@@ -684,6 +695,11 @@ class AttributeSpec:
     slug: str
     triggers: tuple[str, ...]
     requires_self_possessor: bool = False
+    #: 所有者ガードを **明示の所有格** (「X の色は」) だけで判定する。話題語からの
+    #: 推定 (「猫を飼っていて、名前は…」) は name のように暗黙の所有者が多い
+    #: スロット向けで、color では「最近は緑より紺色のほうが好き」の「最近」を
+    #: 所有者と読んで本人の好みを落とす (2026-09-23)。
+    possessor_explicit_only: bool = False
     #: 部分文字列では書けない **構造** の trigger (コンパイル済み正規表現)。
     #:
     #: 一致したとき抽出側へ返す語形は、named group ``anchor`` があればその
@@ -794,9 +810,36 @@ class AttributeSpec:
         stripped = strip_bracketed(haystack)
         return self._match_in(stripped) if stripped != haystack else ()
 
+    def _phrase_starts(self, haystack: str) -> dict[int, int]:
+        """trigger の出現位置 → **重なり合う出現をまとめた句の先頭** (所有者ガード用)。
+
+        「娘の好きな色は」には ``好きな色`` と ``色は`` が重なって現れる。短い方の
+        直前は「好きな」で所有者が無いので、出現ごとに見ると ``色は`` だけが
+        ガードを通り、娘の好きな色が本人の好きな色になっていた (2026-09-23)。
+        重なる出現は 1 つの句として、その先頭の所有者 (娘の) で判定する。
+        """
+        spans: list[tuple[int, int]] = []
+        for word in self.triggers:
+            for variant in self._variants(word) if word else ():
+                start = haystack.find(variant)
+                while start != -1:
+                    spans.append((start, start + len(variant)))
+                    start = haystack.find(variant, start + 1)
+        spans.sort()
+        head: dict[int, int] = {}
+        group_start, group_end = -1, -1
+        for start, end in spans:
+            if start < group_end:
+                group_end = max(group_end, end)
+            else:
+                group_start, group_end = start, end
+            head[start] = group_start
+        return head
+
     def _match_in(self, haystack: str) -> tuple[str, ...]:
         """``haystack`` に対する 1 回分の照合 (:meth:`match` の本体)。"""
         hit: list[str] = []
+        phrase_head = self._phrase_starts(haystack) if self.requires_self_possessor else {}
         for word in self.triggers:
             if not word:
                 continue
@@ -808,10 +851,14 @@ class AttributeSpec:
                     continue
                 # 所有者ガード付きは **出現ごと** に判定する。1 つでも自己所有の
                 # 出現があれば一致 (「猫の名前はソラで、私の名前は小川です」)。
+                # 所有者は重なる出現をまとめた句の先頭で見る (:meth:`_phrase_starts`)。
                 start = haystack.find(variant)
                 matched = False
                 while start != -1:
-                    if _possessor_is_self(haystack, start):
+                    if _possessor_is_self(
+                        haystack, phrase_head.get(start, start),
+                        explicit_only=self.possessor_explicit_only,
+                    ):
                         hit.append(variant)
                         matched = True
                         break
@@ -821,7 +868,7 @@ class AttributeSpec:
         for pattern in self.patterns:
             for m in pattern.finditer(haystack):
                 if self.requires_self_possessor and not _possessor_is_self(
-                    haystack, m.start(),
+                    haystack, m.start(), explicit_only=self.possessor_explicit_only,
                 ):
                     continue
                 anchor = m.groupdict().get("anchor") or m.group(0)
@@ -1087,6 +1134,50 @@ def is_multi_valued_subject(
         if spec.slug == parts[2]:
             return spec.multi_valued
     return False
+
+
+#: 本文から属性スロットを解く fact_type (``fact_attributes.yaml`` の節)。
+_STATEMENT_SLOT_FACT_TYPES = ("personal_fact", "preference")
+
+
+def single_attribute_slot(
+    text: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> str | None:
+    """本文が **1 つの (並列多値でない) 属性スロットだけ** を述べていればその slug。
+
+    言い直した値と前の値を「同じスロットの世代」として比べる判定 (純粋関数)。
+    エピソードの参考情報 (``search_pipeline``) と SemMem 注入 (``injector``) の
+    両方がこれを使う。
+
+    - 複数の属性を述べる本文 (自己紹介) は ``None`` — 1 つのスロットが新しく
+      なっただけで、他の属性まで巻き添えで落とさないため
+    - 並列多値のスロット (家族 / 予定 / 勤務先…) は ``None`` (値は世代では
+      なく別の事実、不変則 #13)
+    """
+    if triggers_dir is None:
+        triggers_dir = _DEFAULT_TRIGGERS_DIR
+    kinds = {v: k for k, v in _ATTR_FACT_TYPE_BY_KIND.items()}
+    found = {
+        (fact_type, slug)
+        for fact_type in _STATEMENT_SLOT_FACT_TYPES
+        for slug, _ in resolve_fact_attribute_matches(
+            text, fact_type, mode=mode, triggers_dir=triggers_dir,
+        )
+    }
+    slugs = {slug for _, slug in found}
+    if len(slugs) != 1:
+        return None
+    if any(
+        is_multi_valued_subject(
+            f"mem.{kinds[fact_type]}.{slug}", mode=mode, triggers_dir=triggers_dir,
+        )
+        for fact_type, slug in found
+    ):
+        return None
+    return next(iter(slugs))
 
 
 def states_single_valued_attribute(
@@ -1419,7 +1510,7 @@ class NoteBuilder:
 
         now = time.time()
         return {
-            "id": uuid4().hex[:12],
+            "id": new_id("ev_"),
             "content": content,
             "keywords": keywords,
             "tags": merged_tags,
@@ -1712,6 +1803,27 @@ class CreateNoteBuilder(_ModeAwareNoteBuilder):
 
 _CHAT_BUILDER = ChatNoteBuilder()
 _CREATE_BUILDER = CreateNoteBuilder()
+
+
+def restated_attribute_slot(text: str) -> str | None:
+    """本文が利用者の **1 つの単値スロットの値** を述べる自己開示ならその slug。
+
+    言い直した値を「同じスロットの新しい世代」として扱ってよいかの判定で、
+    エピソードの参考情報 (``search_pipeline``) と SemMem 注入 (``injector``) の
+    両方が使う。抽出 (sleep-time Step 8) と同じ判断にそろえる:
+
+    - 自己開示の候補 (:meth:`ChatNoteBuilder.candidate_fact_tags`) であること —
+      「空の色は青いですね」のような無関係な言及で世代を進めない
+    - 問いでも依頼でもないこと — 「好きな色は何色でしたか？」は同じスロットに
+      解決されるが値を持たない (2026-09-23 実機: 問いが「最新の言い直し」に
+      数えられ、正しいファクトを落としていた)
+    - 1 つの (並列多値でない) スロットだけを述べること (:func:`single_attribute_slot`)
+    """
+    if not text or carries_no_assertion(text) or states_no_user_value(text):
+        return None
+    if not _CHAT_BUILDER.candidate_fact_tags(text):
+        return None
+    return single_attribute_slot(text)
 
 
 def get_note_builder(mode: MemoryMode) -> NoteBuilder:

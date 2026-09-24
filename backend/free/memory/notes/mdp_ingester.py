@@ -1,12 +1,12 @@
 """
 
-``local/memory/agent_trace/agent_trace*.jsonl`` (``AgentTraceStore``) を
+``<data_root>/store/agent_trace/agent_trace*.jsonl`` (``AgentTraceStore``) を
 エピソード単位で読み出し、エピソード記憶 (EpisodicStore の long tier / RAG ベクトル
 DB) に取り込むためのアダプタ。
 
 設計の主旨
 
-- **入力**: ``local_paths.agent_trace_dir`` 配下の ``agent_trace*.jsonl``
+- **入力**: ``<data_root>/store/agent_trace/`` 配下の ``agent_trace*.jsonl``
   (日付ベースのファイル名 ``agent_trace_YYYY-MM-DD.jsonl`` なのでグロブで
   横断する)。develop フラグには依存しない (以前は DebugLogger の evolve 限定
   JSONL を読んでいたため通常運用ではエピソード記憶が生成されなかった)。
@@ -25,9 +25,15 @@ DB) に取り込むためのアダプタ。
   これにより ``private=True`` のトレースは scope=global / project どちらにも
   昇格しない
 - **オフセット管理**: ファイル末尾までのバイトオフセットを
-  ``local/memory/mdp_ingest_state.json`` に永続化する。次回呼び出しはオフセッ
+  ``<data_root>/store/memory/episodic/mdp_ingest_state.json`` に永続化する。次回呼び出しはオフセッ
   ト以降のみ読む。``processed_episode_ids`` も保持し、念のため二重昇格を防ぐ
-  (上限 ``max_processed_ids`` で FIFO)。
+  (上限 ``max_processed_ids`` で FIFO)。封筒付き (形式 ``mdp.ingest_state`` /
+  Step 8 用は ``mdp.extract_state``)。オフセットの鍵は今もファイル名 (ファイル
+  id を鍵にするのは G1 の後段)。state が readonly (新しい版 / G1 の封筒でない)
+  の間は **何も読まない** — 位置を残せないまま読むと、再起動のたびに同じ
+  エピソードを二度昇格させる。
+- **行の版**: 各行は ``_v`` を持つ。``_v`` の無い行は飛ばし、``_v`` が新しい行に
+  当たったらそのファイルはその行の手前で止める (位置を先へ進めない)。
 - **副作用ゼロ (基本)**: 本クラスはストレージ書き込みを行わない。
   呼び出し側 (``SleepTimeWorker._step7_5_ingest_mdp_traces``) が
   ``MemoryNote`` を受け取り、埋め込み計算と
@@ -49,7 +55,7 @@ from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.session_mode import normalize_session_mode
@@ -58,7 +64,9 @@ from backend.free.memory.extractors.mdp_trace import (
     strip_volatile_measurements,
 )
 from backend.free.memory.episodic.note import MemoryNote
-from backend.io import atomic_write_text
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 
 logger = get_logger("memory.mdp_ingester")
@@ -72,6 +80,12 @@ _MEMORY_READ_ACTIONS: frozenset[str] = frozenset({"search_history"})
 
 #: エピソード記憶に載せる観測値の上限。
 _OBSERVATION_MAX_CHARS = 300
+
+#: 読める ``agent_trace`` の行の版 (``_v``、c_05 §0.5.1)。書き手は Loop pillar の
+#: ``AgentTraceStore`` (形式 ``agent_trace`` の版と同じ値。Mem から Loop を import しない)。
+_TRACE_ROW_VERSION = 1
+#: :meth:`MDPIngester._parse_line` が「版が新しい行」を表す番兵。
+_NEWER_ROW = object()
 
 
 def _summarize_observation(observation: str) -> str:
@@ -106,9 +120,10 @@ def _summarize_observation(observation: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+@persisted()
 @dataclass
 class EpisodeRecord:
-    """1 エピソード分の生イベント集合。
+    """1 エピソード分の生イベント集合 (state の ``pending_episodes`` の項目でもある)。
 
     ``begin`` イベントが無いまま ``step``/``end`` だけが届いた場合は
     ``begin is None`` のままになる (debug_logger の書き出しが途中で
@@ -121,6 +136,8 @@ class EpisodeRecord:
     end: dict[str, Any] | None = None
     trace_id: str | None = None
     """``trace_id`` は最初に観測されたイベントから引き継ぐ"""
+    #: 保留を読み戻したときの、この版が知らないキー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
 
     def is_complete(self) -> bool:
         return self.end is not None
@@ -205,51 +222,91 @@ class EpisodeRecord:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+@persisted()
 @dataclass
 class IngestState:
-    """``mdp_ingest_state.json`` のメモリ表現。"""
+    """``mdp_ingest_state.json`` / ``mdp_extract_state.json`` の payload (コーデックの表)。"""
 
     file_offsets: dict[str, int] = field(default_factory=dict)
     processed_episode_ids: list[str] = field(default_factory=list)
-    pending_episodes: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """未終了エピソードの保留 (episode_id → serialized EpisodeRecord)"""
+    pending_episodes: dict[str, EpisodeRecord] = field(default_factory=dict)
+    """未終了エピソードの保留 (episode_id → EpisodeRecord)"""
+    #: この版が知らないキー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "file_offsets": dict(self.file_offsets),
-            "processed_episode_ids": list(self.processed_episode_ids),
-            "pending_episodes": dict(self.pending_episodes),
-        }
+        return _STATE_CODEC.encode(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> IngestState:
-        return cls(
-            file_offsets={
-                str(k): int(v) for k, v in (d.get("file_offsets") or {}).items()
-            },
-            processed_episode_ids=list(d.get("processed_episode_ids") or []),
-            pending_episodes=dict(d.get("pending_episodes") or {}),
-        )
+        """payload から復元する。保留の項目は 1 件ずつ読み、形の崩れた項目だけを飛ばす。"""
+        if not isinstance(d.get("pending_episodes") or {}, dict):
+            raise CodecError("IngestState.pending_episodes: expected an object")
+        state = _STATE_CODEC.decode({k: v for k, v in d.items() if k != "pending_episodes"})
+        skipped = 0
+        for key, value in (d.get("pending_episodes") or {}).items():
+            try:
+                state.pending_episodes[key] = _EPISODE_CODEC.decode(value)
+            except CodecError:
+                skipped += 1
+        if skipped:
+            logger.warning("Skipped %d malformed pending episode(s) in the MDP state", skipped)
+        return state
 
 
-def _serialize_episode(ep: EpisodeRecord) -> dict[str, Any]:
-    return {
-        "episode_id": ep.episode_id,
-        "begin": ep.begin,
-        "steps": ep.steps,
-        "end": ep.end,
-        "trace_id": ep.trace_id,
-    }
+_EPISODE_CODEC = codec_for(EpisodeRecord)
+_STATE_CODEC = codec_for(IngestState)
+
+MDP_INGEST_STATE_FORMAT = register_format(FormatSpec(
+    format_id="mdp.ingest_state",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/memory/mdp_ingest_state.json",
+    retention="processed_episode_ids FIFO (max_processed_ids), pending cap",
+    records=(IngestState,),
+))
+
+MDP_EXTRACT_STATE_FORMAT = register_format(FormatSpec(
+    format_id="mdp.extract_state",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/memory/mdp_extract_state.json",
+    retention="processed_episode_ids FIFO (max_processed_ids), pending cap",
+    records=(IngestState,),
+))
 
 
-def _deserialize_episode(d: dict[str, Any]) -> EpisodeRecord:
-    return EpisodeRecord(
-        episode_id=str(d.get("episode_id") or ""),
-        begin=d.get("begin"),
-        steps=list(d.get("steps") or []),
-        end=d.get("end"),
-        trace_id=d.get("trace_id"),
-    )
+class _IngestStateFile(VersionedJsonFile):
+    """Step 7.5 (エピソード記憶への昇格) の state (形式 ``mdp.ingest_state``)。"""
+
+    FORMAT = MDP_INGEST_STATE_FORMAT
+    _state_logger = logger
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.state = IngestState()
+
+    def _to_payload(self) -> dict[str, Any]:
+        return self.state.to_dict()
+
+    def _from_payload(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            raise TypeError("MDP ingest state payload must be an object")
+        self.state = IngestState.from_dict(payload)
+
+
+class _ExtractStateFile(_IngestStateFile):
+    """Step 8 (``MDPTraceExtractor``) の state (形式 ``mdp.extract_state``)。"""
+
+    FORMAT = MDP_EXTRACT_STATE_FORMAT
+
+
+_STATE_FILES: dict[str, type[_IngestStateFile]] = {
+    "ingest": _IngestStateFile,
+    "extract": _ExtractStateFile,
+}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -262,10 +319,12 @@ class MDPIngester:
     に変換するアダプタ。
 
     Args:
-        log_dir: ``AgentTraceStore`` の常設ディレクトリ (``local_paths.agent_trace_dir``)。
+        log_dir: ``AgentTraceStore`` の常設ディレクトリ (``resolve_local("agent_trace_dir")``)。
             ``None`` の場合 ``collect_episodes`` は常に空リストを返す。
-        state_path: オフセット永続化先 (``local/memory/mdp_ingest_state.json``)
+        state_path: オフセット永続化先 (``store/memory/episodic/mdp_ingest_state.json``)
         file_pattern: グロブパターン。デフォルトで日付ファイルを含む
+        state_kind: state の形式。Step 7.5 は ``"ingest"``
+            (``mdp.ingest_state``)、Step 8 は ``"extract"`` (``mdp.extract_state``)
         max_processed_ids: ``processed_episode_ids`` を FIFO 上限で切り詰める
         max_pending_episodes: 保留エピソードの上限 (それ以上は古い順に廃棄)
     """
@@ -278,12 +337,17 @@ class MDPIngester:
         file_pattern: str = "agent_trace*.jsonl",
         max_processed_ids: int = 10000,
         max_pending_episodes: int = 1000,
+        state_kind: Literal["ingest", "extract"] = "ingest",
     ) -> None:
         self.log_dir = Path(log_dir) if log_dir is not None else None
         self.state_path = Path(state_path) if state_path is not None else None
         self.file_pattern = file_pattern
         self.max_processed_ids = max_processed_ids
         self.max_pending_episodes = max_pending_episodes
+        self._state_file = (
+            _STATE_FILES[state_kind](self.state_path)
+            if self.state_path is not None else None
+        )
         self._state = self._load_state()
 
     @property
@@ -291,29 +355,26 @@ class MDPIngester:
         """処理済み (昇格 / 除外を問わず読み終えた) episode_id の数。"""
         return len(self._state.processed_episode_ids)
 
+    @property
+    def readonly(self) -> bool:
+        """state を書き戻すと壊す (新しい版 / G1 の封筒でない) — この間は読まない。"""
+        return self._state_file is not None and self._state_file.readonly
+
     # ─── state I/O ────────────────────────────────────────────────────────
 
     def _load_state(self) -> IngestState:
-        if self.state_path is None or not self.state_path.exists():
+        """state を読む。無い / 読めない / readonly なら空の state。"""
+        if self._state_file is None:
             return IngestState()
-        try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return IngestState.from_dict(data)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("MDPIngester: failed to load state %s: %s", self.state_path, exc)
-        return IngestState()
+        self._state_file.load()
+        return self._state_file.state
 
     def _save_state(self) -> None:
-        if self.state_path is None:
+        """state を封筒付きで書く。失敗はログに出して続ける (sleep-time を止めない)。"""
+        if self._state_file is None or self._state_file.readonly:
             return
-        try:
-            atomic_write_text(
-                self.state_path,
-                json.dumps(self._state.to_dict(), ensure_ascii=False, indent=2),
-            )
-        except OSError as exc:
-            logger.warning("MDPIngester: failed to save state %s: %s", self.state_path, exc)
+        self._state_file.state = self._state
+        self._state_file.save()
 
     # ─── 公開 API ─────────────────────────────────────────────────────────
 
@@ -330,6 +391,12 @@ class MDPIngester:
         - 未終了エピソードは ``pending_episodes`` に保留する。
         """
         if self.log_dir is None or not self.log_dir.exists():
+            return []
+        if self.readonly:
+            logger.warning(
+                "MDPIngester: skipping %s — state %s cannot be written back (%s)",
+                self.log_dir, self.state_path, self._state_file.last_status,
+            )
             return []
 
         private_set: set[str] = {t for t in (private_trace_ids or []) if t}
@@ -360,9 +427,7 @@ class MDPIngester:
                 self._mark_processed(ep_id, already_processed)
 
         self._enforce_pending_cap(pending)
-        self._state.pending_episodes = {
-            k: _serialize_episode(v) for k, v in pending.items()
-        }
+        self._state.pending_episodes = pending
         self._save_state()
         if completed:
             logger.info(
@@ -432,10 +497,7 @@ class MDPIngester:
     # ─── 内部ヘルパ ────────────────────────────────────────────────────
 
     def _restore_pending(self) -> dict[str, EpisodeRecord]:
-        return {
-            k: _deserialize_episode(v)
-            for k, v in (self._state.pending_episodes or {}).items()
-        }
+        return dict(self._state.pending_episodes)
 
     def _read_new_events(self) -> list[dict[str, Any]]:
         """設定された log_dir の各ファイルを offset 以降だけ読む。
@@ -460,34 +522,60 @@ class MDPIngester:
                 with path.open("rb") as f:
                     f.seek(offset)
                     raw = f.read(size - offset)
-                # 書きかけの末尾行 (改行なし) は次回に回す。offset を size まで
-                # 進めると、その行は warning 1 回で恒久に失われる。
-                cut = raw.rfind(b"\n")
-                if cut < 0:
-                    continue
-                raw = raw[: cut + 1]
-                self._state.file_offsets[path.name] = offset + len(raw)
             except OSError as exc:
                 logger.warning("MDPIngester: failed to read %s: %s", path, exc)
                 continue
-            events.extend(self._parse_lines(raw))
+            # 書きかけの末尾行 (改行なし) は次回に回す。offset を size まで
+            # 進めると、その行は warning 1 回で恒久に失われる。
+            cut = raw.rfind(b"\n")
+            if cut < 0:
+                continue
+            parsed, consumed = self._parse_lines(raw[: cut + 1])
+            if consumed <= cut:
+                logger.warning(
+                    "MDPIngester: %s has a row newer than _v %d at byte %d; not reading past it",
+                    path, _TRACE_ROW_VERSION, offset + consumed,
+                )
+            self._state.file_offsets[path.name] = offset + consumed
+            events.extend(parsed)
         return events
 
     @staticmethod
-    def _parse_lines(raw: bytes) -> list[dict[str, Any]]:
+    def _parse_lines(raw: bytes) -> tuple[list[dict[str, Any]], int]:
+        """行を読み、``(イベント, 読み終えたバイト数)`` を返す。
+
+        ``_v`` の無い行は壊れた行として飛ばす。``_v`` が新しい行の手前で止める —
+        位置をその行より先へ進めない (新しい版の行を飛ばして畳まない、c_05 §0.4.5)。
+        """
         out: list[dict[str, Any]] = []
-        for line in raw.splitlines():
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError as exc:
-                logger.warning("MDPIngester: malformed jsonl line: %s", exc)
-                continue
-            if isinstance(obj, dict):
+        consumed = 0
+        for line in raw.splitlines(keepends=True):
+            obj = MDPIngester._parse_line(line)
+            if obj is _NEWER_ROW:
+                return out, consumed
+            if obj is not None:
                 out.append(obj)
-        return out
+            consumed += len(line)
+        return out, consumed
+
+    @staticmethod
+    def _parse_line(line: bytes) -> Any:
+        """1 行 → イベント (``_v`` は外す)。飛ばす行は ``None``、新しい版の行は番兵。"""
+        s = line.strip()
+        if not s:
+            return None
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError as exc:
+            logger.warning("MDPIngester: malformed jsonl line: %s", exc)
+            return None
+        if not isinstance(obj, dict):
+            return None
+        version = obj.pop("_v", None)
+        if type(version) is not int or version < 1:
+            logger.warning("MDPIngester: skipping a trace line without an integer _v")
+            return None
+        return _NEWER_ROW if version > _TRACE_ROW_VERSION else obj
 
     @staticmethod
     def _merge_event(

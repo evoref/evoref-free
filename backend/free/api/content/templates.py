@@ -10,7 +10,6 @@ install する (`/api/rag/ingest` と同じ作法)。この経路で作れるの
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import tempfile
@@ -19,7 +18,6 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from backend.app_state import AppState, get_app_state
-from backend.io import atomic_write_text
 from backend.free.api._error_responses import api_error
 from backend.free.api.content._rag_helpers import (
     corpus_store_not_initialized_error,
@@ -35,7 +33,11 @@ from backend.free.rag.corpus.package import (
     package_filename,
     write_package,
 )
-from backend.free.rag.corpus.templates import BASE_SUFFIXES, TEMPLATES_SCHEMA_VERSION
+from backend.free.rag.corpus.templates import (
+    BASE_SUFFIXES,
+    TEMPLATES_FORMAT_VERSION,
+    write_template_manifest,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("api.templates")
@@ -60,6 +62,11 @@ async def list_templates(state: AppState = Depends(get_app_state)) -> dict:
     if manager is None:
         raise corpus_store_not_initialized_error()
     return {"templates": manager.list_templates()}
+
+
+def template_package_id(content: bytes) -> str:
+    """単一ファイル登録のパッケージ id: ``tpl-`` + ファイル本体 (変換後) の sha256 の先頭 12 hex。"""
+    return f"tpl-{hashlib.sha256(content).hexdigest()[:12]}"
 
 
 def _safe_base_name(filename: str, suffix: str) -> str:
@@ -118,7 +125,7 @@ async def register_template(
             "api.template_unreadable",
         ) from e
 
-    package_id = f"tpl-{hashlib.sha256(content).hexdigest()[:12]}"
+    package_id = template_package_id(content)
     base_name = _safe_base_name(file.filename, ext)
     clean_aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
 
@@ -129,17 +136,14 @@ async def register_template(
         language=str(lang or "ja"),
         description=doc_type,
         provides=["templates"],
-        requires=["templates/1"],
+        requires=[f"{TEMPLATES_DIR}/{TEMPLATES_FORMAT_VERSION}"],
     )
-    manifest = {
-        "schema_version": TEMPLATES_SCHEMA_VERSION,
-        "templates": [{
-            "id": "base",
-            "doc_type": doc_type,
-            "aliases": clean_aliases,
-            "lang": str(lang or "ja"),
-            "base": base_name,
-        }],
+    entry = {
+        "id": "base",
+        "doc_type": doc_type,
+        "aliases": clean_aliases,
+        "lang": str(lang or "ja"),
+        "base": base_name,
     }
 
     with tempfile.TemporaryDirectory(prefix="evoref-template-") as tmp:
@@ -147,14 +151,11 @@ async def register_template(
         templates_dir = staging / TEMPLATES_DIR
         templates_dir.mkdir(parents=True)
         (templates_dir / base_name).write_bytes(content)
-        atomic_write_text(
-            templates_dir / "manifest.json",
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-        )
+        write_template_manifest(templates_dir, [entry])
         zip_path = Path(tmp) / package_filename(meta)
         try:
             write_package(staging, zip_path, meta)
-            info = await manager.install(zip_path)
+            info = await manager.install(zip_path, internal=True)
         except PackageError as exc:
             logger.warning("Template registration rejected %s: %s", file.filename, exc)
             raise api_error(400, "E0400", str(exc)) from exc

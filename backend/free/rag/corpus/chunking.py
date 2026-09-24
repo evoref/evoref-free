@@ -10,20 +10,23 @@ c_05 §0.5.5 は「位置カウンタを鍵にしない」— ``len(...)`` 由�
 再発行され、既存レコードを別内容で上書きする (VectorStore の chunk id で実際に
 起きた、2026-09-05 監査)。ここで使うのは連番ではなく
 
-``sha256(content_digest | chunker_version | doc_id | position)`` の先頭 12 hex
+``"ev_" + sha256("doc_chunk", CHUNKER_VERSION, doc_id, sha256(正規化した本文),
+同一本文の出現番号)`` の先頭 16 hex (:func:`chunk_evidence_id`)
 
-で、**同じ内容には同じ id、違う内容には違う id** が付く。``position`` は入って
-いるが単独の鍵ではない — ``content_digest`` (docs 全体の本文 sha256) が変われば
-全チャンクの id が変わるので、「削除後に同じ id が別内容で再発行される」形には
-ならない。ランダム id にしないのは、prebuilt (作成側が事前に作ったチャンクと
-埋め込み) を install 側が **id で突き合わせて流用する**ため — ランダムだと
-毎回全件埋め込み直しになる。
+で、**同じ本文には同じ id、違う本文には違う id** が付く。位置もパッケージ全体の
+ダイジェストも入れないので、**版を跨いで本文が同じチャンクは同じ id** を保つ
+(疑似クエリの ``target_id`` や学習の参照が版上げで切れない)。同じ文書に同じ本文が
+2 回出るときだけ出現番号で分ける。パッケージ内で id が衝突したら組み立てを拒否する
+(:class:`ChunkIdCollisionError`)。ランダム id にしないのは、prebuilt (作成側が事前に
+作ったチャンクと埋め込み) を install 側が **id で突き合わせて流用する**ため —
+ランダムだと毎回全件埋め込み直しになる。
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,7 @@ from backend.free.rag.text_extractor import (
     extract_text,
     parse_csv_to_chunks,
 )
+from backend.io.id_registry import derived_id
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
@@ -47,7 +51,7 @@ logger = get_logger("rag.corpus.chunking")
 #: チャンク生成規則の版。**分割の結果が変わる変更で上げる** (chunk_size の
 #: 既定変更 / 抽出器の差し替え / heading の付け方)。prebuilt はこの版が一致
 #: したときだけ採用される (c_16 §4.3)。
-CHUNKER_VERSION = 3
+CHUNKER_VERSION = 4
 
 #: ``provenance[].extractor``。
 EXTRACTOR_NAME = "corpus_chunker"
@@ -63,17 +67,30 @@ _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULT
 _MAX_HEADING_CHARS = 120
 
 
-def chunk_evidence_id(
-    content_digest: str, chunker_version: int, doc_id: str, position: int,
-) -> str:
-    """``(content_digest, chunker_version, doc_id, position)`` から id を導く。
+class ChunkIdCollisionError(ValueError):
+    """パッケージ内で 2 つのチャンクが同じ id になった (組み立てを拒否する)。"""
 
-    再インストールで同じ id になることが prebuilt 流用の前提 (モジュール
-    docstring 参照)。
+
+def normalize_chunk_text(text: str) -> str:
+    """id の素にする本文の正規化: NFC + 改行を LF に + 前後の空白を除く。"""
+    unified = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
+    return unified.strip()
+
+
+def chunk_evidence_id(
+    chunker_version: int, doc_id: str, text: str, occurrence: int = 0,
+) -> str:
+    """``("doc_chunk", chunker_version, doc_id, sha256(本文), 出現番号)`` から id を導く。
+
+    ``occurrence`` は同じ文書の中で同じ (正規化後の) 本文が何回目に現れたか (0 始まり)。
+    再インストール・版上げで本文が同じなら同じ id になる (モジュール docstring、
+    c_05 §0.5.5)。golden vector は ``test_chunking.py`` で固定する。
     """
-    payload = f"{content_digest}\x00{chunker_version}\x00{doc_id}\x00{position}"
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    return f"ev_{digest[:12]}"
+    text_digest = hashlib.sha256(normalize_chunk_text(text).encode("utf-8")).hexdigest()
+    payload = "\x00".join(
+        ("doc_chunk", str(int(chunker_version)), doc_id, text_digest, str(int(occurrence))),
+    )
+    return derived_id("ev_", hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
 
 def document_headings(raw_text: str) -> list[str]:
@@ -172,7 +189,6 @@ def chunk_documents(
     *,
     package_id: str,
     package_version: str,
-    content_digest: str,
     language: str = "",
     rag_config: Any = None,
     now: str | None = None,
@@ -183,9 +199,6 @@ def chunk_documents(
     Args:
         docs_dir: パッケージの ``docs/``。
         package_id / package_version: ``attrs`` と ``source_id`` に刻む。
-        content_digest: :func:`~backend.free.rag.corpus.package.compute_content_digest`
-            の値。evidence id の素になるので **必ず実際の docs から計算した値**
-            を渡す (持ち回った古い値だと別内容に同じ id が付く)。
         language: ``Evidence.lang`` に入れる (パッケージの宣言言語)。
         rag_config: ``chunk_size`` 等を読む ``rag`` セクション。
         now: 観測時刻。``None`` で現在時刻。1 回のインストールで全チャンクに
@@ -194,6 +207,9 @@ def chunk_documents(
 
     Returns:
         doc_id 昇順 → position 昇順の :class:`Evidence` 列。
+
+    Raises:
+        ChunkIdCollisionError: パッケージ内で 2 つのチャンクの id が衝突した。
     """
     stamp = now or utc_now()
     chunker = _make_chunker(rag_config)
@@ -202,6 +218,7 @@ def chunk_documents(
     confidence = derive_confidence("document", _CORROBORATION)
 
     out: list[Evidence] = []
+    seen_ids: dict[str, tuple[str, int]] = {}
     for index, (doc_id, doc_path) in enumerate(documents, start=1):
         if on_document is not None:
             on_document(index, total, doc_id)
@@ -214,16 +231,26 @@ def chunk_documents(
 
         headings = document_headings(raw_text)
         heading = ""
+        occurrences: dict[str, int] = {}
         for position, text in enumerate(texts):
             body = text.strip()
             if not body:
                 continue
             heading = _heading_of(body, headings, heading)
+            normalized = normalize_chunk_text(body)
+            occurrence = occurrences.get(normalized, 0)
+            occurrences[normalized] = occurrence + 1
+            record_id = chunk_evidence_id(CHUNKER_VERSION, doc_id, body, occurrence)
+            clash = seen_ids.get(record_id)
+            if clash is not None:
+                raise ChunkIdCollisionError(
+                    f"chunk id {record_id} collides in package {package_id}: "
+                    f"{clash[0]}#{clash[1]} and {doc_id}#{position}",
+                )
+            seen_ids[record_id] = (doc_id, position)
             out.append(
                 Evidence(
-                    id=chunk_evidence_id(
-                        content_digest, CHUNKER_VERSION, doc_id, position,
-                    ),
+                    id=record_id,
                     kind="doc_chunk",
                     store="corpus",
                     text=body,
@@ -261,9 +288,11 @@ def chunk_documents(
 __all__ = [
     "CHUNKER_VERSION",
     "EXTRACTOR_NAME",
+    "ChunkIdCollisionError",
     "chunk_documents",
     "chunk_evidence_id",
     "document_headings",
     "extract_chunks",
     "list_documents",
+    "normalize_chunk_text",
 ]

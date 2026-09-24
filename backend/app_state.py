@@ -224,6 +224,12 @@ class AppState:
     # SleepTimeWorker 学習関連書戻し / FeedbackCollector.record が
     # すべて no-op となり、SemMem の読み込みやチャット応答は通常通り。
     learning_disabled: bool = False
+    #: 起動ゲートの結果 (``backend.factory._data_gate.DataGateResult``、c_05 §0.9)。
+    #: 書き手ロックを保持するのでプロセスの間は手放さない。
+    data_gate: Any = None
+    #: データ根が readonly の理由 (``None`` = 書ける)。readonly の間は学習を止め
+    #: (``learning_disabled`` を立てる)、sleep-time をスケジュールしない。
+    data_readonly_reason: str | None = None
 
     # ── メトリクス ──
     last_request_metrics: LastRequestMetrics = field(

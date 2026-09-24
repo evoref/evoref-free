@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.cli_theme import CLITheme
 from backend.free.cli.renderer import (
     render_error,
@@ -38,7 +39,7 @@ def _api_post(
 ) -> httpx.Response | None:
     """POST リクエスト。接続・HTTPエラー時はメッセージ表示済み + None 返却"""
     try:
-        resp = httpx.post(f"{backend_url}{path}", json=json_data, timeout=_TIMEOUT)
+        resp = httpx.post(f"{backend_url}{path}", headers=backend_headers(), json=json_data, timeout=_TIMEOUT)
         resp.raise_for_status()
         return resp
     except httpx.ConnectError:
@@ -159,6 +160,7 @@ async def _theme_activate(
     try:
         resp = httpx.post(
             f"{backend_url}/api/themes/activate",
+            headers=backend_headers(),
             json={"theme_id": theme_id},
             timeout=_TIMEOUT,
         )

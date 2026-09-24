@@ -441,6 +441,10 @@ class ThemeManager:
             features=features,
         )
 
+    def theme_exists(self, theme_id: str) -> bool:
+        """インストール済み (または組み込み) のテーマか"""
+        return self._resolve_theme_dir(theme_id) is not None
+
     def _resolve_theme_dir(self, theme_id: str) -> Path | None:
         """テーマ ID からディレクトリを解決"""
         if not theme_id:

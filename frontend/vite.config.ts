@@ -9,8 +9,10 @@ export default defineConfig({
 	server: {
 		proxy: {
 			'/api': {
-				target: `http://localhost:${apiPort}`,
-				changeOrigin: true
+				// 127.0.0.1 固定 (Node 17+ は localhost を ::1 に解決しうる)。Host を書き換えない —
+				// backend の Host 許可リストが frontend のポートを見て判定する (c_06 §1.5)。
+				target: `http://127.0.0.1:${apiPort}`,
+				changeOrigin: false
 			}
 		}
 	}

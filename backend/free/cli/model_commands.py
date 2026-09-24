@@ -10,6 +10,7 @@ import sys
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
 
@@ -21,7 +22,6 @@ def _handle_migrate(
     base_url: str,
     *,
     new_model_path: str,
-    try_lora: bool,
     regenerate_context: bool,
     dry_run: bool,
 ) -> int:
@@ -30,7 +30,6 @@ def _handle_migrate(
 
     payload = {
         "new_model_path": new_model_path,
-        "try_lora": try_lora,
         "regenerate_context": regenerate_context,
         "dry_run": dry_run,
     }
@@ -38,6 +37,7 @@ def _handle_migrate(
     try:
         resp = httpx.post(
             f"{base_url}/api/model/migrate",
+            headers=backend_headers(),
             json=payload,
             timeout=120.0,
         )
@@ -71,6 +71,7 @@ def _handle_rollback(base_url: str, target_model: str | None) -> int:
     try:
         resp = httpx.post(
             f"{base_url}/api/model/rollback",
+            headers=backend_headers(),
             json=payload,
             timeout=60.0,
         )
@@ -83,11 +84,7 @@ def _handle_rollback(base_url: str, target_model: str | None) -> int:
         return 1
 
     data = resp.json()
-    print(msg(
-        "cli.migrate_model_rollback_done",
-        model=data["rolled_back_to"],
-        lora="restored" if data["lora_restored"] else "not available",
-    ))
+    print(msg("cli.migrate_model_rollback_done", model=data["rolled_back_to"]))
     return 0
 
 

@@ -2,6 +2,7 @@
  * ダッシュボード store (Free) — RAG 統計・学習状態 (Level 0/1) のデータ取得
  */
 import type { DashboardLearningData, DashboardRagStats } from '$lib/free/api';
+import { loggedFetch as fetch } from '$lib/devlog';
 
 // ── デフォルト値 ──
 

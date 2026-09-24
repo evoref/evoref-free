@@ -28,17 +28,28 @@ embedding    埋め込み空間の健全性 (類似ペアが非類似ペアよ�
 
 from __future__ import annotations
 
-import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from backend.io.atomic import atomic_write_text
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.free.core.text_quality import has_broken_ja_spacing, is_japanese_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
 logger = get_logger("llm.quality_probe")
+
+#: 役割ごとに最後に検査したモデルと結果 (``PathResolver.LAYOUT["model_quality_file"]``)。
+#: 失っても次の起動でプローブし直す。
+MODEL_QUALITY_FORMAT = register_format(FormatSpec(
+    format_id="model_quality",
+    version=1,
+    klass="derived",
+    writers=frozenset({"free"}),
+    path_key="store/model_quality.json",
+    retention="one record per role, overwritten",
+))
 
 #: プローブ対象の役割。``model_paths`` のキーではなく論理名で扱う。
 QUALITY_ROLES: tuple[str, ...] = ("base", "aux", "embedding")
@@ -520,33 +531,34 @@ async def probe_embed_quality(
 # ─────────────────────────────────────────────────────────────────────────
 
 
-class QualityProbeStore:
-    """``local/model_quality.json`` の読み書きと「切替されたか」の判定。
+class QualityProbeStore(VersionedJsonFile):
+    """``store/model_quality.json`` の読み書きと「切替されたか」の判定。
 
     プローブを毎起動走らせない (iGPU では 6 カナリア × 3 役割で分単位かかる)。
     記録済みモデル名と現在のモデル名を突き合わせ、**変わったときだけ**走らせる。
 
     モデル名で比較するのは、``model_state.json`` の migrate 記録と独立に効かせる
-    ため。config.yaml を直接書き換えた / 別マシンから local/ を持ち込んだ場合でも
+    ため。config.yaml を直接書き換えた / 別マシンからデータ根を持ち込んだ場合でも
     「前回プローブしたモデルと違う」ことは同じく検知できる。
     """
 
-    def __init__(self, path: Path):
-        self.path = path
-        self._records: dict[str, QualityProbeResult] = {}
-        self._load()
+    FORMAT = MODEL_QUALITY_FORMAT
+    _state_logger = logger
 
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to load model_quality.json: %s", exc)
-            return
-        for role, raw in (data.get("roles") or {}).items():
-            if isinstance(raw, dict):
-                self._records[role] = QualityProbeResult.from_dict(raw)
+    def __init__(self, path: Path):
+        super().__init__(path)
+        self._records: dict[str, QualityProbeResult] = {}
+        self.load()
+
+    def _to_payload(self) -> dict:
+        return {"roles": {role: res.to_dict() for role, res in self._records.items()}}
+
+    def _from_payload(self, payload: dict) -> None:
+        self._records = {
+            role: QualityProbeResult.from_dict(raw)
+            for role, raw in (payload.get("roles") or {}).items()
+            if isinstance(raw, dict)
+        }
 
     def get(self, role: str) -> QualityProbeResult | None:
         return self._records.get(role)
@@ -573,18 +585,6 @@ class QualityProbeStore:
     def record(self, result: QualityProbeResult) -> None:
         self._records[result.role] = result
         self.save()
-
-    def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "roles": {
-                role: res.to_dict() for role, res in self._records.items()
-            },
-        }
-        atomic_write_text(
-            self.path,
-            json.dumps(payload, ensure_ascii=False, indent=2),
-        )
 
     def summary(self) -> list[dict]:
         """``/api/status`` 向けの要約 (役割順で安定)。"""

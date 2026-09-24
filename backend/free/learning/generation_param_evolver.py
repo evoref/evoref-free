@@ -33,9 +33,6 @@ PARAM_CLAMPS = {
     "presence_penalty": (-2.0, 2.0),
 }
 
-# デルタファイルのデフォルトパス (実配置は PathResolver ``generation_deltas_file``)
-DEFAULT_DELTA_FILE = "local/generation_deltas.json"
-
 
 class GenerationParamEvolver:
     """生成パラメータのデルタベース進化

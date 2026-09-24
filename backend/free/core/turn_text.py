@@ -43,7 +43,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+
+from backend.free.core.prompt_blocks import SHARED_CONTEXT_BOUNDARY
 
 # 動的コンテキストブロックと生クエリの境界に挟む固定文 (``i18n.prompt_locale`` 別)。
 # few-shot 例 / 参考情報をユーザー発言と混同させないための区切り。
@@ -95,6 +98,40 @@ FRAME_LINE_LABELS: frozenset[str] = frozenset({
     "訂正済み", "corrected",
     "競合", "conflict", "conflicting",
 })
+
+
+#: プロンプト上で意味を持つ枠の見出しと、参考枠の閉じ (上の区切り・ツール結果の
+#: 見出し・staged の共有文脈の境界)。取得した本文 (第三者のパッケージを含む) に
+#: そのまま現れると、偽の「関連する記憶」や「ここからユーザーの発言」を装って
+#: モデルを誘導でき、:func:`split_last_user` / ``split_shared_context`` も偽の
+#: 境界で切ってしまう。``[参考情報`` / ``[関連する記憶]`` は
+#: ``core.inference.EVIDENCE_BLOCK_MARKERS`` と同じ綴り (テストで突き合わせる)。
+_FRAME_MARKER_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("[参考情報", "［参考情報"),
+    ("[関連する記憶]", "［関連する記憶］"),
+    ("[参考例]", "［参考例］"),
+    ("[添付ファイル]", "［添付ファイル］"),
+    ("[ここまで参考枠", "［ここまで参考枠"),
+    ("[End of reference material", "［End of reference material"),
+    (TOOL_RESULT_HEADER.strip(), "＃＃ ツール実行結果"),
+    (SHARED_CONTEXT_BOUNDARY.strip(), "＜＜＜END OF SHARED CONTEXT＞＞＞"),
+)
+#: 区切りはどの locale も ``---`` の行を含むので、本文の ``---`` 行を崩せば
+#: 区切りの逐語一致は本文から作れない (Markdown の水平線としての意味は残る)。
+_RULE_LINE_RE = re.compile(r"^---[ \t]*$", re.MULTILINE)
+
+
+def neutralize_frame_markers(text: str) -> str:
+    """取得本文の中の枠の見出しと閉じを無害化する (docs/c_06 §1.5)。
+
+    見出しは全角の括弧に、``---`` の行は ``- - -`` に置き換える。本文の意味は
+    変えず、プロンプトの枠としては読まれない形にする。注入する側 (RAG ブロック、
+    meta_cognitive の system、制作ブリーフの References、長文のユニット参考情報)
+    で掛ける。検索結果そのものは接地の照合に使うので書き換えない。
+    """
+    for marker, replacement in _FRAME_MARKER_REPLACEMENTS:
+        text = text.replace(marker, replacement)
+    return _RULE_LINE_RE.sub("- - -", text)
 
 
 def _all_delimiters(table: dict[str, str]) -> list[str]:

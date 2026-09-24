@@ -37,6 +37,7 @@ from backend.free.core.turn_text import (
     DYNAMIC_CONTEXT_TRAILING_DELIMITERS,
     FRAME_LINE_LABELS,
     append_to_last_user,
+    neutralize_frame_markers,
     prepend_to_last_user,
     split_last_user,
 )
@@ -1032,7 +1033,7 @@ def _inject_rag_salience(
         return None, remaining, 0
 
     selected_entries = [
-        f"{RAG_ENTRY_PREFIX} {i + 1}]\n{text}"
+        f"{RAG_ENTRY_PREFIX} {i + 1}]\n{neutralize_frame_markers(text)}"
         for i, text in enumerate(ranked_texts)
     ]
     rag_block = _format_rag_block(selected_entries)
@@ -1054,7 +1055,7 @@ def _inject_rag_fallback(
     """スコア降順 + 予算逐次選別で RAG block を構築する (フォールバック経路)。"""
     selected_entries: list[str] = []
     for i, chunk in enumerate(rag_chunks):
-        entry = f"{RAG_ENTRY_PREFIX} {i + 1}]\n{chunk}"
+        entry = f"{RAG_ENTRY_PREFIX} {i + 1}]\n{neutralize_frame_markers(chunk)}"
         cost = _estimate_tokens(entry)
         if cost > remaining:
             logger.debug(

@@ -10,11 +10,11 @@ from backend.free.api.system._status_collectors import (
     count_recent_errors,
     extract_embedder_cache_hit_rate,
     extract_learning_brief,
-    resolve_log_dir,
 )
 from backend.free.api.schemas import (
     CapabilityInfo,
     ComponentStatus,
+    DataHealthInfo,
     DebugStatusInfo,
     LivenessAlertModel,
     LlamaServerInfo,
@@ -159,21 +159,16 @@ def _collect_debug_info(cfg: dict, state: AppState) -> DebugStatusInfo:  # noqa:
 
     ``cfg["debug"]`` セクションは廃止されたため、有効/無効と
     log_dir は ``state.develop_level`` から導出する。``log_dir`` は
-    ``project_root/local/logs/debug`` に固定。
+    データ根の ``logs/debug`` に固定 (``DebugLogger`` と同じ置き場)。
 
     純粋な計算 / パス解決 / ファイル I/O ベースの集計は
     `_status_collectors` に委譲し、本関数はオーケストレーションに専念する。
     """
-    from pathlib import Path
+    from backend.config import resolve_data_path
 
     develop_level = getattr(state, "develop_level", "off")
     enabled = develop_level != "off"
-    log_dir_str = "local/logs/debug/"
-
-    # log_dir の絶対パスを解決
-    # backend/free/api/system/status.py から 5 階層上が repo root
-    project_root = Path(__file__).resolve().parents[4]
-    log_dir = resolve_log_dir(log_dir_str, project_root)
+    log_dir = resolve_data_path("logs_dir") / "debug"
 
     disk_usage_mb = compute_log_disk_usage_mb(log_dir)
     recent_errors_count = count_recent_errors(log_dir.parent / "backend.log")
@@ -189,7 +184,7 @@ def _collect_debug_info(cfg: dict, state: AppState) -> DebugStatusInfo:  # noqa:
 
     return DebugStatusInfo(
         enabled=enabled,
-        log_dir=log_dir_str,
+        log_dir=str(log_dir),
         disk_usage_mb=disk_usage_mb,
         recent_errors_count=recent_errors_count,
         cache_hit_rate=cache_hit_rate,
@@ -288,7 +283,7 @@ async def get_status(state: AppState = Depends(get_app_state)):
         cartridges_loaded=cartridges_loaded,
         free_version=version_info.free,
         pro_version=version_info.pro,
-        schema_version=version_info.schema,
+        data_generation=version_info.generation,
         uptime_seconds=time.time() - _start_time,
         llama_server=LlamaServerInfo(
             connected=connected,
@@ -304,4 +299,45 @@ async def get_status(state: AppState = Depends(get_app_state)):
             LivenessAlertModel(**alert.as_dict())
             for alert in liveness_ledger().alerts()
         ],
+        data_health=_data_health(state),
+    )
+
+
+def _data_health(state: AppState) -> DataHealthInfo:
+    """起動ゲートの結果と、モデル識別子の照合、チャット経路の保存に失敗した形式を UI 向けに畳む (c_05 §0.9 / §0.5.7 / §0.5.9)。
+
+    埋め込みの確認待ちと ``/props`` の照合は属性を読むだけ (I/O なし)。``formats`` は
+    読み手が溜めた current 以外の形式 (:mod:`backend.io.format_health`) を読むだけ。
+    """
+    from backend.free.api.model.model import evidence_stores
+    from backend.model_key import model_label
+
+    served = getattr(state, "served_model_mismatch", None) or {}
+    models = {
+        "reembed_pending": [
+            name for name, store in evidence_stores(state) if store.embedding_model_pending
+        ],
+        "served_model_mismatch": bool(served),
+        "served_model": model_label(str(served.get("served_filename") or "")),
+        "expected_model": model_label(str(served.get("expected_filename") or "")),
+    }
+    from backend.io import format_health
+    from backend.io.writer_thread import default_writer
+
+    degraded = sorted(default_writer().degraded())
+    formats = format_health.snapshot()
+    gate = getattr(state, "data_gate", None)
+    if gate is None:
+        return DataHealthInfo(**models, degraded=degraded, formats=formats)
+    return DataHealthInfo(
+        data_root=str(gate.data_root),
+        readonly=state.data_readonly_reason is not None,
+        reason=state.data_readonly_reason,
+        warnings=list(gate.warnings),
+        g0_found=bool(gate.g0 is not None and gate.g0.found),
+        **models,
+        degraded=degraded,
+        edition_switched_from=gate.edition_switched_from,
+        edition_switched_to=gate.edition_switched_to,
+        formats=formats,
     )

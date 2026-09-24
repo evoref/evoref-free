@@ -9,12 +9,12 @@ from pathlib import Path
 
 from backend.app_state import AppState, get_app_state
 from backend.config import (
+    get_config,
     get_mode_generation_params,
-    get_mode_lora_path,
     get_path_resolver,
     get_project_root,
-    validate_lora_for_launch,
 )
+from backend.free.core.launch_adapters import LaunchAdapters, adapters_for_launch
 from backend.log_config import get_logger
 
 logger = get_logger("api.mode")
@@ -32,30 +32,6 @@ class ModeSwitchResponse(BaseModel):
     restart_initiated: bool
     lora_changed: bool = False
     message: str = ""
-
-
-def _resolve_lora_override(
-    model_path: str, lora_path: Path | None,
-) -> tuple[Path | None, bool]:
-    """``get_mode_lora_path`` の解決結果を、実際に ``--lora`` へ渡してよいか
-    (存在確認 + arch 互換) 検証する。
-
-    ``partition_by_base_model=false`` (パーティション無効) または ``lora_path``
-    が None のときは ``(None, True)`` を返し、``build_*_cmd`` 側の従来どおりの
-    flat フォールバック分岐に委譲する (レガシー配置の後方互換)。
-
-    パーティション有効時は、対象モデル/モードのアダプタが (a) 存在しない、
-    または (b) 起動対象モデルと非互換であれば ``(None, False)`` を返し、
-    flat フォールバックも踏ませずに明示的に「LoRA なし」で起動させる —
-    そのモードがまだ学習されていない状態を安全に表す。
-
-    判定本体は ``backend.config.validate_lora_for_launch`` に集約している
-    (通常起動経路 ``resolve_base_lora_for_launch`` と同一述語)。
-    """
-    resolver = get_path_resolver()
-    if lora_path is None or not resolver.partition_enabled:
-        return None, True
-    return validate_lora_for_launch(model_path, lora_path, get_project_root())
 
 
 @router.post("/switch", response_model=ModeSwitchResponse)
@@ -84,11 +60,11 @@ async def switch_mode(
     new_params = get_mode_generation_params(new_mode)
     model_changed = old_params["model"] != new_params["model"]
 
-    # base LoRA パスの比較 (level2_adapter_partition=="model_mode" の
-    # ときのみ差が出る。レガシー "model" では get_mode_lora_path は常に同一パスを
-    # 返すため lora_changed は常に False = 再起動トリガーへの影響なし)。
-    new_lora_path = get_mode_lora_path(new_mode)
-    lora_changed = get_mode_lora_path(old_mode) != new_lora_path
+    # 当てるアダプタ (Pro の LoRA / control vector) の比較。Free では常に無し
+    # なので差が出ず、再起動トリガーに影響しない。
+    cfg = get_config()
+    new_adapters = adapters_for_launch(cfg, get_project_root(), new_mode)
+    lora_changed = adapters_for_launch(cfg, get_project_root(), old_mode) != new_adapters
 
     # モード状態を更新。resolver 側の active_mode も同期する (ダッシュボード等の
     # 「現在モードのアダプタ」既定表示に使われる、Level2Runner は mode を明示
@@ -101,7 +77,7 @@ async def switch_mode(
 
     if model_changed or lora_changed:
         restart_initiated = await _restart_base_server(
-            state, new_params["model"], lora_path=new_lora_path,
+            state, new_params["model"], adapters=new_adapters,
         )
         message += (
             ", server restart initiated" if restart_initiated
@@ -123,21 +99,17 @@ async def switch_mode(
 
 
 async def _restart_base_server(
-    state: AppState, model_path: str, lora_path: Path | None = None,
+    state: AppState, model_path: str, adapters: LaunchAdapters,
 ) -> bool:
     """ベースサーバーを新モデルで再起動する
 
-    ``lora_path`` は ``get_mode_lora_path(new_mode)`` の解決結果 (存在確認前)。
-    レガシー "model" スキームでは常に ``None`` 相当 (呼出元の ``_resolve_lora_override``
-    が ``adapter_partition_mode!="model_mode"`` を見て ``(None, True)`` に丸める
-    ため、legacy flat フォールバックへ委譲され挙動は完全に従来通り)。
+    ``adapters`` は新モードの ``adapters_for_launch`` の結果 (存在・互換確認済み)。
 
     Returns:
         再起動が成功したかどうか
     """
     import asyncio
 
-    from backend.config import get_config
     from backend.free.api.system.server_control import (
         stop_server_process,
         wait_port_released,
@@ -147,7 +119,6 @@ async def _restart_base_server(
     from scripts.launch_llama import wait_for_health
 
     cfg = get_config()
-    lora_override, lora_fallback = _resolve_lora_override(model_path, lora_path)
 
     # 1. 既存プロセスを確実に停止。``_stop_server`` は本バックエンドが spawn して
     #    ``_managed`` に登録したプロセスしか kill しないが、base は通常 CLI /
@@ -170,10 +141,9 @@ async def _restart_base_server(
     #    旧サーバの 200 を拾う窓を潰す)。
     await asyncio.to_thread(wait_port_released, "base", cfg, 10.0)
 
-    # 3. model_override / lora_override 付きで新プロセス起動
+    # 3. model_override / adapters 付きで新プロセス起動
     managed = _spawn_server_with_override(
-        "base", cfg, model_override=model_path,
-        lora_override=lora_override, lora_fallback=lora_fallback,
+        "base", cfg, model_override=model_path, adapters=adapters,
     )
     if managed is None:
         logger.error("Failed to spawn base server with model override")
@@ -199,6 +169,11 @@ async def _restart_base_server(
 
     # 5. クライアント再接続
     await _try_reconnect("base", state, cfg)
+
+    # 6. 実際に載ったモデルをこのモードのモデルと照合する (c_05 §0.5.7)
+    from backend.factory._served_model import check_served_model
+
+    check_served_model(state, model_path, get_project_root())
 
     return True
 

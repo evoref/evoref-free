@@ -1,147 +1,28 @@
-"""CLI セッション永続化: 自動保存・チェックポイント・セッション復元"""
+"""CLI セッション: 終了時のサマリ・履歴からのセッション復元"""
 
 from __future__ import annotations
 
-import json
+import re
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.free.cli.command_parser import CommandResult, SessionState
-from backend.free.history.utils import parse_iso
 from backend.free.cli.renderer import render_error, render_info
 from backend.i18n_helper import msg
-from backend.io import atomic_write_text
 from backend.log_config import get_logger
-from backend.utils import utc_now_dt
 
 logger = get_logger("cli.session_persistence")
 
 
 # ────────────────────────────────────────────
-# 自動保存判定・データ構築
+# セッション終了
 # ────────────────────────────────────────────
-
-
-def _should_auto_save(state: SessionState) -> bool:
-    """自動保存の条件を判定
-
-    /save（セッション復元用）と history（アーカイブ）は別系統のため、
-    /save 実行済みでも history への自動保存は行う。
-    """
-    if not state.auto_save_enabled:
-        return False
-    if not state.turns:
-        return False
-    # ユーザー発話が 1 ターン未満 → 保存しない
-    if not any(t["role"] == "user" for t in state.turns):
-        return False
-    return True
-
-
-def _resolve_base_model_name() -> str:
-    """アーカイブに刻むベースモデル名。config 未初期化なら空文字列。
-
-    CLI は config を読まずに単独起動されうる (テスト・オフライン検査)。その場合は
-    従来どおり空のままにし、保存自体は止めない。
-    """
-    try:
-        from backend.config import get_config
-        from backend.free.history.history_manager import active_base_model_name
-
-        return active_base_model_name(get_config())
-    except Exception:
-        return ""
-
-
-def _build_history_data(state: SessionState) -> dict:
-    """自動保存用のセッションデータを構築"""
-    now = utc_now_dt()
-    pct = int(state.token_used / state.token_limit * 100) if state.token_limit > 0 else 0
-    started = datetime.fromtimestamp(state.started_at, tz=timezone.utc)
-    duration = int(now.timestamp() - state.started_at)
-
-    return {
-        "session_id": state.session_id,
-        "started_at": started.isoformat(),
-        "ended_at": now.isoformat(),
-        "duration_sec": duration,
-        "mode": state.mode,
-        "instance_name": state.instance_name,
-        "base_model": _resolve_base_model_name(),
-        "source": "auto",
-        "turns": list(state.turns),
-        "turn_count": len(state.turns),
-        "context_files": list(state.context_files),
-        "token_info": {
-            "used": state.token_used,
-            "limit": state.token_limit,
-            "pct": pct,
-        },
-        "ttft_history": list(state.ttft_history),
-        "summary": None,
-        "summary_embedding": None,
-        "archived_at": now.isoformat(),
-    }
-
-
-# ────────────────────────────────────────────
-# 自動保存・チェックポイント
-# ────────────────────────────────────────────
-
-
-def auto_save_session(state: SessionState) -> bool:
-    """セッションを local/history/YYYY-MM/ に自動保存
-
-    HistoryManager.save_session() 経由で保存し、index.json も更新する。
-
-    Returns:
-        True if saved, False if skipped or failed
-    """
-    if not _should_auto_save(state):
-        return False
-
-    if state.history_dir is None:
-        logger.debug("auto_save: history_dir not configured, skipping")
-        return False
-
-    data = _build_history_data(state)
-
-    try:
-        from backend.free.history.history_manager import (
-            HistoryManager, SessionData, active_base_model_name,
-            get_history_manager,
-        )
-        try:
-            mgr = get_history_manager()
-        except RuntimeError:
-            # config 未初期化（CLI 単独起動・テスト等）: 直接インスタンス化
-            mgr = HistoryManager(state.history_dir)
-        session = SessionData(
-            session_id=data["session_id"],
-            started_at=data["started_at"],
-            ended_at=data["ended_at"],
-            duration_sec=data["duration_sec"],
-            mode=data["mode"],
-            instance_name=data["instance_name"],
-            base_model=data["base_model"],
-            source=data["source"],
-            turns=data["turns"],
-            turn_count=data["turn_count"],
-            context_files=data["context_files"],
-            token_info=data["token_info"],
-            summary=data.get("summary"),
-            archived_at=data["archived_at"],
-        )
-        path = mgr.save_session(session)
-        if path:
-            logger.debug("auto_save: wrote %s (%d turns)", path, len(state.turns))
-            return True
-        logger.debug("auto_save: HistoryManager.save_session returned None")
-        return False
-    except OSError as e:
-        logger.debug("auto_save: failed: %s", e)
-        return False
+#
+# 会話履歴は backend が書く (``/api/chat`` の記録経路がターンごとの追記ログへ出し、
+# 閉じたとき・起動時に畳む、c_05 §2.1)。CLI は同じセッションを自前で
+# ``HistoryManager.save_session`` しない — 以前は CLI と backend の 2 つの書き手が
+# 別の形 (``ttft_history`` の有無・ファイル名の session_id の長さ) で同じ会話を
+# 書き、CLI 側のチェックポイント (``.checkpoint/``) と backend の追記が二重だった。
 
 
 def log_session_summary(state: SessionState) -> None:
@@ -189,97 +70,11 @@ def log_session_summary(state: SessionState) -> None:
 
 
 def finalize_session(state: SessionState) -> None:
-    """セッション終了時の共通後処理
+    """セッション終了時の共通後処理 (サマリログ出力)。
 
-    1. サマリログ出力
-    2. 自動保存
-    3. チェックポイント削除
+    履歴の保存は backend の記録経路が行う (このモジュール冒頭の注記)。
     """
     log_session_summary(state)
-    auto_save_session(state)
-    delete_checkpoint(state)
-
-
-def save_checkpoint(state: SessionState) -> bool:
-    """チェックポイントを .checkpoint/ に保存（上書き）"""
-    if not state.auto_save_enabled or not state.turns:
-        return False
-
-    if state.history_dir is None:
-        return False
-
-    checkpoint_dir = state.history_dir / ".checkpoint"
-    path = checkpoint_dir / f"{state.session_id}.json"
-
-    data = _build_history_data(state)
-    try:
-        atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
-        logger.debug("checkpoint: wrote %s (%d turns)", path, len(state.turns))
-        return True
-    except OSError as e:
-        logger.debug("checkpoint: failed to write %s: %s", path, e)
-        return False
-
-
-def delete_checkpoint(state: SessionState) -> None:
-    """セッションのチェックポイントファイルを削除"""
-    if state.history_dir is None:
-        return
-    path = state.history_dir / ".checkpoint" / f"{state.session_id}.json"
-    if path.exists():
-        try:
-            path.unlink()
-            logger.debug("checkpoint: deleted %s", path)
-        except OSError as e:
-            logger.debug("checkpoint: failed to delete %s: %s", path, e)
-
-
-def recover_checkpoints(history_dir: Path) -> int:
-    """起動時に残存チェックポイントを正式アーカイブに昇格
-
-    Returns:
-        復旧したセッション数
-    """
-    checkpoint_dir = history_dir / ".checkpoint"
-    if not checkpoint_dir.exists():
-        return 0
-
-    recovered = 0
-    for cp_file in checkpoint_dir.glob("*.json"):
-        try:
-            data = json.loads(cp_file.read_text(encoding="utf-8"))
-            started_at = data.get("started_at", "")
-            session_id = data.get("session_id", cp_file.stem)
-
-            # 月ディレクトリを started_at から決定
-            if started_at:
-                try:
-                    dt = datetime.fromisoformat(started_at)
-                    month_str = dt.strftime("%Y-%m")
-                except ValueError:
-                    month_str = utc_now_dt().strftime("%Y-%m")
-            else:
-                month_str = utc_now_dt().strftime("%Y-%m")
-
-            month_dir = history_dir / month_str
-
-            # ファイル名の時刻は **セッション開始時刻**。復旧時刻を使うと
-            # 1 月開始のセッションが history/2026-01/20260315_... となり、
-            # 月ディレクトリ順 → ファイル名降順で並べる一覧で、実際には
-            # 古いセッションが新しいものより上位に居座る (2026-09-05 監査)。
-            stamp = parse_iso(started_at) if started_at else None
-            ts = (stamp or utc_now_dt()).strftime("%Y%m%d_%H%M%S")
-            dest = month_dir / f"{ts}_{session_id}.json"
-
-            # アーカイブとして移動（source を維持）
-            atomic_write_text(dest, json.dumps(data, ensure_ascii=False, indent=2))
-            cp_file.unlink()
-            recovered += 1
-            logger.debug("checkpoint recovery: %s -> %s", cp_file.name, dest)
-        except (OSError, json.JSONDecodeError) as e:
-            logger.debug("checkpoint recovery: failed for %s: %s", cp_file.name, e)
-
-    return recovered
 
 
 # ────────────────────────────────────────────
@@ -312,13 +107,22 @@ def _load_from_history(
     return _load_history_by_id(session_id, state, console)
 
 
+#: 履歴の月ディレクトリ (``active/`` ``embeddings/`` 等の内部ディレクトリを除く)。
+_MONTH_DIR_RE = re.compile(r"\d{4}-\d{2}")
+
+
+def _month_dirs(history_dir: Path) -> list[Path]:
+    return sorted(
+        (d for d in history_dir.iterdir() if d.is_dir() and _MONTH_DIR_RE.fullmatch(d.name)),
+        reverse=True,
+    )
+
+
 def _load_latest_history(state: SessionState, console) -> CommandResult:
     """最新の自動保存セッションを復元"""
     latest_file: Path | None = None
 
-    for month_dir in sorted(state.history_dir.iterdir(), reverse=True):
-        if not month_dir.is_dir() or month_dir.name.startswith("."):
-            continue
+    for month_dir in _month_dirs(state.history_dir):
         files = sorted(month_dir.glob("*.json"), reverse=True)
         if files:
             latest_file = files[0]
@@ -329,36 +133,43 @@ def _load_latest_history(state: SessionState, console) -> CommandResult:
         return CommandResult()
 
     logger.debug("/load --history --latest: found %s", latest_file)
-    return _restore_session(latest_file, state, console)
+    return _restore_history_session(latest_file, state, console)
 
 
 def _load_history_by_id(
     session_id: str, state: SessionState, console,
 ) -> CommandResult:
     """session_id で自動保存セッションを検索して復元"""
-    for month_dir in sorted(state.history_dir.iterdir(), reverse=True):
-        if not month_dir.is_dir() or month_dir.name.startswith("."):
-            continue
+    for month_dir in _month_dirs(state.history_dir):
         for f in month_dir.glob(f"*_{session_id}.json"):
             logger.debug("/load --history %s: found %s", session_id, f)
-            return _restore_session(f, state, console)
+            return _restore_history_session(f, state, console)
 
     render_error(console, f"History session not found: {session_id}")
     return CommandResult()
 
 
-def _restore_session(
+def _restore_history_session(
     path: Path, state: SessionState, console,
 ) -> CommandResult:
-    """セッションファイルからステートを復元"""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.debug("/load: failed to read %s: %s", path, e)
-        render_error(console, f"Failed to load session: {e}")
-        return CommandResult()
+    """会話履歴の原本 (``history.session`` の封筒) からステートを復元"""
+    from backend.free.history.history_manager import read_session_file
 
-    # ステート復元
+    read = read_session_file(path)
+    if not read.ok or not isinstance(read.payload, dict):
+        logger.debug("/load: failed to read %s: %s %s", path, read.status, read.detail)
+        render_error(console, f"Failed to load session: {read.status} {read.detail}")
+        return CommandResult()
+    return _apply_session_data(read.payload, path, state, console)
+
+
+def _apply_session_data(
+    data: dict, path: Path, state: SessionState, console,
+) -> CommandResult:
+    """読んだセッションの dict をステートへ反映する。"""
+
+    # ステート復元 (手動保存の読み手は復元の後で読んだレコードを入れ直す)
+    state.loaded_session = None
     state.session_id = data.get("session_id", state.session_id)
     state.turns = data.get("turns", [])
     state.context_files = data.get("context_files", [])

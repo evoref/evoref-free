@@ -2,7 +2,6 @@
 
 `backend/free/api/status.py` の `_collect_debug_info` ハンドラ内に直書きされて
 いた以下のロジックを抽出した純粋関数群:
-- ログディレクトリの解決 (相対パス → 絶対パス)
 - ログディレクトリ全体のディスク使用量計算 (rglob + stat)
 - backend.log の ERROR 行数カウント
 - 埋め込みキャッシュヒット率の算出
@@ -12,7 +11,7 @@
 - `status.py` (API 層)            — HTTP / Pydantic / 状態取得 / オーケストレーション
 - `_status_collectors.py` (helper) — 純粋な計算 / パス解決 / ファイル I/O ベース集計
 
-`compute_cache_hit_rate` と `resolve_log_dir` は完全な純粋関数。
+`compute_cache_hit_rate` は完全な純粋関数。
 `compute_log_disk_usage_mb` / `count_recent_errors` / `extract_learning_brief` は
 ファイル I/O または scheduler オブジェクトに依存するが、副作用は読み込みのみ。
 """
@@ -25,17 +24,6 @@ from backend.free.api.schemas import LearningBriefStatus
 
 
 # ── ログディレクトリ ────────────────────────────────────────────────────
-
-
-def resolve_log_dir(log_dir_str: str, project_root: Path) -> Path:
-    """設定値の `log_dir` (相対 / 絶対) を絶対パスとして解決する純粋関数。
-
-    既に絶対パスならそのまま `Path` 化、相対パスなら `project_root` 配下に解決。
-    """
-    log_dir = Path(log_dir_str)
-    if log_dir.is_absolute():
-        return log_dir
-    return project_root / log_dir
 
 
 def compute_log_disk_usage_mb(log_dir: Path) -> float:

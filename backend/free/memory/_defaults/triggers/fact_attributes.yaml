@@ -379,6 +379,11 @@ chat:
     # 一人称で personal_fact にも当たる)。
     color:
       single_valued: true
+      # 「色は」は物の色にも当たる。「自転車の色は朱色です」が本人の好きな色へ
+      # 入り、単値なので本当の好きな色を supersede していた (2026-09-23 実機)。
+      # 「<非一人称>の色は」は一致させない。明示の所有格だけを見る (話題語からの
+      # 推定をすると「最近は緑より紺色のほうが好き」の「最近」を所有者と読む)。
+      requires_self_possessor: explicit
       triggers:
       - 好きな色
       - 色は
@@ -515,6 +520,8 @@ chat:
     # ``色`` を含むので、変化の申告もこのスロットへ着地する。
     color:
       single_valued: true
+      # personal_fact 側と同じ所有者ガード (物の色を本人の好きな色にしない)。
+      requires_self_possessor: explicit
       triggers:
       - 好きな色
       - 色は

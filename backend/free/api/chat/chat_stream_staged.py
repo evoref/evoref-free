@@ -409,7 +409,7 @@ async def run_staged_pipeline(
     ``resume_of`` (Phase 3b、f_10 §7) は問い返し (needs_input) から再開する
     元 run_id。``run_store.start()`` の ``_extra`` へそのまま渡す。
     """
-    from uuid import uuid4
+    from backend.io.id_registry import new_id
 
     from backend.config import get_path_resolver
     from backend.free.loop.artifact_writer import make_loop_artifact_hook
@@ -459,7 +459,7 @@ async def run_staged_pipeline(
         staged_total_timeout_sec = float(total_timeout_sec)
     deadline_monotonic = t_start + staged_total_timeout_sec
 
-    run_id = uuid4().hex[:12]
+    run_id = new_id("run_")
     workspace_root = get_path_resolver().resolve_local("create_workspace_dir")
     ws = WorkspaceManager.open_or_create(
         workspace_root, workspace_id=run_id, session_id=session_id,

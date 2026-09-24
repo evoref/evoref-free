@@ -98,7 +98,6 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
     logger.debug("GET /api/optimize/status")
 
     scheduler = state.learning_scheduler
-    resolver = get_path_resolver()
 
     # Level 1: モード別 + 補助タスクタスク別プロンプト進化状態
     modes = collect_prompt_mode_statuses(state.prompt_manager, _LEVEL1_MODES)
@@ -112,14 +111,12 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
     # スケジューラ設定値 (未初期化時は既定値)
     params = extract_scheduler_params(scheduler)
 
-    # Level 2: LoRA 状態 (Pro のみ)
+    # Level 2: LoRA 状態 (Pro のみ。パスは Pro の (モデル×モード) パーティション)
     lora_adapter_exists = False
-    if is_pro():
+    pro_path = get_pro_handler("pro_learning_path")
+    if is_pro() and pro_path is not None:
         try:
-            # resolve_learning (パーティション対応) で引く。flat のままだと
-            # Level 2 が書き出した実アダプタを「無い」と誤報告する。
-            lora_path = resolver.resolve_learning("lora_adapter")
-            lora_adapter_exists = lora_path.exists()
+            lora_adapter_exists = pro_path("lora_adapter").exists()
         except Exception:
             pass
 
@@ -164,7 +161,6 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
         )
 
     if req.mode is not None:
-        # 旧名 ("coding") は現行名へ正規化する (chat 入口と同じ理由)。
         canonical_mode = canonicalize_session_mode(req.mode)
         if canonical_mode is None:
             raise api_error(
@@ -238,11 +234,10 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
         except Exception:
             return None
 
-    # 学習データは (モデル×モード) パーティション配下にあるため
-    # resolve_learning で引く。resolve_local (flat) のままだと存在しない
-    # パスを渡してしまい、bootstrap 済みのアダプタが「無い」と判定される
-    # (SleepTimeScheduler 経路とも食い違う)。
-    lora_path = _safe(resolver.resolve_learning, "lora_adapter")
+    # アダプタは Pro の (モデル×モード) パーティション配下 (SleepTimeScheduler
+    # 経路と同じ場所)。ハンドラが無ければ None (bootstrap のみの判定に倒れる)。
+    pro_path = get_pro_handler("pro_learning_path")
+    lora_path = None if pro_path is None else _safe(pro_path, "lora_adapter")
     bootstrap_only = (
         not methods["will_run"]
         and (lora_path is None or not lora_path.exists())
@@ -262,7 +257,6 @@ async def optimize_trigger(req: OptimizeTriggerRequest, state: AppState = Depend
     started = scheduler.check_level2(
         is_user_active=False,
         lora_path=lora_path,
-        current_model=base_model_path.name if base_model_path else "",
         base_model_path=base_model_path,
         # 手動トリガは「今すぐ試す」意図なので overdue クールダウンは迂回する。
         # データ量 / 実行中 / アダプタ互換のゲートはそのまま効く。
@@ -287,8 +281,6 @@ async def optimize_history(state: AppState = Depends(get_app_state)):
     """最適化履歴の取得（プロンプト進化 + LoRA バージョン）"""
     logger.debug("GET /api/optimize/history")
 
-    resolver = get_path_resolver()
-
     # プロンプト進化履歴 (システム + 補助タスク)
     prompt_history = collect_prompt_history(state.prompt_manager, _LEVEL1_MODES)
     if is_pro():
@@ -299,13 +291,13 @@ async def optimize_history(state: AppState = Depends(get_app_state)):
     # LoRA バージョン履歴（Pro のみ）
     lora_history: list[LoRAHistoryEntry] = []
     LoRAVersionManager = get_pro_handler("lora_version_manager")
-    if is_pro() and LoRAVersionManager is not None:
+    pro_path = get_pro_handler("pro_learning_path")
+    if is_pro() and LoRAVersionManager is not None and pro_path is not None:
         try:
-            # resolve_learning (パーティション対応)。flat のままだと Level 2 が
-            # 実際に積んだ版履歴が 1 件も出ない。
-            versions_dir = resolver.resolve_learning("lora_versions_dir")
-            adapter_path = resolver.resolve_learning("lora_adapter")
-            vmgr = LoRAVersionManager(versions_dir, adapter_path)
+            # Level 2 が実際に積んだ版履歴 (Pro の (モデル×モード) パーティション)。
+            vmgr = LoRAVersionManager(
+                pro_path("lora_versions_dir"), pro_path("lora_adapter"),
+            )
             for v in vmgr.list_versions():
                 lora_history.append(LoRAHistoryEntry(
                     version=v.version,

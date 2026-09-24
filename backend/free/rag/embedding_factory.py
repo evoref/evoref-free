@@ -68,6 +68,16 @@ def validate_embedding_config(emb_cfg: dict) -> None:
     )
 
 
+def _embed_model_key(cfg: dict, project_root: Path | None) -> str:
+    """``model_paths.embed_model`` の model_key (宣言が無ければ空文字 = model_name を使う)。"""
+    raw = (cfg.get("model_paths") or {}).get("embed_model") or ""
+    if not raw:
+        return ""
+    from backend.config import PathResolver, get_project_root
+
+    return PathResolver(cfg, project_root or get_project_root()).model_key_for(raw)
+
+
 def create_embedding_backend(
     cfg: dict,
     project_root: Path | None = None,
@@ -77,7 +87,7 @@ def create_embedding_backend(
 
     Args:
         cfg: config.yaml の辞書全体
-        project_root: プロジェクトルート（相対パス解決用）
+        project_root: インストール根 (キャッシュの置き場 = そのデータ根の解決用)
 
     Returns:
         EmbeddingBackend 準拠のインスタンス
@@ -112,10 +122,13 @@ def create_embedding_backend(
             )
             doc_template = emb_cfg.get("doc_template", "")
 
+            # ストアのディレクトリ名に使う埋め込みモデルの識別子 (c_05 §0.5.7)
+            model_key = _embed_model_key(cfg, project_root)
             embedder = LlamaCppEmbedder(
                 host=host,
                 port=port,
                 model_name_str=model_name,
+                model_key=model_key,
                 dim_size=dim,
                 timeout=timeout,
                 query_timeout=query_timeout,
@@ -135,15 +148,21 @@ def create_embedding_backend(
         case _:
             raise ValueError(f"Unknown embedding backend: {backend}")
 
+    # 埋め込みサーバの調停 (c_16 §6.5)。キャッシュの内側に置く — キャッシュに
+    # 当たった呼び出しは順番を待たない。
+    from backend.free.rag.embed_scheduler import ScheduledEmbeddingBackend
+
+    embedder = ScheduledEmbeddingBackend(embedder)
+
     # キャッシュラッパーで包む（embedding.cache_enabled: true 時）
     cache_enabled = emb_cfg.get("cache_enabled", True)
     if cache_enabled:
         from backend.free.rag.embedding_cache import CachedEmbeddingBackend
 
-        cache_dir_str = emb_cfg.get("cache_dir", "local/cache/embeddings/")
-        cache_dir = Path(cache_dir_str)
-        if project_root and not cache_dir.is_absolute():
-            cache_dir = project_root / cache_dir
+        from backend.config import resolve_data_path
+
+        # 置き場はデータ根の cache/embeddings/ 固定 (c_05 §0.2)。
+        cache_dir = resolve_data_path("embedding_cache_dir", project_root)
         cache_max_mb = emb_cfg.get("cache_max_mb", 100)
 
         embedder = CachedEmbeddingBackend(

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 # NOTE: 既定値は `learned_patterns` モジュールのデフォルトと一致させること。
 _DEFAULT_INITIAL_WEIGHT = 0.5
@@ -23,3 +24,5 @@ class LearnedPattern:
     first_seen: float = 0.0
     last_seen: float = 0.0
     last_hit: float = 0.0
+    #: 永続形の未知キー (この版が知らないフィールド)。書き戻しで元の位置へ戻す。
+    _extra: dict[str, Any] | None = None

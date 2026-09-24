@@ -295,8 +295,6 @@ async def pin_memory(
                 "the memory API can only create mem-owned facts"
             ),
         )
-    # 旧名 ("coding") は現行名へ正規化する (chat 入口と同じ理由。
-    # canonicalize_session_mode の docstring が定める入口互換)。
     canonical_origin = canonicalize_session_mode(req.mode_origin)
     if canonical_origin is None:
         raise HTTPException(

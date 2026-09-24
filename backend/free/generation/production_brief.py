@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.free.core.turn_text import neutralize_frame_markers
 from backend.utils import estimate_tokens
 
 #: 節の内部キー→見出しの対応。この順で組み立て、総予算超過時は逆順
@@ -68,7 +69,7 @@ def _render_references(chunks: list[tuple[str, float, str]]) -> str:
     """RAG 採用チャンク (chunk_id, salience, content) を References 節の本文へ整形する。"""
     parts: list[str] = []
     for chunk_id, _score, content in chunks:
-        body = (content or "").strip()
+        body = neutralize_frame_markers((content or "").strip())
         if not body:
             continue
         parts.append(f"[{chunk_id}]\n{body}" if chunk_id else body)

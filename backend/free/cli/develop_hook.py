@@ -101,7 +101,7 @@ class _FreeDevelopHook:
         )
         parser.add_argument(
             "--isolate-data", action="store_true",
-            help="Isolate local/ data dir (Pro only, no-op in Free)",
+            help="Use a separate data root userdata-isolated/develop/ (Pro only, no-op in Free)",
         )
 
     def setup_develop_env(self, level: DevelopLevel) -> None:

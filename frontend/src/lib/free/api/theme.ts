@@ -116,13 +116,6 @@ export async function activateThemeApi(
 	});
 }
 
-/** テーマを信頼済みとしてマーク */
-export async function trustThemeApi(
-	themeId: string
-): Promise<{ theme_id: string; trusted: boolean }> {
-	return request<{ theme_id: string; trusted: boolean }>('POST', `/themes/${themeId}/trust`);
-}
-
 /** テーマインストール (ZIP) */
 export async function installThemeApi(file: File): Promise<ThemeInstallResponse> {
 	const formData = new FormData();

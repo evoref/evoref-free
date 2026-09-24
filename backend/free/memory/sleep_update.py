@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now
@@ -54,14 +55,29 @@ logger = get_logger("memory.sleep_update")
 #: (:meth:`SleepTimeWorker._save_state_async`)。
 _SAVE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="episodic-save")
 
-#: Light サイクルで snapshot を作る事象数の下限。
-#:
-#: snapshot 生成は畳み込み + 索引再構築 + 増分埋め込みで、Light は応答のたびに
-#: 走る。1 ターン (= 2 ノート) ごとに版を積むと、会話中ずっと索引を作り直す
-#: ことになる。**新しいノートが検索に出るのは次の snapshot から** だが、直近の
-#: 会話はワーキングメモリの窓がそのままプロンプトに載るので、そこは失われない
-#: (c_16 §2.1 の割り切りと同じ)。Full は溜まった事象があれば必ず版を作る。
-_SNAPSHOT_MIN_EVENTS_LIGHT = 16
+#: 最後の追記からこの秒数を過ぎたアクティブなセッションは sleep-time に畳む。
+_HISTORY_FOLD_IDLE_SECONDS = 1800.0
+
+#: 版を作る条件 (c_16 §5.7): 未畳みの事象がこの件数以上、**または** 前の版から
+#: :data:`SNAPSHOT_MAX_AGE_SEC` 経って未畳みの事象がある。新しい記憶を検索に出す
+#: のは tail 索引 (c_16 §6.4) の役目なので、版は事象がまとまってから作る
+#: (1 日 20〜30 版 → 1〜3 版、書き込みは 1/10〜1/20)。
+SNAPSHOT_MAX_BACKLOG = 512
+SNAPSHOT_MAX_AGE_SEC = 24 * 60 * 60
+
+
+def snapshot_due(evidence) -> bool:
+    """このストアの版を作る時か (:data:`SNAPSHOT_MAX_BACKLOG` / :data:`SNAPSHOT_MAX_AGE_SEC`)。
+
+    版がまだ無いストアは経過時間を無限大と見る (最初の事象から版を作る)。
+    """
+    pending = int(evidence.manifest.events_since_snapshot)
+    if pending <= 0:
+        return False
+    return (
+        pending >= SNAPSHOT_MAX_BACKLOG
+        or evidence.snapshot_age_seconds() >= SNAPSHOT_MAX_AGE_SEC
+    )
 
 # ノートを埋め込む際の本文上限 (文字数)。llama-server の embed インスタンスは
 # n_ctx_slot が 2048〜4096 程度で運用されるため、超過すると
@@ -232,15 +248,94 @@ class SleepTimeWorker:
                 "Sleep-time Light skipped: another sleep-time cycle is in progress",
             )
             return {
-                "notes_created": 0, "touched": 0, "snapshot": "",
+                "notes_created": 0, "touched": 0,
                 "knowledge_claims": 0, "skipped": "cycle_in_progress",
             }
         async with self._cycle_lock:
             self._cancelled = False
             return await self._run_light_locked()
 
+    def snapshot_due(self) -> bool:
+        """episodic か SemMem のどちらかで版を作る時か (:func:`snapshot_due`)。"""
+        if snapshot_due(self.episodic.evidence):
+            return True
+        store = self._semantic_store()
+        return store is not None and snapshot_due(store.evidence)
+
+    def snapshot_backlog(self) -> int:
+        """版に畳まれていない事象数 (episodic と SemMem の大きい方)。"""
+        pending = int(self.episodic.evidence.manifest.events_since_snapshot)
+        store = self._semantic_store()
+        if store is not None:
+            pending = max(pending, int(store.evidence.manifest.events_since_snapshot))
+        return pending
+
+    async def refresh_tail(self) -> int:
+        """episodic / SemMem の tail 索引を埋める (c_16 §6.4)。
+
+        版を待たずに新しいノート・ファクトを検索に出す。サイクルロックは取らない
+        — tail は書き手が事象を追記した後に埋めるだけで、ストアの内容を変えない。
+
+        Returns:
+            新しく埋め込んだ行数 (2 ストアの合計)。
+        """
+        stores = [self.episodic.evidence]
+        semantic = self._semantic_store()
+        if semantic is not None:
+            stores.append(semantic.evidence)
+        total = 0
+        for store in stores:
+            try:
+                total += await store.refresh_tail()
+            except Exception as e:  # noqa: BLE001 — 埋められなくても版で拾える
+                logger.warning("Tail index refresh failed for %s: %s", store.store_name, e)
+        return total
+
+    async def run_snapshot(self) -> dict:
+        """保守の snapshot: 溜まった事象を版に畳み、未確定の較正を拾い直す。
+
+        応答開始時の Light (Trigger A) から外した段 (G1 設計 §17.5-4 /
+        docs/f_02 §4.3)。版の生成は畳み込みと索引の作り直しをイベントループ上で
+        行うため、生成と並走させるとストリームが止まる (50k で 27〜29 秒)。
+        呼出側 (``SleepScheduler``) が応答後の静穏窓で呼ぶ。
+
+        較正 (Step 10d) はノートのベクトルを読むので、版を作った後に置く。
+        Light / Full が走っていれば待たずに飛ばす (Full は末尾で自分で版を作る)。
+
+        Returns:
+            ``{"episodic_snapshot": 0|1, "semantic_snapshot": 0|1,
+            "threshold_calibrated": bool}``。飛ばした場合は
+            ``{"skipped": "cycle_in_progress"}``。
+        """
+        if self._cycle_lock.locked():
+            return {"skipped": "cycle_in_progress"}
+        async with self._cycle_lock:
+            result: dict = {"episodic_snapshot": 0, "semantic_snapshot": 0}
+            # 入力件数は版を作るべきときだけ載せる — 溜まっているのに版が
+            # できない回を死活監視が stalled として数える (c_07 §7.1)。
+            pending = int(self.episodic.evidence.manifest.events_since_snapshot)
+            if snapshot_due(self.episodic.evidence):
+                result["episodic_snapshot" + INPUT_SUFFIX] = pending
+                try:
+                    result["episodic_snapshot"] = int(
+                        bool(await self.episodic.create_snapshot()),
+                    )
+                except Exception as e:  # noqa: BLE001 — 版が作れなくても事象は残る
+                    logger.warning("Episodic snapshot failed: %s", e)
+            else:
+                self.episodic.save_progress()
+            store = self._semantic_store()
+            semantic_pending = (
+                int(store.evidence.manifest.events_since_snapshot) if store is not None else 0
+            )
+            if store is not None and snapshot_due(store.evidence):
+                result["semantic_snapshot" + INPUT_SUFFIX] = semantic_pending
+            result["semantic_snapshot"] = int(bool(await self._maybe_snapshot_semantic()))
+            result["threshold_calibrated"] = await self._step10d_retry_calibration()
+            return result
+
     async def _run_light_locked(self) -> dict:
-        """Light 版: LLM なし。ノート生成 → touch flush → (必要なら) snapshot。
+        """Light 版: LLM なし。ノート生成 → touch flush → パターン減衰。
 
         **サイクルロック保持中に呼ぶこと** (:meth:`run_light` /
         :meth:`run_full` が入口)。``_cancelled`` のリセットも入口側が持つ。
@@ -254,6 +349,9 @@ class SleepTimeWorker:
         - eviction は tier 遷移と保持方針 (:meth:`_step_e_lifecycle`) が担う。
           ストア間のコピーは無くなったので、ここで「落とす」ものは無い
 
+        snapshot と閾値較正は Light でやらない (応答の生成と並走してイベント
+        ループを止めるため)。応答後の静穏窓で :meth:`run_snapshot` が走る。
+
         Returns:
             実行結果サマリ dict
         """
@@ -261,7 +359,7 @@ class SleepTimeWorker:
         t0 = time.monotonic()
         step_durations: dict[str, float] = {}
         result: dict = {
-            "notes_created": 0, "touched": 0, "snapshot": "", "knowledge_claims": 0,
+            "notes_created": 0, "touched": 0, "knowledge_claims": 0,
         }
 
         logger.info(
@@ -292,25 +390,12 @@ class SleepTimeWorker:
             step_durations["step8_7_knowledge_fetch"] = round(time.monotonic() - ts, 3)
         finally:
             ts = time.monotonic()
-            result["snapshot"] = await self._maybe_snapshot(
-                min_events=_SNAPSHOT_MIN_EVENTS_LIGHT,
-            )
-            step_durations["step_e5_snapshot"] = round(time.monotonic() - ts, 3)
-            # **較正を Full まで待たない。** 較正は起動時 (ノート < MIN_NOTES
-            # なら skip) と Full の末尾でしか確定しないので、``local/`` を
-            # 空にした直後は「最初の Full が終わるまで config の静的閾値」と
-            # いう長い窓ができる。実測 (2026-09-14 監査 F-06): 50 ターンの
-            # うち **最初の 35 ターン** がその窓に入り、棒が 0.584 ではなく
-            # 0.40 で回って無関係チャンクが ``[参考情報]`` に載り続けた。
-            # Light は応答のたびに走るので、ノートが閾値に達した直後の
-            # サイクルで確定できる。確定済みなら中で即 return する
-            # (未確定のあいだだけのコスト)。版を作った後に置くのは Full の
-            # Step 10d と同じ理由 — 較正はノートのベクトルを読む。
-            ts = time.monotonic()
-            result["threshold_calibrated"] = await self._step10d_retry_calibration()
-            step_durations["step10d_threshold_calibration"] = round(
-                time.monotonic() - ts, 3,
-            )
+            self.episodic.save_progress()
+            store = self._semantic_store()
+            if store is not None:
+                self._semantic_housekeeping(store)
+                store.save_manifest()
+            step_durations["step_e5_save_progress"] = round(time.monotonic() - ts, 3)
             await self._save_state_async()
 
         elapsed = round(time.monotonic() - t0, 3)
@@ -434,8 +519,8 @@ class SleepTimeWorker:
             long_max_records=int(self._retention_value("long_max_records", 50000)),
         )
 
-    async def _maybe_snapshot(self, *, min_events: int = 1) -> str:
-        """未畳み込み事象が ``min_events`` 以上あれば版を作る。
+    async def _maybe_snapshot(self) -> str:
+        """版を作る時 (:func:`snapshot_due`) なら版を作る。
 
         episodic と semantic の 2 ストアを同じ条件で畳む。版を作った時点で
         埋め込みとクラスタ索引・転置索引がまとめて更新される (c_16 §6.1)。
@@ -444,22 +529,34 @@ class SleepTimeWorker:
             作った episodic の版名。作らなければ空文字。
         """
         version = ""
-        pending = int(self.episodic.evidence.manifest.events_since_snapshot)
-        if pending < max(1, min_events):
+        if not snapshot_due(self.episodic.evidence):
             self.episodic.save_progress()
         else:
             try:
                 version = await self.episodic.create_snapshot() or ""
             except Exception as e:  # noqa: BLE001 — 版が作れなくても事象は残る
                 logger.warning("Episodic snapshot failed: %s", e)
-        await self._maybe_snapshot_semantic(min_events=min_events)
+        await self._maybe_snapshot_semantic()
         return version
 
-    async def _maybe_snapshot_semantic(self, *, min_events: int = 1) -> str:
-        """SemMem 側の保持方針を適用してから版を作る (c_16 §5.4 / §6.1)。"""
+    async def _maybe_snapshot_semantic(self) -> str:
+        """SemMem 側の保持方針を適用してから、版を作る時なら版を作る (c_16 §5.4 / §6.1)。"""
         store = self._semantic_store()
         if store is None:
             return ""
+        self._semantic_housekeeping(store)
+        if not snapshot_due(store.evidence):
+            store.save_manifest()
+            return ""
+        try:
+            return await store.create_snapshot() or ""
+        except Exception as e:  # noqa: BLE001 — 版が作れなくても事象は残る
+            logger.warning("Semantic snapshot failed: %s", e)
+            return ""
+
+    @staticmethod
+    def _semantic_housekeeping(store) -> None:
+        """SemMem の保持方針と touch の書き出し (失敗しても後段は続ける)。"""
         try:
             store.enforce_retention()
         except Exception as e:  # noqa: BLE001 — 保持で落ちても版は作る
@@ -468,15 +565,6 @@ class SleepTimeWorker:
             store.flush_touch()
         except Exception as e:  # noqa: BLE001
             logger.warning("Semantic touch flush failed: %s", e)
-        pending = int(store.evidence.manifest.events_since_snapshot)
-        if pending < max(1, min_events):
-            store.save_manifest()
-            return ""
-        try:
-            return await store.create_snapshot() or ""
-        except Exception as e:  # noqa: BLE001 — 版が作れなくても事象は残る
-            logger.warning("Semantic snapshot failed: %s", e)
-            return ""
 
     def _semantic_store(self):
         """SemMem 本体 (スコープ束縛ビューではない)。未配線なら ``None``。
@@ -924,7 +1012,7 @@ class SleepTimeWorker:
         step_durations["step_e_lifecycle"] = round(time.monotonic() - ts, 3)
 
         ts = time.monotonic()
-        result["snapshot"] = await self._maybe_snapshot(min_events=1)
+        result["snapshot"] = await self._maybe_snapshot()
         step_durations["step_e5_snapshot"] = round(time.monotonic() - ts, 3)
 
         # Step 10d: 起動時に条件を満たさず見送られた閾値較正を拾い直す。
@@ -937,6 +1025,11 @@ class SleepTimeWorker:
         step_durations["step10d_threshold_calibration"] = round(
             time.monotonic() - ts, 3,
         )
+
+        # 抽出したファクト・統合したノートのうち版に入らなかったものを tail へ
+        ts = time.monotonic()
+        result["tail_refreshed"] = await self.refresh_tail()
+        step_durations["step_e6_tail_refresh"] = round(time.monotonic() - ts, 3)
 
         # 永続化 + 完了ログ
         # Step 5.9: corpus 疑似クエリ生成 (f_01 §6.4)。**Full の最後** に置く —
@@ -1078,7 +1171,7 @@ class SleepTimeWorker:
             try:
                 from backend.config import get_path_resolver
                 resolver = get_path_resolver()
-                patterns_file = resolver.resolve_learning("learned_patterns_file")
+                patterns_file = resolver.resolve_local("learned_patterns_file")
                 self.learned_patterns.save(patterns_file)
             except Exception as e:
                 logger.warning("Failed to save learned patterns: %s", e)
@@ -1172,6 +1265,7 @@ class SleepTimeWorker:
             language_overlay=language_overlay,
         )
 
+    @with_embed_priority(P3_BULK)
     async def _step5_9_pseudo_queries(self, llm_client) -> int:
         """Step 5.9: corpus パッケージの疑似クエリ生成 (f_01 §6.4)。
 
@@ -1564,6 +1658,9 @@ class SleepTimeWorker:
 
         try:
             mgr = get_history_manager()
+            # しばらく追記の無いアクティブなセッションを JSON へ畳む (閉じられない
+            # まま残る Web のセッションの追記ログを溜め続けない、c_05 §2.1)。
+            mgr.fold_active_sessions(idle_seconds=_HISTORY_FOLD_IDLE_SECONDS)
             result = mgr.compact_sessions()
             total = result.get("compressed", 0) + result.get("summarized", 0) + result.get("deleted", 0)
             return total

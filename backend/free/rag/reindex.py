@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.exceptions import (
     LLMConnectionError,
     LLMRequestRejectedError,
@@ -151,6 +152,7 @@ def _translate_embed_error(exc: httpx.HTTPError, label: str) -> Exception:
     )
 
 
+@with_embed_priority(P3_BULK)
 async def reindex_evidence_store(
     store: Any,
     embedder: "EmbeddingBackend",
@@ -179,6 +181,8 @@ async def reindex_evidence_store(
     # 起動時に差した Embedder とモデル切替後の Embedder は別インスタンスに
     # なりうる。ここで必ず現在のものへ差し替える。
     evidence.embedding_backend = embedder
+    # 作り直しの明示の指示なので、埋め込みモデルの変更の確認も兼ねる (c_05 §0.5.7)。
+    evidence.confirm_reembed()
     try:
         if not evidence.manifest.active_snapshot:
             if int(getattr(evidence.manifest, "events_since_snapshot", 0)) <= 0:

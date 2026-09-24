@@ -1,8 +1,5 @@
 """設定管理とパス解決"""
 
-import importlib.util
-import sys
-
 import yaml
 from pathlib import Path
 
@@ -44,109 +41,128 @@ def mode_base_model_raw(
 
 
 class PathResolver:
-    """モデルパスとローカルパスを統一的に解決"""
+    """モデルパスとデータパスを統一的に解決する (c_05 §0.2)。
+
+    モデルは ``model_paths`` (インストール根基準)。データ・状態は **データ根
+    ``data_root`` からだけ** 導出する (:data:`LAYOUT`)。``local_paths`` の個別
+    キーは撤去済みで、利用者が変えられるのは ``outputs_dir`` だけ。
+    """
 
     MODEL_DEFAULTS = {
         "base_model": "models/gemma-4-12b-it-qat-q4_0.gguf",
     }
-    LOCAL_DEFAULTS = {
-        "lora_adapter": "local/models/adapter.gguf",
-        "lora_versions_dir": "local/lora_versions/",
-        "lora_spsa_checkpoint": "local/models/lora_spsa_checkpoint.json",
-        # Level 2 base=C: control vector 本体 / 版管理 / 作業用ディレクトリ
-        "control_vector_adapter": "local/models/control_vector.gguf",
-        "control_vector_versions_dir": "local/models/control_vector_versions/",
-        "cvector_work_dir": "local/cvector/",
-        "aux_prompts_dir": "local/aux_prompts/",
-        "aux_calibration_file": "local/aux_calibration.json",
-        "liveness_file": "local/liveness.json",
-        "lora_archive_dir": "local/lora_archive/",
-        "embed_lora_adapter": "local/models/embed_adapter.gguf",
-        "embed_lora_versions_dir": "local/models/embed_lora_versions/",
-        "knowledge_dir": "local/knowledge/",
+    #: データ根からの相対パス (c_03 §10.1)。末尾 ``/`` はディレクトリ。
+    #: ``store/learning/shared/`` はモデル非依存の学習データだけの置き場
+    #: (c_05 §0.5.12)。モデル依存の学習データは :data:`_LEARNING_SUBPATH`。
+    LAYOUT = {
+        "liveness_file": "logs/liveness.json",
         # ディレクトリ指定の無い生成物の既定の書込み先 (CWD へ書かないため)。
-        "outputs_dir": "local/outputs/",
-        "experience_file": "local/experience.json",
-        "eval_core_file": "local/eval_core.json",
-        "model_state_file": "local/model_state.json",
-        "model_quality_file": "local/model_quality.json",
+        # 利用者が ``local_paths.outputs_dir`` で変えられる唯一のパス。
+        "outputs_dir": "outputs/",
+        "model_state_file": "store/model_state.json",
+        # model_key の計算結果 (derived、c_05 §0.5.7)。
+        "model_registry_file": "store/model_registry.json",
+        "model_quality_file": "store/model_quality.json",
         # EvorefMem ローカル状態
-        "local_state_file": "local/state.json",
-        "memory_dir": "local/memory/",
+        "local_state_file": "store/state.json",
+        "memory_dir": "store/memory/",
         # AgentTracer の MDP トレース常設ストア (エピソード記憶の入力)。
-        "agent_trace_dir": "local/memory/agent_trace/",
-        "prompts_dir": "local/prompts/",
-        "history_dir": "local/history/",
-        "learned_patterns_file": "local/learned_patterns.json",
-        "themes_dir": "local/themes/",
-        # SchemaMigrator バックアップ / 旧 prompts 退避先
-        "migration_archive_dir": "local/migration_archive/",
+        "agent_trace_dir": "store/agent_trace/",
+        "history_dir": "store/history/",
+        "learned_patterns_file": "store/learning/shared/learned_patterns.json",
+        "themes_dir": "themes/",
         # EvorefMem トリガ辞書 (pin / fact / classify) のユーザー上書き先。
         # 同梱 default は ``backend/free/memory/_defaults/triggers/``。
-        "triggers_dir": "local/triggers/",
+        "triggers_dir": "store/overrides/triggers/",
         # staged クリエイトパイプラインの一時ワークスペース。
-        "create_workspace_dir": "local/create/",
-        # base 学習データの (model × mode) パーティションルート。
-        "learning_dir": "local/learning/",
-        # Level 1 phase6 (GenerationParamEvolver) の学習デルタ。base モデル依存
-        # なので resolve_learning でパーティション配下へ置く。
-        "generation_deltas_file": "local/generation_deltas.json",
+        "create_workspace_dir": "store/create/",
+        # base 学習データの (model_key × mode) パーティションルート。
+        "learning_dir": "store/learning/",
         # develop=evolve の LogIngestor 進捗 (読み込みオフセット)。
-        "log_ingestor_file": "local/state/log_ingestor.json",
+        "log_ingestor_file": "store/state/log_ingestor.json",
+        # ── ここから G1 で足した置き場 (c_03 §10.1) ──
+        "store_dir": "store/",
+        # corpus ストア (文書由来チャンク)。``resolve_corpus_dir()`` の実体。
+        "corpus_dir": "store/corpus/",
+        "logs_dir": "logs/",
+        "tmp_dir": "tmp/",
+        "run_dir": "run/",
+        "cache_dir": "cache/",
+        "embedding_cache_dir": "cache/embeddings/",
+        "profiles_dir": "profiles/",
+        "loop_sandbox_dir": "store/loop_sandbox/",
+        "subject_dictionary_file": "store/memory/semantic/subject_dictionary.json",
+        # PolicyInterpreter のポリシー (進化対象外のドメイン・モデル非依存)。
+        # 進化対象 (agent / long_form) は ``evolved_policies_dir`` (パーティション)。
+        "policies_dir": "store/learning/shared/policies/",
+        # CLI の ``/save`` ``/load`` が書く手動保存セッション。
+        "cli_sessions_dir": "store/cli_sessions/",
+        # Pro だけが書くデータの根 (c_05 §0.4.2 所有表)。Free は開かない・作らない・
+        # 消さない (:data:`PRO_LAYOUT_KEYS` は ``ensure_local_dirs`` の対象外)。
+        "pro_dir": "store/pro/",
     }
+    #: Pro の置き場のキー。Free のプロセスはディレクトリを作らない。
+    PRO_LAYOUT_KEYS = frozenset({"pro_dir"})
+    #: ``local_paths`` で上書きできるキー (c_05 §0.2: ``outputs_dir`` だけ)。
+    USER_OVERRIDABLE = frozenset({"outputs_dir"})
 
-    # resolve_learning で active モデルパーティション配下へ rebase する base 学習キーと、
-    # ``learning_dir/<stem>/`` からの相対サブパス。ここに無いキー (共有 / embed)
-    # は resolve_local へ素通しする (memory_dir を巻き込まないため allow-list)。
+    # resolve_learning で active モデルの model_key パーティション配下へ rebase する
+    # base 学習キーと、``learning_dir/<model_key>/`` からの相対サブパス。ここに無い
+    # キー (共有 / embed) は resolve_local へ素通しする (memory_dir を巻き込まない
+    # ための allow-list)。flat の置き場は持たない (c_05 §0.5.12)。
     _LEARNING_SUBPATH = {
-        "experience_file": "experience.json",
+        "experience_file": "experience.jsonl",
         "prompts_dir": "prompts",
         # 補助タスクのプロンプト。実行するのはベースモデルなので base 軸で
         # 分離する (モデルを替えたら既定から作り直す)。
         "aux_prompts_dir": "aux_prompts",
-        "lora_adapter": "models/adapter.gguf",
-        "lora_versions_dir": "models/lora_versions",
-        "lora_spsa_checkpoint": "models/lora_spsa_checkpoint.json",
-        "control_vector_adapter": "models/control_vector.gguf",
-        "control_vector_versions_dir": "models/control_vector_versions",
-        "cvector_work_dir": "cvector",
+        # 補助タスクの timeout 較正 (derived、keep_on_reset)。
+        "aux_calibration_file": "aux_calibration.json",
+        # PolicyParamEvolver の進化対象ドメイン (agent / long_form) のポリシー。
+        "evolved_policies_dir": "policies",
         "generation_deltas_file": "generation_deltas.json",
-        # 訂正パターン辞書。ベースモデル自身の出力の癖から学習するため、
-        # モデルを替えたら持ち越してはいけない (2026-09-05 監査で漏れを検出)。
-        "learned_patterns_file": "learned_patterns.json",
-        # Level 1 採用ゲート / Level 2 目的関数の合格基準。auto ケースは
-        # そのモデルの訂正から作られるので base 軸で分離する。
-        "eval_core_file": "eval_core.json",
     }
 
-    # ``_LEARNING_SUBPATH`` のうち、``learning.level2_adapter_partition=="model_mode"``
-    # の時に ``<stem>/<mode>/...`` と mode サブディレクトリを追加で挟む対象キー。
-    # experience_file / prompts_dir は既に別の方法 (mode.md ファイル名 / mode タグ) で
-    # モード分離済みのため対象外。control_vector 系 / cvector_work_dir は本機能の
-    # スコープ外 (Level 2 base=cvector 手法は今回のモード分離の対象としない)。
-    _MODE_PARTITIONED_KEYS = frozenset(
-        {"lora_adapter", "lora_versions_dir", "lora_spsa_checkpoint"},
-    )
+    # Pro の学習データ (c_05 §0.4.2 所有表)。``resolve_pro_learning`` が
+    # ``<pro_dir>/learning/<model_key>/`` の下に解決する。eval_core 以外は
+    # アダプタ系で、``<model_key>/<mode>/`` の mode パーティションに置く。
+    _PRO_LEARNING_SUBPATH = {
+        # Level 1 採用ゲート / Level 2 目的関数の合格基準。auto ケースは
+        # そのモデルの訂正から作られるので base 軸で分離する (書き手は Pro)。
+        "eval_core_file": "eval_core.json",
+        "lora_adapter": "adapter.gguf",
+        "lora_versions_dir": "lora_versions",
+        "lora_spsa_checkpoint": "lora_spsa_checkpoint.json",
+        "control_vector_adapter": "control_vector.gguf",
+        "control_vector_versions_dir": "control_vector_versions",
+        "cvector_work_dir": "cvector",
+    }
+    #: ``_PRO_LEARNING_SUBPATH`` のうち mode で分けないキー。
+    _PRO_MODELESS_KEYS = frozenset({"eval_core_file"})
 
-    def __init__(self, config: dict, project_root: Path):
+    def __init__(self, config: dict, project_root: Path, data_root: Path | None = None):
+        from backend.data_root import resolve_data_root
+
         self.root = project_root
-        self.models = config.get("model_paths", {})
-        self.local = config.get("local_paths", {})
-        # base 学習データの (model × mode) パーティション state。
-        # active stem 未設定 or flag false なら resolve_learning は resolve_local 同等
-        # (レガシー flat レイアウト)。set_active_model_stem で起動時に確定する。
-        self._active_stem: str | None = None
-        self._partition_enabled: bool = bool(
-            (config.get("learning", {}) or {}).get("partition_by_base_model", True)
+        #: データ根 (c_05 §0.2)。未指定なら ``--data-root`` を反映した環境変数
+        #: ``EVOREF_DATA_ROOT`` → ``<project_root>/userdata``。
+        self.data_root: Path = (
+            Path(data_root) if data_root is not None else resolve_data_root(root=project_root)
         )
-        # embed_instruction 系データの (embedding モデル) パーティション state。
-        # base 学習パーティション (_active_stem) とは独立した軸。
-        self._active_embed_stem: str | None = None
-        # Level 2 base LoRA アダプタの (mode) パーティション state。
-        # レガシー "model" では resolve_learning は mode 引数を
-        # 無視し、従来どおりモデル単位で 1 アダプタを共有する。"model_mode" のときのみ
-        # chat/create で別ファイルへ分離する。AppState.current_mode の初期値と揃え、
-        # active_mode の既定は "chat"。
+        self.models = config.get("model_paths", {})
+        self.local = config.get("local_paths", {}) or {}
+        # base 学習パーティションの active モデル (model_key と GGUF の stem)。
+        # 未束縛のまま resolve_learning が呼ばれたら ``model_paths.base_model``
+        # から遅延で導出する (CLI など束縛しないプロセス向け)。
+        self._active_key: str | None = None
+        self._active_stem: str | None = None
+        # embed_instruction 系データの (embedding モデル) パーティション。
+        # base 学習パーティションとは独立した軸。未束縛なら ``embed_model`` から導出。
+        self._active_embed_key: str | None = None
+        # Level 2 アダプタの (mode) パーティション state。レガシー "model" では
+        # resolve_pro_learning は mode 引数を無視し、chat/create が "chat" の
+        # 1 つを共有する。AppState.current_mode の初期値と揃え、active_mode の
+        # 既定は "chat"。
         self._active_mode: str = "chat"
         self._adapter_partition_mode: str = str(
             (config.get("learning", {}) or {}).get(
@@ -168,60 +184,102 @@ class PathResolver:
         return self._to_absolute(raw)
 
     def resolve_local(self, key: str) -> Path:
-        """ローカルパス解決（読み書きリソース）"""
-        raw = self.local.get(key, self.LOCAL_DEFAULTS[key])
-        return self._to_absolute(raw)
+        """データパス解決 (読み書きリソース)。全て ``data_root`` の下。
+
+        ``outputs_dir`` だけは ``local_paths.outputs_dir`` で変えられる
+        (相対ならデータ根基準)。
+        """
+        rel = self.LAYOUT[key]
+        if key in self.USER_OVERRIDABLE and self.local.get(key):
+            override = Path(str(self.local[key]))
+            return override if override.is_absolute() else self.data_root / override
+        return self.data_root / rel
+
+    # ── モデル識別子 (c_05 §0.5.7) ──
+
+    def model_key_for(self, model_path: Path | str) -> str:
+        """``model_path`` の ``model_key`` (相対ならインストール根基準)。
+
+        GGUF が読めなければファイル名由来の仮 key (:func:`backend.model_key.model_key_for`)。
+        """
+        from backend.model_key import model_key_for
+
+        return model_key_for(self._to_absolute(str(model_path)))
+
+    def bind_active_model(self, model_path: Path | str | None) -> str | None:
+        """base 学習パーティションを ``model_path`` の ``model_key`` に束ねる。
+
+        起動時は ``model_paths.base_model``、ランタイムのモデル切替では新しい
+        モデルで呼ぶ。``None`` / 空なら束縛を外す (次の resolve_learning が
+        ``model_paths.base_model`` から導出し直す)。
+
+        Returns:
+            束ねた ``model_key`` (外したときは ``None``)。
+        """
+        name = Path(str(model_path or "")).name
+        if not name:
+            self._active_key = None
+            self._active_stem = None
+            return None
+        self._active_key = self.model_key_for(model_path)
+        self._active_stem = Path(name).stem
+        return self._active_key
+
+    def set_active_model_key(self, model_key: str, *, stem: str | None = None) -> None:
+        """``model_key`` を直接束ねる (計算済みの key を持っている呼出元・テスト用)。"""
+        self._active_key = model_key
+        self._active_stem = stem
+
+    @property
+    def active_model_key(self) -> str:
+        """base 学習パーティションの ``model_key`` (未束縛なら base_model から導出)。"""
+        if self._active_key is None:
+            self.bind_active_model(self.models.get("base_model") or self.MODEL_DEFAULTS["base_model"])
+        assert self._active_key is not None
+        return self._active_key
 
     @property
     def active_model_stem(self) -> str | None:
-        """base 学習パーティションの active モデル stem (未設定なら ``None``)。
+        """束ねたモデルの GGUF ファイル名の stem (未束縛なら ``None``)。
 
-        downstream の構築側が SemMem ``learn.*`` subject 用スラグ
-        (``model_slug``) を導出するために参照する。
+        ランタイム切替の検知 (``LearningScheduler._base_model_changed``) が
+        ``model_state`` のファイル名と突き合わせる。パーティションのディレクトリ名
+        は :attr:`active_model_key`。
         """
         return self._active_stem
 
-    @property
-    def partition_enabled(self) -> bool:
-        """base 学習パーティションが有効か (``partition_by_base_model``)。"""
-        return self._partition_enabled
-
-    def set_active_model_stem(self, stem: str | None) -> None:
-        """base 学習パーティションの active モデル stem を設定する。
-
-        ``None`` / 空 のときは partition を無効化し、``resolve_learning`` が
-        ``resolve_local`` へ素通しする (レガシー flat レイアウト)。起動時に
-        ``ModelState.current_filename`` の stem で確定し、モデル切替時に更新する。
-        """
-        self._active_stem = stem or None
+    def bind_active_embedding_model(self, model_path: Path | str | None) -> str | None:
+        """embed_instruction のパーティションを埋め込みモデルの ``model_key`` に束ねる。"""
+        name = Path(str(model_path or "")).name
+        self._active_embed_key = self.model_key_for(model_path) if name else None
+        return self._active_embed_key
 
     @property
-    def active_embedding_model_stem(self) -> str | None:
-        """embed_instruction パーティションの active 埋め込みモデル stem。"""
-        return self._active_embed_stem
+    def active_embedding_model_key(self) -> str:
+        """埋め込みモデルの ``model_key`` (未束縛なら ``model_paths.embed_model`` から導出)。
 
-    def set_active_embedding_model_stem(self, stem: str | None) -> None:
-        """embed_instruction パーティションの active 埋め込みモデル stem を設定する。
-
-        base 学習パーティション (``set_active_model_stem``) とは独立した軸。
-        ``None`` / 空のときは ``resolve_embed_instruction_dir`` が flat レイアウト
-        (``resolve_local("prompts_dir")``) へ素通しする。
+        ``embed_model`` が宣言されていなければ ``embedding.model_name`` の無い
+        構成なので、空のファイル名の仮 key に倒す。
         """
-        self._active_embed_stem = stem or None
+        if self._active_embed_key is None:
+            raw = self.models.get("embed_model") or ""
+            if raw:
+                self.bind_active_embedding_model(raw)
+            else:
+                from backend.model_key import provisional_model_key
+
+                self._active_embed_key = provisional_model_key("")
+        assert self._active_embed_key is not None
+        return self._active_embed_key
 
     def resolve_embed_instruction_dir(self) -> Path:
-        """embed_instruction 系データの保存先を **embedding モデル単位**で解決する。
+        """embed_instruction 系データの保存先を **埋め込みモデルの model_key 単位**で解決する。
 
         embed_instruction は埋め込みモデル向けのクエリ指示文であり、base モデル
-        切替とは無関係に保持されるべきだが、従来 ``SystemPromptManager.prompt_dir``
-        (base 学習パーティション) に同居しており base モデル切替で誤って
-        切り替わっていた (2026-07-18)。partition 無効 / active embed stem 未確定
-        時は ``resolve_local("prompts_dir")`` (従来の flat 配置) へ素通しし、
-        後方互換を保つ。
+        切替とは無関係に保持されるべきなので、base 学習パーティションとは別軸の
+        ``learning_dir/embed/<embed model_key>/`` に置く (c_05 §0.7.1)。
         """
-        if not self._partition_enabled or not self._active_embed_stem:
-            return self.resolve_local("prompts_dir")
-        return self.resolve_local("learning_dir") / "embed" / self._active_embed_stem
+        return self.resolve_local("learning_dir") / "embed" / self.active_embedding_model_key
 
     def resolve_aux_prompt_dir(self) -> Path:
         """補助タスクプロンプトの保存先を **ベースモデル単位**で解決する。
@@ -230,23 +288,17 @@ class PathResolver:
         は進化の対象で、進化した文面は **そのモデルの癖に合わせて最適化される**。
         判定を実行するのはベースモデルなので、base 学習パーティション
         (``resolve_learning``) と同じ軸に置き、モデルを差し替えたら既定から
-        作り直す。partition 無効時は ``local/aux_prompts/`` (flat) を返す。
+        作り直す。
         """
         return self.resolve_learning("aux_prompts_dir")
 
     def resolve_corpus_dir(self) -> Path:
         """corpus ストア (文書由来チャンク) の置き場を解決する。
 
-        c_16 §2 で 3 ストア (episodic / semantic / corpus) は
-        ``local_paths.memory_dir`` 配下へ統合された。旧
-        ``local_paths.cartridges_dir`` は廃止 (c_16 §8) で、パッケージは
-        ``<memory_dir>/corpus/packages/<id>/<version>/`` に置く。
-
-        独立した ``local_paths`` キーを持たないのは、3 ストアが 1 つの
-        ``memory_dir`` の下に揃っていること自体が不変則だから — 別キーにすると
-        「片方だけ別ドライブへ移した」状態が作れてしまう。
+        G1 のレイアウト (c_03 §10.1) では ``<data_root>/store/corpus/`` で、
+        パッケージは ``packages/<id>/<version>/`` に置く。
         """
-        return self.resolve_local("memory_dir") / "corpus"
+        return self.resolve_local("corpus_dir")
 
     def resolve_outputs_dir(self) -> Path:
         """ディレクトリ指定の無い生成物の既定の書込み先を解決する。
@@ -273,101 +325,82 @@ class PathResolver:
         """``learning.level2_adapter_partition`` の値 (``"model"``/``"model_mode"``)。"""
         return self._adapter_partition_mode
 
-    def resolve_learning(self, key: str, mode: str | None = None) -> Path:
-        """base 学習データのパスを **active** モデルパーティション配下で解決する。
+    def resolve_learning(self, key: str) -> Path:
+        """base 学習データのパスを **active** モデルの model_key パーティション配下で解決する。
 
-        ``_LEARNING_SUBPATH`` の base 学習キーのみ ``learning_dir/<active_stem>/...``
-        配下へ rebase する。partition 無効 (``partition_by_base_model=false`` /
-        active stem 未設定) または非対象キーは ``resolve_local`` へ素通しする
-        (共有・レガシー)。``learning_dir`` は ``resolve_local`` 経由で解決
-        するため ``--isolate-data`` の prefix 書換えを自動継承する。
-
-        ``mode`` は ``key`` が ``_MODE_PARTITIONED_KEYS`` に属し、かつ
-        ``adapter_partition_mode=="model_mode"`` のときだけ効く (``learning_path_for``
-        参照)。省略時は ``active_mode`` を使う。レガシー "model" スキームでは mode に
-        関わらず常に同一パスを返す (後方互換)。
-        """
-        if (
-            not self._partition_enabled
-            or not self._active_stem
-            or key not in self._LEARNING_SUBPATH
-        ):
-            return self.resolve_local(key)
-        effective_mode = mode if mode is not None else self._active_mode
-        return self.learning_path_for(
-            key, self._stem_for(key, effective_mode), mode=effective_mode,
-        )
-
-    def _stem_for(self, key: str, mode: str | None) -> str:
-        """``key`` / ``mode`` に対するパーティション根のモデル stem を返す。
-
-        LoRA アダプタ系 (``_MODE_PARTITIONED_KEYS``) は **そのモードが実際に
-        ロードするモデル** を根にする。アダプタは特定モデルの重みへの差分なので、
-        「どのモデル向けか」が保存先の第一キーであるべき。
-
-        従来は常に ``_active_stem`` (= ``model_paths.base_model`` = chat のモデル)
-        を根にしていたため、create が別モデル (``create_model``) を使う構成では
-        create のアダプタが chat モデルのパーティション配下に置かれていた。この
-        状態で chat の ``base_model`` を差し替えると、``create_model`` は変わって
-        いないのに create のアダプタが参照されなくなる (根が別 stem に移るため)。
-
-        アダプタ以外 (experience / prompts / cvector 系) は従来どおり
-        ``_active_stem``。経験とプロンプトは base 学習パーティション単位で
-        まとまっている既存設計 (docs/f_04_self_learning.md) を変えない。
-
-        ``model_paths`` に該当モデルの宣言が無い場合も ``_active_stem`` に倒す
-        (宣言されていないモデル名でパーティションを作らない)。
-        """
-        assert self._active_stem is not None  # 呼出元でガード済み
-        if (
-            mode is None
-            or key not in self._MODE_PARTITIONED_KEYS
-            or self._adapter_partition_mode != "model_mode"
-        ):
-            return self._active_stem
-        raw = mode_base_model_raw(self.models, mode, default="")
-        return Path(raw).stem if raw else self._active_stem
-
-    def learning_path_for(self, key: str, stem: str, mode: str | None = None) -> Path:
-        """**指定** モデル stem のパーティション配下で base 学習パスを解決する。
-
-        active stem に依存せず任意モデルのパーティションパスを得る。flat→partition
-        移行 (producer 別 / experience の base_model タグ別バケツ) で、active モデル
-        とは異なるモデルのパーティションへ振り分けるために使う。``_LEARNING_SUBPATH``
-        非対象キーは ``resolve_local`` へ素通しする。
-
-        ``mode`` は ``key in _MODE_PARTITIONED_KEYS`` かつ
-        ``adapter_partition_mode=="model_mode"`` のときのみ ``<stem>/<mode>/...`` と
-        サブディレクトリを追加する。それ以外 (レガシー "model" スキーム、または
-        mode 分割対象外キー) は従来どおり ``<stem>/...`` のまま (mode を無視する)。
+        ``_LEARNING_SUBPATH`` の base 学習キーのみ ``learning_dir/<model_key>/...``
+        配下へ rebase する。非対象キー (共有) は ``resolve_local`` へ素通しする。
+        active モデルが未束縛なら ``model_paths.base_model`` から導出する
+        (:attr:`active_model_key`)。``learning_dir`` は ``resolve_local`` 経由で
+        データ根の下に解決する (``--isolate-data`` は別のデータ根になる)。
+        Pro の学習データは :meth:`resolve_pro_learning`。
         """
         if key not in self._LEARNING_SUBPATH:
             return self.resolve_local(key)
-        root = self.resolve_local("learning_dir") / stem
-        if (
-            mode is not None
-            and key in self._MODE_PARTITIONED_KEYS
-            and self._adapter_partition_mode == "model_mode"
-        ):
-            root = root / mode
-        return root / self._LEARNING_SUBPATH[key]
+        return self.learning_path_for(key, self.active_model_key)
+
+    def learning_path_for(self, key: str, model_key: str) -> Path:
+        """**指定** ``model_key`` のパーティション配下で base 学習パスを解決する。
+
+        active モデルに依存せず任意モデルのパーティションパスを得る。
+        ``_LEARNING_SUBPATH`` 非対象キーは ``resolve_local`` へ素通しする。
+        """
+        if key not in self._LEARNING_SUBPATH:
+            return self.resolve_local(key)
+        return self.resolve_local("learning_dir") / model_key / self._LEARNING_SUBPATH[key]
+
+    def resolve_pro_learning(self, key: str, mode: str | None = None) -> Path:
+        """Pro の学習データのパスを ``<pro_dir>/learning/<model_key>/`` の下に解決する。
+
+        ``eval_core_file`` は active モデルの ``<model_key>/`` 直下。アダプタ系
+        (LoRA / control vector / SPSA checkpoint / cvector 作業場) は
+        ``<model_key>/<mode>/`` で、``<model_key>`` は **そのモードが実際に
+        ロードするモデル** (アダプタは特定モデルの重みへの差分なので、「どの
+        モデル向けか」が保存先の第一キー)。create が別モデル (``create_model``)
+        を使う構成で chat の ``base_model`` を差し替えても、create のアダプタは
+        create のモデルの下に残る。
+
+        ``mode`` 省略時は :attr:`active_mode`。レガシー
+        ``learning.level2_adapter_partition == "model"`` では mode に依らず
+        active モデルの ``chat`` を chat/create で共有する。
+        """
+        sub = self._PRO_LEARNING_SUBPATH[key]
+        if key in self._PRO_MODELESS_KEYS:
+            return self._pro_learning_root(self.active_model_key) / sub
+        if self._adapter_partition_mode != "model_mode":
+            return self._pro_learning_root(self.active_model_key) / "chat" / sub
+        effective_mode = mode if mode in ("chat", "create") else self._active_mode
+        return self._pro_learning_root(self._mode_model_key(effective_mode)) / effective_mode / sub
+
+    def _pro_learning_root(self, model_key: str) -> Path:
+        return self.resolve_local("pro_dir") / "learning" / model_key
+
+    def _mode_model_key(self, mode: str) -> str:
+        """``mode`` が実際にロードするモデルの ``model_key`` (宣言が無ければ active)。"""
+        active = self.active_model_key
+        raw = mode_base_model_raw(self.models, mode, default="")
+        if not raw or Path(raw).stem == self._active_stem:
+            return active
+        return self.model_key_for(raw)
+
+    def resolve_pro_created_dir(self) -> Path:
+        """Pro が作る ``.evocart`` の置き場 (``<pro_dir>/created/``)。"""
+        return self.resolve_local("pro_dir") / "created"
 
     def _to_absolute(self, raw: str) -> Path:
         path = Path(raw)
         return path if path.is_absolute() else self.root / path
 
     def ensure_local_dirs(self) -> None:
-        """ローカルパスのディレクトリを自動作成"""
-        for key in self.LOCAL_DEFAULTS:
+        """データ根のディレクトリを作成する (ファイルのキーは親だけ)。"""
+        for key, rel in self.LAYOUT.items():
+            if key in self.PRO_LAYOUT_KEYS:
+                continue
             path = self.resolve_local(key)
-            # ファイルパスの場合は親ディレクトリを作成
-            if "." in path.name:
-                path.parent.mkdir(parents=True, exist_ok=True)
-            else:
+            if rel.endswith("/"):
                 path.mkdir(parents=True, exist_ok=True)
-        # ログディレクトリも作成
-        logs_dir = self.root / "local" / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -448,12 +481,32 @@ def resolve_outputs_dir() -> Path:
 
     エージェントの書込み経路は config を持たない静的ヘルパから呼ばれるため、
     ``get_path_resolver()`` の「未ロードなら RuntimeError」をここで吸収し、
-    未ロード時は既定値 (``<project_root>/local/outputs/``) を返す。書込み先の
+    未ロード時は既定値 (``<data_root>/outputs/``) を返す。書込み先の
     解決が config のロード順に依存して CWD へ落ちることを防ぐ。
     """
     if _path_resolver is not None:
         return _path_resolver.resolve_outputs_dir()
-    return get_project_root() / PathResolver.LOCAL_DEFAULTS["outputs_dir"]
+    from backend.data_root import resolve_data_root
+
+    return resolve_data_root(root=get_project_root()) / PathResolver.LAYOUT["outputs_dir"]
+
+
+def resolve_data_path(key: str, project_root: Path | None = None) -> Path:
+    """``PathResolver.LAYOUT`` のキーをデータ根の下に解決する (config 未ロードでも解決する)。
+
+    config ロード後 (``project_root`` 未指定か、グローバル ``PathResolver`` と同じ根)
+    はグローバル ``PathResolver``。それ以外 (CLI の起動前・ログ設定・単体テスト) は
+    ``--data-root`` → ``EVOREF_DATA_ROOT`` → ``<project_root>/userdata`` の 3 段で
+    決めたデータ根に ``LAYOUT`` の相対パスを足す。
+    """
+    if _path_resolver is not None and (
+        project_root is None or Path(project_root) == _path_resolver.root
+    ):
+        return _path_resolver.resolve_local(key)
+    from backend.data_root import resolve_data_root
+
+    root = project_root if project_root is not None else get_project_root()
+    return resolve_data_root(root=root) / PathResolver.LAYOUT[key]
 
 
 def get_project_root() -> Path:
@@ -472,10 +525,14 @@ def save_config_section(section: str, data: dict) -> dict:
     4. バリデーション
     5. 書き込み + リロード
     """
+    from backend.io.readonly import guard_write
     from backend.schemas import validate_config
 
     project_root = get_project_root()
     config_path = project_root / "config.yaml"
+    # 設定は store/ の外 (インストール根) だが、readonly の間は設定 API も止める
+    # (c_05 §0.4.2)。API では 423 / E0423 になる。
+    guard_write(config_path, outside_store=True)
 
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -888,11 +945,6 @@ def get_mode_generation_params(mode: str) -> dict:
         from backend.free.learning.generation_param_evolver import apply_deltas
         resolver = get_path_resolver()
         delta_path = resolver.resolve_learning("generation_deltas_file")
-        if not delta_path.exists():
-            # 旧配置 (local/generation_deltas.json、パーティション導入前) を読む後方互換
-            legacy = resolver.resolve_local("generation_deltas_file")
-            if legacy.exists():
-                delta_path = legacy
         mode_deltas = GenerationDeltaStore.load_mode(delta_path, mode)
         if mode_deltas:
             params = apply_deltas(params, mode_deltas)
@@ -901,168 +953,3 @@ def get_mode_generation_params(mode: str) -> dict:
         logger.warning("Failed to apply generation deltas: %s", e)
 
     return params
-
-
-def get_mode_lora_path(mode: str) -> Path:
-    """指定モードで使用すべき base LoRA アダプタの絶対パスを解決する (存在確認はしない)。
-
-    レガシーの ``learning.level2_adapter_partition=="model"`` のときは mode に依らず
-    常に同一パスを返す — ``/api/mode/switch`` の再起動判定がこの関数の戻り値を
-    比較するだけで LoRA 差分による再起動要否を導けるようにするため
-    (既定運用では常に等しい = 再起動トリガーなし、後方互換)。
-    "model_mode" のときのみ mode 別の実際のパスを返す。
-
-    Args:
-        mode: "chat" または "create"
-
-    Returns:
-        解決された絶対パス (ファイルの存在は保証しない)
-    """
-    resolver = get_path_resolver()
-    effective_mode = mode if resolver.adapter_partition_mode == "model_mode" else None
-    return resolver.resolve_learning("lora_adapter", mode=effective_mode)
-
-
-def _lora_compat_check(project_root: Path):
-    """``scripts.launch_llama.lora_compatible_with_model`` を解決する。
-
-    ``scripts`` はパッケージとして sys.path 上に無いことがある。特に
-    ``python scripts/launch_llama.py`` (evoref-ctl start が使う本番経路) では
-    ``sys.path[0]`` がスクリプト自身のディレクトリになり project_root が載らない
-    ため、素の ``import scripts.launch_llama`` は ModuleNotFoundError になる。
-    通常 import が通らない場合はファイルパスから解決する。
-
-    ロード済みモジュール (launch_llama 自身から呼ばれた場合は ``__main__``) を
-    先に探すのは、2900 行のモジュールを二重実行しないため。
-    """
-    try:
-        from scripts.launch_llama import lora_compatible_with_model
-    except ImportError:
-        pass
-    else:
-        return lora_compatible_with_model
-
-    launch_py = Path(project_root) / "scripts" / "launch_llama.py"
-    for mod in list(sys.modules.values()):
-        fn = getattr(mod, "lora_compatible_with_model", None)
-        mod_file = getattr(mod, "__file__", None)
-        if fn is None or not mod_file:
-            continue
-        try:
-            if Path(mod_file) == launch_py:
-                return fn
-        except (TypeError, ValueError):
-            continue
-
-    spec = importlib.util.spec_from_file_location("_launch_llama_compat", launch_py)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {launch_py}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.lora_compatible_with_model
-
-
-def validate_lora_for_launch(
-    model_path: Path | str,
-    lora_path: Path | None,
-    project_root: Path | None = None,
-) -> tuple[Path | None, bool]:
-    """解決済みの LoRA パスを検証し ``build_*_cmd`` の引数組へ落とす。
-
-    「そのモデル/モードにはまだ学習済みアダプタが無い」ことを
-    ``(None, False)`` = flat フォールバックも踏まない、で表す。flat
-    (``local_paths.lora_adapter``) はパーティション導入前のレガシー配置なので、
-    パーティション運用中に踏むと **別モデル向けの差分を静かに当てる** ことに
-    なりうる (``lora_compatible_with_model`` の系統チェックが守る対象そのもの)。
-
-    Returns:
-        ``(lora_override, lora_fallback)``
-    """
-    if lora_path is None or not Path(lora_path).exists():
-        return None, False
-
-    model_abs = Path(model_path)
-    if not model_abs.is_absolute():
-        model_abs = (project_root or get_project_root()) / model_abs
-
-    # arch / テンソル形状 / 系統 (evoref.trained_on_model) の三層判定。不適合な
-    # アダプタを --lora で渡すと llama-server がプロセスごと落ちるため必須。
-    lora_compatible_with_model = _lora_compat_check(
-        project_root or get_project_root(),
-    )
-    ok, reason = lora_compatible_with_model(model_abs, Path(lora_path))
-    if not ok:
-        logger.warning(
-            "LoRA %s incompatible with model %s (%s); starting without LoRA",
-            lora_path, model_abs, reason,
-        )
-        return None, False
-    return Path(lora_path), False
-
-
-def resolve_base_lora_for_launch(
-    cfg: dict,
-    project_root: Path,
-    mode: str = "chat",
-) -> tuple[Path | None, bool]:
-    """起動時に ``--lora`` へ渡す base LoRA を **cfg だけから** 解決する。
-
-    ``scripts.launch_llama.build_llama_cmd`` の ``lora_override`` /
-    ``lora_fallback`` へそのまま渡せる組を返す、LoRA 適用判断の **単一述語**。
-    base llama-server を起こす経路は 3 つある
-
-    - ``backend.free.cli.service_manager``      (``evoref serve`` の初回起動)
-    - ``backend.free.core.llama_process_manager`` (API からの再起動)
-    - ``backend.free.api.config.mode``          (モード切替に伴う再起動)
-
-    が、従来はモード切替経路だけがパーティション対応の解決を持ち、残る 2 経路は
-    ``build_llama_cmd`` 内の flat フォールバック (``local_paths.lora_adapter``)
-    しか見ていなかった。``partition_by_base_model`` 既定 true では学習済み
-    アダプタは ``local/learning/<model>/[<mode>/]models/adapter.gguf`` に置かれる
-    ため、**通常起動では Level 2 が作ったアダプタが一度もロードされない**
-    (実機で確認: ``GET /lora-adapters`` が空)。全経路をこの関数へ寄せる。
-
-    グローバル ``PathResolver`` (``get_path_resolver``) は **backend プロセスの
-    起動時にしか active stem が確定しない**ため、CLI プロセスからは使えない。
-    ここでは cfg からローカルに ``PathResolver`` を組み、``_pillar_wirer`` と
-    同じ規則 (``model_paths.base_model`` の stem) で active stem を決める。
-
-    Args:
-        cfg: config.yaml をロードした dict
-        project_root: プロジェクトルート絶対パス
-        mode: 起動対象モード ("chat" / "create")。起動時の既定は "chat"
-
-    Returns:
-        ``(lora_override, lora_fallback)``。
-
-        - ``(None, True)``  — パーティション無効。従来どおり flat を探索させる
-        - ``(None, False)`` — パーティション有効だが当該モデル/モードは未学習
-          または非互換。flat も踏ませず「LoRA なし」で起動する
-        - ``(path, False)`` — 学習済みかつ互換。このアダプタを適用する
-    """
-    resolver = PathResolver(cfg, project_root)
-    if not resolver.partition_enabled:
-        return None, True
-
-    model_paths = cfg.get("model_paths", {}) or {}
-    active_stem = Path(Path(model_paths.get("base_model") or "").name).stem
-    if not active_stem:
-        # モデル identity 不明。パーティション根を決められないので従来挙動へ。
-        return None, True
-    resolver.set_active_model_stem(active_stem)
-    resolver.set_active_mode(mode)
-
-    model_raw = mode_base_model_raw(model_paths, mode, default="")
-    if not model_raw:
-        return None, False
-
-    lora_path = resolver.resolve_learning("lora_adapter")
-    override, fallback = validate_lora_for_launch(model_raw, lora_path, project_root)
-    if override is None:
-        logger.info(
-            "No usable base LoRA for mode=%s (%s); starting without --lora",
-            mode, lora_path,
-        )
-    else:
-        logger.info("Applying trained base LoRA for mode=%s: %s", mode, override)
-    return override, fallback

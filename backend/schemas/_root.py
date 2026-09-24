@@ -6,6 +6,7 @@ YAML を辞書として正規化する ``validate_config`` を提供する。
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.config_normalize import CONFIG_VERSION
 from backend.log_config import get_logger
 from backend.schemas._common import (
     AgentConfig,
@@ -74,6 +75,9 @@ class EvorefConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
+    # 設定ファイルの版 (c_05 §7.6)。版の無い G0 の config は
+    # ``evoref config normalize`` が一度だけ直して ``1`` を付ける。
+    config_version: int = Field(default=CONFIG_VERSION, ge=1)
     instance: InstanceConfig = Field(default_factory=InstanceConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
@@ -111,71 +115,6 @@ class EvorefConfig(BaseModel):
             for key in data:
                 if data[key] is None:
                     data[key] = {}
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def drop_removed_loop_section(cls, data: dict) -> dict:
-        """撤去済みの ``loop:`` セクションを検証前に取り除く。
-
-        常駐の自律ループ (ループ管理 / ``/api/loop``) は機能ごと撤去した。
-        旧 config.yaml.example 由来のセクションはほぼ全ての config.yaml に残って
-        いるので、``debug:`` / ``reranker:`` のように起動を止めず、WARNING を
-        1 行出して削除を促す。クリエイトの staged パイプラインは
-        ``create.staged.*`` だけを読み、このセクションを使わない。
-        """
-        if not (isinstance(data, dict) and "loop" in data):
-            return data
-        logger.warning(
-            "config.yaml 'loop:' section was removed with the autonomous loop "
-            "feature and is ignored; delete it from config.yaml",
-        )
-        return {k: v for k, v in data.items() if k != "loop"}
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_legacy_debug_section(cls, data: dict) -> dict:
-        """``debug:`` セクションを起動時に明示的に拒否する
-
-        ログ系設定は CLI フラグ ``--develop=<level>`` (``debug`` /
-        ``investigate`` / ``evolve``) の SSOT に集約されたため、
-        ``config.yaml`` の ``debug:`` セクションは廃止された。
-
-        ``EvorefConfig.model_config = ConfigDict(extra="allow")`` のため
-        トップレベル extra フィールドはエラーにならず黙って透過するが、
-        ``debug:`` だけは過去設定の残存に気付かせるため明示的に
-        ``ValueError`` を上げる。
-        """
-        if isinstance(data, dict) and "debug" in data:
-            raise ValueError(
-                "config.yaml must not contain a 'debug:' section anymore "
-                ". Develop logging is controlled exclusively via "
-                "the --develop=<level> CLI flag (debug | investigate | evolve). "
-                "Remove the 'debug:' section from config.yaml.",
-            )
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_legacy_reranker_section(cls, data: dict) -> dict:
-        """``reranker:`` セクションを起動時に明示的に拒否する
-
-        リランカー機能は削除され、検索フローは fetch_multiplier 拡張 +
-        3 ストア共通の 1 本の順位式 (c_16 §7.2) に一本化された。``EvorefConfig`` は
-        ``extra="allow"`` のため残存セクションは黙って透過してしまうが、
-        過去設定の残存に気付かせるため明示的に ``ValueError`` を上げる。
-        """
-        if isinstance(data, dict) and "reranker" in data:
-            raise ValueError(
-                "config.yaml must not contain a 'reranker:' section anymore. "
-                "The reranker feature has been removed; retrieval now uses "
-                "rag.fetch_multiplier plus the single ranking formula "
-                "(cos x freshness x confidence x "
-                "memory.evidence.ranking.store_prior) instead. "
-                "Remove the 'reranker:' section (and the "
-                "'model_paths.reranker_model' line if present) from "
-                "config.yaml.",
-            )
         return data
 
     @model_validator(mode="after")
@@ -312,40 +251,11 @@ class EvorefConfig(BaseModel):
         return self
 
 
-#: 旧 "coding" モード名時代のキー → 現行キー。``LocalPathsConfig`` /
-#: ``ModelPathsConfig`` 等が ``extra="forbid"`` のため、旧キーの残る config.yaml は
-#: そのままでは起動時に ValidationError になる。ファイルは書き換えず、読み込んだ
-#: dict の上でだけ読み替えて WARNING を出す (更新はユーザーの任意)。
-_LEGACY_KEY_RENAMES: dict[str, str] = {
-    "coding": "create",
-    "coding_task": "create_task",
-    "coding_model": "create_model",
-    "coding_workspace_dir": "create_workspace_dir",
-    "coding_budget_tokens": "create_budget_tokens",
-    "coding_code_signal": "create_code_signal",
-}
-
-
-def _rename_legacy_keys(node: object, path: str, renamed: list[str]) -> object:
-    """設定ツリーを再帰的に走査し、旧モード名のキーを現行キーへ読み替える。"""
-    if isinstance(node, dict):
-        out: dict = {}
-        for key, value in node.items():
-            new_key = _LEGACY_KEY_RENAMES.get(key, key) if isinstance(key, str) else key
-            if new_key != key:
-                renamed.append(f"{path}{key} -> {new_key}")
-            out[new_key] = _rename_legacy_keys(value, f"{path}{new_key}.", renamed)
-        return out
-    if isinstance(node, list):
-        return [_rename_legacy_keys(v, path, renamed) for v in node]
-    return node
-
-
 def validate_config(raw: dict) -> dict:
     """config dict を Pydantic スキーマで検証し、デフォルト値を補完した dict を返す
 
-    旧 "coding" モード名時代のキーは現行キーへ読み替えてから検証する
-    (:data:`_LEGACY_KEY_RENAMES`)。
+    G0 の撤去キー・旧名キーはここでは扱わない (``evoref config normalize`` が
+    設定ファイルから落とす、:mod:`backend.config_normalize`)。
 
     Args:
         raw: YAML から読み込んだ生の設定辞書
@@ -356,14 +266,6 @@ def validate_config(raw: dict) -> dict:
     Raises:
         pydantic.ValidationError: 設定値が不正な場合
     """
-    renamed: list[str] = []
-    raw = _rename_legacy_keys(raw, "", renamed)  # type: ignore[assignment]
-    if renamed:
-        logger.warning(
-            "config.yaml uses legacy 'coding' mode keys; reading them as the "
-            "current names for this run. Update config.yaml to silence this: %s",
-            ", ".join(renamed),
-        )
     validated = EvorefConfig.model_validate(raw)
     logger.info("Config validation passed")
     return validated.model_dump()

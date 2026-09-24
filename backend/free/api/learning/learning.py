@@ -5,7 +5,6 @@ import time
 from fastapi import APIRouter, Depends
 
 from backend.app_state import AppState, get_app_state
-from backend.config import get_path_resolver
 from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
 from backend.i18n_helper import msg
@@ -166,28 +165,21 @@ async def improvement_curve():
     logger.debug("GET /api/learning/improvement-curve")
 
     LoRAVersionManager = get_pro_handler("lora_version_manager")
-    if not is_pro() or LoRAVersionManager is None:
+    pro_path = get_pro_handler("pro_learning_path")
+    if not is_pro() or LoRAVersionManager is None or pro_path is None:
         return ImprovementCurveResponse()
 
-    resolver = get_path_resolver()
-
-    # base は (モデル×モード) パーティション配下。
-    # resolve_local (flat) のままだと Level 2 が積んだ版履歴が 1 件も出ない。
-    def _scores(resolve, versions_key: str, adapter_key: str) -> list[ImprovementPoint]:
-        vmgr = LoRAVersionManager(resolve(versions_key), resolve(adapter_key))
-        return [
+    # base は Pro の (モデル×モード) パーティション配下。
+    vmgr = LoRAVersionManager(pro_path("lora_versions_dir"), pro_path("lora_adapter"))
+    return ImprovementCurveResponse(
+        lora_scores=[
             ImprovementPoint(
                 version=v.version,
                 eval_score=v.eval_score,
                 created_at=v.created_at,
             )
             for v in vmgr.list_versions()
-        ]
-
-    return ImprovementCurveResponse(
-        lora_scores=_scores(
-            resolver.resolve_learning, "lora_versions_dir", "lora_adapter",
-        ),
+        ],
     )
 
 
@@ -293,21 +285,22 @@ def _get_pro_learning_info() -> dict:
 
     LoRAVersionManager = get_pro_handler("lora_version_manager")
     EvalCoreManager = get_pro_handler("eval_core_manager")
-    if not is_pro() or LoRAVersionManager is None or EvalCoreManager is None:
+    pro_path = get_pro_handler("pro_learning_path")
+    if (
+        not is_pro() or LoRAVersionManager is None or EvalCoreManager is None
+        or pro_path is None
+    ):
         return result
 
-    resolver = get_path_resolver()
-    # 学習済みアダプタは (モデル×モード) パーティション配下にある。resolve_local
-    # (flat) のままだと Level 2 が実際に書き出した版が見えず、同じ応答の中の
+    # 学習済みアダプタは Pro の (モデル×モード) パーティション配下にある。
+    # Level 2 が実際に書き出した版と同じ場所を見ないと、同じ応答の中の
     # level2.base.version と食い違う (実機で version=0/exists=false vs v4)。
-    versions_dir = resolver.resolve_learning("lora_versions_dir")
-    adapter_path = resolver.resolve_learning("lora_adapter")
-    vmgr = LoRAVersionManager(versions_dir, adapter_path)
+    adapter_path = pro_path("lora_adapter")
+    vmgr = LoRAVersionManager(pro_path("lora_versions_dir"), adapter_path)
     result["lora_version"] = vmgr.get_latest_version()
     result["lora_adapter_exists"] = adapter_path.exists()
 
-    eval_path = resolver.resolve_learning("eval_core_file")
-    emgr = EvalCoreManager(eval_path)
+    emgr = EvalCoreManager(pro_path("eval_core_file"))
     eval_set = emgr.load()
     result["eval_cases_count"] = len(eval_set.cases)
     result["eval_pass_threshold"] = eval_set.pass_threshold

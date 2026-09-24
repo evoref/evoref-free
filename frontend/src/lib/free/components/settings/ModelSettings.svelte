@@ -47,6 +47,5 @@
 		<TextField label="settings.embedding.model_name" value={String(embedding.model_name ?? '')} onchange={fieldUpdater('embedding', 'model_name')} />
 		<ToggleField label="settings.embedding.cache_enabled" value={Boolean(embedding.cache_enabled ?? true)} onchange={fieldUpdater('embedding', 'cache_enabled')} />
 		<NumberField label="settings.embedding.cache_max_mb" value={Number(embedding.cache_max_mb ?? 100)} min={1} onchange={fieldUpdater('embedding', 'cache_max_mb')} />
-		<TextField label="settings.embedding.cache_dir" value={String(embedding.cache_dir ?? '')} onchange={fieldUpdater('embedding', 'cache_dir')} />
 	</FieldGroup>
 </SettingsSection>

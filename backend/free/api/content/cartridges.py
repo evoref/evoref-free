@@ -22,6 +22,8 @@ from backend.free.api.content._cartridge_serializers import (
 )
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.rag.cartridge_manager import CartridgeInstallCancelled
+from backend.free.rag.corpus.package import PackageFormatError
+from backend.i18n_helper import msg
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, set_trace_id
 
@@ -128,6 +130,10 @@ async def install_cartridge(
     start = time.time()
     try:
         info = await mgr.install(tmp_path, embedder=embedder)
+    except PackageFormatError as e:
+        raise _cartridge_error(
+            400, "E0510", msg(e.i18n_key, **e.context), i18n_key=e.i18n_key, **e.context,
+        )
     except ValueError as e:
         raise _cartridge_error(400, "E0510", str(e))
     except FileNotFoundError as e:
@@ -308,6 +314,9 @@ async def install_cartridge_stream(
             await queue.put({"__result__": payload})
         except CartridgeInstallCancelled:
             await queue.put({"__cancelled__": True})
+        except PackageFormatError as e:
+            # G0 / 新しい版のパッケージは案内の文言で返す (UI はこの message を出す)
+            await queue.put({"__error__": {"code": "E0510", "message": msg(e.i18n_key, **e.context)}})
         except (ValueError, FileNotFoundError) as e:
             await queue.put({"__error__": {"code": "E0510", "message": str(e)}})
         except Exception as e:

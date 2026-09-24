@@ -78,6 +78,7 @@ phase 4 が SemMem を置き換えるときに、これらの消費者ごと畳�
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -91,7 +92,7 @@ from backend.free.rag.evidence import (
     new_evidence_id,
 )
 from backend.log_config import get_logger
-from backend.utils import format_utc, parse_utc, utc_now, utc_now_dt
+from backend.utils import epoch_to_utc, format_utc, parse_utc, utc_now, utc_now_dt, utc_to_epoch
 
 logger = get_logger("memory.episodic.note")
 
@@ -353,60 +354,255 @@ def _iso(epoch: float | None) -> str | None:
     return format_utc(datetime.fromtimestamp(float(epoch), tz=UTC))
 
 
-def note_to_evidence(note: MemoryNote, *, tier: str | None = None) -> Evidence:
-    """``MemoryNote`` を ``Evidence`` (kind=``note``) にする。
+#: 作業型 (``MemoryNote``) では epoch 秒、``attrs`` では ISO 8601 UTC μs ``Z`` の
+#: フィールド。epoch を永続化しない (c_05 §0.5.4)。
+_TIME_ATTR_FIELDS: frozenset[str] = frozenset({
+    "conflict_cooldown_until",
+    "url_curated_at",
+    "command_curated_at",
+    "assertion_curated_at",
+    "personal_fact_curated_at",
+    "correction_verified_at",
+})
 
-    ``confidence`` は :func:`derive_confidence` で origin から決める
-    (LLM にも呼出側にも答えさせない、c_16 §3.3)。``claim_key`` は本文の
-    正規化ハッシュで、同一発話の重複注入を注入時に 1 件へ畳むための鍵。
+
+def _failures_to_attrs(failures: Any) -> Any:
+    """``curation_failures`` の ``cooldown_until`` (epoch) を ISO にする。"""
+    if not isinstance(failures, dict):
+        return failures
+    return {
+        key: (
+            {**entry, "cooldown_until": epoch_to_utc(entry.get("cooldown_until"))}
+            if isinstance(entry, dict) else entry
+        )
+        for key, entry in failures.items()
+    }
+
+
+def _failures_from_attrs(failures: Any) -> Any:
+    """:func:`_failures_to_attrs` の逆 (ISO → epoch)。"""
+    if not isinstance(failures, dict):
+        return failures
+    return {
+        key: (
+            {**entry, "cooldown_until": utc_to_epoch(entry.get("cooldown_until"))}
+            if isinstance(entry, dict) else entry
+        )
+        for key, entry in failures.items()
+    }
+
+
+#: ``MemoryNote`` のフィールド → ``Evidence`` の書き先 (c_16 §3.5 / c_05 §1.4)。
+#:
+#: 新規の組み立て (:func:`note_to_evidence`) と既存レコードへの差分
+#: (:func:`note_patch`) はどちらもこの 1 表から組む。``None`` は永続化しない作業値。
+#: ``claim_key`` は ``text`` の変更に連動して作り直す。``MemoryNote`` にフィールドを
+#: 足したらここにも足す (足し忘れはテストが落とす)。
+NOTE_EVIDENCE_FIELDS: dict[str, str | None] = {
+    "id": "id",
+    "content": "text",
+    "created_at": "observed_at",
+    "accessed_at": "last_used_at",
+    "session_id": "provenance",
+    "turn_id": "provenance",
+    "trace_id": "provenance",
+    "source": "origin",
+    "confidence": "confidence",
+    "pin_flag": "pinned",
+    "private": "private",
+    "mode": "attrs",
+    "tier": "attrs",
+    "project_id": "scope",
+    "lang": "lang",
+    "superseded_by": "superseded_by",
+    "embedding": None,
+    "_extra": "_extra",
+    **{name: "attrs" for name in NOTE_ATTR_FIELDS},
+}
+
+#: patch で変えられない書き先 (``PATCHABLE_FIELDS`` に無いもの)。
+_IMMUTABLE_TARGETS: frozenset[str] = frozenset({"id", "origin", "observed_at"})
+
+_MISSING = object()
+
+
+def _note_attr_value(note: MemoryNote, name: str) -> tuple[bool, Any]:
+    """``attrs.<name>`` に書く値。既定値と同じなら ``(False, None)`` (書かない)。"""
+    if name == "tier":
+        return True, note.tier or "short"
+    if name == "mode":
+        return True, _MODE_TO_ATTR.get(str(note.mode), "chat")
+    value = getattr(note, name, None)
+    if name == "turn_index":
+        return (True, int(value)) if value else (False, None)
+    if value == _ATTR_DEFAULTS.get(name):
+        return False, None
+    if name in _TIME_ATTR_FIELDS:
+        value = epoch_to_utc(value)
+    elif name == "curation_failures":
+        value = _failures_to_attrs(value)
+    return True, value
+
+
+def _note_core_value(note: MemoryNote, target: str) -> Any:
+    """コアフィールド 1 つの値 (対応表の単純な書き先)。"""
+    match target:
+        case "text":
+            return note.content
+        case "last_used_at":
+            return _iso(note.accessed_at)
+        case "confidence":
+            return float(note.confidence)
+        case "pinned":
+            return bool(note.pin_flag)
+        case "private":
+            return bool(note.private)
+        case "scope":
+            return f"project:{note.project_id}" if note.project_id else "global"
+        case "lang":
+            return note.lang or None
+        case _:
+            return getattr(note, target)
+
+
+def _note_provenance(
+    note: MemoryNote, stored: list[dict[str, Any]] | None, observed_at: str,
+) -> list[dict[str, Any]]:
+    """会話上の位置 (session / turn / trace) を ``provenance[0]`` に載せる。
+
+    既存レコードは先頭要素の 3 キーだけを差し替え、他のキー・要素は保つ。
+    """
+    head = {
+        "session_id": note.session_id,
+        "turn_id": note.turn_id,
+        "trace_id": note.trace_id or "",
+    }
+    if stored:
+        return [{**stored[0], **head}, *(dict(p) for p in stored[1:])]
+    return [{
+        **head,
+        "extractor": "note_builder",
+        "extractor_version": NOTE_BUILDER_VERSION,
+        "captured_at": observed_at,
+    }]
+
+
+def note_to_evidence(note: MemoryNote, *, tier: str | None = None) -> Evidence:
+    """**新しい** ``MemoryNote`` を ``Evidence`` (kind=``note``) にする。
+
+    ``confidence`` は作成時に :func:`derive_confidence` で origin から決める
+    (LLM にも呼出側にも答えさせない、c_16 §3.3)。以後の書き込みは差分
+    (:func:`note_patch`) で、明示的に変えない限り作り直さない。``claim_key`` は
+    本文の正規化ハッシュで、同一発話の重複注入を注入時に 1 件へ畳むための鍵。
     """
     origin = _SOURCE_TO_ORIGIN.get(str(note.source), "user")
     observed_at = _iso(note.created_at) or utc_now()
-    provenance = [
-        {
-            "session_id": note.session_id,
-            "turn_id": note.turn_id,
-            "trace_id": note.trace_id or "",
-            "extractor": "note_builder",
-            "extractor_version": NOTE_BUILDER_VERSION,
-            "captured_at": observed_at,
-        },
-    ]
-    attrs: dict[str, Any] = {"tier": tier or note.tier or "short"}
-    mode_attr = _MODE_TO_ATTR.get(str(note.mode), "chat")
-    attrs["mode"] = mode_attr
-    for name in NOTE_ATTR_FIELDS:
-        value = getattr(note, name, None)
-        if value == _ATTR_DEFAULTS.get(name) and name not in ("turn_index",):
+    attrs: dict[str, Any] = {}
+    for name, target in NOTE_EVIDENCE_FIELDS.items():
+        if target != "attrs":
             continue
-        attrs[name] = value
-    if note.turn_index:
-        attrs["turn_index"] = int(note.turn_index)
-    else:
-        attrs.pop("turn_index", None)
+        present, value = _note_attr_value(note, name)
+        if present:
+            attrs[name] = value
+    if tier:
+        attrs["tier"] = tier
 
-    scope = f"project:{note.project_id}" if note.project_id else "global"
     return Evidence(
         id=note.id or new_evidence_id(),
         kind="note",
         store="episodic",
-        scope=scope,
+        scope=_note_core_value(note, "scope"),
         text=note.content,
-        lang=note.lang or None,
+        lang=_note_core_value(note, "lang"),
         origin=origin,  # type: ignore[arg-type]
-        provenance=provenance,
+        provenance=_note_provenance(note, None, observed_at),
         observed_at=observed_at,
         confidence=derive_confidence(origin, 1),
         claim_key=compute_claim_key(note.content),
         superseded_by=note.superseded_by,
-        private=bool(note.private),
-        pinned=bool(note.pin_flag),
+        private=_note_core_value(note, "private"),
+        pinned=_note_core_value(note, "pinned"),
         created_at=observed_at,
         updated_at=utc_now(),
-        last_used_at=_iso(note.accessed_at),
+        last_used_at=_note_core_value(note, "last_used_at"),
         attrs=attrs,
         _extra=dict(note._extra or {}),
     )
+
+
+def note_patch(
+    note: MemoryNote, stored: Evidence, names: Iterable[str],
+) -> tuple[dict[str, Any], list[str]]:
+    """作業型の ``names`` の変更を、既存レコード ``stored`` への patch にする (G1)。
+
+    :data:`NOTE_EVIDENCE_FIELDS` の対応だけを書き、それ以外の ``stored`` の中身
+    (``confidence`` / ``veracity`` / ``valid_until`` / ``provenance`` の他のキー /
+    各階層の未知キー) には触らない (c_05 §1.4)。読み取りビュー
+    (:func:`evidence_to_note`) と同じ値のフィールドは書かないので、差分の無い
+    更新は空の patch になる。
+
+    Returns:
+        ``EvidenceStore.patch`` に渡す ``(fields, unset)``。
+
+    Raises:
+        ValueError: patch で変えられないフィールド (``id`` / ``source`` /
+            ``created_at``) の変更。
+    """
+    view = evidence_to_note(stored)
+    changed: list[str] = []
+    for name in dict.fromkeys(names):
+        target = NOTE_EVIDENCE_FIELDS.get(name)
+        if target is None:
+            continue
+        if getattr(note, name) == getattr(view, name):
+            continue
+        if target in _IMMUTABLE_TARGETS:
+            raise ValueError(f"cannot change {name} of an existing note by patch")
+        changed.append(name)
+
+    fields: dict[str, Any] = {}
+    unset: list[str] = []
+    attrs: dict[str, Any] = {}
+    extra: dict[str, Any] = {}
+    for name in changed:
+        target = NOTE_EVIDENCE_FIELDS[name]
+        if target == "attrs":
+            present, value = _note_attr_value(note, name)
+            if present and stored.attrs.get(name, _MISSING) != value:
+                attrs[name] = value
+            elif not present and name in stored.attrs:
+                unset.append(f"attrs.{name}")
+        elif target == "_extra":
+            old, new = view._extra or {}, note._extra or {}
+            for key in list(dict.fromkeys([*old, *new])):
+                in_attrs = key in stored.attrs and key not in NOTE_EVIDENCE_FIELDS
+                if key in new:
+                    if key not in old or old[key] != new[key]:
+                        (attrs if in_attrs else extra)[key] = new[key]
+                    continue
+                if in_attrs:
+                    unset.append(f"attrs.{key}")
+                if key in stored._extra:
+                    unset.append(f"_extra.{key}")
+        elif target == "provenance":
+            continue
+        else:
+            value = _note_core_value(note, target)
+            if getattr(stored, target) != value:
+                fields[target] = value
+    if "text" in fields:
+        claim_key = compute_claim_key(note.content)
+        if claim_key != stored.claim_key:
+            fields["claim_key"] = claim_key
+    if any(NOTE_EVIDENCE_FIELDS[n] == "provenance" for n in changed):
+        provenance = _note_provenance(note, stored.provenance, stored.observed_at)
+        if provenance != stored.provenance:
+            fields["provenance"] = provenance
+    if attrs:
+        fields["attrs"] = attrs
+    if extra:
+        fields["_extra"] = extra
+    return fields, unset
 
 
 def evidence_to_note(record: Evidence) -> MemoryNote:
@@ -440,6 +636,10 @@ def evidence_to_note(record: Evidence) -> MemoryNote:
     for key, value in attrs.items():
         if key in ("tier", "mode"):
             continue
+        if key in _TIME_ATTR_FIELDS:
+            value = utc_to_epoch(value)
+        elif key == "curation_failures":
+            value = _failures_from_attrs(value)
         if key in known:
             setattr(note, key, value)
         else:
@@ -460,8 +660,10 @@ def note_age_days(note: MemoryNote, now: float | None = None) -> float:
 __all__ = [
     "NOTE_ATTR_FIELDS",
     "NOTE_BUILDER_VERSION",
+    "NOTE_EVIDENCE_FIELDS",
     "MemoryNote",
     "evidence_to_note",
     "note_age_days",
+    "note_patch",
     "note_to_evidence",
 ]

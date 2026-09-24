@@ -17,15 +17,75 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
+from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 from backend.free.agent.learned_patterns_types import LearnedPattern
-from backend.io import atomic_write_text
+from backend.io.codec import codec_for, decode_skipping, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
+from backend.utils import epoch_to_utc, utc_to_epoch
 
 logger = get_logger("agent.learned_pattern_store")
+
+
+@persisted()
+@dataclass
+class LearnedPatternRecord:
+    """``LearnedPattern`` の永続形 (時刻は ISO 8601 UTC μs ``Z``、epoch を永続化しない)。"""
+
+    keyword: str
+    category: str = "correction"
+    weight: float = 0.5
+    hit_count: int = 0
+    source_count: int = 1
+    first_seen: str | None = None
+    last_seen: str | None = None
+    last_hit: str | None = None
+    _extra: dict[str, Any] | None = None
+
+
+@persisted()
+@dataclass
+class LearnedPatternsFile:
+    """``learned_patterns.json`` のペイロード。"""
+
+    patterns: list[LearnedPatternRecord] = field(default_factory=list)
+    last_decay_at: str | None = None
+    _extra: dict[str, Any] | None = None
+
+
+#: ``learned_patterns.json`` の形式。ペイロードは :class:`LearnedPatternsFile`
+#: (時刻は ISO 8601 UTC μs ``Z``。epoch を永続化しない、c_05 §0.5.4)。
+LEARNED_PATTERNS_FORMAT = register_format(FormatSpec(
+    format_id="learning.learned_patterns",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/shared/learned_patterns.json",
+    retention="capped by LearnedPatternStore (weight decay + max patterns)",
+    export=True,
+    records=(LearnedPatternsFile,),
+))
+
+
+def _decode_file(payload: Any) -> LearnedPatternsFile:
+    """ペイロードを読む。読めないパターンはそれだけ飛ばして数える (c_05 §0.5.2)。"""
+    data, skipped = decode_skipping(LearnedPatternsFile, payload, each=("patterns",))
+    if skipped:
+        logger.warning("Skipped %d unreadable learned pattern(s)", skipped)
+    return data
+
+
+def _patterns_file(path: str | Path) -> VersionedPayloadFile:
+    """型の合わないファイルは読み込みで退避する (SoT)。"""
+    return VersionedPayloadFile(
+        LEARNED_PATTERNS_FORMAT, path,
+        component="LearnedPatternRepository", state_logger=logger,
+        decode=_decode_file, encode=codec_for(LearnedPatternsFile).encode,
+    )
 
 
 class LearnedPatternRepository:
@@ -36,57 +96,38 @@ class LearnedPatternRepository:
     """
 
     @staticmethod
-    def serialize(patterns: dict[str, LearnedPattern]) -> list[dict]:
-        """`LearnedPattern` 辞書を JSON-serializable な list[dict] に変換する。"""
-        return [_pattern_to_dict(p) for p in patterns.values()]
-
-    @staticmethod
-    def deserialize(data: list[dict]) -> dict[str, LearnedPattern]:
-        """list[dict] から `LearnedPattern` 辞書を再構築する。
-
-        欠損フィールドはデフォルト値で埋め、後方互換 (古い JSON フォーマット)
-        を維持する。キーはパターンの keyword を lower-case 化したもの
-        (空 keyword のエントリは無視)。ドメインルール (ストップワード除外等)
-        は呼び出し側で適用する。
-        """
-        patterns: dict[str, LearnedPattern] = {}
-        for d in data:
-            pattern = _pattern_from_dict(d)
-            key = pattern.keyword.lower()
-            if not key:
-                continue
-            patterns[key] = pattern
-        return patterns
-
-    @staticmethod
     def save(
         patterns: dict[str, LearnedPattern],
         path: str | Path,
         *,
         last_decay_at: float | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
-        """`patterns` を JSON ファイルに書き出す。親ディレクトリは自動作成。
+        """`patterns` を版付き封筒で書き出す。親ディレクトリは自動作成。
 
-        ``last_decay_at`` を渡すとエンベロープ形式
-        ``{"patterns": [...], "last_decay_at": <epoch>}`` で書き、6h 減衰間隔の
-        基準時刻を再起動越しに残す。省略時は従来のフラットな list (旧形式)。
+        ``last_decay_at`` は 6h 減衰間隔の基準時刻を再起動越しに残す。``extra`` は
+        読んだファイルのトップの未知キー (:meth:`load_with_meta` の ``_extra``) で、
+        そのまま書き戻す。ディスク上のファイルが G1 の封筒でない / 版が新しいなら
+        上書きしない (WARNING)。書き込みの失敗は従来どおり送出する。
         """
-        path = Path(path)
-        data = LearnedPatternRepository.serialize(patterns)
-        payload: list | dict = (
-            data if last_decay_at is None
-            else {"patterns": data, "last_decay_at": last_decay_at}
+        f = _patterns_file(path)
+        f.RAISE_ON_SAVE_ERROR = True
+        f.load()
+        f.payload = LearnedPatternsFile(
+            patterns=[_pattern_to_record(p) for p in patterns.values()],
+            last_decay_at=epoch_to_utc(last_decay_at),
+            _extra=extra,
         )
-        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
-        logger.info("Saved %d learned patterns to %s", len(data), path)
+        if f.save():
+            logger.info("Saved %d learned patterns to %s", len(patterns), path)
 
     @staticmethod
     def load(path: str | Path) -> dict[str, LearnedPattern] | None:
         """JSON ファイルから `LearnedPattern` 辞書を読み込む。
 
-        ファイルが存在しない場合、または JSON のパースに失敗した場合は
-        `None` を返す (空辞書とは区別する)。呼び出し側は `None` を
-        「ファイル未存在 / 破損 = 既存状態を保持」と解釈できる。
+        ファイルが存在しない場合、または読めない場合 (G1 の封筒でない / 版が
+        新しい / 壊れている) は `None` を返す (空辞書とは区別する)。呼び出し側は
+        `None` を「ファイル未存在 / 破損 = 既存状態を保持」と解釈できる。
         """
         loaded = LearnedPatternRepository.load_with_meta(path)
         return None if loaded is None else loaded[0]
@@ -94,49 +135,46 @@ class LearnedPatternRepository:
     @staticmethod
     def load_with_meta(
         path: str | Path,
-    ) -> tuple[dict[str, LearnedPattern], dict] | None:
-        """`load` に加えてエンベロープのメタ (``last_decay_at`` 等) も返す。
+    ) -> tuple[dict[str, LearnedPattern], dict[str, Any]] | None:
+        """`load` に加えてペイロードのメタ (``last_decay_at`` と未知キーの ``_extra``) も返す。
 
-        旧形式 (フラット list) はメタ空 ``{}`` として読む。
+        キーはパターンの keyword を lower-case 化したもの (空 keyword のエントリは
+        無視)。読めないパターンはそれだけ飛ばして数える (c_05 §0.5.2)。ドメイン
+        ルール (ストップワード除外等) は呼び出し側で適用する。
         """
         path = Path(path)
-        if not path.exists():
+        f = _patterns_file(path)
+        if not f.load():
             return None
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to load learned patterns from %s: %s", path, exc)
-            return None
-        meta: dict = {}
-        if isinstance(data, dict):
-            meta = {k: v for k, v in data.items() if k != "patterns"}
-            data = data.get("patterns")
-        if not isinstance(data, list):
-            logger.warning("Invalid learned patterns format (expected list) in %s", path)
-            return None
-        patterns = LearnedPatternRepository.deserialize(data)
+        data: LearnedPatternsFile = f.payload
+        patterns: dict[str, LearnedPattern] = {}
+        for record in data.patterns:
+            key = record.keyword.lower()
+            if key:
+                patterns[key] = _pattern_from_record(record)
         logger.info("Loaded %d learned patterns from %s", len(patterns), path)
-        return patterns, meta
+        return patterns, {"last_decay_at": data.last_decay_at, "_extra": data._extra}
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# private serialize / deserialize helpers (純粋関数)
+# private 変換 (作業型 ⇔ 永続形、純粋関数)
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _pattern_to_dict(pattern: LearnedPattern) -> dict:
-    return asdict(pattern)
+#: 作業型では epoch 秒、永続形では ISO 8601 UTC μs ``Z`` のフィールド (c_05 §0.5.4)。
+_TIME_FIELDS: tuple[str, ...] = ("first_seen", "last_seen", "last_hit")
+_RECORD_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(LearnedPatternRecord))
 
 
-def _pattern_from_dict(d: dict) -> LearnedPattern:
-    return LearnedPattern(
-        keyword=d.get("keyword", ""),
-        category=d.get("category", "correction"),
-        weight=float(d.get("weight", 0.5)),
-        hit_count=int(d.get("hit_count", 0)),
-        source_count=int(d.get("source_count", 1)),
-        first_seen=float(d.get("first_seen", 0.0)),
-        last_seen=float(d.get("last_seen", 0.0)),
-        last_hit=float(d.get("last_hit", 0.0)),
-    )
+def _pattern_to_record(pattern: LearnedPattern) -> LearnedPatternRecord:
+    values = {name: getattr(pattern, name) for name in _RECORD_FIELDS}
+    for name in _TIME_FIELDS:
+        values[name] = epoch_to_utc(values[name])
+    return LearnedPatternRecord(**values)
+
+
+def _pattern_from_record(record: LearnedPatternRecord) -> LearnedPattern:
+    values = {name: getattr(record, name) for name in _RECORD_FIELDS}
+    for name in _TIME_FIELDS:
+        values[name] = utc_to_epoch(values[name], 0.0)
+    return LearnedPattern(**values)

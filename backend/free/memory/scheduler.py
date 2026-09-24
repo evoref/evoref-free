@@ -15,7 +15,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from backend.aux_telemetry import aux_failure_scope, aux_failure_signals
 from backend.liveness import ledger as liveness_ledger
-from backend.free.memory.sleep_update import FULL_COMPLETED_KEY, INPUT_SUFFIX
+from backend.free.memory.sleep_update import (
+    FULL_COMPLETED_KEY,
+    INPUT_SUFFIX,
+)
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, trace_id_var
 from backend.utils import utc_now_dt
@@ -127,6 +130,16 @@ _FULL_INFLIGHT_WAIT_SEC = 180.0
 #: これを超えたら「予約は生きているが待たない」(``deferred``) として返す。
 #: 予約自体は残るので、Trigger B の 1 本がそのまま走り切る。
 _MANUAL_FULL_WAIT_SEC = 900.0
+
+#: 保守の snapshot の静穏窓 (秒)。最後の入力・応答からこれだけ静かなら版を作る
+#: (G1 設計 §11-2 の 5〜10 秒)。読んでいる間に済ませ、次の入力と重ねない。
+_SNAPSHOT_QUIET_SEC = 8.0
+#: 未畳みの事象がこれを超えたら静穏窓を待たない (生成中は待つ)。会話が
+#: 途切れない使い方で版が作られず、tail 索引と事象ログが伸び続けるのを防ぐ
+#: (版を作る条件 ``SNAPSHOT_MAX_BACKLOG`` = 512 の 4 倍)。
+_SNAPSHOT_BACKLOG_FORCE = 2048
+#: 静穏窓の確認間隔 (秒)。
+_SNAPSHOT_POLL_SEC = 2.0
 
 
 def _emit_bg_task_outcome(
@@ -259,6 +272,10 @@ class SleepTimeScheduler:
         self._last_response: float = 0.0
         self._light_task: asyncio.Task | None = None
         self._full_task: asyncio.Task | None = None
+        #: 応答後の静穏窓で版を作る保守タスク (:meth:`_snapshot_when_quiet`)。
+        self._snapshot_task: asyncio.Task | None = None
+        #: 応答後に tail 索引を埋めるタスク (:meth:`arm_tail_refresh`)。
+        self._tail_task: asyncio.Task | None = None
         # Level 1 / Level 2 独立常駐ループ
         self._level1_loop_task: asyncio.Task | None = None
         self._level2_loop_task: asyncio.Task | None = None
@@ -302,6 +319,16 @@ class SleepTimeScheduler:
         self.local_tz_name = "UTC"
         return timezone.utc
 
+    def suspend(self, reason: str) -> None:
+        """sleep-time を止める (データ根が readonly のとき、c_05 §0.4.2)。
+
+        worker を外すので Light / Full / tail / snapshot はどれも起きない
+        (各入口の ``self._worker is None`` で止まる)。以後の ``set_worker`` も無視する。
+        """
+        self._suspended_reason = reason
+        self._worker = None
+        logger.warning("Sleep-time suspended: %s", reason)
+
     def set_worker(self, worker) -> None:
         """SleepTimeWorker を設定
 
@@ -310,6 +337,8 @@ class SleepTimeScheduler:
         (2026-08-22 の修正: 止めると Full が一度も完走しない) ため、走り出した
         Full の中で LLM を逐次に叩くステップは自前で手を止める必要がある。
         """
+        if getattr(self, "_suspended_reason", None) is not None:
+            return
         self._worker = worker
         setter = getattr(worker, "set_chat_in_flight", None)
         if callable(setter):
@@ -498,6 +527,8 @@ class SleepTimeScheduler:
 
         if self._worker is None:
             return
+        self.arm_tail_refresh()
+        self.arm_snapshot()
 
         # 強制実行中の Full は張り直さない。ここは応答のたびに無条件で
         # タスクを作り替えるため、``on_user_input`` 側だけ免除しても
@@ -537,6 +568,100 @@ class SleepTimeScheduler:
         )
         # Level 2 は on_response_sent では起動しない。再起動耐性のある
         # 独立常駐ループ (start_level2_loop) が overdue/idle で発火する。
+
+    def arm_tail_refresh(self) -> None:
+        """tail 索引を埋める (既に走っていれば何もしない、c_16 §6.4)。
+
+        応答の後に呼ぶ — Light (応答開始時) が起こしたノートを、次の版を待たずに
+        検索へ出す。起動直後にも 1 回呼ぶ (tail はメモリにしか無いので、再起動後は
+        埋め直す)。
+        """
+        worker = self._worker
+        refresh = getattr(worker, "refresh_tail", None)
+        if refresh is None:
+            return
+        if self._tail_task is not None and not self._tail_task.done():
+            return
+        self._tail_task = asyncio.create_task(self._refresh_tail(refresh))
+
+    async def _refresh_tail(self, refresh) -> None:
+        token = trace_id_var.set(generate_trace_id())
+        try:
+            added = await refresh()
+            if added:
+                logger.info("Tail index: embedded %d row(s)", added)
+        except Exception as e:  # noqa: BLE001 — 埋められなくても版で拾える
+            logger.warning("Tail index refresh failed: %s", e)
+        finally:
+            trace_id_var.reset(token)
+
+    def arm_snapshot(self) -> None:
+        """保守の snapshot を待たせる (既に待っていれば何もしない)。
+
+        応答の後と起動直後に呼ぶ (起動時に条件を満たしていれば裏で版を作る)。
+        """
+        if self._snapshot_task is not None and not self._snapshot_task.done():
+            return
+        self._snapshot_task = asyncio.create_task(self._snapshot_when_quiet())
+
+    async def _snapshot_when_quiet(self) -> None:
+        """事象が溜まっていれば、静穏窓で版を作る (G1 設計 §11-2 / §17.5-4)。
+
+        応答開始時の Light から外した snapshot の起点。版の生成はイベント
+        ループ上で畳み込みと索引の作り直しをするので、生成中や生成直後には
+        走らせない。条件は **版を作る時** (``SleepTimeWorker.snapshot_due``:
+        未畳み 512 件以上 / 前の版から 1 日) かつ (最後の入力・応答から
+        ``_SNAPSHOT_QUIET_SEC`` 秒静か / 事象が ``_SNAPSHOT_BACKLOG_FORCE`` 件超)。
+        後者でも生成中は待つ。
+
+        走り出した版の生成は ``asyncio.shield`` で守る — 途中で取り消すと
+        reader の差し替えと manifest の保存がずれる。待っている間のキャンセル
+        (停止) は受ける。
+        """
+        token = trace_id_var.set(generate_trace_id())
+        try:
+            while True:
+                await asyncio.sleep(_SNAPSHOT_POLL_SEC)
+                worker = self._worker
+                if worker is None:
+                    return
+                if not worker.snapshot_due():
+                    return
+                backlog = int(worker.snapshot_backlog())
+                if self._chat_in_flight():
+                    continue
+                if backlog <= _SNAPSHOT_BACKLOG_FORCE and self._recently_active(
+                    _SNAPSHOT_QUIET_SEC,
+                ):
+                    continue
+                logger.info("Maintenance snapshot: %d unfolded event(s)", backlog)
+                result = await asyncio.shield(worker.run_snapshot())
+                if "skipped" not in result:
+                    observe_sleep_liveness(worker, "snapshot", result)
+                return
+        except Exception as e:  # noqa: BLE001 — 版が作れなくても事象は残る
+            logger.warning("Maintenance snapshot failed: %s", e)
+        finally:
+            trace_id_var.reset(token)
+
+    def _recently_active(self, quiet_sec: float) -> bool:
+        """入力を受けてから、または生成が終わってから ``quiet_sec`` 秒未満か。
+
+        入力の直後 (検索・埋め込み中でまだ生成が始まっていない) も含める。
+        """
+        if self._chat_recent(quiet_sec):
+            return True
+        last_input = self._last_user_input
+        return bool(last_input) and time.time() - last_input < quiet_sec
+
+    def is_serving_request(self) -> bool:
+        """応答を生成中か、入力を受けてまだ応答していないリクエストがあるか。
+
+        版の差し替え (L2) を重ねない判定 (``snapshot_build.set_busy_probe``)。
+        応答が失敗すると「入力はあったが応答が無い」が残るので、呼出側は
+        上限時間で打ち切る。
+        """
+        return self._chat_in_flight() or self._last_user_input > self._last_response
 
     def is_user_active(self) -> bool:
         """ユーザーがフォアグラウンド対応中かどうか
@@ -1334,13 +1459,6 @@ class SleepTimeScheduler:
                     triggered = bool(ls.check_level2(
                         is_user_active=self.is_user_active(),
                         lora_path=self._lora_path,
-                        # 現在の base モデルファイル名でモデル隔離フィルタを有効化。
-                        # FeedbackCollector が刻む base_model (= 同じ GGUF ファイル名)
-                        # と一致するため、現モデルの経験のみが Level 2 に渡る。
-                        current_model=(
-                            self._base_model_path.name
-                            if self._base_model_path else ""
-                        ),
                         base_model_path=self._base_model_path,
                     ))
                 except Exception as e:

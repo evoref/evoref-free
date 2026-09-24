@@ -48,19 +48,27 @@ SemanticFact の `subject` フィールドは検索・索引・コンフリク�
 
 ## ファイル形式
 
-``local/memory/semantic/subject_dictionary.json``::
+``local/memory/semantic/subject_dictionary.json`` (形式
+``semantic.subject_dictionary``、利用者が手で編集する SoT)::
 
     {
-      "version": 1,
-      "entries": {
-        "私": "user",
-        "僕": "user",
-        ...
+      "format_id": "semantic.subject_dictionary",
+      "format_version": 1,
+      "written_at": "...Z",
+      "producer": {...},
+      "payload": {
+        "entries": {
+          "私": "mem.personal.user",
+          ...
+        }
       }
     }
 
-破損や欠損時は ``ensure_default_subject_dictionary`` がデフォルトを書き
-出して回復する (後方互換は提供しない)。
+版は封筒の ``format_version`` だけが持つ (payload に独自の ``version`` は置かない)。
+欠損時は ``ensure_default_subject_dictionary`` がデフォルトを書き出す。壊れた
+ファイルは ``subject_dictionary.json.corrupt-<stamp>`` へ退避してからデフォルトを
+書く。G1 の封筒でない (G0) / 新しい版のファイルは読まず、書き換えもしない
+(``ValueError``)。
 
 ## API
 
@@ -75,26 +83,44 @@ SemanticFact の `subject` フィールドは検索・索引・コンフリク�
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Pattern
+from typing import Any, Pattern
 
 from backend.free.memory.semantic.subject_key import SubjectKey
-from backend.io.atomic import atomic_write_text
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 
 logger = get_logger("memory.subject_canonicalizer")
 
 
-SUBJECT_DICTIONARY_FILE_VERSION = 1
-"""``subject_dictionary.json`` のフォーマットバージョン。
+@persisted()
+@dataclass
+class SubjectDictionaryPayload:
+    """``subject_dictionary.json`` の payload (``entries`` の無いファイルは壊れている)。"""
 
-互換性のない変更を入れる場合のみインクリメントし、古い値を読んだ場合は
-警告ログを出して既定値で再生成する (後方互換は提供しない方針)。
-"""
+    entries: dict[str, str]
+    #: この版が知らないキー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
+
+
+_PAYLOAD_CODEC = codec_for(SubjectDictionaryPayload)
+
+SUBJECT_DICTIONARY_FORMAT = register_format(FormatSpec(
+    format_id="semantic.subject_dictionary",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/memory/semantic/subject_dictionary.json",
+    retention="user-edited; no automatic expansion",
+    export=True,
+    human_edited=True,
+    records=(SubjectDictionaryPayload,),
+))
 
 DEFAULT_BYPASS_REGEX = r"^(loop|learn|mem)\."
 """3 pillar namespace (``loop`` / ``learn`` / ``mem``) の正規化バイパス既定パターン。
@@ -214,71 +240,80 @@ def default_subject_dictionary() -> SubjectDictionary:
     return SubjectDictionary(entries=dict(DEFAULT_SUBJECT_ENTRIES))
 
 
-def write_subject_dictionary(
-    path: Path, entries: Mapping[str, str], *, version: int = SUBJECT_DICTIONARY_FILE_VERSION,
-) -> Path:
-    """``subject_dictionary.json`` を書き出す。
+class _SubjectDictionaryFile(VersionedJsonFile):
+    """``subject_dictionary.json`` の封筒。payload は ``{"entries": {str: str}}``。"""
 
-    親ディレクトリは必要に応じて作成する。``ensure_ascii=False`` で日本語
-    エントリをそのまま保存する。
+    FORMAT = SUBJECT_DICTIONARY_FORMAT
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
+
+    def __init__(self, path: Path, entries: Mapping[str, str] | None = None) -> None:
+        super().__init__(path)
+        self.entries: dict[str, str] = dict(entries or {})
+        #: payload の未知キー (書き戻しでそのまま戻す)。
+        self._extra: dict[str, Any] | None = None
+
+    def _to_payload(self) -> dict[str, Any]:
+        return _PAYLOAD_CODEC.encode(SubjectDictionaryPayload(dict(self.entries), self._extra))
+
+    def _from_payload(self, payload: object) -> None:
+        data = _PAYLOAD_CODEC.decode(payload)
+        self.entries = data.entries
+        self._extra = data._extra
+
+
+def write_subject_dictionary(path: Path, entries: Mapping[str, str]) -> Path:
+    """``subject_dictionary.json`` を封筒付きで書き出す。
+
+    親ディレクトリは必要に応じて作成する。日本語エントリはエスケープせずに
+    保存する (利用者が手で編集する)。書き込みの失敗は送出する。
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"version": version, "entries": dict(entries)}
-    atomic_write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
-    )
+    _SubjectDictionaryFile(path, entries).save()
     logger.info("Wrote subject dictionary: %s (entries=%d)", path, len(entries))
     return path
+
+
+def _read_subject_dictionary(path: Path) -> _SubjectDictionaryFile:
+    f = _SubjectDictionaryFile(path)
+    f.load()
+    return f
 
 
 def load_subject_dictionary(path: Path) -> SubjectDictionary:
     """``subject_dictionary.json`` を読み込む。
 
+    壊れたファイル (JSON でない / 形が違う) は ``<name>.corrupt-<stamp>`` へ退避
+    してから ``ValueError`` を送出する。
+
     Raises:
         FileNotFoundError: ファイルが存在しない
-        ValueError: フォーマットが不正
+        ValueError: 読めない (壊れている / G1 の封筒でない / 新しい版)
     """
-    if not path.exists():
+    f = _read_subject_dictionary(path)
+    if f.last_status in ("current", "migrated"):
+        return SubjectDictionary(entries=f.entries)
+    if f.last_status == "absent":
         raise FileNotFoundError(f"subject_dictionary.json not found: {path}")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"subject_dictionary.json is not valid JSON: {path}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"subject_dictionary.json must be a JSON object: {path}")
-
-    version = payload.get("version")
-    if version != SUBJECT_DICTIONARY_FILE_VERSION:
-        logger.warning(
-            "subject_dictionary.json version mismatch: expected=%s actual=%s (path=%s)",
-            SUBJECT_DICTIONARY_FILE_VERSION, version, path,
-        )
-
-    raw_entries = payload.get("entries")
-    if not isinstance(raw_entries, dict):
-        raise ValueError(
-            f"subject_dictionary.json must contain an 'entries' object: {path}",
-        )
-    entries: dict[str, str] = {}
-    for key, value in raw_entries.items():
-        if not isinstance(key, str) or not isinstance(value, str):
-            raise ValueError(
-                f"subject_dictionary.json entries must be string->string: {path}",
-            )
-        entries[key] = value
-    return SubjectDictionary(entries=entries)
+    raise ValueError(f"subject_dictionary.json could not be loaded ({f.last_status}): {path}")
 
 
 def ensure_default_subject_dictionary(path: Path) -> SubjectDictionary:
     """ファイルが無ければデフォルトを書き出してから読み込む。
 
-    あれば既存をそのまま読み込む。読み込みに失敗した場合は
-    ``ValueError`` を再送出する (回復は呼び出し側の判断に委ねる)。
+    あれば既存をそのまま読み込む。壊れていれば退避してデフォルトを書き直す。
+    G1 の封筒でない / 新しい版のファイルは書き換えずに ``ValueError`` を送出する
+    (回復は呼び出し側の判断に委ねる)。
     """
-    if not path.exists():
-        write_subject_dictionary(path, DEFAULT_SUBJECT_ENTRIES)
-    return load_subject_dictionary(path)
+    f = _read_subject_dictionary(path)
+    if f.last_status in ("current", "migrated"):
+        return SubjectDictionary(entries=f.entries)
+    if f.readonly:
+        raise ValueError(
+            f"subject_dictionary.json cannot be used ({f.last_status}); "
+            f"left untouched: {path}",
+        )
+    write_subject_dictionary(path, DEFAULT_SUBJECT_ENTRIES)
+    return default_subject_dictionary()
 
 
 # ──────────────────────────────────────────────────────────────────────────

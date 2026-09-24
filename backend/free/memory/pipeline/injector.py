@@ -947,6 +947,11 @@ class MemoryInjector:
             facts, collapsible=_collapsible, no_value_cache=no_value,
             stale_note_ids=stale_note_ids,
         )
+        stm_notes = list(stm_notes)
+        facts, restated_later = self._drop_facts_restated_later(
+            facts, stm_notes, stale_texts, stale_note_ids,
+        )
+        collapsed += restated_later
         if stale_note_ids:
             retired = set(retired) | stale_note_ids
         filtered_out += collapsed
@@ -1593,8 +1598,7 @@ class MemoryInjector:
         logger.warning(
             "Memory injection: fact embedding dim %d != query dim %d. "
             "These facts are excluded from injection until re-embedded. "
-            "Run 'python scripts/evorefmem_cli.py reembed-facts --apply' "
-            "(or POST /api/model/reembed-facts).",
+            "Run POST /api/model/reembed-facts.",
             fact_dim, query_dim,
         )
 
@@ -2038,6 +2042,64 @@ class MemoryInjector:
                 "MemoryInjector: collapsed %d duplicate/stale fact rows", dropped,
             )
         return out, dropped, stale_texts
+
+    def _drop_facts_restated_later(
+        self,
+        facts: list[SemanticFact],
+        stm_notes: list[MemoryNote],
+        stale_texts: set[str],
+        stale_note_ids: set[str],
+    ) -> tuple[list[SemanticFact], int]:
+        """ファクトより **後に** 利用者が同じ単値スロットを言い直していたら、そのファクトを落とす。
+
+        SemMem を書くのは sleep-time だけ (不変則 #2) なので、言い直した値は
+        次の Full が抽出するまでノートにしか無い。その間は前の値のファクトが
+        ``[関連する記憶]`` に「現在値」として載り、モデルはそれを答える
+        (2026-09-23 実機: 「好きな色は茜色です」の直後に別セッションで
+        「若草色です」)。言い直しのノート (Tier 2) が値を運ぶので、古い
+        ファクトと、その根拠になった発話ノートを注入から外す。
+
+        比べるのはノートを取り込んだ時刻とファクトを作った時刻 — ファクトより
+        前のノートは、そのファクトの抽出で既に考慮済み。アシスタントのノートは
+        根拠にしない (古い値を答えた応答が「新しい言い直し」に見えるため)。
+        """
+        from backend.free.memory.notes.note_builder import restated_attribute_slot
+
+        latest: dict[str, float] = {}
+        for note in stm_notes:
+            if getattr(note, "source", "user") != "user":
+                continue
+            slot = restated_attribute_slot(getattr(note, "content", "") or "")
+            if slot is None:
+                continue
+            created = float(getattr(note, "created_at", 0.0) or 0.0)
+            if created > latest.get(slot, 0.0):
+                latest[slot] = created
+        if not latest:
+            return facts, 0
+        out: list[SemanticFact] = []
+        dropped = 0
+        for fact in facts:
+            key = _attribute_key(fact.subject)
+            restated_at = latest.get(key) if key is not None else None
+            if (
+                restated_at is None
+                or getattr(fact, "superseded_by", None)
+                or self._is_multi_valued(fact.subject)
+                or restated_at <= float(getattr(fact, "created_at", 0.0) or 0.0)
+            ):
+                out.append(fact)
+                continue
+            dropped += 1
+            stale_texts.add(_normalize_for_dup(fact.object))
+            _add_provenance_note_ids(stale_note_ids, fact)
+        if dropped:
+            logger.info(
+                "MemoryInjector: %d fact(s) left out — the user restated the slot "
+                "after they were extracted (%s)",
+                dropped, ", ".join(sorted(latest)),
+            )
+        return out, dropped
 
     def _collapse_by_attribute(
         self,

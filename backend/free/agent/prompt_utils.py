@@ -23,9 +23,11 @@ Gen) から自由に import してよい。
 from __future__ import annotations
 
 import re
-import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from backend.io.codec import persisted
+from backend.io.id_registry import new_id
 
 if TYPE_CHECKING:
     import numpy as np
@@ -35,9 +37,14 @@ if TYPE_CHECKING:
 # ─────────────────────────────────────────────────────────────────────
 
 
+@persisted(transient=("embedding",))
 @dataclass
 class FewShotExample:
-    """Few-shot 候補の 1 エントリ (純粋 dataclass)"""
+    """Few-shot 候補の 1 エントリ (純粋 dataclass)。
+
+    ``fewshot_pool.json`` の 1 件の永続形でもある (``embedding`` は永続化しない。
+    この版が知らないキーは ``_extra``)。
+    """
 
     id: str = ""
     query: str = ""
@@ -79,10 +86,11 @@ class FewShotExample:
     #: "active" | "stale" | "archived"。stale は選択に効かないラベル。
     state: str = "active"
     state_since: str = ""
+    _extra: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.id:
-            self.id = uuid.uuid4().hex[:12]
+            self.id = new_id("fs_")
 
 
 @runtime_checkable

@@ -84,11 +84,9 @@ _LEVEL_CONFIGS: dict[DevelopLevel, dict[str, Any]] = {
 }
 
 
-# develop モード時の DebugLogger 出力先 (project_root 相対)。
-# `--isolate-data` (Pro) 指定時は ``apply_data_isolation`` が
-# ``local_paths.logs_dir`` を ``local/test_data/logs/`` 系へ差し替えるため、
-# ``project_root`` 側で吸収される。
-_DEFAULT_LOG_SUBDIR = ("local", "logs", "debug")
+# develop モード時の DebugLogger 出力先はデータ根の ``logs/debug/`` (c_03 §10.1)。
+# `--isolate-data` (Pro) は別のデータ根 (``userdata-isolated/<name>/``) になる。
+_DEBUG_SUBDIR = "debug"
 
 
 class DebugLogger:
@@ -130,9 +128,9 @@ class DebugLogger:
         self.max_log_generations: int = 3
         self.log_retention_days: int = int(cfg["retention_days"])
 
-        if project_root is None:
-            project_root = Path(__file__).parent.parent
-        self.log_dir: Path = project_root.joinpath(*_DEFAULT_LOG_SUBDIR)
+        from backend.config import resolve_data_path
+
+        self.log_dir: Path = resolve_data_path("logs_dir", project_root) / _DEBUG_SUBDIR
 
         if self.enabled:
             self._sink: DebugLogSink | None = DebugLogSink(
@@ -218,7 +216,7 @@ class DebugLogger:
                 slot、それ以外は background slot)。``None`` なら記録しない。
             resolved_timeout: 実際に適用されたタイムアウト秒
                 purpose 別の解決値 (``PURPOSE_TIMEOUT_DEFAULTS`` と
-                ``local/aux_calibration.json`` の較正) と既定値のどちらが採用されたか
+                ``aux_calibration.json`` の較正) と既定値のどちらが採用されたか
                 を回帰追跡できるようにする。``None`` なら記録しない。
             cache_metrics: llama-server の KV キャッシュ命中率指標
 。``{"prompt_n": int, "cache_n": int, "hit_ratio": float}``

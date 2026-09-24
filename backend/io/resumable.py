@@ -40,6 +40,7 @@ from typing import (
 from backend.io.jsonl_store import JSONLAppendStore
 from backend.log_config import get_logger
 from backend.trace_context import get_trace_id
+from backend.utils import epoch_to_utc, utc_to_epoch
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
@@ -78,7 +79,7 @@ class CheckpointEntry:
 
     key: str
     status: CheckpointStatus
-    ts: float  # epoch seconds (UTC)
+    ts: float  # epoch seconds (UTC)。永続形は ISO 8601 UTC μs ``Z`` (c_05 §0.5.4)
     trace_id: str = ""
     detail: dict[str, Any] = field(default_factory=dict)
 
@@ -87,7 +88,7 @@ class CheckpointEntry:
             {
                 "key": self.key,
                 "status": self.status,
-                "ts": self.ts,
+                "ts": epoch_to_utc(self.ts),
                 "trace_id": self.trace_id,
                 "detail": self.detail,
             },
@@ -100,8 +101,8 @@ class CheckpointEntry:
         return CheckpointEntry(
             key=str(obj["key"]),
             status=obj["status"],
-            ts=float(obj.get("ts", 0.0)),
-            trace_id=str(obj.get("trace_id", "")),
+            ts=utc_to_epoch(obj.get("ts"), 0.0),
+            trace_id=str(obj.get("trace_id") or ""),
             detail=dict(obj.get("detail", {})),
         )
 

@@ -40,6 +40,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
+from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.liveness import ledger as liveness_ledger
 from backend.log_config import get_logger
 
@@ -468,8 +469,14 @@ class ExemplarPredicate:
         if embedder is not None:
             self._embedder = embedder
 
+    @with_embed_priority(P2_LEARNING)
     async def warmup(self) -> bool:
-        """事例を埋め込み、較正する。成功で ``True``。例外は投げない。"""
+        """事例を埋め込み、較正する。成功で ``True``。例外は投げない。
+
+        起動直後に走る下ごしらえなので埋め込みは P2 (c_16 §6.5)。事例は数百件
+        あり、CPU の埋め込みサーバでは 64 件で 4〜7 秒かかる。クエリ扱いの
+        既定 (P0) のままだと、最初のチャットのクエリと同じ順位で並んでいた。
+        """
         if self._vectors is not None:
             return True
         if self._embedder is None or not self._exemplars:

@@ -16,20 +16,29 @@
 
 from __future__ import annotations
 
-import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from backend.free.rag.corpus.package import PACKAGE_ID_RE, PackageError
+from backend.free.rag.corpus.package import (
+    PACKAGE_ID_RE,
+    TEMPLATES_DIR,
+    PackageError,
+    PackageFormatError,
+    section_manifest_payload,
+    validate_section_feature,
+)
+from backend.io.versioned import read_versioned, read_versioned_bytes, write_versioned
 from backend.log_config import get_logger
 
 logger = get_logger("rag.corpus.templates")
 
-#: セクション独自の manifest 版。``requires`` の ``"templates/1"`` と一致させる
-#: (c_16 §4.5.1)。
-TEMPLATES_SCHEMA_VERSION = 1
+#: ``templates/manifest.json`` の封筒 (c_16 §4.5.1)。版は ``requires`` の
+#: ``"templates/<N>"`` と一致させる。台帳の宣言は ``corpus.store``。
+TEMPLATES_FORMAT_ID = "evoref.package.templates"
+TEMPLATES_FORMAT_VERSION = 1
 
 TEMPLATES_MANIFEST_FILE = "manifest.json"
 
@@ -66,9 +75,8 @@ class TemplateEntry:
 
 @dataclass(frozen=True, slots=True)
 class TemplateManifest:
-    """``templates/manifest.json`` 全体 (有効なエントリだけを持つ)。"""
+    """``templates/manifest.json`` の ``payload`` (有効なエントリだけを持つ)。"""
 
-    schema_version: int
     entries: tuple[TemplateEntry, ...]
 
 
@@ -274,25 +282,16 @@ def _parse_entry(raw: Any, section_dir: Path, package_id: str) -> TemplateEntry 
 def parse_template_manifest(
     data: Any, section_dir: Path, package_id: str,
 ) -> TemplateManifest:
-    """``templates/manifest.json`` の dict を検証済みの :class:`TemplateManifest` にする。
+    """``templates/manifest.json`` の ``payload`` を検証済みの :class:`TemplateManifest` にする。
 
     無効なエントリはそのエントリだけ飛ばして件数を WARNING に出す (c_05 §0.5.2)。
-    ``schema_version`` がこのコードより新しければ、エントリを一切読まない
-    (c_16 §4.5.1 — install の ``requires`` 検査で新しい版は既に拒否されている
-    ため、ここに来るのは異常系のみ)。
+    封筒 (版) の検査は呼出側 (:func:`load_template_manifest` /
+    :func:`validate_templates_install`) が済ませている。
     """
     if not isinstance(data, dict):
         raise TemplateManifestError(
             f"templates manifest of package '{package_id}' must be a JSON object",
         )
-    schema_version = int(data.get("schema_version") or TEMPLATES_SCHEMA_VERSION)
-    if schema_version > TEMPLATES_SCHEMA_VERSION:
-        logger.warning(
-            "corpus package %s: templates manifest schema_version %d is newer "
-            "than supported %d; ignoring templates section",
-            package_id, schema_version, TEMPLATES_SCHEMA_VERSION,
-        )
-        return TemplateManifest(schema_version=schema_version, entries=())
 
     raw_entries = data.get("templates") or []
     if not isinstance(raw_entries, list):
@@ -314,31 +313,46 @@ def parse_template_manifest(
             "corpus package %s: skipped %d invalid templates entry(ies)",
             package_id, skipped,
         )
-    return TemplateManifest(schema_version=schema_version, entries=tuple(entries))
+    return TemplateManifest(entries=tuple(entries))
+
+
+def write_template_manifest(section_dir: Path, templates: Sequence[dict[str, Any]]) -> Path:
+    """``<section_dir>/manifest.json`` を G1 の封筒で書く (パッケージを組む側、c_16 §4.5.1)。"""
+    path = Path(section_dir) / TEMPLATES_MANIFEST_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_versioned(
+        path, format_id=TEMPLATES_FORMAT_ID, format_version=TEMPLATES_FORMAT_VERSION,
+        payload={"templates": list(templates)}, component="corpus.templates",
+        fsync=False, indent=2,
+    )
+    return path
 
 
 def load_template_manifest(
     section_dir: Path, package_id: str,
 ) -> TemplateManifest | None:
-    """``<section_dir>/manifest.json`` を読む (寛容: 開けなければ ``None``)。
+    """``<section_dir>/manifest.json`` を読む (無い・壊れていれば ``None``)。
 
     版ディレクトリは install 後不変なので、install 時に検証済みの manifest を
     ここで再度壊れているとみなす必要は薄いが、手動でディレクトリを触られた
-    場合にも本体の起動を落とさない。
+    場合にも本体の起動を落とさない。ただし封筒の無い (G0) / 新しい版の
+    manifest は黙って空にせず :class:`PackageFormatError` を送出する —
+    呼出側はパッケージの読み込みを拒否する (c_16 §4.5.1)。
     """
     path = section_dir / TEMPLATES_MANIFEST_FILE
-    if not path.is_file():
+    result = read_versioned(
+        path, format_id=TEMPLATES_FORMAT_ID, format_version=TEMPLATES_FORMAT_VERSION,
+    )
+    if result.status == "absent":
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(
-            "corpus package %s: unreadable templates manifest %s: %s",
-            package_id, path, e,
+        payload = section_manifest_payload(
+            result, section=TEMPLATES_DIR, source=str(path),
+            format_version=TEMPLATES_FORMAT_VERSION, error=TemplateManifestError,
         )
-        return None
-    try:
-        return parse_template_manifest(data, section_dir, package_id)
+        return parse_template_manifest(payload, section_dir, package_id)
+    except PackageFormatError:
+        raise
     except TemplateManifestError as e:
         logger.warning(
             "corpus package %s: invalid templates manifest: %s", package_id, e,
@@ -346,33 +360,43 @@ def load_template_manifest(
         return None
 
 
-def validate_templates_install(directory: Path, package_id: str) -> None:
+def validate_templates_install(
+    directory: Path, package_id: str, requires: Sequence[str],
+) -> None:
     """install 時の拒否判定 (c_16 §4.5.1)。
 
     ``templates/`` セクションを ``provides`` しているのに ``manifest.json`` が
-    無い、または JSON として壊れている場合は install を拒否する。呼出側
+    無い / 壊れている / G1 の封筒でない / 新しい版 / 版が ``requires`` の
+    ``templates/<N>`` と一致しない場合は install を拒否する。呼出側
     (``CorpusStore.install``) は ``provides`` の宣言と実ディレクトリが既に
     突き合わせ済みの後でこれを呼ぶ。
     """
-    from backend.free.rag.corpus.package import TEMPLATES_DIR
-
     section_dir = directory / TEMPLATES_DIR
     if not section_dir.is_dir():
         return
+    source = f"{TEMPLATES_DIR}/{TEMPLATES_MANIFEST_FILE}"
     manifest_path = section_dir / TEMPLATES_MANIFEST_FILE
     if not manifest_path.is_file():
         raise TemplateManifestError(
-            f"package '{package_id}' provides templates but "
-            f"{TEMPLATES_DIR}/{TEMPLATES_MANIFEST_FILE} is missing",
+            f"package '{package_id}' provides templates but {source} is missing",
         )
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+        data = manifest_path.read_bytes()
+    except OSError as e:
         raise TemplateManifestError(
             f"package '{package_id}' has an unreadable templates manifest: {e}",
         ) from e
+    # 取り込み中の版は data_health に載せない (拒否すれば版ごと消える)
+    result = read_versioned_bytes(
+        data, format_id=TEMPLATES_FORMAT_ID, format_version=TEMPLATES_FORMAT_VERSION,
+    )
+    payload = section_manifest_payload(
+        result, section=TEMPLATES_DIR, source=source,
+        format_version=TEMPLATES_FORMAT_VERSION, error=TemplateManifestError,
+    )
+    validate_section_feature(requires, TEMPLATES_DIR, TEMPLATES_FORMAT_VERSION, package_id)
     # ここは検証だけ (結果は _open_package / _build_version が改めて読む)。
-    parse_template_manifest(data, section_dir, package_id)
+    parse_template_manifest(payload, section_dir, package_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,9 +437,11 @@ def _term_in_text(text: str, term: str) -> bool:
 
 
 def load_templates_for_package(directory: Path, package_id: str) -> tuple[TemplateEntry, ...]:
-    """版ディレクトリの ``templates/`` を開く (open 時に常駐させる、c_16 §4.5.1)。"""
-    from backend.free.rag.corpus.package import TEMPLATES_DIR
+    """版ディレクトリの ``templates/`` を開く (open 時に常駐させる、c_16 §4.5.1)。
 
+    Raises:
+        PackageFormatError: manifest が G1 の封筒でない (G0) / 新しい版。
+    """
     section_dir = directory / TEMPLATES_DIR
     if not section_dir.is_dir():
         return ()
@@ -427,8 +453,9 @@ def load_templates_for_package(directory: Path, package_id: str) -> tuple[Templa
 
 __all__ = [
     "BASE_SUFFIXES",
+    "TEMPLATES_FORMAT_ID",
+    "TEMPLATES_FORMAT_VERSION",
     "TEMPLATES_MANIFEST_FILE",
-    "TEMPLATES_SCHEMA_VERSION",
     "TemplateCandidate",
     "TemplateEntry",
     "TemplateManifest",
@@ -437,4 +464,5 @@ __all__ = [
     "load_templates_for_package",
     "parse_template_manifest",
     "validate_templates_install",
+    "write_template_manifest",
 ]

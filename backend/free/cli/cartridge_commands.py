@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.renderer import (
     render_error,
     render_info,
@@ -146,6 +147,7 @@ def _cartridge_install(backend_url: str, console, file_path: str) -> int:
                 files = {"file": (zip_path.name, f, "application/zip")}
                 resp = httpx.post(
                     f"{backend_url}/api/cartridges/install",
+                    headers=backend_headers(),
                     files=files,
                     timeout=_timeouts.install,
                 )
@@ -246,6 +248,7 @@ def _cartridge_load(backend_url: str, console, cartridge_id: str) -> int:
     try:
         resp = httpx.post(
             f"{backend_url}/api/cartridges/{cartridge_id}/load",
+            headers=backend_headers(),
             timeout=_timeouts.default,
         )
         if resp.status_code == 404:
@@ -273,6 +276,7 @@ def _cartridge_unload(backend_url: str, console, cartridge_id: str) -> int:
     try:
         resp = httpx.post(
             f"{backend_url}/api/cartridges/{cartridge_id}/unload",
+            headers=backend_headers(),
             timeout=_timeouts.default,
         )
         if resp.status_code == 404:
@@ -298,6 +302,7 @@ def _cartridge_uninstall(backend_url: str, console, cartridge_id: str) -> int:
     try:
         resp = httpx.delete(
             f"{backend_url}/api/cartridges/{cartridge_id}",
+            headers=backend_headers(),
             timeout=_timeouts.default,
         )
         if resp.status_code == 404:
@@ -329,6 +334,7 @@ def _cartridge_rebuild(backend_url: str, console, cartridge_id: str) -> int:
         with console.status(msg("cli.cartridge_rebuilding", id=cartridge_id), spinner="dots"):
             resp = httpx.post(
                 f"{backend_url}/api/cartridges/{cartridge_id}/rebuild",
+                headers=backend_headers(),
                 timeout=_timeouts.rebuild,
             )
         if resp.status_code == 404:
@@ -471,6 +477,7 @@ def _execute_create_request(
         ):
             resp = httpx.post(
                 f"{backend_url}/api/pro/cartridges/create",
+                headers=backend_headers(),
                 files=multipart_files,
                 data=form_data,
                 timeout=_timeouts.create,

@@ -15,7 +15,7 @@ backend / frontend を止めようとしていた。ウィンドウタイトル�
 計測を続けるところだった。
 
 停止の判定はウィンドウタイトルではなく **ポートの占有** で行う。``pid_manager``
-は ``reset_local_data.py`` が同じ目的で使っている純粋ヘルパーで、アプリ context
+は ``evoref reset --stop-services`` も同じ目的で使っている純粋ヘルパーで、アプリ context
 に依存しない。
 
 ログは英語固定 (リポジトリ規約)。standalone のため print で stdout へ出す。

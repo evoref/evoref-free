@@ -8,7 +8,7 @@
 		clearThemeColors,
 		type ThemeInfo
 	} from '$lib/free/stores/theme';
-	import { getThemes, trustThemeApi, installThemeApi, uninstallThemeApi } from '$lib/free/api';
+	import { getThemes, installThemeApi, uninstallThemeApi } from '$lib/free/api';
 	import { get } from 'svelte/store';
 	import { onMount } from 'svelte';
 	import ThemeTrustDialog from './ThemeTrustDialog.svelte';
@@ -59,27 +59,19 @@
 		await doActivate(theme.theme_id);
 	}
 
-	async function handleTrustConfirm() {
-		if (!trustDialogTheme) return;
-		const themeToTrust = trustDialogTheme;
+	// 信頼の付与は API からはできない (docs/c_11 §1)。ダイアログは端末での手順を案内し、
+	// ここでは「コードなしで適用」と「キャンセル」だけを扱う。
+	function handleApplyWithoutCode() {
+		const themeToApply = trustDialogTheme;
 		trustDialogTheme = null;
-
-		const result = await handleApiCall(() => trustThemeApi(themeToTrust.theme_id), {
-			fallbackKey: 'theme_manager.activate_failed'
-		});
-		if (!result) return;
-
-		await doActivate(themeToTrust.theme_id);
+		// 信頼なしでアクティベート（colors + layout のみ、スロット無効）
+		if (themeToApply) {
+			doActivate(themeToApply.theme_id);
+		}
 	}
 
 	function handleTrustCancel() {
-		const themeToSkip = trustDialogTheme;
 		trustDialogTheme = null;
-
-		// 信頼なしでアクティベート（colors + layout のみ、スロット無効）
-		if (themeToSkip) {
-			doActivate(themeToSkip.theme_id);
-		}
 	}
 
 	async function doActivate(id: string) {
@@ -117,11 +109,12 @@
 
 {#if trustDialogTheme}
 	<ThemeTrustDialog
+		themeId={trustDialogTheme.theme_id}
 		themeName={trustDialogTheme.name}
 		themeAuthor={trustDialogTheme.author}
 		themeVersion={trustDialogTheme.version}
 		componentCount={trustDialogTheme.component_count}
-		onConfirm={handleTrustConfirm}
+		onApplyWithoutCode={handleApplyWithoutCode}
 		onCancel={handleTrustCancel}
 	/>
 {/if}

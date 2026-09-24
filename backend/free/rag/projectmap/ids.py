@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from backend.io.id_registry import derived_id
+
 #: ``package.json`` の ``_extra.kind`` (c_16 §4.4)。
 PROJECT_MAP_KIND = "project_map"
 
@@ -41,8 +43,7 @@ def code_node_id(path: str, node_type: str, qualname: str) -> str:
     変わらない — 版そのものが不変なので、内容の変化は版番号が担う。
     """
     payload = f"code_node\x00{path}\x00{node_type}\x00{qualname}"
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
-    return f"{_CODE_NODE_ID_PREFIX}{digest}"
+    return derived_id(_CODE_NODE_ID_PREFIX, hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
 
 __all__ = ["PROJECT_MAP_KIND", "code_node_id", "project_map_package_id"]

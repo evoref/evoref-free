@@ -34,6 +34,25 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _TRAILING_PUNCT_RE = re.compile(r"[?？!！。.、,]+$")
 
 
+def embedding_store_id(backend: object) -> str:
+    """ストアの ``embeddings/<id>/``・manifest・tail に刻む埋め込みモデルの識別子。
+
+    埋め込みモデルの ``model_key`` (``mk_<hex16>``、c_05 §0.5.12) を持つバックエンドは
+    それを、持たないもの (テスト用の簡易実装) は ``model_name`` を返す。メソッド形・
+    属性形のどちらでも読む。取れなければ空文字。
+    """
+    for name in ("model_key", "model_name"):
+        value = getattr(backend, name, None)
+        if callable(value):
+            try:
+                value = value()
+            except TypeError:
+                value = None
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def normalize_cache_key(text: str) -> str:
     """キャッシュキーの正規化（空白・末尾句読点の揺れを吸収）"""
     key = _WHITESPACE_RE.sub(" ", text.strip())

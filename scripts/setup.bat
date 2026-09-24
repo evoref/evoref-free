@@ -40,7 +40,7 @@ echo Options:
 echo   --shared-path ^<path^>  NAS shared path for multi-PC setup
 echo                          Uses shared models/ (no model checks)
 echo   --force                 Force reinstall (recreate .venv, reinstall packages,
-echo                          overwrite config.yaml)
+echo                          overwrite config.yaml; the data root and local\ are kept)
 echo   -h, --help              Show this help message
 exit /b 0
 
@@ -156,6 +156,13 @@ if defined SHARED_PATH if exist "config.yaml" (
     echo   Updated config.yaml with shared paths
 )
 
+rem An old config.yaml without config_version is rewritten once
+rem (backup config.yaml.g0-<stamp>); evoref-ctl start retries if this fails.
+if exist "config.yaml" (
+    python -m backend.free.cli.main config normalize --if-needed
+    if errorlevel 1 echo   WARNING: config.yaml was not normalized; evoref-ctl start will retry
+)
+
 rem --- 5. Model placement check ---
 echo [5/6] Checking models...
 if defined SHARED_PATH (
@@ -165,28 +172,20 @@ if defined SHARED_PATH (
     python scripts\download_model.py
 )
 
-rem --- 6. Local directories ---
-echo [6/6] Creating local directories...
-for %%d in (
-    "local\models"
-    "local\models\embed_lora_versions"
-    "local\knowledge"
-    "local\outputs"
-    "local\memory"
-    "local\memory\corpus\packages"
-    "local\memory\episodic"
-    "local\memory\semantic"
-    "local\prompts"
-    "local\history"
-    "local\lora_archive"
-    "local\lora_versions"
-    "local\migration_archive"
-    "local\profiles"
-    "local\themes"
-    "local\triggers"
-    "local\logs\debug"
-) do (
-    if not exist %%d mkdir %%~d
+rem --- 6. Data root directories ---
+rem backend.data_root resolves the data root (EVOREF_DATA_ROOT, else
+rem <install_root>\userdata) and rejects invalid ones. local\ (G0 data) is never
+rem created, moved or deleted here.
+echo [6/6] Creating data root directories...
+set "DATA_ROOT="
+for /f "usebackq delims=" %%r in (`python -c "from backend.data_root import resolve_data_root; print(resolve_data_root())"`) do set "DATA_ROOT=%%r"
+if not defined DATA_ROOT (
+    echo ERROR: could not resolve the data root ^(check EVOREF_DATA_ROOT^)
+    exit /b 1
+)
+echo   Data root: !DATA_ROOT!
+for %%d in (store logs outputs themes profiles tmp run cache) do (
+    if not exist "!DATA_ROOT!\%%d" mkdir "!DATA_ROOT!\%%d"
 )
 echo   Done
 

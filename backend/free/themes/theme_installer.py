@@ -3,23 +3,36 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import tempfile
 import zipfile
 from ipaddress import ip_address
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NotRequired, TypedDict
 from urllib.parse import urlparse
 
 import httpx
 
+from backend.io.safe_extract import (
+    ExtractBudget,
+    ExtractLimits,
+    check_zip_members,
+    resolve_under,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("themes.installer")
 
 # ZIP アップロードサイズ上限 (10MB)
 MAX_ZIP_SIZE = 10 * 1024 * 1024
+#: 展開の上限。テーマは CSS / JS / 画像の小さな束なので狭くする。
+THEME_LIMITS = ExtractLimits(
+    max_entries=2_000, max_member_bytes=16 << 20, max_total_bytes=64 << 20, max_ratio=200.0,
+)
+#: テーマ ID はディレクトリ名になるので、先頭がドットや区切りにならない安全な文字だけを許す。
+THEME_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 # 組み込みテーマディレクトリ名（現在は制約なし — 全テーマ削除可能）
 BUILTIN_THEMES: set[str] = set()
@@ -104,7 +117,10 @@ def install_theme(zip_path: Path, themes_dir: Path) -> ThemeInstallResult:
         raise ValueError("Not a valid ZIP file")
 
     with zipfile.ZipFile(str(zip_path), "r") as zf:
-        names = zf.namelist()
+        # 全エントリを先に検査する (パスの逃げ・予約名・シンボリックリンク・展開後サイズ)。
+        # エントリ名をそのまま展開先に連結しない (docs/c_06 §1.5)。
+        members = check_zip_members(zf, THEME_LIMITS)
+        names = [str(member) for _, member in members]
 
         # theme.json を探す
         meta_file = _find_file_in_zip(names, "theme.json")
@@ -121,6 +137,9 @@ def install_theme(zip_path: Path, themes_dir: Path) -> ThemeInstallResult:
 
         # theme_id の決定（ZIP 内のルートディレクトリ名、またはメタデータの name を slug 化）
         theme_id = _detect_theme_id(names, meta)
+
+        if not THEME_ID_RE.fullmatch(theme_id):
+            raise ValueError(f"Invalid theme id: {theme_id!r}")
 
         # 組み込みテーマと同名は禁止
         if theme_id in BUILTIN_THEMES:
@@ -150,19 +169,18 @@ def install_theme(zip_path: Path, themes_dir: Path) -> ThemeInstallResult:
         staging_dir.mkdir(parents=True, exist_ok=True)
         prefix = _detect_zip_prefix(names)
 
+        budget = ExtractBudget(THEME_LIMITS)
         try:
-            for name in names:
-                if name.endswith("/"):
-                    continue
+            for info, member in members:
                 # ZIP 内のプレフィックスを除去して展開
-                rel_path = (
-                    name[len(prefix):] if prefix and name.startswith(prefix) else name
-                )
-                if not rel_path:
+                parts = member.parts
+                if prefix and parts[0] == prefix.rstrip("/"):
+                    parts = parts[1:]
+                if not parts:
                     continue
-                out_path = staging_dir / rel_path
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_bytes(zf.read(name))
+                out_path = resolve_under(staging_dir, PurePosixPath(*parts))
+                with zf.open(info) as src:
+                    budget.copy(src, out_path, compressed_size=info.compress_size)
             staging_dir.rename(target_dir)
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)

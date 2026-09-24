@@ -83,6 +83,84 @@ def _guard_model_paths_immutable(data: dict) -> None:
         )
 
 
+#: 設定 API から危険側へは変えられない「能力キー」(docs/c_06 §1.5)。
+#: 値がそのままコード実行・秘密の持ち出し・任意パスの読み書きにつながるので、
+#: 変更は config.yaml を手で編集する (PC の持ち主だけができる経路) に限る。
+#: 空文字のパスはセクション全体。
+CAPABILITY_KEYS: dict[str, tuple[str, ...]] = {
+    "local_paths": ("",),
+    "runtime": ("fit_params_binary",),
+    "llama": ("extra_args", "speculative.draft_model_path"),
+    "theme": ("trusted",),
+    "rag": ("project_map.roots",),
+    "learning": ("cvector_seed_pairs_file",),
+    "agent": ("dangerous_command_block",),
+    "tools": ("fetch_url_allow_private_ip",),
+    "widget_proxy": ("apis",),
+    "create": ("staged.verify",),
+}
+#: 安全側と見なす真偽値 (この値への変更は許す)。
+_SAFE_BOOL_VALUES: dict[tuple[str, str], bool] = {
+    ("agent", "dangerous_command_block"): True,
+    ("tools", "fetch_url_allow_private_ip"): False,
+}
+#: 要素を減らす変更だけ許すリスト (信頼の取り消し・許可の縮小)。
+_SHRINK_ONLY_LISTS = frozenset({
+    ("theme", "trusted"), ("llama", "extra_args"), ("rag", "project_map.roots"), ("widget_proxy", "apis"),
+})
+_MISSING = object()
+
+
+def _dig(data: object, dotted: str) -> object:
+    if not dotted:
+        return data
+    node = data
+    for key in dotted.split("."):
+        if not isinstance(node, dict) or key not in node:
+            return _MISSING
+        node = node[key]
+    return node
+
+
+def _is_safe_change(section: str, path: str, old: object, new: object) -> bool:
+    if new == old:
+        return True
+    if (section, path) in _SAFE_BOOL_VALUES:
+        return new is _SAFE_BOOL_VALUES[(section, path)]
+    if (section, path) in _SHRINK_ONLY_LISTS and isinstance(new, list) and isinstance(old, list):
+        return all(item in old for item in new)
+    return False
+
+
+def _guard_capability_keys(section: str, data: dict) -> None:
+    """能力キーを危険側へ変える要求を 403 で拒否する (安全側への変更は通す)。"""
+    paths = CAPABILITY_KEYS.get(section)
+    if not paths:
+        return
+    current = get_config().get(section, {}) or {}
+    blocked: list[str] = []
+    for path in paths:
+        new = _dig(data, path)
+        if new is _MISSING:
+            continue
+        old = _dig(current, path)
+        if path == "" and isinstance(new, dict) and isinstance(old, dict):
+            changed = [k for k, v in new.items() if old.get(k, _MISSING) != v]
+            blocked.extend(f"{section}.{k}" for k in changed)
+            continue
+        if not _is_safe_change(section, path, None if old is _MISSING else old, new):
+            blocked.append(f"{section}.{path}" if path else section)
+    if blocked:
+        raise api_error(
+            403,
+            "E0403",
+            f"capability keys cannot be changed via the API: {', '.join(sorted(blocked))}. "
+            "Edit config.yaml directly.",
+            "api.config_capability_key_protected",
+            keys=", ".join(sorted(blocked)),
+        )
+
+
 # ── 固定パスのエンドポイント（{section} より先に定義） ──
 
 
@@ -162,6 +240,9 @@ async def update_config_section(
     # model_paths の model_state 追跡キーは migrate 専用 (config 直書きを遮断)
     if section == "model_paths":
         _guard_model_paths_immutable(req.data)
+
+    # 能力キー (コード実行・秘密・任意パスにつながる値) は API から危険側へ変えない
+    _guard_capability_keys(section, req.data)
 
     # api_key マスク値の場合は既存値を保持
     data = dict(req.data)

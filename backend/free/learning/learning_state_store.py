@@ -16,16 +16,58 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from backend.free.learning.level1_session import PriorityRequest
-from backend.io import atomic_write_text
+from backend.free.learning.level1_session import PriorityRequest, PriorityRequestRecord
+from backend.io.codec import codec_for, decode_skipping, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
+from backend.utils import epoch_to_utc, utc_to_epoch
 
 logger = get_logger("learning.learning_state_store")
+
+
+@persisted()
+@dataclass
+class LearningStateFile:
+    """``learning_state.json`` のペイロード (時刻は ISO 8601 UTC μs ``Z``、未実行は null)。"""
+
+    last_level1_run: str | None = None
+    last_level2_run: dict[str, str | None] = field(default_factory=dict)
+    level2_no_improve_streak: dict[str, int] = field(default_factory=dict)
+    level1_run_count: int = 0
+    last_level1_results: dict[str, Any] = field(default_factory=dict)
+    fitness_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    prev_correction_rate: float | None = None
+    prev_rag_usage_rate: float | None = None
+    priority_queue: list[PriorityRequestRecord] = field(default_factory=list)
+    prompt_adoptions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
+
+
+#: ``learning_state.json`` の形式。ペイロードは :class:`LearningStateFile`。
+LEARNING_STATE_FORMAT = register_format(FormatSpec(
+    format_id="learning.learning_state",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/learning_state.json",
+    retention="one per partition",
+    export=True,
+    records=(LearningStateFile,),
+))
+
+
+def _state_file(path: str | Path) -> VersionedPayloadFile:
+    """ペイロードを :class:`LearningState` で読み書きする (型の合わないファイルは退避)。"""
+    return VersionedPayloadFile(
+        LEARNING_STATE_FORMAT, path,
+        component="LearningStateStore", state_logger=logger,
+        decode=LearningStateStore.deserialize, encode=LearningStateStore.serialize,
+    )
 
 
 @dataclass
@@ -56,6 +98,8 @@ class LearningState:
     #: (``rollback_to`` / ``baseline`` / ``adopted_at`` / ``windows``)。
     #: 監視が完了 (合格 or rollback) したら mode ごと削除される。
     prompt_adoptions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 読んだファイルのトップの未知キー (書き戻しで元の位置へ戻す、c_05 §0.5.2)。
+    _extra: dict[str, Any] | None = None
 
 
 class LearningStateStore:
@@ -67,113 +111,44 @@ class LearningStateStore:
 
     @staticmethod
     def serialize(state: LearningState) -> dict[str, Any]:
-        """`LearningState` を JSON-serializable な dict に変換する純粋関数。
-
-        `priority_queue` 内の `PriorityRequest` は `to_dict()` で展開する。
-        """
-        return {
-            "last_level1_run": state.last_level1_run,
-            "last_level2_run": state.last_level2_run,
-            "level2_no_improve_streak": state.level2_no_improve_streak,
-            "level1_run_count": state.level1_run_count,
-            "last_level1_results": state.last_level1_results,
-            "fitness_history": state.fitness_history,
-            "prev_correction_rate": state.prev_correction_rate,
-            "prev_rag_usage_rate": state.prev_rag_usage_rate,
-            "priority_queue": [r.to_dict() for r in state.priority_queue],
-            "prompt_adoptions": state.prompt_adoptions,
-        }
-
-    @staticmethod
-    def _deserialize_last_level2_run(raw: Any) -> dict[str, float]:
-        """``last_level2_run`` を target 別 dict へ正規化する。
-
-        旧フォーマット (単一 float、base/aux 共有) との後方互換: float の
-        場合は base/aux 両方に同じ値を適用する (旧仕様では両ターゲットの
-        実行がこの単一値を共有更新していたため、片方だけ「未実行」扱いに
-        してしまうと移行直後に不要な overdue 発火を招く)。
-        """
-        if isinstance(raw, dict):
-            result: dict[str, float] = {}
-            for k, v in raw.items():
-                if not isinstance(k, str):
-                    continue
-                try:
-                    result[k] = float(v or 0.0)
-                except (TypeError, ValueError):
-                    logger.warning(
-                        "Skipping malformed last_level2_run entry: %r=%r", k, v,
-                    )
-            return result
-        if isinstance(raw, (int, float)) and raw:
-            return {"base": float(raw), "aux": float(raw)}
-        return {}
+        """`LearningState` を永続形 (:class:`LearningStateFile`) の dict にする純粋関数。"""
+        return codec_for(LearningStateFile).encode(LearningStateFile(
+            # epoch を永続化しない (c_05 §0.5.4)。0.0 (未実行) は null。
+            last_level1_run=epoch_to_utc(state.last_level1_run),
+            last_level2_run={k: epoch_to_utc(v) for k, v in state.last_level2_run.items()},
+            level2_no_improve_streak=state.level2_no_improve_streak,
+            level1_run_count=state.level1_run_count,
+            last_level1_results=state.last_level1_results,
+            fitness_history=state.fitness_history,
+            prev_correction_rate=state.prev_correction_rate,
+            prev_rag_usage_rate=state.prev_rag_usage_rate,
+            priority_queue=[r.to_record() for r in state.priority_queue],
+            prompt_adoptions=state.prompt_adoptions,
+            _extra=state._extra,
+        ))
 
     @staticmethod
-    def _deserialize_no_improve_streak(raw: Any) -> dict[str, int]:
-        """``level2_no_improve_streak`` を target 別 dict へ正規化する。
+    def deserialize(data: Any) -> LearningState:
+        """永続形の dict から `LearningState` を再構築する純粋関数。
 
-        欠損 (旧フォーマット) は空 dict = 全 target ストリーク 0 として扱う。
+        読めなければ :class:`CodecError`。読めない ``priority_queue`` の要素は
+        それだけ飛ばす (c_05 §0.5.2)。
         """
-        if not isinstance(raw, dict):
-            return {}
-        result: dict[str, int] = {}
-        for k, v in raw.items():
-            if not isinstance(k, str):
-                continue
-            try:
-                result[k] = max(0, int(v or 0))
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Skipping malformed level2_no_improve_streak entry: %r=%r", k, v,
-                )
-        return result
-
-    @staticmethod
-    def deserialize(data: dict[str, Any]) -> LearningState:
-        """raw JSON dict から `LearningState` を再構築する純粋関数。
-
-        欠損フィールドは既定値で埋め、後方互換 (古い JSON フォーマット) を
-        維持する。`priority_queue` の非 dict 要素はスキップする。
-        """
-        if not isinstance(data, dict):
-            return LearningState()
-
-        raw_queue = data.get("priority_queue", []) or []
-        priority_queue: list[PriorityRequest] = []
-        if isinstance(raw_queue, list):
-            for item in raw_queue:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    priority_queue.append(PriorityRequest.from_dict(item))
-                except (KeyError, ValueError, TypeError) as e:
-                    logger.warning(
-                        "Skipping malformed priority_queue entry: %r (%s)",
-                        item, e,
-                    )
-
+        record, skipped = decode_skipping(LearningStateFile, data, each=("priority_queue",))
+        if skipped:
+            logger.warning("Skipped %d malformed priority_queue entr(ies)", skipped)
         return LearningState(
-            last_level1_run=float(data.get("last_level1_run", 0.0) or 0.0),
-            last_level2_run=LearningStateStore._deserialize_last_level2_run(
-                data.get("last_level2_run"),
-            ),
-            level2_no_improve_streak=(
-                LearningStateStore._deserialize_no_improve_streak(
-                    data.get("level2_no_improve_streak"),
-                )
-            ),
-            level1_run_count=int(data.get("level1_run_count", 0) or 0),
-            last_level1_results=dict(data.get("last_level1_results", {}) or {}),
-            fitness_history=dict(data.get("fitness_history", {}) or {}),
-            prev_correction_rate=data.get("prev_correction_rate"),
-            prev_rag_usage_rate=data.get("prev_rag_usage_rate"),
-            priority_queue=priority_queue,
-            prompt_adoptions={
-                str(k): dict(v)
-                for k, v in (data.get("prompt_adoptions") or {}).items()
-                if isinstance(v, dict)
-            },
+            last_level1_run=utc_to_epoch(record.last_level1_run, 0.0),
+            last_level2_run={k: utc_to_epoch(v, 0.0) for k, v in record.last_level2_run.items()},
+            level2_no_improve_streak=record.level2_no_improve_streak,
+            level1_run_count=record.level1_run_count,
+            last_level1_results=record.last_level1_results,
+            fitness_history=record.fitness_history,
+            prev_correction_rate=record.prev_correction_rate,
+            prev_rag_usage_rate=record.prev_rag_usage_rate,
+            priority_queue=[PriorityRequest.from_record(r) for r in record.priority_queue],
+            prompt_adoptions=record.prompt_adoptions,
+            _extra=record._extra,
         )
 
     @staticmethod
@@ -182,33 +157,29 @@ class LearningStateStore:
 
         Level 1 (`_save_state`) と Level 2 (`record_level2_run`) がそれぞれ独立に
         同一ファイルへ書き戻すため、書込み途中のクラッシュや同時読み出しで壊れた
-        (truncate された) ファイルを見せないよう原子的に書き込む。
+        (truncate された) ファイルを見せないよう原子的に書き込む。ディスク上の
+        ファイルが G1 の封筒でない / 版が新しいなら上書きしない (WARNING)。
+        書き込みの失敗は従来どおり送出する。
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = LearningStateStore.serialize(state)
-        atomic_write_text(
-            path,
-            json.dumps(data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.info("Saved learning state to %s", path)
+        f = _state_file(path)
+        f.RAISE_ON_SAVE_ERROR = True
+        f.load()
+        f.payload = state
+        if f.save():
+            logger.info("Saved learning state to %s", path)
 
     @staticmethod
     def load(path: str | Path) -> LearningState | None:
-        """JSON ファイルから `LearningState` を読み込む。
+        """版付き封筒から `LearningState` を読み込む。
 
         ファイルが存在しない場合は `None` を返す (空 state とは区別する)。
-        パース失敗時も `None` を返し、警告ログを出力する。
+        読めない場合 (G1 の封筒でない / 版が新しい / 壊れている) も `None`。
         """
         path = Path(path)
-        if not path.exists():
+        f = _state_file(path)
+        if not f.load():
             return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning("Failed to load learning state from %s: %s", path, e)
-            return None
-        state = LearningStateStore.deserialize(data)
         logger.info("Loaded learning state from %s", path)
-        return state
+        return f.payload

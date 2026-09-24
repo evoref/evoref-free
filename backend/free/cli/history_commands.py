@@ -9,6 +9,7 @@ from datetime import datetime
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.renderer import (
     render_error,
     render_info,
@@ -121,6 +122,7 @@ def _history_search(
     try:
         resp = httpx.post(
             f"{backend_url}/api/history/search",
+            headers=backend_headers(),
             json=payload,
             timeout=_TIMEOUT,
         )
@@ -241,6 +243,7 @@ def _history_compact(backend_url: str, console) -> int:
     try:
         resp = httpx.post(
             f"{backend_url}/api/history/compact",
+            headers=backend_headers(),
             timeout=60.0,
         )
         resp.raise_for_status()
@@ -267,6 +270,7 @@ def _history_delete(backend_url: str, console, session_id: str) -> int:
     try:
         resp = httpx.delete(
             f"{backend_url}/api/history/{session_id}",
+            headers=backend_headers(),
             timeout=_TIMEOUT,
         )
         if resp.status_code == 404:
@@ -320,6 +324,7 @@ def _history_prune(backend_url: str, console, before: str) -> int:
         del_resp = httpx.request(
             "DELETE",
             f"{backend_url}/api/history",
+            headers=backend_headers(),
             json={"session_ids": session_ids},
             timeout=_TIMEOUT,
         )

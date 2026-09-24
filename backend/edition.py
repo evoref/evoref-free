@@ -11,11 +11,8 @@
 
 from __future__ import annotations
 
-import json
 from enum import IntEnum
-from pathlib import Path
 
-from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 
 logger = get_logger("edition")
@@ -213,64 +210,3 @@ def develop_available() -> bool:
         return importlib.util.find_spec("backend.develop") is not None
     except (ModuleNotFoundError, ValueError):
         return False
-
-
-# ── ダウングレード検出 ──
-
-_EDITION_STATE_FILE = "edition_state.json"
-
-
-def check_downgrade(local_dir: Path) -> None:
-    """前回のエディションと比較し、ダウングレードを検出して警告を表示する
-
-    Args:
-        local_dir: ローカルデータディレクトリ (local/)
-    """
-    from backend.i18n_helper import msg
-
-    state_file = local_dir / _EDITION_STATE_FILE
-    cur = current_edition()
-
-    prev_name: str | None = None
-    if state_file.exists():
-        try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            prev_name = data.get("edition")
-        except Exception:
-            pass
-
-    # 前回エディションを保存（次回起動時の比較用）
-    try:
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(
-            state_file,
-            json.dumps({"edition": cur.name}, ensure_ascii=False, indent=2),
-        )
-    except Exception as e:
-        logger.debug("Failed to save edition state: %s", e)
-
-    if prev_name is None:
-        # 初回起動 — 比較対象なし
-        return
-
-    try:
-        prev = Edition[prev_name]
-    except KeyError:
-        logger.debug("Unknown previous edition: %s", prev_name)
-        return
-
-    if cur >= prev:
-        # アップグレードまたは同一 — 警告不要
-        return
-
-    # ダウングレード検出
-    logger.warning(
-        "Edition downgrade detected: %s -> %s",
-        prev.name, cur.name,
-    )
-    logger.warning(msg("warning.edition.downgrade", old=prev.name, new=cur.name))
-
-    # Pro 以上 → Free へのダウングレード: LoRA 警告
-    if prev >= Edition.PRO and cur < Edition.PRO:
-        logger.warning(msg("warning.edition.lora_unavailable"))
-

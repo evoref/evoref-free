@@ -88,24 +88,17 @@ class LearningConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")  # Pro 拡張フィールドを許可
 
-    # base モデルの自己学習データを (base モデル識別子 × モード) でパーティション化する。
-    # True: experience / base prompts / base LoRA・cvector / learning_state を
-    #   ``local/learning/<base_model_stem>/`` 配下へ分離し、モデル切替でそのモデルの
-    #   保存済みセットへ差し替える (未知モデルは空=ゼロから学習)。
-    # False: レガシー flat レイアウト (resolve_learning が resolve_local へ素通し)。
-    #   既存環境の即時ロールバック用キルスイッチ。
-    partition_by_base_model: bool = True
-    # Level 2 base LoRA アダプタ (Pro) のパーティション粒度。
-    # 対象は LoRA のみ (control vector / cvector は本設定の対象外、常にモデル単位で
-    # 不変 — ランタイム hot-swap 不可 + GGUF 再ロードが高コストなため)。
-    # "model_mode" (既定): LoRA を (model×mode) で分け、chat/create で別々に
-    #   訓練・保存し、モード切替時に LoRA パスが変わっていれば該当サーバを
-    #   再起動して切り替える。同一モデルを両モードで使う構成でも
-    #   chat 用 / create 用のアダプタは混ざらない。
-    #   partition_by_base_model=true を前提とする (model_validator で強制)。
-    # "model": LoRA はモデル単位 (両モードの経験を 1 アダプタにプール)。
-    #   chat↔create 切替で base サーバを LoRA 差分では再起動しないため
-    #   切替レイテンシを最優先したい場合のレガシー互換値。
+    # base モデルの自己学習データは常に ``store/learning/<model_key>/`` で
+    # パーティション化する (c_05 §0.5.12)。flat に戻すキー
+    # (``partition_by_base_model``) は G1 で撤去した (:meth:`_reject_flat_layout`)。
+    # Level 2 アダプタ (Pro の LoRA / control vector、store/pro/learning/) の
+    # パーティション粒度。
+    # "model_mode" (既定): (model×mode) で分け、chat/create で別々に訓練・保存し、
+    #   モード切替時に当てるアダプタが変われば該当サーバを再起動して切り替える。
+    #   同一モデルを両モードで使う構成でも chat 用 / create 用は混ざらない。
+    # "model": モデル単位 (両モードの経験を 1 アダプタにプール、置き場は
+    #   ``<model_key>/chat/``)。chat↔create 切替でアダプタ差分による再起動を
+    #   しないため、切替レイテンシを最優先したい場合のレガシー互換値。
     level2_adapter_partition: Literal["model", "model_mode"] = "model_mode"
 
     #: Level 1 の起動に要る経験数。前回実行以降の **新規** 件数にも同じ値が
@@ -261,18 +254,21 @@ class LearningConfig(BaseModel):
     # ポリシー / 進化結果書き戻し設定
     policy: LearningPolicyConfig = Field(default_factory=LearningPolicyConfig)
 
-    @model_validator(mode="after")
-    def _require_partition_for_adapter_mode_split(self) -> "LearningConfig":
-        """``level2_adapter_partition="model_mode"`` は base 学習パーティション必須
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_flat_layout(cls, data: object) -> object:
+        """撤去した ``partition_by_base_model`` を扱う (``extra="allow"`` を素通りさせない)。
 
-        chat/create 別アダプタは ``local/learning/<base_model_stem>/<mode>/...``
-        という base パーティション配下のサブディレクトリとして実装されるため、
-        ``partition_by_base_model=false`` (flat レイアウト) との組合せは意味を
-        持たない。単純化のため起動時に明示的に拒否する。
+        ``true`` は現行の挙動そのものなので黙って落とす。``false`` (flat
+        レイアウト) はもう無いので起動時に拒否する — 設定したのに効かない
+        状態を作らない。
         """
-        if self.level2_adapter_partition == "model_mode" and not self.partition_by_base_model:
-            raise ValueError(
-                "learning.level2_adapter_partition='model_mode' requires "
-                "learning.partition_by_base_model=true",
-            )
-        return self
+        if isinstance(data, dict) and "partition_by_base_model" in data:
+            data = dict(data)
+            if not data.pop("partition_by_base_model"):
+                raise ValueError(
+                    "learning.partition_by_base_model was removed: learning data is "
+                    "always partitioned by model_key (docs/c_05 §0.5.12). "
+                    "Remove the key from config.yaml.",
+                )
+        return data

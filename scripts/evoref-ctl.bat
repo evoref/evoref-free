@@ -16,7 +16,7 @@ rem EVOREF_DEVELOP_LEVEL (backend/factory/_bootstrap.py reads it). The backend i
 rem spawned as `uvicorn backend.main:app`, bypassing the CLI, so a `--develop`
 rem flag cannot reach it -- the environment variable is the only channel.
 rem Without this, `evoref-ctl start` always ran at the normal level and the
-rem debug JSONL under local/logs/debug stayed empty, which cost time in two live
+rem debug JSONL under the data root logs/debug stayed empty, which cost time in two live
 rem audits (2026-08-23 and 2026-08-27) before the cause was spotted.
 set "EVOREF_DEVELOP_LEVEL="
 set "EVOREF_LEARNING_DISABLED="
@@ -63,7 +63,7 @@ call :start_core
 if errorlevel 1 exit /b 1
 
 echo [start] Starting SvelteKit dev server on :5173...
-start "evoref-frontend" /min cmd /c "cd frontend && npm run dev -- --host 0.0.0.0"
+start "evoref-frontend" /min cmd /c "cd frontend && npm run dev -- --host 127.0.0.1"
 
 echo.
 echo === evoref is running ===
@@ -77,9 +77,9 @@ echo or run: %~nx0 stop
 goto :eof
 
 rem --- Start core services only (llama + backend; frontend is left running) ---
-rem Called from `:start`, and invoked directly as the `start-core` command when
-rem reset_local_data.py restarts services. Restarts llama and backend while
-rem keeping frontend(vite:5173) alive. Window titles are kept so `stop` still works.
+rem Called from `:start`, and invoked directly as the `start-core` command.
+rem Restarts llama and backend while keeping frontend(vite:5173) alive.
+rem Window titles are kept so `stop` still works.
 :start_core
 call :check_dep python "python.org or winget install Python.Python.3"
 if errorlevel 1 exit /b 1
@@ -88,6 +88,10 @@ rem Activate the virtual environment
 if exist ".venv\Scripts\activate.bat" (
     call .venv\Scripts\activate.bat
 )
+
+rem EVOREF_DATA_ROOT, when set, is inherited by every child started below
+rem (llama-server launcher and uvicorn); unset means the install root's userdata.
+if defined EVOREF_DATA_ROOT echo [start] data root: !EVOREF_DATA_ROOT! ^(EVOREF_DATA_ROOT^)
 
 rem Reference the venv python/uvicorn directly (activate is not inherited by start cmd /c)
 if exist ".venv\Scripts\python.exe" (
@@ -98,6 +102,14 @@ if exist ".venv\Scripts\python.exe" (
     set "VENV_UVICORN=uvicorn"
 )
 
+rem An old config.yaml without config_version is rewritten once before start
+rem (backup config.yaml.g0-<stamp>). Refused while another evoref holds the lock.
+"%VENV_PYTHON%" -m backend.free.cli.main config normalize --if-needed
+if errorlevel 1 (
+    echo ERROR: config.yaml could not be normalized; see the message above.
+    exit /b 1
+)
+
 rem If a stale llama-server still holds the port, the new process fails to bind
 rem and dies at once, yet the old process keeps answering /health so we wrongly
 rem judge it ready (this is why a model switch could appear to have no effect).
@@ -106,14 +118,16 @@ echo [start] Ensuring no stale llama-server.exe is running...
 taskkill /im "llama-server.exe" /f >nul 2>&1
 
 echo [start] Starting llama-server (base + embedding)...
-start "llama-server" /min cmd /c ""%VENV_PYTHON%" scripts\launch_llama.py config.yaml --all"
+rem The launcher adds the trained adapters (--lora / --control-vector, Pro only)
+rem and runs scripts\launch_llama.py, which never resolves adapters itself.
+start "llama-server" /min cmd /c ""%VENV_PYTHON%" -m backend.free.cli.llama_launcher config.yaml --all"
 
 rem wait targets come from launch_llama.py --print-health-ports
 echo [start] Waiting for llama-server to be ready (up to 60s)...
 powershell -NoProfile -Command "$pairs=& '%VENV_PYTHON%' scripts\launch_llama.py config.yaml --print-health-ports; foreach ($p in $pairs) { if ($p -notmatch '^(\w+)=(\d+)$') { continue }; $name=$Matches[1]; $port=$Matches[2]; $elapsed=0; do { Start-Sleep 2; $elapsed+=2; try { $r=(Invoke-WebRequest \"http://localhost:$port/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 } } while ($r -ne 200 -and $elapsed -lt 60); if ($r -ne 200) { Write-Host \"[start] WARNING: $name (port $port) health check timed out, proceeding anyway\" } }"
 
 echo [start] Starting FastAPI backend on :8000...
-start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 0.0.0.0 --port 8000"
+start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 127.0.0.1 --port 8000"
 goto :eof
 
 rem --- Stop services ---
@@ -189,7 +203,7 @@ echo.
 echo Options (start / start-core / restart):
 echo   debug^|investigate^|evolve   Develop level; sets EVOREF_DEVELOP_LEVEL for the backend.
 echo                              Without it the backend runs at the normal level and
-echo                              local/logs/debug stays empty.
+echo                              the data root's logs\debug stays empty.
 echo   --no-learning              Disable the self-learning cycle (EVOREF_LEARNING_DISABLED=1).
 echo.
 echo Examples:

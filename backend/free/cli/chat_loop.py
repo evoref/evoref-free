@@ -11,6 +11,7 @@ from pathlib import Path
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.command_parser import (
     SessionState,
     handle_async_command,
@@ -20,7 +21,6 @@ from backend.free.cli.command_parser import (
 )
 from backend.free.cli.session_persistence import (
     finalize_session,
-    save_checkpoint,
 )
 from backend.free.cli.renderer import (
     StepSpinner,
@@ -269,7 +269,7 @@ async def _send_chat_cancel_request(
     接続エラー / タイムアウトは無視する (best-effort)。
     """
     try:
-        async with httpx.AsyncClient() as cancel_client:
+        async with httpx.AsyncClient(headers=backend_headers()) as cancel_client:
             await cancel_client.post(
                 f"{backend_url}/api/chat/cancel",
                 json={"session_id": session_id},
@@ -344,7 +344,7 @@ async def chat_stream(
     stream_state = _ChatStreamState()
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             async with client.stream(
                 "POST",
                 f"{state.backend_url}/api/chat",
@@ -493,14 +493,6 @@ async def _process_post_response(
         await _execute_shell_outs(shell_out_requests, console)
 
 
-def _save_checkpoint_if_needed(state: SessionState) -> None:
-    """定期チェックポイント保存（設計書 23.3.3）"""
-    if (state.checkpoint_interval > 0
-            and len(state.turns) > 0
-            and len(state.turns) % state.checkpoint_interval == 0):
-        save_checkpoint(state)
-
-
 def resolve_layout_mode(cfg: dict, project_root: Path) -> str:
     """config `theme.cli_layout_mode` を実際のレイアウトへ解決する。
 
@@ -616,7 +608,6 @@ async def _main_loop_sequential(state: SessionState, console) -> None:
             elapsed, state.context_files, ttft_sec=ttft,
         )
         await _process_post_response(response, shell_out_requests, state, console)
-        _save_checkpoint_if_needed(state)
 
 
 def _write_user_panel(layout: SplitLayout, text: str) -> None:
@@ -775,7 +766,6 @@ async def _handle_split_chat_input(
         layout, original_console, response, shell_out_requests,
         state, split_console,
     )
-    _save_checkpoint_if_needed(state)
 
 
 async def _main_loop_split(state: SessionState, console) -> None:

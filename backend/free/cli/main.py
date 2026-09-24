@@ -13,11 +13,11 @@ from pathlib import Path
 
 import httpx
 
+from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.chat_loop import chat_stream, _main_loop
 from backend.free.cli.command_parser import SessionState
-from backend.free.cli.develop_mode_setup import setup_develop_mode
+from backend.free.cli.develop_mode_setup import add_data_root_flag, setup_develop_mode
 from backend.free.cli.edition_validator import validate_edition_arg
-from backend.free.cli.session_persistence import recover_checkpoints
 from backend.free.cli.config_loader import (
     _find_project_root,
     _load_cli_config,
@@ -50,6 +50,7 @@ from backend.free.cli.startup_checks import (
     CheckStatus,
     run_interactive_checks,
 )
+from backend.config import resolve_data_path
 from backend.error_handlers import E6001
 from backend.i18n_helper import init_i18n, msg
 from backend.log_config import get_logger, setup_cli_logging
@@ -58,7 +59,10 @@ logger = get_logger("cli.main")
 
 # サブコマンドとして認識する名前
 # - "create": 対話モード (Pro はクリエイト、Free は警告 + chat フォールバック)
-_SUBCOMMANDS = {"serve", "chat", "create", "gui", "export", "import", "reindex", "projectmap"}
+_SUBCOMMANDS = {
+    "serve", "chat", "create", "gui", "export", "import", "reindex", "projectmap", "theme",
+    "config", "reset", "doctor",
+}
 
 #: 旧サブコマンド名 → 現行名。``code`` はクリエイトモードへの改名に追随して
 #: ``create`` になった。既存のスクリプトや手癖を壊さないよう受理し続け、
@@ -134,6 +138,7 @@ def _build_gui_arg_parser() -> argparse.ArgumentParser:
         help="Disable self-learning when auto-serving the backend "
              "(propagates EVOREF_LEARNING_DISABLED=1).",
     )
+    add_data_root_flag(parser)
     _add_develop_flag(parser)
     return parser
 
@@ -304,7 +309,7 @@ async def _auto_start_frontend(
     frontend_url = f"http://{host}:{port}"
     logger.debug("Checking frontend at %s", frontend_url)
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             resp = await client.get(frontend_url, timeout=3.0)
             if resp.status_code < 500:
                 logger.debug("Frontend already running at %s (status=%d)", frontend_url, resp.status_code)
@@ -329,7 +334,7 @@ async def _auto_start_frontend(
         logger.debug("Frontend edition override: VITE_EVOREF_EDITION=%s", edition)
     logger.debug("Starting frontend: %s (cwd=%s)", cmd, frontend_dir)
     try:
-        log_dir = project_root / "local" / "logs"
+        log_dir = resolve_data_path("logs_dir", project_root)
         log_dir.mkdir(parents=True, exist_ok=True)
         stderr_f = open(log_dir / "frontend.stderr.log", "w", encoding="utf-8")
         proc = subprocess.Popen(
@@ -349,7 +354,7 @@ async def _auto_start_frontend(
     for i in range(30):
         await asyncio.sleep(1)
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(headers=backend_headers()) as client:
                 resp = await client.get(frontend_url, timeout=3.0)
                 if resp.status_code < 500:
                     logger.debug("Frontend ready after %ds (pid=%d)", i + 1, proc.pid)
@@ -420,6 +425,18 @@ def _get_subcommand_handler(name: str):
     if name == "projectmap":
         from backend.free.cli.projectmap_command import run_projectmap
         return run_projectmap
+    if name == "theme":
+        from backend.free.cli.theme_trust_command import run_theme
+        return run_theme
+    if name == "config":
+        from backend.free.cli.config_command import run_config
+        return run_config
+    if name == "reset":
+        from backend.free.cli.reset_command import run_reset
+        return run_reset
+    if name == "doctor":
+        from backend.free.cli.doctor_command import run_doctor_command
+        return run_doctor_command
     return None
 
 
@@ -501,6 +518,7 @@ def _build_interactive_parser() -> argparse.ArgumentParser:
         help="Disable self-learning when auto-serving the backend "
              "(propagates EVOREF_LEARNING_DISABLED=1).",
     )
+    add_data_root_flag(parser)
     _add_develop_flag(parser)
     return parser
 
@@ -540,14 +558,13 @@ def _build_session_state(
     init_cartridge_timeouts(cli_cfg)
 
     history_cfg = _load_history_config(project_root)
-    history_dir = project_root / "local" / "history"
+    history_dir = resolve_data_path("history_dir", project_root)
     return SessionState(
         backend_url=f"http://{args.host}:{args.port}",
         context_files=list(args.file),
-        sessions_dir=project_root / "local" / "sessions",
+        sessions_dir=resolve_data_path("cli_sessions_dir", project_root),
         history_dir=history_dir,
         auto_save_enabled=history_cfg.get("auto_save", True),
-        checkpoint_interval=history_cfg.get("checkpoint_interval", 10),
         mode=getattr(args, "_resolved_mode", None) or _resolve_default_mode_value(),
     )
 
@@ -556,15 +573,6 @@ def _resolve_default_mode_value() -> str:
     """SessionState 構築時のフォールバック: argparse 検証前のテスト等で使用。"""
     from backend.free.cli.cli_mode import default_cli_mode
     return default_cli_mode()
-
-
-def _try_recover_checkpoints(state: SessionState, console) -> None:
-    """起動時チェックポイント復旧（設計書 23.3.3）"""
-    if not (state.auto_save_enabled and state.history_dir.exists()):
-        return
-    recovered = recover_checkpoints(state.history_dir)
-    if recovered > 0:
-        render_info(console, msg("cli.checkpoint_recovered", count=recovered))
 
 
 def _setup_develop_mode_async(
@@ -675,7 +683,7 @@ async def _fetch_status_data(
     if status_data is not None:
         return status_data
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=backend_headers()) as client:
             resp = await client.get(f"{state.backend_url}/api/status", timeout=5.0)
             if resp.status_code == 200:
                 return resp.json()
@@ -804,8 +812,6 @@ async def async_main(args: argparse.Namespace) -> int:
     _resolve_cli_mode(args)
 
     state = _build_session_state(project_root, args)
-    _try_recover_checkpoints(state, console)
-
     _apply_develop_port_offset(args, state, project_root)
 
     if (rc := _run_interactive_startup_checks(project_root, console)) is not None:

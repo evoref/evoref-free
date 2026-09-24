@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from backend.config import PathResolver
 from backend.error_handlers import E1001
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
@@ -61,7 +62,7 @@ def run_serve_checks(
     # 1. config.yaml は呼び出し元で既に読込み済み（ここでは構文検証済みとして扱う）
     # → 呼び出し元の validate_config() で CRITICAL チェック済み
 
-    # 2. [WARNING] local_paths ディレクトリの存在確認 → 自動作成
+    # 2. [WARNING] データ根のディレクトリの存在確認 → 自動作成
     results.extend(_check_local_paths(project_root, config))
 
     # 3. [WARNING] model_paths の存在確認 → 警告のみ
@@ -71,8 +72,10 @@ def run_serve_checks(
     if not skip_llama_check:
         results.append(_check_llama_connection(config))
 
-    # 5. [WARNING] LoRA アダプタの存在確認
-    results.append(_check_lora_adapter(project_root, config))
+    # 5. [WARNING] LoRA アダプタの存在確認 (Pro のみ)
+    lora_result = _check_lora_adapter(project_root, config)
+    if lora_result is not None:
+        results.append(lora_result)
 
     # 6. [INFO] ベクトルインデックスの存在確認
     results.append(_check_vector_index(project_root, config))
@@ -165,21 +168,16 @@ def _resolve_path(project_root: Path, path_str: str) -> Path:
 
 
 def _check_local_paths(project_root: Path, config: dict) -> list[CheckResult]:
-    """local_paths の各ディレクトリ存在確認 → 自動作成"""
+    """データ根 (``PathResolver.LAYOUT``) の各ディレクトリ存在確認 → 自動作成"""
     results: list[CheckResult] = []
-    local_paths = config.get("local_paths", {})
+    resolver = PathResolver(config, project_root)
 
-    for key, path_str in local_paths.items():
-        path = _resolve_path(project_root, path_str)
-
-        # ファイルパスの場合はディレクトリ部分を確認
-        if key.endswith("_file"):
-            target_dir = path.parent
-        elif key.endswith("_dir"):
-            target_dir = path
-        else:
-            # adapter 等: ファイルの親ディレクトリ
-            target_dir = path.parent
+    for key, rel in resolver.LAYOUT.items():
+        if key in resolver.PRO_LAYOUT_KEYS:
+            continue
+        path = resolver.resolve_local(key)
+        # 末尾 ``/`` はディレクトリ、それ以外はファイルの親ディレクトリを確認
+        target_dir = path if rel.endswith("/") else path.parent
 
         if not target_dir.exists():
             try:
@@ -271,14 +269,16 @@ def _check_llama_connection(config: dict) -> CheckResult:
     )
 
 
-def _check_lora_adapter(project_root: Path, config: dict) -> CheckResult:
-    """LoRA アダプタの存在確認"""
-    local_paths = config.get("local_paths", {})
-    lora_path_str = local_paths.get("lora_adapter", "local/models/adapter.gguf")
-    lora_path = _resolve_path(project_root, lora_path_str)
+def _check_lora_adapter(project_root: Path, config: dict) -> CheckResult | None:
+    """起動時に当てる LoRA があるか (Pro のみ。Free はアダプタを持たないので ``None``)。"""
+    from backend.edition import get_pro_handler
+    from backend.free.core.launch_adapters import HANDLER_NAME, adapters_for_launch
 
-    if not lora_path.exists():
-        logger.info("LoRA adapter not found: %s (starting without LoRA)", lora_path)
+    adapters = adapters_for_launch(config, project_root, "chat")
+    if get_pro_handler(HANDLER_NAME) is None:  # 取得口の登録は上の呼出しで済む
+        return None
+    if adapters.lora is None:
+        logger.info("No usable LoRA adapter (starting without LoRA)")
         return CheckResult(
             level=CheckLevel.WARNING,
             status=CheckStatus.WARN,
@@ -286,7 +286,7 @@ def _check_lora_adapter(project_root: Path, config: dict) -> CheckResult:
             message=msg("cli.startup_lora_missing"),
         )
 
-    logger.debug("LoRA adapter found: %s", lora_path)
+    logger.debug("LoRA adapter found: %s", adapters.lora)
     return CheckResult(
         level=CheckLevel.WARNING,
         status=CheckStatus.OK,
@@ -304,8 +304,7 @@ def _episodic_index_file(project_root: Path, config: dict) -> Path | None:
     ``index_q8.npy`` を再帰で探して最初に見つかったものを見る (存在確認と
     次元照合が目的で、どのモデル・どの版かはここでは問わない)。
     """
-    local_paths = config.get("local_paths", {})
-    memory_dir = _resolve_path(project_root, local_paths.get("memory_dir", "local/memory/"))
+    memory_dir = PathResolver(config, project_root).resolve_local("memory_dir")
     embeddings_dir = memory_dir / "episodic" / "embeddings"
     if not embeddings_dir.is_dir():
         return None
@@ -345,29 +344,27 @@ def _check_vector_dim_consistency(
 ) -> CheckResult | None:
     """ベクトルインデックスと設定の埋め込み次元の整合性チェック
 
-    metadata.json の `_store_info.embedding_dim`（なければ index_q8.npy の
+    埋め込み版の刻印 ``stamp.json`` の ``dim``（なければ index_q8.npy の
     shape[1]）を読み、`embedding.dim` と比較する。
     インデックスが空のときは None を返してチェック自体を省略する。
     """
     index_file = _episodic_index_file(project_root, config)
     if index_file is None or not index_file.exists():
         return None
-    metadata_file = index_file.parent / "metadata.json"
+    stamp_file = index_file.parent / "stamp.json"
 
     embedding_cfg = config.get("embedding", {})
     config_dim = int(embedding_cfg.get("dim", 1024))
 
     stored_dim: int | None = None
-    if metadata_file.exists():
+    if stamp_file.exists():
         try:
             import json
-            with open(metadata_file, encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, list) and raw and isinstance(raw[0], dict) \
-                    and raw[0].get("_store_info") is True:
-                stored_dim = int(raw[0].get("embedding_dim", 0)) or None
+            raw = json.loads(stamp_file.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                stored_dim = int(raw.get("dim", 0) or 0) or None
         except Exception as e:
-            logger.warning("Failed to parse metadata.json for dim check: %s", e)
+            logger.warning("Failed to parse stamp.json for dim check: %s", e)
 
     if stored_dim is None:
         try:
@@ -406,9 +403,7 @@ def _check_vector_dim_consistency(
 
 def _check_memory_files(project_root: Path, config: dict) -> CheckResult:
     """メモリファイルの存在確認"""
-    local_paths = config.get("local_paths", {})
-    memory_dir_str = local_paths.get("memory_dir", "local/memory/")
-    memory_dir = _resolve_path(project_root, memory_dir_str)
+    memory_dir = PathResolver(config, project_root).resolve_local("memory_dir")
 
     if not memory_dir.exists() or not any(memory_dir.iterdir()):
         logger.info("Memory files not found in %s (will be created on first use)", memory_dir)
@@ -435,9 +430,7 @@ def _check_model_state_consistency(
 
     不一致が検出された場合は、/migrate-model の利用を CLI で明示的に通知する。
     """
-    local_paths = config.get("local_paths", {})
-    state_file_str = local_paths.get("model_state_file", "local/model_state.json")
-    state_path = _resolve_path(project_root, state_file_str)
+    state_path = PathResolver(config, project_root).resolve_local("model_state_file")
 
     if not state_path.exists():
         return CheckResult(

@@ -6,38 +6,79 @@ SystemPromptManager の補助タスク版。全エディション共通。
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from backend.free.agent._prompt_store_helpers import (
     archive_to_history,
     body_exists,
     list_history_entries,
+    meta_file_path,
     read_body,
     read_history_version,
-    read_meta_dict,
+    read_meta,
     write_body,
-    write_meta_dict,
+    write_meta,
 )
 from backend.free.agent.prompt_utils import (
     dedupe_paragraphs,
     restore_protected_sections,
     validate_protected_sections,
 )
+from backend.io.codec import persisted
+from backend.io.format_registry import FormatSpec, register_format
 from backend.log_config import get_logger
 from backend.utils import utc_now as _now
 
 logger = get_logger("agent.aux_prompt_manager")
 
 
+@persisted()
 @dataclass
 class AuxPromptMeta:
-    """補助タスクプロンプトメタ情報"""
+    """補助タスクプロンプトメタ情報 (``aux_{task}.meta.json`` のペイロード。未知キーは ``_extra``)"""
     task: str
     version: int = 1
     updated_at: str = ""
     source: str = "default"  # "default" | "manual" | "evolution"
     fitness_score: float = 0.0
+    _extra: dict[str, Any] | None = None
+
+
+#: ``aux_{task}.meta.json`` (``AuxPromptMeta``) の形式。本文 ``.md`` と ``history/`` は封筒を持たない。
+AUX_PROMPT_META_FORMAT = register_format(FormatSpec(
+    format_id="learning.aux_prompts",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/aux_prompts/aux_<task>.meta.json",
+    retention="one per task (history/ keeps every body version)",
+    export=True,
+    records=(AuxPromptMeta,),
+))
+#: 本文 ``aux_<task>.md`` (封筒を持たない)。
+AUX_PROMPT_BODY_FORMAT = register_format(FormatSpec(
+    format_id="learning.aux_prompt_body",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/aux_prompts/aux_<task>.md",
+    retention="one per task",
+    export=True,
+    encodings=("md",),
+))
+#: 本文の過去版 (``history/aux_<task>_v<NNN>.md``)。
+AUX_PROMPT_HISTORY_FORMAT = register_format(FormatSpec(
+    format_id="learning.aux_prompt_history",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/aux_prompts/history/aux_<task>_v<n>.md",
+    retention="unbounded (text only)",
+    export=True,
+    encodings=("md",),
+))
 
 
 # デフォルトプロンプト
@@ -87,9 +128,14 @@ class AuxPromptManager:
             key = f"aux_{task}"
             if body_exists(self.prompt_dir, key):
                 self.contents[task] = read_body(self.prompt_dir, key)
-                meta_data = read_meta_dict(self.prompt_dir, key)
-                if meta_data is not None:
-                    self.metas[task] = self._meta_from_dict(meta_data, task)
+                meta = read_meta(self.prompt_dir, key, AuxPromptMeta, spec=AUX_PROMPT_META_FORMAT)
+                # 読めないまま残ったメタ (G1 の封筒でない / 版が新しい) は source が
+                # 分からないので、本文を既定値と見なして書き直さない。
+                meta_unreadable = (
+                    meta is None and meta_file_path(self.prompt_dir, key).exists()
+                )
+                if meta is not None:
+                    self.metas[task] = meta
                 else:
                     self.metas[task] = AuxPromptMeta(task=task)
                     self._save_meta(task)
@@ -97,7 +143,8 @@ class AuxPromptManager:
                 # 更新された場合、ディスクの旧デフォルトを現行デフォルトに書き直し、
                 # デフォルト更新を既存インストールへ伝播させる。手動編集 (manual) /
                 # 進化 (evolution) で更新されたプロンプトは保護する。
-                self._refresh_default_if_stale(task)
+                if not meta_unreadable:
+                    self._refresh_default_if_stale(task)
             else:
                 self._create_default(task)
 
@@ -272,15 +319,4 @@ class AuxPromptManager:
 
     def _save_meta(self, task: str) -> None:
         """メタ情報を JSON ファイルに保存 (infra 層 `_prompt_store_helpers` に委譲)"""
-        write_meta_dict(self.prompt_dir, f"aux_{task}", asdict(self.metas[task]))
-
-    @staticmethod
-    def _meta_from_dict(data: dict, task: str) -> AuxPromptMeta:
-        """`read_meta_dict` の結果を `AuxPromptMeta` にハイドレートする (純粋関数)"""
-        return AuxPromptMeta(
-            task=data.get("task", task),
-            version=data.get("version", 1),
-            updated_at=data.get("updated_at", ""),
-            source=data.get("source", "default"),
-            fitness_score=data.get("fitness_score", 0.0),
-        )
+        write_meta(self.prompt_dir, f"aux_{task}", self.metas[task], spec=AUX_PROMPT_META_FORMAT)

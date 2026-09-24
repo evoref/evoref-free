@@ -71,6 +71,37 @@ export interface LivenessAlert {
 	detail: string;
 }
 
+/**
+ * データ根の状態 (docs/c_05 §0.9)。readonly の間は記憶・学習・履歴・設定を保存しない。
+ * reason / warnings は英語 (ログと同じ文)。g0_found は local/ に旧形式のデータが残っていること。
+ * reembed_pending は埋め込みモデルが変わって再埋め込みの確認待ちのストア (確認までは記憶の検索が限られる)。
+ * served_model_mismatch は llama-server が実際に載せているモデルが config と違うこと (docs/c_05 §0.5.7)。
+ * degraded はこの起動中にチャット経路の保存に失敗した形式 (format_id)。
+ * formats は読み手が開いたときに current でなかった形式だけ (健全なら空。全件の照合は evoref doctor)。
+ */
+export interface DataHealthInfo {
+	data_root: string;
+	readonly: boolean;
+	reason: string | null;
+	warnings: string[];
+	g0_found: boolean;
+	reembed_pending: string[];
+	served_model_mismatch: boolean;
+	served_model: string;
+	expected_model: string;
+	degraded: string[];
+	/** 前回と違うエディションで起動した (from → to)。切替が無ければ null */
+	edition_switched_from: string | null;
+	edition_switched_to: string | null;
+	formats: Record<string, FormatHealthInfo>;
+}
+
+/** 読み手が current として読めなかった形式 1 つ。state は newer / foreign / unmigratable / corrupt / readonly、reason は英語 */
+export interface FormatHealthInfo {
+	state: string;
+	reason: string;
+}
+
 export interface StatusResponse {
 	status: string;
 	edition: string;
@@ -78,7 +109,7 @@ export interface StatusResponse {
 	version: string;
 	free_version?: string;
 	pro_version?: string | null;
-	schema_version?: number;
+	data_generation?: number;
 	uptime_seconds: number;
 	llama_server: LlamaServerInfo;
 	model?: ModelInfo;
@@ -89,6 +120,8 @@ export interface StatusResponse {
 	capabilities?: CapabilityInfo[];
 	/** 効果の死活監視の警告。空なら異常なし */
 	liveness?: LivenessAlert[];
+	/** データ根の状態 (readonly なら入力欄に常時表示) */
+	data_health?: DataHealthInfo;
 }
 
 /** ステータス取得 */

@@ -34,6 +34,8 @@ class ModelMetadata:
     bos_token: str = ""
     eos_token: str = ""
     model_id: str = ""
+    #: ``/props`` の ``model_path`` (llama-server が実際に載せている GGUF、c_05 §0.5.7)。
+    model_path: str = ""
     template_family: TemplateFamily = "unknown"
     #: llama-server が実際にロードしているコンテキスト長とスロット数。
     #: config の宣言値と食い違いうる (config を書き替えても llama-server を
@@ -178,6 +180,7 @@ async def fetch_model_metadata(
         bos_token=props.get("bos_token", ""),
         eos_token=props.get("eos_token", ""),
         model_id=model_id,
+        model_path=str(props.get("model_path") or ""),
         template_family=family,
         n_ctx=int(n_ctx) if isinstance(n_ctx, (int, float)) else 0,
         total_slots=int(props.get("total_slots") or 0),

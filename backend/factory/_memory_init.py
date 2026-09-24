@@ -2,10 +2,9 @@
 
 含まれる関数:
 
-- :func:`_init_memory` : ``WorkingMemoryRegistry`` / ``EpisodicStore`` の
-  初期化と SchemaMigrator 連鎖。
-  EvorefMem スキーマバージョン検査 → in-place migration → destructive init
-  fallback の判定を行う。
+- :func:`_init_memory` : ``WorkingMemoryRegistry`` / ``EpisodicStore`` /
+  ``SemanticStore`` の初期化。G0 のスキーマ版マーカー・移行器・破壊的な
+  自動初期化は持たない (G1 の版は形式ごとの封筒と世代印、c_05 §0.4)。
 - :func:`apply_semmem_policy_overrides` : SemMem active policy ファクト
   → ``PolicyInterpreter`` 反映。
 
@@ -14,6 +13,7 @@
 
 from __future__ import annotations
 
+import gc
 from typing import TYPE_CHECKING, Any
 
 from backend.app_state import AppState
@@ -73,93 +73,9 @@ def _init_memory(
     from backend.free.memory.semantic.store import SemanticStore
     from backend.free.memory.stores.working import WorkingMemoryRegistry
     from backend.free.rag.evidence.config import merge_rag_evidence_config
-    from backend.free.memory.init_evorefmem import (
-        SCHEMA_VERSION as EVOREFMEM_SCHEMA_VERSION,
-        initialize_evorefmem,
-        needs_initialization,
-        read_schema_version,
-    )
-    from backend.free.memory.migrations import (
-        DEFAULT_MIGRATIONS,
-        MigrationChainNotFoundError,
-        MigrationError,
-        SchemaMigrator,
-    )
-    # EvorefMem スキーマバージョン検査 & 自動初期化
-    # - code 側の SCHEMA_VERSION を source of truth とする (cfg 値は参考情報)
-    # - SchemaMigrator で in-place migration を試行 (v1 のみの現状は no-op)
-    # - 未初期化 / 不一致の場合は destructive initialize_evorefmem を呼ぶ
-    expected_version = EVOREFMEM_SCHEMA_VERSION
-    cfg_version = cfg.get("memory", {}).get("schema_version")
-    if cfg_version is not None and cfg_version != expected_version:
-        logger.warning(
-            "config.yaml memory.schema_version=%d does not match "
-            "EvorefMem version=%d; using code version.",
-            cfg_version, expected_version,
-        )
 
     memory_dir = resolver.resolve_local("memory_dir")
     memory_dir.mkdir(parents=True, exist_ok=True)
-
-    # SchemaMigrator で in-place migration を試行する
-    # - 登録済 Migration で現在版から expected_version へ到達できる場合に実行
-    # - v1 のみの現状は DEFAULT_MIGRATIONS=[] で常に no-op
-    # - 連鎖解決できなかった場合は静かに fallback (destructive init 判定へ)
-    current_version = read_schema_version(memory_dir)
-    if (
-        current_version is not None
-        and current_version != expected_version
-    ):
-        migration_archive_dir_for_migrate = resolver.resolve_local(
-            "migration_archive_dir",
-        )
-        migration_archive_dir_for_migrate.mkdir(parents=True, exist_ok=True)
-        try:
-            migrator = SchemaMigrator(
-                migrations=list(DEFAULT_MIGRATIONS),
-                migration_archive_dir=migration_archive_dir_for_migrate,
-            )
-            migrator.upgrade(
-                memory_dir, current_version, expected_version,
-            )
-        except MigrationChainNotFoundError as e:
-            logger.info(
-                "SchemaMigrator has no chain for %d -> %d: %s "
-                "(falling back to destructive init check)",
-                current_version, expected_version, e,
-            )
-        except MigrationError as e:
-            logger.warning(
-                "SchemaMigrator upgrade failed (%d -> %d): %s "
-                "(falling back to destructive init check)",
-                current_version, expected_version, e,
-            )
-
-    if needs_initialization(memory_dir, expected_version):
-        prompts_dir = resolver.resolve_local("prompts_dir")
-        migration_archive_dir = resolver.resolve_local("migration_archive_dir")
-        prompts_dir.mkdir(parents=True, exist_ok=True)
-        migration_archive_dir.mkdir(parents=True, exist_ok=True)
-        current = read_schema_version(memory_dir)
-        logger.info(
-            "EvorefMem auto-initialization: expected=%s actual=%s",
-            expected_version, current,
-        )
-        try:
-            result = initialize_evorefmem(
-                memory_dir, prompts_dir, migration_archive_dir,
-            )
-            logger.info(
-                "EvorefMem auto-initialized: backed_up=%d deleted=%d "
-                "created=%d gc=%d",
-                len(result.backed_up), len(result.deleted),
-                len(result.created), len(result.gc_removed),
-            )
-        except Exception as e:
-            logger.warning(
-                "EvorefMem auto-initialization failed: %s — "
-                "run `python scripts/init_evorefmem.py` manually", e,
-            )
 
     # EvorefMem トリガ辞書 (pin / fact / classify) の user override 配置先。
     # 同梱 default は ``backend/free/memory/_defaults/triggers/`` 配下。
@@ -211,6 +127,7 @@ def _init_memory(
         semantic.load()
     except Exception as e:  # noqa: BLE001 — 記憶が読めなくても起動は続ける
         logger.warning("Semantic store load skipped: %s", e)
+    _freeze_resident_once()
 
     state.working_memory_registry = wm
     state.episodic_memory = episodic
@@ -221,6 +138,23 @@ def _init_memory(
         len(episodic), len(semantic),
     )
     return wm, episodic
+
+
+_frozen = False
+
+
+def _freeze_resident_once() -> None:
+    """一括ロードした常駐 (Evidence 等) を GC の走査から外す (G1 設計 §17.4)。
+
+    以後の世代 GC が数万件の長寿命オブジェクトを毎回たどらない。先に 1 回集めて
+    ゴミの循環を凍らせない。プロセスで 1 回だけ (起動し直すテストで凍結が積もらない)。
+    """
+    global _frozen
+    if _frozen:
+        return
+    gc.collect()
+    gc.freeze()
+    _frozen = True
 
 
 def attach_episodic_embedder(episodic: "EpisodicStore", embedder: Any) -> None:

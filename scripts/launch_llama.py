@@ -370,6 +370,21 @@ def _resolve_pro_edition() -> bool:
         return False
 
 
+def _data_path(cfg: dict, project_root: Path, key: str) -> Path | None:
+    """データ根 (c_05 §0.2) 配下の ``key`` を ``PathResolver`` で解決する。
+
+    データ根は ``EVOREF_DATA_ROOT`` (``--data-root`` を反映) →
+    ``<project_root>/userdata``。``local_paths`` の個別キーは撤去済みなので読まない。
+    ``backend`` を import できない単体実行 (editable install 前) ではデータ根が
+    決まらないため ``None`` (データ側のアダプタ / override は無いものとして扱う)。
+    """
+    try:
+        from backend.config import PathResolver
+    except ImportError:
+        return None
+    return PathResolver(cfg, project_root).resolve_local(key)
+
+
 def _resolve_draft_model_path(
     spec_cfg: dict, project_root: Path,
 ) -> Path | None:
@@ -631,26 +646,22 @@ def lora_compatible_with_model(
        vs E4B 2560) や head 構成違い、block 数を超えるターゲットは
        llama-server が "tensor has incorrect shape" でコンテキスト生成に
        失敗しプロセスごと落ちるため、arch 一致だけでは適合と言えない。
-    3. 系統 (lineage) チェック: アダプタに ``evoref.trained_on_model``
-       (学習元モデルの filename stem、Level 2 トレーナーが刻む) がある
-       場合、現モデルの stem と完全一致 (大文字小文字無視) を要求する。
+    3. 系統 (lineage) チェック: アダプタに ``evoref.trained_on_model_key``
+       (学習元モデルの ``model_key``、c_05 §0.5.7。Level 2 トレーナーが刻む)
+       がある場合、現モデルの ``model_key`` との一致を要求する。
        LoRA は特定の重みへの差分なので、同一 arch・同一形状でも別モデル
        (例: Qwen3.5-9B と同 arch の別 finetune) に当てると silent な品質
-       摂動になる。GGUF の identity メタデータ (``general.name`` 等) は
-       量子化違いの同一モデルすら識別できない品質のため (qat 変換由来の
-       ゴミ名等)、再量子化も「系統不明」として不適合側に倒す (誤って
-       捨てる実害は次の Level 2 サイクルで再学習される軽微なもの、誤って
-       適用する実害は診断困難な品質摂動であるため)。
+       摂動になる。model_key は重みの標本から導くので、ファイル名が同じ
+       別モデルも、再量子化した同じモデルも別の系統になる (誤って捨てる
+       実害は次の Level 2 サイクルで再学習される軽微なもの、誤って適用する
+       実害は診断困難な品質摂動であるため)。
 
     形状が判定不能 (LoRA テンソル無し / どちらかのテンソル情報節が
     読めない) の場合、および stamp が無いレガシーアダプタの系統は
     fail-open (arch + 形状のみで判定)。arch 側の fail-closed との非対称は
     意図的 — テンソル命名の異なる正当なアダプタを誤って捨てないため。
-    Free エディションはトレーナーを持たず stamp 付きアダプタを生成しない
-    ので、系統チェックは Free では実質 inert。
-
-    起動側 (:func:`_lora_compatible`) と model migration 側
-    (``backend.free.core.model_migration``) の両層で共有する単一の述語。
+    起動側 (``backend.pro.adapters``) と LoRA 一覧 API
+    (``backend.pro.api.lora``) で共有する単一の述語。
 
     Returns:
         ``(compatible, reason)``。reason はログ向けの英語短文。
@@ -673,38 +684,17 @@ def lora_compatible_with_model(
     if mismatch is not None:
         return False, mismatch
 
-    stamp = lora_meta.get("trained_on_model")
-    if stamp and stamp.casefold() != model_path.stem.casefold():
-        return False, (
-            f"lineage mismatch (adapter trained on {stamp}, "
-            f"model is {model_path.stem})"
-        )
+    stamp = lora_meta.get("trained_on_model_key")
+    if stamp:
+        from backend.model_key import model_key_for
+
+        model_key = model_key_for(model_path)
+        if stamp != model_key:
+            return False, (
+                f"lineage mismatch (adapter trained on {stamp}, "
+                f"model {model_path.name} is {model_key})"
+            )
     return True, f"architecture={model_arch}"
-
-
-def _lora_compatible(
-    model_path: Path,
-    lora_path: Path,
-    *,
-    warn: Callable[[str], None] | None = None,
-) -> bool:
-    """LoRA アダプタとモデルの互換性 (arch + 形状) を判定する。
-
-    モデル切替 (``POST /api/model/{component}/migrate`` 等) 後に旧モデル向け
-    LoRA が残存すると、llama-server が arch 不一致または tensor 形状不一致で
-    コンテキスト生成に失敗しプロセスごと落ちる。付与直前に
-    :func:`lora_compatible_with_model` で検証し、不適合は warning を出して
-    ``--lora`` を諦める (``build_mtp_args`` と同じ「非対応なら機能を諦める」
-    方針)。誤ってスキップする実害は警告ログのみだが、誤って付与する実害は
-    プロセスクラッシュそのものであるため、この非対称性を正当化する。
-    """
-    ok, reason = lora_compatible_with_model(model_path, lora_path)
-    if not ok and warn is not None:
-        warn(
-            f"[launch] WARNING: incompatible LoRA ({reason}): "
-            f"{lora_path.name}. Skipping --lora."
-        )
-    return ok
 
 
 def _cvector_compatible(
@@ -747,7 +737,7 @@ def build_llama_cmd(
     *,
     model_override: str | None = None,
     lora_override: str | Path | None = None,
-    lora_fallback: bool = True,
+    control_vector_override: str | Path | None = None,
     port_override: int | None = None,
     context_override: int | None = None,
     slots_override: int | None = None,
@@ -760,11 +750,10 @@ def build_llama_cmd(
     起動する。いずれも未指定 (通常運用) の
     ときは従来挙動と完全に等価。
 
-    ``lora_fallback`` は ``lora_override is None`` のときのみ意味を持つ。既定
-    ``True`` は従来どおり ``local_paths.lora_adapter`` (flat) を exists+compat
-    チェック付きで読む。``False`` を渡すと (level2_adapter_partition=="model_mode"
-    でのモード切替のように) そのモードにはまだ学習済み LoRA が存在しないことを
-    明示するために、flat フォールバックを踏まず ``--lora`` を一切付与しない。
+    通常運用のアダプタ (``lora_override`` / ``control_vector_override``) は
+    呼出元が Pro のハンドラ ``adapter_paths_for_launch`` から得て渡す
+    (``backend.free.core.launch_adapters``)。このモジュールは config から
+    アダプタを解決しない — ``None`` なら付けない (Free は常に無し)。
 
     ``context_override`` / ``slots_override`` / ``no_warmup`` は Level 2 候補評価
     のような **使い捨てサーバ** 用。通常運用の値 (base は既定 8192 × 2 slot) を
@@ -776,7 +765,6 @@ def build_llama_cmd(
         raise ValueError("config.yaml に 'llama' セクションがありません")
     lc = cfg["llama"]
     sp = cfg.get("model_paths", {})
-    lp = cfg.get("local_paths", {})
 
     if project_root is None:
         project_root = Path.cwd()
@@ -800,65 +788,46 @@ def build_llama_cmd(
         "-b", str(lc.get("batch_size", 512)),
     ]
 
-    # LoRA アダプタ。lora_override (Level 2 base=spsa-real-eval 候補評価) は無条件で
-    # 付与する (候補 GGUF は harness が起動直前に書き出すため exists チェックしない)。
-    # 通常運用は既存アダプタが存在し、かつモデルと arch が一致する場合のみ付与する。
+    # LoRA アダプタ。呼出元が解決・検証済み (Level 2 候補評価の GGUF は harness が
+    # 起動直前に書き出すため exists チェックしない)。
     if lora_override is not None:
         cmd += ["--lora", str(Path(lora_override))]
-    elif lora_fallback:
-        lora_path = lp.get("lora_adapter", "local/models/adapter.gguf")
-        lora_full = Path(lora_path)
-        if not lora_full.is_absolute():
-            lora_full = project_root / lora_full
-        if lora_full.exists() and _lora_compatible(
-            base_model_path, lora_full, warn=lambda m: print(m, file=sys.stderr),
-        ):
-            cmd += ["--lora", str(lora_full)]
-    # else: lora_fallback=False → 明示的に LoRA なし (flat フォールバック抑制)
 
-    # Level 2 base=C: control vector (残差ストリーム操舵)。
-    # learning.level2_base_method=='cvector' かつファイルが存在するときのみ適用する。
-    # config 駆動のみ (backend.pro / backend.edition の import は行わない = 横断スクリプト)。
-    # Free は control_vector.gguf を生成しないので inert。適用は次回起動時。
-    learning_cfg = cfg.get("learning", {}) or {}
-    if learning_cfg.get("level2_base_method") == "cvector":
-        cvec_path = lp.get("control_vector_adapter", "local/models/control_vector.gguf")
-        cvec_full = Path(cvec_path)
-        if not cvec_full.is_absolute():
-            cvec_full = project_root / cvec_full
-        if cvec_full.exists() and _cvector_compatible(
-            base_model_path, cvec_full, warn=lambda m: print(m, file=sys.stderr),
-        ):
-            # 既定 1.0。``or`` フォールバックは使わない (0.0 は診断用の正当な値で、
-            # falsy 畳み込みすると 1.0=full strength に化けるため)。dict 既定が欠損を
-            # 補い、schema が非 Optional float なので None は来ない。
-            scale = float(learning_cfg.get("cvector_scale", 1.0))
-            if scale == 1.0:
-                # --control-vector は FNAME のみ取るため、Windows のドライブレター
-                # (E:) のコロンとも衝突しない (絶対パスで安全)。
-                cmd += ["--control-vector", str(cvec_full)]
-            else:
-                # スケール指定時のみ --control-vector-scaled FNAME:SCALE。FNAME に
-                # Windows 絶対パス (E:\...) を渡すとドライブレターのコロンが FNAME:SCALE
-                # のセパレータと衝突するため、project_root 相対 POSIX パスを渡す
-                # (llama-server は CWD=project_root 基準で解決; standalone 起動は
-                # _start_and_wait が cwd=project_root を設定)。project_root 外の絶対
-                # パスは衝突を避けられないため fail-fast する。
-                try:
-                    rel = cvec_full.relative_to(project_root).as_posix()
-                except ValueError as e:
-                    raise ValueError(
-                        "cvector_scale != 1.0 requires control_vector_adapter to "
-                        "resolve under project_root (relative path); an absolute path "
-                        "outside project_root collides with the --control-vector-scaled "
-                        "FNAME:SCALE separator.",
-                    ) from e
-                cmd += ["--control-vector-scaled", f"{rel}:{scale}"]
-            layer_range = str(learning_cfg.get("cvector_layer_range", "") or "").strip()
-            if layer_range:
-                parts = layer_range.replace(",", " ").split()
-                if len(parts) == 2:
-                    cmd += ["--control-vector-layer-range", parts[0], parts[1]]
+    # Level 2 base=C: control vector (残差ストリーム操舵)。呼出元が解決・検証済み。
+    # scale / 層範囲は config (learning.cvector_*) から読む。
+    if control_vector_override is not None:
+        learning_cfg = cfg.get("learning", {}) or {}
+        cvec_full = Path(control_vector_override)
+        # 既定 1.0。``or`` フォールバックは使わない (0.0 は診断用の正当な値で、
+        # falsy 畳み込みすると 1.0=full strength に化けるため)。dict 既定が欠損を
+        # 補い、schema が非 Optional float なので None は来ない。
+        scale = float(learning_cfg.get("cvector_scale", 1.0))
+        if scale == 1.0:
+            # --control-vector は FNAME のみ取るため、Windows のドライブレター
+            # (E:) のコロンとも衝突しない (絶対パスで安全)。
+            cmd += ["--control-vector", str(cvec_full)]
+        else:
+            # スケール指定時のみ --control-vector-scaled FNAME:SCALE。FNAME に
+            # Windows 絶対パス (E:\...) を渡すとドライブレターのコロンが FNAME:SCALE
+            # のセパレータと衝突するため、project_root 相対 POSIX パスを渡す
+            # (llama-server は CWD=project_root 基準で解決; standalone 起動は
+            # _start_and_wait が cwd=project_root を設定)。project_root 外の絶対
+            # パスは衝突を避けられないため fail-fast する。
+            try:
+                rel = cvec_full.relative_to(project_root).as_posix()
+            except ValueError as e:
+                raise ValueError(
+                    "cvector_scale != 1.0 requires the control vector to "
+                    "resolve under project_root (relative path); an absolute path "
+                    "outside project_root collides with the --control-vector-scaled "
+                    "FNAME:SCALE separator.",
+                ) from e
+            cmd += ["--control-vector-scaled", f"{rel}:{scale}"]
+        layer_range = str(learning_cfg.get("cvector_layer_range", "") or "").strip()
+        if layer_range:
+            parts = layer_range.replace(",", " ").split()
+            if len(parts) == 2:
+                cmd += ["--control-vector-layer-range", parts[0], parts[1]]
 
     # オプション
     threads = lc.get("threads", 0)
@@ -992,7 +961,6 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
         project_root = Path.cwd()
 
     sp = cfg.get("model_paths", {})
-    lp = cfg.get("local_paths", {})
 
     # エンベッドモデルパス（model_paths.embed_model or デフォルト）
     embed_model = sp.get("embed_model", "models/Qwen3-Embedding-0.6B-Q8_0.gguf")
@@ -1044,16 +1012,6 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
             f"Consider raising embedding.context_size to at least {max_length}.",
             file=sys.stderr,
         )
-
-    # エンベッド LoRA アダプタ（存在し、かつモデルと arch が一致する場合のみ）
-    embed_lora = lp.get("embed_lora_adapter", "local/models/embed_adapter.gguf")
-    embed_lora_path = Path(embed_lora)
-    if not embed_lora_path.is_absolute():
-        embed_lora_path = project_root / embed_lora_path
-    if embed_lora_path.exists() and _lora_compatible(
-        embed_model_path, embed_lora_path, warn=lambda m: print(m, file=sys.stderr),
-    ):
-        cmd += ["--lora", str(embed_lora_path)]
 
     # 物理バッチサイズ。長い STM ノート (>512 tok) の埋め込みリクエストが
     # llama-server デフォルト batch=512 のままだと 500 エラーで落ちるため、
@@ -1249,10 +1207,10 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
            "has_chat_template": bool,
            "block_count" / "head_count_kv" / "head_count" / "key_length" /
            "value_length" / "embedding_length": int | None,
-           "trained_on_model": str | None}``
+           "trained_on_model_key": str | None}``
 
-    ``trained_on_model`` は evoref 独自 KV ``evoref.trained_on_model``
-    (Level 2 トレーナーが LoRA アダプタに刻む学習元モデルの filename stem)。
+    ``trained_on_model_key`` は evoref 独自 KV ``evoref.trained_on_model_key``
+    (Level 2 トレーナーが LoRA アダプタに刻む学習元モデルの ``model_key``)。
     :func:`lora_compatible_with_model` の系統チェックに使う。
     後半 6 キーは KV キャッシュ VRAM 推定 (``estimate_kv_cache_mb``) 用。
     ``expert_count`` は対応キーが無い dense モデルで 0。パース失敗・I/O
@@ -1283,8 +1241,8 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
         # 再帰状態のサイズ (``<arch>.ssm.state_size`` / ``<arch>.ssm.inner_size``)。
         "ssm_state_size": None,
         "ssm_inner_size": None,
-        # LoRA アダプタ専用の evoref 独自 KV (学習元モデルの filename stem)
-        "trained_on_model": None,
+        # LoRA アダプタ専用の evoref 独自 KV (学習元モデルの model_key)
+        "trained_on_model_key": None,
     }
     try:
         with gguf_path.open("rb") as f:
@@ -1370,9 +1328,9 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                 elif key == "tokenizer.chat_template":
                     result["has_chat_template"] = True
                     _gguf_skip_value(f, vtype)
-                elif key == "evoref.trained_on_model":
+                elif key == "evoref.trained_on_model_key":
                     val = _gguf_read_scalar_or_skip(f, vtype)
-                    result["trained_on_model"] = (
+                    result["trained_on_model_key"] = (
                         str(val) if val is not None else None
                     )
                 else:
@@ -1477,26 +1435,28 @@ def _lora_shape_mismatch(model_path: Path, lora_path: Path) -> str | None:
 
 
 # モデルプロファイル: arch 単位 + GGUF ファイル名単位の起動フラグ / sampling 既定。
-# 同梱ベース (tracked, models/profiles/) + local override の 2 段階 × arch 層 /
+# 同梱ベース (tracked, models/profiles/) + データ根の override (<data_root>/profiles/)
+# の 2 段階 × arch 層 /
 # モデル別層 (by-model/) の 2 スコープ。default フォールバックは持たない
 # (プロファイルの無い arch はフラグ無付与)。
 # ``models/`` 自体は .gitignore 対象だが models/profiles/ は再包含例外で tracked
 # (``by-model/`` サブディレクトリにも同じ再包含が効く)。
 _MODEL_PROFILE_BASE_DIR = "models/profiles"
-_MODEL_PROFILE_OVERRIDE_DIR = "local/profiles"
 _MODEL_PROFILE_BY_MODEL_SUBDIR = "by-model"
 
 
 def _load_profile_layer(project_root: Path, *parts: str) -> tuple[dict, Path | None]:
-    """1 スコープ分のプロファイルを解決する (local override → 同梱 base)。
+    """1 スコープ分のプロファイルを解決する (データ根の override → 同梱 base)。
 
     最初に読めた YAML を wholesale で採用し ``(data, path)`` を返す。読取失敗 /
     dict でない場合は次の候補へ進み、どこにも無ければ ``({}, None)``。
     """
     for base in (
-        project_root / _MODEL_PROFILE_OVERRIDE_DIR,
+        _data_path({}, project_root, "profiles_dir"),
         project_root / _MODEL_PROFILE_BASE_DIR,
     ):
+        if base is None:
+            continue
         path = base.joinpath(*parts)
         if not path.exists():
             continue
@@ -1530,7 +1490,7 @@ def _deep_merge(base: dict, over: dict) -> dict:
 def load_model_profile(arch: str | None, project_root: Path) -> dict:
     """arch 名からモデルプロファイル dict を解決する (2 段階)。
 
-    解決順: ``local/profiles/<arch>.yaml`` (user override) →
+    解決順: ``<data_root>/profiles/<arch>.yaml`` (user override) →
     同梱 ``models/profiles/<arch>.yaml`` (base)。いずれも無い / ``arch`` が
     None の場合は ``{}`` (フォールバックなし)。override は wholesale 置換
     (deep merge しない)。
@@ -1548,9 +1508,9 @@ def load_model_profile_for(
 
     解決順:
       ① ``models/profiles/<arch>.yaml``          同梱・arch 既定
-      ② ``local/profiles/<arch>.yaml``           ①を wholesale 置換
+      ② ``<data_root>/profiles/<arch>.yaml``     ①を wholesale 置換
       ③ ``models/profiles/by-model/<stem>.yaml`` 同梱・モデル固有
-      ④ ``local/profiles/by-model/<stem>.yaml``  ③を wholesale 置換
+      ④ ``<data_root>/profiles/by-model/<stem>.yaml``  ③を wholesale 置換
 
     有効プロファイル = ``deep_merge(arch 層, モデル別層)``。同一スコープ内は
     wholesale 置換 (arch override の既存挙動を変えない)、スコープ跨ぎのみ
@@ -2752,35 +2712,6 @@ def _wait_health(ports: dict[str, int], timeout_sec: float) -> None:
             print(f"[launch] WARNING: {name} (port {port}) health check timed out, proceeding anyway")
 
 
-def _resolve_learned_lora_args(
-    cfg: dict, project_root: Path, component: str,
-) -> tuple[Path | None, bool]:
-    """学習済み LoRA (パーティション配置) を解決して build_*_cmd 引数へ落とす。
-
-    ``build_*_cmd`` 単体の flat フォールバック (``local_paths.*_lora_adapter``)
-    は ``partition_by_base_model`` 導入前のレガシー配置しか見ないため、Level 2
-    が実際に書き出す ``local/learning/...`` 配下のアダプタを拾えない。解決規則の
-    二重管理を避けるため ``backend.config`` の共有述語に委譲する。
-
-    ``backend`` は横断スクリプト単体実行 (``python scripts/launch_llama.py``、
-    editable install 前) では import できないことがあるため、失敗時は従来の
-    flat フォールバック ``(None, True)`` へ倒す (起動自体は妨げない)。
-    """
-    try:
-        from backend.config import resolve_base_lora_for_launch
-    except ImportError:
-        return None, True
-    try:
-        return resolve_base_lora_for_launch(cfg, project_root)
-    except Exception as e:  # noqa: BLE001 - 起動を止めない best-effort
-        print(
-            f"[launch] {component} LoRA resolution failed ({e}); "
-            "falling back to flat lookup",
-            file=sys.stderr,
-        )
-        return None, True
-
-
 def _extract_model_basename(cmd: list[str]) -> str | None:
     """``cmd`` 中の ``-m`` 引数の basename を返す
 
@@ -2852,6 +2783,14 @@ if __name__ == "__main__":
         help=(
             "VRAM 予算超過時も強制起動する。--all と併用することを想定"
         ),
+    )
+    parser.add_argument(
+        "--lora", default=None, metavar="PATH",
+        help="base に当てる LoRA (呼出元が解決・検証済み。backend.free.cli.llama_launcher が渡す)",
+    )
+    parser.add_argument(
+        "--control-vector", default=None, metavar="PATH",
+        help="base に当てる control vector (呼出元が解決・検証済み)",
     )
     parser.add_argument(
         "--print-health-ports",
@@ -2931,12 +2870,10 @@ if __name__ == "__main__":
     try:
         # ベースモデル
         if launch_base:
-            base_lora, base_lora_fallback = _resolve_learned_lora_args(
-                cfg, project_root, "base",
-            )
             cmd = build_llama_cmd(
                 cfg, project_root,
-                lora_override=base_lora, lora_fallback=base_lora_fallback,
+                lora_override=args.lora,
+                control_vector_override=args.control_vector,
             )
             host = cfg["llama"].get("host", "localhost")
             port = cfg["llama"].get("port", 8080)

@@ -1,8 +1,9 @@
 """共通ユーティリティ関数"""
 
+import math
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 #: :func:`estimate_tokens` の **CJK 項だけ** に掛ける補正係数。既定 1.0 = 無補正。
@@ -195,6 +196,51 @@ def parse_utc(value: str | float | int | None) -> datetime | None:
         except (OverflowError, OSError, ValueError):
             return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+_EPOCH_ZERO = datetime.fromtimestamp(0, tz=timezone.utc)
+
+#: 永続化する instant の唯一の形 (``YYYY-MM-DDTHH:MM:SS.ffffffZ``、c_05 §0.5.4)。
+_PERSISTED_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
+
+
+def parse_utc_strict(value: object) -> datetime | None:
+    """永続化した時刻の **厳格な** 読み手 (c_05 §0.5.4)。
+
+    受けるのは :func:`format_utc` の 1 形式 (ISO 8601 UTC μs ``Z``) だけで、epoch や
+    ``+00:00`` オフセットは ``None`` (読めない) にする。外部入力 (API・ユーザー・旧形式)
+    を受ける場所は寛容な :func:`parse_utc` を使う。
+    """
+    if not isinstance(value, str) or not _PERSISTED_UTC_RE.fullmatch(value):
+        return None
+    try:
+        return datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return None
+
+
+def epoch_to_utc(epoch: float | int | None) -> str | None:
+    """内部の epoch 秒を永続形 (ISO 8601 UTC μs ``Z``) にする。``None`` / 0 以下 / 非有限は ``None``。
+
+    epoch を永続化しない (c_05 §0.5.4)。0 は「未設定」の番兵として使われてきたので
+    時刻にしない。μs 未満は **切り捨てる** — 読み戻した値が元の値を超えないので、
+    読み戻した時刻から測る間隔 (減衰・TTL) が早まらない。
+    """
+    if epoch is None or isinstance(epoch, bool):
+        return None
+    try:
+        value = float(epoch)
+        if not value > 0.0:
+            return None
+        return format_utc(_EPOCH_ZERO + timedelta(microseconds=math.floor(value * 1_000_000)))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def utc_to_epoch(value: object, default: float | None = None) -> float | None:
+    """永続形の時刻 (:func:`parse_utc_strict`) を epoch 秒へ。読めなければ ``default``。"""
+    dt = parse_utc_strict(value)
+    return default if dt is None else dt.timestamp()
 
 
 def utc_now_dt() -> datetime:

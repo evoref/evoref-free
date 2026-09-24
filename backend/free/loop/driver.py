@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-from uuid import uuid4
 
 from backend.free.loop.bootstrap import (
     BootstrapResult,
@@ -50,6 +49,7 @@ from backend.free.memory.views.loop import (
     LoopFactView,
 )
 from backend.free.memory.stores.working import WorkingMemory
+from backend.io.id_registry import new_id
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, set_trace_id
 
@@ -270,7 +270,7 @@ def make_task_fact(
     """
     if not project_id:
         raise ValueError("project_id must be non-empty")
-    tid = task_id or f"t_{uuid4().hex[:8]}"
+    tid = task_id or new_id("task_")
     object_json = encode_task_object(
         task_id=tid,
         title=title,

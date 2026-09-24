@@ -27,7 +27,7 @@ snapshot には残るので監査で追え、物理削除は snapshot 3 版後�
 
     python scripts/purge_semantic_facts.py --contains "7006653"
 
-``--id`` — ファクト id の直接指定 (``evorefmem_cli inspect`` で拾った id を渡す)。
+``--id`` — ファクト id の直接指定。
 複数回指定できる。
 
 既定は **dry-run**。実際に取り下げるには ``--apply`` を付ける。
@@ -40,23 +40,36 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend.free.memory.semantic.cli._paths import (  # noqa: E402
-    open_semantic_store,
-)
 from backend.free.memory.types import SemanticFact  # noqa: E402
 
+if TYPE_CHECKING:
+    from backend.free.memory.semantic.store import SemanticStore
+
 _RETRACT_REASON = "purged_by_operator"
+
+
+def open_semantic_store(memory_dir: Path) -> "SemanticStore":
+    """``<memory_dir>/semantic`` のストアを開いて読み込む (埋め込みなし、検索しない)。"""
+    from backend.free.memory.semantic.store import SemanticStore
+
+    store = SemanticStore(Path(memory_dir))
+    store.load()
+    return store
 
 
 class StoreNotFound(RuntimeError):
     """SemMem のストアディレクトリが見つからない。"""
 
 
-def resolve_memory_dir(memory_dir: str | None) -> Path:
-    """``local/memory/`` を解決する。見つからなければ理由付きで落とす。
+def resolve_memory_dir(memory_dir: str | None, data_root: str | None = None) -> Path:
+    """``<data_root>/store/memory/`` を解決する。見つからなければ理由付きで落とす。
+
+    ``--memory-dir`` が最優先。無ければ ``--data-root`` (→ ``EVOREF_DATA_ROOT`` →
+    ``<repo>/userdata``) から ``PathResolver`` で引く。
 
     旧実装は ``facts.jsonl`` を rglob していたため、c_16 でファイルが無くなった
     あとは **黙って 0 件で成功** していた。ストアが無いのは掃除対象が無いのでは
@@ -64,6 +77,14 @@ def resolve_memory_dir(memory_dir: str | None) -> Path:
     """
     if memory_dir is not None:
         root = Path(memory_dir)
+    elif data_root is not None:
+        from backend.config import PathResolver
+        from backend.data_root import install_root, resolve_data_root
+
+        base = install_root()
+        root = PathResolver(
+            {}, base, data_root=resolve_data_root(data_root, root=base),
+        ).resolve_local("memory_dir")
     else:
         from backend.config import get_path_resolver, load_config
 
@@ -76,7 +97,7 @@ def resolve_memory_dir(memory_dir: str | None) -> Path:
             f"no semantic store under {semantic}. Since c_16 (2026-09-07) SemMem "
             "lives in <memory_dir>/semantic/ as one evidence store (events/ + "
             "snapshots/); the old facts.jsonl version log is gone and there is no "
-            "migrator. Pass --memory-dir if your local/memory/ is elsewhere."
+            "migrator. Pass --memory-dir or --data-root if your memory dir is elsewhere."
         )
     return root
 
@@ -115,7 +136,7 @@ def purge(
     """条件に一致する live ファクトを取り下げ、対象件数を返す。
 
     Args:
-        memory_dir: ``local/memory/`` ルート。
+        memory_dir: ``<data_root>/store/memory/`` ルート。
         needle: subject/predicate/object/statement に含まれる部分文字列。
         subject: subject の前方一致。
         fact_ids: ファクト id の直接指定。
@@ -183,7 +204,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--memory-dir", default=None,
-        help="local/memory/ root (default: resolved from config.yaml)",
+        help="memory dir (default: <data root>/store/memory/)",
+    )
+    parser.add_argument(
+        "--data-root", default=None,
+        help="data root (default: EVOREF_DATA_ROOT, else <repo>/userdata)",
     )
     args = parser.parse_args(argv)
 
@@ -191,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("at least one of --contains / --subject / --id is required")
 
     try:
-        memory_dir = resolve_memory_dir(args.memory_dir)
+        memory_dir = resolve_memory_dir(args.memory_dir, args.data_root)
     except StoreNotFound as exc:
         print(f"[purge] {exc}", file=sys.stderr)
         return 1

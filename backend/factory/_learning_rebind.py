@@ -1,15 +1,15 @@
 """ランタイム base モデル切替時の Learn pillar 再バインド
 
 起動時は ``_pillar_wirer._activate_learning_partition`` が PathResolver の active
-stem と ``AppState.active_base_model_slug`` を確定し、その値で experience /
-base prompts / FewShotPool / PolicyParamEvolver 等が (model×mode) パーティション
-(docs/f_04 §1.2) に束ねられる。本モジュールは base モデルの **ランタイム** 切替
+model_key と ``AppState.active_base_model_slug`` (= model_key) を確定し、その値で
+experience / base prompts / FewShotPool / PolicyParamEvolver 等が (model_key×mode)
+パーティション (docs/f_04 §1.2.0) に束ねられる。本モジュールは base モデルの **ランタイム** 切替
 (``/api/model/migrate`` → llama-server 再起動 → ``/api/model/reload``) の後で
 同じ束ね直しを再起動なしに行う。
 
-- :func:`bind_active_base_model` — resolver の active stem と state のスラグを
+- :func:`bind_active_base_model` — resolver の active model_key と state のスラグを
   確定する共有ヘルパ (起動時 / rebind 共用)。
-- :func:`rebind_base_learning` — 旧パーティションへ退避 → active stem 切替 →
+- :func:`rebind_base_learning` — 旧パーティションへ退避 → active model_key 切替 →
   各コンポーネントを新パーティションへ向け直して再ロード。
 - :func:`install_rebind_hook` — ``LearningScheduler`` が ModelState との食い違いを
   検知したときの自己修復フックを注入する。
@@ -32,47 +32,54 @@ if TYPE_CHECKING:
 logger = get_logger("factory.learning_rebind")
 
 
+def model_path_for(resolver: "PathResolver", filename: str) -> Path:
+    """GGUF のファイル名からモデルのパスを決める (``model_state`` はファイル名だけを持つ)。
+
+    ``model_paths.base_model`` と同じ名前ならそのパス、違えば同じディレクトリの
+    同名ファイル (モデル移行は base_model のディレクトリの中で行う)。
+    """
+    base = resolver.resolve_model("base_model")
+    name = Path(filename).name
+    return base if base.name == name else base.parent / name
+
+
 def bind_active_base_model(
-    resolver: "PathResolver", state: "AppState", base_filename: str,
+    resolver: "PathResolver", state: "AppState", base_model: str | Path,
 ) -> tuple[str, str] | None:
-    """resolver の active モデル stem と ``state.active_base_model_slug`` を確定する。
+    """resolver の active model_key と ``state.active_base_model_slug`` を確定する。
+
+    ``learn.*`` subject のモデル次元は model_key (``mk_<hex16>``、c_05 §0.5.7)。
 
     Returns:
-        ``(stem, slug)``。``base_filename`` が空、または slug 化に失敗した場合は
-        partition を無効化 (flat) して ``None``。
+        ``(stem, model_key)``。``base_model`` が空なら ``None`` (束縛を外し、
+        resolve_learning が ``model_paths.base_model`` から導出し直す)。
     """
-    from backend.free.memory.notes.subject_ns import model_slug
-
-    name = Path(base_filename or "").name
-    if not name:
-        logger.warning("Learning partition: no base model identity; staying flat")
-        resolver.set_active_model_stem(None)
+    raw = Path(str(base_model or ""))
+    if not raw.name:
+        logger.warning("Learning partition: no base model identity")
+        resolver.bind_active_model(None)
         state.active_base_model_slug = ""
         return None
-    stem = Path(name).stem
-    try:
-        slug = model_slug(name)
-    except Exception as exc:
-        logger.warning("Learning partition: model_slug failed (%s); staying flat", exc)
-        resolver.set_active_model_stem(None)
-        state.active_base_model_slug = ""
-        return None
-    resolver.set_active_model_stem(stem)
-    state.active_base_model_slug = slug
-    return stem, slug
+    # ファイル名だけ (model_state 由来) なら base_model のディレクトリで探す
+    key = resolver.bind_active_model(
+        raw if raw.parent != Path() else model_path_for(resolver, raw.name),
+    )
+    assert key is not None
+    state.active_base_model_slug = key
+    return raw.stem, key
 
 
 def rebind_base_learning(
-    state: "AppState", cfg: dict[str, Any], *, new_model_filename: str,
+    state: "AppState", *, new_model_filename: str,
 ) -> dict[str, Any]:
-    """base モデル切替後に Learn pillar を新 (model×mode) パーティションへ束ね直す。
+    """base モデル切替後に Learn pillar を新 (model_key×mode) パーティションへ束ね直す。
 
     手順:
       1. 旧パーティションへ退避 (learning_state / policy_evolver / exploration /
          yaml モードの fewshot_pool、経験バッファ)。
-      2. ``PathResolver`` の active stem と ``state.active_base_model_slug`` を新
+      2. ``PathResolver`` の active model_key と ``state.active_base_model_slug`` を新
          モデルへ切替 (:func:`bind_active_base_model`)。
-      3. PolicyInterpreter を再スコープ (SemMem override 再適用)、
+      3. PolicyInterpreter を再スコープ (進化対象ポリシーの置き場 + SemMem override)、
          SystemPromptManager / AuxPromptManager の prompt_dir を差替えて再ロード、
          ExperienceBuffer を新パーティションへ rebind、FeedbackCollector の
          base_model 名を更新、LearningScheduler 経由で learning_state /
@@ -81,29 +88,24 @@ def rebind_base_learning(
 
     Args:
         state: AppState (Learn pillar 構築済)。
-        cfg: 現在の config dict (``learning.partition_by_base_model`` の参照用)。
         new_model_filename: 新 base モデルの GGUF ファイル名 (パス可、name を使う)。
 
     Returns:
         ``{"rebound": bool, "reason": str | None, "old_stem", "new_stem",
         "base_model_id", "prompt_dir", "experience_file", "fewshot_total"}``。
-        partition 無効 / 同一モデル / Level 1 実行中は ``rebound=False`` で理由を返す。
+        同一モデル (model_key が同じ) / Level 1 実行中は ``rebound=False`` で理由を返す。
     """
     from backend.config import get_path_resolver
 
     resolver = get_path_resolver()
     new_name = Path(new_model_filename or "").name
-    partition_enabled = resolver.partition_enabled and bool(
-        (cfg.get("learning") or {}).get("partition_by_base_model", True),
-    )
-    if not partition_enabled:
-        return {"rebound": False, "reason": "partition_disabled"}
     if not new_name:
         return {"rebound": False, "reason": "no_model_identity"}
 
     old_stem = resolver.active_model_stem
     new_stem = Path(new_name).stem
-    if old_stem == new_stem:
+    new_path = model_path_for(resolver, new_name)
+    if resolver.model_key_for(new_path) == resolver.active_model_key:
         return {"rebound": False, "reason": "unchanged", "old_stem": old_stem,
                 "new_stem": new_stem}
 
@@ -117,8 +119,8 @@ def rebind_base_learning(
     if scheduler is not None:
         scheduler.save_partition_state()
 
-    # 2. active stem / slug を切替
-    bound = bind_active_base_model(resolver, state, new_name)
+    # 2. active model_key / slug を切替
+    bound = bind_active_base_model(resolver, state, new_path)
     if bound is None:
         return {"rebound": False, "reason": "bind_failed",
                 "old_stem": old_stem, "new_stem": new_stem}
@@ -127,7 +129,7 @@ def rebind_base_learning(
     # 3. 各コンポーネントを新パーティションへ
     policy = getattr(state, "policy_interpreter", None)
     if policy is not None:
-        policy.set_base_model_id(slug)
+        policy.rebind_partition(resolver.resolve_learning("evolved_policies_dir"), slug)
 
     prompt_dir = resolver.resolve_learning("prompts_dir")
     prompt_mgr = getattr(state, "prompt_manager", None)
@@ -160,7 +162,7 @@ def rebind_base_learning(
         if pool is not None:
             fewshot_total = pool.total_count
 
-    _rebind_lora_partition(state, resolver, scheduler)
+    _rebind_lora_partition(state, scheduler)
 
     learn = getattr(state, "learn", None)
     adjuster = getattr(learn, "policy_adjuster", None) if learn is not None else None
@@ -183,21 +185,22 @@ def rebind_base_learning(
     }
 
 
-def _rebind_lora_partition(
-    state: "AppState", resolver: "PathResolver", scheduler: Any,
-) -> None:
+def _rebind_lora_partition(state: "AppState", scheduler: Any) -> None:
     """base LoRA のパスをキャッシュしている保持者を新パーティションへ向け直す。
 
-    起動時は ``_pillar_wirer._wire_sleep_scheduler_llm`` が resolve_learning の
-    値を SleepTimeScheduler と Level 2 の version_manager に焼き込むため、
+    起動時は ``_pillar_wirer._wire_sleep_scheduler_models`` が Pro のパスを
+    SleepTimeScheduler と Level 2 の version_manager に焼き込むため、
     切替後に呼び直さないと旧モデルのアダプタを指したままになる。Pro が保持する
     :class:`LoRAVersionManager` (CartridgeChangeHandler / ProLearnComponents 経由)
     は Free から import できないので、Pro が登録したハンドラへ委譲する。
     """
     from backend.edition import get_pro_handler
 
-    lora_path = resolver.resolve_learning("lora_adapter")
-    versions_dir = resolver.resolve_learning("lora_versions_dir")
+    pro_path = get_pro_handler("pro_learning_path")
+    if pro_path is None:
+        return
+    lora_path = pro_path("lora_adapter")
+    versions_dir = pro_path("lora_versions_dir")
 
     sleep_scheduler = getattr(state, "sleep_scheduler", None)
     if sleep_scheduler is not None:
@@ -222,16 +225,11 @@ def install_rebind_hook(state: "AppState") -> None:
     """``LearningScheduler`` にランタイム切替検知時の自己修復フックを注入する。
 
     ``_base_model_changed`` が ModelState との食い違いを見つけたとき、Level 1 を
-    止める代わりに :func:`rebind_base_learning` をその場で呼ぶ。config は呼出
-    時点の ``get_config()`` を使う (migrate 後の in-memory 同期値)。
+    止める代わりに :func:`rebind_base_learning` をその場で呼ぶ。
     """
     scheduler = getattr(state, "learning_scheduler", None)
     if scheduler is None:
         return
-    from backend.config import get_config
-
     scheduler.set_partition_rebind_hook(
-        lambda filename: rebind_base_learning(
-            state, get_config(), new_model_filename=filename,
-        ),
+        lambda filename: rebind_base_learning(state, new_model_filename=filename),
     )

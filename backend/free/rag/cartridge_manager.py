@@ -93,7 +93,6 @@ class CartridgeInfo:
     content_digest: str = ""
     embedding_model_id: str = ""
     embedding_dim: int = 0
-    schema_version: int = 1
     #: 所有と生まれ方 (``package`` / ``project_map``、c_16 §4.3)。
     kind: str = "package"
     #: 運ぶセクション名の列 (``docs`` / ``templates`` / ``language``)。
@@ -128,7 +127,6 @@ def cartridge_info_of(
         content_digest=meta.content_digest,
         embedding_model_id=package.embedding_model_id,
         embedding_dim=package.embedding_dim,
-        schema_version=meta.schema_version,
         kind=meta.kind,
         provides=list(meta.provides),
         language_pack=list(language_pack or []),
@@ -203,8 +201,12 @@ class CartridgeManager:
         *,
         progress_callback: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
+        internal: bool = False,
     ) -> CartridgeInfo:
         """`.evocart` パッケージをインストールする。
+
+        ``internal`` は自分で作ったパッケージ (手動取り込み・テンプレート登録) だけが
+        渡す (:meth:`CorpusStore.install`)。
 
         Raises:
             CartridgeInstallCancelled: ``cancel_check`` が ``True`` を返した。
@@ -215,6 +217,7 @@ class CartridgeManager:
         try:
             result = await self._corpus.install(
                 zip_path, progress_cb=progress_callback, cancel_check=cancel_check,
+                internal=internal,
             )
         except CorpusInstallCancelled as e:
             raise CartridgeInstallCancelled(str(e)) from e

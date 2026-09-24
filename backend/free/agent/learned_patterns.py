@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from backend.free.agent.learned_pattern_store import LearnedPatternRepository
 from backend.free.agent.learned_patterns_types import LearnedPattern
@@ -22,6 +22,7 @@ from backend.free.core.script_ranges import (
     KANJI,
     KATAKANA_BLOCK,
 )
+from backend.utils import utc_to_epoch
 
 if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
@@ -148,6 +149,8 @@ class LearnedPatternStore:
         # ``load`` でファイルに残した値があればそれで上書きする (6h 間隔が
         # 再起動で仕切り直されないようにする。欠損 = 旧形式は「今」扱い)。
         self._last_decay_at: float = time.time()
+        # 読んだファイルのトップの未知キー (save で書き戻す、c_05 §0.5.2)。
+        self._payload_extra: dict[str, Any] | None = None
         # 重み / 件数が変わったか (Step 5.5 が「変更があった時だけ保存」する印)。
         # ``match`` のヒット統計は含めない — 毎ターン変わる値で毎ターン書くのを
         # 避ける (次の実変更時にまとめて永続化される)。
@@ -510,6 +513,7 @@ class LearnedPatternStore:
         """
         LearnedPatternRepository.save(
             self._patterns, path, last_decay_at=self._last_decay_at,
+            extra=self._payload_extra,
         )
         self._dirty = False
 
@@ -526,9 +530,10 @@ class LearnedPatternStore:
         if result is None:
             return
         loaded, meta = result
-        stored_decay = meta.get("last_decay_at")
-        if isinstance(stored_decay, (int, float)) and stored_decay > 0:
-            self._last_decay_at = float(stored_decay)
+        self._payload_extra = meta["_extra"]
+        stored_decay = utc_to_epoch(meta.get("last_decay_at"))
+        if stored_decay is not None:
+            self._last_decay_at = stored_decay
 
         self._patterns.clear()
         for key, pattern in loaded.items():

@@ -230,7 +230,7 @@ class FeedbackPipe:
             m_obj = self._parse_object_json(marker.object)
             if m_obj.get("status") != "done":
                 continue
-            task_id = str(m_obj.get("task_id", ""))
+            task_id = str(m_obj.get("task_id") or "")
             if not task_id:
                 continue
             related_arts = artifacts_by_task.get(task_id, [])
@@ -242,7 +242,7 @@ class FeedbackPipe:
             if not passed_arts:
                 continue
 
-            query = task_titles_by_id.get(task_id) or str(m_obj.get("title", ""))
+            query = task_titles_by_id.get(task_id) or str(m_obj.get("title") or "")
             if not query:
                 continue
             response_parts = [

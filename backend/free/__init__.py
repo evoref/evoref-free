@@ -42,7 +42,6 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.learning.learning import router as learning_router
     from backend.free.api.learning.optimize import router as optimize_router
     from backend.free.api.learning.fewshot import router as fewshot_router
-    from backend.free.api.system.data import router as data_router
     from backend.free.api.system.export_file import router as export_file_router
     from backend.free.api.system.diffs import router as diffs_router
     from backend.free.api.system.server_control import router as server_control_router
@@ -69,7 +68,6 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(learning_router)
     app.include_router(optimize_router)
     app.include_router(fewshot_router)
-    app.include_router(data_router)
     app.include_router(export_file_router)
     app.include_router(diffs_router)
     app.include_router(server_control_router)

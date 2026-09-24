@@ -4,10 +4,9 @@ EvorefMem 統合仕様 で追加される `local/state.json` を扱う
 プロジェクト ID のキャッシュ・モード保持・alias 上書き・最終アクセス時刻
 追跡を一元化する。
 
-ファイル例 (`local/state.json`)::
+ファイル例 (`local/state.json` の封筒の ``payload``、形式 ``state``)::
 
     {
-      "schema_version": 1,
       "current_project_id": "git_abc123def456",
       "mode": "create",
       "project_aliases": {
@@ -27,35 +26,33 @@ EvorefMem 統合仕様 で追加される `local/state.json` を扱う
 
 設計原則 (CLAUDE.md / .claude/rules/backend.md):
 - 純粋関数 (`serialize` / `deserialize`) と I/O (`load` / `save`) を分離
-- 書き込みはアトミック (一時ファイル + replace) でクラッシュ耐性
-- 後方互換不要
+- 書き込みは封筒付きでアトミック (:class:`backend.io.versioned.VersionedJsonFile`)。
+  G1 の封筒でない / 新しい版のファイルは読まず書き戻さない (readonly)、
+  壊れたファイルは ``state.json.corrupt-<stamp>`` へ退避して既定値で続ける
 - 180 日無アクセスのアーカイブ提案は **提案のみ**
 """
 
 from __future__ import annotations
 
-import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from backend.free.core.session_mode import normalize_session_mode
-from backend.io import AtomicWriter
+from backend.io.codec import CodecError, codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
+from backend.utils import epoch_to_utc, utc_to_epoch
 
 logger = get_logger("memory.local_state_store")
 
 
-SCHEMA_VERSION = 1
 DEFAULT_MODE: "MemoryMode" = "chat"
 DEFAULT_INACTIVE_DAYS = 180
 
 MemoryMode = Literal["chat", "create"]
-
-
-class LocalStateVersionError(RuntimeError):
-    """state.json が対応版より新しい (旧版で書き戻すと壊す)。"""
 
 
 @dataclass
@@ -68,20 +65,68 @@ class ProjectMeta:
     first_seen_at: float = 0.0
     last_accessed_at: float = 0.0
     archived: bool = False
+    #: 読み戻したときの、この版が知らないキー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
 
 
 @dataclass
 class LocalState:
     """`local/state.json` の in-memory 表現"""
 
-    schema_version: int = SCHEMA_VERSION
     current_project_id: str | None = None
     mode: MemoryMode = DEFAULT_MODE
     project_aliases: dict[str, str] = field(default_factory=dict)
     projects: dict[str, ProjectMeta] = field(default_factory=dict)
-    #: ディスク上のファイルが未対応の新しい版で、書き戻すと壊す状態。
+    #: ディスク上のファイルが書き戻すと壊す状態 (新しい版 / G1 の封筒でない)。
     #: :meth:`LocalStateStore.save` はこの印が立っていたら書き込まない。
     readonly: bool = False
+    #: payload の未知キー (書き戻しでそのまま戻す)。
+    _extra: dict[str, Any] | None = None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 永続形 (コーデックの表、c_05 §0.5.2)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@persisted()
+@dataclass
+class ProjectRecord:
+    """``projects`` の 1 項目の永続形 (時刻は ISO 8601 UTC μs ``Z``、作業型は epoch 秒)。"""
+
+    project_id: str = ""
+    path: str | None = None
+    remote: str | None = None
+    first_seen_at: str | None = None
+    last_accessed_at: str | None = None
+    archived: bool = False
+    _extra: dict[str, Any] | None = None
+
+
+@persisted()
+@dataclass
+class StatePayload:
+    """``state.json`` の payload。"""
+
+    current_project_id: str | None = None
+    mode: str = DEFAULT_MODE
+    project_aliases: dict[str, str] = field(default_factory=dict)
+    projects: dict[str, ProjectRecord] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
+
+
+_PROJECT_CODEC = codec_for(ProjectRecord)
+_PAYLOAD_CODEC = codec_for(StatePayload)
+
+STATE_FORMAT = register_format(FormatSpec(
+    format_id="state",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/state.json",
+    retention="rewritten in place; projects are archived, not deleted",
+    records=(StatePayload,),
+))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -91,80 +136,63 @@ class LocalState:
 
 def serialize(state: LocalState) -> dict[str, Any]:
     """`LocalState` を JSON-serializable な dict にする純粋関数"""
-    return {
-        "schema_version": state.schema_version,
-        "current_project_id": state.current_project_id,
-        "mode": state.mode,
-        "project_aliases": dict(state.project_aliases),
-        "projects": {pid: asdict(meta) for pid, meta in state.projects.items()},
-    }
+    return _PAYLOAD_CODEC.encode(StatePayload(
+        current_project_id=state.current_project_id,
+        mode=state.mode,
+        project_aliases=dict(state.project_aliases),
+        projects={
+            pid: ProjectRecord(
+                project_id=meta.project_id,
+                path=meta.path,
+                remote=meta.remote,
+                first_seen_at=epoch_to_utc(meta.first_seen_at),
+                last_accessed_at=epoch_to_utc(meta.last_accessed_at),
+                archived=meta.archived,
+                _extra=meta._extra,
+            )
+            for pid, meta in state.projects.items()
+        },
+        _extra=state._extra,
+    ))
 
 
 def deserialize(data: dict[str, Any] | None) -> LocalState:
     """JSON dict から `LocalState` を再構築する純粋関数。
 
-    壊れたフィールドは既定値で埋める (起動時に state.json を破壊しない)。
-    schema_version が想定外なら警告ログを出すが例外は投げない。
+    形の崩れたプロジェクトの項目だけを飛ばし、読めない時刻は未設定 (0.0) として
+    読む。それ以外の型の違う値は :class:`~backend.io.codec.CodecError` (壊れた
+    ファイル)。版の判定は封筒 (``format_version``) が持つので、ここでは見ない。
     """
     if not isinstance(data, dict):
         return LocalState()
-
-    raw_version = data.get("schema_version")
-    version = raw_version if isinstance(raw_version, int) else SCHEMA_VERSION
-    if version > SCHEMA_VERSION:
-        # 新しい版のファイルを旧版として読むと、知らないフィールドを落としたまま
-        # ``save`` が旧版で書き戻して新版の内容を破壊する (2026-09-05 監査)。
-        # 読まずに既定へ倒し、ファイルはそのまま残す (次の save は別途ガードする)。
-        raise LocalStateVersionError(
-            f"local state schema_version {version} is newer than supported "
-            f"{SCHEMA_VERSION}; refusing to downgrade the file",
-        )
-    if version != SCHEMA_VERSION:
-        logger.warning(
-            "local state schema_version mismatch: expected=%s actual=%s. "
-            "Loading with default fields.",
-            SCHEMA_VERSION, version,
-        )
-
-    mode_raw = data.get("mode")
-    mode: MemoryMode = normalize_session_mode(mode_raw, default=DEFAULT_MODE)
-
-    current = data.get("current_project_id")
-    current_pid = current if isinstance(current, str) and current else None
-
-    aliases_raw = data.get("project_aliases") or {}
-    aliases: dict[str, str] = {}
-    if isinstance(aliases_raw, dict):
-        for k, v in aliases_raw.items():
-            if isinstance(k, str) and isinstance(v, str):
-                aliases[k] = v
+    projects_raw = data.get("projects") or {}
+    if not isinstance(projects_raw, dict):
+        raise CodecError("StatePayload.projects: expected an object")
+    payload = _PAYLOAD_CODEC.decode({k: v for k, v in data.items() if k != "projects"})
 
     projects: dict[str, ProjectMeta] = {}
-    projects_raw = data.get("projects") or {}
-    if isinstance(projects_raw, dict):
-        for pid, meta_raw in projects_raw.items():
-            if not isinstance(pid, str) or not isinstance(meta_raw, dict):
-                continue
-            try:
-                meta = ProjectMeta(
-                    project_id=str(meta_raw.get("project_id") or pid),
-                    path=meta_raw.get("path"),
-                    remote=meta_raw.get("remote"),
-                    first_seen_at=float(meta_raw.get("first_seen_at") or 0.0),
-                    last_accessed_at=float(meta_raw.get("last_accessed_at") or 0.0),
-                    archived=bool(meta_raw.get("archived", False)),
-                )
-            except (TypeError, ValueError) as exc:
-                logger.warning("Skipping malformed project meta %s: %s", pid, exc)
-                continue
-            projects[pid] = meta
+    for pid, meta_raw in projects_raw.items():
+        try:
+            record = _PROJECT_CODEC.decode(meta_raw)
+        except CodecError as exc:
+            logger.warning("Skipping malformed project meta %s: %s", pid, exc)
+            continue
+        projects[pid] = ProjectMeta(
+            project_id=record.project_id or pid,
+            path=record.path,
+            remote=record.remote,
+            first_seen_at=utc_to_epoch(record.first_seen_at, 0.0),
+            last_accessed_at=utc_to_epoch(record.last_accessed_at, 0.0),
+            archived=record.archived,
+            _extra=record._extra,
+        )
 
     return LocalState(
-        schema_version=SCHEMA_VERSION,
-        current_project_id=current_pid,
-        mode=mode,
-        project_aliases=aliases,
+        current_project_id=payload.current_project_id or None,
+        mode=normalize_session_mode(payload.mode, default=DEFAULT_MODE),
+        project_aliases=payload.project_aliases,
         projects=projects,
+        _extra=payload._extra,
     )
 
 
@@ -173,50 +201,55 @@ def deserialize(data: dict[str, Any] | None) -> LocalState:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+class _LocalStateFile(VersionedJsonFile):
+    """``state.json`` の封筒 (形式 ``state``)。"""
+
+    FORMAT = STATE_FORMAT
+    RAISE_ON_SAVE_ERROR = True
+    _state_logger = logger
+
+    def __init__(self, path: Path, state: LocalState | None = None) -> None:
+        super().__init__(path)
+        self.state = state if state is not None else LocalState()
+
+    def _to_payload(self) -> dict[str, Any]:
+        return serialize(self.state)
+
+    def _from_payload(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            raise TypeError("local state payload must be an object")
+        self.state = deserialize(payload)
+
+
 class LocalStateStore:
     """`local/state.json` の純粋永続化担当"""
 
     @staticmethod
     def load(path: Path) -> LocalState:
-        """state.json を読み込む。存在しなければ既定値で返す"""
-        if not path.exists():
-            return LocalState()
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning(
-                "Failed to read local state %s: %s. Falling back to defaults.",
-                path, exc,
-            )
-            return LocalState()
-        try:
-            return deserialize(raw)
-        except LocalStateVersionError as exc:
-            logger.error(
-                "Refusing to load %s: %s. Running with defaults; "
-                "the file is left untouched.", path, exc,
-            )
-            return LocalState(readonly=True)
+        """state.json を読み込む。存在しなければ既定値で返す。
+
+        新しい版 / G1 の封筒でないファイルは読まず ``readonly=True`` の既定値を
+        返す (ファイルはそのまま残る)。壊れたファイルは退避して既定値を返す。
+        """
+        f = _LocalStateFile(path)
+        if f.load():
+            return f.state
+        return LocalState(readonly=f.readonly)
 
     @staticmethod
     def save(path: Path, state: LocalState) -> None:
-        """state.json をアトミックに書き出す (:class:`AtomicWriter` 委譲)。
+        """state.json を封筒付きでアトミックに書き出す。
 
-        親ディレクトリは自動作成。書き込み失敗時は tmp ファイルが除去される
-        (詳細は :mod:`backend.io.atomic` 参照)。Windows ``PermissionError``
-        は :mod:`backend.io._retry` の retry ポリシーで吸収される。
+        親ディレクトリは自動作成。``state.readonly`` なら書き込まない。
+        書き込み失敗は送出する (呼出側の sleep-time Step 10 が握る)。
         """
         if state.readonly:
             logger.warning(
-                "Skipping local state save: on-disk file is a newer schema "
-                "version and would be downgraded (%s)", path,
+                "Skipping local state save: the on-disk file must not be "
+                "overwritten (%s)", path,
             )
             return
-        payload = json.dumps(
-            serialize(state), ensure_ascii=False, indent=2, sort_keys=True,
-        )
-        with AtomicWriter(path) as f:
-            f.write(payload)
+        _LocalStateFile(path, state).save()
         logger.debug("Saved local state: %s", path)
 
 

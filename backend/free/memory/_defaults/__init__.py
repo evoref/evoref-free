@@ -17,11 +17,25 @@ from __future__ import annotations
 
 from pathlib import Path
 
-__all__ = ["DEFAULT_TRIGGERS_DIR", "resolve_trigger_file"]
+from backend.io.format_registry import FormatSpec, register_format
+
+__all__ = ["DEFAULT_TRIGGERS_DIR", "TRIGGER_OVERRIDE_FORMAT", "resolve_trigger_file"]
 
 
 #: 同梱デフォルト辞書ディレクトリ (package-relative)。
 DEFAULT_TRIGGERS_DIR: Path = Path(__file__).resolve().parent / "triggers"
+
+#: 利用者が置く上書き (``PathResolver.LAYOUT["triggers_dir"]``、c_05 §0.4.9)。
+TRIGGER_OVERRIDE_FORMAT = register_format(FormatSpec(
+    format_id="overrides.triggers",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/overrides/triggers/<name>.yaml",
+    retention="written by the user; never pruned",
+    export=True,
+    encodings=("yaml",),
+))
 
 
 def resolve_trigger_file(

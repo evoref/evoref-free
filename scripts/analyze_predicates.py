@@ -22,7 +22,7 @@
     python scripts/analyze_predicates.py --jaccard 0.9 --json out.json
     python scripts/analyze_predicates.py --holes --hole-sim 0.75
 
-発話プールの既定は ``local/learning/*/experience.json`` の ``query``。監査の
+発話プールの既定はデータ根の ``store/learning/*/experience.jsonl`` の ``query``。監査の
 results.jsonl / 任意の JSONL (``query`` か ``text`` キー) / 1 行 1 発話のテキスト
 ファイルも ``--texts`` で足せる。
 """
@@ -252,9 +252,10 @@ def _iter_json_records(path: Path) -> Iterable[dict]:
             if isinstance(rec, dict):
                 yield rec
         return
-    # 会話履歴 (local/history/<month>/<session>.json) は turns[] を持つ。
-    if isinstance(doc, dict) and isinstance(doc.get("turns"), list):
-        for turn in doc["turns"]:
+    # 会話履歴 (<data_root>/store/history/<month>/<session>.json) は封筒の payload に turns[] を持つ。
+    session = payload if isinstance(payload, dict) else doc
+    if isinstance(session, dict) and isinstance(session.get("turns"), list):
+        for turn in session["turns"]:
             if isinstance(turn, dict) and turn.get("role") == "user":
                 yield turn
 
@@ -304,18 +305,23 @@ def load_utterances(
     return out[:limit] if limit else out
 
 
-def default_text_sources() -> list[Path]:
-    """既定の発話プール: 経験バッファと会話履歴 (どちらも ``local/`` の実データ)。
+def default_text_sources(data_root: str | None = None) -> list[Path]:
+    """既定の発話プール: 経験バッファと会話履歴 (どちらもデータ根の実データ)。
 
-    経験バッファ (``experience.json``) は保持方針で数十件に絞られるため、
-    ``local/history/<month>/*.json`` の user ターンも足す。監査の
-    ``results.jsonl`` を混ぜたいときは ``--texts`` で明示する。
+    経験バッファ (``experience.jsonl``) は保持方針で数十件に絞られるため、
+    ``<data_root>/store/history/<month>/*.json`` の user ターンも足す。監査の
+    ``results.jsonl`` を混ぜたいときは ``--texts`` で明示する。データ根は
+    ``--data-root`` → ``EVOREF_DATA_ROOT`` → ``<repo>/userdata``。
     """
+    from backend.config import PathResolver
+    from backend.data_root import resolve_data_root
+
+    resolver = PathResolver({}, REPO_ROOT, data_root=resolve_data_root(data_root, root=REPO_ROOT))
     out: list[Path] = []
-    learning = REPO_ROOT / "local" / "learning"
+    learning = resolver.resolve_local("learning_dir")
     if learning.exists():
-        out.extend(sorted(learning.glob("*/experience.json")))
-    history = REPO_ROOT / "local" / "history"
+        out.extend(sorted(learning.glob("*/experience.jsonl")))
+    history = resolver.resolve_local("history_dir")
     if history.exists():
         out.extend(sorted(history.glob("*/*.json")))
     return out
@@ -529,15 +535,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--holes", action="store_true", help="語形の穴の候補も出す")
     ap.add_argument("--hole-sim", type=float, default=0.8, help="穴判定の類似度")
     ap.add_argument("--json", type=Path, default=None, help="結果を JSON で保存")
+    ap.add_argument(
+        "--data-root", default=None,
+        help="既定の発話プールを読むデータ根 (既定: EVOREF_DATA_ROOT → <repo>/userdata)",
+    )
     args = ap.parse_args(argv)
 
-    sources = [Path(p) for p in args.texts] or default_text_sources()
+    sources = [Path(p) for p in args.texts] or default_text_sources(args.data_root)
     keys = tuple(args.key) if args.key else DEFAULT_TEXT_KEYS
     texts = load_utterances(sources, limit=args.limit, keys=keys)
     if not texts:
         print(
             "発話プールが空です。--texts で監査ログを指定するか、"
-            "local/learning/*/experience.json を用意してください。",
+            "データ根の store/learning/*/experience.jsonl を用意してください。",
             file=sys.stderr,
         )
         return 2

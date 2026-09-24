@@ -53,8 +53,8 @@ def _make_rotating_handler(
     ``RotatingFileHandler`` は ``delay`` 未指定だとコンストラクタで即座に
     ファイルを開くため、開けないと ``setup_logging()` が例外を上げてアプリが
     **起動不能** になる。Windows では削除保留 (delete pending) のファイルが
-    同名の再作成をブロックするため、``scripts/reset_local_data.py``
-    (UI の初期化ボタン) が ``local/`` を wipe した直後にこれを踏みうる
+    同名の再作成をブロックするため、データ根の初期化 (``evoref reset``、
+    UI の初期化ボタン) でログを消した直後にこれを踏みうる
     (2026-08-14 に実機で再現: ``PermissionError`` → ``Application startup failed``)。
 
     ログが 1 本落ちることとアプリが起動しないことは重大さが桁違いなので、
@@ -213,7 +213,7 @@ def setup_logging(
             ソール OFF)、``"debug"`` / ``"investigate"`` は backend.log
             DEBUG+ + コンソール ON、``"evolve"`` は backend.log DEBUG+ だが
             コンソール OFF (loop 実行を妨げないため)。
-        project_root: ログディレクトリ (`local/logs/`) のベース。
+        project_root: インストール根 (ログはそのデータ根の `logs/` に書く)。
     """
     if project_root is None:
         project_root = Path(__file__).parent.parent
@@ -228,8 +228,10 @@ def setup_logging(
         # evolve は loop 自己学習向けで console を出すと loop 実行を妨げる
         console_enabled = develop_level in ("debug", "investigate")
 
-    # ログディレクトリ作成
-    log_dir = project_root / "local" / "logs"
+    # ログディレクトリ作成 (データ根の logs/、c_03 §10.1)
+    from backend.config import resolve_data_path
+
+    log_dir = resolve_data_path("logs_dir", project_root)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     max_bytes = _log_max_bytes(develop_level)
@@ -316,13 +318,15 @@ def setup_cli_logging(
 ) -> None:
     """CLI 専用ロガーを初期化し cli.log に出力する
 
-    backend.cli 名前空間のログを local/logs/cli.log へ書き込む。
+    backend.cli 名前空間のログを <data_root>/logs/cli.log へ書き込む。
     propagate=False でバックエンド側 (backend.log) への混在を防ぐ。
     """
     if project_root is None:
         project_root = Path(__file__).parent.parent
 
-    log_dir = project_root / "local" / "logs"
+    from backend.config import resolve_data_path
+
+    log_dir = resolve_data_path("logs_dir", project_root)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"

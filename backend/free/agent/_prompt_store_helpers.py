@@ -17,13 +17,18 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
+from typing import Any, TypeVar
 
 from backend.io import atomic_write_text
+from backend.io.codec import codec_for
+from backend.io.format_registry import FormatSpec
+from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 
 logger = get_logger("agent.prompt_store")
+
+T = TypeVar("T")
 
 __all__ = [
     "parse_version_from_filename",
@@ -36,8 +41,8 @@ __all__ = [
     "write_body",
     "body_exists",
     "meta_file_path",
-    "read_meta_dict",
-    "write_meta_dict",
+    "read_meta",
+    "write_meta",
 ]
 
 
@@ -175,7 +180,7 @@ def write_body(prompt_dir: Path, key_prefix: str, content: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# メタ (.meta.json) ファイル I/O — dict ベースで dataclass 非依存
+# メタ (.meta.json) ファイル I/O — 永続 dataclass (:mod:`backend.io.codec`) で読み書き
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -184,35 +189,41 @@ def meta_file_path(prompt_dir: Path, key_prefix: str) -> Path:
     return prompt_dir / f"{key_prefix}.meta.json"
 
 
-def read_meta_dict(prompt_dir: Path, key_prefix: str) -> dict | None:
-    """メタファイルを JSON として読み込み dict を返す。
+def _meta_file(prompt_dir: Path, key_prefix: str, record: type[Any], spec: FormatSpec) -> VersionedPayloadFile:
+    """ペイロードを ``record`` (永続 dataclass) で読み書きするメタファイル。
 
-    - ファイルが存在しない場合: `None`
-    - パース失敗時: 警告ログを出して `None`
-
-    呼び出し側 (各 PromptManager) は受け取った dict を自身の dataclass に
-    ハイドレートする責務を負う (この関数は dataclass を知らない)。
+    型の合わないペイロードは読み込みで ``corrupt`` (退避) になる。未知キーは各階層の
+    ``_extra`` に残り、書き戻しで元の位置へ戻る。
     """
-    path = meta_file_path(prompt_dir, key_prefix)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("Failed to load prompt meta from %s: %s", path, e)
-        return None
-    if not isinstance(data, dict):
-        logger.warning("Prompt meta at %s is not a JSON object, ignoring", path)
-        return None
-    return data
-
-
-def write_meta_dict(prompt_dir: Path, key_prefix: str, data: dict) -> None:
-    """メタ dict を JSON として書き込む。親ディレクトリは自動作成。"""
-    prompt_dir.mkdir(parents=True, exist_ok=True)
-    path = meta_file_path(prompt_dir, key_prefix)
-    atomic_write_text(
-        path,
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    codec = codec_for(record)
+    return VersionedPayloadFile(
+        spec, meta_file_path(prompt_dir, key_prefix), component="prompt_store",
+        state_logger=logger, decode=codec.decode, encode=codec.encode,
     )
+
+
+def read_meta(prompt_dir: Path, key_prefix: str, record: type[T], *, spec: FormatSpec) -> T | None:
+    """メタファイル (``spec`` の版付き封筒) を ``record`` の値として読む。
+
+    ファイルが無い / 読めない (G1 の封筒でない・版が新しい・壊れている・型が合わない)
+    場合は ``None``。readonly / 退避の扱いは :class:`VersionedPayloadFile` に従う。
+    """
+    f = _meta_file(prompt_dir, key_prefix, record, spec)
+    if not f.load():
+        return None
+    return f.payload
+
+
+def write_meta(prompt_dir: Path, key_prefix: str, meta: Any, *, spec: FormatSpec) -> None:
+    """``meta`` (永続 dataclass) を ``spec`` の版付き封筒で書き込む。親ディレクトリは自動作成。
+
+    書く前にディスク上のファイルを分類する — G1 の封筒でない / 版が新しいファイルは
+    上書きせず WARNING を出して見送り、壊れたファイルは退避してから書く。
+    書き込みの失敗は従来どおり送出する。
+    """
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    f = _meta_file(prompt_dir, key_prefix, type(meta), spec)
+    f.RAISE_ON_SAVE_ERROR = True
+    f.load()
+    f.payload = meta
+    f.save()

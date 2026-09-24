@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --shared-path <path>  NAS shared path for multi-PC setup"
             echo "                        Uses shared models/ (no model checks)"
             echo "  --force               Force reinstall (recreate .venv, reinstall packages,"
-            echo "                        overwrite config.yaml)"
+            echo "                        overwrite config.yaml; the data root and local/ are kept)"
             echo "  -h, --help            Show this help message"
             exit 0
             ;;
@@ -154,6 +154,13 @@ if [[ -n "$SHARED_PATH" ]] && [ -f "config.yaml" ]; then
     echo "  Updated config.yaml with shared paths"
 fi
 
+# 版 (config_version) の無い旧形式の config.yaml は一度だけ直す
+# (config.yaml.g0-<stamp> へ退避)。失敗しても evoref-ctl start が再試行する。
+if [ -f "config.yaml" ]; then
+    python -m backend.free.cli.main config normalize --if-needed \
+        || echo "  WARNING: config.yaml was not normalized; evoref-ctl start will retry"
+fi
+
 # ── 5. モデル配置チェック ──
 echo "[5/6] Checking models..."
 if [[ -n "$SHARED_PATH" ]]; then
@@ -164,8 +171,8 @@ else
     python scripts/download_model.py || true
 fi
 
-# ── 6. ローカルディレクトリ ──
-echo "[6/6] Creating local directories..."
+# ── 6. データ根のディレクトリ ──
+echo "[6/6] Creating data root directories..."
 ensure_directories
 echo "  Done"
 

@@ -2,24 +2,76 @@
 
 設計書 f_08_long_form_generation.md §3.3.1 準拠。
 コンテキストサイズ × 比率で各スロットの予算を算出する。
-比率テーブルは local/prompts/token_budget.json に保存し、
+比率テーブルはプロンプトディレクトリの token_budget.json に保存し、
 Level 1 進化させる
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from backend.exceptions import InsufficientContextError
 from backend.free.generation.models import ContentType
-from backend.io import atomic_write_text
+from backend.io.codec import codec_for, persisted
+from backend.io.format_registry import FormatSpec, register_format
+from backend.io.versioned import VersionedPayloadFile
 from backend.utils import estimate_tokens
 
 logger = logging.getLogger("backend.free.generation.token_budget")
+
+
+@persisted()
+@dataclass
+class SlotRatios:
+    """1 つの ``<strategy>_<content_type>`` の比率表 (スロット → ``[比率, 最低保証]``)。
+
+    スロットの追加は任意フィールドの追加 (同じ版)。この版が知らないスロットは
+    ``_extra`` に残り、書き戻しで元の位置へ戻る (予算には使わない)。
+    """
+
+    system_prompt: list[Any]
+    skeleton_or_summary: list[Any]
+    short_term: list[Any]
+    unit_spec: list[Any]
+    rag_chunks: list[Any]
+    _extra: dict[str, Any] | None = None
+
+
+@persisted()
+@dataclass
+class TokenBudgetFile:
+    """``token_budget.json`` のペイロード。"""
+
+    updated_at: str = ""
+    source: str = "learned"
+    ratios: dict[str, SlotRatios] = field(default_factory=dict)
+    _extra: dict[str, Any] | None = None
+
+
+#: ``token_budget.json`` の形式。ペイロードは :class:`TokenBudgetFile`。
+TOKEN_BUDGET_FORMAT = register_format(FormatSpec(
+    format_id="learning.token_budget",
+    version=1,
+    klass="sot",
+    writers=frozenset({"free"}),
+    path_key="store/learning/<mk>/prompts/token_budget.json",
+    retention="one per partition",
+    export=True,
+    records=(TokenBudgetFile,),
+))
+
+
+def _ratios_file(prompts_dir: Path) -> VersionedPayloadFile:
+    """ペイロードを :class:`TokenBudgetFile` で読み書きする (型の合わないファイルは退避)。"""
+    codec = codec_for(TokenBudgetFile)
+    return VersionedPayloadFile(
+        TOKEN_BUDGET_FORMAT, prompts_dir / "token_budget.json",
+        component="token_budget", state_logger=logger,
+        decode=codec.decode, encode=codec.encode,
+    )
 
 # ── デフォルト比率テーブル ──
 # 各スロット: [比率, 最低保証トークン数]
@@ -95,54 +147,42 @@ def truncate_tail(text: str, token_limit: int) -> str:
     return text[-char_limit:]
 
 
+def read_budget_file(prompts_dir: Path) -> TokenBudgetFile | None:
+    """``<prompts_dir>/token_budget.json`` を読む。無い / 読めないなら ``None``。"""
+    f = _ratios_file(prompts_dir)
+    return f.payload if f.load() else None
+
+
+def write_budget_file(budget: TokenBudgetFile, prompts_dir: Path) -> None:
+    """``budget`` を ``<prompts_dir>/token_budget.json`` へ書く。
+
+    ディスク上のファイルが G1 の封筒でない / 版が新しいなら上書きしない (WARNING)。
+    書き込みの失敗は送出する。
+    """
+    prompts_dir.mkdir(parents=True, exist_ok=True)
+    f = _ratios_file(prompts_dir)
+    f.RAISE_ON_SAVE_ERROR = True
+    f.load()
+    f.payload = budget
+    f.save()
+
+
 def load_ratios(
     prompts_dir: Path | None = None,
 ) -> dict[str, dict[str, list[float | int]]]:
-    """local/prompts/token_budget.json から比率テーブルを読み込む
+    """``<prompts_dir>/token_budget.json`` から比率テーブルを読み込む
 
-    ファイルが存在しない場合はデフォルトを返す。
+    ファイルが存在しない / 読めない (G1 の封筒でない・版が新しい・壊れている・型が
+    合わない) 場合はデフォルトを返す。値は ``{key: {slot: [比率, 最低保証]}}`` で、
+    この版が知らないスロットもそのまま載る (予算の計算は既知のスロットだけを引く)。
     """
     if prompts_dir is None:
         return DEFAULT_RATIOS.copy()
-
-    path = prompts_dir / "token_budget.json"
-    if not path.exists():
+    budget = read_budget_file(prompts_dir)
+    if budget is None:
         return DEFAULT_RATIOS.copy()
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        ratios = data.get("ratios", DEFAULT_RATIOS.copy())
-    except (json.JSONDecodeError, KeyError):
-        logger.warning("Failed to load token_budget.json, using defaults")
-        return DEFAULT_RATIOS.copy()
-    return _drop_unknown_slots(ratios)
-
-
-def _drop_unknown_slots(
-    ratios: dict[str, dict[str, list[float | int]]],
-) -> dict[str, dict[str, list[float | int]]]:
-    """撤去済みスロット名 (``plan_overview`` 等) が残る比率テーブルを無害化する。
-
-    ``token_budget.json`` は Level 1 進化対象で、撤去済みスロット名を含んだ
-    旧テーブルが残っている可能性がある。未知スロット名は無視して 1 行
-    WARNING を出す。既知スロットを揃えられない ``(content_type, strategy)``
-    キーはそのエントリごと落とし、``_resolve_ratios`` の
-    ``DEFAULT_RATIOS[key]`` フォールバックへ安全に縮退させる
-    (部分的に古いキーだけを残すと ``from_context_size`` が KeyError になる)。
-    """
-    unknown: set[str] = set()
-    cleaned: dict[str, dict[str, list[float | int]]] = {}
-    for key, slots in ratios.items():
-        kept = {slot: value for slot, value in slots.items() if slot in _SLOT_NAMES}
-        unknown |= set(slots) - set(kept)
-        if set(kept) == set(_SLOT_NAMES):
-            cleaned[key] = kept
-    if unknown:
-        logger.warning(
-            "token_budget.json contains unknown slot name(s), ignoring: %s",
-            sorted(unknown),
-        )
-    return cleaned
+    slots = codec_for(SlotRatios)
+    return {key: slots.encode(row) for key, row in budget.ratios.items()}
 
 
 def save_ratios(
@@ -151,22 +191,23 @@ def save_ratios(
     *,
     source: str = "learned",
 ) -> None:
-    """local/prompts/token_budget.json に比率テーブルを保存"""
+    """``<prompts_dir>/token_budget.json`` に比率テーブルを保存
+
+    ディスク上のファイルが G1 の封筒でない / 版が新しいなら上書きしない (WARNING)。
+    読めたファイルのトップの未知キーは残す。書き込みの失敗は従来どおり送出する。
+    """
     from backend.utils import utc_now
 
-    prompts_dir.mkdir(parents=True, exist_ok=True)
-    path = prompts_dir / "token_budget.json"
-    data = {
-        "version": 1,
-        "updated_at": utc_now(),
+    current = read_budget_file(prompts_dir)
+    slots = codec_for(SlotRatios)
+    write_budget_file(TokenBudgetFile(
+        updated_at=utc_now(),
         # 呼び手が何を書いているかを記録する。以前は path.exists() から
         # 決めており、2 回目以降は既定値を書き戻しても "learned" になった。
-        "source": source,
-        "ratios": ratios,
-    }
-    atomic_write_text(
-        path, json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
+        source=source,
+        ratios={key: slots.decode(row) for key, row in ratios.items()},
+        _extra=current._extra if current is not None else None,
+    ), prompts_dir)
 
 
 def _resolve_ratios(

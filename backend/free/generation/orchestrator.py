@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
 from backend.config import resolve_context_size_for_mode
+from backend.free.core.turn_text import neutralize_frame_markers
 from backend.free.generation.code_repair import CodeRepairer, infer_language
 from backend.free.generation.import_wirer import wire_imports
 from backend.free.generation.code_skeleton import CodeSkeleton, update_skeleton
@@ -1498,7 +1499,7 @@ class LongFormOrchestrator:
                     for chunk_text, score, source in results[:RAG_MAX_CHUNKS]:
                         rag_parts.append(
                             f"[{source}] (score={score:.2f})\n"
-                            f"{chunk_text[:RAG_CHUNK_CHAR_CAP]}"
+                            f"{neutralize_frame_markers(chunk_text[:RAG_CHUNK_CHAR_CAP])}"
                         )
                     context["rag"] = "\n---\n".join(rag_parts)
             except Exception as e:
@@ -1528,7 +1529,7 @@ class LongFormOrchestrator:
         parts: list[str] = []
         used_tokens = 0
         for chunk_id, score, text in scored_chunks[:RAG_MAX_CHUNKS]:
-            snippet = (text or "")[:RAG_CHUNK_CHAR_CAP]
+            snippet = neutralize_frame_markers((text or "")[:RAG_CHUNK_CHAR_CAP])
             if not snippet:
                 continue
             part = f"[{chunk_id}] (score={score:.2f})\n{snippet}"
@@ -1582,7 +1583,8 @@ class LongFormOrchestrator:
                 logger.warning("per-unit RAG search failed: %s", e)
                 return ""
             return "\n---\n".join(
-                f"[{source}] (score={score:.2f})\n{text[:RAG_CHUNK_CHAR_CAP]}"
+                f"[{source}] (score={score:.2f})\n"
+                f"{neutralize_frame_markers(text[:RAG_CHUNK_CHAR_CAP])}"
                 for text, score, source in hits[:top_k]
             )
 

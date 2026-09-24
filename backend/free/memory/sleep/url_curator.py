@@ -15,9 +15,10 @@ CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定�
 - 新 FactType を追加せず ``world_fact`` を流用する (CLAUDE.md §3 / §6 #2)。
 - subject = ``idx.url.<host>.<sha1_12(url_normalized)>``。同一 URL の
   決定論的キーで既存 fact を引き当て可能。
-- ``_extra`` に URL 専用メタ (url / fetch_count / score_history /
-  score_avg / last_query 等) を載せる。SemanticFact の round-trip 機能で
-  そのまま JSONL に保持される。
+- URL 専用メタ (url / fetch_count / score_history / score_avg /
+  last_query 等) はレコードの ``attrs`` に載る
+  (``semantic.fact.FACT_CURATOR_ATTR_FIELDS``)。作業型では ``SemanticFact._extra``
+  から読み書きし、更新は変わったキーだけの ``patch`` になる。
 - ``scorer_client is None`` (ベース未接続) では何もせず ``0`` を返す。
 """
 
@@ -48,6 +49,7 @@ from backend.free.memory.sleep.curation_backoff import (
 )
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
+from backend.utils import epoch_to_utc
 
 if TYPE_CHECKING:
     from backend.free.memory.semantic.store import SemanticFactStore
@@ -204,7 +206,7 @@ def _record_score(
             "score_history": history,
             "score_avg": round(score_avg, 4),
             "score_count": len(history),
-            "last_fetched_at": now,
+            "last_fetched_at": epoch_to_utc(now),
             "last_query": _truncate(redact_for_store(query), 200),
         },
     )
@@ -439,7 +441,7 @@ async def curate_url_facts(
                         "score_history": [round(float(score), 4)],
                         "score_avg": round(float(score), 4),
                         "score_count": 1,
-                        "last_fetched_at": now,
+                        "last_fetched_at": epoch_to_utc(now),
                         "last_query": _truncate(
                             redact_for_store(user_note.content), 200,
                         ),
