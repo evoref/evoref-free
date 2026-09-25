@@ -66,7 +66,7 @@ class StoreNotFound(RuntimeError):
 
 
 def resolve_memory_dir(memory_dir: str | None, data_root: str | None = None) -> Path:
-    """``<data_root>/store/memory/`` を解決する。見つからなければ理由付きで落とす。
+    """``<data_root>/g1/store/memory/`` を解決する。見つからなければ理由付きで落とす。
 
     ``--memory-dir`` が最優先。無ければ ``--data-root`` (→ ``EVOREF_DATA_ROOT`` →
     ``<repo>/userdata``) から ``PathResolver`` で引く。
@@ -136,7 +136,7 @@ def purge(
     """条件に一致する live ファクトを取り下げ、対象件数を返す。
 
     Args:
-        memory_dir: ``<data_root>/store/memory/`` ルート。
+        memory_dir: ``<data_root>/g1/store/memory/`` ルート。
         needle: subject/predicate/object/statement に含まれる部分文字列。
         subject: subject の前方一致。
         fact_ids: ファクト id の直接指定。
@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--memory-dir", default=None,
-        help="memory dir (default: <data root>/store/memory/)",
+        help="memory dir (default: <data root>/g1/store/memory/)",
     )
     parser.add_argument(
         "--data-root", default=None,

@@ -15,6 +15,7 @@ import yaml
 from backend.io import atomic_write_text
 from backend.io.codec import codec_for, persisted
 from backend.io.format_registry import FormatSpec, register_format
+from backend.io.readonly import is_readonly
 from backend.io.versioned import VersionedJsonFile
 from backend.log_config import get_logger
 from backend.utils import utc_now as _now
@@ -45,7 +46,7 @@ MODEL_STATE_TRACKED_KEYS: frozenset[str] = frozenset(
 
 
 # ────────────────────────────────────────────
-# ModelState: <data_root>/store/model_state.json 管理
+# ModelState: <data_root>/g1/store/model_state.json 管理
 # ────────────────────────────────────────────
 
 
@@ -285,7 +286,8 @@ class ModelState(VersionedJsonFile):
                 name, comp.current.filename,
             )
 
-        if changed:
+        # readonly のデータ根ではメモリ上の初期値だけで動く (起動を落とさない)
+        if changed and not is_readonly():
             self.save()
 
 

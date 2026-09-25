@@ -42,7 +42,7 @@ from backend.log_config import get_logger
 
 logger = get_logger("rag.corpus.calibration")
 
-#: 保存ファイル (``local/memory/corpus/`` 配下)。
+#: 保存ファイル (``<data_root>/g1/store/corpus/`` 配下)。
 CALIBRATION_FILENAME = "calibration.json"
 
 #: 式を変えたら版を上げる (移行器は置かない — 旧版は捨てて較正し直す)。

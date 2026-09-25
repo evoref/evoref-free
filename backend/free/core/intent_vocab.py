@@ -1099,7 +1099,7 @@ _OWN_PROCESS_PAST_ASK_RE = re.compile(
 #: 「compose.yaml を書いてください。ファイルには書き込まず、本文で示して
 #: ください。」の「書き込まず」が ``_SAVE_VERB_RE`` (書き込) に当たり、
 #: 禁止された書込みがそのまま実行された (2026-09-09 ライブ監査 H-04:
-#: ``local/outputs/docker-compose.yaml`` が書かれ、応答は「…に書き込んだ
+#: ``outputs/docker-compose.yaml`` (当時は ``local/outputs/``、現在は ``<data_root>/outputs/``) が書かれ、応答は「…に書き込んだ
 #: 内容:」)。否定接尾を伴う保存動詞は宛先の証拠ではなく **禁止の証拠**。
 #:
 #: 一般動詞 (出力 / 作成 / 生成 / 書か) は「本文には出力せず」のような別の

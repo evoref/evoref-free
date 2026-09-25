@@ -20,7 +20,8 @@ import:
 
 - パッケージの manifest を先に検査する (G0 / 新しい版 / 新しい形式は全体を拒否)。
 - 全エントリを :mod:`backend.io.safe_extract` で検査し、パスは export が作る形
-  (台帳で ``export=True`` の sot に分類される ``store/...`` とダンプ) だけを許す。
+  (台帳で ``export=True`` の sot に分類される ``store/...`` とダンプ) だけを許す。パッケージの
+  ``store/...`` は世代フォルダ ``g<N>/`` からの相対で、取り込み先もこのリリースの世代フォルダ。
 - カテゴリごとに取り込み先が **空** のときだけ置換する (統合・上書きはしない)。
   ``learning`` はパーティション (``store/learning/<key>/`` 等) ごとに判定する。
 - Evidence のダンプは新しいストアへ ``create`` し直す (snapshot・埋め込み・索引は
@@ -39,6 +40,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from backend.config import PathResolver
+from backend.data_root import generation_root, store_root
 from backend.free.memory.episodic.store import STORE_DIRNAME as EPISODIC_DIRNAME
 from backend.free.memory.semantic.store import STORE_DIRNAME as SEMANTIC_DIRNAME
 from backend.io import jsoncodec, ledger_files
@@ -167,10 +169,10 @@ def exportable_files(
     """
     wanted = set(categories)
     out: list[tuple[Path, str, FormatSpec, str]] = []
-    for path, spec in ledger_files.iter_files(data_root, registry):
+    for path, spec in ledger_files.iter_files(generation_root(data_root), registry):
         if not (spec.export and spec.klass == "sot") or _is_evidence(spec) or not _visible(spec, edition):
             continue
-        rel = path.relative_to(data_root).as_posix()
+        rel = path.relative_to(generation_root(data_root)).as_posix()
         category = category_of(rel)
         if category in wanted:
             out.append((path, rel, spec, category))
@@ -181,10 +183,10 @@ def evidence_stores(data_root: Path, registry: FormatRegistry) -> list[str]:
     """``store/memory/`` に在る Evidence Store の名前 (中身の形式のファイルがあるもの)。"""
     memory = _LAYOUT["memory_dir"]
     names: set[str] = set()
-    for path, spec in ledger_files.iter_files(data_root, registry):
+    for path, spec in ledger_files.iter_files(generation_root(data_root), registry):
         if not _is_evidence(spec):
             continue
-        rel = path.relative_to(data_root).as_posix()
+        rel = path.relative_to(generation_root(data_root)).as_posix()
         if rel.startswith(memory):
             names.add(rel[len(memory):].split("/", 1)[0])
     return sorted(n for n in names if n in EVIDENCE_STORES)
@@ -306,7 +308,7 @@ def default_export_name() -> str:
 
 def resolve_destination(data_root: Path, output: Path | None) -> Path:
     """書き出し先を決める (データ根の中なら ``outputs/`` の下だけを許す)。"""
-    outputs = data_root / _LAYOUT["outputs_dir"]
+    outputs = PathResolver.layout_path(data_root, "outputs_dir")
     if output is None:
         path = outputs / default_export_name()
     elif output.is_dir():
@@ -330,7 +332,7 @@ def _iter_dump_lines(
 ) -> Iterator[str]:
     from backend.free.rag.evidence.store import EvidenceStore
 
-    store = EvidenceStore(data_root / _LAYOUT["memory_dir"] / store_name, store_name=store_name,
+    store = EvidenceStore(PathResolver.layout_path(data_root, "memory_dir") / store_name, store_name=store_name,
                           by=EXPORT_COMPONENT)
     store.load()
     try:
@@ -388,7 +390,7 @@ def export_data(
     書き手ロックは呼出側が持つ。
     """
     selected = [c for c in CATEGORIES if c in set(categories)]
-    _require_writable_seal(data_root / "store", registry, edition)
+    _require_writable_seal(store_root(data_root), registry, edition)
     stats = {c: CategoryStats() for c in selected}
     entries: list[dict[str, Any]] = []
     record_spec = registry.get(EVIDENCE_RECORD_FORMAT_ID)
@@ -553,10 +555,10 @@ def _occupied(data_root: Path, registry: FormatRegistry, edition: str) -> tuple[
     """取り込み先で sot のファイルを持つ (カテゴリ, learning のパーティション)。"""
     categories: set[str] = set()
     partitions: set[str] = set()
-    for path, spec in ledger_files.iter_files(data_root, registry):
+    for path, spec in ledger_files.iter_files(generation_root(data_root), registry):
         if spec.klass != "sot" or not _visible(spec, edition):
             continue
-        rel = path.relative_to(data_root).as_posix()
+        rel = path.relative_to(generation_root(data_root)).as_posix()
         category = category_of(rel)
         if category is None:
             continue
@@ -575,7 +577,7 @@ def _restore_evidence(data_root: Path, store_name: str, dump: Path, result: Cate
     from backend.free.rag.evidence.store import EvidenceIdExistsError, EvidenceStore
     from backend.free.rag.evidence.types import EvidenceRecordError, EvidenceVersionError, from_record
 
-    store_dir = data_root / _LAYOUT["memory_dir"] / store_name
+    store_dir = PathResolver.layout_path(data_root, "memory_dir") / store_name
     store_dir.mkdir(parents=True, exist_ok=True)
     store = EvidenceStore(store_dir, store_name=store_name, by=IMPORT_COMPONENT)
     store.load()
@@ -610,7 +612,7 @@ def import_data(
     """export パッケージを空の取り込み先へ置換で取り込む (書き手ロックは呼出側が持つ)。"""
     wanted = set(CATEGORIES if categories is None else categories)
     report = ImportReport()
-    store_dir = data_root / "store"
+    store_dir = store_root(data_root)
     try:
         zf = zipfile.ZipFile(package)
     except (OSError, zipfile.BadZipFile) as e:
@@ -658,7 +660,7 @@ def import_data(
         if not selected:
             return report
 
-        tmp_root = data_root / _LAYOUT["tmp_dir"]
+        tmp_root = PathResolver.layout_path(data_root, "tmp_dir")
         tmp_root.mkdir(parents=True, exist_ok=True)
         workdir = Path(tempfile.mkdtemp(prefix="import-", dir=tmp_root))
         try:
@@ -670,7 +672,7 @@ def import_data(
                 if category == "memory" and entry.format_id == EVIDENCE_RECORD_FORMAT_ID:
                     _restore_evidence(data_root, PurePosixPath(entry.path).parent.name, source, result)
                 else:
-                    _copy_into_store(source, resolve_under(data_root, PurePosixPath(entry.path)))
+                    _copy_into_store(source, resolve_under(generation_root(data_root), PurePosixPath(entry.path)))
                 result.files += 1
         finally:
             shutil.rmtree(workdir, ignore_errors=True)

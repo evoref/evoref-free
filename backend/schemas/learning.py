@@ -65,7 +65,8 @@ class LearningPolicyConfig(BaseModel):
     進化挙動を制御する。owner pillar は EvorefLearn。
 
     - ``source`` :
-        - ``yaml`` (デフォルト) : 従来通り ``local/policies/*.json`` のみを参照
+        - ``yaml`` (デフォルト) : 従来通り policy ファイル (``<data_root>/g1/store/learning/``
+          の ``shared/policies/`` と ``<mk>/policies/``) のみを参照
         - ``hybrid`` : YAML を seed としてロード後、SemMem の active な
           ``policy`` ファクト (``subject`` 先頭が ``learn.policy.``) で上書き
         - ``semmem`` : 導入予定 (現状は ``hybrid`` と同等動作)

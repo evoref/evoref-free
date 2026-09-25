@@ -1,0 +1,38 @@
+# Qwen2.5-Coder-14B-Instruct (Q4_K_M) 固有のプロファイル。
+# arch は "qwen2" を報告するため models/profiles/qwen2.yaml が土台になり、本ファイルの
+# 宣言だけが差分上書きされる (dict は再帰マージ、list とスカラーは置換)。ファイル名は
+# GGUF ファイル名の拡張子なし部分と完全一致させること。反映は llama-server / backend の
+# 再起動時のみ (キャッシュキーは GGUF の mtime で、本 YAML の mtime は見ない)。
+#
+# GGUF メタデータ実測 (2026-09-24, models/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf):
+#   architecture=qwen2 / block_count=48 / context_length=131072 / dense (expert なし)
+#   attention.head_count=40 / head_count_kv=8 / embedding_length=5120
+#   feed_forward_length=13824 / rope.freq_base=1e6
+#   rope.scaling.type=yarn / factor=4.0 / original_context_length=32768
+#   nextn_predict_layers なし (MTP ヘッド非内蔵) / general.sampling なし
+#   chat_template: ChatML、system 無しのとき "You are Qwen, created by Alibaba Cloud..."
+#   を自動挿入、ツール呼出は <tool_call>{"name", "arguments"}</tool_call> の JSON 形式。
+#   thinking / reasoning 非対応。
+#
+# よって launch_flags (--jinja / --reasoning-format auto) / moe / reasoning (mode: none) は
+# arch 層のままで正しく、ここでは宣言しない (list の launch_flags は置換なので、書くなら
+# arch 側の値も全部書き直す必要がある)。
+#
+# ── YaRN が GGUF に焼き込まれている ─────────────────────
+# arch 層のコメントは n_ctx_train=32768 を前提にしているが、この GGUF は
+# context_length=131072 と YaRN (factor 4) を宣言しており、llama.cpp はメタデータの
+# rope scaling を **文脈長に関係なく静的に** 適用する。モデルカードは「長文が必要な
+# ときだけ YaRN を足す (短文の性能に影響しうる)」としている。
+# 無効化するなら launch_flags に --rope-scaling none --rope-scale 1 を足す
+# (--rope-scaling none だけでは freq_scale=1/4 が残り線形補間になる)。ただし短文での
+# 品質差は未計測なので、ここでは宣言しない。
+#
+# context_size: arch 層の 32768 (= original_context_length) を継承する。config.yaml の
+# llama.context_size が明示されていればそれが勝つ (config 明示 > profile > 既定)。
+#
+# ── サンプリング ────────────────────────────────────────
+# モデルの generation_config.json の推奨値: temperature 0.7 / top_p 0.8 / top_k 20 /
+# repetition_penalty 1.05。本 GGUF は create モード専用 (model_paths.create_model) で
+# 使っており、modes.create (temperature 0.3 / top_p 0.95 / top_k 20) はコード生成向けに
+# 意図的に低温度へ振ってある。profile.sampling は modes.* を上書きするため宣言しない
+# (top_k は既に一致)。

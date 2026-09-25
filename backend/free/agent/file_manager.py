@@ -45,7 +45,7 @@ class SessionFile:
 class SessionFileManager:
     """セッションスコープのファイル管理
 
-    ファイルは local/tmp/{session_id}/ に保存され、
+    ファイルは <data_root>/tmp/{session_id}/ に保存され、
     セッション終了時に自動削除される。
     """
 

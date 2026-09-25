@@ -1,12 +1,12 @@
 """
 
-``<data_root>/store/agent_trace/agent_trace*.jsonl`` (``AgentTraceStore``) を
+``<data_root>/g1/store/agent_trace/agent_trace*.jsonl`` (``AgentTraceStore``) を
 エピソード単位で読み出し、エピソード記憶 (EpisodicStore の long tier / RAG ベクトル
 DB) に取り込むためのアダプタ。
 
 設計の主旨
 
-- **入力**: ``<data_root>/store/agent_trace/`` 配下の ``agent_trace*.jsonl``
+- **入力**: ``<data_root>/g1/store/agent_trace/`` 配下の ``agent_trace*.jsonl``
   (日付ベースのファイル名 ``agent_trace_YYYY-MM-DD.jsonl`` なのでグロブで
   横断する)。develop フラグには依存しない (以前は DebugLogger の evolve 限定
   JSONL を読んでいたため通常運用ではエピソード記憶が生成されなかった)。
@@ -25,7 +25,7 @@ DB) に取り込むためのアダプタ。
   これにより ``private=True`` のトレースは scope=global / project どちらにも
   昇格しない
 - **オフセット管理**: ファイル末尾までのバイトオフセットを
-  ``<data_root>/store/memory/episodic/mdp_ingest_state.json`` に永続化する。次回呼び出しはオフセッ
+  ``<data_root>/g1/store/memory/episodic/mdp_ingest_state.json`` に永続化する。次回呼び出しはオフセッ
   ト以降のみ読む。``processed_episode_ids`` も保持し、念のため二重昇格を防ぐ
   (上限 ``max_processed_ids`` で FIFO)。封筒付き (形式 ``mdp.ingest_state`` /
   Step 8 用は ``mdp.extract_state``)。オフセットの鍵は今もファイル名 (ファイル

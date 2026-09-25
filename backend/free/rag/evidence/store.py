@@ -392,7 +392,7 @@ class EvidenceStore:
     """1 ストア (episodic / semantic / corpus) の永続基盤。
 
     Args:
-        store_dir: ストアのルート (``local/memory/<store>``)。
+        store_dir: ストアのルート (``<data_root>/g1/store/memory/<store>``)。
         store_name: ``episodic`` / ``semantic`` / ``corpus``。
         embedding_backend: 埋め込みバックエンド。``None`` なら snapshot 生成
             時にベクトル索引を作らない (縮退動作。検索は語彙索引のみになる)。

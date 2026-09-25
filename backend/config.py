@@ -186,14 +186,21 @@ class PathResolver:
     def resolve_local(self, key: str) -> Path:
         """データパス解決 (読み書きリソース)。全て ``data_root`` の下。
 
+        ``store/`` ``cache/`` は世代フォルダ ``g<N>/`` の下 (:func:`backend.data_root.data_path`)。
         ``outputs_dir`` だけは ``local_paths.outputs_dir`` で変えられる
         (相対ならデータ根基準)。
         """
-        rel = self.LAYOUT[key]
         if key in self.USER_OVERRIDABLE and self.local.get(key):
             override = Path(str(self.local[key]))
             return override if override.is_absolute() else self.data_root / override
-        return self.data_root / rel
+        return self.layout_path(self.data_root, key)
+
+    @classmethod
+    def layout_path(cls, data_root: Path, key: str) -> Path:
+        """``LAYOUT[key]`` をデータ根 ``data_root`` の下の実パスにする (利用者の上書きは見ない)。"""
+        from backend.data_root import data_path
+
+        return data_path(data_root, cls.LAYOUT[key])
 
     # ── モデル識別子 (c_05 §0.5.7) ──
 
@@ -295,7 +302,7 @@ class PathResolver:
     def resolve_corpus_dir(self) -> Path:
         """corpus ストア (文書由来チャンク) の置き場を解決する。
 
-        G1 のレイアウト (c_03 §10.1) では ``<data_root>/store/corpus/`` で、
+        G1 のレイアウト (c_03 §10.1) では ``<data_root>/g1/store/corpus/`` で、
         パッケージは ``packages/<id>/<version>/`` に置く。
         """
         return self.resolve_local("corpus_dir")
@@ -488,7 +495,7 @@ def resolve_outputs_dir() -> Path:
         return _path_resolver.resolve_outputs_dir()
     from backend.data_root import resolve_data_root
 
-    return resolve_data_root(root=get_project_root()) / PathResolver.LAYOUT["outputs_dir"]
+    return PathResolver.layout_path(resolve_data_root(root=get_project_root()), "outputs_dir")
 
 
 def resolve_data_path(key: str, project_root: Path | None = None) -> Path:
@@ -506,7 +513,7 @@ def resolve_data_path(key: str, project_root: Path | None = None) -> Path:
     from backend.data_root import resolve_data_root
 
     root = project_root if project_root is not None else get_project_root()
-    return resolve_data_root(root=root) / PathResolver.LAYOUT[key]
+    return PathResolver.layout_path(resolve_data_root(root=root), key)
 
 
 def get_project_root() -> Path:
@@ -744,7 +751,7 @@ def resolve_reasoning_mode(
     プロファイル未宣言時のみ、実機プローブ観測 (``observed_reasoning_mode``、未知モデルの
     シード) → ``chat_template`` の template family fallback の順で補う。**観測は profile を
     上書きしない** (宣言と実機の食い違いはプローブが WARNING + Status で可視化し、ユーザーが
-    ``local/profiles/<arch>.yaml`` で是正する)。どれでも不明なら ``None``。
+    ``<data_root>/profiles/<arch>.yaml`` で是正する)。どれでも不明なら ``None``。
     """
     # プロファイル宣言が最優先 (profile = SSOT)。
     mode = _resolve_profile_reasoning(cfg, slot).get("mode")
@@ -930,7 +937,7 @@ def get_mode_generation_params(mode: str) -> dict:
     mode_cfg.pop("model", None)
     # モデル arch プロファイルの sampling 既定を、汎用 modes.* より優先で適用する
     # (モデル切替時にモデル推奨値を自動反映する目的)。空 {} なら従来どおり。
-    # 上書きしたい場合は local/profiles/<arch>.yaml か auto_model_flags:false。
+    # 上書きしたい場合は <data_root>/profiles/<arch>.yaml か auto_model_flags:false。
     # 学習デルタは後段 (apply_deltas) で最優先に適用される。
     profile_sampling = _resolve_profile_sampling_for_mode(cfg, mode)
     params = {**defaults[mode], **mode_cfg, **profile_sampling}

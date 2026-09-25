@@ -36,7 +36,7 @@
 #   取り逃す。逆に粗すぎると無関係な事実が競合扱いになる。
 #   「ユーザーが後から言い直しうる単位」を 1 attribute とする。
 #
-# ユーザー上書き: ``local/triggers/fact_attributes.yaml`` に同名ファイルを置くと
+# ユーザー上書き: ``<data_root>/g1/store/overrides/triggers/fact_attributes.yaml`` に同名ファイルを置くと
 # package 同梱 default に代えて読み込まれる (fact_triggers.yaml と同じ方針)。
 
 chat:

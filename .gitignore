@@ -15,7 +15,7 @@ models/*
 # userdata-isolated/ は --isolate-data の別根。どちらも丸ごと git 管理外。
 userdata/
 userdata-isolated/
-# 0.0.98 以前 (G0) のデータ置き場。G1 は開かない・動かさない・消さない (c_05 §0.3)。
+# 撤去済みの 0.0.98 以前 (G0) のデータ置き場。手元に残っていても管理外 (c_05 §0.3)。
 local/
 # 相対パス解決が cwd=backend/ で起きた際に生成される迷子データの保険。
 backend/local/

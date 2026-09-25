@@ -2,10 +2,10 @@
 
 pin / fact / classify の各トリガ辞書は、
 ``backend/free/memory/_defaults/triggers/<name>.yaml`` を同梱 default とし、
-ユーザーがチューニングしたい場合は ``local/triggers/<name>.yaml`` に
+ユーザーがチューニングしたい場合は ``<data_root>/g1/store/overrides/triggers/<name>.yaml`` に
 同名ファイルを置くことで上書きする 2 層構造で解決する。
 
-``local/`` 配下は ``.gitignore`` で除外されているため、ユーザー編集は
+データ根 (``userdata/``) の中身は ``.gitignore`` で除外されているため、ユーザー編集は
 リポジトリ差分に現れない。本 package (shipped default) はリポジトリに
 commit されており、fresh clone 直後から辞書が利用可能な状態を保つ。
 

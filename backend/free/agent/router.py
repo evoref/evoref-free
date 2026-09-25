@@ -277,7 +277,7 @@ _DESCRIPTIVE_WRITE_CLAUSE_RE = re.compile(
 _TARGET_FILE_EXTS = (
     r"txt|md|markdown|csv|tsv|json|jsonl|ya?ml|log|ini|cfg|conf|toml"
     r"|xlsx|xls|ods|docx|doc|pptx|ppt|pdf|html?|xml"
-    r"|py|js|ts|tsx|jsx|sh|ps1|bat|sql|rs|go|java|rb|c|cpp|h"
+    r"|py|js|mjs|cjs|ts|tsx|jsx|css|scss|vue|svelte|php|sh|ps1|bat|sql|rs|go|java|kt|swift|cs|rb|c|cpp|hpp|h|lua"
 )
 _BARE_FILENAME_TARGET_RE = re.compile(
     r"(?<![\w./\\-])"
@@ -345,9 +345,20 @@ _DESTINATION_PARTICLE_RE = re.compile(r"^[)）」』】\]\"'\s　]*(?:に|へ)")
 _DESTINATION_PREPOSITION_RE = re.compile(
     r"(?:^|[\s(\[])(?:to|into|in|onto)\s+$", re.IGNORECASE,
 )
+# **フォルダ** を置き場として指す形 (「units_app/ フォルダに main.py を作って」/
+# 「in the units_app folder」)。ファイル名は ``を`` で生成対象を指していても、
+# 置き場のフォルダを名指した時点でディスク上の宛先がある。これが無いと
+# フォルダ付きの複数ファイル依頼が本文提示に倒れ、コードがチャットに出るだけで
+# 1 つも保存されなかった (2026-09-25 create ベンチ m2)。
+_FOLDER_DESTINATION_RE = re.compile(
+    r"[\w.-]+[\\/]?[\s　]*(?:フォルダ|ディレクトリ)[\s　]*(?:の中|内|配下|の下)?[\s　]*(?:に|へ)"
+    r"|[\w.-]+[\\/][\s　]*(?:の中|内|配下|の下)?[\s　]*(?:に|へ)"
+    r"|(?:^|[\s(\[])(?:in|into|under)\s+(?:the\s+)?[\w.-]+[\\/]?\s+(?:folder|directory)\b",
+    re.IGNORECASE,
+)
 
 
-def write_intent_probe(query: str) -> str:
+def write_intent_probe(query: str, *, whole_request: bool = False) -> str:
     """書込み判定に掛ける本文を正規化する (SSOT)。
 
     依頼している節だけを取り、コマンドリテラル内の引数パスと、既出成果物を
@@ -355,6 +366,11 @@ def write_intent_probe(query: str) -> str:
     ``_is_local_write_intent`` と ``indicates_write_destination`` は
     **同じ本文** を見なければならない (片方だけが書込みだと判断すると、
     ``output_target`` と層の振り分けが食い違う)。
+
+    ``whole_request=True`` (create モード) は依頼節に絞らない。create の依頼は文全体が
+    成果物の仕様で、「tax.php に関数…を書きます」のような説明の文が保存先を名指す
+    (依頼形でない文を落とすと保存先が消え、成果物がエディタに出るだけになった。
+    2026-09-25 create ベンチ p1)。chat は状況説明の書込み語を拾わないよう依頼節だけ (F-02)。
     """
     # 書込みの禁止は依頼節に限らず発話全体で見る。「E:\tmp\out.md には
     # 書き込まなくていいです。本文で。」の禁止は依頼形でないので
@@ -364,7 +380,7 @@ def write_intent_probe(query: str) -> str:
     # 同時に本文提示へ倒す。
     if write_prohibited(query):
         return ""
-    probe = strip_command_literals(request_clauses(query))
+    probe = strip_command_literals(query if whole_request else request_clauses(query))
     return _DESCRIPTIVE_WRITE_CLAUSE_RE.sub(" ", probe)
 
 
@@ -376,6 +392,7 @@ def _filename_target_is_destination(probe: str) -> bool:
     - ファイル名が宛先として格標識されている (``notes.txt に`` / ``へ``、
       英語の ``to notes.txt``)
     - 依頼文に保存動詞がある (``保存して`` / ``書き出して`` / ``追記して``)
+    - 置き場のフォルダを名指している (``units_app/ フォルダに``)
 
     「compose.yaml を書いてください」はどちらも満たさない = 中身を見せて
     ほしい依頼であり、ファイル書込みではない (2026-09-08 監査 F-05)。
@@ -386,7 +403,7 @@ def _filename_target_is_destination(probe: str) -> bool:
     ]
     if not matches:
         return False
-    if _SAVE_VERB_RE.search(probe):
+    if _SAVE_VERB_RE.search(probe) or _FOLDER_DESTINATION_RE.search(probe):
         return True
     for m in matches:
         if _DESTINATION_PARTICLE_RE.match(probe[m.end():]):
@@ -417,6 +434,10 @@ def write_destination_evidence(probe: str) -> bool:
     if _LOCAL_PATH_RE.search(probe) or _EXPLICIT_RELATIVE_PATH_RE.search(probe):
         return True
     if _REFERENTIAL_WRITE_TARGET_RE.search(probe):
+        return True
+    # 置き場のフォルダだけを名指す形 (「sales_db/ フォルダに SQL を作って」)。ファイル名が
+    # 別の文にしか無くても、フォルダを名指した時点でディスク上の宛先がある (2026-09-25 ベンチ q1)
+    if _FOLDER_DESTINATION_RE.search(probe):
         return True
     return _filename_target_is_destination(probe)
 
@@ -1118,6 +1139,16 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
             and not c._is_strict_knowledge_query(x.query)
         ),
     ),
+    # 書込み先を名指しした create の生成依頼 (「Python で書き、add.py に保存して」)。
+    # ``create_meta_keywords`` はて形 (書いて / 作って) しか拾わず、連用形の
+    # 「書き、」は ``persist_intent`` → deliberative へ落ちて、分類器が
+    # write_file の file_path を埋められずに成果物が保存されなかった
+    # (2026-09-25)。create は常に meta 経路 (f_03 §4.4)。宛先の証拠は chat の
+    # ``local_write_intent`` と同じ 1 本 (``_has_local_write_destination``)。
+    _ClassifyRule(
+        "create_write_destination", _META,
+        lambda c, x: is_create_mode(x.mode) and c._has_local_write_destination(x.query, whole_request=True),
+    ),
     # 「明日は何月何日?」のような ? 終わりの疑問文は知識質問パターンが要求する
     # 末尾形式を満たさないため、is_knowledge を見ずに常時評価する。
     _ClassifyRule(
@@ -1516,6 +1547,14 @@ class ComplexityClassifier:
         """
         if not is_chat_mode(mode):
             return False
+        return self._has_local_write_destination(query)
+
+    def _has_local_write_destination(self, query: str, *, whole_request: bool = False) -> bool:
+        """書込み動詞と書込み先 (ローカル) の双方がある依頼か (モードを問わない)。
+
+        ``_is_local_write_intent`` (chat) と ``create_write_destination`` (create) が
+        共有する本体。URL を含む依頼・how-to は除く。
+        """
         if _URL_HINT_RE.search(query):
             return False
         if _HOWTO_QUERY_RE.search(query):
@@ -1527,7 +1566,7 @@ class ComplexityClassifier:
         # 「(書き込みが実行されませんでした)」だけを返した)。
         # コマンドリテラル内のパス・既出成果物への言及を落とした本文で判定する
         # (正規化は ``write_intent_probe`` が SSOT)。
-        probe = write_intent_probe(query)
+        probe = write_intent_probe(query, whole_request=whole_request)
         # 書込み動詞の列挙に加えて **本文代入** の構文も受ける。「内容を『X』に
         # してください」は書込み依頼だが動詞を 1 つも含まないため、動詞だけの
         # 判定では読取へ落ちる (assigns_file_content の docstring 参照)。
@@ -1722,7 +1761,7 @@ def _can_use_meta_cognitive(
     return loop_budget >= min_budget
 
 
-def indicates_write_destination(query: str) -> bool:
+def indicates_write_destination(query: str, *, whole_request: bool = False) -> bool:
     """発話が **書込み先** を指しているか (純粋関数)。
 
     明示パス / 宛先として書かれた裸のファイル名 / 参照表現 (「同じファイルに」)
@@ -1736,4 +1775,4 @@ def indicates_write_destination(query: str) -> bool:
     見せてほしい** 依頼を書込みに倒すと、本文が出ずファイルだけが残る
     (2026-09-08 監査 F-05)。
     """
-    return write_destination_evidence(write_intent_probe(query))
+    return write_destination_evidence(write_intent_probe(query, whole_request=whole_request))

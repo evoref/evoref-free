@@ -19,8 +19,8 @@ EvorefMem 統合仕様 の自動 Pin 検出を実装する
 辞書ファイルの解決:
     - **shipped default**: ``backend/free/memory/_defaults/triggers/pin_triggers.yaml``
       (パッケージ同梱 / git tracked)
-    - **user override** (任意): ``local/triggers/pin_triggers.yaml``
-      (``local/`` は git-ignored のためリポジトリ差分に現れない)
+    - **user override** (任意): ``<data_root>/g1/store/overrides/triggers/pin_triggers.yaml``
+      (データ根の中身は git-ignored のためリポジトリ差分に現れない)
     - 解決は :func:`backend.free.memory._defaults.resolve_trigger_file`
       が override を優先し、無ければ default にフォールバックする。
       起動時コピー等のマイグレーションは行わない。

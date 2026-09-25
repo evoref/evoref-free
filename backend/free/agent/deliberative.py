@@ -873,7 +873,7 @@ _GENERATED_DRAFT_GUIDANCES: dict[str, str] = {
 # 落ちた項目をもっともらしい名前で埋めないようグラウンディング文言を足す
 # (実インシデント 2026-08-01 ライブ監査: list_directory の結果を圧縮した結果、
 # 回答が実在しない requirements.txt / .env.example を挙げ、実在する scripts/
-# local/ models/ CLAUDE.md 等を落とした)。
+# local/ (当時のデータ置き場) models/ CLAUDE.md 等を落とした)。
 _ENUMERATIVE_TOOLS = frozenset({"list_directory", "search_code"})
 _ENUMERATION_RESULT_GUIDANCE = (
     "上記の ## ツール実行結果 は、システムが実際に列挙した項目そのものである。"

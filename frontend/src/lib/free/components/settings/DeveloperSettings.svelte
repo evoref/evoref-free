@@ -1,10 +1,10 @@
 <script lang="ts">
 	/**
-	 * Develop 設定ページ — local/ データ初期化 (Danger Zone)
+	 * Develop 設定ページ — データ根の初期化 (Danger Zone)
 	 *
 	 * Develop エディションでのみ表示される (SettingsTabs の DEVELOP_ONLY_TABS)。
 	 * 「ローカルデータを初期化」ボタンで確認ダイアログを出し、確定すると
-	 * backend のデタッチヘルパーが全サービス停止 → local/ wipe → 再起動を行う。
+	 * backend のデタッチヘルパーが全サービス停止 → データ根の初期化 → 再起動を行う。
 	 * その間 UI は「再起動中」オーバーレイで /api/status をポーリングし、復帰したら
 	 * 自動リロードする。
 	 */

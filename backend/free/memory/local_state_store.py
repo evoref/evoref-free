@@ -1,10 +1,10 @@
 """ローカル状態 (state.json) の永続化層
 
-EvorefMem 統合仕様 で追加される `local/state.json` を扱う
+EvorefMem 統合仕様 で追加される `<data_root>/g1/store/state.json` を扱う
 プロジェクト ID のキャッシュ・モード保持・alias 上書き・最終アクセス時刻
 追跡を一元化する。
 
-ファイル例 (`local/state.json` の封筒の ``payload``、形式 ``state``)::
+ファイル例 (`<data_root>/g1/store/state.json` の封筒の ``payload``、形式 ``state``)::
 
     {
       "current_project_id": "git_abc123def456",
@@ -71,7 +71,7 @@ class ProjectMeta:
 
 @dataclass
 class LocalState:
-    """`local/state.json` の in-memory 表現"""
+    """`<data_root>/g1/store/state.json` の in-memory 表現"""
 
     current_project_id: str | None = None
     mode: MemoryMode = DEFAULT_MODE
@@ -222,7 +222,7 @@ class _LocalStateFile(VersionedJsonFile):
 
 
 class LocalStateStore:
-    """`local/state.json` の純粋永続化担当"""
+    """`<data_root>/g1/store/state.json` の純粋永続化担当"""
 
     @staticmethod
     def load(path: Path) -> LocalState:

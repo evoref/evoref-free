@@ -142,7 +142,7 @@ class PrivateContentFilter(logging.Filter):
     ``ChatRequest.private`` の契約は「LTM/SemMem/履歴ディスク永続化に書き込ま
     ない」だが、**ログはその経路に入っていない**ため素通りしていた。実測
     (2026-09-03 ライブ監査 T16): private セッションで話した口座番号が
-    ``local/logs/backend.log`` に平文で残り、うち 2 行は ``[INFO]``
+    ``<data_root>/logs/backend.log`` に平文で残り、うち 2 行は ``[INFO]``
     (develop モード無しの通常運用でも出る)。
 
     発話を書く logger 呼び出しは router / tool_call_judge / search_pipeline /

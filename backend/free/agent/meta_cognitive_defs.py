@@ -199,6 +199,14 @@ _WRITE_REJECTION_REASON_JA: dict[str, str] = {
 }
 _WRITE_REJECTION_RE = re.compile(r"invalid output \(([a-z_]+)\)")
 
+# 制作ステージが未完了のまま **書けた分は書いた** 結果 (``_execute_production_task``)。
+# 「書き込みが実行されませんでした」と区別して、書いたファイルと未完了の理由を伝える。
+_PARTIAL_WRITE_RE = re.compile(
+    r"production stage incomplete \((?P<reason>.+?)\)"
+    r"(?:; wrote (?P<count>\d+) file\(s\)(?:: (?P<paths>.+))?)?$",
+)
+_PARTIAL_WRITE_TASKS_FAILED_RE = re.compile(r"(\d+) task\(s\) failed")
+
 # 「書くべき本文は会話にある」ことを示す参照表現。既存ファイルがある上書き
 # 依頼でも、この語があるときは既存内容ではなく会話を素材にする
 # (_generate_content 内の使用箇所のコメント参照)。

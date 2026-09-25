@@ -1,4 +1,4 @@
-"""世代印 ``<data_root>/store/.generation`` (c_05 §0.4.6)。
+"""世代印 ``<data_root>/g1/store/.generation`` (c_05 §0.4.6)。
 
 G1 の封筒 (``store.generation`` v1) に包む。ペイロードは恒久に凍結する形::
 
@@ -161,13 +161,26 @@ def updated_seal(
     )
 
 
+#: ディレクトリ構成だけを残す印 (リポジトリの ``userdata/**/.gitkeep``、c_03 §10.1)。
+GITKEEP_FILENAME = ".gitkeep"
+
+
 def store_has_data(store_dir: Path) -> bool:
-    """``store/`` に世代印とロック以外の何かがあるか (世代印の欠落を readonly にする条件)。"""
+    """``store/`` に世代印・ロック・``.gitkeep`` 以外のファイルがあるか (世代印の欠落を readonly にする条件)。
+
+    空のディレクトリ構成 (setup / ``ensure_local_dirs`` / ``.gitkeep`` の骨組み) はデータではない。
+    """
+    import os
+
     from backend.io.writer_lock import LOCK_FILENAME
 
     if not store_dir.is_dir():
         return False
-    return any(p.name not in (LOCK_FILENAME, SEAL_FILENAME) for p in store_dir.iterdir())
+    ignored = {LOCK_FILENAME, SEAL_FILENAME, GITKEEP_FILENAME}
+    for _current, _dirs, files in os.walk(store_dir):
+        if any(name not in ignored for name in files):
+            return True
+    return False
 
 
 @dataclass

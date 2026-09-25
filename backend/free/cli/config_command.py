@@ -2,7 +2,7 @@
 
 ``normalize``: 版 (``config_version``) の無い G0 の ``config.yaml`` を G1 の形へ
 一度だけ直す (実体は :mod:`backend.config_normalize`)。単一書き手ロック
-(``<data_root>/store/.writer.lock``) の下で動かし、serve の稼働中 (ロックが
+(``<data_root>/g1/store/.writer.lock``) の下で動かし、serve の稼働中 (ロックが
 取られている) は書き換えずに拒否する。
 
 ``evoref serve`` / ``evoref-ctl start`` / setup は起動前に
@@ -18,7 +18,7 @@ import yaml
 from rich.console import Console
 
 from backend.config_normalize import NormalizeReport, normalize_config
-from backend.data_root import DataRootError, resolve_data_root
+from backend.data_root import DataRootError, resolve_data_root, store_root
 from backend.free.cli.config_loader import _find_project_root, _setup_encoding
 from backend.free.cli.renderer import create_console, render_error, render_info
 from backend.i18n_helper import init_i18n, msg
@@ -38,7 +38,7 @@ def config_needs_normalize(config_path: Path) -> bool:
 
 def normalize_under_lock(config_path: Path, data_root: Path) -> NormalizeReport:
     """書き手ロックを取って正規化する。serve が稼働中なら :class:`WriterLockHeld`。"""
-    lock = acquire_writer_lock(data_root / "store")
+    lock = acquire_writer_lock(store_root(data_root))
     try:
         return normalize_config(config_path)
     finally:

@@ -1164,15 +1164,18 @@ long_form:
   code_smoke_timeout_sec: 10        # import スモークテストのサブプロセスタイムアウト(秒)
 
 # ===== クリエイトモード パイプライン設定 =====
-# pipeline=staged で「仕様書→コード→テスト」の多段・各工程多パス生成 (専用 LoopDriver を
-# インライン駆動)。staged は Pro 限定 (evoref create は Pro ゲート済)。
-# 既定 longform は従来の LongFormOrchestrator 1 リクエスト生成 (無改変)。
+# pipeline=staged (既定) は v2 工程 (f_10 §11): 骨組み JSON → モジュールの同時生成 → import スモーク
+# → 完成コードから SPEC.md / flowchart.md を描く。Free はテスト工程なし (契約テストは Pro)。
+# longform は従来の LongFormOrchestrator 1 リクエスト生成。
 create:
-  pipeline: longform                  # staged | longform (既定 longform)
+  pipeline: staged                    # staged | longform (既定 staged)
   staged_enabled: true                # staged のキルスイッチ (pipeline と独立。false で即無効化)
   turn_timeout_sec: 3600.0            # create 1 ターン全体のウォールクロック上限 (予算の 3 層の最終防衛線、f_10 §3)。staged.total_timeout_sec はこの値-300秒にクランプされる
   runs_keep: 20                       # staged クリエイトの run レコード (f_10 §7) の保持件数
   staged:
+    profile: v2                      # v2 = 骨組み → 同時生成 → smoke → (Pro) 契約テスト → as-built 文書 (f_10 §11) / v1 = 旧工程 (Pro だけ)
+    parallel_generation: 3           # v2 の同時生成数の上限 (チャット以外のスロット数と小さい方)
+    v2_families: [python, web, php, sql]  # v2 で作る系統 (f_10 §12.1)。外した系統と対象外の言語は旧経路 (Pro は v1、Free は longform)
     test_stage_enabled: true          # test 工程のうち advisory ユニットテスト生成+pytest 実行。false で生成のみ
     smoke_gate_enabled: true          # test 工程のうち決定論的 import スモーク+spec/flowchart 注入リペア。test_stage_enabled とは独立
     flowchart_enabled: true          # spec 工程でフロー構造を合成し flowchart.md (mermaid) と spec.md の Processing flow 節を同一データから描画
@@ -1199,6 +1202,9 @@ create:
       enabled: false                 # true にした PC だけが実行する。false では宣言を読みもしない
       commands: []                   # 承認済み argv の allow-list (例: [["node", "--check", "{file}"]])。パックは承認済みのコマンドを選ぶだけで、引数も増やせない
       timeout_sec: 60                # 宣言側の timeout_sec の上限 (実際は min(宣言値, これ))
+  runtimes:                          # staged v2 が構文検査に使う実行環境 (f_10 §12.4)。空なら PATH から探す。GUI の設定画面からも変えられる
+    php: ""                          # php.exe の絶対パス (php -l)
+    node: ""                         # node.exe の絶対パス (node --check)
   brief:
     # ProductionBrief (f_08 §2.2): create ターン入口で1回だけ組む不変ブリーフの予算。
     # 全 LLM 呼出 (計画/spec/深化/フロー/code/test/修復/見直し/unit/レビュー) のプロンプト先頭に同じ bytes を置く

@@ -165,7 +165,7 @@ redact_string = _redact_string
 #: (``api.schemas.ChatRequest.private``) だが、ログはその経路に入っていない
 #: ため素通りしていた。実インシデント (2026-09-03 ライブ監査 T16):
 #: private セッションで話した口座番号とパスワードのヒントが
-#: ``local/logs/backend.log`` と ``local/logs/debug/rag_*.jsonl`` に平文で
+#: ``<data_root>/logs/backend.log`` と ``<data_root>/logs/debug/rag_*.jsonl`` に平文で
 #: 残った。記憶ストアには 1 件も入っていない (契約は守られている) のに、
 #: ログにだけ残るという食い違いだった。
 #:

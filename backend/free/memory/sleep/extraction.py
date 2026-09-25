@@ -486,7 +486,7 @@ def collect_live_attribute_values(
 
 
 def _mdp_extract_state_path(agent_trace_dir: Path | None) -> Path | None:
-    """Step 8 の処理済み episode_id 永続先 (``local/memory/mdp_extract_state.json``)。
+    """Step 8 の処理済み episode_id 永続先 (``<data_root>/g1/store/memory/mdp_extract_state.json``)。
 
     ``ensure_mdp_ingester`` と同じく ``memory_dir`` を優先し、resolver が使えない
     場合は ``agent_trace_dir`` 配下へフォールバックする。

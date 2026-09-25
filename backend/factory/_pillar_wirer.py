@@ -413,7 +413,7 @@ def _start_quality_probes(
     日本語の語間空白が 1% → 76〜83% に悪化したのに起動も capability probe も
     正常で、27 ターン会話するまで気付けなかった (2026-08-02)。その穴を塞ぐ。
 
-    毎起動は走らせない。``local/model_quality.json`` に「役割ごとに最後に検査した
+    毎起動は走らせない。``<data_root>/g1/store/model_quality.json`` に「役割ごとに最後に検査した
     モデル名」を記録し、**変わったときだけ**カナリアを投げる (iGPU では 3 役割で
     分単位かかるため)。起動はブロックせず、失敗しても prior のまま継続する。
     """
@@ -566,7 +566,7 @@ def _make_probe_embed_fn(embedder: Any) -> Any:
 def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> None:
     """6b. corpus パッケージストア初期化 (c_16 §4.3)
 
-    パッケージは ``PathResolver.resolve_corpus_dir()`` (``<data_root>/store/corpus/``)
+    パッケージは ``PathResolver.resolve_corpus_dir()`` (``<data_root>/g1/store/corpus/``)
     にある (旧 ``local_paths.cartridges_dir`` は廃止)。``rag`` セクションには
     c_16 §9 の ``memory.evidence.*`` を重ねて渡す — ``EvidenceStore`` が
     量子化 / memmap / クラスタ索引 (``rag.*``) と語彙索引 / 順位
@@ -2550,8 +2550,8 @@ async def _init_evolve_pipeline(
 
     結線:
 
-    1. LogIngestor: ``debug_log_dir`` = ``local/logs/debug/``、``state_path``
-       = ``local/state/log_ingestor.json``
+    1. LogIngestor: ``debug_log_dir`` = ``<data_root>/logs/debug/``、``state_path``
+       = ``<data_root>/g1/store/state/log_ingestor.json``
     2. LearnFactView: ``global`` + ``project:<id>`` (解決可能なら) を読み、
        writeback は ``project:<id>`` (なければ ``global``) — PolicyParamEvolver
        の semmem 経路と同じ scope 戦略

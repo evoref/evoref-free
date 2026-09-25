@@ -4,7 +4,7 @@
 実行時側。ディスク形は:
 
 ```
-local/memory/corpus/
+<data_root>/g1/store/corpus/
 ├── manifest.json                     # {active: {<id>: <version>},
 │                                     #  store_prior_overrides: {<id>: float},
 │                                     #  loaded: [<id>]}
@@ -594,7 +594,7 @@ class CorpusStore:
     """文書由来チャンクの実行時ストア (c_16 §4.3)。
 
     Args:
-        corpus_dir: ``local/memory/corpus``。
+        corpus_dir: ``<data_root>/g1/store/corpus``。
         embedding_backend: 埋め込みバックエンド。``None`` でも既存パッケージの
             検索はできる (ベクトルはディスク上にある)。install / rebuild には
             必要。:meth:`set_embedding_backend` で後から差せる。

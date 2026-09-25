@@ -131,6 +131,8 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     # ユーザ体感を阻害するため、失敗時は単一タスクへ倒して先へ進む。
     "meta_cognitive_plan": 90.0,
     "create_task_graph": 120.0,
+    # staged v2 の骨組み (f_10 §11)。呼出側が残りステージ予算を上限に明示する。
+    "create_skeleton": 240.0,
     # 帳票の穴埋め (f_11 §9.2、段階 B-1b)。chat 応答パスで同期発火する
     # (CLAUDE.md §6 #1)。失敗時は needs_input へ倒すだけなので短く打ち切る。
     "template_fill": 60.0,

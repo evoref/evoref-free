@@ -11,7 +11,7 @@ import importlib.util
 import zipfile
 from pathlib import Path
 
-from backend.data_root import DataRootError, resolve_data_root
+from backend.data_root import DataRootError, resolve_data_root, store_root
 from backend.free.cli.renderer import create_console, render_error, render_info
 from backend.free.export_import import (
     CATEGORIES,
@@ -123,7 +123,7 @@ def _open(argv: list[str], parser: argparse.ArgumentParser):
 
 def _lock(data_root: Path, console, key: str) -> WriterLock | None:
     try:
-        return acquire_writer_lock(data_root / "store")
+        return acquire_writer_lock(store_root(data_root))
     except WriterLockHeld as e:
         render_error(console, msg(key, detail=str(e)))
         return None

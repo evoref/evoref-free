@@ -62,7 +62,7 @@ class GateVote:
             "gate_votes": f"{self.tool_votes}/{self.k}",
         }
 
-#: 同梱 exemplar (tracked)。ユーザ override は ``local/triggers`` と同じ
+#: 同梱 exemplar (tracked)。ユーザ override は ``<data_root>/g1/store/overrides/triggers`` と同じ
 #: 2 段階構成にせず、まず同梱のみ。育成経路は今後 Level 1 側で足す。
 _DEFAULTS_FILE = Path(__file__).parent / "_defaults" / "tool_gate_exemplars.jsonl"
 

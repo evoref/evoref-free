@@ -2,7 +2,7 @@
 
 EvorefMem 統合仕様 における **プロジェクトスコープ** の同定を担う
 クリエイトモードでの SemMem は project スコープに物理分離されるため
-(`local/memory/semantic/projects/<project_id>/`)、現在の作業ディレクトリから
+(`<data_root>/g1/store/memory/semantic/projects/<project_id>/`)、現在の作業ディレクトリから
 安定した project_id を導出する必要がある。
 
 決定方針:

@@ -17,8 +17,7 @@
     python scripts\\strip_truncation_notice.py --apply    # 実際に書き換える
 
 ``--apply`` は書き換え前に ``<file>.bak`` を作る。走査の既定はデータ根
-(``--data-root`` → ``EVOREF_DATA_ROOT`` → ``<repo>/userdata``)。``local/`` (G0) は
-走査しない。
+(``--data-root`` → ``EVOREF_DATA_ROOT`` → ``<repo>/userdata``)。
 """
 
 from __future__ import annotations

@@ -48,7 +48,7 @@ SemanticFact の `subject` フィールドは検索・索引・コンフリク�
 
 ## ファイル形式
 
-``local/memory/semantic/subject_dictionary.json`` (形式
+``<data_root>/g1/store/memory/semantic/subject_dictionary.json`` (形式
 ``semantic.subject_dictionary``、利用者が手で編集する SoT)::
 
     {

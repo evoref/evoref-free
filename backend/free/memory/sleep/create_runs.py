@@ -1,6 +1,6 @@
 """Step 5.89: staged クリエイトの run GC (f_10 §7 / c_05 §0.5.6)。
 
-``local/create/<run_id>/`` (run.json + events.jsonl + WorkspaceManager 生成物)
+``<data_root>/g1/store/create/<run_id>/`` (run.json + events.jsonl + WorkspaceManager 生成物)
 は ``create.runs_keep`` (既定 20) を超えた古い run から ``ended_at`` 順に削除
 する。走行中 (``activity_state == "running"``) は対象外。
 

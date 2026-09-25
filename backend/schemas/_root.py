@@ -194,7 +194,7 @@ class EvorefConfig(BaseModel):
 
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
         - ``learning.optimizer == "full-cma-es"`` (Pro CMA-ES オプティマイザ)
-        - ``create.pipeline == "staged"`` (Pro staged クリエイトパイプライン)
+        - ``create.staged.profile == "v1"`` (staged の v1 工程は Pro 限定。v2 は Free でも使う)
         - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
 
         過去存在した ``external_api.enabled`` / 補助タスク関連の判定対象は
@@ -222,11 +222,14 @@ class EvorefConfig(BaseModel):
                 "pro.url_recall.team_profile_ids",
                 bool(self.pro.url_recall.team_profile_ids),
             ),
-            # staged クリエイトパイプラインは Pro 限定 (_staged_stage_base_enabled が
-            # is_pro() でゲート)。Free で pipeline=staged を設定しても longform の
-            # まま無効なので警告する。staged_enabled は intra-staged のキルスイッチ
-            # (既定 True) で Pro signal ではないため対象にしない。
-            ("create.pipeline", self.create.pipeline == "staged"),
+            # staged の v1 工程は Pro 限定 (_staged_stage_base_enabled がゲート)。
+            # Free は v2 だけを使うので、v1 を指定しても longform のまま無効に
+            # なることを警告する (f_10 §11.3)。staged_enabled は intra-staged の
+            # キルスイッチ (既定 True) で Pro signal ではないため対象にしない。
+            (
+                "create.staged.profile",
+                self.create.pipeline == "staged" and self.create.staged.profile == "v1",
+            ),
         ]
 
         # extra="allow" で透過する未定義トップレベルキー (Pro 拡張)。

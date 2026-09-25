@@ -97,7 +97,7 @@ def run_doctor_command(argv: list[str]) -> int:
     # 読み手の WARNING (退避・readonly) は報告の指摘と重複するので出さない。
     logging.disable(logging.ERROR)
     try:
-        report = run_doctor(data_root, install_root=project_root)
+        report = run_doctor(data_root)
         bundle = write_bundle(report, data_root, Path(args.bundle)) if args.bundle else None
     except DoctorError as e:
         print(msg("cli.doctor_failed", detail=str(e)), file=sys.stderr)

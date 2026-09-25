@@ -52,7 +52,7 @@ logger = get_logger("learning.policy_evolver")
 #: ユーザーが訂正も再質問もしない限り 1 件も数えられない。片側だけが動く
 #: 構造なので、最適化器は制約上限まで広げ続ける。
 #:
-#: 実測 (2026-08-23 ライブ監査): local/ を全消去した状態から同一セッション内の
+#: 実測 (2026-08-23 ライブ監査): データを全消去した状態から同一セッション内の
 #: 2 進化ステップで chat の ``short_query_max_chars`` が 20 → 34 へ動き、
 #: fitness は 0.9362 → 0.9453 と **改善判定** された (decline_count=0)。同じ
 #: コード・同じ 203 クエリの再分類で reactive は 5 件 (2.5%) → 53 件 (26.1%) と
@@ -948,7 +948,7 @@ class PolicyParamEvolver(VersionedJsonFile):
         # 改善し得ず劣化だけを起こす。恒真ガード (2.5) は窓が埋まる
         # DEGENERATE_WINDOW tick までは保留するので、初期化直後の数 tick は
         # 選択圧ゼロのまま動いてしまう — 実機 (2026-09-09 ライブ監査 B-04、
-        # local/ 全リセット後の初回 Level 1): 経験 25 件で欠陥ゼロ = fitness 1.0
+        # データ全リセット後の初回 Level 1): 経験 25 件で欠陥ゼロ = fitness 1.0
         # の memory:chat が explore の 1 手で conflict_similarity_threshold を
         # 0.85 → 0.881 へ動かした。ロールバックの基準 (prev_best) も 1.0 で
         # 固定されるため、この 1 手は後から「劣化」として検出されない。

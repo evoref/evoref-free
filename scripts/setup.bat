@@ -40,7 +40,7 @@ echo Options:
 echo   --shared-path ^<path^>  NAS shared path for multi-PC setup
 echo                          Uses shared models/ (no model checks)
 echo   --force                 Force reinstall (recreate .venv, reinstall packages,
-echo                          overwrite config.yaml; the data root and local\ are kept)
+echo                          overwrite config.yaml; the data root is kept)
 echo   -h, --help              Show this help message
 exit /b 0
 
@@ -174,19 +174,16 @@ if defined SHARED_PATH (
 
 rem --- 6. Data root directories ---
 rem backend.data_root resolves the data root (EVOREF_DATA_ROOT, else
-rem <install_root>\userdata) and rejects invalid ones. local\ (G0 data) is never
-rem created, moved or deleted here.
+rem <install_root>\userdata) and rejects invalid ones. PathResolver creates the
+rem layout, including the schema generation folder (g<N>\store, g<N>\cache).
 echo [6/6] Creating data root directories...
 set "DATA_ROOT="
-for /f "usebackq delims=" %%r in (`python -c "from backend.data_root import resolve_data_root; print(resolve_data_root())"`) do set "DATA_ROOT=%%r"
+for /f "usebackq delims=" %%r in (`python -c "from backend.config import PathResolver; from backend.data_root import install_root, resolve_data_root; r = PathResolver({}, install_root(), data_root=resolve_data_root()); r.ensure_local_dirs(); print(r.data_root)"`) do set "DATA_ROOT=%%r"
 if not defined DATA_ROOT (
     echo ERROR: could not resolve the data root ^(check EVOREF_DATA_ROOT^)
     exit /b 1
 )
 echo   Data root: !DATA_ROOT!
-for %%d in (store logs outputs themes profiles tmp run cache) do (
-    if not exist "!DATA_ROOT!\%%d" mkdir "!DATA_ROOT!\%%d"
-)
 echo   Done
 
 echo.

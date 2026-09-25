@@ -20,11 +20,6 @@
 - 共有形式 (``writers`` に free を含む) → ``backend.free.__version__.DATA_GENERATION``
 - Pro 専用形式 (``writers`` が pro だけ) → ``backend.pro.__version__.PRO_DATA_GENERATION``
 
-lock はトップに G0 検出の署名 (``g0_signatures``、起動ゲートの ``G0_SIGNATURES``) も
-持つ (設計 r6 §15.10)。署名を削るのは違反 (既存の G0 のデータを見落として黙って新規扱い
-になる)、足すのは更新待ち。定数は ``backend/factory`` にあるので :mod:`backend.formats` が
-渡す (``backend/io`` は起動の層を import しない)。
-
 使い方 (宣言モジュールを揃える必要があるので入口は :mod:`backend.formats`)::
 
     python -m backend.formats --check
@@ -138,14 +133,10 @@ def current_generations() -> dict[str, int]:
 def build_lock(
     registry: FormatRegistry = FORMATS,
     generations: dict[str, int] | None = None,
-    g0_signatures: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
-    """lock の描き出し。``g0_signatures`` は G0 検出の署名 (起動ゲートの定数を呼び手が渡す)。"""
+    """lock の描き出し。"""
     gens = current_generations() if generations is None else generations
-    lock: dict[str, Any] = {**gens, "formats": {s.format_id: describe_format(s) for s in registry.all()}}
-    if g0_signatures is not None:
-        lock["g0_signatures"] = sorted(g0_signatures)
-    return lock
+    return {**gens, "formats": {s.format_id: describe_format(s) for s in registry.all()}}
 
 
 def generation_key(writers: list[str]) -> str:
@@ -207,27 +198,9 @@ def _generation_changes(saved: dict[str, Any], current: dict[str, Any]) -> tuple
     return violations, stale
 
 
-def _g0_signature_changes(saved: dict[str, Any], current: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """G0 検出の署名 (設計 r6 §15.10)。削るのは違反 (既存の G0 のデータを見落とす)、足すのは更新待ち。"""
-    if "g0_signatures" not in current:
-        return [], []
-    after = set(current["g0_signatures"])
-    if "g0_signatures" not in saved:
-        return [], [f"g0_signatures: recorded {len(after)}"]
-    before = set(saved["g0_signatures"])
-    violations = [
-        f"G0 signature removed: {sig} (G0 data matching it would no longer be detected)"
-        for sig in sorted(before - after)
-    ]
-    return violations, [f"G0 signature added: {sig}" for sig in sorted(after - before)]
-
-
 def compare(saved: dict[str, Any], current: dict[str, Any]) -> tuple[list[str], list[str]]:
     """(違反, 更新が要るだけの差分) を返す。"""
     violations, stale = _generation_changes(saved, current)
-    g0_violations, g0_stale = _g0_signature_changes(saved, current)
-    violations.extend(g0_violations)
-    stale.extend(g0_stale)
     old_formats = saved.get("formats", {})
     new_formats = current["formats"]
     for fid, new in new_formats.items():

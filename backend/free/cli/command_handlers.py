@@ -170,7 +170,7 @@ def _cmd_clear(args: str, state: SessionState, console) -> CommandResult:  # noq
 
 
 def _cmd_save(args: str, state: SessionState, console) -> CommandResult:
-    """セッションを local/sessions/{name}.json に保存"""
+    """セッションを <data_root>/g1/store/cli_sessions/{name}.json に保存"""
     name = args.strip() or "default"
 
     if state.sessions_dir is None:

@@ -2,15 +2,20 @@
 # MoE 版 (LFM2-8B-A1B / LFM2.5-8B-A1B) は別アーキ "lfm2moe" を報告するため
 # lfm2moe.yaml 側で扱う (sampling 等もそちらが本命)。
 #
-# dense 版の推奨 sampling は公式に明示が無いため空にし、mode 別 (modes.*) の
-# 設定に委ねる。内蔵 ChatML テンプレートを使うため --jinja のみ付与する。
+# sampling は意図的に空: モデルカード (LiquidAI/LFM2-1.2B) の推奨は
+# temperature 0.3 / min_p 0.15 / repetition_penalty 1.05 だが、プロファイル sampling は
+# modes.* を上書きするため、ここで値を入れると chat (temp 0.7) と create (temp 0.3) の
+# モード別チューニングを一律に潰してしまう。モデル固有に寄せるなら by-model 層で宣言する
+# (例: by-model/LFM2.5-2.6B-Q5_K_M.yaml)。内蔵 ChatML テンプレートを使うため --jinja を付与する。
 launch_flags:
   - "--jinja"
   - "--reasoning-format"
   - "auto"
-# context_size (-c)。LFM2 dense の学習時最大コンテキスト (n_ctx_train) = 32768。
+# context_size (-c)。LFM2 (初代) のモデルカード記載の文脈長 = 32768。LFM2.5 世代は 128000 で、
+# GGUF の n_ctx_train (<arch>.context_length) 実測 (2026-09-24) は手元の LFM2-1.2B-Tool /
+# LFM2.5-2.6B / LFM2.5-Embedding-350M がいずれも 128000。32768 はその範囲に収まる保守既定。
 # config.yaml の llama.context_size が未指定 / null のとき採用される
-# (解決順: config 明示 > profile > 8192)。32768 を超える拡張は RoPE スケーリングが必要。
+# (解決順: config 明示 > profile > 8192)。
 # 32768 は KV キャッシュ VRAM が 8192 比で約4倍。VRAM が厳しい場合は config 側で
 # context_size を明示 (8192 等) して上書きするか cache_type_k/v を量子化する。
 context_size: 32768
@@ -20,6 +25,7 @@ moe:
 sampling: {}
 # reasoning (thinking)。dense LFM2 は非 reasoning 想定 (mode: none)。
 # enable_thinking / reasoning_budget を送らない (HTTP 400 回避)。
+# LFM2.5-2.6B は同じ arch でも強制 reasoning なので by-model 層で mode: always に上書きしている。
 reasoning:
   mode: none
 # LFM2.5-Embedding-350M (arch "lfm2") の埋め込みプロファイル。embed モデルを本 arch へ

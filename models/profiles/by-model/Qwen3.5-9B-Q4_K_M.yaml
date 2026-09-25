@@ -1,0 +1,53 @@
+# Qwen3.5-9B (Q4_K_M / Unsloth 量子化) 固有のプロファイル。
+# arch は "qwen35" を報告するため models/profiles/qwen35.yaml が土台になり、本ファイルの
+# 宣言だけが差分上書きされる (dict は再帰マージ、list とスカラーは置換)。ファイル名は
+# GGUF ファイル名の拡張子なし部分と完全一致させること。反映は llama-server / backend の
+# 再起動時のみ (キャッシュキーは GGUF の mtime で、本 YAML の mtime は見ない)。
+#
+# GGUF メタデータ実測 (2026-09-24, models/Qwen3.5-9B-Q4_K_M.gguf):
+#   architecture=qwen35 / block_count=32 / context_length=262144 / expert_count なし (dense)
+#   attention.head_count=16 / head_count_kv=4 / key_length=value_length=256
+#   embedding_length=4096 / feed_forward_length=12288 / rope.freq_base=1e7
+#   full_attention_interval=4 → 32 層中 8 層のみ full attention、残り 24 層は
+#   Gated DeltaNet (ssm.state_size=128 / ssm.inner_size=4096 / ssm.conv_kernel=4)
+#   nextn_predict_layers なし (MTP ヘッド非内蔵)
+#   general.sampling なし
+#
+# よって launch_flags (--jinja / --reasoning-format auto) / moe / reasoning (toggle・既定 OFF) /
+# context_size は arch 層のままで正しく、ここでは宣言しない (list の launch_flags は置換
+# なので、書くなら arch 側の値も全部書き直す必要がある)。
+#
+# context_size について: arch 層の 32768 は VRAM 都合の保守既定で、本モデルの
+# n_ctx_train は 262144。config.yaml の llama.context_size が明示されていればそれが勝つ
+# (config 明示 > profile > 既定)。伸ばすなら config 側を触る。
+#
+# 日本語品質: 2026-08-02 の実測で語間空白の混入率 1% (525 応答中 6)。known_issues なし。
+
+# ── サンプリング ────────────────────────────────────────
+# モデルカード (Qwen/Qwen3.5-9B) の推奨値:
+#   thinking     : temperature 1.0 / top_p 0.95 / top_k 20 / min_p 0.0 / presence_penalty 1.5
+#   non-thinking : temperature 0.7 / top_p 0.80 / top_k 20 / min_p 0.0 / presence_penalty 1.5
+# 本リポジトリは enable_thinking=false 運用なので non-thinking 側が該当する。
+#
+# profile.sampling は modes.* を上書きする
+# (backend/config.py get_mode_generation_params: {**defaults, **modes.*, **profile.sampling})。
+# 本 GGUF を chat と create の両方で使う構成に戻すと、モード間で値の割れる
+# temperature / top_p を宣言した時点で create の低温度を潰すため宣言しない。
+#
+# top_k だけ宣言する: 20 は thinking / non-thinking 双方で同じ推奨値で、modes.create は
+# 既に 20、modes.chat だけ 40 で乖離している。モード別チューニングを壊さずに
+# モデルカードへ寄せられる唯一のキー (Qwen3.8-27B-Q4_K_M.yaml と同じ判断)。
+#
+# presence_penalty 1.5 は意図的に不採用 — Qwen 系は presence_penalty > 0 で language
+# mixing が出やすく日本語運用でリスクがある。必要なら config.yaml の
+# modes.chat.presence_penalty に明示すること。
+sampling:
+  top_k: 20
+
+# ── MTP (自己投機デコード) — 使えない ──────────────────────
+# NextN ヘッドを持たないため、config.yaml の llama.mtp.enabled=true でも
+# scripts/launch_llama.py build_mtp_args が WARNING を出して --spec-type を付与しない
+# (graceful degrade)。
+
+# ── 画像 / 動画 ────────────────────────────────────────
+# chat_template は image/video を扱うが、この GGUF はテキスト側のみ (vision テンソルなし)。

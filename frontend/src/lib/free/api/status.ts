@@ -73,7 +73,7 @@ export interface LivenessAlert {
 
 /**
  * データ根の状態 (docs/c_05 §0.9)。readonly の間は記憶・学習・履歴・設定を保存しない。
- * reason / warnings は英語 (ログと同じ文)。g0_found は local/ に旧形式のデータが残っていること。
+ * reason / warnings は英語 (ログと同じ文)。
  * reembed_pending は埋め込みモデルが変わって再埋め込みの確認待ちのストア (確認までは記憶の検索が限られる)。
  * served_model_mismatch は llama-server が実際に載せているモデルが config と違うこと (docs/c_05 §0.5.7)。
  * degraded はこの起動中にチャット経路の保存に失敗した形式 (format_id)。
@@ -84,7 +84,6 @@ export interface DataHealthInfo {
 	readonly: boolean;
 	reason: string | null;
 	warnings: string[];
-	g0_found: boolean;
 	reembed_pending: string[];
 	served_model_mismatch: boolean;
 	served_model: string;

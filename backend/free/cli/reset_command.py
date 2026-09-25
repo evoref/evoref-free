@@ -1,12 +1,12 @@
 """evoref reset サブコマンド — データ根を初期状態へ戻す (c_05 §0.2 / §0.3)。
 
-消すもの: ``<data_root>/store/`` (記憶・履歴・学習・corpus・モデル切替状態) と
-``logs/`` ``tmp/`` ``cache/`` の中身。
+消すもの: このリリースの世代フォルダの ``<data_root>/g<N>/store/`` (記憶・履歴・学習・
+corpus・モデル切替状態) と ``g<N>/cache/``、データ根直下の ``logs/`` ``tmp/`` の中身。
 
 残すもの: ``outputs/`` ``themes/`` ``profiles/`` (利用者の成果物と上書き)、
 ``store/pro/`` と世代印 (``--include-pro`` を付けない限り。Pro の形式の版を
 世代印が覚えているので、片方だけ消すと次の起動が readonly になる)、
-``local/`` (G0 のデータ。G1 は開かない・動かさない・消さない)、
+他の世代フォルダ (``g<M>/``。消すのは ``evoref data prune`` の役目、G2 から)、
 台帳で ``keep_on_reset`` を宣言した形式のファイル (作り直しが高価な derived。
 補助タスクの timeout 較正・履歴要約の埋め込み。``--include-cache`` で消す)。
 
@@ -41,15 +41,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from backend.config import PathResolver
-from backend.data_root import DataRootError, resolve_data_root
+from backend.data_root import DataRootError, data_path, generation_root, resolve_data_root, store_root
 from backend.io import ledger_files
-from backend.io.generation_seal import SEAL_FILENAME
+from backend.io.generation_seal import GITKEEP_FILENAME, SEAL_FILENAME
 from backend.io.writer_lock import LOCK_FILENAME, WriterLockHeld, acquire_writer_lock
 from backend.log_config import get_logger
 
 logger = get_logger("cli.reset")
 
-#: 中身を消す (ディレクトリ自体は残す) データ根直下のディレクトリ。
+#: 中身を消す (ディレクトリ自体は残す) ディレクトリ (``cache`` は世代フォルダの下、:func:`data_path`)。
 WIPED_DIRS: tuple[str, ...] = ("logs", "tmp", "cache")
 #: ``--include-pro`` を付けない限り ``store/`` に残す項目。
 PRO_KEPT: tuple[str, ...] = ("pro", SEAL_FILENAME)
@@ -106,13 +106,15 @@ def kept_on_reset_classifier() -> ledger_files.Classifier:
 def _kept_files(data_root: Path, bases: list[Path], classify: ledger_files.Classifier) -> set[Path]:
     """``bases`` の下で残すファイル (形式が ``keep_on_reset`` を宣言しているもの)。"""
     kept: set[Path] = set()
+    generation_dir = generation_root(data_root)
     for base in bases:
-        if not base.is_dir():
+        # 台帳 (path_key) は世代フォルダの中だけ。logs/ tmp/ に keep_on_reset の形式は無い
+        if not base.is_dir() or not base.is_relative_to(generation_dir):
             continue
         for path in base.rglob("*"):
             if not path.is_file():
                 continue
-            spec = classify(path.relative_to(data_root).as_posix())
+            spec = classify(path.relative_to(generation_dir).as_posix())
             if spec is not None and spec.keep_on_reset:
                 kept.add(path)
     return kept
@@ -136,7 +138,7 @@ def _open_semantic_store(data_root: Path):
     from backend.free.memory.semantic.store import STORE_DIRNAME
     from backend.free.rag.evidence.store import EvidenceStore, EvidenceStoreReadonlyError
 
-    store_dir = data_root / PathResolver.LAYOUT["memory_dir"] / STORE_DIRNAME
+    store_dir = PathResolver.layout_path(data_root, "memory_dir") / STORE_DIRNAME
     if not store_dir.is_dir():
         return None
     store = EvidenceStore(store_dir, store_name="semantic", by=RETRACT_BY)
@@ -199,7 +201,7 @@ def restore_learning_facts(data_root: Path, records: list) -> int:
 
     if not records:
         return 0
-    store_dir = data_root / PathResolver.LAYOUT["memory_dir"] / STORE_DIRNAME
+    store_dir = PathResolver.layout_path(data_root, "memory_dir") / STORE_DIRNAME
     store_dir.mkdir(parents=True, exist_ok=True)
     store = EvidenceStore(store_dir, store_name="semantic", by=RETRACT_BY)
     store.load()
@@ -227,24 +229,24 @@ def reset_data_root(
     ``learning`` / ``memory`` のどちらも偽なら全体、どちらかが真ならその範囲だけ。
     """
     report = ResetReport()
-    store = data_root / "store"
+    store = store_root(data_root)
     selective = learning or memory
     # (消す範囲の根, 根の直下で飛ばす名前)
     scopes: list[tuple[Path, set[str]]] = []
     if selective:
         if learning:
-            scopes.append((data_root / PathResolver.LAYOUT["learning_dir"], set()))
+            scopes.append((PathResolver.layout_path(data_root, "learning_dir"), set()))
             if include_pro:
                 scopes.append((store / "pro" / "learning", set()))
         if memory:
-            scopes.append((data_root / PathResolver.LAYOUT["memory_dir"], set()))
+            scopes.append((PathResolver.layout_path(data_root, "memory_dir"), set()))
     else:
         skip = {LOCK_FILENAME}
         if not include_pro and (store / "pro").exists():
             skip.update(PRO_KEPT)
             report.kept_pro = True
         scopes.append((store, skip))
-        scopes += [(data_root / name, set()) for name in WIPED_DIRS]
+        scopes += [(data_path(data_root, name), set()) for name in WIPED_DIRS]
 
     if learning and not memory:
         try:
@@ -260,6 +262,8 @@ def reset_data_root(
             return report
 
     bases = [base for base, _ in scopes if base.is_dir()]
+    # ディレクトリ構成の印 (リポジトリで追跡する .gitkeep、c_03 §10.1) は消した後に戻す
+    gitkeeps = [path for base in bases for path in base.rglob(GITKEEP_FILENAME)]
     kept = set() if include_cache else _kept_files(data_root, bases, kept_on_reset_classifier())
     report.kept_cache = len(kept)
     kept_dirs = {parent for path in kept for parent in path.parents}
@@ -273,6 +277,12 @@ def reset_data_root(
             report.removed += 1
         else:
             report.errors.append(error)
+    for marker in gitkeeps:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch(exist_ok=True)
+        except OSError as e:
+            report.errors.append(f"{marker}: {e}")
     if kept_learning:
         try:
             report.kept_learning = restore_learning_facts(data_root, kept_learning)
@@ -407,7 +417,7 @@ def run_reset(argv: list[str]) -> int:
     console = create_console(no_color=not (sys.stdout and sys.stdout.isatty()))
     project_root = _find_project_root()
     try:
-        # 不正なデータ根 (local/ の中など) はサービスを止める前に拒否する。
+        # 不正なデータ根 (models/ の中など) はサービスを止める前に拒否する。
         data_root = resolve_data_root(args.data_root, root=project_root)
     except DataRootError as e:
         render_error(console, msg("cli.data_root_invalid", detail=str(e)))
@@ -421,7 +431,7 @@ def run_reset(argv: list[str]) -> int:
         if not stop_services(project_root):
             print("[reset] WARNING: some ports are still occupied")
     try:
-        lock = acquire_writer_lock(data_root / "store")
+        lock = acquire_writer_lock(store_root(data_root))
     except WriterLockHeld as e:
         render_error(console, msg("cli.reset_locked", detail=str(e)))
         return 1

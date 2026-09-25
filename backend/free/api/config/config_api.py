@@ -1,5 +1,6 @@
 """設定 API"""
 
+import asyncio
 import copy
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,9 +19,13 @@ from backend.free.api.schemas import (
     LocaleRequest,
     LocaleResponse,
     LocalesResponse,
+    RuntimeInfo,
+    RuntimePathRequest,
 )
+from backend.free.core import runtimes
 from backend.i18n_helper import set_locale, get_locale, available_locales
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 logger = get_logger("api.config")
 
@@ -97,7 +102,7 @@ CAPABILITY_KEYS: dict[str, tuple[str, ...]] = {
     "agent": ("dangerous_command_block",),
     "tools": ("fetch_url_allow_private_ip",),
     "widget_proxy": ("apis",),
-    "create": ("staged.verify",),
+    "create": ("staged.verify", "runtimes"),
 }
 #: 安全側と見なす真偽値 (この値への変更は許す)。
 _SAFE_BOOL_VALUES: dict[tuple[str, str], bool] = {
@@ -187,6 +192,77 @@ async def get_locales():
         current=get_locale(),
         prompt_locale=get_config().get("i18n", {}).get("prompt_locale", "ja"),
     )
+
+
+# ── create の実行環境 (c_06 §1.5 の例外 / f_10 §12.4) ──
+#
+# ``create.runtimes.<name>`` は能力キー (汎用 PUT からは書けない) だが、ここだけは
+# 保存前に ``validate_runtime_path`` を通して書ける。起動する引数は固定で設定から増やせない。
+
+
+def _runtime_info(name: str, cfg: dict) -> RuntimeInfo:
+    """実行環境 1 件の状態 (解決・版の取得はファイル I/O と子プロセスを伴う — スレッドで呼ぶ)。"""
+    configured = str((((cfg.get("create") or {}).get("runtimes") or {}).get(name)) or "")
+    found, reason = runtimes.resolve_runtime(name, cfg)
+    if found is None:
+        return RuntimeInfo(
+            name=name, configured=configured, resolved=None, source=None, version="",
+            error=reason if configured.strip() else None,
+        )
+    return RuntimeInfo(
+        name=name, configured=configured, resolved=str(found),
+        source="configured" if reason == "configured" else "path",
+        version=runtimes.runtime_version(name, found), error=None,
+    )
+
+
+async def _runtime_info_async(name: str) -> RuntimeInfo:
+    loop = asyncio.get_running_loop()
+    return await run_in_executor_with_context(loop, None, _runtime_info, name, get_config())
+
+
+@router.get("/runtimes", response_model=list[RuntimeInfo])
+async def get_runtimes():
+    """create の実行環境 (``create.runtimes.*``) の設定値・解決先・版"""
+    return [await _runtime_info_async(name) for name in runtimes.RUNTIME_NAMES]
+
+
+@router.put("/runtimes/{name}", response_model=RuntimeInfo)
+async def update_runtime_path(name: str, req: RuntimePathRequest):
+    """実行環境のパスを検証してから保存する。空文字列は設定を消す (PATH から探す)。"""
+    if name not in runtimes.RUNTIME_NAMES:
+        raise api_error(
+            404, "E0404", f"Unknown runtime: {name}",
+            "api.config_unknown_runtime", name=name,
+        )
+    value = ""
+    if req.path.strip():
+        loop = asyncio.get_running_loop()
+        found, reason = await run_in_executor_with_context(
+            loop, None, runtimes.validate_runtime_path, name, req.path,
+        )
+        if found is None:
+            raise api_error(
+                422, "E0422", f"create.runtimes.{name} is not usable: {reason}",
+                f"api.runtime_path_invalid.{reason}", name=name, reason=reason,
+            )
+        value = str(found)
+
+    try:
+        save_config_section("create", {"runtimes": {name: value}})
+    except ValidationError as e:
+        errors = [str(err["msg"]) for err in e.errors()]
+        raise HTTPException(status_code=422, detail={
+            "code": "E0422", "message": str(e),
+            "i18n_key": "", "context": {},
+            "errors": errors,
+        })
+    except Exception as e:
+        logger.error("Failed to save create.runtimes.%s: %s", name, e)
+        raise api_error(500, "E0500", str(e))
+
+    logger.info("create.runtimes.%s updated (%s)", name, "cleared" if not value else "set")
+    return await _runtime_info_async(name)
 
 
 # ── 全設定取得 ──
