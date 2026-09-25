@@ -8,6 +8,7 @@
 	import NumberField from './fields/NumberField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
 	import SliderField from './fields/SliderField.svelte';
+	import RuntimeSettingsGroup from './RuntimeSettingsGroup.svelte';
 
 	let modes = $derived(configSection($configData, 'modes'));
 	let chat = $derived((modes.chat ?? {}) as ChatModeConfig);
@@ -42,4 +43,7 @@
 		<ToggleField label="settings.long_form.rag_per_unit" value={Boolean(longForm.rag_per_unit ?? true)} onchange={fieldUpdater('long_form', 'rag_per_unit')} />
 		<NumberField label="settings.long_form.rag_top_k_per_unit" value={Number(longForm.rag_top_k_per_unit ?? 3)} min={1} onchange={fieldUpdater('long_form', 'rag_top_k_per_unit')} />
 	</FieldGroup>
+
+	<!-- create の実行環境は専用 API で保存する (タブの「適用」には乗らない) -->
+	<RuntimeSettingsGroup />
 </SettingsSection>

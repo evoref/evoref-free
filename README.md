@@ -8,12 +8,12 @@ evoref は **完全ローカル動作** の自己進化型 LLM アシスタン�
 
 ## 主な機能
 
-> 会話・記憶・学習データはすべて手元 (`local/`) に保存され、外部に送信されません。
+> 会話・記憶・学習データはすべて手元 (`userdata/`) に保存され、外部に送信されません。
 
 ### 完全ローカル / プライバシー
 
 - 推論エンジンは llama.cpp (llama-server) 上で GGUF モデルをローカル実行。**インターネット接続なしで動作**します (外部 API への接続機能はありません)。
-- 会話履歴・記憶・資料パック・学習データはすべて手元 (`local/`) に保存され、外部に送信されません。
+- 会話履歴・記憶・資料パック・学習データはすべて手元 (`userdata/`) に保存され、外部に送信されません。
 - GPU が無くても **CPU only で動作可能** (`llama.gpu_layers: 0`)。Windows 11 / macOS / Linux 対応。
 
 ### チャット（RAG 付き会話・ファイル添付）
@@ -98,7 +98,7 @@ evoref は **完全ローカル動作** の自己進化型 LLM アシスタン�
 | Git | 最新版 |
 | llama-server | [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases) の build **b8946 以上**を推奨 (CVE-2026-21869 修正以降) |
 | GPU / VRAM | GPU 推奨だが **CPU only でも動作** (`llama.gpu_layers: 0`)。必要 VRAM はモデルサイズ・`context_size`・並列スロット数 (`llama.slots`) に依存 (既定 base = gemma-4-12b-it-qat-q4_0 で概ね 8GB 前後)。埋め込みは既定で CPU 配置 |
-| ディスク | GGUF モデル計 十数 GB (既定構成: base gemma-4-12b-it-qat-q4_0 / embed Qwen3-Embedding-0.6B)。`local/` データは運用に応じ別途数百 MB〜数 GB |
+| ディスク | GGUF モデル計 十数 GB (既定構成: base gemma-4-12b-it-qat-q4_0 / embed Qwen3-Embedding-0.6B)。`userdata/` (データ) は運用に応じ別途数百 MB〜数 GB |
 
 llama-server は setup では導入されません。**別途インストールして PATH を通す**必要があります。
 
@@ -125,7 +125,7 @@ setup は以下を一括実行します:
 3. フロントエンド依存 (`npm install`)
 4. `config.yaml.example` → `config.yaml` コピー
 5. モデル配置チェック: `models/` に GGUF が配置されているか確認 (自動ダウンロードは行いません)
-6. `local/` データディレクトリ生成
+6. `userdata/` データディレクトリ生成
 
 > **モデルは手動配置**: GGUF を `models/` に置き、`config.yaml` の `model_paths` と整合させてください。既定は base (gemma-4-12b-it-qat-q4_0) / embed (Qwen3-Embedding-0.6B)。配置状況は `python scripts/download_model.py` で確認できます。
 
@@ -136,7 +136,7 @@ setup は以下を一括実行します:
 .\scripts\setup.bat --force                    # .venv / config.yaml を強制再構築
 ```
 
-複数 PC で使う場合、大きな GGUF モデルは NAS 上に共有しつつ、個人データ (履歴・記憶・学習) は各 PC の `local/` に独立して保持できます。
+複数 PC で使う場合、大きな GGUF モデルは NAS 上に共有しつつ、個人データ (履歴・記憶・学習) は各 PC の `userdata/` に独立して保持できます。PC を移るときは、サービスを止めて `userdata/` と `config.yaml` をコピーし、移行先の `models/` に同じモデルを置けば続きから使えます。
 
 ---
 

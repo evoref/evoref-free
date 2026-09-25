@@ -84,6 +84,11 @@ def js_export_summary(code: str, max_lines: int = 40) -> str:
     return "\n".join(lines[:max_lines])
 
 
+def relative_js_imports(code: str) -> list[str]:
+    """名前付き import の相対指定子 (``./y.js``、document 順)。staged v2 の参照関係 (f_10 §12.3)。"""
+    return [f"./{src}" for _group, src in _NAMED_IMPORT_RE.findall(code or "")]
+
+
 def missing_js_imports(code: str, siblings: dict[str, str]) -> list[str]:
     """``./兄弟`` から名前付き import した名前のうち、兄弟が export していないもの。
 

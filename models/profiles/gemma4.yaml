@@ -1,30 +1,34 @@
-# Google Gemma-4 系 (arch "gemma4"・非 MoE・reasoning)。
-# gemma-4-E4B-it / gemma-4-E2B-it / gemma-4-12B-it 等の GGUF は
+# Google Gemma-4 系 (arch "gemma4"・dense と MoE の両方・reasoning)。
+# gemma-4-E4B-it / gemma-4-E2B-it / gemma-4-12B-it / gemma-4-26B-A4B-it 等の GGUF は
 # general.architecture="gemma4" を報告するため、プロファイル名は gemma4.yaml
 # でなければマッチしない (Gemma3 系 "gemma3" / "gemma3n" とは別アーキ)。
-# E2B/E4B は MatFormer の effective param 表記、12B 等は通常の dense サイズで、
-# いずれもアーキ名は gemma4 (サイズ非依存・本プロファイルで共通カバー)。
+# E2B/E4B は MatFormer の effective param 表記、12B は dense、26B-A4B は MoE
+# (expert_count=128) で、いずれもアーキ名は gemma4 (本プロファイルで共通カバー)。
 #
 # sampling は意図的に空: プロファイル sampling は modes.* を上書きするため、
 # ここで値を入れると chat (temp 0.7) と create (temp 0.3) のモード別チューニングを
 # 一律に潰してしまう。Gemma 公式推奨 (temp 1.0 / top_k 64 / top_p 0.95) は単一 arch
 # プロファイルでは chat/create を区別できないため採用せず、modes.* に委ねる。
 #
-# dense なので MoE 無効 (expert_count=0)。内蔵テンプレートを使うため --jinja を付与。
+# 内蔵テンプレートを使うため --jinja を付与。
 launch_flags:
   - "--jinja"
   - "--reasoning-format"
   - "auto"
-# context_size (-c)。Gemma-4 の学習時最大コンテキスト (n_ctx_train)。E2B/E4B (小型) は 32768。
-# 12B 等の大型は最大 131072 まで対応するが、サイズ共通プロファイルでは小型に合わせ 32768 とする
-# (12B でさらに伸ばす場合は config の llama.context_size 明示、または
-#  local/profiles/gemma4.yaml で 131072 + RoPE スケーリングを指定)。
+# context_size (-c)。**モデルの上限ではなく VRAM 都合の保守既定**。
+# GGUF の n_ctx_train (<arch>.context_length) 実測 (2026-09-24): E2B / E4B / 12B (Q4_K_M) は
+# 131072、12B (qat-q4_0) / 26B-A4B は 262144。いずれも 32768 を上回るので、伸ばすなら
+# config の llama.context_size を明示する (RoPE スケーリングは不要)。
 # config.yaml の llama.context_size が未指定 / null のとき採用 (解決順: config 明示 > profile > 8192)。
 # 32768 は KV キャッシュ VRAM が 8192 比で約4倍。VRAM が厳しい場合は config 側で context_size を
 # 明示 (8192 等) して上書きするか cache_type_k/v を量子化する。
 context_size: 32768
+# MoE は 26B-A4B だけ。--n-cpu-moe は GGUF が expert を報告するモデルにしか付かない
+# (scripts/launch_llama.py resolve_auto_model_flags) ので、enabled: true でも dense には無影響。
+# 既定は付けない (n_cpu_moe: null)。VRAM が厳しい場合は <data_root>/profiles/by-model/
+# <GGUF stem>.yaml で moe.n_cpu_moe を整数指定すると expert を CPU 退避できる。
 moe:
-  enabled: false
+  enabled: true
   n_cpu_moe: null
 sampling: {}
 # reasoning (thinking)。chat_template 実測で thinking 切替対応 (mode: toggle)・

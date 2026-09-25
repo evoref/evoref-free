@@ -30,7 +30,7 @@ extractor は no-op となる。
 - fact / provenance の ``trace_id`` はリクエストの trace_id (行の ``trace_id``、
   無ければ episode_id) — episodic LTM ノート (Step 7.5) と同じ値になり、
   ファクトとノートを trace_id で連結できる。
-- 読み手は ``MDPIngester`` (別 state ``<data_root>/store/memory/episodic/mdp_extract_state.json``)。
+- 読み手は ``MDPIngester`` (別 state ``<data_root>/g1/store/memory/episodic/mdp_extract_state.json``)。
   ファイル別オフセットで差分だけ読み、処理済み episode_id を永続化する。
   in-memory だけだと再起動後に 30 日分の failure_pattern をもう一度
   occurrences 加算してしまう (decision は subject dedup で守られるが

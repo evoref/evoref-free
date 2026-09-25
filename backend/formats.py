@@ -86,12 +86,11 @@ def load_all_formats() -> None:
 
 
 def build_current_lock() -> dict[str, Any]:
-    """全宣言を揃えた現行の lock (形式・世代・G0 検出の署名)。"""
-    from backend.factory._data_gate import G0_SIGNATURES
+    """全宣言を揃えた現行の lock (形式・世代)。"""
     from backend.io.format_lock import build_lock
 
     load_all_formats()
-    return build_lock(g0_signatures=G0_SIGNATURES)
+    return build_lock()
 
 
 def freeze_fixtures() -> list[Any]:

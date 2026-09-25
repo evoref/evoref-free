@@ -27,7 +27,7 @@ _TOOL_MAX_FILE_READ_BYTES = 2_000_000
 
 #: search_code の走査で降りないディレクトリ (隠しディレクトリは別に除く)。
 _WALK_EXCLUDED_DIRS = frozenset({
-    "node_modules", "__pycache__", ".git", "models", "local",
+    "node_modules", "__pycache__", ".git", "models",
     DEFAULT_DIRNAME, ISOLATED_DIRNAME,
 })
 

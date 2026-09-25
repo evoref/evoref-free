@@ -16,8 +16,8 @@ G0 の ``JsonStateStore`` (learning) と ``JsonStateFile`` (rag.evidence) を統
   - ``absent`` — ファイルが無い。
   - ``current`` / ``migrated`` — 読めた (古い版は ``MIGRATIONS`` を vN→vN+1 で連鎖)。
   - ``newer`` — 版がアプリより新しい、または解けない圧縮形式。**読まず、保存も拒否**。
-  - ``foreign`` — 別の形式 / G1 の封筒でない (G0 を含む)。G1 は G0 を開かない・
-    動かさない (§0.3) ので、触らずに readonly。
+  - ``foreign`` — 別の形式 / G1 の封筒でない (G0 を含む)。G0 とはデータ互換を持たない
+    (c_05 §0.3) ので、読まず・書き換えずに readonly。
   - ``unmigratable`` — 古い版だが移行器が欠けている。読めないが壊してもいけないので readonly。
   - ``corrupt`` — 版が現行以下で読めない。``<name>.corrupt-<utcstamp>`` へ改名して
     既定の状態で続ける (degraded)。**改名に失敗したら readonly** — 黙って既定値で

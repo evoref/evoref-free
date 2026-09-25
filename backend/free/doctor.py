@@ -15,7 +15,7 @@ readonly にして止める)。serve の稼働中でも動く (書き手ロッ�
   offsets の行数、ぶら下がった参照 (gc_log の墓標は許容)
 - 履歴のセッション id と経験の id の一意性、未知の列挙値の経験 (計数だけ)
 - スコープを跨ぐ参照 (Pro の LoRA meta → 共有の経験) は弱い参照で、欠けは計数だけ (§15.3)
-- 世代印・G0 の検出・データ根の置き場
+- 世代印・世代フォルダ (``g<N>/``)・データ根の置き場
 
 ``--bundle`` の束 (:func:`write_bundle`) は報告・形式表・版・redact 済みのログの末尾だけで、
 ストアの中身 (レコード・本文) は入れない。
@@ -34,6 +34,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from backend.data_root import DATA_GENERATION, generation_dirs, generation_root, store_root
 from backend.io import jsoncodec, ledger_files
 from backend.io.format_registry import FORMATS, FormatSpec
 from backend.io.generation_seal import check_seal
@@ -165,7 +166,8 @@ def _no_store_writes(store_dir: Path) -> Iterator[None]:
 
 
 def _rel(path: Path, data_root: Path) -> str:
-    return path.relative_to(data_root).as_posix()
+    """世代フォルダからの相対 (``path_key`` と同じ ``store/...`` の形)。"""
+    return path.relative_to(generation_root(data_root)).as_posix()
 
 
 # ── 版付き JSON / JSONL ──
@@ -437,7 +439,7 @@ def _check_weak_refs(report: _Report, collected: dict[str, Any]) -> None:
         report.add("info", "weak_reference_missing", format_id=_ADAPTER_META, count=missing)
 
 
-# ── 世代印・置き場・G0 ──
+# ── 世代印・置き場・世代フォルダ ──
 
 
 def _check_seal(report: _Report, store_dir: Path, edition: str) -> None:
@@ -484,15 +486,13 @@ def _check_location(report: _Report, data_root: Path) -> None:
         report.add("info", "location_weak_fs", detail=location.fs_type or "")
 
 
-def _check_g0(report: _Report, install_root: Path | None) -> None:
-    if install_root is None:
-        return
-    from backend.factory._data_gate import detect_g0
-
-    g0 = detect_g0(install_root)
-    report.sections["g0"] = {"detected": g0.found, "signatures": len(g0.signatures)}
-    if g0.found:
-        report.add("info", "g0_detected", count=len(g0.signatures))
+def _check_generations(report: _Report, data_root: Path) -> None:
+    """世代フォルダ ``g<N>/`` の一覧。自分の世代以外があれば知らせる (c_05 §0.2)。"""
+    present = sorted(generation_dirs(data_root))
+    report.sections["generations"] = {"current": DATA_GENERATION, "present": present}
+    others = [f"g{g}" for g in present if g != DATA_GENERATION]
+    if others:
+        report.add("info", "other_generations", detail=", ".join(others))
 
 
 def _app_section(edition: str) -> dict[str, Any]:
@@ -515,9 +515,7 @@ def _app_section(edition: str) -> dict[str, Any]:
 # ── 入口 ──
 
 
-def run_doctor(
-    data_root: Path, *, install_root: Path | None = None, edition: str | None = None,
-) -> dict[str, Any]:
+def run_doctor(data_root: Path, *, edition: str | None = None) -> dict[str, Any]:
     """データ根を検査して報告 (JSON にできる dict) を返す。``store/`` には書かない。
 
     Raises:
@@ -530,7 +528,7 @@ def run_doctor(
         raise DoctorError(f"data root does not exist: {data_root}")
     load_all_formats()
     edition = edition or producer_edition()
-    store_dir = data_root / ledger_files.STORE_DIR
+    store_dir = store_root(data_root)
     report = _Report()
     report.sections.update(_app_section(edition))
     report.sections["serve_running"] = lock_held(store_dir)
@@ -544,9 +542,9 @@ def run_doctor(
     }
     with _no_store_writes(store_dir):
         _check_location(report, data_root)
-        _check_g0(report, install_root)
+        _check_generations(report, data_root)
         _check_seal(report, store_dir, edition)
-        for path, spec in ledger_files.walk(data_root):
+        for path, spec in ledger_files.walk(generation_root(data_root)):
             rel = _rel(path, data_root)
             if spec is None:
                 report.add("error", "unledgered_file", path=rel)
@@ -608,12 +606,12 @@ def write_bundle(
     from backend.structlog_config import redact_string
 
     target = bundle_path(dest).resolve()
-    store_dir = (Path(data_root) / ledger_files.STORE_DIR).resolve()
+    store_dir = store_root(Path(data_root)).resolve()
     if target == store_dir or store_dir in target.parents:
         raise DoctorError(f"the bundle must be written outside {store_dir}")
     formats = {spec.format_id: spec.version for spec in FORMATS.all()}
     environment = {
-        **{k: report.get(k) for k in ("generated_at", "app", "serve_running", "location", "seal", "g0")},
+        **{k: report.get(k) for k in ("generated_at", "app", "serve_running", "location", "seal", "generations")},
         "python": platform.python_version(),
         "platform": platform.platform(),
     }

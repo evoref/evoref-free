@@ -103,6 +103,21 @@ class CreateStagedConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    profile: Literal["v1", "v2"] = Field(
+        default="v2",
+        description="staged の工程構成 (f_10 §11)。v1 = タスクグラフ → spec 本文 → 深化 → "
+                    "フロー → コード → テスト → spec 見直し。v2 = 骨組み (文法制約 JSON 1 回) → "
+                    "別スロットでの同時生成 → smoke → (Pro) 契約テスト → as-built 文書",
+    )
+    parallel_generation: int = Field(
+        default=3, ge=1, le=3,
+        description="v2 の同時生成数の上限 (チャット以外のスロット数と小さい方)",
+    )
+    v2_families: list[Literal["python", "web", "php", "sql"]] = Field(
+        default_factory=lambda: ["python", "web", "php", "sql"],
+        description="v2 で作る系統 (f_10 §12.1)。含めない系統と対象外の言語は旧経路 "
+                    "(Pro は v1、Free は longform)。判定 (§12.6) を満たした系統だけを残す",
+    )
     test_stage_enabled: bool = Field(
         default=True,
         description="test 工程のうち advisory なユニットテスト生成+pytest 実行を"
@@ -264,14 +279,27 @@ class BriefConfig(BaseModel):
     )
 
 
+class CreateRuntimesConfig(BaseModel):
+    """staged v2 が構文検査に使う実行環境 (f_10 §12.4)。空なら PATH から探す。
+
+    GUI からは専用 API (``PUT /api/config/runtimes/{name}``) で検証つきで書ける
+    (c_06 §1.5 の例外)。検証は ``backend.free.core.runtimes.validate_runtime_path``。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    php: str = Field(default="", description="php.exe の絶対パス (空なら PATH)。php -l で構文を検査する")
+    node: str = Field(default="", description="node.exe の絶対パス (空なら PATH)。node --check で構文を検査する")
+
+
 class CreateConfig(BaseModel):
     """``create:`` トップレベル設定。"""
 
     model_config = ConfigDict(extra="forbid")
 
     pipeline: Literal["staged", "longform"] = Field(
-        default="longform",
-        description="クリエイトモードの生成方式。既定は従来の longform",
+        default="staged",
+        description="クリエイトモードの生成方式。既定は staged (v2、f_10 §11)。longform は従来の CogWriter",
     )
     staged_enabled: bool = Field(
         default=True,
@@ -289,4 +317,5 @@ class CreateConfig(BaseModel):
         description="staged クリエイトの run レコード (f_10 §7) の保持件数",
     )
     staged: CreateStagedConfig = Field(default_factory=CreateStagedConfig)
+    runtimes: CreateRuntimesConfig = Field(default_factory=CreateRuntimesConfig)
     brief: BriefConfig = Field(default_factory=BriefConfig)

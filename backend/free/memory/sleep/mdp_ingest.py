@@ -39,7 +39,7 @@ def ensure_mdp_ingester(
     ``cached`` が既に生成済ならそのまま返す。そうでなければ
     ``agent_trace_dir`` が存在する場合にのみ新規生成する。
     ``path_resolver`` から ``memory_dir`` を解決し、state ファイルを
-    ``local/memory/mdp_ingest_state.json`` に配置する。resolver が使えない
+    ``<data_root>/g1/store/memory/mdp_ingest_state.json`` に配置する。resolver が使えない
     場合は ``agent_trace_dir`` 配下にフォールバック。
 
     Args:

@@ -581,7 +581,7 @@ class ModelMigrationConfig(BaseModel):
     """ベースモデル移行 / 起動時整合性チェック設定
 
     `strict_startup_check=True` にすると、起動時に
-    `<data_root>/store/model_state.json` の `current_filename` と
+    `<data_root>/g1/store/model_state.json` の `current_filename` と
     `config.yaml.model_paths.base_model` のファイル名が一致しない場合に
     `RuntimeError` を送出して起動をブロックする。
 

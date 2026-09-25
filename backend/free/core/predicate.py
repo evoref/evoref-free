@@ -286,7 +286,7 @@ def _l2_normalize(mat: np.ndarray) -> np.ndarray:
 #: 手でベンチを回している間は気づけるが、それは仕組みではない。warmup が毎回
 #: 測って下回ったら WARNING を出す。
 #:
-#: user override (``local/`` 側で事例を差し替える) を将来入れるなら、この
+#: user override (``<data_root>/g1/store/overrides/`` 側で事例を差し替える) を将来入れるなら、この
 #: 自己診断が前提になる — ユーザーには劣化に気づく手段が他に無い。
 DEFAULT_MIN_LOO_ACCURACY = 0.95
 

@@ -9,7 +9,7 @@
 
 コスト標本の入手経路は 2 つ:
 
-1. ``<data_root>/store/learning/<model>/experience.jsonl`` の ``prompt_tokens`` /
+1. ``<data_root>/g1/store/learning/<model>/experience.jsonl`` の ``prompt_tokens`` /
    ``cached_prompt_tokens`` (2026-08-18 に配線)。本命だが、配線以降に蓄積した
    ぶんしか無い。
 2. ``<data_root>/logs/llama-base.stderr.log`` の ``slot print_timing``。配線以前の

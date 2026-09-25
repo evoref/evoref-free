@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --shared-path <path>  NAS shared path for multi-PC setup"
             echo "                        Uses shared models/ (no model checks)"
             echo "  --force               Force reinstall (recreate .venv, reinstall packages,"
-            echo "                        overwrite config.yaml; the data root and local/ are kept)"
+            echo "                        overwrite config.yaml; the data root is kept)"
             echo "  -h, --help            Show this help message"
             exit 0
             ;;

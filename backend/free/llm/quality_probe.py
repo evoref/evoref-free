@@ -134,7 +134,7 @@ class CheckResult:
 
 @dataclass
 class QualityProbeResult:
-    """役割 1 つ分のプローブ結果。``local/model_quality.json`` に永続化される。"""
+    """役割 1 つ分のプローブ結果。``<data_root>/g1/store/model_quality.json`` に永続化される。"""
 
     role: str
     model: str
@@ -207,7 +207,7 @@ class QualityBaseline:
 def resolve_quality_baseline(profile: dict | None) -> QualityBaseline:
     """arch プロファイルから :class:`QualityBaseline` を解決する (純粋関数)。
 
-    未知キーは黙って無視する — プロファイルはユーザーが ``local/profiles/`` で
+    未知キーは黙って無視する — プロファイルはユーザーが ``<data_root>/profiles/`` で
     上書きでき、綴り違いで起動を落としたくない。型が合わないキーも既定へ倒す。
     """
     block = (profile or {}).get("quality_baseline")

@@ -7,7 +7,7 @@
 
 import { request } from './_client';
 
-/** local/ 初期化レスポンス */
+/** データ根の初期化レスポンス */
 export interface ResetLocalDataResponse {
 	/** "restarting" (デタッチヘルパー起動済み) */
 	status: string;
@@ -18,10 +18,10 @@ export interface ResetLocalDataResponse {
 }
 
 /**
- * local/ データを setup.bat 直後の空スケルトンへ初期化し、サービスを再起動する。
+ * データ根 (userdata/) を setup.bat 直後の空スケルトンへ初期化し、サービスを再起動する。
  *
  * バックエンドはデタッチヘルパーを起動して即座に 202 を返す。その後ヘルパーが
- * backend を含む全サービスを停止 → local/ を wipe → 再起動するため、本リクエスト
+ * backend を含む全サービスを停止 → データ根を初期化 → 再起動するため、本リクエスト
  * 完了後ほどなく backend への接続は一時的に切れる (呼び出し側で再起動待ち UI を出す)。
  */
 export async function resetLocalData(confirm: boolean): Promise<ResetLocalDataResponse> {

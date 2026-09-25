@@ -164,8 +164,7 @@ class DataHealthInfo(BaseModel):
     """データ根の状態 (c_05 §0.9、起動ゲートの結果)。
 
     ``readonly`` の間は記憶・学習・履歴・設定を保存しない (UI は入力欄に常時表示する)。
-    ``reason`` / ``warnings`` は英語 (ログと同じ文)。``g0_found`` は ``local/`` に
-    旧形式 (0.0.98 以前) のデータが残っていること (このバージョンは読まない)。
+    ``reason`` / ``warnings`` は英語 (ログと同じ文)。
 
     ``reembed_pending`` は埋め込みモデルが変わって再埋め込みの確認待ちのストア
     (``episodic`` / ``semantic`` / ``corpus:<id>@<version>``)。確認
@@ -182,7 +181,6 @@ class DataHealthInfo(BaseModel):
     readonly: bool = False
     reason: str | None = None
     warnings: list[str] = Field(default_factory=list)
-    g0_found: bool = False
     reembed_pending: list[str] = Field(default_factory=list)
     served_model_mismatch: bool = False
     served_model: str = ""
@@ -613,6 +611,21 @@ class ConfigValidateResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class RuntimeInfo(BaseModel):
+    """create の実行環境 1 件の状態 (``create.runtimes.<name>``、f_10 §12.4)"""
+    name: str
+    configured: str
+    resolved: str | None
+    source: Literal["configured", "path"] | None
+    version: str
+    error: str | None  # 設定値が使えないときの検証理由
+
+
+class RuntimePathRequest(BaseModel):
+    """実行環境のパス設定リクエスト (空文字列で設定を消し PATH から探す)"""
+    path: str
+
+
 # ===== Sessions =====
 
 class SessionRegisterRequest(BaseModel):
@@ -664,7 +677,7 @@ class SessionData(BaseModel):
     """セッション永続化データ（CLI / GUI 共通スキーマ）
 
     CLI の /save, /load および GUI のセッション管理で使用する
-    統一フォーマット。local/sessions/{name}.json に保存される。
+    統一フォーマット。<data_root>/g1/store/cli_sessions/{name}.json に保存される。
     """
     session_id: str
     started_at: str

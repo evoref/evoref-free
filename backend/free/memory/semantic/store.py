@@ -1,6 +1,6 @@
 """`SemanticStore` — 構造化事実の唯一の永続層 (c_16 §4.2)。
 
-``local/memory/semantic/`` に :class:`~backend.free.rag.evidence.EvidenceStore`
+``<data_root>/g1/store/memory/semantic/`` に :class:`~backend.free.rag.evidence.EvidenceStore`
 を **1 つだけ** 持ち、旧 ``SemanticFactStore`` のスコープ別ディレクトリ
 (``global/`` / ``projects/<id>/``) を ``Evidence.scope`` フィールドへ畳む。
 
@@ -120,7 +120,7 @@ def _resolve_store_priors(rag_config: Any) -> tuple[float, float]:
             out.append(default)
     return out[0], out[1]
 
-#: ストアのディレクトリ名 (``local/memory/semantic``)。
+#: ストアのディレクトリ名 (``<data_root>/g1/store/memory/semantic``)。
 STORE_DIRNAME = "semantic"
 
 #: 事象ログの ``by`` (書き手コンポーネント)。

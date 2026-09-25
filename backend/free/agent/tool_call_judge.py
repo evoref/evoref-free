@@ -20,6 +20,7 @@ import httpx
 from backend.config import get_project_root
 from backend.free.agent.router import (
     asks_directory_listing,
+    indicates_write_destination,
     is_environment_fact_query,
 )
 from backend.free.core.intent_vocab import (
@@ -199,6 +200,7 @@ from backend.free.agent.tool_judge_args import (
     _normalize_path_text,
     _trim_nonexistent_path_tail,
     asks_file_existence_only,
+    extract_write_target_path,
     quoted_spans,
     resolve_listing_directory,
 )
@@ -1994,7 +1996,9 @@ class ToolCallJudge:
         # 渡ってくることがある (層 5.5 と違い縮約が掛からない)。
         self._maybe_reduce_history_query(result, query)
         # 分類器は 1 つの arg しか生成しないので、必須引数が 2 つ以上ある
-        # ツールは呼び出しが必ず失敗する (下記)。
+        # ツールは呼び出しが必ず失敗する (下記)。write_file は宛先を補い、
+        # 本文は実行側 (deliberative の _ensure_write_file_content) に作らせる。
+        self._fill_write_file_target(result, query)
         self._drop_if_required_args_missing(result, query, tools_registry)
 
         result = self._finalize(
@@ -2419,6 +2423,33 @@ class ToolCallJudge:
     _ARG_FILLERS: dict = {
         "translate.text": ("quoted", staticmethod(_first_quoted_span)),
     }
+    #: 空でも実行側が生成して埋める必須引数 (``_drop_if_required_args_missing`` の対象外)。
+    #: write_file の本文は deliberative の ``_ensure_write_file_content`` が作る。
+    _GENERATED_ARGS: frozenset[str] = frozenset({"write_file.content"})
+
+    def _fill_write_file_target(self, result: "ToolJudgement", query: str) -> None:
+        """分類器が選んだ ``write_file`` の宛先をクエリから補い、本文は捨てる (純粋な後処理)。
+
+        分類器の arg は 1 つで、``write_file`` では本文 (``content``、先頭の必須引数)
+        に使われ ``file_path`` が空になる。実インシデント (2026-09-25): create の
+        「Python で書き、add.py に保存して」で write_file が取り下げられ、保存
+        されなかった。本文は 256 トークンで切れた下書きなので採らず、宛先だけ
+        決めて本文は実行側に生成させる (層 1 の ``write_file({'file_path': …})`` と
+        同じ形)。宛先は router と同じ証拠 (``indicates_write_destination``) がある
+        ときだけ補う — 「compose.yaml を書いて」は中身を見せる依頼 (F-05)。
+        """
+        if not result.tool_needed or result.tool_name != "write_file":
+            return
+        args = result.tool_args or {}
+        if str(args.get("file_path") or "").strip():
+            return
+        if not indicates_write_destination(query):
+            return
+        path = extract_write_target_path(query)
+        if not path:
+            return
+        result.tool_args = {"file_path": path}
+        logger.info("Filled write_file destination from the query: %s", path)
 
     def _drop_if_required_args_missing(
         self, result: "ToolJudgement", query: str, tools_registry,
@@ -2445,7 +2476,11 @@ class ToolCallJudge:
         except Exception:
             return
         args = result.tool_args or {}
-        missing = [a for a in required if not str(args.get(a) or "").strip()]
+        missing = [
+            a for a in required
+            if not str(args.get(a) or "").strip()
+            and f"{result.tool_name}.{a}" not in self._GENERATED_ARGS
+        ]
         if not missing:
             return
         for name in list(missing):

@@ -1,6 +1,6 @@
 """`EpisodicStore` — 会話由来ノートの唯一の永続層 (c_16 §4.1)。
 
-``local/memory/episodic/`` に :class:`~backend.free.rag.evidence.EvidenceStore`
+``<data_root>/g1/store/memory/episodic/`` に :class:`~backend.free.rag.evidence.EvidenceStore`
 を 1 つだけ持ち、WM / STM / LTM の 3 ストアを ``attrs.tier`` へ畳む。
 
 ```
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.episodic.store")
 
-#: ストアのディレクトリ名 (``local/memory/episodic``)。
+#: ストアのディレクトリ名 (``<data_root>/g1/store/memory/episodic``)。
 STORE_DIRNAME = "episodic"
 
 #: ``long`` tier で検索するシャードの窓 (月数)。これより古い月のシャードは

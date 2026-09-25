@@ -63,7 +63,7 @@ _OUTPUT_EXTENSION_PATTERN = r"(?i)\.(md|txt|csv|docx|pptx|xlsx)\b"
 #: create モードで、文書拡張子の付いた **添え物** (「サンプルの sales.csv も」) と
 #: 並んだときだけ見る (:func:`_extension_only_on_bare_names`)。
 _IMPLEMENTATION_LANGUAGE_RE = re.compile(
-    r"(?i)\b(?:python|javascript|typescript|java|go|rust|ruby|php|kotlin|swift|c\+\+|c#)"
+    r"(?i)\b(python|javascript|typescript|java|go|rust|ruby|php|kotlin|swift|c\+\+|c#)"
     # 「Python 標準ライブラリで」のように修飾が挟まる (K10)。句読点は越えない。
     r"\b[^。、,.\n]{0,12}?(?:で|を使|により|による)",
 )
@@ -125,6 +125,15 @@ def _mask_input_file_paths(instruction: str) -> str:
         if is_input:
             instruction = instruction.replace(path, " ")
     return instruction
+
+
+def implementation_languages(text: str) -> set[str]:
+    """実装手段として名指された言語 (小文字、「JavaScript で」→ ``{"javascript"}``)。
+
+    staged v2 が Python だけの依頼かを見る (f_10 §11.3)。語彙は
+    ``_IMPLEMENTATION_LANGUAGE_RE`` の 1 本を共用する (不変則 #14 (a))。
+    """
+    return {m.group(1).lower() for m in _IMPLEMENTATION_LANGUAGE_RE.finditer(text or "")}
 
 
 def _extension_only_on_bare_names(hits: list[str], text: str) -> bool:

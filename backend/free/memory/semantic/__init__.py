@@ -2,7 +2,7 @@
 
 スコープ別ディレクトリ (``global/`` / ``projects/<id>/``) を廃し、``Evidence``
 (``kind="fact"`` / ``"claim"``) 1 型 + ``scope`` フィールドへ畳んだ。実体は
-``local/memory/semantic/`` の :class:`~backend.free.rag.evidence.EvidenceStore`
+``<data_root>/g1/store/memory/semantic/`` の :class:`~backend.free.rag.evidence.EvidenceStore`
 1 つで、シャードは namespace (``mem`` / ``know`` / ``idx`` / ``loop`` / ``learn``)。
 
 - :mod:`~backend.free.memory.semantic.fact` — ``SemanticFact`` ↔ ``Evidence``

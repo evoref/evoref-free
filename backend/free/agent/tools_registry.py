@@ -107,7 +107,15 @@ def _resolve_bare_filename(name: str, kwargs: dict) -> None:
     for arg in arg_names:
         value = kwargs.get(arg)
         if isinstance(value, str) and value.strip():
-            kwargs[arg] = resolve_current_against_recent_dir(value)
+            resolved = resolve_current_against_recent_dir(value)
+            if name == "write_file":
+                # 会話に寄せる先が無い裸名 / 相対パスはプロセスの CWD (= リポジトリ
+                # 直下) に落ちる。書込みは既定の出力先へ寄せる (F-05 と同じ規則、
+                # meta_cognitive の ``_resolve_write_path`` と揃える)。
+                from backend.free.agent.output_format import anchor_relative_output_path
+
+                resolved = anchor_relative_output_path(resolved)
+            kwargs[arg] = resolved
             return
 
 

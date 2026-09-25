@@ -19,7 +19,7 @@
 #
 # i18n: ja / en をフラットに混在させる。pin_triggers.yaml と同じ方針。
 #
-# ユーザー上書き: ``local/triggers/fact_triggers.yaml`` に同名ファイルを置くと
+# ユーザー上書き: ``<data_root>/g1/store/overrides/triggers/fact_triggers.yaml`` に同名ファイルを置くと
 # package 同梱 default に代えて読み込まれる。
 
 chat:

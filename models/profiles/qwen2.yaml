@@ -16,9 +16,12 @@ launch_flags:
   - "--jinja"
   - "--reasoning-format"
   - "auto"
-# context_size (-c)。Qwen2.5 / Qwen2.5-Coder の学習時最大コンテキスト (n_ctx_train) = 32768。
+# context_size (-c)。Qwen2.5 / Qwen2.5-Coder のネイティブ文脈長 (YaRN 無し) = 32768。
 # config.yaml の llama.context_size が未指定 / null のとき採用される
-# (解決順: config 明示 > profile > 8192)。32768 を超える拡張 (131072 等) は YaRN/RoPE 必須。
+# (解決順: config 明示 > profile > 8192)。32768 を超える拡張 (131072 等) は YaRN 必須。
+# ⚠ GGUF によっては YaRN が焼き込まれている (例: Qwen2.5-Coder-14B-Instruct-Q4_K_M は
+# context_length=131072 / rope.scaling.type=yarn / factor 4)。その場合 llama.cpp は文脈長に
+# 関係なく YaRN を静的に適用する。詳細は by-model/Qwen2.5-Coder-14B-Instruct-Q4_K_M.yaml。
 # 32768 は KV キャッシュ VRAM が 8192 比で約4倍。VRAM が厳しい場合は config 側で
 # context_size を明示 (8192 等) して上書きするか cache_type_k/v を量子化する。
 context_size: 32768

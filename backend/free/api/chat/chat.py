@@ -118,7 +118,7 @@ from backend.free.llm.aux_client import AuxClient
 from backend.free.generation.content_detector import detect_content_type
 from backend.free.generation.direct_codegen import generate_single_file
 from backend.free.generation.models import ContentType
-from backend.free.loop.staged.harness import StagedCodeHarness
+from backend.free.loop.staged.harness import StagedCodeHarness, staged_profile
 from backend.free.loop.staged.run_recorder import StagedRunRecorder
 from backend.free.generation.production_brief import (
     BriefLimits,
@@ -1234,7 +1234,9 @@ def _plan_output_target(req: ChatRequest) -> tuple[str, str | None]:
     """``(output_target, editor_route)`` を発話とモードから決める。
 
     create モード:
-    - 出力先パス明示 → "file" (write_file でディスクへ)
+    - 書込み先の証拠あり (明示パス、または宛先として名指したファイル名「add.py に
+      保存して」。判定は chat と同じ ``indicates_write_destination``) → "file"
+      (write_file でディスクへ)
     - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
     - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
 
@@ -1244,7 +1246,13 @@ def _plan_output_target(req: ChatRequest) -> tuple[str, str | None]:
     (2026-09-06 監査 F-02)。
     """
     if is_create_mode(req.mode):
-        if _extract_file_path(req.message):
+        # 宛先の判定は chat と同じ 1 本。以前は ``_extract_file_path`` (名前の字句
+        # 抽出) を見ており、(a) 連用形の後の裸名「書き、add.py に保存して」を拾えず
+        # エディタへ出すだけで保存されない、(b) 「compose.yaml を書いて」(F-05) や
+        # 「add.py に保存せず」まで file に倒す、の両方が起きていた (2026-09-25)。
+        # create は依頼文全体が成果物の仕様なので依頼節に絞らない (ルータの
+        # ``create_write_destination`` と同じ本文を見る)
+        if indicates_write_destination(req.message, whole_request=True):
             target = "file"
         elif detect_editor_route(req.message) == "chat":
             target = "chat"
@@ -1988,14 +1996,15 @@ def _staged_stage_base_enabled(mode: str, cfg: dict, state: AppState) -> bool:
     if not is_create_mode(mode):
         return False
     create_cfg = cfg.get("create", {}) or {}
-    if create_cfg.get("pipeline") != "staged":
+    if create_cfg.get("pipeline", "staged") != "staged":
         return False
     if not create_cfg.get("staged_enabled", True):
         return False
     # 補助クライアント未配線 (ベース llama-server 未接続) なら従来 longform へ倒す。
     if getattr(state, "aux_client", None) is None:
         return False
-    return is_pro()
+    # v2 は Free でも使う (テスト工程は Pro だけ)。v1 は Pro だけ (f_10 §11.3)。
+    return is_pro() or staged_profile(cfg) == "v2"
 
 
 class _ProductionStageSelector:
@@ -2020,6 +2029,7 @@ class _ProductionStageSelector:
     def __init__(
         self, *, staged_factory, longform_factory, staged_base_enabled: bool,
         resume_of: str | None = None, force_longform: bool = False,
+        deterministic_plan: bool = False,
     ) -> None:
         self._staged_factory = staged_factory
         self._longform_factory = longform_factory
@@ -2027,6 +2037,9 @@ class _ProductionStageSelector:
         self._resume_of = resume_of
         self._resume_finished = False
         self._force_longform = force_longform
+        #: meta の計画を LLM に作らせない (staged v2、f_10 §11)。制作ステージが依頼全体を
+        #: 引き受けるので、計画は常に「制作タスク 1 件」。
+        self.deterministic_plan = deterministic_plan
 
     async def precheck(self, req):
         """計画の前に決定論で問い返すか (f_03 §4.4、2026-09-19)。
@@ -2082,10 +2095,17 @@ class _ProductionStageSelector:
             result = await self._staged_factory().run(
                 req, on_event=on_event, is_cancelled=is_cancelled,
             )
-            if not (
-                result.exit_kind == "error"
-                and result.notes.get("fallback") == "empty_task_graph"
-            ):
+            from backend.free.api.chat.chat_stream_staged_v2 import UNSUPPORTED_LANGUAGE_FALLBACK
+
+            fallback = result.notes.get("fallback") if result.exit_kind == "error" else None
+            if fallback == UNSUPPORTED_LANGUAGE_FALLBACK:
+                # staged v2 の対象外の言語・系統。Free は変更前と同じ longform へ (f_10 §12.1。
+                # Pro はハーネスが同じターンで v1 を走らせるのでここへは来ない)
+                logger.info("Production stage: request is outside the staged v2 languages; using longform")
+                return await self._longform_factory().run(
+                    req, on_event=on_event, is_cancelled=is_cancelled,
+                )
+            if fallback != "empty_task_graph":
                 return result
             if req.resume_of is None and not names_creation_target(req.instruction):
                 return self._block_for_input(result, req)
@@ -2181,7 +2201,7 @@ def make_production_stage(
             if staged_cfg.get("part_generation_enabled", False) else None
         )
         return StagedCodeHarness(
-            state=state, cfg=cfg, codegen=codegen, part_codegen=part_codegen,
+            state=state, cfg=cfg, codegen=codegen, part_codegen=part_codegen, client=client,
         )
 
     def _longform_factory() -> LongFormHarness:
@@ -2211,6 +2231,9 @@ def make_production_stage(
         staged_factory=_staged_factory, longform_factory=_longform_factory,
         staged_base_enabled=staged_base_enabled, resume_of=resume_of,
         force_longform=force_longform,
+        deterministic_plan=(
+            staged_base_enabled and not force_longform and staged_profile(cfg) == "v2"
+        ),
     )
 
 

@@ -137,7 +137,7 @@ class CartridgeManager:
     """corpus パッケージの install / load / unload / uninstall / search。
 
     Args:
-        corpus_dir: ``local/memory/corpus``。
+        corpus_dir: ``<data_root>/g1/store/corpus``。
         rag_config: ``rag`` セクション (c_16 §9 の ``memory.evidence.*`` を
             重ねたもの。:func:`merge_rag_evidence_config` を使う)。
         debug_logger: ``rag.jsonl`` へゲートの採否を残す。

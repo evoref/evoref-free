@@ -334,7 +334,6 @@ def _data_health(state: AppState) -> DataHealthInfo:
         readonly=state.data_readonly_reason is not None,
         reason=state.data_readonly_reason,
         warnings=list(gate.warnings),
-        g0_found=bool(gate.g0 is not None and gate.g0.found),
         **models,
         degraded=degraded,
         edition_switched_from=gate.edition_switched_from,

@@ -23,7 +23,7 @@ pillar) に供給する Loop pillar コンポーネント。
   bounded LRU buffer (1024 件)** で JOIN
 * 一定時間 (デフォルト 5 分) outcome が来ない decision は orphan として
   PolicyAdjuster に送る (フォールバック後にクラッシュした等の解析用)
-* offset 永続化先は ``local/state/log_ingestor.json`` (再起動後の続き
+* offset 永続化先は ``<data_root>/g1/store/state/log_ingestor.json`` (再起動後の続き
   から読む)。封筒付き (形式 ``log_ingestor``)。G1 の封筒でない / 新しい版の
   ファイルは読まず書き戻さない (readonly: その回は先頭から読み、offset は
   保存しない)
@@ -179,7 +179,7 @@ LOG_INGESTOR_FORMAT = register_format(FormatSpec(
 
 
 class _OffsetState(VersionedJsonFile):
-    """offset map の永続化 (``local/state/log_ingestor.json``)。
+    """offset map の永続化 (``<data_root>/g1/store/state/log_ingestor.json``)。
 
     payload は ``{"offsets": {filename: {"inode": int, "offset": int}}}``。
     形の崩れたエントリだけを読み飛ばし (件数を WARNING に出す)、payload /

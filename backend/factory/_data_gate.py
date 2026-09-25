@@ -3,12 +3,14 @@
 必須段 (配線前、50ms 未満):
 
 1. ``data_root`` の置き場を判定する (ネットワーク / OneDrive → 拒否、FAT / exFAT → 警告)
-2. 単一書き手ロックを取る (取れなければ拒否)
-3. 世代印を読む。読めなければ readonly
-4. ``pending`` に自分の読む形式があれば拒否 (G1 は移行器を持たない)
-5. コードとの版比較。``newer`` (と、移行器の無い ``older``) があれば readonly
-6. readonly でなければ世代印を現行へ書き直す (新しい形式・書き手・最後のエディション)
-7. G0 (``local/``) の SoT 署名を stat だけで調べる (開かない・動かさない・消さない)
+2. 世代フォルダ ``g<N>/`` を調べる (c_05 §0.2)。自分の世代が無く新しい世代だけあれば
+   拒否、古い世代だけあれば readonly (移行は G2 の ``evoref data migrate``)。自分の世代と
+   新しい世代が両方あれば警告 (ここでの変更は新しい世代へ持ち越されない)
+3. 単一書き手ロックを取る (取れなければ拒否)
+4. 世代印を読む。読めなければ readonly
+5. ``pending`` に自分の読む形式があれば拒否 (G1 は移行器を持たない)
+6. コードとの版比較。``newer`` (と、移行器の無い ``older``) があれば readonly
+7. readonly でなければ世代印を現行へ書き直す (新しい形式・書き手・最後のエディション)
 8. readonly でなければ取り残しの ``*.tmp`` (kill された原子的書き込みの一時ファイル) を
    ``store/`` から消す。ロックの下なので年齢判定は要らない (書いている他プロセスは無い)
 
@@ -25,6 +27,7 @@ from typing import Any
 
 from backend.config import PathResolver
 from backend.data_location import DataLocation, inspect_location
+from backend.data_root import DATA_GENERATION, GENERATION_DIRNAME, generation_dirs, store_root
 from backend.io.format_registry import FormatRegistry
 from backend.io.generation_seal import (
     SEAL_FILENAME,
@@ -38,36 +41,12 @@ from backend.log_config import get_logger
 
 logger = get_logger("factory.data_gate")
 
-#: G0 の SoT の署名 (``local/`` からの相対 glob)。ディレクトリの有無では判定しない
-#: (setup と ensure_dirs が空ディレクトリを作るため)。
-G0_SIGNATURES: tuple[str, ...] = (
-    "memory/*/manifest.json",
-    "history/index.json",
-    "learning/*/experience.json",
-    "experience.json",
-    "model_state.json",
-    "state.json",
-)
-
-
 class DataGateRefused(RuntimeError):
     """起動を止める理由 (``code`` は UI / CLI の案内の鍵)。"""
 
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
-
-
-@dataclass(slots=True)
-class G0Info:
-    """``local/`` に残っている G0 の SoT。"""
-
-    root: Path
-    signatures: list[str] = field(default_factory=list)
-
-    @property
-    def found(self) -> bool:
-        return bool(self.signatures)
 
 
 @dataclass(slots=True)
@@ -79,7 +58,6 @@ class DataGateResult:
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     states: dict[str, FormatState] = field(default_factory=dict)
-    g0: G0Info | None = None
     #: 世代印の ``last_edition`` と今のエディションが違えば (前回, 今回)。UI へ 1 回出す。
     edition_switched_from: str | None = None
     edition_switched_to: str | None = None
@@ -91,20 +69,30 @@ class DataGateResult:
     format_versions: dict[str, int] = field(default_factory=dict)
 
 
-def detect_g0(install_root: Path) -> G0Info:
-    """G0 の SoT 署名を探す (中身のあるファイルだけ数える)。"""
-    root = install_root / "local"
-    info = G0Info(root=root)
-    if not root.is_dir():
-        return info
-    for pattern in G0_SIGNATURES:
-        for path in root.glob(pattern):
-            try:
-                if path.is_file() and path.stat().st_size > 0:
-                    info.signatures.append(path.relative_to(root).as_posix())
-            except OSError:
-                continue
-    return info
+def check_generation_dirs(data_root: Path) -> tuple[list[str], list[str]]:
+    """世代フォルダを調べる。戻り値は (readonly の理由, 警告)。起動を止めるなら例外。"""
+    gens = generation_dirs(data_root)
+    newer = sorted(g for g in gens if g > DATA_GENERATION)
+    older = sorted(g for g in gens if g < DATA_GENERATION)
+    if DATA_GENERATION in gens:
+        warnings = [
+            f"a newer data generation exists (g{g}); changes made here are not carried "
+            f"forward to it" for g in newer
+        ]
+        return [], warnings
+    if newer:
+        raise DataGateRefused(
+            "data_generation_newer",
+            f"{data_root} holds only newer data generation(s) "
+            f"({', '.join(f'g{g}' for g in newer)}); this version reads {GENERATION_DIRNAME}",
+        )
+    if older:
+        return [
+            f"data generation {GENERATION_DIRNAME} is missing and only older generation(s) "
+            f"exist ({', '.join(f'g{g}' for g in older)}); they need a migration this "
+            "version does not have",
+        ], []
+    return [], []
 
 
 
@@ -114,7 +102,6 @@ def run_data_gate(
     *,
     edition: str,
     app_version: str,
-    install_root: Path,
     started_at: str = "",
     allow_unsafe: bool = False,
 ) -> DataGateResult:
@@ -132,8 +119,10 @@ def run_data_gate(
         warnings.append(f"data_root is on {where} (allowed by --allow-unsafe-data-root)")
     if location.weak_fs:
         warnings.append(f"data_root is on {location.fs_type}; rename/fsync ordering is weak")
+    generation_reasons, generation_warnings = check_generation_dirs(data_root)
+    warnings += generation_warnings
 
-    store_dir = data_root / "store"
+    store_dir = store_root(data_root)
     try:
         lock = acquire_writer_lock(store_dir, started_at=started_at)
     except WriterLockHeld as e:
@@ -144,6 +133,9 @@ def run_data_gate(
         edition=edition, app_version=app_version,
         format_versions={s.format_id: s.version for s in registry.read_by(edition)},  # type: ignore[arg-type]
     )
+    if generation_reasons:
+        result.readonly = True
+        result.reasons.extend(generation_reasons)
     try:
         _check_generation(result, store_dir, registry, edition=edition, app_version=app_version)
     except BaseException:
@@ -151,9 +143,8 @@ def run_data_gate(
         raise
     if not result.readonly:
         # Free は Pro のデータ (store/pro/) に入らない (c_05 §0.4.2)。
-        pro_dir = None if edition == "pro" else data_root / PathResolver.LAYOUT["pro_dir"]
+        pro_dir = None if edition == "pro" else PathResolver.layout_path(data_root, "pro_dir")
         result.stale_tmp_removed = sweep_stale_tmp(store_dir, skip=pro_dir)
-    result.g0 = detect_g0(install_root)
     return result
 
 
@@ -244,7 +235,6 @@ def open_data_root(state: Any, project_root: Path) -> DataGateResult:
             FORMATS,
             edition=producer_edition(),
             app_version=str(get_runtime_version()),
-            install_root=project_root,
             started_at=utc_now(),
             allow_unsafe=os.environ.get(ALLOW_UNSAFE_ENV) == "1",
         )
@@ -255,7 +245,7 @@ def open_data_root(state: Any, project_root: Path) -> DataGateResult:
     if result.readonly:
         reason = "; ".join(result.reasons)
         state.data_readonly_reason = reason
-        enable_readonly(data_root / "store", reason)
+        enable_readonly(store_root(data_root), reason)
     return result
 
 
@@ -287,14 +277,9 @@ def report_data_gate(state: Any) -> None:
         logger.info("Edition switched from %s to %s", result.edition_switched_from,
                     result.edition_switched_to)
         _warn_edition_downgrade(result.edition_switched_from)
-    if result.g0 is not None and result.g0.found:
-        logger.warning(
-            "G0 data in %s is not used by this version (0.0.98 can still read it); "
-            "%d signature file(s) found", result.g0.root, len(result.g0.signatures),
-        )
     if result.stale_tmp_removed:
         logger.info("Removed %d stale temporary file(s) under %s", result.stale_tmp_removed,
-                    result.data_root / "store")
+                    store_root(result.data_root))
     if result.readonly:
         logger.error("Data root %s is read-only: %s", result.data_root, "; ".join(result.reasons))
     logger.info(
@@ -328,11 +313,9 @@ def _format_versions_text(versions: dict[str, int]) -> str:
 
 
 __all__ = [
-    "G0_SIGNATURES",
     "DataGateRefused",
     "DataGateResult",
-    "G0Info",
-    "detect_g0",
+    "check_generation_dirs",
     "open_data_root",
     "report_data_gate",
     "run_data_gate",

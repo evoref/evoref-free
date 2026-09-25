@@ -4,7 +4,7 @@
 実装。reset (``keep_on_reset``)・export (``export``)・doctor・台帳の完全性テスト
 (「台帳外のファイルを書かない」、c_05 §0.7.2) が使う。
 
-``path_key`` の文法 (データ根からの相対 posix パス):
+``path_key`` の文法 (世代フォルダ ``<data_root>/g<N>/`` からの相対 posix パス、c_05 §0.2):
 
 - ``<name>`` — 置換子。1 つのパス要素の中で 1 文字以上に当たる (``/`` は跨がない)。
   要素の一部でもよい (``aux_<task>.md`` / ``pm-<hash>``)。
@@ -48,7 +48,7 @@ from backend.io.format_registry import (
     register_format,
 )
 
-#: 台帳の範囲 (データ根直下の ``store/``)。
+#: 台帳の範囲 (世代フォルダ直下の ``store/``)。
 STORE_DIR = "store"
 
 #: 退避名・取り残しの一時ファイル (パス要素 1 つに当てる)。
@@ -141,7 +141,7 @@ def classifier(registry: FormatRegistry = FORMATS) -> Classifier:
 
 
 def match(rel: str, registry: FormatRegistry = FORMATS) -> FormatSpec | None:
-    """データ根からの相対 posix パス ``rel`` の形式。"""
+    """世代フォルダからの相対 posix パス ``rel`` の形式。"""
     return classifier(registry)(rel)
 
 
@@ -149,9 +149,12 @@ def _pro_declared(specs: Iterable[FormatSpec]) -> bool:
     return any(s.path_key.startswith(PRO_STORE_PREFIX) for s in specs)
 
 
-def walk(data_root: Path, registry: FormatRegistry = FORMATS) -> Iterator[tuple[Path, FormatSpec | None]]:
-    """``store/`` の下の全ファイルを (パス, 形式) で返す (パス順、台帳外は ``None``)。"""
-    root = Path(data_root)
+def walk(generation_dir: Path, registry: FormatRegistry = FORMATS) -> Iterator[tuple[Path, FormatSpec | None]]:
+    """``store/`` の下の全ファイルを (パス, 形式) で返す (パス順、台帳外は ``None``)。
+
+    ``generation_dir`` は世代フォルダ (``backend.data_root.generation_root``)。
+    """
+    root = Path(generation_dir)
     store = root / STORE_DIR
     if not store.is_dir():
         return
@@ -167,16 +170,16 @@ def walk(data_root: Path, registry: FormatRegistry = FORMATS) -> Iterator[tuple[
             yield path, classify(path.relative_to(root).as_posix())
 
 
-def iter_files(data_root: Path, registry: FormatRegistry = FORMATS) -> Iterator[tuple[Path, FormatSpec]]:
+def iter_files(generation_dir: Path, registry: FormatRegistry = FORMATS) -> Iterator[tuple[Path, FormatSpec]]:
     """``store/`` の下で台帳のどれかの形式に属するファイルと、その形式。"""
-    for path, spec in walk(data_root, registry):
+    for path, spec in walk(generation_dir, registry):
         if spec is not None:
             yield path, spec
 
 
-def unledgered(data_root: Path, registry: FormatRegistry = FORMATS) -> list[Path]:
+def unledgered(generation_dir: Path, registry: FormatRegistry = FORMATS) -> list[Path]:
     """``store/`` の下でどの形式にも属さないファイル (台帳の穴)。"""
-    return [path for path, spec in walk(data_root, registry) if spec is None]
+    return [path for path, spec in walk(generation_dir, registry) if spec is None]
 
 
 __all__ = [

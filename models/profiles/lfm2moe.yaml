@@ -7,15 +7,17 @@
 # (それらは mode 既定値がそのまま使われる)。
 #
 # MoE オフロードは既定で付けない (n_cpu_moe: null)。8.3B総/1.5Bアクティブで多くの GPU に
-# 収まるため。VRAM が厳しい場合は local/profiles/lfm2moe.yaml で moe.n_cpu_moe を
-# 整数指定すると expert を CPU 退避できる。
+# 収まるため。VRAM が厳しい場合は <data_root>/profiles/by-model/<GGUF stem>.yaml で
+# moe.n_cpu_moe を整数指定すると expert を CPU 退避できる。
 launch_flags:
   - "--jinja"
   - "--reasoning-format"
   - "auto"
-# context_size (-c)。LFM2.5-8B-A1B / LFM2-8B-A1B の学習時最大コンテキスト (n_ctx_train) = 32768。
+# context_size (-c)。**モデルの上限ではなく VRAM 都合の保守既定**。
+# LFM2.5-8B-A1B はモデルカード・GGUF の n_ctx_train (<arch>.context_length、2026-09-24 実測) とも
+# 128000。伸ばすなら config の llama.context_size を明示する。
 # config.yaml の llama.context_size が未指定 / null のとき採用される
-# (解決順: config 明示 > profile > 8192)。32768 を超える拡張は RoPE スケーリングが必要。
+# (解決順: config 明示 > profile > 8192)。
 # 32768 は KV キャッシュ VRAM が 8192 比で約4倍。VRAM が厳しい場合は config 側で
 # context_size を明示 (8192 等) して上書きするか cache_type_k/v を量子化する。
 context_size: 32768

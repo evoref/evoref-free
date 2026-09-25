@@ -1,4 +1,5 @@
-# Qwen3 / Qwen3.5 dense 系 (arch "qwen3"・非 MoE)。
+# Qwen3 dense 系 (arch "qwen3"・非 MoE)。Qwen3-Embedding もこの arch を報告する。
+# Qwen3.5 / Qwen3.8 は別アーキ "qwen35" (qwen35.yaml)、Qwen2.5 は "qwen2" (qwen2.yaml)。
 #
 # sampling は意図的に空にする: プロファイル sampling は modes.* を上書きするため、
 # ここで値を入れると chat (temp 0.7) と create (temp 0.3) のモード別チューニングを

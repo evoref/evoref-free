@@ -37,16 +37,13 @@ setup_utf8() {
 
 # ── データ根のディレクトリ一括作成 ──
 # データ根は backend.data_root が決める (EVOREF_DATA_ROOT → <install_root>/userdata)。
-# 不正な指定はそこで拒否される。local/ (G0) は作らない・動かさない・消さない。
+# 不正な指定はそこで拒否される。レイアウト (世代フォルダ g<N>/store・g<N>/cache を含む) は
+# PathResolver.ensure_local_dirs が作る。
 ensure_directories() {
     local data_root
-    data_root="$(cd "$PROJECT_ROOT" && python -c 'from backend.data_root import resolve_data_root; print(resolve_data_root())')" || {
+    data_root="$(cd "$PROJECT_ROOT" && python -c 'from backend.config import PathResolver; from backend.data_root import install_root, resolve_data_root; r = PathResolver({}, install_root(), data_root=resolve_data_root()); r.ensure_local_dirs(); print(r.data_root)')" || {
         echo "ERROR: could not resolve the data root (check EVOREF_DATA_ROOT)"
         return 1
     }
     echo "  Data root: $data_root"
-    local dirs=(store logs outputs themes profiles tmp run cache)
-    for dir in "${dirs[@]}"; do
-        mkdir -p "$data_root/$dir"
-    done
 }

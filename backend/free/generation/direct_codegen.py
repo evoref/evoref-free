@@ -158,6 +158,7 @@ async def generate_single_file(
     max_tokens: int = 4096,
     temperature: float = 0.3,
     request_timeout: float | None = None,
+    id_slot: int | None = None,
 ) -> dict[str, str]:
     """instruction から単一ファイルのコードを base モデルへの 1 回の呼び出しで生成する。
 
@@ -172,6 +173,9 @@ async def generate_single_file(
             (呼出側は常にこのキーで結果を取得できる)。
         max_tokens: 初回生成の最大トークン。
         temperature: 生成温度。
+        id_slot: 使うスロット。既定 (``None``) は ``client.longform_slot``。staged v2 が
+            独立したモジュールを別スロットで同時生成するときに指定する (f_10 §11)。
+            チャットスロットは渡さない (不変則 #1)。
         request_timeout: 呼出予算 (f_10 §3)。``LocalClient.generate`` の
             ``request_timeout`` へそのまま渡す。``None`` (既定) は
             ``sync_request_timeout`` (実質無制限) に委ねる。切断時の再生成
@@ -187,6 +191,7 @@ async def generate_single_file(
     """
     # 境界の前 (run 内で共有する brief + spec) は system へ載せ、同じスロットの
     # 連続呼出で接頭辞 KV を再利用させる。system は文脈ガードでも捨てられない。
+    slot = client.longform_slot if id_slot is None else id_slot
     shared, task_instruction = split_shared_context(instruction)
     messages = [
         {"role": "system",
@@ -198,7 +203,7 @@ async def generate_single_file(
             messages, stream=False, max_tokens=max_tokens, temperature=temperature,
             # chat_slot だとチャット接頭辞 KV を破壊する退行 (f_08 §2.2 実測、
             # f_10 §0)。staged の codegen は long_form 専有スロットを使う。
-            id_slot=client.longform_slot,
+            id_slot=slot,
             request_timeout=request_timeout,
         )
     except Exception as exc:
@@ -250,7 +255,7 @@ async def generate_single_file(
             try:
                 resp2 = await client.generate(
                     messages, stream=False, max_tokens=retry_tokens,
-                    temperature=retry_temperature, id_slot=client.longform_slot,
+                    temperature=retry_temperature, id_slot=slot,
                     request_timeout=request_timeout,
                 )
                 retry_code, retry_from_salvage = _extract_code(resp2, file_path)

@@ -114,7 +114,7 @@ class AuxPromptManager:
     def __init__(self, prompt_dir: Path) -> None:
         """
         Args:
-            prompt_dir: プロンプトディレクトリ（local/prompts/）
+            prompt_dir: プロンプトディレクトリ（<data_root>/g1/store/learning/<mk>/aux_prompts/）
         """
         self.prompt_dir = prompt_dir
         self.contents: dict[str, str] = {}

@@ -10,14 +10,21 @@ G1 の全データは ``data_root`` の下に置く。決め方は 3 段だけ:
 ``EVOREF_DATA_ROOT`` に入れて全子プロセス (llama-server 起動・uvicorn・reset の
 再起動経路) へ伝える。
 
-拒否する指定: ``local/`` (G0) や ``models/`` の中、それらを内側に含む指定、
-インストール根そのもの。G1 は ``local/`` を開かない・動かさない・消さない (c_05 §0.3)。
+スキーマ世代 (c_05 §0.2): 形式に縛られる ``store/`` と ``cache/`` は世代フォルダ
+``<data_root>/g<N>/`` の下に置き、世代に依存しない ``logs/`` ``outputs/`` ``themes/``
+``profiles/`` ``bk/`` ``run/`` ``tmp/`` はデータ根の直下に置く。形式台帳の
+``path_key`` (``store/...`` ``cache/...``) は世代フォルダからの相対 (:func:`data_path`)。
+
+拒否する指定: ``models/`` の中、それを内側に含む指定、インストール根そのもの。
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+
+# このリリースのスキーマ世代 (SSOT はリリース定数、c_05 §0.2)
+from backend.free.__version__ import DATA_GENERATION
 
 ENV_VAR = "EVOREF_DATA_ROOT"
 #: ``--allow-unsafe-data-root`` を子プロセスの起動ゲートへ伝える環境変数。
@@ -26,7 +33,12 @@ DEFAULT_DIRNAME = "userdata"
 #: ``--isolate-data`` の別根の置き場 (本番根の外、c_05 §0.2)。
 ISOLATED_DIRNAME = "userdata-isolated"
 
-_FORBIDDEN_CHILDREN = ("local", "models")
+#: 世代フォルダの名前 (``<data_root>/g<N>/``)。
+GENERATION_DIRNAME = f"g{DATA_GENERATION}"
+#: 世代フォルダの下に置く最上位のディレクトリ (形式に縛られるもの)。
+GENERATION_SCOPED_DIRS = ("store", "cache")
+
+_FORBIDDEN_CHILDREN = ("models",)
 
 
 class DataRootError(ValueError):
@@ -93,6 +105,39 @@ def isolated_data_root(name: str = "develop", *, root: Path | None = None) -> Pa
     return validate_data_root(base / ISOLATED_DIRNAME / name, base)
 
 
+def generation_root(data_root: Path) -> Path:
+    """このリリースの世代フォルダ ``<data_root>/g<N>/``。"""
+    return Path(data_root) / GENERATION_DIRNAME
+
+
+def data_path(data_root: Path, rel: str) -> Path:
+    """データ根からの論理パス ``rel`` (``PathResolver.LAYOUT`` / ``path_key``) の実パス。
+
+    最上位が ``store`` / ``cache`` なら世代フォルダの下、それ以外はデータ根の直下。
+    """
+    top = rel.replace("\\", "/").split("/", 1)[0]
+    base = generation_root(data_root) if top in GENERATION_SCOPED_DIRS else Path(data_root)
+    return base / rel
+
+
+def store_root(data_root: Path) -> Path:
+    """このリリースの ``store/`` (``<data_root>/g<N>/store``)。"""
+    return data_path(data_root, "store")
+
+
+def generation_dirs(data_root: Path) -> dict[int, Path]:
+    """データ根にある世代フォルダ ``g<N>/`` (世代 → パス)。"""
+    found: dict[int, Path] = {}
+    root = Path(data_root)
+    if not root.is_dir():
+        return found
+    for entry in root.iterdir():
+        name = entry.name
+        if entry.is_dir() and len(name) > 1 and name[0] == "g" and name[1:].isdigit():
+            found[int(name[1:])] = entry
+    return found
+
+
 def export_data_root(path: Path) -> None:
     """決めた ``data_root`` を子プロセスへ伝える (``EVOREF_DATA_ROOT``)。"""
     os.environ[ENV_VAR] = str(path)
@@ -100,13 +145,20 @@ def export_data_root(path: Path) -> None:
 
 __all__ = [
     "ALLOW_UNSAFE_ENV",
+    "DATA_GENERATION",
     "DEFAULT_DIRNAME",
     "ENV_VAR",
+    "GENERATION_DIRNAME",
+    "GENERATION_SCOPED_DIRS",
     "ISOLATED_DIRNAME",
     "DataRootError",
+    "data_path",
     "export_data_root",
+    "generation_dirs",
+    "generation_root",
     "install_root",
     "isolated_data_root",
     "resolve_data_root",
+    "store_root",
     "validate_data_root",
 ]

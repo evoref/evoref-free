@@ -211,6 +211,48 @@ class FlowchartSpec(_StrictModel):
     mermaid: str = ""
 
 
+# ── staged v2 の骨組み (create_skeleton、f_10 §11) ──
+
+class SkeletonComponent(_StrictModel):
+    """骨組みの公開要素 1 つ (関数 / クラス)。"""
+
+    signature: str = ""  # 例: "def add(a: int, b: int) -> int"
+    summary: str = ""  # 1 行の役割 (UI の言語)
+
+
+class SkeletonModule(_StrictModel):
+    """骨組みの 1 モジュール (= 1 ファイル)。"""
+
+    path: str = ""  # 依頼が名指したフォルダを含む相対パス (例: "todo_app/cli.py")
+    role: str = ""
+    components: list[SkeletonComponent] = Field(default_factory=list)
+    imports_from: list[str] = Field(default_factory=list)  # 同じ成果物の他モジュールのパス
+
+
+class SkeletonExample(_StrictModel):
+    """契約の入出力例 1 つ (Pro のテストは LLM を使わずここから組む)。"""
+
+    module: str = ""  # 例を評価するモジュールのパス
+    call: str = ""  # Python 式 (例: "add(1, 2)")
+    expected: str = ""  # Python リテラル (例: "3")
+
+
+class CreateSkeleton(_StrictModel):
+    """staged v2 の骨組み (契約)。モジュール・シグネチャ・入口・入出力例。
+
+    旧経路のタスクグラフ / spec 本文 / 深化 / フロー合成を 1 回の文法制約 JSON で
+    置き換える。コードと Pro のテストはこれを共通の文脈に同時生成し、SPEC.md と
+    flowchart.md は完成したコードと骨組みから決定論で描く (as-built)。
+    """
+
+    summary: str = ""
+    language: str = "python"
+    modules: list[SkeletonModule] = Field(default_factory=list)
+    entry_module: str = ""
+    usage: str = ""
+    examples: list[SkeletonExample] = Field(default_factory=list)
+
+
 # ── staged クリエイトのタスクグラフ合成 (create_task_graph) ──
 
 class CreateModuleUnit(_StrictModel):
@@ -567,6 +609,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "code_spec_synthesis": CodeSpec,
     "flowchart_synthesis": FlowchartSpec,
     "create_task_graph": CreateTaskGraph,
+    "create_skeleton": CreateSkeleton,
     "flow_spec_synthesis": FlowSpec,
     "flow_spec_part_synthesis": FlowSpec,
     "spec_revision_judge": SpecRevisionJudgement,

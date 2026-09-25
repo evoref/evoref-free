@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from backend.io.format_registry import FormatSpec, register_format
+from backend.io.readonly import is_readonly
 from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 
@@ -68,7 +69,7 @@ _TYPE_CONVERTERS: dict[str, type] = {
 #:
 #: ``constraints`` は 1 キーずつ独立に clamp するだけなので、進化は
 #: 「下限 > 上限」の**空の窓**を作れてしまう。実測 (2026-08-21、
-#: ``local/policies/router_policy.json``): ``short_query_min_tokens: 3`` /
+#: ``<data_root>/g1/store/learning/shared/policies/router_policy.json``): ``short_query_min_tokens: 3`` /
 #: ``short_query_max_tokens: 2`` に進化しており、``_is_short_query`` の
 #: ``tokens >= min and tokens < max`` が **恒偽** になっていた。英語 3 語以上の
 #: クエリは語数分岐に到達せず文字数判定へ落ちる (``"What is DNS?"`` が
@@ -345,7 +346,8 @@ def _clamp(value: int | float, constraint: dict) -> int | float:
 class PolicyInterpreter:
     """ポリシーファイルによるパラメータの O(1) 参照
 
-    起動時に local/policies/*.json を読み込み、メモリ上に保持する。
+    起動時に ``<data_root>/g1/store/learning/shared/policies/*.json`` (進化対象の agent /
+    long_form は ``learning/<mk>/policies/``) を読み込み、メモリ上に保持する。
     get() は dict lookup のみで推論パスから安全に呼べる。
     apply_delta() / rollback() は Stage 4（PolicyEvolver）で使用する。
     """
@@ -922,7 +924,9 @@ class PolicyInterpreter:
                         "Failed to load %s, using defaults: %s", path, e,
                     )
                     self._data[domain] = copy.deepcopy(defaults[domain])
-            elif f.readonly:
+            elif f.readonly or is_readonly():
+                # 新しい版のファイル / readonly のデータ根には既定を書かずメモリで持つ
+                # (新しい model_key のパーティションで seed が起動を落としていた)
                 self._data[domain] = copy.deepcopy(defaults[domain])
             else:
                 # デフォルトで生成 (無い / 壊れていて退避した)
@@ -953,7 +957,7 @@ class PolicyInterpreter:
                 if seeded is not None and current != seeded:
                     logger.info(
                         "Policy %s/%s %s=%s overrides config %s.%s=%s "
-                        "(policy values win; edit local/policies to change)",
+                        "(policy values win; edit the policy files under the data root to change)",
                         domain, mode, key, current, section, cfg_key, seeded,
                     )
 

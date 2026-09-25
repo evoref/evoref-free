@@ -61,6 +61,8 @@ from backend.free.agent.meta_cognitive_defs import (
     _EXT_LANGUAGE_MAP,
     _LANGUAGE_EXT_MAP,
     _LANGUAGE_KEYWORDS,
+    _PARTIAL_WRITE_RE,
+    _PARTIAL_WRITE_TASKS_FAILED_RE,
     PLAN_SYSTEM_PROMPT,
     _WRITE_REJECTION_RE,
     _WRITE_REJECTION_REASON_JA,
@@ -545,8 +547,13 @@ class MetaCognitiveAgent(
             context_parts: list[str] = []
             steps = 0
         else:
-            # Step 1: タスク計画を生成
-            tasks = await self._plan(query, conversation, llm_client, on_step)
+            # Step 1: タスク計画を生成。staged v2 の create は制作ステージが依頼全体を
+            # 引き受けるので、計画は「制作タスク 1 件」と決まっている — LLM を呼ばない
+            # (f_10 §11。旧経路では 1,000 トークン超の prefill で毎回 15 秒前後かかっていた)。
+            if getattr(self._production_stage, "deterministic_plan", False):
+                tasks = [TaskItem(description=f"Create the requested deliverable: {query}")]
+            else:
+                tasks = await self._plan(query, conversation, llm_client, on_step)
             if not tasks:
                 tasks = [TaskItem(description=query)]
 
@@ -1227,11 +1234,17 @@ class MetaCognitiveAgent(
         incomplete = self._production_incomplete_reason(result)
         if incomplete:
             # 書けた分は残すが、タスクは失敗として数える (成功と報告しない)。
+            # 書いたパスは結果に残す — 最終応答が「書き込みが実行されません
+            # でした」ではなく、書いた先と未完了の理由を伝えるため。
             return (
                 f"Error: production stage incomplete ({incomplete}); "
-                f"wrote {written} file(s)", tool_calls,
+                f"wrote {written} file(s): {', '.join(written_paths)}", tool_calls,
             )
-        return f"Wrote {written} file(s) via production stage", tool_calls
+        # 書いた先を添える (件数だけでは保存先が分からない)
+        return (
+            f"Wrote {written} file(s) via production stage: {', '.join(written_paths)}",
+            tool_calls,
+        )
 
     @staticmethod
     def _production_incomplete_reason(result: "ProductionResult") -> str:
@@ -1781,6 +1794,39 @@ class MetaCognitiveAgent(
         return f": {reason}" if reason else ""
 
     @staticmethod
+    def _partial_write_note(result: str) -> str:
+        """制作ステージが未完了のまま書けた分を書いた結果の注記 (該当しなければ空。純粋関数)。
+
+        実インシデント (2026-09-25): create の「add.py に保存して」で add.py は
+        ``outputs/`` に書けたのに、自動生成したテストが 1 件落ちてタスクが
+        failed になり、最終応答は「(書き込みが実行されませんでした)」だけだった。
+        """
+        m = _PARTIAL_WRITE_RE.search(result or "")
+        if m is None:
+            return ""
+        reason = m.group("reason")
+        failed = _PARTIAL_WRITE_TASKS_FAILED_RE.search(reason)
+        if failed:
+            reason_ja = f"検証などのタスクが {failed.group(1)} 件失敗しました"
+        elif reason == "timed out":
+            reason_ja = "時間切れで打ち切りました"
+        else:
+            reason_ja = reason
+        if m.group("count") is None:
+            # 2 つ目以降の制作タスク: 成果物は最初の制作タスクがまとめて扱った
+            # (出力先が editor / chat なら書き込みではないので「書き込んだ」とは言わない)
+            return (
+                "(成果物は上の制作タスクでまとめて扱いました。ただし制作は"
+                f"完了していません: {reason_ja})"
+            )
+        paths = m.group("paths") or ""
+        where = f" ({paths})" if paths else ""
+        return (
+            f"(ファイルは書き込みました{where}。ただし制作は完了していません: "
+            f"{reason_ja})"
+        )
+
+    @staticmethod
     def _build_final_response(
         tasks: list[TaskItem],
         context_parts: list[str],
@@ -1792,7 +1838,13 @@ class MetaCognitiveAgent(
         parts: list[str] = []
         for task in tasks:
             parts.append(f"- [{task.status}] {task.description}")
-            if task.status == "failed" and task_expects_write(task.description):
+            partial = (
+                MetaCognitiveAgent._partial_write_note(task.result or "")
+                if task.status == "failed" else ""
+            )
+            if partial:
+                parts.append(f"    {partial}")
+            elif task.status == "failed" and task_expects_write(task.description):
                 # write 期待タスクの失敗時、無関係なツール結果 (誤ってハイジャック
                 # された fetch_url の webpage 抽出テキスト等) をそのままユーザーへ
                 # 露出させない。ただし **自前の棄却理由コード** は安全に出せるので

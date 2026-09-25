@@ -22,7 +22,7 @@
     python scripts/analyze_predicates.py --jaccard 0.9 --json out.json
     python scripts/analyze_predicates.py --holes --hole-sim 0.75
 
-発話プールの既定はデータ根の ``store/learning/*/experience.jsonl`` の ``query``。監査の
+発話プールの既定はデータ根の ``g1/store/learning/*/experience.jsonl`` の ``query``。監査の
 results.jsonl / 任意の JSONL (``query`` か ``text`` キー) / 1 行 1 発話のテキスト
 ファイルも ``--texts`` で足せる。
 """
@@ -252,7 +252,7 @@ def _iter_json_records(path: Path) -> Iterable[dict]:
             if isinstance(rec, dict):
                 yield rec
         return
-    # 会話履歴 (<data_root>/store/history/<month>/<session>.json) は封筒の payload に turns[] を持つ。
+    # 会話履歴 (<data_root>/g1/store/history/<month>/<session>.json) は封筒の payload に turns[] を持つ。
     session = payload if isinstance(payload, dict) else doc
     if isinstance(session, dict) and isinstance(session.get("turns"), list):
         for turn in session["turns"]:
@@ -309,7 +309,7 @@ def default_text_sources(data_root: str | None = None) -> list[Path]:
     """既定の発話プール: 経験バッファと会話履歴 (どちらもデータ根の実データ)。
 
     経験バッファ (``experience.jsonl``) は保持方針で数十件に絞られるため、
-    ``<data_root>/store/history/<month>/*.json`` の user ターンも足す。監査の
+    ``<data_root>/g1/store/history/<month>/*.json`` の user ターンも足す。監査の
     ``results.jsonl`` を混ぜたいときは ``--texts`` で明示する。データ根は
     ``--data-root`` → ``EVOREF_DATA_ROOT`` → ``<repo>/userdata``。
     """
@@ -547,7 +547,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not texts:
         print(
             "発話プールが空です。--texts で監査ログを指定するか、"
-            "データ根の store/learning/*/experience.jsonl を用意してください。",
+            "データ根の g1/store/learning/*/experience.jsonl を用意してください。",
             file=sys.stderr,
         )
         return 2

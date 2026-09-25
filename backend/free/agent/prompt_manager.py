@@ -198,7 +198,7 @@ PROMPT_HISTORY_FORMAT = register_format(FormatSpec(
 
 # インスタンス名プレフィックス（言語別）
 # 自己紹介質問への対応も含める理由: ランタイム定数であり、コード変更のみで
-# 既存・将来の全 base_model パーティション (local/learning/<stem>/prompts/)
+# 既存・将来の全 base_model パーティション (<data_root>/g1/store/learning/<mk>/prompts/)
 # に再起動後即座に反映される (本文 (DEFAULT_PROMPTS) は _create_default() 実行時
 # にしか焼き込まれず、既に本文が存在するパーティションには反映されない)。
 # 実インシデント: 「自己紹介してください」に対しベースモデル自身の学習時の

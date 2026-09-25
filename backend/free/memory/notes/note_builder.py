@@ -214,7 +214,7 @@ _EXPECTED_TAGS: dict[MemoryMode, tuple[str, ...]] = {
 _TRIGGERS_LOCK = threading.Lock()
 _TRIGGERS_CACHE: dict[str, FactTriggerMap] = {}
 
-#: プロセス全体で共有される user override 配置先 (通常 ``local/triggers/``)。
+#: プロセス全体で共有される user override 配置先 (通常 ``<data_root>/g1/store/overrides/triggers/``)。
 #: app_factory が :func:`set_default_triggers_dir` で起動時にセットする。
 #: これにより、明示的な ``triggers_dir`` を渡さずに生成された Builder /
 #: Extractor (``sleep/extraction.py`` 内の ``ChatExtractor()`` 等) も
@@ -1617,7 +1617,7 @@ class _ModeAwareNoteBuilder(NoteBuilder):
 
     shipped default は :mod:`backend.free.memory._defaults` 配下の
     ``fact_triggers.yaml`` に、user override は ``<triggers_dir>/
-    fact_triggers.yaml`` (通常 ``local/triggers/``) に置く。
+    fact_triggers.yaml`` (通常 ``<data_root>/g1/store/overrides/triggers/``) に置く。
     ``triggers_dir=None`` の場合は default のみ参照する。
     """
 

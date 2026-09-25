@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from backend.io import atomic_write_text
+from backend.io.readonly import is_readonly
 from backend.io.codec import codec_for
 from backend.io.format_registry import FormatSpec
 from backend.io.versioned import VersionedPayloadFile
@@ -116,7 +117,12 @@ def archive_to_history(
         key_prefix: 履歴ファイルのプレフィックス
         version: アーカイブ対象のバージョン番号
         content: 書き込む本文
+
+    データ根が readonly なら書かない (``save_ledger`` と同じ。起動時の既定の生成を
+    落とさない、c_05 §0.4.2)。
     """
+    if is_readonly():
+        return
     history_dir = prompt_dir / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
     dst = history_file_path(prompt_dir, key_prefix, version)
@@ -173,7 +179,9 @@ def read_body(prompt_dir: Path, key_prefix: str) -> str:
 
 
 def write_body(prompt_dir: Path, key_prefix: str, content: str) -> None:
-    """本文ファイルへ UTF-8 で書き込む。親ディレクトリは自動作成。"""
+    """本文ファイルへ UTF-8 で書き込む。親ディレクトリは自動作成。readonly なら書かない。"""
+    if is_readonly():
+        return
     prompt_dir.mkdir(parents=True, exist_ok=True)
     path = body_file_path(prompt_dir, key_prefix)
     atomic_write_text(path, content, encoding="utf-8")
@@ -219,8 +227,10 @@ def write_meta(prompt_dir: Path, key_prefix: str, meta: Any, *, spec: FormatSpec
 
     書く前にディスク上のファイルを分類する — G1 の封筒でない / 版が新しいファイルは
     上書きせず WARNING を出して見送り、壊れたファイルは退避してから書く。
-    書き込みの失敗は従来どおり送出する。
+    書き込みの失敗は従来どおり送出する。データ根が readonly なら書かない。
     """
+    if is_readonly():
+        return
     prompt_dir.mkdir(parents=True, exist_ok=True)
     f = _meta_file(prompt_dir, key_prefix, type(meta), spec)
     f.RAISE_ON_SAVE_ERROR = True

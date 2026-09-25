@@ -51,7 +51,7 @@ logger = get_logger("memory.sleep.promotion")
 #
 # shipped default: ``backend/free/memory/_defaults/triggers/classify_triggers.yaml``
 # user override  : ``<triggers_dir>/classify_triggers.yaml``
-#     (``triggers_dir`` は通常 ``local/triggers/``; ``.gitignore`` で除外)
+#     (``triggers_dir`` は通常 ``<data_root>/g1/store/overrides/triggers/``; ``.gitignore`` で除外)
 
 
 _CLASSIFY_LOCK = threading.Lock()

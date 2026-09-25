@@ -21,7 +21,7 @@
 # pin_triggers.yaml / fact_triggers.yaml と異なり、大文字小文字の扱いが
 # 言語で違うため ja / en を分離してある。
 #
-# ユーザー上書き: ``local/triggers/classify_triggers.yaml`` に同名ファイルを
+# ユーザー上書き: ``<data_root>/g1/store/overrides/triggers/classify_triggers.yaml`` に同名ファイルを
 # 置くと package 同梱 default に代えて読み込まれる。
 
 commitment:

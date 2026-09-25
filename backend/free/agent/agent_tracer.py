@@ -37,7 +37,7 @@ class MDPStep:
 class AgentTracer:
     """エージェント実行を MDP エピソード形式で記録
 
-    イベントは常設の :class:`AgentTraceStore` (``local/memory/agent_trace/``、
+    イベントは常設の :class:`AgentTraceStore` (``<data_root>/g1/store/agent_trace/``、
     エピソード記憶の入力) へ書き、develop モードでは同じものを DebugLogger の
     ``agent_trace`` JSONL にも出す (観測用)。同時にインメモリでステップを
     保持してクレジット割当に利用する。
