@@ -7,74 +7,50 @@
 	import RAGStats from '$lib/free/components/RAGStats.svelte';
 	import { onMount, onDestroy } from 'svelte';
 	import type { Component } from 'svelte';
-	import type { LoraTarget, LoraMode, DashboardLearningData, DashboardRagStats } from '$lib/free/api';
-	import { getLoraVersions, rollbackLora } from '$lib/free/api';
+	import type { DashboardLearningData, DashboardRagStats } from '$lib/free/api';
 	import {
 		DEFAULT_LEARNING_DATA,
 		DEFAULT_RAG_STATS,
 		fetchFreeDashboardData
 	} from '$lib/free/stores/dashboard';
-	import {
-		type ProComponentMap,
-		type DashboardLoraModes,
-		type ImprovementSeries,
-		loadProComponents,
-		fetchProDashboardData,
-		mapLoraTarget,
-		emptyLoraModes
-	} from '$lib/pro/stores/dashboard';
 
 	const REFRESH_INTERVAL_MS = 30_000;
 
-	// Pro のみ動的ロード対象 (LoRA バージョン / 改善カーブは Pro 専用データのため)
+	// エディション境界: Free 配布物には $lib/pro が無いので、静的 import すると
+	// Free のビルドが失敗する。Pro のパネル (LoRA バージョン / 改善カーブ) は
+	// `import.meta.glob` で動的ロードする (Free では空になる)。
 	const proLoaders = import.meta.glob<{ default: Component }>(
-		'/src/lib/pro/components/{LoRAVersions,PerformanceChart}.svelte'
+		'/src/lib/pro/components/DashboardProPanels.svelte'
 	);
 
-	let components: ProComponentMap | null = $state(null);
+	let DashboardProPanels: Component | null = $state(null);
 	let learningData: DashboardLearningData = $state({ ...DEFAULT_LEARNING_DATA });
-	// LoRA は chat / create を上下段で並べて表示する (以前はセレクトで切り替えて
-	// いたが、レガシーの level2_adapter_partition="model" ではアダプタがモード非依存で
-	// 切り替えても内容が変わらず、動作していないように見えていた)。
-	let loraModes = $state<DashboardLoraModes>(emptyLoraModes());
-	let improvement = $state<ImprovementSeries>({ base: [] });
 	let ragStats: DashboardRagStats = $state({ ...DEFAULT_RAG_STATS });
-	let fetchError = $state(false);
+	let freeFetchError = $state(false);
+	let proFetchError = $state(false);
+	let fetchError = $derived(freeFetchError || proFetchError);
 	let loaded = $state(false);
 
 	let gridCols = $derived($layout.dashboard.grid_columns);
 
 	async function refreshDashboardData() {
-		if (isPro) {
-			const [freeData, proData] = await Promise.all([
-				fetchFreeDashboardData(),
-				fetchProDashboardData()
-			]);
-			learningData = freeData.learningData;
-			ragStats = freeData.ragStats;
-			loraModes = proData.loraModes;
-			improvement = proData.improvement;
-			fetchError = freeData.hasError || proData.hasError;
-		} else {
-			const freeData = await fetchFreeDashboardData();
-			learningData = freeData.learningData;
-			ragStats = freeData.ragStats;
-			fetchError = freeData.hasError;
+		const freeData = await fetchFreeDashboardData();
+		learningData = freeData.learningData;
+		ragStats = freeData.ragStats;
+		freeFetchError = freeData.hasError;
+	}
+
+	async function loadProPanels() {
+		const loaders = Object.values(proLoaders);
+		if (loaders.length > 0) {
+			DashboardProPanels = (await loaders[0]()).default;
 		}
 	}
 
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
 	onMount(async () => {
-		if (isPro) {
-			const [loadedComponents] = await Promise.all([
-				loadProComponents(proLoaders),
-				refreshDashboardData()
-			]);
-			components = loadedComponents;
-		} else {
-			await refreshDashboardData();
-		}
+		await Promise.all([refreshDashboardData(), isPro ? loadProPanels() : Promise.resolve()]);
 		loaded = true;
 		refreshTimer = setInterval(refreshDashboardData, REFRESH_INTERVAL_MS);
 	});
@@ -82,37 +58,6 @@
 	onDestroy(() => {
 		if (refreshTimer) clearInterval(refreshTimer);
 	});
-
-	/** ロールバック後に該当モードの系列だけ再取得する */
-	async function reloadMode(mode: LoraMode) {
-		const updated = await getLoraVersions(mode);
-		const targets = {
-			base: mapLoraTarget(updated.base)
-		};
-		loraModes = { ...loraModes, [mode]: targets };
-	}
-
-	async function handleRollback(target: LoraTarget, version: number, mode: LoraMode) {
-		const label = $t('dashboard.level2_base');
-		if (!confirm($t('dashboard.rollback_confirm', { target: label, version }))) return;
-
-		try {
-			const result = await rollbackLora(version, target, mode);
-			if (result.restart_required) {
-				alert($t('dashboard.rollback_restart_required'));
-			}
-		} catch {
-			return;
-		}
-
-		try {
-			// partition="model" ではアダプタがモード非依存なので両段が同じ実体を指す。
-			// 片方だけ更新すると上下段で表示がずれるため、両モードを取り直す。
-			await Promise.all([reloadMode('chat'), reloadMode('create')]);
-		} catch {
-			// silent — 既存挙動踏襲 (次回の定期リフレッシュで再試行される)
-		}
-	}
 </script>
 
 <PageLayout title={$t('sidebar.dashboard')}>
@@ -145,18 +90,13 @@
 				fitnessHistory={learningData.fitness_history}
 				policyEvolverStatus={learningData.policy_evolver_status}
 			/>
-			{#if isPro && components?.LoRAVersions}
-				<components.LoRAVersions
-					modes={loraModes}
+			{#if isPro && DashboardProPanels}
+				{@const ProPanels = DashboardProPanels}
+				<ProPanels
 					evalCasesCount={learningData.eval_cases_count}
 					evalPassThreshold={learningData.eval_pass_threshold}
-					onrollback={handleRollback}
-				/>
-			{/if}
-			{#if isPro && components?.PerformanceChart}
-				<components.PerformanceChart
-					baseScores={improvement.base}
-					baseLabel={loraModes.chat.base.label}
+					refreshIntervalMs={REFRESH_INTERVAL_MS}
+					onfetched={(hasError: boolean) => (proFetchError = hasError)}
 				/>
 			{/if}
 			<RAGStats stats={ragStats} />

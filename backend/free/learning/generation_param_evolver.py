@@ -10,7 +10,6 @@ from pathlib import Path
 from backend.free.learning.fitness import (
     GENERATION_DEFECT_WEIGHTS,
     defect_rate_fitness,
-    has_defect_signal,
 )
 from backend.free.learning.generation_delta_store import GenerationDeltaStore
 from backend.log_config import get_logger
@@ -130,10 +129,6 @@ class GenerationParamEvolver:
         """観測された欠陥の率からフィットネスを計算する (1.0 = 欠陥なし、空は 0.5)。"""
         value = defect_rate_fitness(experiences, weights=self._DEFECT_WEIGHTS)
         return 0.5 if value is None else value
-
-    def _has_outcome_signal(self, experiences: list[dict]) -> bool:
-        """欠陥シグナルが 1 件でも立っているか (= 評価に使える分散があるか)。"""
-        return has_defect_signal(experiences, weights=self._DEFECT_WEIGHTS)
 
     def propose_delta(
         self,

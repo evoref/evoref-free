@@ -194,7 +194,6 @@
 		progress: number;
 	}
 
-	/** Level 2 の状態 + 発火閾値を表示用に整形する */
 	/** target の残りクールダウン時間（h、小数1桁）。算出不能なら null */
 	function remainingCooldownHours(key: 'base'): number | null {
 		const gates = level2?.gates;
@@ -206,6 +205,7 @@
 		return remain > 0 ? Math.round(remain * 10) / 10 : 0;
 	}
 
+	/** Level 2 の状態 + 発火閾値を表示用に整形する */
 	function buildTargetView(key: 'base', tStat: Level2TargetStatus): Level2TargetView {
 		const isRunning = runningTarget === key;
 		// 発火に必要な閾値: adapter 未生成なら bootstrap、生成済みは方式で分岐。

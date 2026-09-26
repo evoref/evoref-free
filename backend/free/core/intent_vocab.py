@@ -2318,8 +2318,8 @@ def tool_inventory_question(query: str) -> bool:
 #:
 #: 英語側は以前 ``now`` / ``date`` / ``time`` を **裸で** 拾っていた。これらは
 #: 談話副詞・一般名詞として頻出するため、時刻と無関係な文でツールが発火する。
-#: 本パターンは aux の否定票を上書きする高特異度扱い (``_upgrade_command_via_aux``
-#: の降格例外) なので、誤検出はそのまま無駄なツール実行になる。
+#: 本パターンは aux の否定票を上書きする高特異度扱いなので、
+#: 誤検出はそのまま無駄なツール実行になる。
 #: 実インシデント (2026-08-14 ライブ監査 ターン28/29):
 #: 「Please answer in English **from now** until I say otherwise. What are the
 #: three main benefits of using type hints in Python?」と

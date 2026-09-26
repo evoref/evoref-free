@@ -1066,10 +1066,6 @@ class LearningScheduler:
     def priority_queue_length(self) -> int:
         return len(self._priority_queue)
 
-    def priority_queue_snapshot(self) -> list[PriorityRequest]:
-        """API/CLI 表示用のスナップショット（コピー）"""
-        return list(self._priority_queue)
-
     # ── Level1Session ヘルパー ──────
 
     def has_active_session(self) -> bool:

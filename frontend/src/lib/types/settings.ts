@@ -197,18 +197,6 @@ export interface I18nConfig {
 	prompt_locale: 'ja' | 'en';
 }
 
-export interface DebugConfig {
-	enabled: boolean;
-	log_dir: string;
-	log_level: 'DEBUG' | 'INFO' | 'WARNING';
-	log_requests: boolean;
-	log_rag: boolean;
-	log_memory: boolean;
-	log_learning: boolean;
-	log_long_form: boolean;
-	max_log_mb: number;
-}
-
 export interface LongFormConfig {
 	max_units: number;
 	unit_max_tokens: number;
@@ -267,7 +255,6 @@ export interface ConfigData {
 	widget_proxy: WidgetProxyConfig;
 	external_api: ExternalApiConfig;
 	i18n: I18nConfig;
-	debug: DebugConfig;
 	modes: ModesConfig;
 	editor: EditorSettingsConfig;
 	long_form: LongFormConfig;

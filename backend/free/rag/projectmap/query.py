@@ -18,7 +18,6 @@ from pathlib import Path
 from backend.free.rag.corpus.package import PACKAGE_FILE
 from backend.free.rag.corpus.store import PACKAGES_DIR, CorpusManifest
 from backend.free.rag.evidence.store import EvidenceStore
-from backend.free.rag.evidence.types import Evidence
 from backend.free.rag.projectmap import graph_io
 from backend.free.rag.projectmap.graph import Node
 from backend.free.rag.projectmap.ids import code_node_id, project_map_package_id
@@ -28,24 +27,6 @@ from backend.utils import estimate_tokens
 _ENTRY_STEMS: frozenset[str] = frozenset({"main", "app", "cli", "index", "__main__"})
 #: overview のエントリ候補の上限件数。
 _ENTRY_LIMIT = 5
-
-
-def _evidence_to_node(record: Evidence) -> Node:
-    attrs = record.attrs
-    parent_id = attrs.get("parent_id")
-    return Node(
-        id=record.id,
-        node_type=str(attrs.get("node_type") or ""),
-        path=str(attrs.get("path") or ""),
-        name=str(attrs.get("name") or ""),
-        qualname=str(attrs.get("qualname") or ""),
-        lang=str(attrs.get("lang") or ""),
-        line_start=int(attrs.get("line_start") or 0),
-        line_end=int(attrs.get("line_end") or 0),
-        parent_id=str(parent_id) if parent_id else None,
-        signature=str(attrs.get("signature") or ""),
-        text=record.text,
-    )
 
 
 def _fit_budget(lines: list[str], budget_tokens: int) -> str:

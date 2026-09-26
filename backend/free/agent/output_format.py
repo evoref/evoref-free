@@ -260,11 +260,6 @@ def is_table_output(file_path: str) -> bool:
     return Path(file_path).suffix.lower() in TABLE_OUTPUT_EXTS
 
 
-def is_rich_table_output(file_path: str) -> bool:
-    """``file_path`` の拡張子がリッチ文書 (Word / PowerPoint) か判定する。"""
-    return Path(file_path).suffix.lower() in RICH_TABLE_OUTPUT_EXTS
-
-
 #: 画像 / 図形を実体化できる出力形式 (docs/f_11_file_export.md §3.1)。
 #: ``RICH_TABLE_OUTPUT_EXTS`` は「取得済みテーブルを決定論的に書く」対象の
 #: 集合なので ODF を含まない。画像・図形の案内はそれとは別の軸で決める。

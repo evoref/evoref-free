@@ -146,10 +146,6 @@ class AppState:
     # ``session_id`` と共に参照し、``max_per_session`` / ``max_per_query`` の
     # 上限判定とセッション切替時のリセット (``reset_session``) を担う。
     judge_tracker: "JudgeUsageTracker | None" = None
-    # 競合確認のセッション単位カウンタ (RAG 用とは別インスタンス)。旧
-    # ``conflict_chat_judge`` 経路は撤去済みで、現在は ``prepare_memory_context``
-    # のセッション切替時 ``reset_session`` にしか使われない (予約)。
-    conflict_judge_tracker: "JudgeUsageTracker | None" = None
     # 埋め込みモデルとストアの次元不一致フラグ
     embedding_dim_mismatch: bool = False
     # 不一致時の参考情報（fronend のバナー表示用）
@@ -322,15 +318,6 @@ class AppState:
         view = store.scoped(scope)
         self._semantic_stores[scope] = view
         return view
-
-    def invalidate_semantic_stores(self) -> None:
-        """スコープ束縛ビューのキャッシュを捨てる。
-
-        ストア本体は 1 本なので、ここで捨てるのは ``scope`` ごとの薄い
-        ラッパだけ。アーカイブ等でスコープが消えた後に古いビューを掴んだ
-        ままにしないためのもの。
-        """
-        self._semantic_stores.clear()
 
     # ── LLM クライアント設定 ──
 

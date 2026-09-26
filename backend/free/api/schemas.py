@@ -214,27 +214,6 @@ class StatusResponse(BaseModel):
     data_health: DataHealthInfo = Field(default_factory=DataHealthInfo)
 
 
-# ===== Aux Model =====
-
-class AuxModelConcurrency(BaseModel):
-    """補助タスク用途別セマフォスロット数"""
-    realtime: int = 0
-    background: int = 0
-    learning: int = 0
-
-
-class AuxModelStatusResponse(BaseModel):
-    """補助タスクのステータス（Free版: ローカル専用）"""
-    configured: bool = False
-    connected: bool = False
-    url: str = ""
-    host: str = ""
-    port: int = 0
-    model_params_b: float | None = None
-    concurrency: AuxModelConcurrency = Field(default_factory=AuxModelConcurrency)
-    timeout_seconds: float = 0
-
-
 # ===== RAG =====
 
 class RagIngestResponse(BaseModel):

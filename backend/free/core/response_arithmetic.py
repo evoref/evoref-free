@@ -94,11 +94,6 @@ def find_arithmetic_contradictions(text: str) -> list[str]:
     return found
 
 
-def has_arithmetic_contradiction(text: str) -> bool:
-    """本文中に計算の合わない算術主張が 1 つでもあるか。"""
-    return bool(find_arithmetic_contradictions(text))
-
-
 # ---------------------------------------------------------------------------
 # 冒頭の結論 vs 本文の計算結果
 # ---------------------------------------------------------------------------

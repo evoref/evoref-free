@@ -327,11 +327,6 @@ class PathResolver:
         """モード切替時に呼ぶ。未指定/不明値は安全側で ``"chat"`` に丸める。"""
         self._active_mode = mode if mode in ("chat", "create") else "chat"
 
-    @property
-    def adapter_partition_mode(self) -> str:
-        """``learning.level2_adapter_partition`` の値 (``"model"``/``"model_mode"``)。"""
-        return self._adapter_partition_mode
-
     def resolve_learning(self, key: str) -> Path:
         """base 学習データのパスを **active** モデルの model_key パーティション配下で解決する。
 
@@ -723,16 +718,6 @@ def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
 def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
     """slot ("base") のモデルプロファイルから ``reasoning`` を返す。"""
     return _profile_for(cfg, slot).get("reasoning") or {}
-
-
-def resolve_sampling_params(cfg: dict, target: str) -> dict:
-    """target のモデルプロファイルが宣言する sampling パラメータを返す。
-
-    target は slot (``"base"``) と mode (``"chat"`` / ``"create"``)。
-    宣言の無いキーは含まれないので、呼び出し側の既定を潰さない。
-    :func:`get_mode_generation_params` が ``modes.*`` より優先で適用する。
-    """
-    return _profile_for(cfg, target).get("sampling") or {}
 
 
 def resolve_reasoning_mode(

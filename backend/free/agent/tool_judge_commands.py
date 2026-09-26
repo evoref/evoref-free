@@ -151,8 +151,7 @@ def _build_spec_command(query: str) -> str:
 
 
 # 現在時刻 / 日付クエリ。executable 判定の中で最も曖昧さが小さく、aux が
-# 否定票を返しても regex 結果を維持してよい唯一の高特異度パターン
-# (``_upgrade_command_via_aux`` の降格例外)。
+# 否定票を返しても regex 結果を維持してよい唯一の高特異度パターン。
 # 定義は core.intent_vocab が SSOT (agent.router が同一定義を持っていたが、
 # ``(?!間)`` ガードの有無など細部が食い違っていた)。
 _DATETIME_QUERY_RE = DATETIME_QUERY_RE

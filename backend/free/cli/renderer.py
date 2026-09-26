@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -74,15 +73,6 @@ def _is_no_color() -> bool:
     return False
 
 
-def render_response(console: Console, text: str) -> None:
-    """AI 応答をレンダリング（Markdown インライン表示）"""
-    if console.no_color:
-        console.print(text)
-    else:
-        md = Markdown(text)
-        console.print(md)
-
-
 def render_user_message(console: Console, text: str, *, clear_echo: bool = False) -> None:
     """ユーザー入力メッセージを枠付きで表示
 
@@ -108,11 +98,6 @@ def render_user_message(console: Console, text: str, *, clear_echo: bool = False
         padding=(0, 1),
     )
     console.print(panel)
-
-
-def render_response_start(console: Console) -> None:
-    """応答開始（空行のみ）"""
-    console.print()
 
 
 def render_separator(console: Console) -> None:

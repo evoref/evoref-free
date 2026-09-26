@@ -1,4 +1,4 @@
-"""RAG / 埋め込み / リランカー関連スキーマ"""
+"""RAG / 埋め込み関連スキーマ"""
 
 from typing import Literal
 

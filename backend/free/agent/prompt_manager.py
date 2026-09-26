@@ -37,7 +37,6 @@ from backend.free.agent.prompt_ledger import (
     render_markdown,
     save_ledger,
     shared_bullet_ids,
-    sync_protected,
 )
 from backend.i18n_helper import prompt_locale
 from backend.io.codec import persisted

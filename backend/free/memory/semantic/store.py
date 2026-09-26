@@ -40,7 +40,7 @@ id → ``Evidence`` 1 本 (:class:`~backend.free.memory.semantic.fact_view.FactT
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,7 +57,6 @@ from backend.free.memory.semantic.fact_view import FactTable, check_fact_record
 from backend.free.memory.semantic.namespaces import (
     know_half_life_days,
     namespace_of,
-    policy_for,
 )
 from backend.free.memory.semantic.subject_key import is_generic_subject
 from backend.free.memory.semantic.sources import (
@@ -432,10 +431,6 @@ class SemanticStore:
         )
         return view
 
-    def add_fact_bulk(self, facts: Sequence[SemanticFact]) -> list[SemanticFact]:
-        """複数ファクトを ``put`` する (アトミックではない)。"""
-        return [self.add_fact(fact) for fact in facts]
-
     def put_record(self, record: Evidence) -> SemanticFact:
         """組み立て済みの **新しい** ``Evidence`` をそのまま ``create`` する。
 
@@ -487,7 +482,6 @@ class SemanticStore:
         fact_id: str,
         *,
         touch: bool = True,
-        flush_embedding: bool = True,  # noqa: ARG002 — 呼出側互換 (版で一括保存)
         **changes: Any,
     ) -> SemanticFact:
         """既存ファクトのフィールドを差分更新する (``patch`` 事象、c_05 §1.4)。
@@ -502,8 +496,6 @@ class SemanticStore:
             touch: ``accessed_at`` を現在時刻へ更新するか。既定 True。
                 埋め込みの遡及生成のような **保守処理はアクセスではない** ため、
                 False を渡して保持順を歪めないようにする。
-            flush_embedding: 旧 API 互換のため受け取るだけ。ベクトルは snapshot
-                生成時に増分で作られる (c_16 §6.1)。
         """
         fact = self._facts.get(fact_id)
         if fact is None:
@@ -878,9 +870,6 @@ class SemanticStore:
             if (f := self._facts.get(fid)) is not None
             and (scope is None or f.scope == scope)
         ]
-
-    def iter_facts(self) -> Iterator[SemanticFact]:
-        return iter(list(self._facts.values()))
 
     def _collect(
         self,

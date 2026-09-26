@@ -85,9 +85,7 @@ def _emit_check(
 ) -> tuple[str, dict]:
     """finalize 検査用の内部 emit: ``events.jsonl`` へ永続化し ``(kind, payload)`` を返す。
 
-    :func:`_emit_step` と同じ永続化を行うが SSE 化はしない — 構造化イベント
-    (:func:`run_staged_pipeline`) と SSE (:func:`_finalize_staged_checks`) の
-    共有実体 (:func:`_finalize_staged_checks_events`) が使う。
+    SSE 化はしない — :func:`_finalize_staged_checks_events` が使う。
     """
     if event_log is not None:
         try:
@@ -134,9 +132,7 @@ def _translate_loop_event_payload(
 ) -> dict | None:
     """LoopEvent を staged 進捗の step payload (dict) へ翻訳する (該当なしは None)。
 
-    ``_translate_loop_event`` (SSE 文字列版) / :func:`run_staged_pipeline`
-    (構造化イベント版、meta dispatch) の共有実体 — 同じ翻訳ロジックを 2 本
-    書かないための単一の実装 (f_10 §1)。
+    :func:`run_staged_pipeline` (構造化イベント版、meta dispatch) が使う (f_10 §1)。
 
     2 段階表示:
     - 上位 (工程タスク): ``task_picked`` → ``long_form_unit_start`` を
@@ -233,7 +229,7 @@ def _translate_loop_event_payload(
 _STAGED_PROJECT_ID = "staged"
 
 #: staged クリエイト 1 リクエストの総時間上限の出荷既定
-#: (:class:`backend.schemas.create.StagedCreateConfig` と一致させる)。
+#: (:class:`backend.schemas.create.CreateStagedConfig` と一致させる)。
 #: 打ち切りメッセージで「設定値が既定より低い」ことを示すために参照する。
 _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC = 2400.0
 
@@ -388,17 +384,9 @@ async def run_staged_pipeline(
     ``kind="keepalive"`` / 終端 ``kind="result"`` の dict を yield する。
 
     finalize 検査ロジック (postprocess / smoke / coherence / design_drift) は
-    :func:`_finalize_staged_checks_events` — legacy (``_stream_staged_create_body``
-    → ``_finalize_staged_stream``) と実体を共有する。合成 / LoopDriver 駆動の
-    グルーコード自体は legacy 側 (``_stream_staged_create_body``) と別実装
-    (workspace/ストア構築・ポーリングループ・キャンセル/タイムアウト検知が
-    ``_finalize_staged_stream`` の直接呼出しテストと絡み合っており、検査を
-    二重実行せずに完全統合すると legacy の挙動保証が崩れるため、Phase 3a-1
-    ではここまでに留める) だが、呼び出す下位プリミティブ
-    (``WorkspaceManager`` / ``LoopDriver`` / ``synthesize_create_task_graph_with_plan`` /
-    ``_translate_loop_event_payload``) は同一。
+    :func:`_finalize_staged_checks_events` が持つ。
 
-    ``total_timeout_sec`` 未指定時は legacy と同じ既定計算
+    ``total_timeout_sec`` 未指定時は既定計算
     (``create.staged.total_timeout_sec`` を ``create.turn_timeout_sec - 300`` に
     クランプ) を使う。``is_cancelled`` 未指定時は ``cancel_requested(session_id)``。
 

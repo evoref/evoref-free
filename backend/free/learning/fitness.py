@@ -188,15 +188,3 @@ def defect_rate_fitness(
             if signal_is_defect(signals, key):
                 defects += weight
     return max(0.0, min(1.0, 1.0 - defects / len(experiences)))
-
-
-def has_defect_signal(
-    experiences: list[dict], *, weights: Mapping[str, float] | None = None,
-) -> bool:
-    """欠陥シグナルが 1 件でも立っているか (= 評価に使える分散があるか)。"""
-    table = DEFECT_WEIGHTS if weights is None else weights
-    return any(
-        signal_is_defect(e.get("signals") or {}, key)
-        for e in experiences
-        for key in table
-    )

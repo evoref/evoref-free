@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -501,21 +500,6 @@ class VectorStore:
                 changed = True
         return changed
 
-    def mark_reindexed(
-        self,
-        embedding_model: str,
-        embedding_backend: str,
-        embedding_dim: int,
-    ) -> None:
-        """reindex 完了時に store_info を更新する"""
-        now = utc_now()
-        if not self.store_info:
-            self.store_info = {"created_at": now}
-        self.store_info["embedding_model"] = embedding_model
-        self.store_info["embedding_backend"] = embedding_backend
-        self.store_info["embedding_dim"] = int(embedding_dim)
-        self.store_info["last_reindex_at"] = now
-
     def _save_vectors(self) -> None:
         """ベクトルファイルのみ保存"""
         if (
@@ -540,17 +524,11 @@ class VectorStore:
         category: str = "document",
         embedding_model: str = "",
         embedding_backend: str = "",
-        has_context: bool = False,
         speaker: str | None = None,
         extra_meta: dict | None = None,
         source_path: str = "",
     ) -> list[str]:
         """ベクトル（float32）を受け取り、int8 量子化して追加
-
-        has_context=True は「コンテキストプレフィックス生成の対象外」を表す。
-        自己完結したチャンク（memory ノート等）は prefix を付けても価値が薄く、
-        Step 5.8 (contextual) の source text 探索を空振りさせるだけのため、
-        最初から has_context=True で登録し未処理スキャンから除外する。
 
         ``speaker`` は memory 由来チャンクの発話者 (``user`` / ``assistant`` /
         ``rag`` / ``system``)。検索側が「ユーザーが述べた事実」と「アシスタント
@@ -607,8 +585,6 @@ class VectorStore:
                 # ``source`` はファイル名だけなので、別ディレクトリの同名
                 # ファイルが 1 つの source に潰れる。実体の相対パスを併記する。
                 meta_entry["source_path"] = source_path
-            if has_context:
-                meta_entry["has_context"] = True
             if speaker:
                 meta_entry["speaker"] = speaker
             if embedding_model:
@@ -777,76 +753,6 @@ class VectorStore:
         """行 → チャンク id (行 id の持ち方が違うサブクラスが上書きする)。"""
         return self.metadata[row]["id"]
 
-    def similarity_for(
-        self, query_vec: np.ndarray, chunk_ids: Iterable[str],
-    ) -> dict[str, float]:
-        """指定チャンクとクエリの **素のコサイン類似度** を返す。
-
-        転置索引 (c_16 §6.2) など別チャネルが見つけたチャンクを、ベクトル検索の結果と
-        同じスケールへ載せ直すための入口。品質判定・関連度フロアはすべて
-        cosine スケール前提なので、別スケールのスコアを混ぜてはいけない
-        (`unified_search` の Step 5 / 6.5 のコメント参照)。
-
-        見つからない ``chunk_id`` は戻り値に含まれない。
-        """
-        want = {cid for cid in chunk_ids if cid}
-        if self.vectors_q8 is None or len(self.vectors_q8) == 0 or not want:
-            return {}
-        idxs = [i for i, m in enumerate(self.metadata) if m.get("id") in want]
-        if not idxs:
-            return {}
-        query_f32 = np.asarray(query_vec, dtype=np.float32).ravel()
-        restored = dequantize_int8(
-            np.asarray(self.vectors_q8)[idxs], np.asarray(self.scales)[idxs],
-        )
-        norms = np.linalg.norm(restored, axis=1).clip(min=1e-9)
-        query_norm = float(np.linalg.norm(query_f32).clip(min=1e-9))
-        sims = restored @ query_f32 / (norms * query_norm)
-        return {
-            self.metadata[gi]["id"]: float(sim)
-            for gi, sim in zip(idxs, sims)
-        }
-
-    def prune_stale_source_chunks(self, source: str, chunks: list[str]) -> int:
-        """``source`` の既存チャンクのうち、新しい本文集合に無いものを削除する。
-
-        同じファイルを取り込み直したとき、以前は旧チャンクが残ったまま新しい
-        チャンクが **追記** され、同じ文が二重にヒットしていた (2026-09-05
-        監査)。内容ハッシュで突き合わせ、消えたものだけ落とす。
-
-        Returns:
-            削除したチャンク数。
-        """
-        existing = self.source_content_hashes(source)
-        if not existing:
-            # 旧レコード (content_hash なし) は突き合わせられない。source 単位で
-            # 丸ごと入れ替える (追記して重複させるよりは安全)。
-            stale = self.chunk_ids_for_source(source)
-            return self.delete(stale) if stale else 0
-        incoming = {content_hash(c) for c in chunks}
-        stale = [cid for cid, h in existing.items() if h not in incoming]
-        return self.delete(stale) if stale else 0
-
-    def unchanged_chunk_hashes(self, source: str, chunks: list[str]) -> set[str]:
-        """``source`` に既にあり、本文が変わっていないチャンクのハッシュ集合。"""
-        existing = set(self.source_content_hashes(source).values())
-        return {h for c in chunks if (h := content_hash(c)) in existing}
-
-    def chunk_ids_for_source(self, source: str) -> list[str]:
-        """``source`` に属するチャンク ID を返す。"""
-        return [
-            str(m["id"]) for m in self.metadata
-            if m.get("source") == source and m.get("id")
-        ]
-
-    def source_content_hashes(self, source: str) -> dict[str, str]:
-        """``source`` の ``chunk_id -> content_hash`` を返す (旧レコードは除く)。"""
-        return {
-            str(m["id"]): str(m["content_hash"])
-            for m in self.metadata
-            if m.get("source") == source and m.get("id") and m.get("content_hash")
-        }
-
     def delete(self, chunk_ids: list[str]) -> int:
         """指定されたチャンクを削除"""
         self._ensure_writable()
@@ -909,91 +815,6 @@ class VectorStore:
         if chunk_path.exists():
             return chunk_path.read_text(encoding="utf-8")
         return ""
-
-    # ── ソーステキスト保存 / 読込み（Contextual Retrieval 用）──
-
-    def save_source_text(self, source: str, text: str) -> None:
-        """ソースドキュメントの全文を保存（プレフィックス生成時に参照）"""
-        self.source_texts_dir.mkdir(parents=True, exist_ok=True)
-        path = self.source_texts_dir / f"{source}.txt"
-        path.write_text(text, encoding="utf-8")
-
-    def load_source_text(self, source: str) -> str:
-        """ソースドキュメントの全文を読込み"""
-        path = self.source_texts_dir / f"{source}.txt"
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
-
-    def get_contextual_text(self, chunk_id: str) -> str:
-        """プレフィックス付きチャンクテキストを返す（埋め込み・転置索引用）
-
-        context_prefix がある場合は「プレフィックス + 改行 + 元テキスト」、
-        ない場合は元テキストのみ。
-        """
-        meta = self._find_meta(chunk_id)
-        chunk_text = self.load_chunk(chunk_id)
-        if meta and meta.get("context_prefix"):
-            return meta["context_prefix"] + "\n" + chunk_text
-        return chunk_text
-
-    def get_chunks_without_context(self) -> list[dict]:
-        """コンテキストプレフィックス未生成のチャンク metadata リストを返す"""
-        return [m for m in self.metadata if not m.get("has_context")]
-
-    def mark_has_context(self, chunk_id: str) -> None:
-        """source text が存在せずプレフィックス生成不能なチャンクを
-        ``get_chunks_without_context`` の対象から恒久的に除外する
-
-        ``update_context_prefix`` と異なり prefix もベクトルも更新しない
-        （生成すべきプレフィックスが無いチャンク向け）。
-        """
-        self._ensure_writable()
-        for meta in self.metadata:
-            if meta["id"] == chunk_id:
-                meta["has_context"] = True
-                return
-
-    def increment_access_count(self, chunk_id: str) -> int:
-        """retrieval ヒット回数をメモリ上でインクリメントする
-
-        Lazy Contextual Retrieval 用。hit 回数が閾値に達した chunk のみ
-        プレフィックスを生成・永続化する判定に使う。永続化はプレフィックス
-        生成時の save() までメモリ上に留まる。
-
-        Returns:
-            更新後の access_count。chunk_id が見つからない場合は 0。
-        """
-        for meta in self.metadata:
-            if meta.get("id") == chunk_id:
-                meta["access_count"] = int(meta.get("access_count", 0)) + 1
-                return meta["access_count"]
-        return 0
-
-    def update_context_prefix(
-        self, chunk_id: str, prefix: str, new_vector: np.ndarray | None = None,
-    ) -> None:
-        """チャンクのコンテキストプレフィックスとベクトルを更新"""
-        self._ensure_writable()
-        for i, meta in enumerate(self.metadata):
-            if meta["id"] == chunk_id:
-                meta["context_prefix"] = prefix
-                meta["has_context"] = True
-                if new_vector is not None and self.vectors_q8 is not None:
-                    # float32 → int8 量子化して更新
-                    vec = new_vector.reshape(1, -1)
-                    q8, sc = quantize_int8(vec)
-                    self.vectors_q8[i] = q8[0]
-                    self.scales[i] = sc[0]
-                return
-        logger.warning("update_context_prefix: chunk_id=%s not found", chunk_id)
-
-    def _find_meta(self, chunk_id: str) -> dict | None:
-        """chunk_id に対応する metadata を返す"""
-        for meta in self.metadata:
-            if meta["id"] == chunk_id:
-                return meta
-        return None
 
     @property
     def index_path(self) -> Path:

@@ -41,11 +41,6 @@ def index_size_mb(index_path: Path | None) -> float:
     return index_path.stat().st_size / (1024 * 1024)
 
 
-def count_unique_sources(metadata: Iterable[dict[str, Any]]) -> int:
-    """メタデータ配列から source フィールドのユニーク数を返す"""
-    return len(set(m.get("source", "") for m in metadata))
-
-
 def compute_stm_stats(notes: Iterable[_NoteLike]) -> dict[str, Any]:
     """STM 統計 (pending_emb / pending_evo / avg_score) をまとめて計算する
 
