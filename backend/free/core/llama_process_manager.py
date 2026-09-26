@@ -207,19 +207,6 @@ class LlamaProcessManager:
         self.stop(component)
         return self.start(component, cfg)
 
-    def health(self, component: str) -> bool:
-        """軽量ヘルスチェック (1 回のみ)"""
-        entry = self._procs.get(component)
-        if entry is None:
-            return False
-        try:
-            resp = httpx.get(
-                f"http://{entry.host}:{entry.port}/health", timeout=2.0,
-            )
-            return resp.status_code == 200
-        except (httpx.ConnectError, httpx.TimeoutException):
-            return False
-
     def shutdown_all(self) -> None:
         """登録中の全プロセスを順次停止"""
         for component in list(self._procs.keys()):

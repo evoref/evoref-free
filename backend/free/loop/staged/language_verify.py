@@ -113,8 +113,8 @@ def resolve_verify_executable(executable: str, workspace_root: Path) -> tuple[Pa
     ``workspace_root`` は呼出側の状態に関わらずここで必ず ``resolve()`` する
     — 候補側は ``candidate.resolve()`` で正規化 (8.3 短縮名解決込み) される
     ため、比較対象の ``workspace_root`` を未解決のまま渡す呼出しがあると
-    ``%TEMP%`` の短縮名 (例: ``HIROYU~1``) と解決後の長い名前
-    (``hiroyukiogawa``) が食い違い、ワークスペース内の候補を「外」と
+    ``%TEMP%`` の短縮名 (例: ``LONGUS~1``) と解決後の長い名前
+    (``longusername``) が食い違い、ワークスペース内の候補を「外」と
     誤判定して素通りさせる (2026-09-20 実機確認で検出)。
     """
     try:

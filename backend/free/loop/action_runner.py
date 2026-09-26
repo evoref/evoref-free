@@ -38,7 +38,6 @@ from backend.free.harness.action import (
     RunCommandAction,
     SearchAction,
 )
-from backend.free.loop.executor import ArtifactEntry
 from backend.log_config import get_logger
 
 logger = get_logger("loop.action_runner")
@@ -121,39 +120,6 @@ class ActionRunner:
                 error=str(exc),
                 duration_ms=(time.perf_counter() - t0) * 1000.0,
             )
-
-    def collect_artifacts(
-        self, results: Iterable[ActionResult],
-    ) -> list[ArtifactEntry]:
-        """``ActionResult`` 列から ``ArtifactEntry`` を集計する。
-
-        ``edit_file`` が success した ``ActionResult`` のみを対象とする。
-        """
-        out: list[ArtifactEntry] = []
-        for r in results:
-            if not r.success:
-                continue
-            if not isinstance(r.action, EditFileAction):
-                continue
-            meta = r.metadata or {}
-            sha = str(meta.get("diff_sha1") or "")
-            if not sha:
-                continue
-            try:
-                added = int(meta.get("lines_added") or 0)
-                removed = int(meta.get("lines_removed") or 0)
-            except (TypeError, ValueError):
-                added = removed = 0
-            out.append(
-                ArtifactEntry(
-                    path=r.action.path,
-                    diff_sha1=sha,
-                    lines_added=added,
-                    lines_removed=removed,
-                    action_kind="edit_file",
-                ),
-            )
-        return out
 
     # ── edit_file ─────────────────────────────────────────────────────
 

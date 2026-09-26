@@ -906,10 +906,6 @@ class ExperienceBuffer:
     def _same(a: str | Path, b: str | Path) -> bool:
         return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
-    def get_recent(self, n: int = 10) -> list[ExperienceEntry]:
-        """直近 n 件取得"""
-        return self.entries[-n:]
-
     def mark_user_feedback(
         self, session_id: str, *, negative: bool | None, note: str = "",
         query: str | None = None,
@@ -969,16 +965,6 @@ class ExperienceBuffer:
     @property
     def count(self) -> int:
         return len(self.entries)
-
-    @property
-    def source_memory_ids(self) -> list[str]:
-        """FadeMem ガード用: 空リスト（将来拡張）"""
-        return []
-
-    @property
-    def pending_memory_ids(self) -> list[str]:
-        """FadeMem ガード用: 空リスト（将来拡張）"""
-        return []
 
     def as_dicts(self) -> list[dict]:
         """全エントリを dict 化して返す (時系列順)。学習側の純粋関数の入力用。"""

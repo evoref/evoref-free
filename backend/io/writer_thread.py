@@ -157,11 +157,6 @@ class ChatWriter:
         with self._mode_lock:
             self._ticks.append(fn)
 
-    def remove_tick(self, fn: Callable[[bool], None]) -> None:
-        with self._mode_lock:
-            if fn in self._ticks:
-                self._ticks.remove(fn)
-
     # ── enqueue (呼出側のスレッド) ──
 
     def append(self, path: Path | str, lines: Iterable[str], *, format_id: str) -> None:

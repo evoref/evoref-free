@@ -29,15 +29,12 @@ content_detector.py / tool_call_judge.py / feedback.py / self_rag_judge.py)
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar
 
 from backend.i18n_helper import get_locale
 from backend.free.core.script_ranges import (
     JAPANESE,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
 
 _T = TypeVar("_T")
 
@@ -71,15 +68,6 @@ def matches_either(
     ``intent_vocab.ascii_boundary`` で囲って直す (union をやめる理由にはしない)。
     """
     return bool(ja_pattern.search(text) or en_pattern.search(text))
-
-
-def matches_any_either(
-    text: str,
-    ja_patterns: Iterable[re.Pattern[str]],
-    en_patterns: Iterable[re.Pattern[str]],
-) -> bool:
-    """:func:`matches_either` のパターンリスト版。"""
-    return any(p.search(text) for p in (*ja_patterns, *en_patterns))
 
 
 #: 和文文字 (ひらがな / カタカナ / 漢字)。``text_quality._JA_CHAR_RE`` と同じ範囲。

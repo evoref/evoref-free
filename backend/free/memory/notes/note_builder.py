@@ -1384,11 +1384,6 @@ def resolve_fact_triggers_path(triggers_dir: str | Path | None = None) -> Path:
     return resolve_trigger_file("fact_triggers.yaml", triggers_dir=triggers_dir)
 
 
-def _default_fact_triggers() -> FactTriggerMap:
-    """package 同梱 default を取得 (初期化時 / テスト既定値として使用)。"""
-    return get_fact_triggers(resolve_fact_triggers_path(None))
-
-
 # ──────────────────────────────────────────────────────────────────────────
 # 共通基底
 # ──────────────────────────────────────────────────────────────────────────

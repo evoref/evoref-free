@@ -102,7 +102,3 @@ def national_holidays_between(
     for year in range(lo.year, hi.year + 1):
         out.extend(d for d in national_holidays(year) if lo <= d <= hi)
     return tuple(sorted(out))
-
-
-def is_national_holiday(day: datetime.date) -> bool:
-    return day in national_holidays(day.year)

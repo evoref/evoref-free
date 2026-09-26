@@ -421,23 +421,6 @@ def _truncation_frame(
     )
 
 
-def _disclose_unwritten_files(content: str) -> str:
-    """存在しないファイルの書込み主張に開示注記を足す (同期経路用)。
-
-    ストリーミング経路は ``UnwrittenFileClaimFilter`` がパイプラインで同じ
-    ことをする。同期経路にだけ無いと ``stream=False`` の API 呼び出しが
-    黙って「書き込みました」を返す — 検証と開示がストリーミング側にしか
-    無かった過去の非対称 (``verify_and_repair_sync`` の docstring) と同型。
-    """
-    from backend.free.core.stream_filter import UnwrittenFileClaimFilter
-
-    if not content.strip():
-        return content
-    checker = UnwrittenFileClaimFilter()
-    checker.process(content)
-    return content + checker.flush()
-
-
 async def _finalize_deliberative_stream(
     state: _DeliberativeStreamState,
     sess_state: AppState,

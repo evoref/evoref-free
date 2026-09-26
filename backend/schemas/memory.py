@@ -120,7 +120,7 @@ class FactsConfig(BaseModel):
     """pinned ノート由来の抽出上限。``-1`` で無制限"""
 
     extract_from_mdp_trace: bool = True
-    """常設ストア (``local_paths.agent_trace_dir``) の ``agent_trace*.jsonl`` から
+    """常設ストア (``agent_trace_dir``) の ``agent_trace*.jsonl`` から
     MDPTraceExtractor を実行するか"""
 
     ingest_mdp_trace_to_ltm: bool = True
@@ -432,10 +432,6 @@ class SemMemLimitsConfig(BaseModel):
     訂正の由来を追える期間は残しつつ無限成長を止める。他のファクトの
     ``supersedes`` から参照されているものは対象外 (鎖を切らない)。
     """
-
-    def limit_for(self, fact_type: str) -> int | None:
-        """``fact_type`` の上限を返す。未定義 type は ``None``。"""
-        return getattr(self, fact_type, None) if fact_type in VALID_FACT_TYPES else None
 
 
 class SemMemProjectConfig(BaseModel):

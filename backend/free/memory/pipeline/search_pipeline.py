@@ -38,7 +38,6 @@ from backend.free.rag.self_rag_judge import (
 
 if TYPE_CHECKING:
 
-    from backend.debug_logger import DebugLogger
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.core.stage_timer import StageTimer
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
@@ -56,19 +55,6 @@ _search_executor = ThreadPoolExecutor(max_workers=3)
 #: (3 ワーカーが全部塞がれば記憶検索そのものが止まる)。専用プールへ隔離し、
 #: 影響をカートリッジ層の中に閉じる。
 _cartridge_executor = ThreadPoolExecutor(max_workers=2)
-
-#: fire-and-forget で起動した後始末タスクの参照。参照を持たないタスクは GC に
-#: 回収されうる (asyncio の既知の挙動) ので、完了まで束ねておく。
-_BACKGROUND_TASKS: set[asyncio.Task] = set()
-
-
-def _spawn_background(coro, *, name: str) -> asyncio.Task:
-    """参照を保持したまま補助タスクを起動する (完了時に自動で外す)。"""
-    task = asyncio.create_task(coro, name=name)
-    _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
-    return task
-
 
 #: ストア横断の共通レコード ``(id, cosine, score, text)`` (c_16 §6.3 / §7.2)。
 #:
@@ -1372,14 +1358,6 @@ async def unified_search(
     # で張り付くため、そのままだとセッションの残り全部で記憶検索が skip され
     # 続ける (2026-08-23 ライブ監査: 35/94 ターン)。
     window_complete = int(getattr(working_mem, "session_evicted_turns", 0) or 0) == 0
-    # 末尾ターンは現在のユーザクエリ自身 (chat service が search 前に
-    # WorkingMemory.add_turn 済) なので、補助タスクプロンプトの "最新のクエリ"
-    # と重複しないよう除外する。末尾が user role でない (テスト経路等) なら
-    # 全件をそのまま渡す。
-    if full_context and full_context[-1].get("role") == "user":
-        recent_context = full_context[:-1]
-    else:
-        recent_context = full_context
     # Step 1 全体を計測する。ここが未計測だったため「遅い検索の 89.7% が
     # 内訳不明」という状態が続き、実際の支配要因が見えていなかった
     # (2026-08-01 プロファイリング)。
@@ -1831,10 +1809,6 @@ async def unified_search(
             cid in corpus_ids for cid, _, _ in final_sources
         ),
     )
-
-
-async def _empty_layer() -> list[StoreEntry]:
-    return []
 
 
 async def _empty_pseudo_layer() -> tuple[list[StoreEntry], set[str]]:

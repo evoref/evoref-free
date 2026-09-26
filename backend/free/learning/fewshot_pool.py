@@ -1916,67 +1916,6 @@ class FewShotPool(VersionedJsonFile):
             )
         return selected
 
-    def mutate_selection(
-        self,
-        current_ids: list[str],
-        mode: str,
-        seed: int | None = None,
-    ) -> list[str]:
-        """Few-shot 選択を変異させる（add/remove/swap）
-
-        Args:
-            current_ids: 現在選択されている例の ID リスト
-            mode: 対象モード
-            seed: 乱数シード
-
-        Returns:
-            変異後の ID リスト
-        """
-        pool = self._pools.get(mode, [])
-        if not pool:
-            return []
-
-        pool_ids = {ex.id for ex in pool}
-        # 現在の選択からプールに存在する ID のみ保持
-        valid_ids = [i for i in current_ids if i in pool_ids]
-
-        rng = np.random.default_rng(seed)
-        op = rng.choice(["add", "remove", "swap"])
-
-        available = [ex.id for ex in pool if ex.id not in set(valid_ids)]
-
-        before_ids = list(valid_ids)
-
-        if op == "add" and available and len(valid_ids) < self.max_examples:
-            new_id = rng.choice(available)
-            valid_ids.append(new_id)
-        elif op == "remove" and valid_ids:
-            idx = rng.integers(0, len(valid_ids))
-            valid_ids.pop(idx)
-        elif op == "swap" and valid_ids and available:
-            idx = rng.integers(0, len(valid_ids))
-            new_id = rng.choice(available)
-            valid_ids[idx] = new_id
-
-        dl = self._debug_logger
-        if dl:
-            dl.log_learning_cycle(cycle_num=0, data={
-                "component": "fewshot_pool",
-                "op": "mutate_selection",
-                "mode": mode,
-                "mutation": op,
-                "before_ids": before_ids,
-                "after_ids": valid_ids,
-            })
-
-        return valid_ids
-
-    def get_by_ids(self, ids: list[str], mode: str) -> list[FewShotExample]:
-        """ID リストから例を取得する（存在しない ID は無視）"""
-        pool = self._pools.get(mode, [])
-        id_map = {ex.id: ex for ex in pool}
-        return [id_map[i] for i in ids if i in id_map]
-
     # ── Step 14 — Few-shot プール GC ───────────────────
 
     # ── 使用実績からの寿命 (f_04 §3.2.2) ──

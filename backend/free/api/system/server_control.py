@@ -369,47 +369,6 @@ def wait_port_released(name: ServerName, cfg: dict, timeout: float = 10.0) -> bo
     return find_port_occupant(port) is None
 
 
-async def start_server_process(name: ServerName, cfg: dict) -> tuple[bool, str]:
-    """llama-server プロセスを起動する (既に起動済みなら no-op)
-
-    設定 ON 時の自動起動で使う。``/health`` が通る or `_managed` に生存プロセスが
-    あれば spawn せず ``(True, ...)`` を返す。落ちている場合のみ spawn して
-    ヘルスチェック完了まで待機する。クライアント再接続は呼び出し側の責務。
-    """
-    result = _build_cmd(name, cfg, _find_project_root())
-    if result is None:
-        return (False, "not configured")
-    cmd, host, port = result
-
-    # 既に起動済み (外部起動 / 別経路) なら spawn しない
-    if await _check_health(host, port):
-        return (True, "already healthy")
-    existing = _managed.get(name)
-    if existing and existing.proc.poll() is None:
-        return (True, "already running")
-
-    import asyncio
-
-    # 旧プロセスの graceful shutdown 残響で wait_for_health が旧プロセスの
-    # 200 を拾う窓を潰す (mode.py の base 切替と同じパターン)。
-    await asyncio.to_thread(wait_port_released, name, cfg, 10.0)
-
-    managed = _spawn_server(name, cfg)
-    if managed is None:
-        return (False, "not configured")
-
-    from scripts.launch_llama import wait_for_health, _extract_model_basename
-    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
-    healthy = await asyncio.to_thread(
-        wait_for_health, managed.host, managed.port, health_timeout,
-        _extract_model_basename(cmd),
-    )
-    if healthy:
-        return (True, "started")
-    _stop_server(name)
-    return (False, "health check timed out")
-
-
 # ────────────────────────────────────────────
 # API スキーマ
 # ────────────────────────────────────────────

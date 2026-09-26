@@ -388,10 +388,6 @@ const SERVER_AFFECTING_SECTIONS = new Set([
 /**
  * サーバー関連セクションを保存した場合、サイドバーの状態 (緑ランプ / VRAM) を
  * 即時更新する。
- *
- * aux_model.enabled の ON/OFF はバックエンドで llama-server プロセスの
- * 自動起動 / 停止を伴うため、次のポーリングを待たずに緑ランプとメモリ容量を
- * 揃えて反映させる。
  */
 async function refreshSidebarIfServerSections(changedSections: string[]): Promise<void> {
 	if (!changedSections.some((s) => SERVER_AFFECTING_SECTIONS.has(s))) return;

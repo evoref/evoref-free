@@ -26,9 +26,7 @@ from typing import TYPE_CHECKING
 
 from backend.free.core.stream_filter import strip_thinking_blocks
 from backend.free.core.text_quality import (
-    is_cut_off_answer,
     has_verifiable_output_constraint,
-    length_disclosure_note,
     match_length_directive,
     violates_banned_content,
     violates_enumeration_count,
@@ -218,61 +216,3 @@ def _extract_text(result) -> str:
     else:
         return ""
     return strip_thinking_blocks(content).strip()
-
-async def verify_and_repair_sync(
-    *,
-    query: str,
-    response: str,
-    messages: "list[ChatMessage]",
-    client,
-    max_tokens: int | None = None,
-    generation_params: "GenerationParams | None" = None,
-) -> str:
-    """同期応答用: 検証 → 1 回だけ修復 → 直らなければ開示注記を付けて返す。
-
-    ストリーミング経路の ``_emit_verified_output`` と **同じ結末** を、本文を
-    まとめて持っている同期経路にも与える。検証も修復もストリーミング側に
-    しか無く、``stream=False`` の API 呼び出しは制約違反がそのまま返っていた
-    (``_log_chat_outcome`` が同期 deliberative だけ漏れていたのと同じ非対称)。
-
-    実測 (2026-08-27 ライブ監査、API 経由): 「木の家の良さを50字で説明して
-    ください。」に 34 文字で答え、修復も開示も走らなかった。検証器自体は
-    違反を正しく検出できている::
-
-        violates_length_constraint(q, a)
-          → 'asked for exactly 50 chars but the answer is 34'
-
-    発火するのは ``needs_verification(query)`` が真のターンだけなので、
-    通常の会話にコストは乗らない。
-    """
-    if not response.strip():
-        return response
-    # 語の途中で切れた断片 (「はい、あり」) は検証の対象ではなく **生成の失敗**。
-    # 同じプロンプトを greedy で 1 回だけ生成し直す (2026-09-11 (j) J-07)。
-    if is_cut_off_answer(response) and client is not None and hasattr(client, "generate"):
-        logger.info("Cut-off answer detected (%r); regenerating once", response)
-        try:
-            result = await client.generate(
-                list(messages), stream=False, temperature=0.0,
-                id_slot=getattr(client, "chat_slot", None),
-                max_tokens=max(max_tokens or 0, REPAIR_MIN_MAX_TOKENS),
-            )
-            regenerated = _extract_text(result)
-        except Exception as e:  # noqa: BLE001 - 再生成に失敗したら元を返す
-            logger.warning("Cut-off regeneration failed (keeping original): %s", e)
-            regenerated = ""
-        if regenerated and not is_cut_off_answer(regenerated):
-            response = regenerated
-    if not needs_verification(query):
-        return response
-    final_text, unresolved = await repair_if_violated(
-        query=query,
-        response=response,
-        messages=messages,
-        client=client,
-        max_tokens=max_tokens,
-        generation_params=generation_params,
-    )
-    if unresolved is not None:
-        final_text += length_disclosure_note(query, final_text)
-    return final_text

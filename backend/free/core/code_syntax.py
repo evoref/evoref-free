@@ -88,17 +88,6 @@ def is_python_path(path: str) -> bool:
     return suffix in ("", ".py")
 
 
-def is_known_non_python_code_path(path: str) -> bool:
-    """Python 以外の **コード** として扱える拡張子か (同梱表 → 言語パック)。``.json`` はデータなので除く。
-
-    URL の ``.com`` のような未知の拡張子は偽 (依頼文から拾うときの誤爆を避ける)。
-    """
-    suffix = Path(path).suffix.lower()
-    if suffix == ".json":
-        return False
-    return suffix in _TREE_SITTER_LANGUAGES or suffix in _SFC_LANGUAGES or suffix in _LANGUAGE_OVERLAY
-
-
 def language_label(path: str) -> str:
     """指示文に書く言語名 (``python`` / ``javascript`` / ``html`` …、不明は拡張子)。
 

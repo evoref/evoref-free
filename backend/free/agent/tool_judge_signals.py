@@ -52,7 +52,7 @@ _RECURSIVE_LISTING_RE = re.compile(
     re.IGNORECASE,
 )
 # Windows / Unix の明示パス、または URL。ユーザーが対象を書いた決定論的シグナルで、
-# aux の否定票より優先してよい (``_upgrade_command_via_aux`` の降格例外)。
+# aux の否定票より優先してよい。
 #: ドライブレターの区切りは ``\`` と ``/`` の双方を受ける。バックスラッシュ限定
 #: だったため ``E:/tmp/a.txt`` がツールシグナルとして検出されず、明示パス付きの
 #: 依頼が knowledge query に落ちて「存在しない」と誤答していた (実インシデント

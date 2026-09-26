@@ -264,15 +264,6 @@ def _annotate_level1_gate(
         status.level1_blocked_reason = "waiting_for_idle"
 
 
-def _ts_to_iso(ts: float) -> str | None:
-    """float タイムスタンプを ISO 8601 文字列に変換する。0 以下は None。
-
-    互換性のため API 互換シグネチャを保持し、内部実装は
-    `_learning_collectors.ts_to_iso` に委譲する。
-    """
-    return ts_to_iso(ts)
-
-
 def _get_pro_learning_info() -> dict:
     """Pro 固有の LoRA バージョン・Eval 情報を取得する。Free ではデフォルト値を返す。"""
     result: dict = {

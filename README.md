@@ -177,7 +177,7 @@ evoref gui     # 既定ブラウザで Web UI を開く
 
 ## 変更履歴
 
-[docs/0.0.x_CHANGELOG.md](docs/0.0.x_CHANGELOG.md) を参照してください。
+[docs/](docs/) にあるシリーズごとのファイル (`<メジャー>.<マイナー>.x_CHANGELOG.md`、例: `0.1.x_CHANGELOG.md`) を参照してください。新しい版ほど各ファイルの上にあります。
 
 ---
 

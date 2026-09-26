@@ -8,7 +8,7 @@
 develop モードを 3 段階 (``debug`` / ``investigate`` / ``evolve``)
 に再設計。``__init__`` は ``develop_level: DevelopLevel`` を受け取り、各
 JSONL カテゴリの enabled / max_log_mb / log_retention_days を内部マップから
-導出する。``config.yaml`` の ``debug:`` セクションは廃止 (起動時に拒否)。
+導出する。``config.yaml`` の ``debug:`` セクションは廃止。
 
 公開 API (``log_request`` / ``log_aux_request`` / ``log_rag_result`` /
 ``log_embedding`` /
@@ -35,9 +35,8 @@ logger = get_logger("debug_logger")
 #
 # - ``categories``: 有効化する JSONL カテゴリ集合。
 #     - debug:        requests のみ (即時 BUG 解析向け)
-#     - investigate:  requests / rag / memory / long_form (人間レビュー向け)
-#     - evolve:       既存 6 系統すべて (loop 自己学習向け、PR-C で
-#                     decision / outcome 追加予定)
+#     - investigate:  requests / rag / memory / long_form / decision (人間レビュー向け)
+#     - evolve:       全 8 系統 (loop 自己学習向け、decision / outcome を含む)
 # - ``max_log_mb``:  ファイルあたりのローテ閾値 (MB)。
 # - ``retention_days``: 古いログの自動削除日数 (0 で無効化)。
 #
@@ -75,7 +74,6 @@ _LEVEL_CONFIGS: dict[DevelopLevel, dict[str, Any]] = {
         "enabled": True,
         "categories": frozenset({
             "requests", "rag", "memory", "learning", "long_form", "agent_trace",
-            # 埋込点は PR-C2 (10 decision sites) / PR-C3 (5 outcome sites) で追加予定。
             "decision", "outcome",
         }),
         "max_log_mb": 500,

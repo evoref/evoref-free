@@ -258,12 +258,6 @@ class SplitLayout:
             else:
                 self._pre_mount_items.append(styled)
 
-    def clear_output(self) -> None:
-        """出力エリアをクリア"""
-        richlog = self._get_richlog()
-        if richlog:
-            richlog.clear()
-
     def write_rich(self, renderable) -> None:
         """Rich renderable を出力エリアに直接書き込み
 
@@ -355,10 +349,6 @@ class SplitLayout:
         return False
 
     # ── ユーティリティ ──
-
-    def invalidate(self) -> None:
-        """UI 再描画をトリガー（textual では自動的に行われるため基本的に不要）"""
-        pass
 
     async def get_input(self) -> str:
         """ユーザー入力を待機"""

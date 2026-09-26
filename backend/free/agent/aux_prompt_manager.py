@@ -21,11 +21,6 @@ from backend.free.agent._prompt_store_helpers import (
     write_body,
     write_meta,
 )
-from backend.free.agent.prompt_utils import (
-    dedupe_paragraphs,
-    restore_protected_sections,
-    validate_protected_sections,
-)
 from backend.io.codec import persisted
 from backend.io.format_registry import FormatSpec, register_format
 from backend.log_config import get_logger
@@ -169,63 +164,6 @@ class AuxPromptManager:
         if task not in self.metas:
             raise ValueError(f"Unknown aux task: {task}")
         return self.metas[task]
-
-    def update_aux_prompt(
-        self,
-        task: str,
-        content: str,
-        fitness: float,
-    ) -> None:
-        """Level 1 進化: 最良候補を採用
-
-        保護セクション（<!-- PROTECTED --> マーカー）が現在のプロンプトに含まれている場合、
-        進化候補がそれを維持しているか検証し、欠落時は強制復元する。
-
-        Args:
-            task: タスク名
-            content: 新しいプロンプト本文
-            fitness: 適応度スコア
-        """
-        if task not in self.TASKS:
-            raise ValueError(f"Unknown aux task: {task}")
-
-        # 保護セクション最終ゲート
-        from backend.free.agent.prompt_manager import _normalized_equal
-        current = self.contents.get(task, "")
-
-        # 段落レベル重複を最終正規化
-        content = dedupe_paragraphs(content)
-
-        if not validate_protected_sections(current, content):
-            logger.warning(
-                "Evolved aux prompt for %s lost protected sections, force-restoring",
-                task,
-            )
-            content = restore_protected_sections(current, content)
-            content = dedupe_paragraphs(content)
-
-        # 意味的同一性ガード - 正規化後 current と同じなら no-op
-        if _normalized_equal(current, content):
-            logger.warning(
-                "Evolved aux prompt for %s is semantically identical to current "
-                "(fitness=%.3f), skipping update",
-                task, fitness,
-            )
-            return
-
-        self._archive_current(task)
-        write_body(self.prompt_dir, f"aux_{task}", content)
-        self.contents[task] = content
-        meta = self.metas[task]
-        meta.version += 1
-        meta.updated_at = _now()
-        meta.source = "evolution"
-        meta.fitness_score = fitness
-        self._save_meta(task)
-        logger.info(
-            "Aux prompt evolved: task=%s, version=%d, fitness=%.3f",
-            task, meta.version, fitness,
-        )
 
     def update_manual(self, task: str, content: str) -> None:
         """手動編集によるプロンプト更新"""

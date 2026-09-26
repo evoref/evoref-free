@@ -54,7 +54,6 @@ from backend.free.api.chat.chat_recorder import (
     set_turn_rag_meta,
     set_turn_fewshot_ids,
 )
-from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
     SearchPipelineResult,
@@ -1722,7 +1721,7 @@ async def _dispatch_long_form(
     """Meta-Cognitive (long_form) 経路: 長文生成オーケストレータを起動する。
 
     ``output_target`` は create モード時の出力先 (``"file"`` / ``"editor"`` /
-    ``"chat"``) を ``stream_long_form`` / ``sync_long_form`` に伝播する。
+    ``"chat"``) を ``stream_long_form`` に伝播する。
     既定 ``"file"`` (チャット応答パス互換)。
 
     create の制作 (staged/longform) は 3a-2 でディスパッチが meta 経路の 1 本に
@@ -2015,8 +2014,7 @@ class _ProductionStageSelector:
     タスクグラフ合成空 (``exit_kind="error"`` + ``notes["fallback"] ==
     "empty_task_graph"``) を返したとき: 要求に作成対象 (パス/言語/成果物の
     種類) が無く、かつ再開ターンでもなければ問い返し (``blocked``、Phase 3b)
-    へ倒す。対象がある / 再開ターンなら従来どおり longform へ委譲する
-    (legacy の ``fallback_factory`` と同じ役目)。
+    へ倒す。対象がある / 再開ターンなら従来どおり longform へ委譲する。
 
     ``force_longform=True`` (outline を持つ様式が選ばれたターン、f_08 §3.1.1)
     は content_type 判定を経ずに longform へ確定する — staged (コード生成)

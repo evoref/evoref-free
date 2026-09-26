@@ -3,7 +3,7 @@
 含まれるシンボル:
 
 - 計測ヘルパー : :func:`_timed` / :func:`_timed_task`
-- pillar 内の個別 ``_init_*`` ヘルパー (LLM / 埋め込み / リランカー /
+- pillar 内の個別 ``_init_*`` ヘルパー (LLM / 埋め込み /
   カートリッジ / 学習サイクル / Pro Learn 注入 / テーマ /
   model state / エディションダウングレード)
 - pillar build エントリポイント : :func:`_build_base_context` /
@@ -12,12 +12,6 @@
   :func:`_build_loop_pillar` / :func:`_finalize_base`
 - DI トップレベル : :class:`_LifespanContext` / :class:`_BaseContext` /
   :func:`wire_pillars`
-
-純粋な move であり、関数本体・引数・default 値は変更していない。
-``_build_base_context`` のみ ``_init_config`` / ``_init_logging`` /
-``_init_i18n`` / ``_init_local_dirs`` を ``backend.app_factory`` から
-lazy import する (循環 import 回避)。PR3 で ``_bootstrap.py`` に分離後、
-top-level import に置換される予定。
 """
 
 from __future__ import annotations
@@ -970,13 +964,8 @@ def _init_judge_tracker(state: AppState) -> None:
     """
     from backend.free.rag.judge_usage_tracker import JudgeUsageTracker
     state.judge_tracker = JudgeUsageTracker()
-    # conflict_chat_judge のセッション内発火上限用に別インスタンスを生成
-    # (RAG 判定とカウントを混在させない)。
-    state.conflict_judge_tracker = JudgeUsageTracker()
 
-    logger.info(
-        "JudgeUsageTracker initialized (self_rag + conflict_chat_judge)",
-    )
+    logger.info("JudgeUsageTracker initialized (self_rag)")
 
 
 def _init_sleep_time_worker(
@@ -1184,7 +1173,7 @@ def _init_learning_scheduler(
 
     # 7f-1c. GenerationParamEvolver (Level 1 phase6)
     # 進化したデルタは config.get_generation_params() が読む
-    # ``local_paths.generation_deltas_file`` (base モデルパーティション配下) に
+    # ``generation_deltas_file`` (base モデルパーティション配下) に
     # 永続化される (reader と同一の resolve_learning 経由)。
     from backend.free.learning.generation_param_evolver import GenerationParamEvolver
 
@@ -1724,7 +1713,7 @@ def _wire_write_intent_gate(
 
 
 def _agent_trace_dir() -> Path | None:
-    """MDP トレース常設ストアのディレクトリ (``local_paths.agent_trace_dir``)。"""
+    """MDP トレース常設ストアのディレクトリ (``agent_trace_dir``)。"""
     try:
         from backend.config import get_path_resolver
         return get_path_resolver().resolve_local("agent_trace_dir")
@@ -2005,10 +1994,10 @@ class _BaseContext:
 
 
 def _log_gpu_cpu_placement(cfg: dict[str, Any], project_root: Path) -> None:
-    """llama-server 4 モデルの GPU/CPU 配置と推定 VRAM 合計を INFO に出力する
+    """llama-server 群の GPU/CPU 配置と推定 VRAM 合計を INFO に出力する
 
-    `scripts/launch_llama.py` の推定ロジックを流用し、ベース / 補助タスク /
-    埋め込み / リランカーの ``-ngl`` と GGUF ファイルサイズから使用 VRAM を
+    `scripts/launch_llama.py` の推定ロジックを流用し、ベース /
+    埋め込みの ``-ngl`` と GGUF ファイルサイズから使用 VRAM を
     見積もる。``runtime.total_vram_budget_mb`` が設定されている場合は予算と
     合算値を比較し、超過時に WARNING ログを出力する (起動はブロックしない。
     ブロック挙動は launch_llama.py --all 側に限定)。
@@ -2185,13 +2174,11 @@ async def _build_gen_pillar(
 async def _build_mem_pillar(
     state: AppState,
     base: _BaseContext,
-    gen: "GenPillar",  # noqa: ARG001
     timings: dict[str, float],
 ) -> "MemPillar":
     """EvorefMem pillar を構築する (memory + cartridge + sleep-time + bootstrap)。
 
-    依存方向: Mem は最下流だが、SleepTimeWorker は Gen の embedder / aux_client
-    に依存するため ``gen`` を受け取る。SemMem への書込は MemFactView 経由、
+    依存方向: Mem は最下流。SemMem への書込は MemFactView 経由、
     他 pillar (Loop/Learn) からは Fact View 経由でのみアクセスされる。
     """
     from backend.factory._memory_init import (
@@ -2274,7 +2261,7 @@ def _build_gen_pillar_retrieval(
 
 
 def _wire_fewshot_pool_to_sleep_worker(
-    state: AppState, learning_scheduler: Any, mem: "MemPillar",
+    learning_scheduler: Any, mem: "MemPillar",
 ) -> None:
     """FewShotPool を SleepTimeWorker へ後付けする (構築順の都合)。
 
@@ -2401,7 +2388,7 @@ async def _build_learn_pillar(
     # 候補にならない (STM ノートが embed 工程を通るまで注入対象にならないのと
     # 同じ契約)。
     if not learning_disabled:
-        _wire_fewshot_pool_to_sleep_worker(state, learning_scheduler, mem)
+        _wire_fewshot_pool_to_sleep_worker(learning_scheduler, mem)
     else:
         logger.info("FewShotPool wiring skipped (learning disabled)")
 
@@ -2474,7 +2461,6 @@ def _build_loop_pillar(
     state: AppState,
     base: _BaseContext,
     gen: "GenPillar",
-    mem: "MemPillar",  # noqa: ARG001
     learn: "LearnPillar",
     timings: dict[str, float],
 ) -> "LoopPillar":
@@ -2760,7 +2746,7 @@ async def wire_pillars(
     with _timed(timings, "learning_partition"):
         _activate_learning_partition(base, state)
 
-    # Gen pillar (core): LLM / 埋め込み / リランカー + Pro Gen 拡張 + Develop Gen 拡張
+    # Gen pillar (core): LLM / 埋め込み + Pro Gen 拡張 + Develop Gen 拡張
     with _timed(timings, "pillar_gen"):
         gen, pro_shutdown, develop_shutdown = await _build_gen_pillar(
             state, base, project_root, timings,
@@ -2772,7 +2758,7 @@ async def wire_pillars(
     # async run_reindex を呼ぶため、_build_mem_pillar 自体が async。
     mem = await _timed_task(
         timings, "pillar_mem",
-        _build_mem_pillar(state, base, gen, timings),
+        _build_mem_pillar(state, base, timings),
     )
     state.mem = mem
 
@@ -2799,7 +2785,7 @@ async def wire_pillars(
     # Loop pillar: tools / agent tracer
     with _timed(timings, "pillar_loop"):
         loop_pillar = _build_loop_pillar(
-            state, base, gen, mem, learn, timings,
+            state, base, gen, learn, timings,
         )
         state.loop = loop_pillar
 

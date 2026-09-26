@@ -29,7 +29,6 @@ from backend.trace_context import get_trace_id
 from backend.utils import format_utc, utc_now_dt
 
 if TYPE_CHECKING:
-    from backend.free.memory.stores.working import WorkingMemory
     from backend.free.learning.level0_instant import GenerationConfigRef
 
 logger = get_logger("api.chat.recorder")
@@ -42,7 +41,7 @@ def read_llama_prompt_tokens(state: AppState) -> tuple[int | None, int | None]:
     """直近ストリームの ``(prompt_tokens, cached_prompt_tokens)`` を返す。
 
     llama-server の ``usage.prompt_tokens_details.cached_tokens`` を
-    :class:`~backend.free.llm.local_client.LocalLLMClient` が ``_last_timings``
+    :class:`~backend.free.llm.local_client.LocalClient` が ``_last_timings``
     (``prompt_n`` = 再評価分 / ``cache_n`` = 再利用分) へ畳んでいる。
     ``prompt_tokens`` はその合計。
 
@@ -679,12 +678,9 @@ def end_session(state: AppState, session_id: str) -> bool:
             mgr.close_session(session_id)
         except Exception as exc:
             logger.warning("Failed to close history session %s: %s", session_id, exc)
-    for tracker in (
-        getattr(state, "judge_tracker", None),
-        getattr(state, "conflict_judge_tracker", None),
-    ):
-        if tracker is not None:
-            tracker.reset_session(session_id)
+    tracker = getattr(state, "judge_tracker", None)
+    if tracker is not None:
+        tracker.reset_session(session_id)
     return dropped
 
 

@@ -17,7 +17,7 @@ evoref = "evoref_cli:main"
 py-modules = ["evoref_cli"]
 
 # version SSOT は backend/free/__version__.py
-# 一括 bump は `python scripts/bump_version.py <new-version>` 経由。
+# bump は `python scripts/bump_version.py <new-version> --edition free` 経由。
 [tool.setuptools.dynamic]
 version = { attr = "backend.free.__version__.__version__" }
 

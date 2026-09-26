@@ -71,9 +71,6 @@ VALID_TASK_STATUSES: frozenset[str] = frozenset(
 )
 """許可される task status (TaskStatus Literal と同期)"""
 
-TERMINAL_TASK_STATUSES: frozenset[str] = frozenset({"done", "failed"})
-"""ライフサイクル終端ステータス"""
-
 
 TaskStage = Literal["spec", "code", "test"]
 """staged クリエイトパイプラインの工程種別 (spec→code→test)。
@@ -130,9 +127,6 @@ class TaskFactView:
     created_at: float
     accessed_at: float
     stage: TaskStage | None = None
-
-    def is_terminal(self) -> bool:
-        return self.status in TERMINAL_TASK_STATUSES
 
 
 # ──────────────────────────────────────────────────────────────────────────

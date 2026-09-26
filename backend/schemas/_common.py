@@ -42,8 +42,8 @@ class RuntimeConfig(BaseModel):
     llama-server バイナリのバージョン要件を表現する。
 
     - ``total_vram_budget_mb``: VRAM 予算検査のソフト上限 (MB)
-      ``scripts/launch_llama.py --all`` が本値を参照し、ベース / 補助タスク /
-      埋め込み / リランカーの GPU レイヤ推定 VRAM 合計がこの値を超える場合に
+      ``scripts/launch_llama.py --all`` が本値を参照し、ベース /
+      埋め込みの GPU レイヤ推定 VRAM 合計がこの値を超える場合に
       警告を出して起動を中断する (``--force`` で強制起動可能)。
       None の場合は検査を行わない (従来挙動と同じ)。
     - ``min_llamacpp_build``: 起動時に確認する llama-server の

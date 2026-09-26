@@ -813,10 +813,6 @@ class EvidenceStore:
         """active snapshot 以後に ``put`` された (次の snapshot までベクトル検索外の) id。"""
         return list(self._tail_ids)
 
-    def iter_pending(self) -> Iterator[Evidence]:
-        """snapshot 以後に追加・更新されたレコード (オーバーレイ) を列挙する。"""
-        return iter(list(self._overlay.values()))
-
     def get(self, record_id: str) -> Evidence | None:
         """id でレコードを引く (オーバーレイ優先)。"""
         record = self._overlay.get(record_id)
@@ -1942,17 +1938,6 @@ class EvidenceStore:
             names, query, top_k,
             budget_ms=self._lexical_budget_ms(),
             row_mask=row_mask,
-        )
-
-    def _write_lexical_index(
-        self, directory: Path, records: Sequence[Evidence],
-    ) -> int:
-        """版ディレクトリへ転置索引の pack を書く (:func:`write_lexical_index`)。"""
-        return write_lexical_index(
-            directory, records,
-            shard_key_for=self.shard_key_for,
-            builder=self._lexical_builder(),
-            lexical_version=int(self.manifest.lexical_version),
         )
 
     # ── 検索 (c_16 §6.3 + §7.1〜7.3) ──

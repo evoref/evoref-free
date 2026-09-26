@@ -212,8 +212,6 @@ export interface DashboardRagStats {
 	sourceCount: number;
 	/** チャンク分割戦略（semantic 等） */
 	chunkingStrategy: string;
-	/** BM25 + ベクトルのハイブリッド検索が有効か */
-	/** スコア融合手法（rrf 等） */
 	/** 埋め込み次元と保存済みストアの次元が不一致 */
 	embeddingDimMismatch: boolean;
 	embeddingDimStored: number | null;

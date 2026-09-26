@@ -101,15 +101,6 @@ async def _emit_long_form_init_steps(
     })
 
 
-async def _flush_step_queue_to_sse(
-    step_queue: list[dict],
-) -> AsyncIterator[str]:
-    """`step_queue` の蓄積フレームを順次 yield して空にする。"""
-    while step_queue:
-        step_data = step_queue.pop(0)
-        yield sse.step(step_data)
-
-
 async def _flush_step_queue_split_aware(
     step_queue: list[dict],
     *,
@@ -124,9 +115,7 @@ async def _flush_step_queue_split_aware(
 
     ``long_form_unit_file`` イベントを per-unit ファイル書込みに変換し、
     結果を ``written`` リストに追記する。それ以外のイベントは
-    :func:`_flush_step_queue_to_sse` と同じく SSE フレームとして yield する。
-
-    SPLIT 以外のモードでは ``_flush_step_queue_to_sse`` と完全等価に動作する。
+    SSE フレームとして yield する。
     """
     while step_queue:
         step_data = step_queue.pop(0)

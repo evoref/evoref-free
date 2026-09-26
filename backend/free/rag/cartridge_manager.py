@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.agent.learned_patterns import LearnedPatternStore
     from backend.free.rag.embedding_backend import EmbeddingBackend
-    from backend.free.rag.vector_store import VectorStore
 
 logger = get_logger("rag.cartridge_manager")
 
@@ -302,17 +301,6 @@ class CartridgeManager:
 
     def language_overlay(self) -> LanguageOverlay:
         return self._corpus.language_overlay()
-
-    def get_loaded_stores(self) -> dict[str, "VectorStore"]:
-        """空 dict を返す (corpus パッケージは不変なので追記対象が無い)。
-
-        旧実装はここでカートリッジの ``VectorStore`` を返し、sleep-time の
-        contextual prefix 生成 (step 5.8) がチャンクへプレフィックスを **書き
-        戻して** いた。corpus は「版が履歴そのもので、内容は不変」(c_16 §2.1)
-        なので、稼働中のパッケージへ書き戻す経路は持たない。プレフィックスを
-        付けたければ作成側 (Pro のパッケージ作成) が docs に入れる。
-        """
-        return {}
 
     def check_dimension_consistency(self, embedder_dim: int) -> list[str]:
         """埋め込み次元が現在のモデルと違うパッケージを検索対象から外す。"""

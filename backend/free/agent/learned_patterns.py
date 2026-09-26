@@ -350,21 +350,6 @@ class LearnedPatternStore:
         self._last_decay_at = current
         return self.decay_all()
 
-    def decrement_source_count(self, keyword: str) -> None:
-        """パターンの source_count を減算する（カートリッジ unload 用）
-
-        source_count が 0 になったパターンは削除する。
-        """
-        key = keyword.lower()
-        if key not in self._patterns:
-            return
-        pattern = self._patterns[key]
-        pattern.source_count -= 1
-        self._dirty = True
-        if pattern.source_count <= 0:
-            del self._patterns[key]
-            logger.debug("Removed pattern '%s' (source_count=0)", key)
-
     def extract_intent_keywords(self, text: str) -> list[str]:
         """テキストから意図キーワードを抽出する（LLM 不要）
 

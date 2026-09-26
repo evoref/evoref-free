@@ -147,7 +147,6 @@
 		gap: 0.5rem;
 		flex-wrap: wrap;
 	}
-	.state,
 	.note {
 		font-size: 0.8rem;
 		color: var(--text-secondary, #555);
