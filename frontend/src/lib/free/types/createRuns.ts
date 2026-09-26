@@ -1,7 +1,15 @@
 /** staged クリエイト run の型定義 (再接続 API、f_05 §4.5 / f_10 §7) */
 
 /** 表示状態 (`derive_run_status` が読み出し時に導出。永続はしない) */
-export type CreateRunStatus = 'working' | 'needs_input' | 'done' | 'failed' | 'cancelled' | 'timeout';
+/** `incomplete` は流れたが欠けた run (`exit_kind=done` かつ `tasks_failed > 0`) */
+export type CreateRunStatus =
+	| 'working'
+	| 'needs_input'
+	| 'done'
+	| 'incomplete'
+	| 'failed'
+	| 'cancelled'
+	| 'timeout';
 
 /** `GET /api/create/runs` / `GET /api/create/runs/{run_id}` の 1 件 */
 export interface CreateRunSummary {
@@ -16,6 +24,8 @@ export interface CreateRunSummary {
 	activity_state: string;
 	exit_kind: string | null;
 	last_event_seq: number;
+	/** 流れた上で欠けたもの (失敗タスク / 未生成 / 落ちた契約テスト) の件数 */
+	tasks_failed?: number;
 	status: CreateRunStatus;
 	/** `status === 'needs_input'` のときの問い */
 	question?: string;

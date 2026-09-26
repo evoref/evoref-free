@@ -14,6 +14,7 @@ import {
 	listCreateRuns
 } from '$lib/free/api/createRuns';
 import { eventToStep } from '$lib/free/api/sse_progress';
+import type { CreateRunStatus } from '$lib/free/types/createRuns';
 import { createPoller, type Poller } from '$lib/free/stores/_polling';
 import { activeCreateRun, clearActiveCreateRun } from '$lib/free/stores/createRun';
 import {
@@ -60,10 +61,23 @@ export async function reattachCreateRun(): Promise<void> {
 		return; // 次ターンで再開するので stored は残す
 	}
 
-	// done | failed | cancelled | timeout
+	// done | incomplete | failed | cancelled | timeout
 	await deliverArtifacts(run.run_id);
+	noteUnfinished(run.status);
 	isStreaming.set(false);
 	clearActiveCreateRun();
+}
+
+/** 完了していない終端 (未完了 / 異常終了 / 中止 / 時間切れ) を伝える。
+ * 成果物だけを黙って届けると完了したように見える (f_10 §7、2026-09-26)。 */
+function noteUnfinished(status: CreateRunStatus): void {
+	if (status === 'done' || status === 'working' || status === 'needs_input') return;
+	addMessage({
+		id: nextMessageId(),
+		role: 'assistant',
+		content: get(t)(`chat.create_run_unfinished.${status}`),
+		timestamp: Date.now()
+	});
 }
 
 function showNeedsInput(question: string | undefined): void {
@@ -111,8 +125,9 @@ async function beginReconnect(sessionIdValue: string, runId: string): Promise<vo
 				return;
 			}
 
-			// done | failed | cancelled | timeout
+			// done | incomplete | failed | cancelled | timeout
 			await deliverArtifacts(runId);
+			noteUnfinished(current.status);
 			isStreaming.set(false);
 			clearActiveCreateRun();
 		} catch {

@@ -3,7 +3,7 @@
  *
  * `localStorage['evoref.create.session']` へ永続する。読み書きは try/catch
  * (private window 等で失敗しても動作は変えない、`corpusMode` と同じ作法)。
- * `create_run` SSE フレーム受信時に set し、run が終端 (`done|failed|cancelled|timeout`)
+ * `create_run` SSE フレーム受信時に set し、run が終端 (`done|incomplete|failed|cancelled|timeout`)
  * に達したら clear する。`needs_input` は次ターンで再開するため clear しない。
  */
 import { writable } from 'svelte/store';

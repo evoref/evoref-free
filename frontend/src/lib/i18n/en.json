@@ -51,6 +51,12 @@
 		"step_marker_failed": "✗",
 		"step_marker_needs_input": "?",
 		"create_reattached": "Reconnected to the previous creation run. Restoring progress…",
+		"create_run_unfinished": {
+			"incomplete": "The creation did not complete: some generation or verification steps failed. Please review the delivered artifacts.",
+			"failed": "The creation ended abnormally. The delivered artifacts may be partial.",
+			"cancelled": "The creation was cancelled. Delivering the partial artifacts.",
+			"timeout": "The creation hit its time limit. Delivering the partial artifacts."
+		},
 		"stream_timeout": "Response timed out",
 		"cancel": "Cancel",
 		"cancelled": "Generation cancelled",

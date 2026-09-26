@@ -112,11 +112,12 @@ class RunRecorder(Protocol):
         """生成物の途中経過 / 確定本文を ``src/<path>`` へ書き戻す。"""
         ...
 
-    def finish(self, exit_kind: str, *, template: str = "") -> None:
+    def finish(self, exit_kind: str, *, template: str = "", tasks_failed: int = 0) -> None:
         """run 終端を記録する (``done`` / ``cancelled`` / ``error`` 等)。
 
         ``template`` は構成テンプレートで seed した場合の来歴鍵 (c_05 §0.6)。
-        seed していない run は既定の空文字のまま。
+        seed していない run は既定の空文字のまま。``tasks_failed`` は流れた上で
+        欠けたものの件数 (f_10 §7。1 以上なら ``incomplete`` と導出される)。
         """
         ...
 

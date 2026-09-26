@@ -30,6 +30,7 @@ from backend.i18n_helper import msg
 from backend.utils import estimate_tokens as _estimate_tokens
 
 from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
+from backend.free.api.chat.turn_admission import current_admission
 from backend.free.api.chat.chat_stream_common import (
     agent_layer_frame,
     cancel_requested,
@@ -486,6 +487,11 @@ async def stream_meta_cognitive(
             if timer:
                 timer.start("llm_total_ms")
             agent_task = asyncio.create_task(run_agent())
+            # 受付の解除をこのタスクの終わりまで遅らせる (detached で完走する
+            # 制作の間、次の create を断る。f_10 §3「制作中のターン受付」)。
+            admission = current_admission()
+            if admission is not None:
+                admission.bind_task(agent_task)
 
             async for frame in _drain_meta_cognitive_steps(
                 step_queue, session_id, keepalive_interval, agent_task,

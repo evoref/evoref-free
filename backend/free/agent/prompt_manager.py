@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -408,6 +410,12 @@ Make only the requested change. Do not mix in refactoring, renaming, or rewrites
 }
 
 
+#: レンダを凍結しておくセッション数の上限 (f_03 §7.1.3 #1)。他のセッション台帳
+#: (tool_ledger / feedback の ``MAX_SESSIONS``) と同じ桁。追い出されたセッションは
+#: 次のターンで現行版を引き直すだけで、壊れはしない。
+_FROZEN_RENDER_MAX_SESSIONS = 16
+
+
 class SystemPromptManager:
     """モード別システムプロンプトの管理（本文 .md + メタ .meta.json）"""
 
@@ -425,6 +433,11 @@ class SystemPromptManager:
         # None の場合は従来の meta.candidates (進化凍結) を使う。
         self._fewshot_selector: FewShotSelector | None = None
         self._fewshot_k: int = 3
+        #: ``(session_id, mode) -> (静的 system, その版, 応答言語)``。セッション開始時の
+        #: レンダを持ち続け、進化の採用がセッション途中で接頭辞 KV を壊さない
+        #: ようにする (f_03 §7.1.3 #1)。採用は背景タスクから来るので鍵を掛ける。
+        self._frozen: OrderedDict[tuple[str, str], tuple[str, int, str]] = OrderedDict()
+        self._frozen_lock = threading.Lock()
         self._load_all()
 
     def set_fewshot_selector(
@@ -444,6 +457,8 @@ class SystemPromptManager:
         self.prompt_dir = prompt_dir
         self.contents = {}
         self.metas = {}
+        # 旧パーティションの本文を新モデルのセッションへ持ち越さない
+        self._drop_frozen()
         self._load_all()
 
     def _current_locale(self) -> str:
@@ -607,15 +622,56 @@ class SystemPromptManager:
             return body
         return restore_protected_sections(default_body, body)
 
-    def get_prompt_static(self, mode: str) -> str:
+    def get_prompt_static(self, mode: str, session_id: str | None = None) -> str:
         """インスタンス名プレフィックス + 本文のみ (few-shot を含まない静的 system)。
 
         query 非依存なので連続リクエスト間で安定し、llama-server の prefix KV
         キャッシュが効く。few-shot は ``get_fewshot_block`` で別途取得し、推論時に
         最後の user メッセージへ前置する (build_messages 側)。
+
+        ``session_id`` を渡すと、そのセッションのそのモードで最初にレンダした
+        本文を返し続ける (f_03 §7.1.3 #1)。進化の採用は次のセッションから効く。
         """
         if mode not in self.contents:
             raise ValueError(f"Unknown mode: {mode}")
+        if not session_id:
+            return self._render_static(mode)
+        key = (session_id, mode)
+        # 応答言語の指示もレンダに入るので、言語が変わった凍結は使わない
+        # (config 側の切替でも ``ensure_static_directives`` が別言語の指示を
+        # 継ぎ足して 2 言語が混ざる)。言語の切替は即時に効かせる (§7.1.3 #1)。
+        locale = self._current_locale()
+        with self._frozen_lock:
+            hit = self._frozen.get(key)
+            if hit is not None and hit[2] == locale:
+                self._frozen.move_to_end(key)
+                return hit[0]
+        version = self.metas[mode].version
+        text = self._render_static(mode)
+        with self._frozen_lock:
+            self._frozen[key] = (text, version, locale)
+            while len(self._frozen) > _FROZEN_RENDER_MAX_SESSIONS * len(self.MODES):
+                self._frozen.popitem(last=False)
+        return text
+
+    def frozen_version(self, mode: str, session_id: str) -> int | None:
+        """そのセッションが凍結している本文の版 (凍結していなければ ``None``)。
+
+        経験の ``gen_config.prompt_version`` はこれを刻む — 記録時点の現行版を
+        刻むと、採用後も旧版で話し続けるセッションのターンが新しい版に帰属する
+        (f_04 §4.5 の採用後監視が版で窓を切る)。
+        """
+        with self._frozen_lock:
+            hit = self._frozen.get((session_id, mode))
+        return hit[1] if hit is not None else None
+
+    def _drop_frozen(self) -> None:
+        """凍結を全て破棄する (ユーザー操作とモデル切替は即時に効かせる)。"""
+        with self._frozen_lock:
+            self._frozen.clear()
+
+    def _render_static(self, mode: str) -> str:
+        """現行の台帳から静的 system をレンダする (凍結を通さない)。"""
         locale = self._get_prompt_locale(mode)
         template = _PREFIX_TEMPLATES.get(locale, _PREFIX_TEMPLATES["ja"])
         prefix = template.format(name=self.instance_name)
@@ -752,6 +808,7 @@ class SystemPromptManager:
         meta.fitness = None
         meta.candidates = []
         self._save_meta(mode)
+        self._drop_frozen()
         logger.info("Manual update: mode=%s, version=%d", mode, meta.version)
 
     def update_evolved(
@@ -839,6 +896,7 @@ class SystemPromptManager:
         meta.updated_at = _now()
         meta.source = "manual"
         self._save_meta(mode)
+        self._drop_frozen()
         logger.info("Reloaded from disk: mode=%s", mode)
 
     def get_history(self, mode: str) -> list[dict]:
@@ -863,6 +921,8 @@ class SystemPromptManager:
         meta.fitness = None
         meta.candidates = []
         self._save_meta(mode)
+        # 手動 / 採用後監視の自動のどちらでも即時 (悪化を検出した版で話し続けない)
+        self._drop_frozen()
         logger.info("Rollback: mode=%s to v%03d, new version=%d",
                      mode, version, meta.version)
 
@@ -914,6 +974,8 @@ class SystemPromptManager:
                 mode, new_locale, new_meta.version,
             )
 
+        # ユーザー操作なので現在の会話にも即時に効かせる (f_03 §7.1.3 #1)
+        self._drop_frozen()
         return result
 
     def _archive_current(self, mode: str) -> None:

@@ -1061,8 +1061,14 @@ class LongFormOrchestrator:
         validation_errors: int,
         total_tokens: int,
         elapsed: float,
+        *,
+        timed_out: bool = False,
     ) -> None:
-        """完了ログ + `last_metrics` 保存 (FeedbackCollector 用)"""
+        """完了ログ + `last_metrics` 保存 (FeedbackCollector 用)
+
+        ``timed_out`` は総時間上限でユニットを打ち切ったか。harness が run の
+        ``exit_kind`` を ``timeout`` にするのに使う (f_10 §7、2026-09-26)。
+        """
         context_size = self._effective_context_size()
         logger.info(
             "Long-form generation complete: strategy=%s, content_type=%s, "
@@ -1083,6 +1089,7 @@ class LongFormOrchestrator:
             # イベントと同じ条件 (9.7、この関数の直前) — 選ばれただけで
             # seed しなかったターンは空文字のまま。
             "template": self._seed_template_key or "",
+            "timed_out": bool(timed_out),
         }
 
     async def generate(
@@ -1446,6 +1453,7 @@ class LongFormOrchestrator:
         self._record_final_metrics(
             content_type, plan, units_completed,
             validation_errors, total_tokens, elapsed,
+            timed_out=timed_out,
         )
 
     async def _gather_context(

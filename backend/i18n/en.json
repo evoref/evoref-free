@@ -612,7 +612,9 @@
       "disabled": "Widget proxy is disabled. Set widget_proxy.enabled to true in config.yaml."
     },
     "chat": {
-      "stream_failed": "Failed to generate a response. The inference server may have stopped or the stream was cut off. Please wait a moment and try again."
+      "stream_failed": "Failed to generate a response. The inference server may have stopped or the stream was cut off. Please wait a moment and try again.",
+      "turn_busy_create": "Another creation is still running, so a new one cannot start. Wait for it to finish or stop it, then send again.",
+      "turn_busy_session": "The previous turn in this session is still running. Wait for it to finish, then send again."
     },
     "access": {
       "host_not_allowed": "This request came through an address that is not allowed. Open evoref from http://localhost or http://127.0.0.1.",

@@ -98,14 +98,14 @@ def _base_notes(recorder: "RunRecorder | None", run_id: str) -> dict[str, str]:
 
 
 def _finish_recorder(
-    recorder: "RunRecorder", exit_kind: str, *, template: str = "",
+    recorder: "RunRecorder", exit_kind: str, *, template: str = "", tasks_failed: int = 0,
 ) -> None:
     """run 終端を記録する (失敗しても生成結果は返す)。
 
     ``template`` は構成テンプレートで seed した場合の来歴鍵 (c_05 §0.6)。
     """
     try:
-        recorder.finish(exit_kind, template=template)
+        recorder.finish(exit_kind, template=template, tasks_failed=tasks_failed)
     except Exception as exc:  # noqa: BLE001 - 後始末の失敗で応答は壊さない
         logger.warning("longform run recorder finish(%s) failed: %s", exit_kind, exc)
 
@@ -282,9 +282,20 @@ class LongFormHarness:
             notes["error"] = str(exc)
             return ProductionResult(exit_kind="error", notes=notes)
         await _drain()
+        # 総時間で打ち切ったなら「予算で止まり未完了が残った」= timeout (f_10 §7)。
+        # 以前は done と記録し、meta の報告も「完了」だった (2026-09-26)。
+        final_metrics = getattr(orchestrator, "last_metrics", None)
+        if (
+            exit_kind == "done" and isinstance(final_metrics, dict)
+            and final_metrics.get("timed_out") is True
+        ):
+            exit_kind = "timeout"
 
         content_type = getattr(orchestrator, "last_content_type", None)
         artifacts: list[EditorArtifact] = []
+        #: リペア後も残った CODE の検証エラー (構文 / 整合 / import スモーク)。
+        #: 配信はするが未完了として数える (f_08 §2.3、2026-09-26)。
+        unresolved: list[str] = []
         if content_type == "code":
             files = orchestrator.last_code_files or (
                 {"output.py": orchestrator.last_code_output}
@@ -298,9 +309,8 @@ class LongFormHarness:
             # 「壊れたコードを成功として渡さない」: リペア後も残った検証エラーが
             # あれば best-effort で成果物を返しつつ未解決エラーを可視化する。
             if artifacts and orchestrator.last_validation_errors:
-                artifacts.append(
-                    _validation_issues_artifact(orchestrator.last_validation_errors),
-                )
+                unresolved = list(orchestrator.last_validation_errors)
+                artifacts.append(_validation_issues_artifact(unresolved))
             if recorder is not None:
                 _write_final_files(recorder, files)
         else:
@@ -315,11 +325,16 @@ class LongFormHarness:
 
         if recorder is not None:
             template = str(getattr(orchestrator, "last_metrics", {}).get("template") or "")
-            _finish_recorder(recorder, exit_kind, template=template)
+            _finish_recorder(
+                recorder, exit_kind, template=template, tasks_failed=1 if unresolved else 0,
+            )
 
+        notes = _base_notes(recorder, run_id)
+        if unresolved:
+            notes["validation_errors"] = len(unresolved)
         return ProductionResult(
             artifacts=artifacts,
             exit_kind=exit_kind,
             metrics=dict(getattr(orchestrator, "last_metrics", {}) or {}),
-            notes=_base_notes(recorder, run_id),
+            notes=notes,
         )

@@ -1004,7 +1004,13 @@ def _active_gen_config(
     )
     if pm is not None:
         try:
-            ref.prompt_version = int(pm.get_meta(mode).version)
+            # このセッションが凍結している版 (f_03 §7.1.3 #1)。記録時点の現行版を
+            # 刻むと、採用後も旧版で話し続けるターンが新しい版に帰属する。
+            frozen = getattr(pm, "frozen_version", None)
+            version = frozen(mode, session_id) if (frozen and session_id) else None
+            if not isinstance(version, int):
+                version = pm.get_meta(mode).version
+            ref.prompt_version = int(version)
         except Exception:
             pass
     # 実際に注入した例だけを刻む (以前はプール全体で、読み手は無かった)。

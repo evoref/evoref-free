@@ -99,13 +99,21 @@ def _finish_run_safely(
     run_store: "RunRecordStore | None",
     event_log: "RunEventLog | None",
     exit_kind: str,
+    *,
+    tasks_failed: int = 0,
 ) -> None:
-    """run.json の終端書込み (失敗しても配信を止めない)。"""
+    """run.json の終端書込み (失敗しても配信を止めない)。
+
+    ``tasks_failed`` は流れた上で欠けたものの件数 (f_10 §7)。``exit_kind=done``
+    のままでも 1 以上なら読み出し時に ``incomplete`` と導出される。
+    """
     if run_store is None:
         return
     try:
         last_seq = event_log.last_seq if event_log is not None else -1
-        run_store.finish(exit_kind, last_event_seq=max(0, last_seq))
+        run_store.finish(
+            exit_kind, last_event_seq=max(0, last_seq), tasks_failed=tasks_failed,
+        )
     except Exception as exc:  # noqa: BLE001 - 後始末の失敗で応答を壊さない
         logger.warning("staged run record finish(%s) failed: %s", exit_kind, exc)
 
@@ -845,7 +853,9 @@ async def run_staged_pipeline(
     else:
         # legacy と同じ終端書込み (無いと run.json が running のまま残り、
         # Step 5.89 の GC 対象から外れ続ける — 2026-09-18 実機)。
-        _finish_run_safely(run_store, event_log, exit_kind)
+        _finish_run_safely(
+            run_store, event_log, exit_kind, tasks_failed=checks.tasks_failed,
+        )
 
     spec_md = ws.read_spec()
     flowchart_md = ws.read_flowchart() if spec_md else None
