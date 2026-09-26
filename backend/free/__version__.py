@@ -13,6 +13,6 @@ Free と Pro のバージョンは独立して管理する。
 
 from __future__ import annotations
 
-__version__ = "0.0.101"
+__version__ = "0.0.102"
 DATA_GENERATION = 1
 __build__ = "dev"

@@ -226,7 +226,19 @@ class ChatTurnLease:
         self._released = False
         self._handed_over = False
         self._expiry: asyncio.TimerHandle | None = None
+        self._on_release: list[Callable[[], None]] = []
         _acquire()
+
+    def on_release(self, callback: Callable[[], None]) -> None:
+        """ターンの終わり (解放) で 1 回呼ぶ処理を登録する (解放済みなら即時)。
+
+        解放の 3 経路 (同期応答の返却 / ストリームの終わり / 始まらなかった
+        ストリームの猶予切れ) を 1 か所で拾うための口。
+        """
+        if self._released:
+            callback()
+            return
+        self._on_release.append(callback)
 
     @property
     def handed_over(self) -> bool:
@@ -263,6 +275,12 @@ class ChatTurnLease:
         self._released = True
         self.stream_started()
         _release()
+        callbacks, self._on_release = self._on_release, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:  # noqa: BLE001 - 後始末の失敗で解放を止めない
+                logger.warning("Chat turn lease release callback failed: %s", exc)
 
 
 _turn_lease: ContextVar[ChatTurnLease | None] = ContextVar(

@@ -203,9 +203,14 @@ _WRITE_REJECTION_RE = re.compile(r"invalid output \(([a-z_]+)\)")
 # 「書き込みが実行されませんでした」と区別して、書いたファイルと未完了の理由を伝える。
 _PARTIAL_WRITE_RE = re.compile(
     r"production stage incomplete \((?P<reason>.+?)\)"
-    r"(?:; wrote (?P<count>\d+) file\(s\)(?:: (?P<paths>.+))?)?$",
+    r"(?:; (?P<verb>wrote|generated) (?P<count>\d+) file\(s\)(?:: (?P<paths>.+))?)?$",
 )
 _PARTIAL_WRITE_TASKS_FAILED_RE = re.compile(r"(\d+) task\(s\) failed")
+_PARTIAL_WRITE_VALIDATION_RE = re.compile(r"(\d+) validation error\(s\) remain")
+# 一部だけ書けた配信の理由 (``_execute_production_task``、f_10 §7)。
+_PARTIAL_WRITE_FILES_FAILED_RE = re.compile(
+    r"(?P<n>\d+) file\(s\) failed to write: (?P<paths>.+)$",
+)
 
 # 「書くべき本文は会話にある」ことを示す参照表現。既存ファイルがある上書き
 # 依頼でも、この語があるときは既存内容ではなく会話を素材にする

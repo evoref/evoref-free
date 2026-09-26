@@ -51,6 +51,12 @@
 		"step_marker_failed": "✗",
 		"step_marker_needs_input": "？",
 		"create_reattached": "前回の制作に再接続しました。進捗を復元しています…",
+		"create_run_unfinished": {
+			"incomplete": "制作は完了していません。一部の生成・検証が失敗しました。届いた成果物を確認してください。",
+			"failed": "制作は異常終了しました。届いた成果物は途中までの可能性があります。",
+			"cancelled": "制作を中止しました。途中までの成果物を届けています。",
+			"timeout": "制作は時間切れで打ち切られました。途中までの成果物を届けています。"
+		},
 		"stream_timeout": "応答がタイムアウトしました",
 		"cancel": "キャンセル",
 		"cancelled": "生成を中断しました",

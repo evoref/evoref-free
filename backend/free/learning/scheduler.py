@@ -62,6 +62,16 @@ def _parsed_time(value: object) -> datetime:
     return parse_utc(value) or _TIME_MIN  # type: ignore[arg-type]
 
 
+def _prompt_version_of(experience: dict) -> int | None:
+    """経験を生んだシステムプロンプトの版 (``gen_config.prompt_version``。無ければ ``None``)。"""
+    gen_config = experience.get("gen_config")
+    if isinstance(gen_config, dict):
+        version = gen_config.get("prompt_version")
+    else:
+        version = getattr(gen_config, "prompt_version", None)
+    return version if isinstance(version, int) else None
+
+
 #: 後方互換の別名 (実体は ``level0_instant.used_corpus_evidence``)。
 _used_corpus_evidence = used_corpus_evidence
 
@@ -1694,6 +1704,9 @@ class LearningScheduler:
         now = utc_now()
         self._prompt_adoptions[mode] = {
             "rollback_to": int(rollback_to),
+            # 窓はこの版で生まれた経験だけで切る (レンダはセッション単位で凍結
+            # されるので、採用後も旧版のセッションが続く。f_04 §4.5)
+            "adopted_version": int(self.prompt_manager.get_meta(mode).version),
             "baseline": round(baseline, 4) if baseline is not None else None,
             "adopted_at": now,
             "window_since": now,
@@ -1703,7 +1716,8 @@ class LearningScheduler:
     def _check_prompt_adoptions(self, experiences: list[dict]) -> set[str]:
         """採用済みプロンプトの事後監視。悪化していれば rollback する。
 
-        採用後に記録された経験 (``window_since`` より新しい) が
+        採用後に記録された経験 (``window_since`` より新しく、採用した版で生まれた
+        もの — ``gen_config.prompt_version == adopted_version``) が
         ``min_experiences // 2`` 件以上溜まった Level 1 完了を 1 窓と数え、
         :data:`PROMPT_ROLLBACK_WINDOWS` 窓の欠陥率 fitness 平均が採用時基準を
         :data:`PROMPT_ROLLBACK_EPSILON` 超悪化していたら
@@ -1716,9 +1730,12 @@ class LearningScheduler:
         min_samples = max(1, self.min_experiences // 2)
         for mode, rec in list(self._prompt_adoptions.items()):
             since = _parsed_time(rec.get("window_since"))
+            adopted = rec.get("adopted_version")
             new_exp = [
                 e for e in experiences
                 if e.get("mode") == mode and _parsed_time(e.get("timestamp")) > since
+                # ``adopted_version`` の無い旧レコードは時刻だけで切る
+                and (adopted is None or _prompt_version_of(e) == adopted)
             ]
             if len(new_exp) < min_samples:
                 continue

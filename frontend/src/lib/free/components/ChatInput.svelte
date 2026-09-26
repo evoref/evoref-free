@@ -36,6 +36,7 @@
 	import { get } from 'svelte/store';
 	import { themeSlots } from '$lib/free/stores/theme';
 	import { setActiveCreateRun, clearActiveCreateRun } from '$lib/free/stores/createRun';
+	import { reattachCreateRun } from '$lib/free/services/createReattach';
 	import { addToast } from '$lib/free/stores/toast';
 	import { refreshServerStatus, serverState } from '$lib/free/stores/server';
 	import FileUpload from './FileUpload.svelte';
@@ -116,6 +117,8 @@
 	let sawEditorCode = false;
 	/** このターンで needs_input を受信したか (再接続用 run 記録を残すかの判定) */
 	let sawNeedsInput = false;
+	/** 制作中で受け付けられなかったとき (E0409) の走っている run。後始末の後で再接続する */
+	let busyRun: { session_id: string; run_id: string } | null = null;
 
 	/** long_form ユニットステップの detail ("[3/9] GameGrid: 803 tokens") を進捗に分解する */
 	function parseLongFormProgress(detail: string, done: boolean) {
@@ -163,6 +166,7 @@
 		sawPartialEditor = false;
 		sawEditorCode = false;
 		sawNeedsInput = false;
+		busyRun = null;
 		isStreaming.set(true);
 		cancelled = false;
 		abortController = new AbortController();
@@ -255,6 +259,19 @@
 						pushGeneratedEditorCode(event.editor_code);
 					}
 				} else if (event.type === 'error') {
+					// 別の制作が走っていて受け付けられなかった (f_10 §3)。run が分かれば
+					// 後始末の後で再接続し、進捗の表示と中止をそこから行う (f_05 §4.5)。
+					const ctx = event.error_context ?? {};
+					if (
+						event.error_code === 'E0409' &&
+						mode === 'create' &&
+						typeof ctx.session_id === 'string' &&
+						typeof ctx.run_id === 'string' &&
+						ctx.session_id &&
+						ctx.run_id
+					) {
+						busyRun = { session_id: ctx.session_id, run_id: ctx.run_id };
+					}
 					// 内部コードをそのまま画面に出さない。`stream_timeout` は
 					// 実際にユーザーが目にした唯一のケースで、生文字列
 					// `Error: stream_timeout` が本文の代わりに表示されていた
@@ -288,6 +305,11 @@
 			// needs_input で止まった run は次ターンで再開するため残す。
 			if (mode === 'create' && !sawNeedsInput) {
 				clearActiveCreateRun();
+			}
+			if (busyRun) {
+				setActiveCreateRun({ ...busyRun, started_at: new Date().toISOString() });
+				busyRun = null;
+				void reattachCreateRun();
 			}
 		}
 	}

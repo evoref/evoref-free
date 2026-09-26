@@ -852,10 +852,11 @@ async def run_staged_v2_pipeline(
         logger.warning("staged v2: as-built docs persist failed: %s", exc)
     exit_kind = "cancelled" if _is_cancelled() else "timeout" if _remaining() <= 0 and missing else "done"
     _emit_check(event_log, "finalize", {
-        "type": "task_result", "detail": "; ".join(verification), "status": "done",
+        "type": "task_result", "detail": "; ".join(verification),
+        "status": "failed" if tasks_failed else "done",
         "phase_sec": phase_sec,
     })
-    _finish_run_safely(run_store, event_log, exit_kind)
+    _finish_run_safely(run_store, event_log, exit_kind, tasks_failed=tasks_failed)
     logger.info(
         "staged v2 finished: run=%s modules=%d failed=%d phases=%s total=%.1fs",
         run_id, len(code_map), tasks_failed, phase_sec, time.monotonic() - t_start,

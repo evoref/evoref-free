@@ -94,6 +94,7 @@ from backend.free.core.session_mode import (
     canonicalize_session_mode,
     normalize_session_mode,
 )
+from backend.free.api.chat.turn_admission import TurnBusy, try_admit
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.agent.deliberative import (
     DeliberativeAgent,
@@ -257,6 +258,52 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:  # noqa: ARG00
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
+def _working_run_id(session_id: str) -> str:
+    """そのセッションで ``working`` な制作 run の id (無ければ空。UI の再接続用)。"""
+    if not session_id:
+        return ""
+    try:
+        from backend.config import get_path_resolver
+        from backend.free.loop.staged.run_record import list_runs
+
+        create_dir = get_path_resolver().resolve_local("create_workspace_dir")
+        for record, status in list_runs(create_dir, session_id):
+            if status == "working":
+                return record.run_id
+    except Exception as exc:  # noqa: BLE001 - 再接続の手掛かりが無いだけで拒否は返す
+        logger.warning("turn admission: working run lookup failed: %s", exc)
+    return ""
+
+
+def _turn_busy(req: ChatRequest, busy: TurnBusy) -> StreamingResponse:
+    """制作中で受け付けないターンの応答 (E0409、f_10 §3「制作中のターン受付」)。
+
+    ``context`` の ``session_id`` / ``run_id`` は走っている側のもので、UI は
+    ``run_id`` があれば再接続 (進捗の表示と中止) へつなぐ (f_05 §4.5)。
+    """
+    from backend.i18n_helper import msg
+
+    key = "error.chat.turn_busy_session" if busy.same_session else "error.chat.turn_busy_create"
+    message = msg(key)
+    context = {"session_id": busy.session_id, "run_id": _working_run_id(busy.session_id)}
+    logger.info(
+        "Chat turn refused: a %s turn is running (session=%s, same_session=%s)",
+        busy.mode, busy.session_id, busy.same_session,
+    )
+    if req.stream:
+        sse = SSEFrameBuilder()
+
+        async def _gen():
+            yield sse.error_with_code("E0409", message, **context)
+            yield sse.done()
+
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+    raise HTTPException(
+        status_code=409,
+        detail={"code": "E0409", "message": message, "i18n_key": key, "context": context},
+    )
+
+
 def _llm_unavailable(req: ChatRequest) -> StreamingResponse:
     """llama-server 未接続を要求の形式に合わせて返す (stream は error フレーム、同期は 503)。"""
     if req.stream:
@@ -346,7 +393,7 @@ async def _respond(
 
 
 def _resolve_system_prompt(
-    state: AppState, mode: str, instance_name: str,
+    state: AppState, mode: str, instance_name: str, session_id: str | None = None,
 ) -> str:
     """静的システムプロンプトを取得（PromptManager 未設定時はフォールバック）。
 
@@ -359,11 +406,16 @@ def _resolve_system_prompt(
     get_prompt_static`` が付けて返す (system 文の出所は PromptManager に閉じる、
     docs/f_03 §12 #5)。フォールバック文と ``get_prompt_static`` を持たない代替
     実装に対してだけ ``ensure_static_directives`` が補う (冪等)。
+
+    ``session_id`` を渡すとセッション開始時のレンダを返し続ける (進化の採用が
+    会話の途中で接頭辞 KV を壊さない、f_03 §7.1.3 #1)。
     """
     prompt_mgr = state.prompt_manager
     if prompt_mgr:
         get_static = getattr(prompt_mgr, "get_prompt_static", None)
         if get_static is not None:
+            if session_id:
+                return ensure_static_directives(get_static(mode, session_id=session_id))
             return ensure_static_directives(get_static(mode))
         # 後方互換: get_prompt_static 未実装の Mock 等は query なし get_prompt へ縮退
         return ensure_static_directives(prompt_mgr.get_prompt(mode))
@@ -2487,6 +2539,19 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     )
     _validate_chat_request(req)
 
+    # 制作中のターン受付 (f_10 §3)。WM へ発話を積む前に判定するので、断った
+    # 要求は記憶にも履歴にも残らない。await を挟まずに判定と登録を済ませる。
+    admission = try_admit(req.session_id, req.mode)
+    if isinstance(admission, TurnBusy):
+        return _turn_busy(req, admission)
+    lease = current_turn_lease()
+    if lease is not None:
+        lease.on_release(admission.release)
+    else:
+        # 入口 (``chat``) を通らない呼出。解除の契機が無いので台帳に残さない
+        # (残すと以後の create を再起動まで全部断ってしまう)。
+        admission.release()
+
     cfg = get_config()
     client = await ensure_llm_client(state, cfg)
     if client is None:
@@ -2518,7 +2583,8 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
     # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
     system_prompt = _append_fact_slate(
-        state, session_id, _resolve_system_prompt(state, req.mode, instance_name),
+        state, session_id,
+        _resolve_system_prompt(state, req.mode, instance_name, session_id=session_id),
     )
 
     # 直前の応答が max_tokens で切れていて、今回の発話が「続けて」だけなら

@@ -108,6 +108,10 @@ export interface ChatStreamEvent {
 	token?: string;
 	token_info?: TokenInfo;
 	error?: string;
+	/** 構造化エラー (`error_with_code`) のコード。`E0409` は制作中で受け付けなかったターン */
+	error_code?: string;
+	/** 構造化エラーの付帯情報 (`E0409` なら走っている側の `session_id` / `run_id`) */
+	error_context?: Record<string, unknown>;
 	/** 応答元レイヤー (ストリーム冒頭で 1 度) */
 	agent_layer?: string;
 	/** このターンの識別子。`cancelChat` に添えてこのリクエストだけを止める */
@@ -269,6 +273,18 @@ export function toChatStreamEvent(parsed: Record<string, unknown>): ChatStreamEv
 				typeof err === 'string'
 					? err
 					: String((err as { message?: string } | undefined)?.message ?? 'error');
+			if (err && typeof err === 'object') {
+				const { code, context } = err as { code?: unknown; context?: unknown };
+				return {
+					type: 'error',
+					error: message,
+					error_code: typeof code === 'string' ? code : undefined,
+					error_context:
+						context && typeof context === 'object'
+							? (context as Record<string, unknown>)
+							: undefined
+				};
+			}
 			return { type: 'error', error: message };
 		}
 		case 'step':

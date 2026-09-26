@@ -61,8 +61,10 @@ from backend.free.agent.meta_cognitive_defs import (
     _EXT_LANGUAGE_MAP,
     _LANGUAGE_EXT_MAP,
     _LANGUAGE_KEYWORDS,
+    _PARTIAL_WRITE_FILES_FAILED_RE,
     _PARTIAL_WRITE_RE,
     _PARTIAL_WRITE_TASKS_FAILED_RE,
+    _PARTIAL_WRITE_VALIDATION_RE,
     PLAN_SYSTEM_PROMPT,
     _WRITE_REJECTION_RE,
     _WRITE_REJECTION_REASON_JA,
@@ -613,6 +615,15 @@ class MetaCognitiveAgent(
         elif output_target == "chat" and self._chat_code_parts:
             # チャット経路: 生成コードをコードフェンス付きで本文に返す
             content = "\n\n".join(self._chat_code_parts)
+            # 未完了の制作はコードの後に注記する (本文がコードだけだと完了に見える)
+            unfinished = [
+                note for note in (
+                    self._partial_write_note(t.result or "")
+                    for t in tasks if t.status == "failed"
+                ) if note
+            ]
+            if unfinished:
+                content += "\n\n" + "\n".join(unfinished)
         else:
             content = self._build_final_response(tasks, context_parts)
         logger.info(
@@ -1195,12 +1206,20 @@ class MetaCognitiveAgent(
             return f"Error: {detail}", []
 
         artifacts = result.artifacts
-        if self._output_target == "chat":
-            for art in artifacts:
-                self._chat_code_parts.append(f"```{art.language}\n{art.content}\n```")
-            return f"Generated {len(artifacts)} file(s)", []
-        if self._output_target == "editor":
-            self._editor_artifacts.extend(artifacts)
+        if self._output_target in ("chat", "editor"):
+            if self._output_target == "chat":
+                for art in artifacts:
+                    self._chat_code_parts.append(f"```{art.language}\n{art.content}\n```")
+            else:
+                self._editor_artifacts.extend(artifacts)
+            # 出した分は出すが、未完了なら成功と報告しない (file 出力と同じ判定。
+            # 以前はこの枝だけ判定を通らず「Generated」を返していた、2026-09-26)。
+            incomplete = self._production_incomplete_reason(result)
+            if incomplete:
+                return (
+                    f"Error: production stage incomplete ({incomplete}); "
+                    f"generated {len(artifacts)} file(s)", []
+                )
             return f"Generated {len(artifacts)} file(s)", []
 
         # file: 既存の write 経路で 1 ファイルずつ書く (staged 固有の錨付け問題を
@@ -1211,6 +1230,7 @@ class MetaCognitiveAgent(
         tool_calls: list[dict] = []
         written = 0
         written_paths: list[str] = []
+        failed_paths: list[str] = []
         named_target = (
             self._named_new_file_target(original_query) if len(artifacts) == 1 else ""
         )
@@ -1228,10 +1248,20 @@ class MetaCognitiveAgent(
             if entries and entries[-1].get("success"):
                 written += 1
                 written_paths.append(file_path)
+            else:
+                failed_paths.append(file_path)
+        self._record_delivery(written_paths, failed_paths, result)
         if written == 0:
             return "Error: production stage artifacts failed to write", tool_calls
         self._record_write_impact(written_paths, result)
         incomplete = self._production_incomplete_reason(result)
+        if failed_paths:
+            # 一部だけ書けたターンを成功と報告しない (f_10 §7、2026-09-26。以前は
+            # 1 本でも書ければ「Wrote N file(s)」だった)。
+            write_reason = (
+                f"{len(failed_paths)} file(s) failed to write: {', '.join(failed_paths)}"
+            )
+            incomplete = f"{incomplete}, {write_reason}" if incomplete else write_reason
         if incomplete:
             # 書けた分は残すが、タスクは失敗として数える (成功と報告しない)。
             # 書いたパスは結果に残す — 最終応答が「書き込みが実行されません
@@ -1261,9 +1291,34 @@ class MetaCognitiveAgent(
         failed = int(notes.get("tasks_failed") or 0)
         if failed:
             return f"{failed} task(s) failed"
+        # 長文 CODE のリペア後も残った検証エラー (f_08 §2.3、2026-09-26)
+        unresolved = int(notes.get("validation_errors") or 0)
+        if unresolved:
+            return f"{unresolved} validation error(s) remain"
         if "code_files" in notes and not notes["code_files"]:
             return "no code files were produced"
         return ""
+
+    @staticmethod
+    def _record_delivery(
+        written_paths: list[str], failed_paths: list[str], result: "ProductionResult",
+    ) -> None:
+        """出力先への書込みの結果を events.jsonl へ積む (best-effort、f_10 §7)。
+
+        ``run.json`` はパイプラインの結末なので書き直さない。配信で欠けたものは
+        事実としてイベントに積み、読み手が導出する (2026-09-26)。
+        """
+        workspace_root = (result.notes or {}).get("workspace_root")
+        if not workspace_root:
+            return
+        try:
+            from backend.free.loop.staged.run_record import RunEventLog
+
+            RunEventLog(Path(workspace_root)).append(
+                "delivery", {"written": list(written_paths), "failed": list(failed_paths)},
+            )
+        except Exception as exc:  # noqa: BLE001 - 記録の失敗で書込み結果は覆さない
+            logger.warning("Production stage: delivery event log append failed: %s", exc)
 
     def _record_write_impact(
         self, written_paths: list[str], result: "ProductionResult",
@@ -1805,13 +1860,30 @@ class MetaCognitiveAgent(
         if m is None:
             return ""
         reason = m.group("reason")
+        pieces: list[str] = []
+        if "timed out" in reason:
+            pieces.append("時間切れで打ち切りました")
         failed = _PARTIAL_WRITE_TASKS_FAILED_RE.search(reason)
         if failed:
-            reason_ja = f"検証などのタスクが {failed.group(1)} 件失敗しました"
-        elif reason == "timed out":
-            reason_ja = "時間切れで打ち切りました"
-        else:
-            reason_ja = reason
+            pieces.append(f"検証などのタスクが {failed.group(1)} 件失敗しました")
+        unresolved = _PARTIAL_WRITE_VALIDATION_RE.search(reason)
+        if unresolved:
+            pieces.append(
+                f"自動検証で未解決のエラーが {unresolved.group(1)} 件残っています"
+                " (GENERATION_ISSUES.md を参照)",
+            )
+        if "no code files were produced" in reason:
+            pieces.append("コードのファイルが 1 本も生成されませんでした")
+        unwritten = _PARTIAL_WRITE_FILES_FAILED_RE.search(reason)
+        if unwritten:
+            pieces.append(
+                f"{unwritten.group('n')} 件のファイルを書き込めませんでした"
+                f" ({unwritten.group('paths')})",
+            )
+        reason_ja = "、".join(pieces) or reason
+        if m.group("verb") == "generated":
+            # 出力先が editor / chat: 書き込みではないので「書き込んだ」とは言わない
+            return f"(成果物は出力しました。ただし制作は完了していません: {reason_ja})"
         if m.group("count") is None:
             # 2 つ目以降の制作タスク: 成果物は最初の制作タスクがまとめて扱った
             # (出力先が editor / chat なら書き込みではないので「書き込んだ」とは言わない)

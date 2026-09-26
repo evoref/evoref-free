@@ -4,7 +4,7 @@
 実行 (= 1 workspace = 1 run) の **事実**を ``run.json`` に、**時系列イベント**を
 ``events.jsonl`` に持つ。「事実を永続し、表示状態は導出する」設計 —
 ``derive_run_status`` が読み出し時に ``working`` / ``needs_input`` / ``done`` /
-``failed`` / ``cancelled`` / ``timeout`` を導出するので、表示状態そのものは
+``incomplete`` / ``failed`` / ``cancelled`` / ``timeout`` を導出するので、表示状態そのものは
 どこにも保存しない。
 
 書き手は ``chat_stream_staged.run_staged_pipeline`` (staged) と
@@ -47,7 +47,10 @@ ActivityState = Literal["running", "blocked", "exited"]
 #: ``resumed`` は blocked (needs_input) から次ターンで再開されたときに旧 run が
 #: 終端する exit_kind (Phase 3b、f_10 §7)。
 ExitKind = Literal["done", "timeout", "cancelled", "disconnected", "error", "resumed"]
-RunStatus = Literal["working", "needs_input", "done", "failed", "cancelled", "timeout"]
+#: ``incomplete`` は ``exit_kind=done`` だが ``tasks_failed > 0`` (流れたが欠けた、f_10 §7)。
+RunStatus = Literal[
+    "working", "needs_input", "done", "incomplete", "failed", "cancelled", "timeout",
+]
 
 #: run_id (= workspace_id) の接頭辞 (ID 台帳 ``run_``、c_05 §0.5.5)。
 RUN_ID_PREFIX = "run_"
@@ -96,6 +99,10 @@ class RunRecord:
     #: 構成テンプレートで seed した場合の来歴鍵 (``<package_id>@<version>:
     #: <entry_id>``、c_05 §0.6 / c_16 §4.5.2)。seed していない run は空文字。
     template: str = ""
+    #: パイプラインが流れた上で欠けたもの (失敗タスク / 未生成モジュール / 落ちた
+    #: 契約テスト) の件数。``exit_kind`` は「どう終わったか」でこれとは別の軸
+    #: (f_10 §7、2026-09-26)。任意フィールドなので形式の版は上げない。
+    tasks_failed: int = 0
     #: 未知キー退避 (c_05 §0.5.2)。次の保存で原形のままトップレベルへ復元する。
     _extra: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -207,6 +214,7 @@ class RunRecordStore(VersionedJsonFile):
 
     def finish(
         self, exit_kind: ExitKind, *, last_event_seq: int = 0, template: str = "",
+        tasks_failed: int = 0,
     ) -> None:
         """run 終端を記録し即座に永続化する。``start`` 未実行なら no-op。
 
@@ -218,6 +226,7 @@ class RunRecordStore(VersionedJsonFile):
         self.record.activity_state = "exited"
         self.record.exit_kind = exit_kind
         self.record.last_event_seq = int(last_event_seq)
+        self.record.tasks_failed = max(0, int(tasks_failed))
         if template:
             self.record.template = template
         self.save()
@@ -375,6 +384,14 @@ def stale_after_from_config(config: dict | None) -> float:
     return turn + 600.0
 
 
+def _tasks_failed(run: RunRecord) -> int:
+    """``tasks_failed`` を整数で読む (手で壊された値は 0 = 欠けていない扱い)。"""
+    try:
+        return int(run.tasks_failed or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def derive_run_status(
     run: RunRecord,
     last_event: RunEvent | None,
@@ -385,6 +402,7 @@ def derive_run_status(
     """``run.json`` + 最新イベントから表示状態を導出する (優先順: activity_state →
     exit_kind → 最新 event)。表示状態そのものは保存しない (f_10 §7)。
 
+    ``exit_kind=done`` でも ``tasks_failed > 0`` なら ``incomplete`` (2026-09-26)。
     ``running`` は ``started_at`` から ``stale_after_sec`` を過ぎていれば ``failed``
     (書き手のプロセスがクラッシュ / kill されると終端が書かれないため。2026-09-19)。
     """
@@ -397,7 +415,10 @@ def derive_run_status(
     if run.activity_state == "blocked":
         return "needs_input"
     if run.exit_kind:
-        return _EXIT_KIND_TO_STATUS.get(run.exit_kind, "failed")
+        status = _EXIT_KIND_TO_STATUS.get(run.exit_kind, "failed")
+        if status == "done" and run.exit_kind == "done" and _tasks_failed(run) > 0:
+            return "incomplete"
+        return status
     if last_event is not None:
         return _EVENT_KIND_TO_STATUS.get(last_event.kind, "failed")
     return "failed"
