@@ -11,6 +11,8 @@ import re
 
 from pathlib import Path
 
+from backend.free.agent.output_format import is_table_output
+from backend.free.agent.tools.filesystem import _EXPORT_DOC_EXTS
 from backend.free.agent.meta_cognitive_text import (
     _LITERAL_WRITE_EXTENSIONS,
     _LITERAL_WRITE_REJECT_RE,
@@ -287,6 +289,10 @@ _ARTIFACT_SHAPES: tuple[tuple[re.Pattern, re.Pattern], ...] = (
 )
 
 
+#: 表の見た目 (``_ARTIFACT_SHAPES`` の先頭)。表形式の出力先で必須にする。
+_TABLE_SHAPE_RE = _ARTIFACT_SHAPES[0][1]
+
+
 def _artifact_shape_for(query: str) -> "re.Pattern | None":
     """参照名詞から、候補が満たすべき見た目を返す (純粋関数)。"""
     for noun_re, shape_re in _ARTIFACT_SHAPES:
@@ -296,7 +302,7 @@ def _artifact_shape_for(query: str) -> "re.Pattern | None":
 
 
 def previous_answer_write_content(
-    query: str, conversation: list[dict] | None,
+    query: str, conversation: list[dict] | None, file_path: str = "",
 ) -> str:
     """「この文章を保存して」型の依頼に対し、直前の応答本文を決定論的に返す。
 
@@ -306,6 +312,10 @@ def previous_answer_write_content(
     完了しました。」という報告文がファイルに書かれた)。参照表現があり、
     かつ加工指示 (翻訳・要約・修正等) が無い場合に限り、直前の assistant
     応答をそのまま採用する。該当しなければ空文字列。
+
+    出力先 ``file_path`` が表形式 (xlsx / csv 等) なら表の見た目を持つ候補に
+    限る。表の無い応答を採ると Writer が ``no_table_data`` で必ず落ち、再試行も
+    同じ素材を採り直す (2026-09-26 監査 C15#3、docs/f_11 §5.3)。
     """
     if not conversation:
         return ""
@@ -330,11 +340,20 @@ def previous_answer_write_content(
         return ""
     # 参照が種別を名指ししている (「その**表**を保存して」) なら、その見た目を
     # 持つ最も新しい応答を選ぶ。名指しが無い / 該当が無ければ従来どおり直近。
-    shape = _artifact_shape_for(query)
+    # 表形式の出力先は名指しの有無に関わらず表を必須にし、無ければ生成へ回す。
+    # Writer で表を組むスプレッドシート (xlsx / ods) だけ。.csv はテキストのまま
+    # 書かれるのでカンマ区切りの応答をそのまま採る (docs/f_11 §5.3)。
+    table_required = (
+        is_table_output(file_path)
+        and Path(file_path).suffix.lower() in _EXPORT_DOC_EXTS
+    )
+    shape = _TABLE_SHAPE_RE if table_required else _artifact_shape_for(query)
     if shape is not None:
         for text in candidates:
             if shape.search(text):
                 return text
+    if table_required:
+        return ""
     return candidates[0]
 
 

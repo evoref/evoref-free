@@ -217,6 +217,7 @@ async def curate_corrections(
     aux_client,
     now_provider: Callable[[], float] | None = None,
     max_per_cycle: int = _MAX_PER_CYCLE,
+    should_pause: Callable[[], bool] | None = None,
 ) -> int:
     """訂正候補のノートを検証し、帰属と逐語 span をノートへ刻む。
 
@@ -225,6 +226,8 @@ async def curate_corrections(
         aux_client: 検証に使う補助タスククライアント。``None`` なら no-op。
         now_provider: 時刻供給。テスト用。
         max_per_cycle: 1 サイクルの上限。
+        should_pause: 真ならチャットが最近あった (静穏窓の外)。検証を出さずに
+            打ち切る — 出してもチャットに横取りされるだけ (2026-09-26 監査 #12)。
 
     Returns:
         マーカーを立てたノート数 (却下も含む)。
@@ -252,6 +255,12 @@ async def curate_corrections(
     now_fn = now_provider or time.time
     marked = 0
     for note in candidates:
+        if should_pause is not None and should_pause():
+            logger.info(
+                "correction_curator: chat is recent; verification waits for a "
+                "quiet window (%d candidate(s) carried over)", len(candidates),
+            )
+            break
         content = str(note.content or "")
         prev_response, prev_user = previous_turn_context(ordered, note)
         if not prev_response.strip():
@@ -278,10 +287,14 @@ async def curate_corrections(
             # チャット併走の横取り (contended) は数えない — 静かなサイクルで
             # そのまま再試行する。実失敗が閾値に達したら cooldown に入り、
             # Step 8 は通常の再言明として消費する (永久に据え置かない)。
+            contended = bool(getattr(exc, "contended", False))
             record_transient_failure(
-                note, VERIFY_FAILURE_KEY, now_fn(),
-                counts=not getattr(exc, "contended", False),
+                note, VERIFY_FAILURE_KEY, now_fn(), counts=not contended,
             )
+            if contended:
+                # 横取りされたなら次の候補もまた横取りされる。残りは次の
+                # サイクルへ回す (2026-09-26 監査 #12: 11 回とも全滅)。
+                break
             continue
         clear_failure(note, VERIFY_FAILURE_KEY)
         check = check_verdict(

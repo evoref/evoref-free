@@ -1599,6 +1599,7 @@ def _init_tools(
     _wire_retrieval_skip_gate(state, embedder, state.debug_logger)
     _wire_layer_shadow(state, embedder, state.debug_logger)
     _wire_write_intent_gate(state, embedder, state.debug_logger)
+    _wire_statement_gate(state, embedder, state.debug_logger)
 
     # Reactive 層を常駐化 (挨拶パターンのみ。LLM 非依存なので構築コストはほぼゼロ)。
     state.reactive_agent = ReactiveAgent()
@@ -1710,6 +1711,32 @@ def _wire_write_intent_gate(
         )
     except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
         logger.info("Write intent gate warmup deferred: no running event loop")
+
+
+def _wire_statement_gate(
+    state: AppState, embedder: Any, debug_logger: Any,
+) -> None:
+    """申告の確認ゲートを構築する (c_17 §3.9 / statement_gate)。
+
+    字句が申告と判定したターンだけ事例に確認させ、反対されたら言い換え確認の
+    注記を付けない。埋め込みが無い / 構築に失敗したときはゲート無しで動き、
+    注記は字句のとおりに付く (``statement_note_for`` の縮退)。
+    """
+    if embedder is None:
+        logger.info("Statement gate skipped: no embedder")
+        return
+    from backend.free.agent.statement_gate import StatementGate
+
+    try:
+        gate = StatementGate(embedder, debug_logger=debug_logger)
+    except Exception as e:  # pragma: no cover - 縮退で吸収する
+        logger.warning("Statement gate construction failed: %s", e)
+        return
+    state.statement_gate = gate
+    try:
+        _track_background_task(state, gate.warmup(), name="statement_gate_warmup")
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Statement gate warmup deferred: no running event loop")
 
 
 def _agent_trace_dir() -> Path | None:

@@ -94,6 +94,9 @@ chat:
     family:
       # 家族は複数人 (妻と娘、妹)。世代ではなく並列の事実。
       multi_valued: true
+      # trigger は人を指す。斜格にしか出ない文 (「妻と2人で京都へ旅行に
+      # 行きます」= 同行者) は家族構成の言明ではないので棄権する (2026-09-26)。
+      person_valued: true
       triggers:
       - 家族
       - 妻

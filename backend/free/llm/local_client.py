@@ -955,9 +955,14 @@ class LocalClient(BaseHTTPClient):
         frequency_penalty: float | None = None,
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
+        cache_prompt: bool | None = None,
         **extra,
     ) -> dict:
         """共通ペイロード構築
+
+        ``cache_prompt`` は要求単位の上書き (``None`` = 設定値)。``False`` は本体に
+        ``"cache_prompt": false`` を明示する — llama-server の既定は true なので、省略では
+        切れない (壊れたスロット KV を避けて作り直す用途、e_03 §1.2)。
 
         ``max_tokens`` が ``None`` / ``0`` (config ``llama.max_tokens: 0`` = 無制限、
         ``chat.py`` は ``or None`` で落とす) のときは **無制限で投げない**。
@@ -1001,7 +1006,9 @@ class LocalClient(BaseHTTPClient):
             payload["repetition_penalty"] = repetition_penalty
 
         # KVキャッシュ最適化
-        if self._cache_prompt:
+        if cache_prompt is False:
+            payload["cache_prompt"] = False
+        elif self._cache_prompt:
             payload["cache_prompt"] = True
         # 最終チャンクに usage を載せてもらう (OAI 標準)。
         # ``usage.prompt_tokens_details.cached_tokens`` が接頭辞 KV キャッシュの
@@ -1035,7 +1042,7 @@ class LocalClient(BaseHTTPClient):
             "messages=%d, extra_keys=%s",
             stream, temperature, max_tokens,
             top_p, top_k, presence_penalty, frequency_penalty, repetition_penalty,
-            id_slot, self._cache_prompt,
+            id_slot, payload.get("cache_prompt", self._cache_prompt),
             payload.get("chat_template_kwargs") or "none", len(msgs),
             list(extra.keys()) or "none",
         )
@@ -1054,6 +1061,7 @@ class LocalClient(BaseHTTPClient):
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
         request_timeout: float | None = None,
+        cache_prompt: bool | None = None,
     ) -> dict | TokenStream:
         """llama-server に推論リクエストを送信
 
@@ -1064,6 +1072,8 @@ class LocalClient(BaseHTTPClient):
             id_slot: KVキャッシュスロット指定。
                      chat_slot / background_slot プロパティを使用推奨。
                      None または -1 で自動割当。
+            cache_prompt: 要求単位の接頭辞 KV 再利用の上書き (None = 設定値)。
+                     ``False`` は退化した出力の作り直し用 (c_14 §2.2)。
             request_timeout: 非ストリーミング呼び出し (``stream=False``) 専用の
                      per-request タイムアウト上書き (秒)。既定 (None) は
                      :func:`sync_request_timeout` でペイロードの ``max_tokens`` と
@@ -1082,6 +1092,7 @@ class LocalClient(BaseHTTPClient):
             frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             id_slot=id_slot,
+            cache_prompt=cache_prompt,
         )
 
         if stream:
@@ -1627,8 +1638,11 @@ class LocalClient(BaseHTTPClient):
         id_slot: int | None = None,
         timeout: float | None = None,
         result_meta: dict | None = None,
+        cache_prompt: bool | None = None,
     ) -> str | None:
         """``response_format`` (json_schema) で文法制約した非ストリーミング生成。
+
+        ``cache_prompt`` は :meth:`generate` と同じ要求単位の上書き。
 
         ``result_meta`` (省略可) を渡すと ``finish_reason`` を書き戻す。
         ``"length"`` は max_tokens 到達 = JSON が途中で切れている印で、呼出側
@@ -1665,6 +1679,7 @@ class LocalClient(BaseHTTPClient):
             temperature=temperature,
             max_tokens=max_tokens,
             id_slot=id_slot,
+            cache_prompt=cache_prompt,
             **extra,
         )
 

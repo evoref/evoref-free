@@ -132,6 +132,7 @@ class LLMClient:
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
         request_timeout: float | None = None,
+        cache_prompt: bool | None = None,
     ) -> dict | AsyncIterator[str]:
         """推論リクエスト
 
@@ -146,6 +147,8 @@ class LLMClient:
             id_slot: KV キャッシュスロット
             request_timeout: 非ストリーミング呼び出し専用の per-request
                 タイムアウト上書き (秒)。``LocalClient.generate`` に透過する
+            cache_prompt: 要求単位の接頭辞 KV 再利用の上書き (None = 設定値)。
+                ``LocalClient.generate`` に透過する
 
         Returns:
             dict (非ストリーミング) or AsyncIterator[str] (ストリーミング)
@@ -162,6 +165,7 @@ class LLMClient:
             repetition_penalty=repetition_penalty,
             id_slot=id_slot,
             request_timeout=request_timeout,
+            cache_prompt=cache_prompt,
         )
 
     async def generate_constrained(

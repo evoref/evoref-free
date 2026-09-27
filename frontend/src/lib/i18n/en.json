@@ -796,7 +796,7 @@
 		"loading": "Loading...",
 		"load_failed": "Failed to load conversation history",
 		"search_placeholder": "Search conversations...",
-		"turns": "{count} turns",
+		"turns": "{count} messages",
 		"duration": "{minutes} min",
 		"today": "Today",
 		"yesterday": "Yesterday",

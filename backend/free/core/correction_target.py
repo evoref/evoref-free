@@ -48,6 +48,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from backend.free.core.script_ranges import (
+    HIRAGANA,
     KANJI,
     KANJI_MARKS,
     KATAKANA,
@@ -91,6 +92,104 @@ WRONG_MARKER_RE = re.compile(
 #: 「正しい側」を示す語。この語より後ろは訂正後の値。
 RIGHT_MARKER_RE = re.compile(r"正しくは|正解は|本当は|実際は|が正しい")
 _SENTENCE_SPLIT_RE = re.compile(r"[。！？!?\n]")
+
+#: 対比の印 (「X ではなく Y」)。対比の語彙の唯一の置き場 (不変則 #14a) —
+#: 言い直し判定 (``agent.feedback``)・未検証候補の注記 (``memory.pipeline.injector``)・
+#: 本人の値更新 (``memory.extractors.base.value_update_spans``)・旧値で結ぶ
+#: assertion の畳み込み (``memory.sleep.extraction``) が :func:`contrast_pairs` を共有する。
+CONTRAST_MARKER = r"(?:ではなく|じゃなく|では無く)"
+#: 1 文 = 終端記号以外の並び + 終端記号 (残す)。改行も文の境界。
+_SENTENCE_WITH_TERMINAL_RE = re.compile(r"[^。！？!?\n]+[。！？!?]*")
+#: 「<旧> ではなく[、] <新> <断定・変更の述語>」。旧値の区間 (``head``) は直前の
+#: 区切り (読点・句点・文頭) から印まで。述語で閉じない形 (「Python ではなく Go で
+#: 書いてください」「コーヒーではなく紅茶が好きな人もいます」) は対比にしない。
+_CONTRAST_RE = re.compile(
+    r"(?P<head>[^、，,。．！？!?\n]*?)\s*" + CONTRAST_MARKER + r"[、，,]?\s*"
+    r"(?P<new>[^。．、，,！？!?\n]{1,40}?)\s*"
+    r"(?:です|でした|にします|にしました|になりました|に変わりました|に変更|へ変更|にした)",
+)
+#: 旧値の区間を切る主題・格の助詞 (の文字)。
+_CONTRAST_PARTICLES = frozenset("はがをもにで")
+#: 旧値の最大長 (区切りの無い長い前置きを値にしない)。
+_CONTRAST_MAX_OLD = 30
+#: 長音符 ー は数えない (「アレルギーは」の は は区切り)。
+_HIRAGANA_CHAR_RE = re.compile(f"[{HIRAGANA}]")
+
+
+def split_sentences(text: str) -> list[str]:
+    """文に切る。終端記号 (。！？!?) は各文の末尾に残す (純粋関数)。
+
+    文末の形 (「〜でした。」「〜ますか？」) を文ごとに判定するためのもの。
+    発話全体の末尾で判定すると、訂正の後に問いや依頼が続く形で 1 文目が
+    見えなくなる (2026-09-26 監査 #13)。
+    """
+    return [
+        s.strip() for s in _SENTENCE_WITH_TERMINAL_RE.findall(text or "")
+        if s.strip()
+    ]
+
+
+def _is_single_hiragana(text: str) -> bool:
+    return len(text) == 1 and bool(_HIRAGANA_CHAR_RE.match(text))
+
+
+def _particle_splits_at(head: str, i: int) -> bool:
+    """``head[i]`` (助詞の文字) を旧値の左端の区切りとみなせるか。
+
+    助詞の文字は値の中にも現れる (「はなこ」「もも」「ともだち」)。区切りとみなす
+    のは、直前が非ひらがなの文字 (「名前は」「コタロウは」「3%を」) か、直前の
+    ひらがなの並びが 2 文字以上 (「それは」「わたしは」「好きなのは」) のときだけ。
+    「ともだち」の も は直前が と 1 文字なので区切らない。
+    """
+    if i <= 0:
+        return False
+    run = 0
+    j = i - 1
+    while j >= 0 and _HIRAGANA_CHAR_RE.match(head[j]):
+        run += 1
+        j -= 1
+    return run == 0 or run >= 2
+
+
+def _old_value_of(head: str) -> str:
+    """旧値の区間 ``head`` から旧値を取る (右端に最も近い区切りの後ろ)。"""
+    head = head.strip()
+    for i in range(len(head) - 1, 0, -1):
+        if head[i] not in _CONTRAST_PARTICLES or not _particle_splits_at(head, i):
+            continue
+        rest = head[i + 1:].strip()
+        # 切った残りが空・ひらがな 1 文字 (「くだもの」の の) なら、もっと左で切る。
+        if not rest or _is_single_hiragana(rest):
+            continue
+        head = rest
+        break
+    return head[-_CONTRAST_MAX_OLD:]
+
+
+def contrast_pairs(text: str) -> list[tuple[str, str]]:
+    """「X ではなく Y <述語>」の ``(旧値 X, 新値 Y)`` をすべて返す (純粋関数)。
+
+    - Y は印の直後の読点・空白を飛ばし、断定・変更の述語の手前まで。
+    - X は印の直前の区切りから後ろを、主題・格の助詞で切る
+      (:func:`_particle_splits_at`)。「すみません、コタロウは3歳ではなく5歳
+      でした。」→ ``("3歳", "5歳")``、「名前ははなこではなく…」→ ``はなこ``。
+    - X がひらがな 1 文字 (「走るのではなく」の の) は機能語の断片なので採らない。
+      1 文字でも漢字・カタカナ・英数は採る (「妻ではなく夫です」、F-02)。
+    """
+    out: list[tuple[str, str]] = []
+    for m in _CONTRAST_RE.finditer(text or ""):
+        old = _old_value_of(m.group("head"))
+        new = m.group("new").strip()
+        if not old or not new or _is_single_hiragana(old):
+            continue
+        out.append((old, new))
+    return out
+
+
+def contrast_pair(text: str) -> tuple[str, str] | None:
+    """:func:`contrast_pairs` の最初の 1 組 (無ければ ``None``)。"""
+    pairs = contrast_pairs(text)
+    return pairs[0] if pairs else None
 
 #: どんな文にも現れる語。証拠にならない。
 STOP_IDENTIFIERS = frozenset({

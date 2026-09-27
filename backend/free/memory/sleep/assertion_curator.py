@@ -53,6 +53,7 @@ from backend.free.memory.extractors.base import (
     note_is_verified_correction,
     note_verification_rejected,
 )
+from backend.free.memory.notes.pin_detector import note_is_pinned
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.sleep._curator_common import public_notes
 from backend.free.memory.sleep.curation_backoff import (
@@ -244,7 +245,7 @@ def _is_curatable(note: "MemoryNote", builder) -> bool:
         return False
     # ノート分類器が「事実を述べている」と見たもの、またはユーザーが明示的に
     # 覚えておけと言ったもの (pin) だけを対象にする。
-    return bool("fact" in (note.tags or []) or note.pin_flag)
+    return bool("fact" in (note.tags or []) or note_is_pinned(note))
 
 
 def _build_prompt(content: str) -> str:

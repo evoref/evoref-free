@@ -431,13 +431,19 @@ def _iter_scopes(state: AppState):
 #: 弱い base モデルがこれを回答対象と誤解し、本題と無関係な応答を返していた)。
 _CREATE_ONLY_CONFLICT_TYPES = frozenset({"create", "create_task"})
 
+#: モードによらず表示しない競合グループの FactType。``create`` は書き手を撤去
+#: した旧形式 (依頼全文、docs/f_02 §2.3) で、同じスロットに集まっていたのは
+#: 別々の依頼 — 競合ではない (2026-09-26 監査 #3)。
+_RETIRED_CONFLICT_TYPES = frozenset({"create"})
+
 
 def _collect_all_pending_groups(state: AppState, mode: str = "chat") -> list:
     """global + project ストアの pending 競合グループを集約する (読取のみ)。
 
     chat モードではクリエイト専用型 (``create`` / ``create_task``) の
-    グループを除外する。type は混在時 ``"a/b"`` 形式なので、構成型がすべて
-    クリエイト専用のときだけ落とす (混在は残す)。
+    グループを、create モードでも撤去済みの ``create`` 型だけのグループを
+    除外する。type は混在時 ``"a/b"`` 形式なので、構成型がすべて除外対象の
+    ときだけ落とす (混在は残す)。
     """
     # 表示用グループを使う (collect_pending_groups ではない)。pending だけを
     # 並べるとスロットの最新値が欠け、古い値に「新」ラベルが付く
@@ -455,19 +461,19 @@ def _collect_all_pending_groups(state: AppState, mode: str = "chat") -> list:
     # 1 つの言い直しが複数の型へ書き出されると、同じ「旧…/新…」が
     # グループ数だけ並ぶ。スコープを跨いで畳めるのはここだけ。
     groups = dedupe_equivalent_groups(groups)
-    if is_chat_mode(mode):
-        before = len(groups)
-        groups = [
-            g for g in groups
-            if not set((g.type or "").split("/")).issubset(
-                _CREATE_ONLY_CONFLICT_TYPES,
-            )
-        ]
-        if before != len(groups):
-            logger.debug(
-                "conflict groups: dropped %d create-only group(s) in chat mode",
-                before - len(groups),
-            )
+    hidden = (
+        _CREATE_ONLY_CONFLICT_TYPES if is_chat_mode(mode) else _RETIRED_CONFLICT_TYPES
+    )
+    before = len(groups)
+    groups = [
+        g for g in groups
+        if not set((g.type or "").split("/")).issubset(hidden)
+    ]
+    if before != len(groups):
+        logger.debug(
+            "conflict groups: dropped %d group(s) of %s in %s mode",
+            before - len(groups), sorted(hidden), mode,
+        )
     return groups
 
 

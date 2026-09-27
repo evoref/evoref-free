@@ -12,6 +12,7 @@ import numpy as np
 from backend.log_config import get_logger
 from backend.free.llm.model_metadata import DEFAULT_PARAMS_B
 from backend.free.memory.notes.note_evolver import compute_llm_call_interval
+from backend.free.memory.notes.pin_detector import note_is_pinned
 from backend.free.memory.episodic.note import MemoryNote
 
 if TYPE_CHECKING:
@@ -362,8 +363,11 @@ class ConflictResolver:
                 # 本文が変わったので Step 8 に再抽出させる (旧 ID を持ち越すと
                 # already_extracted で飛ばされ、統合後の内容がファクト化されない)
                 note_a.extracted_fact_ids = []
-                # pin / 訂正の印は片方にでも付いていれば統合先に引き継ぐ
-                note_a.pin_flag = bool(note_a.pin_flag or note_b.pin_flag)
+                # pin / 訂正の印は片方にでも付いていれば統合先に引き継ぐ。
+                # pin は **有効なもの** だけを理由ごと移す (f_02 §8.3)。
+                if not note_is_pinned(note_a) and note_is_pinned(note_b):
+                    note_a.pin_flag = True
+                    note_a.pin_reason = note_b.pin_reason
                 note_a.is_correction = bool(
                     note_a.is_correction or note_b.is_correction,
                 )

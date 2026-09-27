@@ -182,6 +182,13 @@ class StagedCodeHarness:
             )
             for path, content in (result_payload.get("code_map") or {}).items()
         ]
+        # 依頼されたデータファイル・テスト (v2、f_10 §11.1-1) はモジュールと同じフォルダへ
+        artifacts += [
+            EditorArtifact(
+                content=content, language=_language_for_path(path), filename=_out(path),
+            )
+            for path, content in (result_payload.get("extra_files") or {}).items()
+        ]
         spec_md = result_payload.get("spec_md")
         if spec_md:
             artifacts.append(

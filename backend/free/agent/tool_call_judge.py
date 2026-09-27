@@ -68,6 +68,7 @@ from backend.utils import utc_now_dt, utc_to_epoch
 # 取り込む。既存の呼出元・テストが ``tool_call_judge.<名前>`` を直接参照しており、
 # ``mock.patch("...tool_call_judge.Path.exists")`` のようなパッチ対象にもなって
 # いるため、名前の見え方は分割前と一致させる。
+from backend.free.core.response_dates import mentions_literal_date
 from backend.free.agent.tool_judge_types import (
     ToolJudgement,
 )
@@ -304,9 +305,7 @@ _DATE_INTENT_CONTEXT_TURNS = 2
 #: 抽出器を撃てない (client / schema 不在) 印。``None`` (撃ったが取れず) と区別する。
 _DATE_INTENT_UNAVAILABLE = object()
 #: 発話に具体日付があるときは抽出器に起点 / 除外日を読ませる (規則先行の例外)。
-_DATE_INTENT_LITERAL_DATE_RE = re.compile(
-    r"\d{1,2}\s*月\s*\d{1,2}\s*日|(?<![\d/-])\d{1,2}/\d{1,2}(?![\d/-])|\d{4}-\d{2}-\d{2}",
-)
+#: 日付の綴りは ``core.response_dates.mentions_literal_date`` が SSOT。
 _DATE_INTENT_CONTEXT_CHARS = 300
 
 
@@ -635,6 +634,7 @@ class ToolCallJudge:
         # ``test_chat_path_audit_20260823`` が AST で固定している)。
         result.action_blocked = call.action_blocked
         result.measurement_blocked = call.measurement_blocked
+        result.recall_in_window = call.recall_in_window
         return result
 
     async def _judge_layers(
@@ -898,7 +898,7 @@ class ToolCallJudge:
         month_count = month_business_days_from_query(query_text, today_local)
         code_resolved = (
             (code_offset is not None or nth_weekday is not None or month_count is not None)
-            and not _DATE_INTENT_LITERAL_DATE_RE.search(query_text)
+            and not mentions_literal_date(query_text)
         )
         payload: object = None
         params: DateIntentParams | None = None
@@ -1549,6 +1549,15 @@ class ToolCallJudge:
             if model_layers_allowed else None
         )
         if classified is not None:
+            # 窓の外の値を訂正する calculate は式合成で組み直す (docs/f_03 §3.1)
+            resynthesized = await self._resynthesize_beyond_window(
+                classified, query, tools_registry, mode, conversation, call,
+            )
+            if resynthesized is not None:
+                self._log_tool_decision(
+                    resynthesized, "expression_synthesis_beyond_window", call,
+                )
+                return resynthesized
             self._log_tool_decision(classified, "tool_classifier", call)
             return classified
 
@@ -1652,6 +1661,37 @@ class ToolCallJudge:
             return [{"role": "system", "content": task_system}]
         return shared_prefix_messages(
             self._classifier_slot_prefix(tools_registry, mode), task_system,
+        )
+
+    async def _resynthesize_beyond_window(
+        self,
+        classified: "ToolJudgement",
+        query: str,
+        tools_registry: ToolsRegistry,
+        mode: str,
+        conversation: list[dict] | None,
+        call: JudgeCall,
+    ) -> "ToolJudgement | None":
+        """分類器の ``calculate`` が判定窓の外の値の訂正なら、式合成で組み直す。
+
+        分類器の対話窓は判定用の直近 ``_CALCULATE_CONTEXT_TURNS`` 件なので、
+        「年利は3%ではなく4%でした。最初の計算をやり直して」の 1 問目が窓の外に
+        あると、窓内の別の計算の式を新しい値で組む (2026-09-26 監査 C03#3)。
+        会話が窓より長く、クエリの「誤りの側」の数値が会話に既出のときだけ、
+        会話全体を見る層 5.95 に組み直させる。組めなければ ``None``
+        (分類器の結果を使う)。
+        """
+        if classified.tool_name != "calculate":
+            return None
+        outside = (conversation or [])[:-_CALCULATE_CONTEXT_TURNS]
+        if not outside:
+            return None
+        # 旧値が判定窓の **外** に書かれているときだけ。窓の中にしか無ければ
+        # 分類器はそれを見て式を組んでいる (2026-09-26 レビュー)。
+        if not _replaces_dialogue_value(query, _dialogue_text(outside)):
+            return None
+        return await self._judge_with_expression_synthesis(
+            query, tools_registry, mode, conversation, call=call,
         )
 
     async def _judge_with_expression_synthesis(

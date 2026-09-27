@@ -12,6 +12,8 @@ import sqlite3
 import tempfile
 from pathlib import Path, PurePosixPath
 
+from backend.free.core.intent_vocab import FILE_NAME_IN_TEXT_RE as _FILE_NAME_IN_TEXT_RE
+from backend.free.generation.validators import DATA_OR_DOCUMENT_SUFFIXES
 from backend.log_config import get_logger
 
 logger = get_logger("api.chat.staged_v2_languages")
@@ -23,10 +25,9 @@ _PY = frozenset({".py"})
 _WEB = frozenset({".html", ".htm", ".css", ".js", ".mjs", ".ts"})
 _PHP = frozenset({".php"})
 _SQL = frozenset({".sql"})
-#: コードではないファイル (系統の判定に数えない)。
-DATA_SUFFIXES = frozenset({
-    "", ".json", ".csv", ".tsv", ".md", ".txt", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml",
-})
+#: コードではないファイル (系統の判定に数えない)。表は ``validators.DATA_OR_DOCUMENT_SUFFIXES`` の 1 本
+#: (不変則 #14 (a))。拡張子なしもここでは数えない。
+DATA_SUFFIXES = frozenset({""}) | frozenset(DATA_OR_DOCUMENT_SUFFIXES)
 SUPPORTED_SUFFIXES = _PY | _WEB | _PHP | _SQL
 
 #: 実装言語の言い方 (``content_detector.implementation_languages``) のうち v2 が扱うもの。
@@ -38,7 +39,7 @@ _UNSUPPORTED_CODE_SUFFIXES = frozenset({
     ".cc", ".jsx", ".tsx", ".svelte", ".vue", ".scss", ".lua", ".r", ".pl", ".dart", ".scala",
     ".sh", ".ps1", ".bat",
 })
-FILE_NAME_IN_TEXT_RE = re.compile(r"[\w.\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(?![A-Za-z0-9])")
+FILE_NAME_IN_TEXT_RE = _FILE_NAME_IN_TEXT_RE  # SSOT は core.intent_vocab (生成応答の抜き出しと共有)
 #: SQLite で実行できない方言を名指す言い方 (名指されたら構文検査だけにする)。
 _OTHER_SQL_DIALECT_RE = re.compile(r"(?i)\b(?:mysql|mariadb|postgres(?:ql)?|sql\s*server|oracle|t-sql)\b")
 
@@ -82,6 +83,17 @@ def unsupported_request(query: str) -> list[str]:
     if family is None and mixed:
         evidence += mixed
     return evidence
+
+
+#: 依頼が名指す実装言語 (``content_detector.implementation_languages``) → 系統。
+_LANGUAGE_FAMILY = {"python": "python", "javascript": "web", "typescript": "web", "php": "php"}
+
+
+def requested_families(query: str) -> set[str]:
+    """依頼が実装言語として名指した系統 (「JavaScript で」→ ``{"web"}``。名指しが無ければ空)。"""
+    from backend.free.generation.content_detector import implementation_languages
+
+    return {_LANGUAGE_FAMILY[lang] for lang in implementation_languages(query) if lang in _LANGUAGE_FAMILY}
 
 
 def names_other_sql_dialect(query: str) -> bool:
@@ -292,6 +304,63 @@ def reference_errors(code_map: dict[str, str]) -> list[str]:
                 errors.append(f"{path}: uses element id(s) {', '.join(missing)} that no HTML of this "
                               f"deliverable defines (defined ids: {', '.join(sorted(ids)) or 'none'})")
     return errors
+
+
+#: ローカル資産 (音声・画像・フォント) の拡張子 (§12.3-5)。
+_ASSET_SUFFIXES = (
+    "mp3", "wav", "ogg", "oga", "m4a", "aac", "flac",
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "avif",
+    "woff", "woff2", "ttf", "otf", "eot",
+)
+#: 実際に読み込む参照だけ (§12.3-5)。ダウンロード名 (``a.download = 'x.png'``)・``accept=".png"``・
+#: リンクのアイコン (``rel="icon"``) は読み込みではない (独立レビュー 2026-09-26 の誤検知)。
+_LOADING_TAG_SRC_RE = re.compile(
+    r"<(?:img|audio|video|source|track|embed)\b[^>]*?\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE,
+)
+_NEW_AUDIO_RE = re.compile(r"\bnew\s+Audio\(\s*[\"'`]([^\"'`]+)[\"'`]")
+_SRC_ASSIGN_RE = re.compile(r"\.src\s*=\s*[\"'`]([^\"'`]+)[\"'`]")
+_CSS_URL_RE = re.compile(r"url\(\s*[\"']?([^\"')\s]+)[\"']?\s*\)", re.IGNORECASE)
+
+
+def missing_assets(code_map: dict[str, str], *, query: str, folder: str = "") -> list[tuple[str, str]]:
+    """同梱していないローカル資産の読み込み ``(参照したファイル, 資産)`` の列 (§12.3-5、警告だけ)。
+
+    成果物に無く、依頼文にも名前が無く、配信先 (根と出力フォルダ) にも実在しない音声・画像・
+    フォントを読み込んでいれば、その資産は届かない (2026-09-26 ライブ監査 K04: 同梱していない
+    ``beep.mp3`` を鳴らそうとして終了音が鳴らなかった)。外部 URL・``data:``・式で組むパスは対象外。
+    作り直しの理由にはしない (呼出側が verification と本文に警告として出す)。
+    """
+    names = set(code_map)
+    in_query = {PurePosixPath(m.group()).name.lower() for m in FILE_NAME_IN_TEXT_RE.finditer(query or "")}
+    roots: list[Path] | None = None
+    out: list[tuple[str, str]] = []
+    for path, code in code_map.items():
+        if path.endswith(".py"):
+            continue
+        specs = [
+            s for pattern in (_LOADING_TAG_SRC_RE, _NEW_AUDIO_RE, _SRC_ASSIGN_RE, _CSS_URL_RE)
+            for s in pattern.findall(code)
+            if PurePosixPath(s.split("?", 1)[0]).suffix.lower().lstrip(".") in _ASSET_SUFFIXES
+        ]
+        seen: set[str] = set()
+        for spec in specs:
+            if _is_external(spec) or "${" in spec or "{" in spec:
+                continue
+            ref = _resolve(path, spec)
+            if not ref or ref in seen or ref in names or PurePosixPath(ref).name.lower() in in_query:
+                continue
+            seen.add(ref)
+            if roots is None:
+                from backend.free.agent.meta_cognitive_task_exec import delivery_roots
+
+                roots = delivery_roots(query)
+            try:
+                exists = any((root / folder / ref).exists() or (root / ref).exists() for root in roots)
+            except OSError:
+                exists = False
+            if not exists:
+                out.append((path, ref))
+    return out
 
 
 _PHP_SUPERGLOBALS = frozenset({

@@ -872,6 +872,15 @@ def build_llama_cmd(
             warn=lambda msg: print(msg, file=sys.stderr),
         )
         if not inert:
+            # 明示値は尊重する (黙って上書きしない) が、実働する構成では警告する。
+            print(
+                f"[launch] WARNING: llama.cache_reuse={int(cache_reuse)} corrupted slot KV "
+                "on a dense model in a 2026-09-27 A/B test (llama.cpp d834d44, "
+                "Qwen2.5-Coder-14B: cached prompts returned only newlines while "
+                "cache_prompt=false was fine; reuse=0 was clean). Set llama.cache_reuse: 0 "
+                "unless you have verified it on this build (docs c_10 §4).",
+                file=sys.stderr,
+            )
             cmd += ["--cache-reuse", str(int(cache_reuse))]
 
     # コンテキスト checkpoint。hybrid recurrent モデルは部分巻き戻し不可で、

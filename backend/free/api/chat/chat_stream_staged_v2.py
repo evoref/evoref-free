@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import posixpath
 import re
 import time
 from pathlib import PurePosixPath
@@ -38,6 +39,9 @@ from backend.free.api.chat.chat_stream_staged import (
     _staged_import_smoke,
     _staged_postprocess,
 )
+from backend.free.core.file_names import allows_empty_content
+from backend.free.core.intent_vocab import is_absolute_path_text
+from backend.free.generation.smoke_validator import check_call_arity
 from backend.free.core.prompt_blocks import SHARED_CONTEXT_BOUNDARY
 from backend.trace_context import get_trace_id, run_in_executor_with_context
 from backend.utils import estimate_tokens as _estimate_tokens
@@ -68,12 +72,16 @@ Rules:
 - Any background in the system message (facts, memory, prior work) describes earlier and possibly
   unrelated work. Use it only where the request explicitly refers to it; never design a previous
   project instead of the request.
-- modules: the source files to write. Use exactly the file names (and the folder) the request names;
-  otherwise choose short snake_case names. Write every file in the language the request asks for
+- modules: the source files to write. Use exactly the file names (and the sub-folder) the request names;
+  otherwise choose short snake_case names. A path is relative to the output folder: never start it with a
+  drive letter, "/" or the folder path written in the request (the files are written there). Write every file in the language the request asks for
   and give it that language's extension (".py" for Python, ".html", ".js", ".ts", ".css", …);
-  Python when the request does not say. Do not include test files, README,
-  SPEC.md or data files. Prefer the fewest modules that satisfy the request (one file when the
-  request names one file).
+  Python when the request does not say. Do not put test files, README, SPEC.md or data files in
+  modules. Prefer the fewest modules that satisfy the request (one file when the request names one file).
+- data_files: the data files the request asks you to create (e.g. "sample.csv" for "prepare a sample
+  sample.csv"); [] otherwise. Never list the program's own storage file.
+- tests: the test files the request asks for (e.g. ["test_md_toc.py"] for "with tests"); [] when the
+  request does not ask for tests.
 - components: every public function/class of the file with an exact signature in the file's language
   (Python with type hints: "def add(a: int, b: int) -> int", "class Todo" plus its methods as
   "def Todo.mark_done(self) -> None"; JavaScript: "function start()" (no types);
@@ -150,16 +158,85 @@ def _norm_path(raw: str) -> str:
 UNSUPPORTED_LANGUAGE_FALLBACK = "unsupported_language"
 
 
+def _absolute_module_paths(data: dict) -> list[str]:
+    """モデルが書いた絶対パス (形の判定は ``is_absolute_path_text`` の 1 本)。出力先は依頼のフォルダで決まる (f_10 §11.1-1)。"""
+    return [
+        str(m.get("path") or "").strip() for m in data.get("modules") or []
+        if is_absolute_path_text(str(m.get("path") or ""))
+    ]
+
+
+def _outside_request(data: dict, query: str) -> list[str]:
+    """モジュールの絶対パスのうち、配信先の根 (f_03 §4.4) の外にあるもの。"""
+    absolute = _absolute_module_paths(data)
+    if not absolute:
+        return []
+    from backend.free.agent.meta_cognitive_task_exec import delivery_roots, relative_to_roots
+
+    roots = delivery_roots(query)
+    return [p for p in absolute if relative_to_roots(p, roots) is None]
+
+
+def _rebase_absolute_paths(data: dict, query: str) -> dict:
+    """モデルが書いた絶対パスを出力先からの相対に直す (f_10 §11.1-1)。
+
+    配信先の根の配下ならその根からの相対。外なら (作り直しても外だった) 外のパスに共通の
+    親を捨てる — 出力先は依頼のフォルダで決まる。
+    """
+    absolute = _absolute_module_paths(data)
+    if not absolute:
+        return data
+    from backend.free.agent.meta_cognitive_task_exec import delivery_roots, relative_to_roots
+
+    roots = delivery_roots(query)
+    outside = [p.replace("\\", "/") for p in absolute if relative_to_roots(p, roots) is None]
+    try:
+        base = posixpath.commonpath([posixpath.dirname(p) for p in outside]) if outside else ""
+    except ValueError:
+        base = ""
+
+    def _rebase(raw) -> str:
+        text = str(raw or "").strip()
+        if not is_absolute_path_text(text):
+            return text
+        rel = relative_to_roots(text, roots)
+        if rel is not None:
+            return rel
+        norm = text.replace("\\", "/")
+        if base and norm.startswith(base + "/"):
+            return norm[len(base) + 1:]
+        return PurePosixPath(norm).name
+
+    return {
+        **data,
+        "modules": [
+            {**m, "path": _rebase(m.get("path")),
+             "imports_from": [_rebase(x) for x in m.get("imports_from") or []]}
+            for m in data.get("modules") or []
+        ],
+        "entry_module": _rebase(data.get("entry_module")),
+        "examples": [{**e, "module": _rebase(e.get("module"))} for e in data.get("examples") or []],
+    }
+
+
 def skeleton_problem(data: dict, query: str) -> str:
-    """骨組みを作り直すべき理由 (空・依頼が名指したファイルが 1 つも無い)。問題が無ければ空文字列。
+    """骨組みを作り直すべき理由 (f_10 §12.2)。問題が無ければ空文字列。
 
     依頼が ``schema.sql`` のようにファイルを名指しているのに、骨組みのどのモジュールも
     その名前でなければ、依頼ではなく別の何か (ブリーフの過去の作業) を設計している
-    (ベンチ q1: SQL の依頼に以前のお題の単位変換ツールを設計した)。
+    (ベンチ q1: SQL の依頼に以前のお題の単位変換ツールを設計した)。依頼のフォルダの外の
+    絶対パス・依頼が名指した実装言語と違う系統も同じ (2026-09-26 ライブ監査 K04:
+    キッチンタイマーの依頼に別の依頼のフォルダの ``md_toc.py``)。
     """
     paths = skeleton_paths(data)
     if not paths:
         return "empty"
+    if _outside_request(data, query):
+        return "outside the requested folder"
+    requested = languages.requested_families(query)
+    family, _ = languages.family_of(paths)
+    if requested and family is not None and family not in requested:
+        return f"{family} files for a {'/'.join(sorted(requested))} request"
     named = {
         PurePosixPath(m.group()).name.lower()
         for m in languages.FILE_NAME_IN_TEXT_RE.finditer(query or "")
@@ -170,24 +247,47 @@ def skeleton_problem(data: dict, query: str) -> str:
     return ""
 
 
+def _is_test_file(path: str) -> bool:
+    """テストファイルの名前か (``test_x.py`` / ``x_test.py`` / ``x.test.js`` / ``x.spec.ts``)。"""
+    pure = PurePosixPath(path)
+    stem = pure.name[: -len(pure.suffix)] if pure.suffix else pure.name
+    return stem.startswith("test_") or stem.endswith(("_test", ".test", ".spec"))
+
+
 def skeleton_paths(data: dict) -> list[str]:
-    """骨組みのモジュールのパス (テスト・データファイルは除く)。"""
+    """骨組みのモジュールのパス (テスト・データファイルは除く)。
+
+    ``md_toc_test.py`` のような後置の名前もテスト (2026-09-26 ライブ監査 K04 run2 で
+    モジュールとして生成された)。依頼されたテストは ``tests`` に持つ (f_10 §11.1-1)。
+    """
     out = []
     for m in data.get("modules") or []:
         path = _norm_path(m.get("path", ""))
         suffix = PurePosixPath(path).suffix.lower()
-        if not path or PurePosixPath(path).name.startswith("test_") or suffix in languages.DATA_SUFFIXES:
+        if not path or _is_test_file(path) or suffix in languages.DATA_SUFFIXES:
             continue
         out.append(path)
     return out
 
 
-def normalize_skeleton(data: dict) -> tuple[dict, str]:
+def _file_names(values) -> list[str]:
+    """骨組みの ``tests`` / ``data_files`` を拡張子付きのファイル名の列にする (重複は除く)。"""
+    out: list[str] = []
+    for value in values or []:
+        name = PurePosixPath(_norm_path(str(value))).name
+        if name and PurePosixPath(name).suffix and name not in out:
+            out.append(name)
+    return out
+
+
+def normalize_skeleton(data: dict, query: str = "") -> tuple[dict, str]:
     """骨組みを検証・正規化する。戻り値は (正規化済み骨組み, 出力フォルダ)。
 
     モジュールのパスは作業フォルダでは平置き (``src/<name>.py``) にし、依頼が名指した共通の
     フォルダ (``todo_app/``) は出力先の接頭辞として返す。使えなければ ``({}, "")``。
+    モデルが書いた絶対パスは先に出力先からの相対へ直す (``_rebase_absolute_paths``)。
     """
+    data = _rebase_absolute_paths(data, query)
     kept = set(skeleton_paths(data))
     modules = [
         {**m, "path": _norm_path(m.get("path", ""))} for m in data.get("modules") or []
@@ -239,6 +339,11 @@ def normalize_skeleton(data: dict) -> tuple[dict, str]:
         "entry_module": entry if entry in names else "",
         "usage": str(data.get("usage") or ""),
         "examples": [e for e in examples if e["module"] in names and e["module"].endswith(".py")],
+        "data_files": [
+            n for n in _file_names(data.get("data_files"))
+            if PurePosixPath(n).suffix.lower() in languages.DATA_SUFFIXES
+        ],
+        "tests": _file_names(data.get("tests")),
     }, folder
 
 
@@ -287,6 +392,57 @@ def _module_instruction(
             f"```{languages.fence_language(d)}\n# {d}\n{written[d][:6000]}\n```" for d in deps
         ) + "\n"
     return f"{shared}{SHARED_CONTEXT_BOUNDARY}{task}"
+
+
+_DATA_FILE_TASK = """\
+Write the complete file `{path}`.
+
+It is a data file the request asks for (for example sample input). Keep it small, make it realistic, and
+make it valid input for the code below (same columns / keys / format the code reads).
+- Output only the file content.
+"""
+
+
+def _requested_data_files(skeleton: dict, query: str, folder: str) -> list[str]:
+    """骨組みの ``data_files`` のうち、依頼文に名前があり、配信先にまだ無いもの (f_10 §11.1-1)。
+
+    モデルが発明した名前 (依頼文に無い) は採らない。依頼のフォルダに既にあるファイルは入力なので作らない。
+    """
+    names = skeleton.get("data_files") or []
+    if not names:
+        return []
+    in_query = {
+        PurePosixPath(m.group()).name.lower() for m in languages.FILE_NAME_IN_TEXT_RE.finditer(query or "")
+    }
+    from backend.free.agent.meta_cognitive_task_exec import delivery_roots
+
+    roots = delivery_roots(query)
+    out = []
+    for name in names:
+        if name.lower() not in in_query:
+            continue
+        try:
+            exists = any((root / folder / name).exists() or (root / name).exists() for root in roots)
+        except OSError:
+            exists = False
+        if exists:
+            logger.info("staged v2: requested data file %s already exists; not generating it", name)
+            continue
+        out.append(name)
+    return out
+
+
+def _data_file_instruction(
+    skeleton: dict, path: str, code_map: dict[str, str], *, request: str, brief: str,
+) -> str:
+    """依頼されたデータファイルの生成指示 (書き上がったコードを見て形式を合わせる)。"""
+    shared = (f"{brief}\n\n" if brief else "") + render_skeleton_context(skeleton, request)
+    code = "\n".join(
+        f"```{languages.fence_language(p)}\n# {p}\n{c[:6000]}\n```" for p, c in code_map.items()
+    )
+    return f"{shared}{SHARED_CONTEXT_BOUNDARY}" + _DATA_FILE_TASK.format(path=path) + (
+        f"\nCode of this deliverable:\n{code}\n" if code else ""
+    )
 
 
 def generation_waves(modules: list[dict]) -> list[list[dict]]:
@@ -465,6 +621,27 @@ def break_undeclared_cycles(
     return out, errors
 
 
+
+def _declared_signatures(modules: list[dict]) -> dict[str, str]:
+    """骨組みが宣言した関数の signature (``"stem.関数名"`` → ``def f(...)``)。
+
+    モジュール間の引数の数が食い違ったとき、どちらが骨組みから外れたかを決めるのに使う
+    (``check_call_arity``、定義側が外れていれば定義側を作り直す)。
+    """
+    out: dict[str, str] = {}
+    for m in modules:
+        path = str(m.get("path") or "")
+        if not path.endswith(".py"):
+            continue
+        stem = PurePosixPath(path).stem
+        for c in m.get("components") or []:
+            sig = str(c.get("signature") or "").strip()
+            head = sig.removeprefix("async ").removeprefix("def ").split("(", 1)[0].strip()
+            if sig and head.isidentifier():
+                out[f"{stem}.{head}"] = sig
+    return out
+
+
 async def run_staged_v2_pipeline(
     *,
     query: str,
@@ -490,7 +667,7 @@ async def run_staged_v2_pipeline(
     from backend.free.generation.direct_codegen import generate_single_file
     from backend.free.loop.staged import RunEventLog, RunRecordStore, WorkspaceManager
     from backend.free.loop.staged.test_runner import StagedTestRunner
-    from backend.i18n_helper import get_locale
+    from backend.i18n_helper import get_locale, msg
     from backend.io.id_registry import new_id
 
     t_start = time.monotonic()
@@ -506,6 +683,8 @@ async def run_staged_v2_pipeline(
     deadline = t_start + float(total_timeout_sec)
     locale = get_locale()
     phase_sec: dict[str, float] = {}
+    # 接頭辞 KV を使わずに作り直した回数 (骨組み + 本文、c_14 §2.2)。notes に残す
+    gen_stats: dict = {}
 
     def _remaining() -> float:
         return deadline - time.monotonic()
@@ -570,12 +749,13 @@ async def run_staged_v2_pipeline(
             reference=("\nReference design document:\n" + reference_doc + "\n") if reference_doc else "",
             language_name=_language_name(locale),
         )
-        async def _skeleton(system: str | None, max_tokens: int) -> dict:
+        async def _skeleton(system: str | None, max_tokens: int, **cache_kwargs) -> dict:
             try:
                 return await aux_client.generate_json(
                     prompt, system=system, purpose="create_skeleton",
                     max_tokens=max_tokens, temperature=0.2,
                     timeout=max(_CALL_FLOOR_SEC, min(240.0 + len(reference_doc) * 0.05, _remaining())),
+                    **cache_kwargs,
                 ) or {}
             except Exception as exc:  # noqa: BLE001 - 骨組みが無ければ longform へ倒す
                 logger.warning("staged v2: skeleton generation failed: %s", exc)
@@ -586,8 +766,13 @@ async def run_staged_v2_pipeline(
         if problem and _remaining() > _CALL_FLOOR_SEC * 2:
             # 空 (上限で切れた) / 依頼と無関係 (ブリーフの過去の作業に引きずられた) は 1 回だけ、
             # ブリーフを外し上限を上げて作り直す (2026-09-25 create ベンチ q1 / p1)
-            logger.info("staged v2: skeleton %s; retrying once without the brief", problem)
-            raw = await _skeleton(None, _SKELETON_RETRY_MAX_TOKENS)
+            # 接頭辞 KV も使わない: 壊れたスロット KV は空白だけの JSON を返す (2026-09-26
+            # ライブ監査 #5、c_14 §2.2)
+            logger.warning(
+                "staged v2: skeleton %s; retrying once without the brief and the prompt cache", problem,
+            )
+            gen_stats["cache_bypass_retries"] = int(gen_stats.get("cache_bypass_retries") or 0) + 1
+            raw = await _skeleton(None, _SKELETON_RETRY_MAX_TOKENS, cache_prompt=False)
     paths = skeleton_paths(raw)
     family, other = languages.family_of(paths)
     if paths and (family is None or family not in enabled_families):
@@ -596,7 +781,7 @@ async def run_staged_v2_pipeline(
             other or [f"family:{family}"], run_id=run_id, workspace_root=str(ws.root),
         )}
         return
-    skeleton, folder = normalize_skeleton(raw)
+    skeleton, folder = normalize_skeleton(raw, query)
     phase_sec["skeleton"] = round(time.monotonic() - t0, 1)
     if not skeleton:
         logger.info("staged v2: empty skeleton; falling back (%s)", "no aux" if aux_client is None else "no modules")
@@ -648,7 +833,7 @@ async def run_staged_v2_pipeline(
                 return ""
             out = await generate_single_file(
                 client, instruction, module["path"], max_tokens=_MODULE_MAX_TOKENS,
-                request_timeout=max(_CALL_FLOOR_SEC, _remaining()), id_slot=slot,
+                request_timeout=max(_CALL_FLOOR_SEC, _remaining()), id_slot=slot, stats=gen_stats,
             )
             return out.get(module["path"], "")
         return _job
@@ -674,13 +859,13 @@ async def run_staged_v2_pipeline(
             out = await generate_single_file(
                 client, advisory_instruction, advisory_path,
                 max_tokens=_ADVISORY_TEST_MAX_TOKENS,
-                request_timeout=max(_CALL_FLOOR_SEC, _remaining()), id_slot=slot,
+                request_timeout=max(_CALL_FLOOR_SEC, _remaining()), id_slot=slot, stats=gen_stats,
             )
             return out.get(advisory_path, "")
         jobs.append(_advisory_job)
     results = await _run_jobs(jobs, slots)
     for m, content in zip(waves[0], results[: len(waves[0])]):
-        if content:
+        if content or allows_empty_content(m["path"]):
             code_map[m["path"]] = content
     advisory_src = results[len(waves[0])] if advisory else ""
     for wave in waves[1:]:
@@ -691,7 +876,7 @@ async def run_staged_v2_pipeline(
             for m in wave
         ], slots)
         for m, content in zip(wave, wave_results):
-            if content:
+            if content or allows_empty_content(m["path"]):
                 code_map[m["path"]] = content
     phase_sec["generate"] = round(time.monotonic() - t0, 1)
 
@@ -715,6 +900,12 @@ async def run_staged_v2_pipeline(
             errors = cycle_errors + [
                 e for e in errors if "cannot import name" not in e and "partially initialized" not in e
             ]
+        # モジュール間呼び出しの引数の数 (実行すれば必ず TypeError になる確定的な欠陥。
+        # 呼び出し側のモジュールを作り直しに回す、2026-09-27 残件)
+        errors += check_call_arity(
+            {p: c for p, c in wired.items() if p.endswith(".py")},
+            declared=_declared_signatures(modules),
+        )
         # Python 以外: 構文・参照の整合・実行環境による構文検査 (f_10 §12.3 / §12.4)
         errors += await run_in_executor_with_context(
             asyncio.get_running_loop(), None,
@@ -754,7 +945,7 @@ async def run_staged_v2_pipeline(
             repair_jobs.append(_module_job(m, instruction))
         repaired = await _run_jobs(repair_jobs, slots)
         for m, content in zip(failing, repaired):
-            if content:
+            if content or allows_empty_content(m["path"]):
                 code_map[m["path"]] = content
         missing = [m["path"] for m in modules if m["path"] not in code_map]
         code_map, smoke_errors, static_issues = await _check(code_map)
@@ -767,7 +958,7 @@ async def run_staged_v2_pipeline(
     tasks_failed = len(missing) + (1 if smoke_errors else 0)
     verification: list[str] = []
     if missing:
-        verification.append(f"未生成: {', '.join(missing)}")
+        verification.append(msg("create.not_generated", names=", ".join(missing)))
     verification.append(
         "import / 静的検査: " + ("合格" if not smoke_errors else f"エラー {len(smoke_errors)} 件")
     )
@@ -778,8 +969,44 @@ async def run_staged_v2_pipeline(
     })
     yield {"kind": "step", "payload": payload}
 
+    # ── 3b. 依頼されたデータファイル (コードの後、f_10 §11.1-1) ─────────
+    # モジュールとは別に返す (smoke・as-built 文書の対象外)。依頼されたテストもここへ入る (§4)
+    extra_files: dict[str, str] = {}
+    notices: list[str] = []
+    data_files = _requested_data_files(skeleton, query, folder)
+    if data_files and code_map and _remaining() >= _CALL_FLOOR_SEC:
+        yield {"kind": "step", "payload": {
+            "type": "task_progress", "detail": msg("create.generating_data_files", names=", ".join(data_files)),
+            "status": "running",
+        }}
+        data_out = await _run_jobs([
+            _module_job({"path": name}, _data_file_instruction(
+                skeleton, name, code_map, request=query, brief=brief,
+            ))
+            for name in data_files
+        ], slots)
+        for name, content in zip(data_files, data_out):
+            if content:
+                extra_files[name] = content
+                ws.write_file(name, content, kind="src", stage="code", task_id=_task_id(name))
+    missing_data = [name for name in data_files if name not in extra_files]
+    if missing_data:
+        tasks_failed += len(missing_data)
+        verification.append(msg("create.not_generated", names=", ".join(missing_data)))
+    # 同梱していないローカル資産の読み込みは警告だけ (作り直し・tasks_failed へ波及させない、f_10 §12.3-5)
+    asset_refs = languages.missing_assets({**code_map, **extra_files}, query=query, folder=folder)
+    if asset_refs:
+        warning = msg("create.missing_assets", refs=", ".join(f"{p} → {r}" for p, r in asset_refs))
+        verification.append(warning)
+        notices.append(warning)
+
     # ── 4. (Pro) 契約テスト ──────────────────────────────────────
     advisory_note = ""
+    # 依頼されたテストの名前 (Python の参考テストを配信するので .py だけ。無ければ test_<入口>.py)
+    requested_tests = [n for n in skeleton.get("tests") or [] if n.endswith(".py")] or (
+        [f"test_{PurePosixPath(py_modules[0]['path']).stem}.py"] if skeleton.get("tests") and py_modules
+        else list(skeleton.get("tests") or [])
+    )
     if tests_enabled and code_map and not smoke_errors:
         t0 = time.monotonic()
         runner = StagedTestRunner(
@@ -803,11 +1030,32 @@ async def run_staged_v2_pipeline(
                     for m in failing if m["path"] in code_map
                 ]
                 repaired = await _run_jobs(repair_jobs, slots)
-                for m, content in zip([m for m in failing if m["path"] in code_map], repaired):
-                    if content:
-                        code_map[m["path"]] = content
-                        ws.write_file(m["path"], content, kind="src", stage="code",
-                                      task_id=_task_id(m["path"]))
+                candidates = {
+                    m["path"]: content
+                    for m, content in zip([m for m in failing if m["path"] in code_map], repaired)
+                    if content
+                }
+                # 作り直した版は smoke を通してから採る (f_10 §11.1-4)。いまの code_map は smoke
+                # 合格済みなので、落ちたモジュールは修正前の版に戻す (K05 run2: 構文エラー版が
+                # smoke 合格の元コードに取って代わった)
+                while candidates:
+                    wired_trial, trial_errors, _ = await _check({**code_map, **candidates})
+                    if not trial_errors:
+                        break
+                    blamed = [p for p in candidates if _errors_for(p, trial_errors)] or list(candidates)
+                    for path in blamed:
+                        logger.warning(
+                            "staged v2: the contract repair of %s failed the smoke check (%s); "
+                            "keeping the previous version", path, "; ".join(trial_errors[:2]),
+                        )
+                        candidates.pop(path)
+                    verification.append(msg("create.contract_repair_reverted", paths=", ".join(blamed)))
+                if candidates:
+                    # smoke に通った組 (配線後) をそのまま採る
+                    for path, content in wired_trial.items():
+                        if code_map.get(path) != content:
+                            code_map[path] = content
+                            ws.write_file(path, content, kind="src", stage="code", task_id=_task_id(path))
                 gate = await asyncio.to_thread(runner.run, test_logical_path="test_examples.py")
             if gate.skipped:
                 verification.append(f"契約テスト: 実行できず ({gate.skip_reason})")
@@ -830,12 +1078,22 @@ async def run_staged_v2_pipeline(
                     else "参考テスト: 実行できず" if agate.skipped
                     else f"参考テスト: 一部不合格 ({agate.error or ''}) — 警告のみ"
                 )
+                if requested_tests:
+                    # 依頼されたテストは参考テストを依頼の名前で配信する (f_10 §11.1-1 / §11.3)
+                    extra_files[requested_tests[0]] = linted
+                    if not agate.ok and not agate.skipped:
+                        notices.append(msg("create.requested_tests_failing", name=requested_tests[0]))
             else:
                 advisory_note = "参考テスト: なし"
             if dropped:
                 advisory_note += f" (壊れやすい検査を {len(dropped)} 件除外)"
             verification.append(advisory_note)
         phase_sec["tests"] = round(time.monotonic() - t0, 1)
+    if requested_tests and not tests_enabled:
+        # テスト工程の無い構成 (Free) — 作っていないことを本文で伝える
+        notices.append(msg("create.requested_tests_not_available", names=", ".join(requested_tests)))
+    elif requested_tests and not any(name in extra_files for name in requested_tests):
+        notices.append(msg("create.requested_tests_not_generated", names=", ".join(requested_tests)))
 
     # ── 5. as-built 文書 ─────────────────────────────────────────
     other_facts = {p: languages.facts(p, c) for p, c in code_map.items() if not p.endswith(".py")}
@@ -868,9 +1126,12 @@ async def run_staged_v2_pipeline(
             "output_folder": folder, "phase_sec": phase_sec,
             "static_issues": static_issues[:20], "smoke_errors": smoke_errors[:20],
             "verification": verification,
+            "cache_bypass_retries": int(gen_stats.get("cache_bypass_retries") or 0),
+            "notices": notices,
         },
         "run_id": run_id,
         "code_map": code_map,
+        "extra_files": extra_files,
         "spec_md": spec_md,
         "flowchart_md": flowchart_md,
         "tasks_failed": tasks_failed,

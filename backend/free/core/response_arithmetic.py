@@ -381,3 +381,33 @@ def find_breakdown_contradictions(text: str) -> list[str]:
                 f"breakdown of {label} ({value:g}{unit}) sums to {total:g}{unit}"
             )
     return found
+
+
+def format_ja_large_number(value: float) -> str | None:
+    """1 万以上の数を「148万244.28492」のように万・億で読み下す (純粋関数)。
+
+    計算結果を万表記へ直す変換をモデルに任せると写し間違える (2026-09-27 実機:
+    1480244.28492 を「148 万 2,244 円」)。読み取り側 (:func:`_iter_ja_numbers`) と
+    往復で一致する形だけを返す。1 万未満・非有限は None。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")) or not 10_000 <= abs(value) < 10**12:
+        # 1 兆以上は読み取り側 (億・万・素) と往復できないので読み下さない
+        return None
+    sign = "-" if value < 0 else ""
+    text = f"{abs(value):.12g}" if isinstance(value, float) else str(abs(value))
+    if "e" in text or "E" in text:
+        return None
+    whole, _, frac = text.partition(".")
+    n = int(whole)
+    oku, rest = divmod(n, 100_000_000)
+    man, base = divmod(rest, 10_000)
+    parts = []
+    if oku:
+        parts.append(f"{oku}億")
+    if man:
+        parts.append(f"{man}万")
+    if base or frac:
+        parts.append(f"{base}" + (f".{frac}" if frac else ""))
+    return sign + "".join(parts)

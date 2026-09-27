@@ -121,6 +121,8 @@ def observe_sleep_liveness(
 #: 0 秒で起きると生成がまだ in-flight のまま ``chat_in_flight`` で弾かれ、次の応答が
 #: 来るまで再試行できない (実質デッドロック)。生成が畳まれる分の余裕を必ず取る。
 _FULL_MIN_WAIT_SEC = 30.0
+#: 訂正の検証待ちがあるとき、静穏窓が明けてから Full を起こすまでの余裕 (秒)。
+_VERIFY_WAKE_MARGIN_SEC = 30.0
 
 #: 期限切れ / 前倒し要求済みの Full が、進行中の生成の終了を待つ上限 (秒)。
 #: これを超えても生成中なら諦めて次の応答で再試行する (生成に割り込まない)。
@@ -212,6 +214,12 @@ class SleepTimeScheduler:
         #: 「次の Full を前倒しで走らせる」要求 (:meth:`request_full_soon`)。
         #: 訂正ターンのように、記憶へ早く反映しないと意味が薄れる出来事で立てる。
         self._full_requested: bool = False
+        #: 検証待ちの訂正候補を残した Full の後に、前倒しを **再要求済み** か。
+        #: 空振りが続く間は再要求しない (:meth:`_rerequest_for_unverified_corrections`)。
+        self._corrections_rerequested: bool = False
+        #: 検証を見送った訂正候補が残っているか。残っている間は Full の待機を
+        #: 静穏窓の少し後まで縮める (:meth:`_full_wait_seconds`)。
+        self._verification_waiting: bool = False
         #: 期限切れ / 前倒し要求で **実際に走り出した** Full の実行中フラグ。
         #: True の間は :meth:`on_user_input` が worker も待機タスクも止めない
         #: (:meth:`_schedule_full` の説明を参照)。
@@ -521,6 +529,49 @@ class SleepTimeScheduler:
         self._full_requested = True
         logger.info("Trigger B: full sleep-time requested early (reason=%s)", reason)
 
+    def _rerequest_for_unverified_corrections(self, result: object) -> None:
+        """検証待ちの訂正候補を 1 件も検証できなかった Full の後、Full を再要求する。
+
+        Step 8.0 はチャットの静穏窓でしか検証を出さないので、会話が続く間の
+        forced Full は検証 0 件で終わりうる (2026-09-26 監査 #12: 11 回とも
+        全滅し、前倒し要求はそのまま消費された)。再要求は **1 回だけ** —
+        空振りが続く間に繰り返すと会話中ずっと前倒しし続ける。1 件でも検証
+        できたら (または待ちが無くなったら) 再要求の権利を戻す。
+        """
+        if not isinstance(result, dict):
+            return
+        pending = result.get("corrections_verified" + INPUT_SUFFIX)
+        verified = result.get("corrections_verified")
+        if not isinstance(pending, int) or not isinstance(verified, int):
+            return
+        # 静穏窓で見送った件数は死活監視の母数外なので別キーで来る。
+        deferred = result.get("corrections_deferred")
+        if isinstance(deferred, int):
+            pending += deferred
+        self._verification_waiting = pending > 0 and verified == 0
+        if pending <= 0 or verified > 0:
+            self._corrections_rerequested = False
+            return
+        if self._corrections_rerequested:
+            return
+        self._corrections_rerequested = True
+        self.request_full_soon("unverified_corrections")
+        # フラグだけだと次の応答が来るまで誰もタイマーを張らず、離席中は Full が
+        # 走らない。この Full のタスクが終わった直後に待機タスクを張り直す
+        # (``on_response_sent`` と同じ ``_schedule_full``)。
+        try:
+            asyncio.get_running_loop().call_soon(self._arm_requested_full)
+        except RuntimeError:  # イベントループ外 (同期テスト等) では次の応答に任せる
+            pass
+
+    def _arm_requested_full(self) -> None:
+        """前倒し要求済みの Full の待機タスクを張る (既に待機中なら何もしない)。"""
+        if self._worker is None or not self._full_requested:
+            return
+        if self._full_task is not None and not self._full_task.done():
+            return
+        self._full_task = asyncio.create_task(self._schedule_full())
+
     def on_response_sent(self) -> None:
         """応答完了通知: Trigger B (Full) タイマーをリセット（§8.1）"""
         self._last_response = time.time()
@@ -787,6 +838,15 @@ class SleepTimeScheduler:
             # chat_in_flight で弾かれ、次の応答まで再試行できない)。
             return _FULL_MIN_WAIT_SEC
         idle_s = float(self.full_idle_minutes) * 60
+        if self._verification_waiting:
+            # 検証を見送った訂正が残る間は、静穏窓が明けた頃に起きる。再要求は
+            # 1 回だけなので、会話中に使い切ると会話が止まっても次の Full は
+            # full_idle_minutes 後になり、その間の別セッションが訂正前の値を
+            # 読む (2026-09-27 再監査)。応答のたびに張り直される通常の待機を
+            # 縮めるだけなので、会話中のチャットには割り込まない。
+            from backend.free.memory.sleep.pseudo_query import quiet_seconds
+
+            idle_s = min(idle_s, quiet_seconds(self._config) + _VERIFY_WAKE_MARGIN_SEC)
         limit = self.full_max_defer_minutes
         if limit <= 0:
             return idle_s
@@ -1071,6 +1131,12 @@ class SleepTimeScheduler:
                 logger.info("Trigger B: skipped, user is active")
                 success = True
                 skipped_reason = "user_active"
+                if self._verification_waiting:
+                    # 見送って終わると、次の応答が来るまで誰も張り直さず、離席中の
+                    # 検証が走らない (2026-09-27 再監査: 02:47 に起きて見送った後
+                    # 何も起きなかった)。アクティブでなくなるまで待機を張り直す。
+                    self._full_task = asyncio.create_task(self._schedule_full())
+                    handed_off = True
                 return
 
             # 上の in-flight 待ち / アイドル待ちには await があるので、ここまでに
@@ -1109,6 +1175,7 @@ class SleepTimeScheduler:
             with aux_failure_scope() as aux_failures:
                 full_result = await self._worker.run_full(llm_for_sleep)
             success = True
+            self._rerequest_for_unverified_corrections(full_result)
 
         except asyncio.CancelledError:
             cancelled = True

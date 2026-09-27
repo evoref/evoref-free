@@ -17,12 +17,14 @@ from backend.free.core.intent_vocab import (
     refers_to_previous_output,
 )
 from backend.free.core.prompt_blocks import current_datetime_block
+from backend.free.core.response_dates import ISO_DATE_RE, JP_DATE_RE
 from backend.free.core.relative_date import (
     DAY_OFFSETS as _DAY_OFFSETS,
     WEEK_OFFSETS as _WEEK_OFFSETS,
 )
 from backend.free.core.text_quality import (
     carries_no_assertion,
+    detect_lang,
     states_no_user_value,
     conversational_numeric_claims,
     find_superseded_claim,
@@ -275,16 +277,23 @@ _RELATIVE_DATE_WORDS = "|".join(
         set(_DAY_OFFSETS) | set(_WEEK_OFFSETS), key=len, reverse=True,
     )
 )
+#: 明示日付 (和文の月日 / ISO) の読み取りは ``core.response_dates`` が SSOT
+#: (``_has_date_signal``)。ここは相対表現だけを持つ。
 _DATE_CONTEXT_RE = re.compile(
-    r"\d{1,4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
-    r"|\d{1,2}\s*月\s*\d{1,2}\s*日"
-    r"|\d{4}-\d{1,2}-\d{1,2}"
-    r"|" + _RELATIVE_DATE_WORDS +
+    _RELATIVE_DATE_WORDS +
     r"|今月|来月|先月|今年|来年|去年|昨年|何日後|何日前|日後|日前|何曜日"
     r"|\d\s*(?:週間|か月|ヶ月|カ月|ヵ月|年)\s*(?:後|前)"
     r"|(?<![A-Za-z])(?:today|tomorrow|yesterday|this\s+(?:week|month|year))"
     r"(?![A-Za-z])",
 )
+
+
+def _has_date_signal(text: str) -> bool:
+    """明示日付か相対表現を含むか (純粋関数)。"""
+    return bool(
+        JP_DATE_RE.search(text) or ISO_DATE_RE.search(text)
+        or _DATE_CONTEXT_RE.search(text)
+    )
 
 
 def _current_date_note(history: list[ChatMessage]) -> str:
@@ -309,7 +318,7 @@ def _current_date_note(history: list[ChatMessage]) -> str:
     )
     if last_user is None:
         return ""
-    if not _DATE_CONTEXT_RE.search(str(last_user.get("content") or "")):
+    if not _has_date_signal(str(last_user.get("content") or "")):
         return ""
     return current_datetime_block(
         "「今日」「明日」等の相対表現の解釈と、文中の日付が過去か未来かの"
@@ -473,6 +482,44 @@ def _is_persona_question(text: str) -> bool:
         ):
             return True
     return False
+
+
+#: 発話の言語が応答言語 (``i18n.prompt_locale``) と違うターンに付ける注記。
+#: キーは **発話の** 言語。両言語で書くのは、どちらの locale の system でも読めるように。
+_RESPONSE_LANGUAGE_NOTES: dict[str, str] = {
+    "en": "（このターンのユーザー発言は英語だけで書かれているので、英語で答えること。Answer in English.）",
+    "ja": "(This turn's user message is written only in Japanese, so answer in Japanese. 日本語で答えること。)",
+}
+
+
+#: 英語の「文」とみなす最小の語数 (2 文字以上のラテン文字列)。
+_ENGLISH_MIN_WORDS = 3
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+_URL_OR_FENCE_RE = re.compile(r"```.*?```|https?://\S+|\S*[\\/]\S*", re.DOTALL)
+
+
+def _response_language_note(history: list[ChatMessage]) -> str:
+    """英語だけの発言は英語で答える合図 (c_04 §8 原則 1、2026-09-26)。
+
+    発話の言語 (``text_quality.detect_lang``: 和文文字が 1 つでもあれば ja、無くて
+    ラテン文字があれば en、コードフェンスの中は数えない) が応答言語と違うターンに
+    だけ確定の注記を返す。英語は **3 語以上の文** に限る (URL・パス・
+    ファイル名・「OK」や 2 語までの入力は合図にしない)。静的 system の条件付きの言語指示だけだと、9B は同じ会話で
+    英語の質問に日本語・英語と揺れた (2026-09-26 ライブ監査 C06#1 / #5)。
+    """
+    last_user = next(
+        (t for t in reversed(history) if t.get("role") == "user"), None,
+    )
+    if last_user is None:
+        return ""
+    text = str(last_user.get("content") or "")
+    lang = detect_lang(text)
+    if lang == "en" and len(_ENGLISH_WORD_RE.findall(_URL_OR_FENCE_RE.sub(" ", text))) < _ENGLISH_MIN_WORDS:
+        # URL・コマンド・ファイル名・「OK」だけの発言は英語の文ではない
+        return ""
+    if not lang or lang == prompt_locale():
+        return ""
+    return _RESPONSE_LANGUAGE_NOTES.get(lang, "")
 
 
 def _persona_question_note(history: list[ChatMessage]) -> str:
@@ -1736,6 +1783,13 @@ def build_messages(
     if rag_block:
         dyn_parts.append(rag_block)
 
+    # 3.5 現在日時の注記。参考枠の内側 (区切りの前) に置く — 生クエリの直後に
+    #     区切り無しで付けると、ユーザー発言の一部として要約される
+    #     (2026-09-26 監査 C02#5、docs/c_02 §6.3)。
+    date_note = _current_date_note(history)
+    if date_note:
+        dyn_parts.append(date_note)
+
     # 静的 system メッセージ (動的部は含めない)
     messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
 
@@ -1836,11 +1890,12 @@ def build_messages(
         }
         logger.warning("build_messages: %s", truncation_note)
 
-    # 現在日付 / 文字数上限の注記は **最後の user メッセージ末尾** に置く。
+    # 人格 / 訂正対象 / 文字数上限の注記は **最後の user メッセージ末尾** に置く。
     # system へ足すと prefix KV キャッシュが毎ターン無効化される
     # (system は静的に保つ設計)。生クエリの直後は指示追従が最も効く位置でもある。
+    # 現在日時の注記は上の動的ブロック (参考枠の内側) に入れてある。
     for note in (
-        _current_date_note(history),
+        _response_language_note(history),
         _persona_question_note(history),
         _correction_target_note(history),
         _char_limit_note(history),
@@ -1957,8 +2012,13 @@ def build_messages_for_loop(
     # 文字数上限が届かない (本関数の唯一の消費者が MetaCognitiveAgent のため、
     # 層が変わっただけで制約が消える)。いずれも (history) -> str の純粋関数で、
     # シグナルが無ければ空文字列を返すのでトークン浪費にはならない。
+    # 現在日時の注記は build_messages と同じく参考枠の内側 (区切りの前) へ置く
+    # (2026-09-26 監査 C02#5)。
+    date_note = _current_date_note(history)
+    if date_note:
+        _prepend_dynamic_block(trimmed_history, date_note)
     for note in (
-        _current_date_note(history),
+        _response_language_note(history),
         _persona_question_note(history),
         _char_limit_note(history),
         _output_form_note(history),

@@ -15,7 +15,9 @@ from __future__ import annotations
 import ast
 import re
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+
+from backend.free.core.intent_vocab import is_absolute_path_text
 
 
 @dataclass(frozen=True)
@@ -85,12 +87,17 @@ def build_example_tests(cases: list[ExampleCase]) -> str:
         '"""骨組み (契約) の入出力例から自動で組んだテスト (staged v2)。"""',
         "",
         "import importlib",
+        "import importlib.util",
         "",
         "import pytest",
         "",
         "",
         "def _ns(name):",
-        "    return dict(vars(importlib.import_module(name)))",
+        "    # 評価のたびにモジュールを新しく読み込む (例どうし・2 回の評価で状態を共有しない)",
+        "    spec = importlib.util.find_spec(name)",
+        "    module = importlib.util.module_from_spec(spec)",
+        "    spec.loader.exec_module(module)",
+        "    return dict(vars(module))",
         "",
         "",
         "def _same(got, exp):",
@@ -106,6 +113,18 @@ def build_example_tests(cases: list[ExampleCase]) -> str:
         "        return ast.literal_eval(last)",
         "    except (SyntaxError, ValueError):",
         "        return last",
+        "",
+        "",
+        "def _value(call, module, exp):",
+        "    buf = io.StringIO()",
+        "    try:",
+        "        with contextlib.redirect_stdout(buf):",
+        "            got = eval(call, _ns(module))",
+        "    except OSError as exc:  # 例が環境 (ファイル等) に依存していた — 契約の判定から外す",
+        "        pytest.skip(f'example depends on the environment: {exc}')",
+        "    if got is None and exp is not None:",
+        "        got = _printed(buf.getvalue())",
+        "    return got",
     ]
     lines[2:2] = ["import ast", "import contextlib", "import io"]
     for i, case in enumerate(cases, start=1):
@@ -113,15 +132,11 @@ def build_example_tests(cases: list[ExampleCase]) -> str:
             "",
             "",
             f"def test_example_{i}():",
-            "    buf = io.StringIO()",
-            "    try:",
-            "        with contextlib.redirect_stdout(buf):",
-            f"            got = eval({case.call!r}, _ns({case.module!r}))",
-            "    except OSError as exc:  # 例が環境 (ファイル等) に依存していた — 契約の判定から外す",
-            "        pytest.skip(f'example depends on the environment: {exc}')",
             f"    exp = {case.expected}",
-            "    if got is None and exp is not None:",
-            "        got = _printed(buf.getvalue())",
+            f"    got = _value({case.call!r}, {case.module!r}, exp)",
+            "    # 同じ式で値が変わる (乱数・時刻) 例は固定値の契約にできない — 判定から外す",
+            f"    if not _same(_value({case.call!r}, {case.module!r}, exp), got):",
+            "        pytest.skip('example is not deterministic (the same call returned different values)')",
             "    assert _same(got, exp), (got, exp)",
         ]
     return "\n".join(lines) + "\n"
@@ -140,7 +155,37 @@ def _test_functions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctio
     return out
 
 
+def _is_absolute_path(text: str) -> bool:
+    """ホストの絶対パスか (ドライブ + 区切り / UNC / 先頭 ``/`` で第 1 成分がホストに実在)。
+
+    ``/api/todos`` のような URL のパスは残す (第 1 成分がホストに無い)。
+    """
+    value = text.strip()
+    if "\n" in value or not is_absolute_path_text(value):
+        return False
+    if value.startswith("/"):
+        first = value.lstrip("/").split("/", 1)[0]
+        try:
+            return bool(first) and Path("/" + first).exists()
+        except OSError:
+            return False
+    return True
+
+
+def _absolute_path_in(node: ast.AST) -> str:
+    """ノードの下にある絶対パスの文字列定数 (無ければ空)。"""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and _is_absolute_path(sub.value):
+            return sub.value
+    return ""
+
+
 def _brittle_reason(func: ast.AST, allowed_text: str) -> str:
+    # テストはサンドボックス (作業フォルダ) の外に触れない。依頼文にある文字列でも絶対パスは落とす
+    # (2026-09-26 ライブ監査 K08: 依頼のフォルダへ test_files/ 等を作った)
+    path = _absolute_path_in(func)
+    if path:
+        return f"uses an absolute path ({path})"
     for node in ast.walk(func):
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -174,6 +219,17 @@ def lint_generated_tests(source: str, *, allowed_text: str) -> tuple[str, list[s
     drop: list[tuple[int, int]] = []
     reasons: list[str] = []
     tests = _test_functions(tree)
+    # モジュール直下・fixture (テスト関数以外) の絶対パスは全テストに効くので、ファイルごと落とす
+    for node in tree.body:
+        if node in tests:
+            continue
+        if isinstance(node, ast.ClassDef):
+            outside = [m for m in node.body if m not in tests]
+            path = next((p for p in map(_absolute_path_in, outside) if p), "")
+        else:
+            path = _absolute_path_in(node)
+        if path:
+            return "", [f"module: uses an absolute path outside a test ({path})"]
     for func in tests:
         reason = _brittle_reason(func, allowed_text)
         if reason:

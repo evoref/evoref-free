@@ -31,6 +31,7 @@ from backend.free.memory.episodic.note import (
     note_patch,
     note_to_evidence,
 )
+from backend.free.memory.notes.pin_detector import note_is_pinned
 from backend.free.memory.episodic.progress import PROGRESS_FILE, EpisodicProgress
 from backend.free.rag.evidence import (
     Evidence,
@@ -525,7 +526,8 @@ class EpisodicStore:
         total = 0
         for note in self.iter_notes(tier="long", include_private=True):
             total += 1
-            if note.pin_flag:
+            # 辞書から外した語の自動 pin は保護しない (f_02 §8.3)。
+            if note_is_pinned(note):
                 continue
             candidates.append((note.accessed_at or note.created_at, note.id))
         # 上限は ``long`` 全体に対する件数。落とせるのは pinned でないものだけ

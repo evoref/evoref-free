@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.free.memory.episodic.note import MemoryNote
+from backend.free.memory.notes.pin_detector import note_is_pinned
 from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
 from backend.free.memory.note_facts import origin_of
 from backend.free.memory.types import (
@@ -42,10 +43,7 @@ from backend.free.core.correction_verdict import (
 from backend.free.core.relative_date import annotate_relative_dates
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
-from backend.free.core.script_ranges import (
-    HIRAGANA,
-    PROLONGED,
-)
+from backend.free.core.correction_target import contrast_pair
 
 logger = get_logger("memory.extractors.base")
 
@@ -90,19 +88,6 @@ def note_verification_rejected(note: object) -> bool:
     return not note_is_verified_correction(note)
 
 
-#: 本人の値更新の言明 —「<旧> ではなく <新> です / にします / になりました」。
-#: 断定の述語で閉じる形だけを採る (「コーヒーではなく紅茶が好きな人もいます」の
-#: ような一般論や、疑問・依頼は含めない)。
-_VALUE_UPDATE_RE = re.compile(
-    r"(?P<old>[^、，,。．はがをもにで]{1,30}?)\s*(?:ではなく|じゃなく)[、，,]?\s*"
-    r"(?P<new>[^。．、，,]{1,40}?)\s*"
-    r"(?:です|でした|にします|にしました|になりました|に変わりました|に変更|へ変更|にした)",
-)
-
-#: ひらがなだけの span。1 文字の旧値を採るかの判定に使う (下記参照)。
-_HIRAGANA_ONLY_RE = re.compile(f"^[{HIRAGANA}{PROLONGED}]+$")
-
-
 def value_update_spans(content: str) -> tuple[str, str] | None:
     """「X ではなく Y」型の本人の値更新から ``(旧値, 新値)`` を取る (純粋関数)。
 
@@ -112,30 +97,12 @@ def value_update_spans(content: str) -> tuple[str, str] | None:
     外れるが、**記憶にとっては本人の値の更新** で、旧値が本人の live 値に逐語で
     在るなら宛先も一意に決まる (2026-09-11 ライブ監査 (j) J-03: 会議の場所が
     「本社」のまま live に残った)。宛先の照合は呼出側 (値アンカー) が行う。
+
+    分解は :func:`backend.free.core.correction_target.contrast_pair` の 1 実装
+    (注入側の未検証候補の注記と同じ (旧, 新) を採る、不変則 #14a)。断定の述語で
+    閉じる形だけ、1 文字の実質名詞 (「妻ではなく夫です」、F-02) も採る。
     """
-    m = _VALUE_UPDATE_RE.search(content or "")
-    if m is None:
-        return None
-    old = m.group("old").strip()
-    new = m.group("new").strip()
-    if not old or not new:
-        return None
-    # 1 文字の旧値を長さだけで落とさない。日本語の続柄・色・方角は 1 文字が
-    # 普通 (妻 / 夫 / 父 / 母 / 兄 / 姉 / 弟 / 妹 / 赤 / 青 / 北 / 南) で、
-    # ``len(old) < 2`` はそれを全部捨てていた。実インシデント (2026-09-14
-    # ライブ監査 F-02): 「妻ではなく夫です」で正規表現は ('妻', '夫') を
-    # 取れているのにガードが None を返し、``value_update`` が立たないまま
-    # Step 8 の「旧値を含む世代だけ畳む」フィルタが素通りして
-    # ``mem.personal.family`` の live 3 件 (息子の学年を含む) が
-    # 「夫です。私の書き間違い」1 件に畳まれ、息子の情報が消えた。
-    #
-    # 代わりに **ひらがな 1 文字だけ** を落とす — 「走るのではなく歩きます」
-    # の ``の`` のような機能語の断片がこの形になる。語彙を列挙して網目を
-    # 細かくする方向ではなく、字種で決める (実質名詞の 1 文字は漢字 /
-    # カタカナ / 英数で書かれる)。
-    if len(old) == 1 and _HIRAGANA_ONLY_RE.match(old):
-        return None
-    return old, new
+    return contrast_pair(content or "")
 
 
 #: 「N 日 / 週間 / か月 の延期・前倒し」— 既存の予定の日付をずらす申告。
@@ -437,7 +404,8 @@ class BaseExtractor:
             origin=origin_of(note),  # type: ignore[arg-type]
             provenances=[prov],
             confidence=confidence,
-            pinned=bool(getattr(note, "pin_flag", False)),
+            # 辞書から外した語の自動 pin は引き継がない (f_02 §8.3)。
+            pinned=note_is_pinned(note),
             # 訂正ターン由来か。**検証済み** (Step 8.0 が assistant / self と
             # 判定した) ノートからだけ引き継ぎ、競合解決が「同一セッション
             # だから微妙ケース」として pending へ落とすのを免除する
@@ -513,7 +481,7 @@ class BaseExtractor:
         dropped = 0
         for note, fact in candidates:
             sid = (note.session_id or "_no_session_") if note else "_no_session_"
-            if note and note.pin_flag:
+            if note_is_pinned(note):
                 if pinned_cap < 0:
                     kept.append((note, fact))
                     per_session_pinned[sid] = per_session_pinned.get(sid, 0) + 1

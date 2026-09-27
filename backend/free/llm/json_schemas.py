@@ -251,6 +251,10 @@ class CreateSkeleton(_StrictModel):
     entry_module: str = ""
     usage: str = ""
     examples: list[SkeletonExample] = Field(default_factory=list)
+    # 依頼が作成を求めたデータファイル (例 "sample.csv") とテストファイル。モジュールには入れない
+    # (f_10 §11.1-1、2026-09-26)
+    data_files: list[str] = Field(default_factory=list)
+    tests: list[str] = Field(default_factory=list)
 
 
 # ── staged クリエイトのタスクグラフ合成 (create_task_graph) ──

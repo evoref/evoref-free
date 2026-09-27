@@ -14,8 +14,9 @@
       ``source="estimate"`` で推定値を返す。トップレベル ``source`` は
       「全件が実測だった場合のみ ``actual``、それ以外は ``estimate``」。
 
-チャット応答パスでは呼ばれないためパフォーマンス要件は緩い
-(サブプロセス ``nvidia-smi`` 呼び出し許容)。
+チャット応答パスでは呼ばれないが、UI が 10 秒毎にポーリングするため同期のまま
+イベントループで呼ばない (API 側は別スレッドで呼ぶ。サブプロセス ``nvidia-smi``
+呼び出しは許容)。
 """
 
 from __future__ import annotations
@@ -46,26 +47,38 @@ _MODEL_TO_COMPONENT: dict[str, str] = {
 }
 
 
+#: (launch_llama.py のパス, mtime_ns) → ロード済みモジュール。
+_LAUNCH_MODULE_CACHE: dict[tuple[str, int], object] = {}
+
+
 def _load_launch_llama(project_root: Path):
     """``scripts/launch_llama.py`` を動的ロードする
 
-    LlamaProcessManager と同じ importlib 方式。sys.path 汚染を避けるため
-    毎回 spec から load する。失敗時は None を返す。
+    LlamaProcessManager と同じ importlib 方式 (sys.modules へ登録せず sys.path も
+    汚さない)。ロード結果は (パス, mtime_ns) 単位でキャッシュする — 毎回 exec
+    し直すとモジュール変数 ``_gguf_meta_cache`` が空になり、10 秒毎のポーリングで
+    GGUF ヘッダを読み直していた (2026-09-26 ライブ監査 #23)。失敗時は None を返す。
     """
     launch_py = project_root / "scripts" / "launch_llama.py"
-    if not launch_py.exists():
+    try:
+        key = (str(launch_py.resolve()), launch_py.stat().st_mtime_ns)
+    except OSError:
         logger.warning("launch_llama.py not found: %s", launch_py)
         return None
+    cached = _LAUNCH_MODULE_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         spec = importlib.util.spec_from_file_location("_launch_llama_vram", launch_py)
         if spec is None or spec.loader is None:
             return None
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        return mod
     except Exception as e:
         logger.warning("Failed to load launch_llama.py: %s", e)
         return None
+    _LAUNCH_MODULE_CACHE[key] = mod
+    return mod
 
 
 def nvidia_smi_available() -> bool:

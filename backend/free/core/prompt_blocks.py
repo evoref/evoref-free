@@ -14,11 +14,20 @@ pillar 非依存の ``core/`` に置くため、``core.inference`` (チャット
 
 from __future__ import annotations
 
+from datetime import date
+
 #: 現在日時ブロックの角括弧ラベル。チャット応答パス
 #: (``core.inference._current_date_note``) と生成パス
 #: (``agent.meta_cognitive._inject_current_date``) の両方が出し、
 #: ``agent.meta_cognitive_utils._PROMPT_SCAFFOLD_MARKERS`` が剥がす。
 CURRENT_DATETIME_LABEL = "[現在日時]"
+
+
+def local_today() -> date:
+    """日付注記と同じ基準のローカル暦日 (``current_datetime_block`` 参照)。"""
+    from backend.utils import utc_now_dt
+
+    return utc_now_dt().astimezone().date()
 
 
 def current_datetime_block(guidance: str) -> str:

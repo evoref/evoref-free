@@ -188,6 +188,7 @@ def collect_exemplar_gates(embedder: Any) -> dict[str, Any]:
     発話でしか発火していない」ことが検出できる。
     """
     from backend.free.agent.layer_shadow import LayerClassificationShadow
+    from backend.free.agent.statement_gate import StatementGate
     from backend.free.agent.write_intent_gate import WriteIntentGate
     from backend.free.learning.context_bound_gate import ContextBoundGate
     from backend.free.memory.notes.attribute_gate import AttributeSlotGate
@@ -201,6 +202,7 @@ def collect_exemplar_gates(embedder: Any) -> dict[str, Any]:
         "gate.layer_classification_shadow": LayerClassificationShadow(embedder),
         "gate.local_write_intent": WriteIntentGate(embedder),
         "gate.fewshot_context_bound": ContextBoundGate(embedder),
+        "gate.plain_statement": StatementGate(embedder),
     }
 
 

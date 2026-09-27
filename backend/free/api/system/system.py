@@ -12,6 +12,8 @@ VRAM 使用量スナップショットなど、コンポーネント単位では
 
 from __future__ import annotations
 
+import asyncio
+from functools import partial
 from pathlib import Path
 
 from fastapi import APIRouter, Depends
@@ -21,6 +23,7 @@ from backend.config import get_config
 from backend.free.api.schemas import VramStatusResponse
 from backend.free.core.vram_monitor import collect_vram_status
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 logger = get_logger("api.system")
 
@@ -43,9 +46,10 @@ async def get_vram_status(
     # プロジェクトルート: backend/free/api/system/system.py から 5 階層上
     project_root = Path(__file__).resolve().parents[4]
 
-    snapshot = collect_vram_status(
-        cfg,
-        project_root,
-        process_manager=state.llama_manager,
+    # GGUF ヘッダの読込み (初回) と nvidia-smi (最大 3 秒) はイベントループを止める
+    # ので別スレッドへ逃がす (UI が 10 秒毎にポーリングする)
+    snapshot = await run_in_executor_with_context(
+        asyncio.get_running_loop(), None,
+        partial(collect_vram_status, cfg, project_root, process_manager=state.llama_manager),
     )
     return VramStatusResponse(**snapshot)

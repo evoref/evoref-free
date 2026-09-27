@@ -6,6 +6,10 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from backend.free.agent.meta_cognitive_content_gate import (
+    is_edit_request,
+    looks_like_tool_selector_json,
+)
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.log_config import get_logger
 from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE, WRITE_VERB_RE
@@ -64,6 +68,9 @@ class MetaCognitiveResponse:
     # 制作ステージを経由しなかった (production_stage 無し) ターンは空 dict のまま
     # (Level 0 経験記録の quality_signals へ chat_stream_meta が載せる)。
     production_metrics: dict = field(default_factory=dict)
+    # 制作ステージの注記 (``ProductionResult.notes["notices"]``、UI の言語の文)。本文の後に
+    # 添える (依頼されたテストを作っていない等、f_10 §11.1-1)。
+    production_notices: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +117,14 @@ def determine_task_status(
     参照解決ができず、ここで判定すると会話から解決できるケースまで落とす。
     """
     if is_tool_error(result) or "Step limit reached" in result:
+        return "failed"
+
+    # ツールの出力が分類器の {tool, arg} JSON なら本文ではない (2026-09-26 監査 C08#3)
+    if looks_like_tool_selector_json(result):
+        logger.warning(
+            "Task marked failed: output is a tool-selector JSON: %s",
+            task.description[:80],
+        )
         return "failed"
 
     if destination_known and task_expects_write(task.description) and not any(
@@ -163,33 +178,56 @@ def merge_same_file_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
     """
     from backend.free.agent.tool_judge_args import extract_write_target_path as _key
 
-    file_groups: dict[str, tuple[int, list[str]]] = {}
-    for i, task in enumerate(tasks):
-        path = _key(task.description)
-        if path:
-            if path not in file_groups:
-                file_groups[path] = (i, [task.description])
-            else:
-                file_groups[path][1].append(task.description)
-
-    if all(len(descs) == 1 for _, descs in file_groups.values()):
+    keys = [_key(t.description) for t in tasks]
+    groups: dict[str, list[int]] = {}
+    for i, key in enumerate(keys):
+        if key:
+            groups.setdefault(key, []).append(i)
+    multi = {key: members for key, members in groups.items() if len(members) > 1}
+    if not multi:
         return tasks
+
+    # 区間が他のグループと重なるグループは束ねない。束ねると挟まるタスクが
+    # 2 グループに入って 2 回走るか、書き戻しが挟まるタスクより前へ移る
+    # (2026-09-26 レビュー、docs/f_03 §4.3)。重なるときは計画の順序のまま。
+    spans = {key: (m[0], m[-1]) for key, m in multi.items()}
+
+    def _overlaps(key: str) -> bool:
+        a0, a1 = spans[key]
+        return any(
+            other != key and not (b1 < a0 or a1 < b0)
+            for other, (b0, b1) in spans.items()
+        )
+
+    def _absorbable(description: str) -> bool:
+        # 書込みを期待しないか、既存内容の変更依頼だけ。別の成果物を作るパス無し
+        # タスク (「Create a new report」) は別ファイルのグループへ取り込まない。
+        return not task_expects_write(description) or is_edit_request(description)
 
     merged_indices: set[int] = set()
     result_items: list[tuple[int, TaskItem]] = []
 
-    for path, (first_idx, descriptions) in file_groups.items():
-        if len(descriptions) == 1:
-            result_items.append((first_idx, tasks[first_idx]))
-        else:
-            merged_desc = " / ".join(descriptions)
-            result_items.append((first_idx, TaskItem(description=merged_desc)))
-            for j, task in enumerate(tasks):
-                if _key(task.description) == path:
-                    merged_indices.add(j)
+    for key, members in multi.items():
+        if _overlaps(key):
+            continue
+        # 読んで → (パス無しの) 変更 → 書き戻す、の区間は 1 件に束ねる。束ねた
+        # グループは先頭の位置に置かれるので、挟まる変更タスクを残すと書き戻しの
+        # 後に単独で走る (2026-09-26 監査 C08#3、docs/f_03 §4.3)。
+        if (
+            not task_expects_write(tasks[members[0]].description)
+            and task_expects_write(tasks[members[-1]].description)
+        ):
+            members = sorted({
+                *members,
+                *(j for j in range(members[0] + 1, members[-1])
+                  if not keys[j] and _absorbable(tasks[j].description)),
+            })
+        merged_desc = " / ".join(tasks[j].description for j in members)
+        result_items.append((members[0], TaskItem(description=merged_desc)))
+        merged_indices.update(members)
 
     for i, task in enumerate(tasks):
-        if i not in merged_indices and not _key(task.description):
+        if i not in merged_indices:
             result_items.append((i, task))
 
     result_items.sort(key=lambda x: x[0])

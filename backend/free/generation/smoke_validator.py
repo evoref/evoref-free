@@ -20,6 +20,7 @@ import builtins
 import json
 import logging
 import os
+import posixpath
 import subprocess
 import sys
 import tempfile
@@ -1129,3 +1130,266 @@ def run_entry_smoke(
         for issue in data.get("issues", []) or []:
             result.warnings.append(f"エントリ実行スモーク: {issue}")
     return result
+
+
+def _signature_of(func: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
+    """モジュール直下の関数の引数の形 (位置の上限・必須・名前・可変長)。"""
+    a = func.args
+    positional = [p.arg for p in (*a.posonlyargs, *a.args)]
+    n_defaults = len(a.defaults)
+    required = positional[: len(positional) - n_defaults] if n_defaults else list(positional)
+    kwonly_required = [
+        k.arg for k, d in zip(a.kwonlyargs, a.kw_defaults) if d is None
+    ]
+    return {
+        "positional": positional,
+        "required": required + kwonly_required,
+        "names": set(positional) | {k.arg for k in a.kwonlyargs},
+        "posonly": {p.arg for p in a.posonlyargs},
+        "varargs": a.vararg is not None,
+        "varkw": a.kwarg is not None,
+        "shown": f"{func.name}({', '.join(positional + [k.arg for k in a.kwonlyargs])})",
+    }
+
+
+
+def _declared_signature(text: str) -> dict | None:
+    """骨組みの signature 文字列 (``def f(a, b) -> None``) を :func:`_signature_of` の形へ。"""
+    src = (text or "").strip()
+    if not src.startswith(("def ", "async def ")):
+        return None
+    try:
+        tree = ast.parse(src.rstrip(":") + ":\n    pass\n")
+    except SyntaxError:
+        return None
+    node = tree.body[0] if tree.body else None
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return _signature_of(node)
+    return None
+
+
+def _call_problem(sig: dict, n_pos: int, keywords: set[str]) -> str | None:
+    """呼び出し (位置の数・キーワード名) が signature に合わない理由 (合えば None)。"""
+    if not sig["varargs"] and n_pos > len(sig["positional"]):
+        return f"は引数 {len(sig['positional'])} 個まで"
+    unknown = sorted(k for k in keywords if k not in sig["names"] or k in sig["posonly"])
+    if unknown and not sig["varkw"]:
+        return f"に無い引数 {', '.join(unknown)} を渡している"
+    given = set(sig["positional"][:n_pos]) | keywords
+    missing = [p for p in sig["required"] if p not in given]
+    if missing:
+        return f"に必須の引数 {', '.join(missing)} が無い"
+    return None
+
+
+def _bound_names(nodes: list) -> set[str]:
+    """文の並び (ネストした if / for / with / try を含む) で束縛される名前。
+
+    関数・クラスの本体の中は数えない (別スコープ)。import で束縛した名前は数えない
+    (照合の対象そのもの)。
+    """
+    names: set[str] = set()
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+            continue
+        # ``except … as f`` / match の capture (``case f:`` / ``*f`` / ``**f``)
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _import_bound_names(nodes: list) -> set[str]:
+    """文の並びの中の import が束縛する名前 (ネストした関数・クラスの中は数えない)。"""
+    names: set[str] = set()
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
+def _function_locals(node) -> set[str]:
+    """関数 (lambda を含む) の引数とローカルで束縛される名前。"""
+    a = node.args
+    names = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    if a.vararg:
+        names.add(a.vararg.arg)
+    if a.kwarg:
+        names.add(a.kwarg.arg)
+    if not isinstance(node, ast.Lambda):
+        # 関数内の import もローカルの束縛 (モジュール側の import を遮蔽する)
+        names |= _bound_names(node.body) | _import_bound_names(node.body)
+    return names
+
+
+def check_call_arity(
+    files: dict[str, str], *, declared: dict[str, str] | None = None,
+) -> list[str]:
+    """生成物のモジュール間呼び出しの引数の数を、定義と静的に照合する (純粋関数)。
+
+    import smoke と :func:`check_cross_module_imports` は名前の実在しか見ないので、
+    ``data_handler.save_expense(a, c, d)`` と ``def save_expense(amount, category)`` の
+    食い違いは実行するまで分からなかった (2026-09-27 実機、TypeError)。
+
+    対象は **生成物のモジュール直下の、デコレータの無い関数** を ``import m`` /
+    ``from m import f`` (相対 import を含む) 経由で呼ぶ箇所だけ。import 先はファイルの
+    パスと一致するときだけ対応づける (``os.path`` は ``path.py`` ではない。同じ stem が
+    複数あれば dotted で一意に決まるときだけ)。``*args`` / ``**kw`` を渡す呼び出し・
+    メソッド・呼び出し側のスコープで束縛し直した名前 (引数・ローカル・再代入・条件内の
+    再定義) は判定しない (誤検知回避、2026-09-27 独立レビュー)。
+
+    ``declared`` (``"stem.関数名"`` → 骨組みの signature) があり、定義が骨組みと合わず
+    呼び出しは骨組みに合うなら、誤りを **定義側のファイル** に帰属させる — 呼び出し側に
+    機能を落として合わせさせない。出力は決定論順。
+    """
+    parsed: dict[str, ast.Module] = {}
+    for path, code in files.items():
+        if path.endswith(".py"):
+            try:
+                parsed[path.replace("\\", "/")] = ast.parse(code)
+            except SyntaxError:
+                continue
+    by_stem: dict[str, list[str]] = {}
+    for path in parsed:
+        by_stem.setdefault(posixpath.splitext(posixpath.basename(path))[0], []).append(path)
+
+    def resolve(module: str, level: int, importer: str) -> str | None:
+        parts = module.split(".") if module else []
+        if level:
+            base = posixpath.dirname(importer)
+            for _ in range(level - 1):
+                base = posixpath.dirname(base)
+            if not parts:
+                return None
+            cand = posixpath.join(base, *parts) + ".py" if base else "/".join(parts) + ".py"
+            return cand if cand in parsed else None
+        if not parts:
+            return None
+        if len(parts) == 1:
+            hits = by_stem.get(parts[0], [])
+            return hits[0] if len(hits) == 1 else None
+        suffix = "/".join(parts) + ".py"
+        hits = [p for p in parsed if p == suffix or p.endswith("/" + suffix)]
+        return hits[0] if len(hits) == 1 else None
+
+    sigs: dict[str, dict[str, dict]] = {
+        path: {
+            node.name: _signature_of(node)
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.decorator_list
+        }
+        for path, tree in parsed.items()
+    }
+    declared_sigs = {
+        key: sig for key, text in (declared or {}).items()
+        if (sig := _declared_signature(text)) is not None
+    }
+    errors: set[str] = set()
+    for path, tree in parsed.items():
+        modules: dict[str, str] = {}              # 別名 → 定義ファイル
+        funcs: dict[str, tuple[str, str]] = {}    # 名前 → (定義ファイル, 関数名)
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    target = resolve(alias.name, 0, path)
+                    if target and target != path and (alias.asname or "." not in alias.name):
+                        modules[alias.asname or alias.name] = target
+            elif isinstance(node, ast.ImportFrom):
+                target = resolve(node.module or "", node.level, path)
+                for alias in node.names:
+                    if target and target != path and alias.name in sigs[target]:
+                        funcs[alias.asname or alias.name] = (target, alias.name)
+                        continue
+                    sub = resolve(
+                        ".".join(x for x in (node.module, alias.name) if x), node.level, path,
+                    )
+                    if sub and sub != path:
+                        modules[alias.asname or alias.name] = sub
+        rebound = _bound_names(tree.body)
+        funcs = {k: v for k, v in funcs.items() if k not in rebound}
+        modules = {k: v for k, v in modules.items() if k not in rebound}
+        if not funcs and not modules:
+            continue
+
+        def check(node: ast.Call, shadowed: frozenset[str]) -> None:
+            target: tuple[str, str] | None = None
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in funcs and func.id not in shadowed:
+                target = funcs[func.id]
+            elif (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id in modules
+                and func.value.id not in shadowed
+                and func.attr in sigs[modules[func.value.id]]
+            ):
+                target = (modules[func.value.id], func.attr)
+            if target is None:
+                return
+            if any(isinstance(a, ast.Starred) for a in node.args) or any(
+                k.arg is None for k in node.keywords
+            ):
+                return
+            def_path, fname = target
+            sig = sigs[def_path][fname]
+            n_pos = len(node.args)
+            kws = {k.arg for k in node.keywords if k.arg}
+            problem = _call_problem(sig, n_pos, kws)
+            if problem is None:
+                return
+            stem = posixpath.splitext(posixpath.basename(def_path))[0]
+            # 同じ stem のファイルが複数あると骨組みの宣言がどれを指すか決まらない
+            decl = declared_sigs.get(f"{stem}.{fname}") if len(by_stem.get(stem, [])) == 1 else None
+            if decl is not None and _call_problem(decl, n_pos, kws) is None:
+                errors.add(
+                    f"{def_path}: {fname}() の定義が骨組み ({decl['shown']}) と合わず、"
+                    f"{path} の呼び出し (位置 {n_pos} 個) が失敗する (定義: {sig['shown']})",
+                )
+                return
+            if problem.startswith("は引数"):
+                errors.add(
+                    f"{path}: {stem}.{fname}() {problem} (定義: {sig['shown']}) "
+                    f"なのに {n_pos} 個で呼んでいる",
+                )
+            else:
+                errors.add(f"{path}: {stem}.{fname}() {problem} (定義: {sig['shown']})")
+
+        def visit(node, shadowed: frozenset[str]) -> None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                inner = frozenset(shadowed | _function_locals(node))
+                for child in ast.iter_child_nodes(node):
+                    visit(child, inner)
+                return
+            if isinstance(node, ast.ClassDef):
+                # クラス本体での再束縛 (メソッドへは漏れないが、保守的に本体全体で除く)
+                inner = frozenset(
+                    shadowed | _bound_names(node.body) | _import_bound_names(node.body),
+                )
+                for child in ast.iter_child_nodes(node):
+                    visit(child, inner)
+                return
+            if isinstance(node, ast.Call):
+                check(node, shadowed)
+            for child in ast.iter_child_nodes(node):
+                visit(child, shadowed)
+
+        visit(tree, frozenset())
+    return sorted(errors)

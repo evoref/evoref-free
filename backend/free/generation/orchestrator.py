@@ -25,6 +25,7 @@ from backend.free.generation.document_gate import (
     is_document_format,
 )
 from backend.free.generation.smoke_validator import (
+    check_call_arity,
     check_cross_module_imports,
     check_integrity,
     check_main_invoked,
@@ -993,6 +994,7 @@ class LongFormOrchestrator:
         # 未定義属性を持つ K01 が「OK」で配信された (2026-09-21 ライブ監査)。
         issues.extend(check_main_invoked(files))
         issues.extend(check_cross_module_imports(files))
+        issues.extend(check_call_arity(files))
 
         lf = self.config.get("long_form", {})
         warnings: list[str] = []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import posixpath
 import time
 
 from pathlib import Path
@@ -131,20 +132,64 @@ def _is_unanchored_relative(file_path: str) -> bool:
     return "/" in normalized.strip("/")
 
 
-def _explicit_existing_dir(query: str) -> Path | None:
-    """クエリが明示した既存ディレクトリ (最後に現れたもの) を返す (無ければ ``None``)。
+def explicit_query_dirs(query: str) -> list[tuple[Path, bool]]:
+    """依頼が明示したフォルダを出現順に ``(パス, 出力先の候補か)`` で返す (f_03 §4.4 / §4.x)。
 
-    ファイルパスは入力でありうるので対象外。存在確認するのは、日本語が続いて
-    区切れない表記 (``E:\\tmp\\xフォルダに``) を誤ってディレクトリと読まないため。
+    - 実在するディレクトリ → 出力先の候補
+    - 拡張子の無いパス (``E:\\tmp\\new フォルダに``) → **未作成でも** 出力先の候補。日本語が続いて
+      区切れない表記 (``E:\\tmp\\newフォルダに``) は ASCII のセグメントだけを取る (``_DIR_PATH_RE``)
+    - ファイルのパス → その親 (入力ファイルでありうるので出力先の候補にはしない)
+
+    書込み先の確定 (``_resolve_write_path_from_query``) と配信先の根 (:func:`delivery_roots`) が
+    共有する部品。以前は実在するディレクトリしか見ず、未作成の出力フォルダの名指しのファイルが
+    ``outputs_dir`` へ落ちて配信で拒否された (独立レビュー 2026-09-26)。
     """
-    for raw in reversed(EXPLICIT_WINDOWS_PATH_RE.findall(query)):
-        candidate = Path(raw.rstrip("。、,.\\/"))
+    from backend.free.agent.tool_judge_args import (
+        _DIR_PATH_RE,
+        _normalize_path_separators,
+        _trim_nonexistent_path_tail,
+    )
+
+    found: list[tuple[int, Path, bool]] = []
+    for m in EXPLICIT_WINDOWS_PATH_RE.finditer(query or ""):
+        candidate = Path(m.group(0).rstrip("。、,.\\/"))
         try:
             if candidate.is_dir():
-                return candidate
+                found.append((m.start(), candidate, True))
+            elif candidate.suffix:
+                found.append((m.start(), candidate.parent, False))
         except OSError:
             continue
-    return None
+    for m in _DIR_PATH_RE.finditer(query or ""):
+        if m.end() < len(query) and query[m.end()] in "\\/":
+            continue  # 非 ASCII のセグメントの手前で切れた接頭辞
+        candidate = Path(_trim_nonexistent_path_tail(
+            _normalize_path_separators(m.group(1).rstrip()).rstrip("\\/"),
+        ))
+        if len(candidate.parts) <= 1:
+            continue  # ドライブ直下だけ
+        try:
+            is_dir = candidate.is_dir()
+        except OSError:
+            is_dir = False
+        if is_dir or not candidate.suffix:
+            found.append((m.start(), candidate, True))
+        else:
+            found.append((m.start(), candidate.parent, False))
+    out: list[tuple[Path, bool]] = []
+    for _pos, path, is_output in sorted(found, key=lambda item: item[0]):
+        seen = next((i for i, (p, _) in enumerate(out) if p == path), None)
+        if seen is None:
+            out.append((path, is_output))
+        elif is_output:
+            out[seen] = (path, True)
+    return out
+
+
+def _explicit_output_dir(query: str) -> Path | None:
+    """依頼が明示した出力先のフォルダ (最後に現れたもの、未作成でもよい)。無ければ ``None``。"""
+    outputs = [path for path, is_output in explicit_query_dirs(query) if is_output]
+    return outputs[-1] if outputs else None
 
 
 def _explicit_path_named(query: str, name: str) -> str | None:
@@ -153,6 +198,60 @@ def _explicit_path_named(query: str, name: str) -> str | None:
         candidate = raw.rstrip("。、,.\\/")
         if Path(candidate).name == name:
             return candidate
+    return None
+
+
+def delivery_roots(query: str) -> list[Path]:
+    """制作物を配信してよいフォルダ (f_03 §4.4)。
+
+    部品は書込み先の確定 (``_resolve_write_path_from_query``) と同じ: 依頼が明示した
+    フォルダ (:func:`explicit_query_dirs`、未作成も含む)、``_extract_file_path`` が拾うパス
+    (ディレクトリ形ならそれ、ファイル形なら親)。依頼にフォルダが無ければ ``outputs_dir``
+    だけ。裸の名前・相対パスの成果物はこのどれかの下に着地する。
+    """
+    from backend.free.agent.tool_call_judge import _extract_file_path
+
+    roots: list[Path] = []
+
+    def _add(root: Path) -> None:
+        if root not in roots:
+            roots.append(root)
+
+    for path, _is_output in explicit_query_dirs(query or ""):
+        _add(path)
+    qpath = _extract_file_path(query or "")
+    if qpath and ("\\" in qpath or "/" in qpath):
+        qp = Path(qpath)
+        try:
+            is_dir = qp.is_dir()
+        except OSError:
+            is_dir = False
+        _add(qp if is_dir or not qp.suffix else qp.parent)
+    if not roots:
+        from backend.config import resolve_outputs_dir
+
+        roots.append(resolve_outputs_dir())
+    return roots
+
+
+def _path_key(path: str) -> str:
+    """包含判定用の正規形 (区切りを ``/`` に、``..`` を畳む。ドライブ / UNC は大小文字を無視)。"""
+    text = posixpath.normpath(str(path).replace("\\", "/"))
+    if (len(text) > 1 and text[1] == ":") or text.startswith("//"):
+        return text.lower()
+    return text
+
+
+def relative_to_roots(path: str, roots: list[Path]) -> str | None:
+    """``path`` がどれかの根の配下ならその根からの相対パス (``/`` 区切り、根そのものなら "")。外なら ``None``。"""
+    key = _path_key(path)
+    normalized = posixpath.normpath(str(path).replace("\\", "/"))
+    for root in roots:
+        root_key = _path_key(str(root)).rstrip("/")
+        if key == root_key:
+            return ""
+        if key.startswith(root_key + "/"):
+            return normalized[len(root_key) + 1:]
     return None
 
 
@@ -739,7 +838,7 @@ class _TaskExecutionMixin:
             # 入力ファイル (「X\DESIGN.md の設計に基づいて … を X に作成」) だと
             # 以下の分岐では名指しの index.html 等が outputs_dir へ落ちた
             # (2026-09-19 ライブ監査 K05)。
-            out_dir = _explicit_existing_dir(query)
+            out_dir = _explicit_output_dir(query)
             if out_dir is not None:
                 return str(out_dir / p.name)
             qpath = _extract_file_path(query)
@@ -771,7 +870,7 @@ class _TaskExecutionMixin:
             # 指していればその配下へ置く (2026-09-20 実機: 裸名の SPEC.md は依頼
             # フォルダへ、ledger/store.py は outputs_dir へ割れた)。入力ファイルしか
             # 指していない依頼は従来どおり outputs_dir へ。
-            out_dir = _explicit_existing_dir(query)
+            out_dir = _explicit_output_dir(query)
             if out_dir is not None:
                 return str(out_dir / p)
             qpath = _extract_file_path(query)

@@ -21,6 +21,7 @@ import できない) を越えずに済むよう、どの pillar にも属さな
 from __future__ import annotations
 
 import re
+from backend.free.core.response_dates import YMD_JA_PATTERN, YMD_NUMERIC_PATTERN
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
     HIRAGANA,
@@ -42,6 +43,22 @@ from backend.free.core.script_ranges import (
 #: (Unix パスも拾う)、``agent.router._LOCAL_PATH_RE`` はドライブ接頭辞の
 #: 存在だけを見る。要求が異なるものを 1 本にすると、どちらかの誤検出率が上がる。
 EXPLICIT_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
+
+#: 文中のファイル名 (拡張子付きの 1 語、``sample.csv`` / ``md_toc.py``)。staged v2 の依頼文の照合と、
+#: 生成応答のフェンスの情報文字列・前置きの行からの名前の拾い出しが共有する。
+FILE_NAME_IN_TEXT_RE = re.compile(r"[\w.\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(?![A-Za-z0-9])")
+
+#: ホストの絶対パスの形 (ドライブ + 区切り / ``\\`` の UNC / 先頭 ``/`` 1 個)。
+#: ``//host/x`` はプロトコル相対 URL なので含めない (f_10 §11.1-1 / §11.1-4)。
+_ABSOLUTE_PATH_TEXT_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/\s]|/(?!/))")
+
+
+def is_absolute_path_text(text: str) -> bool:
+    """文字列がホストの絶対パスの形か (存在は見ない)。
+
+    staged v2 の骨組みのパスの正規化と、生成テストの lint が共有する 1 本 (不変則 #14 (a))。
+    """
+    return bool(_ABSOLUTE_PATH_TEXT_RE.match((text or "").strip()))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -2350,8 +2367,8 @@ DATETIME_QUERY_RE = re.compile(
     # 絶対日付が直前にある** 場合は 2 点間の日数を数える問いなので通す
     # (``tool_judge_commands._day_count_command`` が両端を Python に数えさせる)。
     # 年を必須にすることで、ツールが答えを出せない形は従来どおり素通りする。
-    r"|(?:\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
-    r"|\d{4}[-/]\d{1,2}[-/]\d{1,2})[^\n]{0,40}?何日間"
+    # 日付の綴りは core.response_dates が SSOT。
+    r"|(?:" + YMD_JA_PATTERN + "|" + YMD_NUMERIC_PATTERN + r")[^\n]{0,40}?何日間"
     r"|(?<![A-Za-z])what(?:'s|’s|\s+is|\s+are|\s+was)?"
     r"[^.?!\n]{0,15}?(?<![A-Za-z])(?:date|time|day)(?![A-Za-z])"
     r"|(?<![A-Za-z])current\s+(?:date|time)(?![A-Za-z])"

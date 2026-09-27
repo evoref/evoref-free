@@ -134,8 +134,15 @@ def chat_is_active() -> bool:
 
 
 def activity_token() -> tuple[int, int]:
-    """「チャットが走ったか」を後で判定するためのスナップショット。"""
-    return (_active, _activations)
+    """「チャットが走ったか」を後で判定するためのスナップショット。
+
+    呼出しのコンテキストの未解放のターンリース (create ターンの中の aux なら、そのターン
+    自身) は差し引く。数えると create 内の aux は常に contended になり、タイムアウトが
+    一度も較正されない (2026-09-26 ライブ監査 #26、c_14 §5)。
+    """
+    lease = _turn_lease.get()
+    own = 1 if lease is not None and not lease.released else 0
+    return (max(0, _active - own), _activations)
 
 
 def was_contended_since(token: tuple[int, int]) -> bool:
@@ -243,6 +250,10 @@ class ChatTurnLease:
     @property
     def handed_over(self) -> bool:
         return self._handed_over
+
+    @property
+    def released(self) -> bool:
+        return self._released
 
     def hand_over(self, grace_sec: float = _HANDOVER_GRACE_SEC) -> None:
         """解放の責務を応答ストリームへ移す (始まらなければ ``grace_sec`` で解放)。"""

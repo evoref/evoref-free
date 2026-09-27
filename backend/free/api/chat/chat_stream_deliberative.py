@@ -41,8 +41,10 @@ from backend.free.core.stream_filter import (
     QueryEchoFilter,
     RepetitionGuardFilter,
     StreamThinkingFilter,
+    WeekdayFilter,
 )
 from backend.free.core.stream_pipeline import StreamPipeline
+from backend.free.core.turn_text import user_utterance_text
 from backend.free.llm.local_client import LocalClient
 
 from backend.free.api.chat.chat_stream_common import (
@@ -130,8 +132,17 @@ async def _drain_deliberative_step_queue(
     step_queue.clear()
 
 
+def _user_text(messages: list[ChatMessage]) -> str:
+    """送信する messages のユーザー発言 (曜日照合の接地文、f_08 §6.3)。
+
+    最後の user の動的ブロック (RAG / 記憶) とツール結果は含めない。
+    """
+    return user_utterance_text(messages)
+
+
 def _build_output_pipeline(
     query: str, *, buffer_only: bool = False, continuation_tail: str = "",
+    grounded: str = "",
 ) -> StreamPipeline:
     """本文の出力フィルタ列 (本流と 0 トークン再試行で **同じ** ものを使う)。
 
@@ -152,6 +163,8 @@ def _build_output_pipeline(
         # system プロンプトと動的ブロックの区切り文の両方で禁じているのに
         # 実機では破られた (2026-08-16 ライブ監査 ターン25)。
         InternalFrameMentionFilter(),
+        # 月日に添えた曜日を暦で照合する (ユーザーが述べた月日だけ。f_08 §6.3)。
+        WeekdayFilter(grounded),
     ]
     if not buffer_only:
         # 明示された文字数指定を破ったことを末尾で開示する。層の終端処理では
@@ -177,6 +190,7 @@ async def _stream_filtered_token_pipeline(
     query: str = "",
     buffer_only: bool = False,
     continuation_tail: str = "",
+    grounded: str = "",
 ) -> AsyncIterator[str]:
     """フィルタパイプライン (思考ブロック除去 + 先頭ラベル除去) でトークンを yield する。
 
@@ -200,6 +214,7 @@ async def _stream_filtered_token_pipeline(
     """
     pipeline = _build_output_pipeline(
         query, buffer_only=buffer_only, continuation_tail=continuation_tail,
+        grounded=grounded,
     )
     # keepalive を「LLM からトークンが来ない時間」ではなく「SSE フレームを
     # 送っていない時間」で測る。フィルタはトークンをバッファするので、LLM が
@@ -378,7 +393,7 @@ async def _retry_zero_tokens_deliberative(
     # (TTFT は初回の到着で確定済み)。切断メタは再試行側で上書きされる。
     async for frame in _stream_filtered_token_pipeline(
         retry_stream, state, session_id, None, query,
-        continuation_tail=continuation_tail,
+        continuation_tail=continuation_tail, grounded=_user_text(messages),
     ):
         yield frame
 
@@ -600,7 +615,7 @@ async def stream_deliberative(
                 })
             async for frame in _stream_filtered_token_pipeline(
                 token_stream, stream_state, session_id, timer, query,
-                buffer_only=verify_output,
+                buffer_only=verify_output, grounded=_user_text(messages),
             ):
                 yield frame
 
@@ -730,6 +745,7 @@ async def stream_reactive_light(
                 buffer_only=verify_output,
                 # 継続生成ターンのみ非空。冒頭の再掲を落とす。
                 continuation_tail=continuation_tail,
+                grounded=_user_text(messages),
             ):
                 yield frame
 

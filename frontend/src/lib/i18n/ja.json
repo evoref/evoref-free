@@ -796,7 +796,7 @@
 		"loading": "読込み中...",
 		"load_failed": "チャット履歴の読込みに失敗しました",
 		"search_placeholder": "会話を検索...",
-		"turns": "{count}ターン",
+		"turns": "{count}件のメッセージ",
 		"duration": "{minutes}分",
 		"today": "今日",
 		"yesterday": "昨日",

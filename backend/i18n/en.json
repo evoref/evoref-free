@@ -645,6 +645,13 @@
     }
   },
   "create": {
-    "needs_input_question": "I couldn't tell what to create. Please tell me what you want (its content or kind) and, if relevant, the language or where to save it."
+    "needs_input_question": "I couldn't tell what to create. Please tell me what you want (its content or kind) and, if relevant, the language or where to save it.",
+    "requested_tests_not_available": "The requested tests ({names}) were not created (this setup does not run the test stage).",
+    "requested_tests_not_generated": "The requested tests ({names}) could not be generated.",
+    "requested_tests_failing": "The requested tests {name} are included, but some of them fail (delivered for reference).",
+    "missing_assets": "These files are loaded but not included: {refs} (sounds or images may not work).",
+    "not_generated": "Not generated: {names}",
+    "generating_data_files": "Generating the data files… ({names})",
+    "contract_repair_reverted": "Reverted the fix after the contract tests (it failed the smoke check): {paths}"
   }
 }

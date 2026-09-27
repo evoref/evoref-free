@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+
+import json
 import re
 
 from difflib import SequenceMatcher
@@ -27,6 +29,8 @@ from backend.free.core.script_ranges import (
     KANA_BLOCKS,
     KANJI,
 )
+from backend.free.core.file_names import allows_empty_content
+from backend.free.generation.validators import file_suffix, is_low_information
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +118,35 @@ _TOOL_CALL_SYNTAX_RE = re.compile(
 )
 
 
+#: ツール分類器の出力スキーマのキー (agent/tool_call_judge の ``{"tool","arg"}``)。
+_TOOL_SELECTOR_KEYS = frozenset({"tool", "arg"})
+_JSON_FENCE_RE = re.compile(r"^```[A-Za-z]*\s*\n(.*)\n```$", re.DOTALL)
+
+
+def looks_like_tool_selector_json(content: str) -> bool:
+    """content が分類器スキーマ形の JSON (キー ⊆ {tool, arg}、tool あり) かを判定する。
+
+    分類器スロットの共有 system を被せられた自由文の生成が、本文の代わりに
+    ツール選択の JSON を返した形 (2026-09-26 監査 C08#3:
+    ``{"tool": "draft_document", "arg": "…"}`` が本文と履歴に入った)。
+    字句ではなく ``json.loads`` で構造を見る (純粋関数)。
+    """
+    text = content.strip()
+    fenced = _JSON_FENCE_RE.match(text)
+    if fenced:
+        text = fenced.group(1).strip()
+    if not text.startswith("{"):
+        return False
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(obj, dict) and "tool" in obj and set(obj) <= _TOOL_SELECTOR_KEYS
+
+
 def looks_like_tool_call_syntax(content: str) -> bool:
-    """content がツールコール構文/特殊トークンの吐き出しかを判定する (純粋関数)。"""
-    return bool(_TOOL_CALL_SYNTAX_RE.search(content))
+    """content がツールコール構文/特殊トークン/分類器 JSON の吐き出しかを判定する (純粋関数)。"""
+    return bool(_TOOL_CALL_SYNTAX_RE.search(content)) or looks_like_tool_selector_json(content)
 
 
 def looks_like_prompt_echo(content: str) -> bool:
@@ -312,6 +342,11 @@ _EDIT_REQUEST_RE = re.compile(
 )
 
 
+def is_edit_request(text: str) -> bool:
+    """既存内容の変更を求める依頼か (``_EDIT_REQUEST_RE``、純粋関数)。"""
+    return bool(_EDIT_REQUEST_RE.search(text or ""))
+
+
 def _normalize_for_content_compare(text: str) -> str:
     """行末空白と改行コードの差を無視した比較用の正規形 (純粋関数)。"""
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -365,6 +400,12 @@ def generated_content_rejection(
         return "edit_without_change"
     if looks_like_path_not_content(content, file_path):
         return "path_only"
+    # 空白と記号だけの退化出力 (2026-09-26 ライブ監査 K04: KV の壊れたスロットの出力を
+    # 書いて done にした)。データ / 文書の拡張子は判定しない (validators 側)。
+    if is_low_information(content, file_suffix(file_path)) and not (
+        not content.strip() and allows_empty_content(file_path)
+    ):
+        return "low_information"
     if looks_like_task_log_echo(content):
         return "task_log_echo"
     if looks_like_write_report(content, file_path):

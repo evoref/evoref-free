@@ -112,6 +112,8 @@ class GuardContext:
     hidden_tools_offered: bool = False
     measurement_blocked: bool = False
     action_blocked: bool = False
+    #: 窓内想起のガードが履歴検索を止めた (``ToolJudgement.recall_in_window``)。
+    recall_in_window: bool = False
     #: 進行中セッションの全ターンが ``conversation`` (窓) に載っているか。
     #: ``WorkingMemory.session_evicted_turns == 0`` を呼出側が写す。不明なら
     #: ``None`` (単体のガードだけを掛ける経路)。
@@ -241,6 +243,9 @@ def _suppress_proximal_recall_cross_session(
         "ongoing session, which is excluded from the search: %s",
         ctx.query[:50],
     )
+    # 窓がセッション全体を含むときだけ「答えは会話履歴にある」と言える。先頭が
+    # 押し出された窓で言うと、窓に無い発言を捏造させる (2026-09-26 レビュー)。
+    ctx.recall_in_window = ctx.window_complete is True
     return ToolJudgement(tool_needed=False, source=result.source)
 
 
@@ -285,6 +290,7 @@ def _suppress_ordinal_recall_within_session(
         "session (%d prior user turns), which is excluded from the search: %s",
         prior_user_turns, ctx.query[:50],
     )
+    ctx.recall_in_window = ctx.window_complete is True
     return ToolJudgement(tool_needed=False, source=result.source)
 
 
@@ -322,6 +328,7 @@ def _suppress_self_session_recall_in_window(
             "Suppressing search_history: self-session recall while the window "
             "holds the whole session: %s", ctx.query[:60],
         )
+        ctx.recall_in_window = True
         return ToolJudgement(tool_needed=False, source=result.source)
     # 検索に渡る語そのもの (``_reduce_ordered_history_query`` の縮約結果) で
     # 見る — 索引が当てるのはこの語なので、窓に全部あるなら索引も同じ本文を
@@ -339,6 +346,7 @@ def _suppress_self_session_recall_in_window(
         "Suppressing search_history: self-session recall whose search terms %s "
         "are all in the ongoing window: %s", terms, ctx.query[:60],
     )
+    ctx.recall_in_window = True
     return ToolJudgement(tool_needed=False, source=result.source)
 
 

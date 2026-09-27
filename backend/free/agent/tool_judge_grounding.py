@@ -78,6 +78,24 @@ def _ungrounded_numbers(
     return tuple(seen)
 
 
+def conversation_operands(
+    expression: str, query: str, dialogue: str,
+) -> tuple[str, ...]:
+    """式の数値のうち、クエリに無く会話 (``dialogue``) に書かれたものを返す (純粋関数)。
+
+    被演算子を会話から取った式か (「最初の計算をやり直して」) を見る。単位系の
+    定数 (``1000000`` 等) は ``100万円`` とも読めるので除外しない — 会話に
+    書かれていれば会話の値として数える (2026-09-26 監査 C03#3)。
+    """
+    in_query = _known_numbers(query)
+    in_dialogue = _known_numbers(dialogue)
+    seen: list[str] = []
+    for n in _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", expression)):
+        if n in in_dialogue and n not in in_query and n not in seen:
+            seen.append(n)
+    return tuple(seen)
+
+
 #: 桁区切り入りの数字 (``2,660`` / ``1,234,567``)。アシスタント自身が金額を
 #: この書式で提示するため、次のターンでその数値を使う式が「対話に無い数値」と
 #: 誤判定されていた (実インシデント 2026-08-03 ライブ監査: 直前の回答

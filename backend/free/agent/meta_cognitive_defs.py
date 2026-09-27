@@ -193,9 +193,11 @@ _WRITE_REJECTION_REASON_JA: dict[str, str] = {
     "instruction_echo": "生成された本文が依頼文の写しになっていたため",
     "literal_wrapped": "生成された本文が依頼文の引用で包まれていたため",
     "path_only": "生成された本文がパスだけだったため",
+    "low_information": "生成された本文に中身がほとんど無かったため",
     "csv_without_rows": "生成された CSV に行が無かったため",
     "edit_without_change": "内容が変わらなかったため",
     "task_restatement": "生成された本文が依頼の言い換えだったため",
+    "no_table_data": "保存する本文に表が無かったため",
 }
 _WRITE_REJECTION_RE = re.compile(r"invalid output \(([a-z_]+)\)")
 

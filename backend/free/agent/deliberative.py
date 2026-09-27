@@ -17,11 +17,16 @@ from backend.free.agent.meta_cognitive_utils import (
     strip_markdown_wrapper,
     tool_result_succeeded,
 )
-from backend.free.agent.tool_call_judge import ToolCallJudge, ToolJudgement
+from backend.free.agent.tool_call_judge import (
+    ToolCallJudge,
+    ToolJudgement,
+    _replaces_dialogue_value,
+)
 from backend.free.agent.tool_judge_commands import (
     command_lacks_date_arithmetic,
     query_has_date_math_cue,
 )
+from backend.free.agent.tool_judge_grounding import conversation_operands
 from backend.free.agent.tool_judge_guards import _STATE_CHANGING_TOOL_NAMES
 from backend.free.agent.tool_judge_history import asks_about_past_conversation
 from backend.free.agent.tools.builtin import (
@@ -62,6 +67,7 @@ from backend.free.core.text_quality import misrounded_result_values
 from backend.free.core.turn_text import TOOL_RESULT_HEADER, append_to_last_user
 from backend.config import resolve_context_size_for_mode
 from backend.i18n_helper import prompt_locale
+from backend.free.core.response_arithmetic import format_ja_large_number
 from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
     TOOL_EXECUTION_TIMEOUT_SEC, TOOL_GROUNDED_TEMPERATURE,
@@ -73,6 +79,19 @@ from backend.log_config import get_logger
 
 logger = get_logger("agent.deliberative")
 
+
+
+def _ja_reading_of_result(result_text: str) -> str | None:
+    """calculate の結果が 1 万以上の数なら万・億の読み下しを返す (日本語応答のときだけ)。"""
+    if prompt_locale() != "ja":
+        return None
+    text = str(result_text).strip()
+    try:
+        # 整数は float を経由しない (2**53 を超えると桁が化ける)
+        value: int | float = int(text) if text.lstrip("-").isdigit() else float(text)
+    except ValueError:
+        return None
+    return format_ja_large_number(value)
 
 def _localized(table: dict[str, str]) -> str:
     """``i18n.prompt_locale`` 別の固定文を引く (未知 locale は ja)。
@@ -179,6 +198,40 @@ _HISTORY_NOT_SEARCHED_GUIDANCES: dict[str, str] = {
         "answered from what remains in this conversation may be answered, "
         "saying so explicitly. If it is not there, say honestly that it has "
         "not been confirmed."
+    ),
+}
+
+#: 実行環境を測る以外のツール (calculate / fetch_url / write_file / apply_diff …) が
+#: エラーを返したときの文言 (``_append_tool_error_note``)。エラー時は結果ガイダンスを
+#: 付けないので、これが無いと失敗したことがモデルに何も伝わらない (2026-09-26 レビュー)。
+_TOOL_FAILED_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: 上記のツール実行は失敗した。結果はエラー文であって、求めた値や"
+        "内容ではない。エラー文から結果を推測・創作せず、失敗したことと、エラー文に"
+        "書かれている範囲の理由を伝えること。状態を変える操作なら、完了したと述べない。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the tool call above failed. Its result is an error "
+        "message, not the value or content that was requested. Do not guess or "
+        "invent a result from the error; say that it failed and give only the "
+        "reason stated in the error. If the operation was meant to change state, "
+        "do not say it was completed."
+    ),
+}
+
+#: 窓内想起のガードが履歴検索を止めたターンの文言 (``_append_recall_in_window_note``)。
+#: 対象は進行中の会話の発言で、答えは上の会話履歴にある。
+_RECALL_IN_WINDOW_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: 尋ねられているのはこの会話の中でのやり取りで、"
+        "該当する発言は上の会話履歴にある (過去の別の会話を検索する必要は無い)。"
+        "会話履歴から該当する発言を探し、その内容をそのまま示して答えること。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the question is about an exchange within this "
+        "conversation, and the relevant message is in the conversation history "
+        "above (there is no need to search other past conversations). Find that "
+        "message in the history and answer by showing its content as it is."
     ),
 }
 
@@ -355,10 +408,39 @@ _SEARCH_HISTORY_RESULT_GUIDANCES: dict[str, str] = {
 # 「約 16,258 リットル」と回答され、さらに「土の比重 1.3 を掛けた結果」という
 # 式に存在しない根拠が創作された)。式を併記したうえで、単位は入力に従うこと・
 # 式に無い係数を語らないことを明示する。
+#: 先頭の「厳密な結果をそのまま使え」。式に会話に無い値があるときは
+#: :data:`_CALCULATE_ASSUMED_LEADS` に差し替える (docs/f_03 §3.5)。
+_CALCULATE_EXACT_LEADS: dict[str, str] = {
+    "ja": (
+        "上記の ## ツール実行結果 は、システムが calculate ツールで実際に評価した式と"
+        "その厳密な計算結果である。数値はこの結果をそのまま使うこと。"
+    ),
+    "en": (
+        "The ## ツール実行結果 above is the expression the system actually "
+        "evaluated with the calculate tool and its exact result. Use the "
+        "number as is. "
+    ),
+}
+#: 式に会話に無い値 (``unexplained_numbers``) があるときの先頭。「厳密」と
+#: 後置の「仮定として断れ」が矛盾し、仮定の税率で断定の試算を返した
+#: (2026-09-26 監査 C13#4)。
+_CALCULATE_ASSUMED_LEADS: dict[str, str] = {
+    "ja": (
+        "上記の ## ツール実行結果 は、システムが calculate ツールで実際に評価した式と"
+        "その結果だが、会話に無い値 {listed} を仮定した試算である。"
+        "答えの冒頭で、どの値を仮定した試算かを明示すること。"
+    ),
+    "en": (
+        "The ## ツール実行結果 above is the expression the system actually "
+        "evaluated with the calculate tool and its result, but it is an "
+        "estimate that assumes {listed}, which does not appear in the "
+        "conversation. State at the start of the answer which value was "
+        "assumed. "
+    ),
+}
 _CALCULATE_RESULT_GUIDANCE = (
-    "上記の ## ツール実行結果 は、システムが calculate ツールで実際に評価した式と"
-    "その厳密な計算結果である。数値はこの結果をそのまま使うこと。"
-    "結果の単位は式に入力した数値の単位に従う"
+    _CALCULATE_EXACT_LEADS["ja"]
+    + "結果の単位は式に入力した数値の単位に従う"
     "(例: cm で測った長さだけを掛けた体積は cm³ であってリットルではない)。"
     "割り算では単位も割り算される "
     "(例: km ÷ (km/時) = 時間、円 ÷ 個 = 円/個)。"
@@ -371,10 +453,8 @@ _CALCULATE_RESULT_GUIDANCE = (
 )
 _CALCULATE_RESULT_GUIDANCES: dict[str, str] = {
     "ja": _CALCULATE_RESULT_GUIDANCE,
-    "en": (
-        "The ## ツール実行結果 above is the expression the system actually "
-        "evaluated with the calculate tool and its exact result. Use the "
-        "number as is. The unit of the result follows the units of the "
+    "en": _CALCULATE_EXACT_LEADS["en"] + (
+        "The unit of the result follows the units of the "
         "numbers entered into the expression (e.g. a volume obtained by "
         "multiplying lengths measured in cm is in cm³, not litres). Division "
         "divides the units too (e.g. km ÷ (km/h) = hours, yen ÷ items = "
@@ -695,14 +775,24 @@ _TOOL_RESULT_BODY_TEMPLATES: dict[str, str] = {
 
 #: 話題再フォーカス (今回の質問を明示し、前ターンの話題を無視させる)。
 _REFOCUS_TEMPLATES: dict[str, str] = {
-    "ja": (
-        "今回ユーザーが答えてほしい質問は『{query}』である。{person_note}"
-        "会話履歴の前の話題は無関係なので無視し、この質問にのみ答えること。\n"
-    ),
+    "ja": "今回ユーザーが答えてほしい質問は『{query}』である。{person_note}{scope}\n",
+    "en": "The question the user wants answered now is \"{query}\". {person_note}{scope}\n",
+}
+#: 再フォーカスの既定の範囲指定 (前の話題を捨てさせる)。
+_REFOCUS_IGNORE_EARLIER: dict[str, str] = {
+    "ja": "会話履歴の前の話題は無関係なので無視し、この質問にのみ答えること。",
     "en": (
-        "The question the user wants answered now is \"{query}\". {person_note}"
         "Earlier topics in the conversation history are unrelated; ignore them "
-        "and answer only this question.\n"
+        "and answer only this question."
+    ),
+}
+#: calculate の式がクエリに無い数値 (会話から取った被演算子) を使うときの範囲指定。
+#: 「前の話題は無関係」と言うと式の出所を説明できない (2026-09-26 監査 C03#3)。
+_REFOCUS_USES_CONVERSATION: dict[str, str] = {
+    "ja": "式は会話履歴の値を使っているので、どの計算をやり直したのかを会話履歴に沿って述べること。",
+    "en": (
+        "The expression uses values from the conversation history, so say which "
+        "calculation was redone, in line with the conversation."
     ),
 }
 #: 引用文に一人称があるときの帰属注記 (``_REFOCUS_TEMPLATES`` に埋める)。
@@ -915,6 +1005,13 @@ _TRUNCATED_ENUMERATION_NOTES: dict[str, str] = {
 }
 
 _FILE_CONTENT_TOOLS = frozenset({"read_file"})
+
+#: 実行環境を測るツール。これらのエラーは「測れなかった」なので未測定の注記を
+#: 付ける (``_append_tool_error_note``、docs/f_03 §3.5)。
+_ENVIRONMENT_MEASURING_TOOLS = (
+    _COMMAND_TOOLS | _ENUMERATIVE_TOOLS | _FILE_CONTENT_TOOLS
+    | frozenset({"project_map", "system_hardware_info", "evoref_runtime_info"})
+)
 _FILE_CONTENT_RESULT_GUIDANCE = (
     "上記の ## ツール実行結果 は、そのファイルに実際に保存されている内容そのものである。"
     "ファイルの中身を示すときは、この結果の文字列をそのまま引用して提示すること。"
@@ -1466,6 +1563,11 @@ class DeliberativeAgent:
                 # 裸の数値だけでは何を計算したかが base に伝わらず、単位と根拠の
                 # 捏造を招く (_CALCULATE_RESULT_GUIDANCE 参照)。式を併記する。
                 truncated = f"{expression} = {truncated}"
+                reading = _ja_reading_of_result(tool_result_text)
+                if reading:
+                    # 万表記への変換をモデルに任せると写し間違える (2026-09-27 実機:
+                    # 1480244.28492 を「148 万 2,244 円」)。読み下しを添える。
+                    truncated = f"{truncated}（万・億で読むと {reading}）"
         elif tool_name in _COMMAND_TOOLS:
             executed = str(args.get("command") or "").strip()
             if executed:
@@ -1503,8 +1605,24 @@ class DeliberativeAgent:
                 _localized(_REFOCUS_PERSON_NOTES)
                 if _FIRST_PERSON_RE.search(q) else ""
             )
+            expression = (
+                str(args.get("expression") or "") if tool_name == "calculate" else ""
+            )
+            dialogue = "\n".join(
+                str(m.get("content") or "") for m in messages[:-1]
+                if m.get("role") in ("user", "assistant")
+            )
+            # 訂正のターン (会話の値を差し替える) だけ。訂正でないターンで
+            # 「/12」のような定数が会話の数値と偶然一致しても切り替えない。
+            scope = (
+                _REFOCUS_USES_CONVERSATION
+                if expression
+                and _replaces_dialogue_value(query, dialogue)
+                and conversation_operands(expression, query, dialogue)
+                else _REFOCUS_IGNORE_EARLIER
+            )
             refocus = _localized(_REFOCUS_TEMPLATES).format(
-                query=q, person_note=person_note,
+                query=q, person_note=person_note, scope=_localized(scope),
             )
         if (
             tool_name == "search_history"
@@ -1518,8 +1636,17 @@ class DeliberativeAgent:
             # ヒットした場合も「唯一の事実根拠」枠は付けない。過去の別セッション
             # の内容を今回の事実として断定させないため専用文言を使う。
             grounding = _localized(_SEARCH_HISTORY_RESULT_GUIDANCES)
+        elif is_tool_error(tool_result_text):
+            # エラー文は結果ではない。結果ガイダンス (「厳密な計算結果」) を
+            # 付けるとエラーを事実根拠として扱わせる (2026-09-26 監査 C13#4)。
+            grounding = ""
         elif tool_name == "calculate":
             grounding = _localized(_CALCULATE_RESULT_GUIDANCES)
+            if unexplained_numbers:
+                exact_lead = _localized(_CALCULATE_EXACT_LEADS)
+                grounding = _localized(_CALCULATE_ASSUMED_LEADS).format(
+                    listed="、".join(unexplained_numbers),
+                ) + grounding[len(exact_lead):]
             grounding += _stale_previous_answer_note(messages, tool_result_text)
             if unexplained_numbers:
                 grounding += _unexplained_numbers_note(unexplained_numbers)
@@ -2070,6 +2197,26 @@ class DeliberativeAgent:
         return True
 
     @staticmethod
+    def _append_tool_error_note(
+        messages: list[dict], tool_name: str, result_text: str,
+    ) -> None:
+        """実行環境を測るツールがエラーを返したら「測れていない」と注記する。
+
+        計算・生成ツール (calculate 等) のエラーは環境の実測とは無関係で、
+        「この実行環境を調べないと答えられない」は誤った注記になる
+        (2026-09-26 監査 C13#4、docs/f_03 §3.5)。
+        """
+        if not is_tool_error(result_text):
+            return
+        if tool_name in _ENVIRONMENT_MEASURING_TOOLS:
+            DeliberativeAgent._append_unmeasured_fact_note(messages)
+        else:
+            # 測る以外のツールの失敗は汎用の失敗注記 (docs/f_03 §3.5)
+            append_to_last_user(
+                messages, _localized(_TOOL_FAILED_GUIDANCES), separator="",
+            )
+
+    @staticmethod
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「実測できなかった」注記を追記する。"""
         append_to_last_user(
@@ -2114,6 +2261,33 @@ class DeliberativeAgent:
             messages, _localized(_HISTORY_NOT_SEARCHED_GUIDANCES), separator="",
         )
         return True
+
+    @staticmethod
+    def _append_history_scope_note(
+        messages: list[dict], query: str, judgement: ToolJudgement,
+    ) -> None:
+        """ツールを撃たなかったターンの、過去会話の範囲についての注記。
+
+        窓内想起で検索を止めた (``recall_in_window``、窓がセッション全体を含む)
+        ターンは「検索していない」ではなく「対象はこの会話の中」と伝える
+        (2026-09-26 監査 C05#5)。それ以外は「検索していない」の注記。
+        """
+        if judgement.recall_in_window:
+            DeliberativeAgent._append_recall_in_window_note(messages)
+        else:
+            DeliberativeAgent._append_history_not_searched_note(messages, query)
+
+    @staticmethod
+    def _append_recall_in_window_note(messages: list[dict]) -> None:
+        """窓内想起で履歴検索を止めたターンへ「対象はこの会話の中」と注記する。
+
+        ``_append_history_not_searched_note`` (「検索していない。確認できていない
+        なら正直に」) をここで付けると、会話にある答えを「記録は含まれていない」
+        と否定する (2026-09-26 監査 C05#5)。
+        """
+        append_to_last_user(
+            messages, _localized(_RECALL_IN_WINDOW_GUIDANCES), separator="",
+        )
 
     @staticmethod
     def _append_write_target_unknown_note(
@@ -2408,7 +2582,7 @@ class DeliberativeAgent:
             # 過去会話を訊かれたのに検索を撃てなかったターン。丸投げすると
             # 「確認しましたが」と調べた体で語り、日付まで捏造する
             # (_HISTORY_NOT_SEARCHED_GUIDANCE 参照)。
-            self._append_history_not_searched_note(messages, query)
+            self._append_history_scope_note(messages, query, judgement)
             if judgement.action_blocked:
                 # 状態を変えようとして撃てなかった。丸投げすると「追記しました」
                 # と完了を捏造する (_UNPERFORMED_ACTION_GUIDANCE 参照)。
@@ -2487,8 +2661,7 @@ class DeliberativeAgent:
         # 「存在しません」と断定した。2 ターン前に read_file で存在を確認済みの
         # ファイルだった。judge 段の拒否 (action/measurement blocked) と違い、
         # 実行段の失敗はこれまで何の注記も伴っていなかった。
-        if is_tool_error(tool_result_text):
-            self._append_unmeasured_fact_note(messages)
+        self._append_tool_error_note(messages, judgement.tool_name, tool_result_text)
         self._append_unperformed_action_note_if_blocked(messages, judgement)
         # 「実行できた」ではなく「役に立つ結果が出た」を成否とする (SSOT)。
         # 非ゼロ終了の run_command / 0 件の search_history を成功にすると、
@@ -2632,8 +2805,7 @@ class DeliberativeAgent:
                 getattr(judgement, "unexplained_date_math", False),
             ),
         )
-        if is_tool_error(result_text):
-            self._append_unmeasured_fact_note(messages)
+        self._append_tool_error_note(messages, judgement.tool_name, result_text)
         success = tool_result_succeeded(judgement.tool_name, result_text)
         logger.info(
             "Follow-up tool executed: %s, result_length=%d, success=%s",

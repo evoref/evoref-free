@@ -48,17 +48,9 @@ positive:
     - "make a note"
     - "take note"
 
-    # 訂正マーカー: 誤答を訂正する発話。訂正内容が STM eviction から保護され
-    # retrieve_top_k のスコアでも優先されるようにする (pin_flag 経由)。
-    - 訂正
-    - 訂正します
-    - 正しくは
-    - 間違っています
-    - 間違いです
-    - "that's incorrect"
-    - "that's wrong"
-    - "not correct"
-    - "the correct answer is"
+    # 訂正の字句 (訂正 / 正しくは / 間違っています …) は置かない (2026-09-26)。
+    # pin は字句の一致を検証なしで消費するが、訂正の字句は候補にすぎない
+    # (不変則 #12)。訂正を優先するのは検証済みの from_correction の役目。
 
   chat:
     # チャットモード固有: 個人的事実・嗜好・感情を「覚えて」と言うパターン
