@@ -48,6 +48,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Sequence
 
+from backend.free.core.correction_target import contrast_pair, split_sentences
+from backend.free.core.correction_verdict import strip_copula
 from backend.free.core.intent_vocab import asks_user_profile_summary, is_plain_statement
 from backend.free.core.relative_date import absolutize_annotated_dates, annotate_relative_dates
 from backend.free.core.text_quality import (
@@ -66,6 +68,7 @@ from backend.free.memory.attribute_key import (
     attribute_key,
 )
 from backend.free.memory.notes.note_builder import is_multi_valued_subject
+from backend.free.memory.notes.pin_detector import note_is_pinned
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.semantic.namespaces import is_injectable, namespace_of
 from backend.free.memory.episodic.note import MemoryNote
@@ -103,6 +106,8 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
         "source": "{name}",
         "corroboration": "裏取り {n} 件",
         "unverified": "未確認",
+        # 未検証の訂正候補 (f_02 §5.3、2026-09-26 監査 #14)。値は置換しない。
+        "claimed_correction": " (後に「{wrong}ではなく{right}」との申告あり・未確認)",
     },
     "en": {
         "corrected": " (corrected record)",
@@ -115,6 +120,7 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
         "source": "{name}",
         "corroboration": "{n} corroborating sources",
         "unverified": "unverified",
+        "claimed_correction": " (later stated as 「{right}」 instead of 「{wrong}」, unverified)",
     },
 }
 
@@ -122,6 +128,30 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
 def _render_labels() -> dict[str, str]:
     """prompt_locale に応じたラベル辞書 (未知 locale は ja)。"""
     return _RENDER_LABELS.get(prompt_locale(), _RENDER_LABELS["ja"])
+
+
+#: 値の境界を判定する文字の組 (数字・英字 / 漢字 / カタカナ)。
+_VALUE_CHAR_CLASSES: tuple[str, ...] = ("0-9.A-Za-z", KANJI, KATAKANA_WORD)
+
+
+def _value_boundary_re(value: str) -> "re.Pattern[str]":
+    """``value`` が前後を同種の文字に挟まれずに現れる箇所を探す正規表現。
+
+    「13歳」の中の「3歳」、「小麦粉」の中の「小麦」は同じ値ではない。
+    """
+    def _cls(ch: str) -> str | None:
+        for cls in _VALUE_CHAR_CLASSES:
+            if re.fullmatch(f"[{cls}]", ch):
+                return cls
+        return None
+
+    before = _cls(value[0])
+    after = _cls(value[-1])
+    return re.compile(
+        (f"(?<![{before}])" if before else "")
+        + re.escape(value)
+        + (f"(?![{after}])" if after else ""),
+    )
 
 # ──────────────────────────────────────────────────────────────────────────
 # 定数
@@ -204,7 +234,8 @@ DEFAULT_RELEVANCE_MIN_SCORE = 0.35
 #: 破綻するのは 0.35 なので 3.5 倍の余裕がある。
 DEFAULT_PINNED_RELEVANCE_MIN_SCORE = 0.10
 
-#: 較正が効いているときの pinned 下限 = ``relevance × この比率``。
+#: pinned 下限 = ``relevance × この比率`` (較正に背景分布の中点
+#: ``pinned_relevance_threshold`` が無いとき・プロファイル由来の静的値のとき)。
 #:
 #: 静的既定 0.10 は **背景ノイズ帯の内側**にある。実測の背景分布
 #: (LFM2.5-Embedding-350M / 2026-08-18 の較正キャッシュ) は p50 0.039 / p95 0.302
@@ -494,6 +525,35 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
 _attribute_key = attribute_key
 
 
+def _correction_form_topics(text: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    """平叙文の「X ではなく Y」を持つなら ``(対比の値, 話題語)``、無ければ None (純粋関数)。
+
+    話題語は :func:`query_anchors` の内容語のうち対比の値と重ならないもの
+    (「コタロウ」「京都」)。値だけでは誰・何の話か分からないので、訂正どうしを
+    照らし合わせるときの手掛かりにする (未検証の申告の注記と、訂正の形の問いに
+    載せる訂正ノートの選別で共有する)。
+    """
+    values: list[str] = []
+    preambles: set[str] = set()
+    for sentence in split_sentences(text or ""):
+        # 「訂正です。」のように内容語 1 つと語尾だけの文は談話の前置きで、
+        # 話題ではない (訂正どうしが「訂正」を共有して通るのを防ぐ)。
+        if strip_copula(sentence) in query_anchors(sentence):
+            preambles.add(strip_copula(sentence))
+        if not is_plain_statement(sentence):
+            continue
+        pair = contrast_pair(sentence)
+        if pair is not None:
+            values.extend(pair)
+    if not values:
+        return None
+    topics = tuple(
+        a for a in query_anchors(text)
+        if a not in preambles and not any(a in v or v in a for v in values)
+    )
+    return tuple(values), topics
+
+
 class MemoryInjector:
     """モード別 Tier 注入器。
 
@@ -658,6 +718,11 @@ class MemoryInjector:
             # 値が無いときだけ引く。
             calibrated, _ = _static()
         relevance = float(calibrated)
+        # pin の下限は背景分布の中点 (f_02 §8.3)。旧式の relevance × 0.5 は
+        # 背景の中央より下に落ちうる (bge-m3 で 0.262 < p50 0.362、監査 #4)。
+        pinned = calibration.get("pinned_relevance_threshold")
+        if pinned is not None:
+            return relevance, float(pinned)
         return relevance, relevance * PINNED_RELEVANCE_RATIO
 
     @staticmethod
@@ -952,6 +1017,7 @@ class MemoryInjector:
             facts, stm_notes, stale_texts, stale_note_ids,
         )
         collapsed += restated_later
+        claims = self._unverified_correction_claims(stm_notes)
         if stale_note_ids:
             retired = set(retired) | stale_note_ids
         filtered_out += collapsed
@@ -966,6 +1032,7 @@ class MemoryInjector:
         attr_exempt = 0
         anchors = query_anchors(query_text)
         anchor_exempt = 0
+        query_form = _correction_form_topics(query_text)
         # **話題を持たない継続指示には記憶を注入しない。**
         #
         # 「表にしてください。」「もう一度お願いします。」のように内容語を
@@ -1132,7 +1199,7 @@ class MemoryInjector:
                 score += _ASKED_ATTRIBUTE_BONUS
             text = self._render_fact(
                 fact, was=(previous_values or {}).get(fact.id),
-            )
+            ) + self._claimed_correction_mark(fact, claims)
             tokens = estimate_tokens(text)
             buckets[tier].append(
                 InjectedItem(
@@ -1164,7 +1231,8 @@ class MemoryInjector:
         # (:meth:`_score_note` が並びへ反映する)。
         note_scores: dict[int, float] = {}
         for note in stm_notes:
-            pinned = bool(getattr(note, "pin_flag", False))
+            # 辞書から外した語の自動 pin は pin として扱わない (f_02 §8.3)。
+            pinned = note_is_pinned(note)
             if topicless_directive:
                 filtered_out += 1
                 topicless_dropped += 1
@@ -1259,6 +1327,15 @@ class MemoryInjector:
                 filtered_out += 1
                 retired_dropped += 1
                 continue
+            # 訂正の形の問いに、訂正の形の別ノートを **形の類似だけ** で載せない。
+            # 「A ではなく B でした」の定型が埋め込みを支配し、無関係な訂正
+            # (年利 / 犬の年齢 / Python の版) が 7 件 cosine の棒を越えていた
+            # (2026-09-27 再監査)。対比の値以外の話題語を共有するものだけ残す。
+            if query_form is not None:
+                note_form = _correction_form_topics(getattr(note, "content", "") or "")
+                if note_form is not None and not set(note_form[1]) & set(query_form[1]):
+                    filtered_out += 1
+                    continue
             gate_reached += 1
             if not self._passes_gate(
                 query_vec, note,
@@ -1619,6 +1696,10 @@ class MemoryInjector:
             # アシスタント由来は既定で注入しない (c_16 §7.3-4)。pin も免除
             # しない — pin は「優先度」の宣言であって出所の保証ではない。
             return None
+        if fact.type == "create":
+            # 書き手を撤去した旧形式 (依頼全文、f_02 §2.3)。既存行を遡及して
+            # 注入しない — pin も免除しない (2026-09-26 監査 #3)。
+            return None
         if fact.pinned:
             # pinned は常に Tier 1 に強制配置
             return 1
@@ -1666,8 +1747,6 @@ class MemoryInjector:
             return 1
         if t == "task":
             return 2 if is_current_project else None
-        if t == "create":
-            return 2 if is_current_project else 4
         if t == "preference":
             return 3
         if t == "personal_fact":
@@ -1691,7 +1770,7 @@ class MemoryInjector:
         if note.is_tool_output:
             # ツール出力は WM までで止める
             return None
-        if note.pin_flag:
+        if note_is_pinned(note):
             return 1
         # モード不一致は対象外
         if note.mode != mode:
@@ -1764,7 +1843,7 @@ class MemoryInjector:
             base *= max(cosine, 0.0)
         if duplicate_of_live_fact:
             base *= _DUPLICATE_FACT_NOTE_PENALTY
-        if note.pin_flag:
+        if note_is_pinned(note):
             base += PINNED_BONUS
         return base
 
@@ -1833,6 +1912,69 @@ class MemoryInjector:
             f"- {head}({fact.type}) {fact.subject} {fact.predicate}: "
             f"{_absolute_dates(fact.text)}{labels['aged'].format(age=int(age))}"
         )
+
+    @staticmethod
+    def _unverified_correction_claims(
+        stm_notes: Sequence[MemoryNote],
+    ) -> list[tuple[str, str, float, tuple[str, ...]]]:
+        """未検証の訂正候補ノートの対比 ``(X, Y, 発話時刻, 話題語)`` を集める (読むだけ)。
+
+        検証 (Step 8.0) は静穏窓でしか走らないので、会話が続く間は訂正前の値の
+        ファクトが注記なしで注入され、後のターンで古い値が答えになった
+        (2026-09-26 監査 #14、C19)。検証済み (却下を含む) のノートは対象外。
+        対比は平叙の文だけから取る — 問い・依頼の対比は言い直しではない。
+
+        話題語は訂正発話の内容語 (:func:`query_anchors`) のうち X・Y と重ならない
+        もの (「コタロウ」「アレルギー」)。X が内容語を持たないときの照合に使う
+        (:meth:`_claimed_correction_mark`)。
+        """
+        claims: list[tuple[str, str, float, tuple[str, ...]]] = []
+        for note in stm_notes:
+            if (
+                getattr(note, "private", False)
+                or str(getattr(note, "source", "user") or "user") != "user"
+                or not getattr(note, "is_correction", False)
+                or getattr(note, "correction_verified_at", None) is not None
+            ):
+                continue
+            at = float(getattr(note, "created_at", 0.0) or 0.0)
+            content = getattr(note, "content", "") or ""
+            form = _correction_form_topics(content)
+            if form is None:
+                continue
+            values, topics = form
+            for wrong, right in zip(values[0::2], values[1::2]):
+                claims.append((wrong, right, at, topics))
+        return claims
+
+    @staticmethod
+    def _claimed_correction_mark(
+        fact: SemanticFact,
+        claims: Sequence[tuple[str, str, float, tuple[str, ...]]],
+    ) -> str:
+        """``fact`` の行末に付ける未確認の訂正申告 (無ければ空文字)。
+
+        X がファクト本文に **値の境界で** 現れ (「13歳」の中の「3歳」は当たらない)、
+        Y を含まず、ファクトが申告より古いときだけ付ける。置換はしない。
+
+        X が内容語を持たない (「3歳」「2泊3日」) ときは、訂正発話の話題語が 1 つ
+        以上ファクト本文にも在ることを要求する — 値だけでは誰・何の値か分からず、
+        「コタロウは3歳ではなく5歳」が「娘は3歳です」にも付いていた (f_02 §5.3)。
+        """
+        if not claims:
+            return ""
+        text = str(getattr(fact, "text", "") or "")
+        created = float(getattr(fact, "created_at", 0.0) or 0.0)
+        for wrong, right, at, topics in claims:
+            if created >= at or right in text:
+                continue
+            if not query_anchors(wrong) and not any(t in text for t in topics):
+                continue
+            if _value_boundary_re(wrong).search(text):
+                return _render_labels()["claimed_correction"].format(
+                    wrong=wrong, right=right,
+                )
+        return ""
 
     def _fact_age_days(self, fact: SemanticFact) -> float | None:
         """ファクトが記録されてからの経過日数 (未記録なら ``None``)。"""

@@ -18,7 +18,9 @@ from backend.log_config import get_logger
 from backend.free.core.date_math_cue import query_has_date_math_cue
 from backend.free.core.inference import eligible_rag_indices
 from backend.free.core.intent_vocab import refers_to_ongoing_session, refers_to_previous_output
+from backend.free.core.session_mode import is_create_mode
 from backend.free.memory.corrections import corrections_by_target
+from backend.free.memory.episodic.note import record_mode
 from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now_dt
 from backend.free.constants import (
@@ -375,8 +377,12 @@ async def _search_episodic_layer(
     drop_past_answers: bool = False,
     threshold: float = 0.0,
     own_session: str | None = None,
+    create_session: str | None = None,
 ) -> list[StoreEntry]:
     """エピソード記憶 (``short`` → ``long``) を 1 回で引く。
+
+    ``create_session`` (create モードのターンのセッション id) が与えられたら、
+    別セッションの create ターンのノートを外す (:func:`_drop_other_create_sessions`)。
 
     ``own_session`` が与えられたら、provenance の ``session_id`` が一致する
     ノートだけ残す。自分の直前の出力を指す問い (「今の 4 つの回答は…」) は
@@ -427,6 +433,8 @@ async def _search_episodic_layer(
                 "%d note(s) from other sessions (kept %d of session %s)",
                 before - len(hits), len(hits), own_session,
             )
+    if create_session is not None:
+        hits = _drop_other_create_sessions(hits, create_session)
     if drop_past_answers:
         before = len(hits)
         hits = [h for h in hits if h.record.origin == "user"]
@@ -488,6 +496,30 @@ def _hit_session(hit) -> str:
     prov = getattr(hit.record, "provenance", None) or []
     first = prov[0] if prov and isinstance(prov[0], Mapping) else {}
     return str(first.get("session_id") or "")
+
+
+def _drop_other_create_sessions(hits: list, session_id: str) -> list:
+    """別セッションの create ターンのノートを外す (create モードのターン用、f_01 §8.1)。
+
+    過去の制作依頼とその配信報告は、依頼が違えば別の成果物の構成でしかない。
+    載せると骨組みがそれを再現し、誤った回の報告が次の回の参考になって自己増幅
+    する (2026-09-27 再監査 trace 8e21c7fba11b: 家計簿 CLI の依頼に過去 3 回の
+    家計簿の依頼と「… kakeibo_live2 の models.py … に書き込みました」が入り、
+    成果物が依頼に無い ``kakeibo_live2`` フォルダの下に作られた)。判定は出所の
+    メタデータ (``attrs.mode`` と provenance の ``session_id``) だけ。同じセッション
+    のノートと chat ターンのノートは残す。問いを答えへ差し替える
+    (:func:`_answers_for_question_only_hits`) 前に掛けるので、対ごと消える。
+    """
+    kept = [
+        h for h in hits
+        if not is_create_mode(record_mode(h.record)) or _hit_session(h) == session_id
+    ]
+    if len(kept) != len(hits):
+        logger.info(
+            "Episodic: dropped %d note(s) from create turns of other sessions "
+            "(create turn of session %s)", len(hits) - len(kept), session_id,
+        )
+    return kept
 
 
 def _latest_statement_per_slot(hits: list) -> list:
@@ -1444,6 +1476,7 @@ async def unified_search(
         _search_episodic_layer(
             episodic, query, query_vec, fetch_k, drop_past_answers,
             threshold=store_gate, own_session=own_session,
+            create_session=session_id if is_create_mode(mode) else None,
         ),
         _empty_corpus_layer() if skip_corpus else _search_corpus_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,

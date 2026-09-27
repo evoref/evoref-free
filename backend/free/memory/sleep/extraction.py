@@ -25,13 +25,12 @@
 
 from __future__ import annotations
 
-import re
-
 import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.free.core.correction_target import contrast_pairs
 from backend.free.memory.notes.note_builder import (
     is_multi_valued_subject,
     is_single_valued_subject,
@@ -101,11 +100,6 @@ def persist_facts(
     return written
 
 
-#: 「<旧> ではなく <新>」の旧値 span。``ではなく`` の直前で、主題・目的語の
-#: 助詞か読点から後ろを旧値とみなす (助詞が無ければ文頭から)。
-_OLD_VALUE_BEFORE_NEGATION_RE = re.compile(
-    r"(?:^|[はがをもに、，,。．])\s*(?P<old>[^、，,。はがをも]{2,40}?)\s*(?:ではなく|じゃなく)",
-)
 _ASSERTION_SUBJECT_PREFIX = "mem.world.assertion."
 
 
@@ -121,8 +115,10 @@ def _old_value_spans(fact: object) -> list[str]:
         str(getattr(fact, "object", "") or ""),
         str(getattr(fact, "statement", None) or ""),
     ):
-        for m in _OLD_VALUE_BEFORE_NEGATION_RE.finditer(text):
-            old = norm_span(m.group("old"))
+        # 対比の分解は core の 1 実装 (不変則 #14a)。旧値が 2 文字未満の畳み込みは
+        # 別会話の同じ語まで巻き込みやすいので、ここでは採らない。
+        for old_raw, _new in contrast_pairs(text):
+            old = norm_span(old_raw)
             if len(old) >= 2 and old not in spans:
                 spans.append(old)
     return spans

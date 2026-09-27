@@ -305,6 +305,48 @@ def detect_pin(
     return PinDetection(should_pin=False)
 
 
+#: :func:`detect_pin` が自動 pin に付ける ``pin_reason`` の接頭辞。
+_AUTO_PIN_REASON_PREFIX = "auto_detect:"
+
+
+def pin_reason_is_current(
+    reason: str | None,
+    triggers_dir: str | Path | None = None,
+) -> bool:
+    """``pin_reason`` の pin が **現行の辞書** で見ても有効かを返す。
+
+    辞書から語を外しても、その語で過去に自動 pin されたノートは
+    ``pin_flag=True`` のまま残る (episodic は不変)。2026-09-26 ライブ監査 #4
+    では「訂正」で pin された発話が Tier 1 で毎ターン注入され続けた。
+    読み出し側がこれで効力を確かめる。
+
+    - ``reason`` が無い (手動 pin) → 有効
+    - ``auto_detect:<語>`` で、語がいずれかのモードの現行辞書にある → 有効
+    - それ以外の ``auto_detect:<語>`` → 無効
+
+    Args:
+        reason: ノートの ``pin_reason``
+        triggers_dir: user override の配置先。``None`` なら起動時に登録された
+            既定 (``note_builder.get_default_triggers_dir``)。
+    """
+    if not reason or not reason.startswith(_AUTO_PIN_REASON_PREFIX):
+        return True
+    word = reason[len(_AUTO_PIN_REASON_PREFIX):]
+    if triggers_dir is None:
+        from backend.free.memory.notes.note_builder import get_default_triggers_dir
+
+        triggers_dir = get_default_triggers_dir()
+    triggers = get_pin_triggers_for(triggers_dir)
+    return any(word in words for words in triggers.mode_positive.values())
+
+
+def note_is_pinned(note: Any) -> bool:
+    """ノートの pin が有効か (``pin_flag`` かつ :func:`pin_reason_is_current`)。"""
+    if not getattr(note, "pin_flag", False):
+        return False
+    return pin_reason_is_current(getattr(note, "pin_reason", None))
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # シングルトン (config 経由のグローバルアクセス)
 # ──────────────────────────────────────────────────────────────────────────

@@ -219,7 +219,23 @@ def resolve_dir_output_path(file_path: str, query: str) -> str:
 #: ``write_file`` の戻り値 (``Written 158 bytes to E:\tmp\a.txt``) から書込み先を
 #: 拾うパターン。書いた事実を読み直す側 (最終応答の本文提示 / SSE の書込み先
 #: 表示) が共有する SSOT — 各所で書き写すと片方だけ形式追随に失敗する。
-WRITTEN_PATH_RE = re.compile(r"Written\s+\d+\s+bytes?\s+to\s+(.+?)\s*$", re.MULTILINE)
+#: 書込み結果の行末に付く注記 (``write_file`` の「 (template style could not be
+#: applied; …)」)。空白を含む括弧書きだけを外す — パス中の「(x86)」「(1).docx」
+#: は区切りや拡張子が続く / 空白を含まないので外れない (docs/f_08 §5.4)。
+_TRAILING_NOTE = r"(?:\s+\([^()\\/\r\n]*\s[^()\\/\r\n]*\))?"
+WRITTEN_PATH_RE = re.compile(
+    r"Written\s+\d+\s+bytes?\s+to\s+(.+?)" + _TRAILING_NOTE + r"\s*$", re.MULTILINE,
+)
+
+#: 制作ステージのタスク結果 (``Wrote 4 file(s) via production stage: <パス>, <パス>`` /
+#: 2 つ目以降の ``Already generated 4 file(s) via production stage``)。内部の進捗
+#: ノートで本文ではない — 進捗ノートの除去 (``meta_cognitive_scaffold``) と書込み先の
+#: 拾い出し (``chat_stream_meta._written_paths``) が共有する SSOT。
+PRODUCTION_WROTE_PATTERN = r"(?:Wrote|Already\s+generated)\s+\d+\s+file\(s\)\s+via\s+production\s+stage"
+PRODUCTION_WROTE_RE = re.compile(
+    r"^\s*" + PRODUCTION_WROTE_PATTERN + r"(?::\s*(?P<paths>.+?))?" + _TRAILING_NOTE
+    + r"\s*$", re.MULTILINE,
+)
 
 
 def anchor_relative_output_path(file_path: str) -> str:

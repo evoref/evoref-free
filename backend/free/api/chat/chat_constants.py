@@ -135,9 +135,8 @@ MAX_FILE_CONTEXT_TOTAL_CHUNKS: int = 100
 #: file_contexts の合計文字数上限
 MAX_FILE_CONTEXT_TOTAL_CHARS: int = 500_000
 
-#: session_id のフォーマット（UUID hex 8-64文字）
-SESSION_ID_MIN_LENGTH: int = 8
-SESSION_ID_MAX_LENGTH: int = 64
+#: session_id の長さ (文法の SSOT は ID 台帳 ``backend.io.id_registry``)
+from backend.io.id_registry import SESSION_ID_MAX_LENGTH, SESSION_ID_MIN_LENGTH  # noqa: E402,F401
 
 # ---------------------------------------------------------------------------
 # step_queue サイズ制限（BUG-10 対策）

@@ -17,6 +17,8 @@
   ラベル付きプローブの no-need 上限 0.243 / need 下限 0.338 のちょうど間に落ちた。
 - ``support`` = ``relevance - 0.05`` (top3 平均に掛かる補助ゲートなので少し下)。
 - ``confidence`` = マッチ top1 コサインの **p50**。「確信できる」上側帯。
+- ``pinned_relevance`` = 背景の **p50 と p95 の中点**。記憶注入の pin の下限
+  (:func:`pinned_relevance_from_distribution`)。
 
 **代理クエリ**: 背景・マッチ両方の分布は「クエリ↔ノート」で測る必要がある。
 質問文と平叙文では埋め込みが非対称で、ノート↔ノートで測ると系統的に高く出る
@@ -176,6 +178,24 @@ def _l2_normalize(mat: np.ndarray) -> np.ndarray:
     return (mat / norms).astype(np.float32)
 
 
+def pinned_relevance_from_distribution(distribution: Any) -> float | None:
+    """pin の関連度下限 = 背景分布の p50 と p95 の中点。
+
+    旧式 (``relevance × 0.5``) は背景の中央より下に落ちうる。bge-m3 の実ストア
+    (2026-09-26、背景 p50 0.362 / p95 0.524) では 0.262 で、無関係なペアの過半が
+    pin の下限を越え、自動 pin されたノートが毎ターン注入された (監査 #4)。
+    中点なら背景の過半より上・p95 より下 (通常の棒より緩い) に収まる。
+    分布に p50 / p95 が無ければ ``None`` (呼出側が従来式へ倒す)。
+    """
+    if not isinstance(distribution, dict):
+        return None
+    p50 = distribution.get("background_p50")
+    p95 = distribution.get("background_p95")
+    if not isinstance(p50, (int, float)) or not isinstance(p95, (int, float)):
+        return None
+    return _clamp01(float(p50) + 0.5 * (float(p95) - float(p50)))
+
+
 def compute_calibration(
     note_vecs: np.ndarray,
     query_vecs: np.ndarray,
@@ -249,6 +269,9 @@ def compute_calibration(
         "relevance_threshold": relevance,
         "support_threshold": support,
         "confidence_threshold": confidence,
+        "pinned_relevance_threshold": pinned_relevance_from_distribution(
+            distribution,
+        ),
     }
     logger.info(
         "Memory threshold calibration: notes=%d queries=%d dist=%s thresholds=%s",
@@ -292,10 +315,17 @@ def load_calibration(
     if not isinstance(thresholds, dict):
         return None
     try:
-        return {k: float(v) for k, v in thresholds.items()}
+        loaded = {k: float(v) for k, v in thresholds.items()}
     except (TypeError, ValueError):
         logger.warning("Threshold calibration cache has non-numeric values; ignoring")
         return None
+    # 2026-09-26 より前のファイルは pin 下限を持たない。分布は同じ版で書かれて
+    # いるので、版を上げずにそこから導く。
+    if "pinned_relevance_threshold" not in loaded:
+        pinned = pinned_relevance_from_distribution(data.get("distribution"))
+        if pinned is not None:
+            loaded["pinned_relevance_threshold"] = pinned
+    return loaded
 
 
 def save_calibration(

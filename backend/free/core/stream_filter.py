@@ -11,7 +11,9 @@ StreamPipeline でチェーン適用できる。
 """
 
 import re
+from datetime import date
 
+from backend.free.core.response_dates import fix_weekday_claims, response_dates
 from backend.free.core.verifier_events import record_verifier_hit
 from backend.log_config import get_logger
 
@@ -959,3 +961,52 @@ class UnwrittenFileClaimFilter:
         record_verifier_hit("unwritten_file")
         logger.info("Claimed file write with no file on disk: %s", missing)
         return unwritten_file_disclosure_note(missing)
+
+
+#: 未確定の文末に月日が書きかけで残っている (「10」「10 月 1」)。
+_PENDING_DATE_RE = re.compile(r"\d\s*(?:月|$)")
+_SENTENCE_ENDS = "。！？!?\n"
+
+
+class WeekdayFilter:
+    """月日に添えた曜日を暦で照合し、食い違えば暦の曜日へ書き換える。
+
+    書き換えの条件は ``core.response_dates.fix_weekday_claims`` (月日が接地文 =
+    ユーザーの発話にあり、曜日だけをモデルが付けた、docs/f_08 §6.3)。月日と曜日が
+    トークンを跨ぐので、未確定の文に月日が書きかけで残っている間だけ文末まで
+    溜める。接地文に日付が 1 つも無ければ何もしない (素通し)。
+
+    StreamFilter プロトコル準拠: process() / flush()
+    """
+
+    #: 文末が来ないまま溜めてよい上限。
+    _MAX_BUFFER_CHARS = 200
+
+    def __init__(self, grounded: str, today: date | None = None) -> None:
+        from backend.free.core.prompt_blocks import local_today
+
+        self._today = today or local_today()
+        self._grounded = grounded or ""
+        self._active = bool(
+            response_dates(self._grounded, year_hint=self._today.year),
+        )
+        self._buffer = ""
+
+    def _fix(self, text: str) -> str:
+        return fix_weekday_claims(text, today=self._today, grounded=self._grounded)
+
+    def process(self, text: str) -> str:
+        if not self._active:
+            return text
+        self._buffer += text or ""
+        cut = max(self._buffer.rfind(c) for c in _SENTENCE_ENDS) + 1
+        tail = self._buffer[cut:]
+        if _PENDING_DATE_RE.search(tail) and len(tail) < self._MAX_BUFFER_CHARS:
+            out, self._buffer = self._buffer[:cut], tail
+        else:
+            out, self._buffer = self._buffer, ""
+        return self._fix(out) if out else ""
+
+    def flush(self) -> str:
+        out, self._buffer = self._buffer, ""
+        return self._fix(out) if out else ""

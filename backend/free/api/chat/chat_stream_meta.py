@@ -20,7 +20,7 @@ from backend.free.api.schemas import (
     TokenInfo,
 )
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
-from backend.free.agent.output_format import WRITTEN_PATH_RE
+from backend.free.agent.output_format import PRODUCTION_WROTE_RE, WRITTEN_PATH_RE
 from backend.free.agent.meta_cognitive_utils import (
     looks_like_task_log_residue,
     strip_task_log_scaffold,
@@ -207,6 +207,13 @@ def _cancel_agent_task(agent_task: "asyncio.Task | None", session_id: str) -> No
 
 
 def _meta_cognitive_body_text(resp) -> str:
+    """MetaCognitive 応答の本文。制作ステージの注記 (f_10 §11.1-1) があれば後に添える。"""
+    body = _meta_cognitive_summary_text(resp)
+    notices = [n for n in getattr(resp, "production_notices", None) or [] if n]
+    return "\n\n".join([body, *notices]) if notices else body
+
+
+def _meta_cognitive_summary_text(resp) -> str:
     """MetaCognitive 応答のうち、チャット本文として出すべきテキストを返す。
 
     ``resp.content`` は ``_build_final_response`` が組み立てたタスク進捗ノート
@@ -284,8 +291,12 @@ def _written_paths(tasks) -> list[str]:
     """
     paths: list[str] = []
     for task in tasks or []:
-        for match in _WRITTEN_PATH_RE.finditer(str(getattr(task, "result", "") or "")):
-            path = match.group(1).strip()
+        result = str(getattr(task, "result", "") or "")
+        found = [m.group(1).strip() for m in _WRITTEN_PATH_RE.finditer(result)]
+        # 制作ステージは 1 行に書いた先を並べる (``Wrote N file(s) via production stage: a, b``)
+        for match in PRODUCTION_WROTE_RE.finditer(result):
+            found += [p.strip() for p in (match.group("paths") or "").split(", ")]
+        for path in found:
             if path and path not in paths:
                 paths.append(path)
     return paths

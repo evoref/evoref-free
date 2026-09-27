@@ -645,6 +645,13 @@
     }
   },
   "create": {
-    "needs_input_question": "何を作るかが読み取れませんでした。作りたいもの (内容や種類) と、必要なら言語・保存先を教えてください。"
+    "needs_input_question": "何を作るかが読み取れませんでした。作りたいもの (内容や種類) と、必要なら言語・保存先を教えてください。",
+    "requested_tests_not_available": "依頼されたテスト ({names}) は作成していません (この構成ではテスト工程を実行しません)。",
+    "requested_tests_not_generated": "依頼されたテスト ({names}) は生成できませんでした。",
+    "requested_tests_failing": "依頼されたテスト {name} を付けましたが、一部が通っていません (参考として配信しています)。",
+    "missing_assets": "同梱していないファイルを読み込んでいます: {refs} (音や画像が出ない可能性があります)。",
+    "not_generated": "未生成: {names}",
+    "generating_data_files": "データファイルを生成中… ({names})",
+    "contract_repair_reverted": "契約テスト後の修正を取り消し (smoke 不合格): {paths}"
   }
 }

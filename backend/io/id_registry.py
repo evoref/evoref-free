@@ -7,7 +7,8 @@
 - 固定幅の列 (``ids`` = ``S24``) に収まることと ASCII 限定を lock で固定する
   (:data:`ID_COLUMN_WIDTH`)。
 - **位置カウンタを鍵にしない**。
-- trace_id は対象外 (不変則 #7)。session_id は uuid4 で別文法。
+- trace_id は対象外 (不変則 #7)。session_id は uuid4 で発番する別文法で、API 入口の
+  受け付け文法 (:data:`SESSION_ID_RE`) もここに置く (全入口で同じ判定を使う)。
 """
 
 from __future__ import annotations
@@ -22,6 +23,19 @@ HEX_DIGITS = 16
 ID_COLUMN_WIDTH = 24
 
 _PREFIX_RE = re.compile(r"[a-z]{1,4}_")
+
+#: API 入口で受け付ける session_id の長さ。
+SESSION_ID_MIN_LENGTH = 8
+SESSION_ID_MAX_LENGTH = 64
+#: API 入口で受け付ける session_id の文法 (c_05 §0.5.5)。発番は小文字の uuid4
+#: (36 文字) だが、テストやドライバが作る英小文字・数字・ハイフンの ID も受け付ける。
+#: ``_`` は不可。chat / 履歴 / セッション登録の入口がこの 1 つを使う。
+SESSION_ID_RE = re.compile(r"^[a-z0-9-]{%d,%d}$" % (SESSION_ID_MIN_LENGTH, SESSION_ID_MAX_LENGTH))
+
+
+def is_valid_session_id(session_id: str) -> bool:
+    """API 入口の session_id 文法に合うか。"""
+    return bool(SESSION_ID_RE.match(session_id))
 
 
 @dataclass(frozen=True, slots=True)

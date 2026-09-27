@@ -28,8 +28,11 @@ from backend.free.core.locale_patterns import (
 )
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.correction_target import (
+    CONTRAST_MARKER,
     DEFAULT_LOOKBACK as CORRECTION_LOOKBACK,
+    contrast_pair,
     resolve_correction_target,
+    split_sentences,
 )
 from backend.free.core.correction_verdict import mask_quoted_speech
 from backend.free.core.response_arithmetic import (
@@ -539,9 +542,12 @@ _RECORD_DIVERGENCE_RE_EN = re.compile(
 #: **ユーザー自身の言い直しをアシスタントの失敗として数えてしまう**。
 #: 記憶層と学習層で必要な範囲が違うという既存の設計 (:func:`restates_a_value`
 #: の説明) に従い、記憶側だけを広げる。
+#:
+#: **文ごとに当てる** (:func:`restates_a_value`)。``$`` は発話全体ではなくその文の
+#: 末尾 — 訂正の後に問いや依頼が続く形 (「…5歳でした。散歩時間の目安は
+#: 変わりますか？」) を取りこぼしていた (2026-09-26 監査 #13)。
 _CONTRASTIVE_RESTATEMENT_RE = re.compile(
-    r"(?:ではなく|じゃなく|では無く)[^。！？!?\n]{1,24}(?:でした|だった)"
-    r"[。．.！!\s]*$",
+    CONTRAST_MARKER + r"[^。！？!?\n]{1,24}(?:でした|だった)[。．.！!\s]*$",
 )
 
 #: 値の **変更の告知** (完了形)。「報告会の日が変わりました」「予定が変更に
@@ -549,10 +555,14 @@ _CONTRASTIVE_RESTATEMENT_RE = re.compile(
 #: 宣言で、記憶層にとっては言い直しと同じ (2026-09-12 (b): 対比形が現在形
 #: 「ではなく…です」で past-only の網に掛からず、前倒しが立たないまま別セッション
 #: へ旧日付が注入された)。疑問形 (「変わりますか」「変わったら」) は除く。
-_VALUE_CHANGED_RE = re.compile(
-    r"(?:が|は)\s*(?:変わり|変更にな|変更され|延期にな|前倒しにな|延び|早ま|ずれ)"
-    r"(?:ました|りました|った|た)(?![らかの]|ら)",
+_VALUE_CHANGE_CORE = (
+    r"(?:変わり|変更にな|変更され|延期にな|前倒しにな|延び|早ま|ずれ)"
+    r"(?:ました|りました|った|た)(?![らかの]|ら)"
 )
+_VALUE_CHANGED_RE = re.compile(r"(?:が|は)\s*" + _VALUE_CHANGE_CORE)
+#: 変更告知の **動詞核** だけ。対比語を含む文 (「2泊3日ではなく1泊2日に変更に
+#: なりました」) では対比が「何から何へ」を示すので、主語の ``は/が`` を要求しない。
+_VALUE_CHANGE_CORE_RE = re.compile(_VALUE_CHANGE_CORE)
 _QUESTION_TAIL_RE = re.compile(r"(?:か|の|でしょう)?[?？]\s*$|(?:ますか|ですか|でしょうか)[。．]?\s*$")
 
 
@@ -636,9 +646,20 @@ def restates_a_value(query: str) -> bool:
     if not query:
         return False
     masked = mask_quoted_speech(query)
-    if _VALUE_CHANGED_RE.search(masked) and not _QUESTION_TAIL_RE.search(masked):
-        return True
-    if not _CONTRASTIVE_RESTATEMENT_RE.search(masked):
+    # 文ごとに見る (2026-09-26 監査 #13)。対比形の文末・変更告知の疑問尾は
+    # その文の末尾で判定する — 訂正の後に問いや依頼が続くのは普通の形。
+    contrastive = False
+    for sentence in split_sentences(masked):
+        asks = _QUESTION_TAIL_RE.search(sentence)
+        if _VALUE_CHANGED_RE.search(sentence) and not asks:
+            return True
+        if _CONTRASTIVE_RESTATEMENT_RE.search(sentence) or (
+            not asks
+            and contrast_pair(sentence) is not None
+            and _VALUE_CHANGE_CORE_RE.search(sentence)
+        ):
+            contrastive = True
+    if not contrastive:
         return False
     # 帰属の判定 (質問 / 比較 / 書式変更依頼を落とす) は共有経路と同じものを通す。
     return classify_correction_target(masked) in ("assistant", "self")

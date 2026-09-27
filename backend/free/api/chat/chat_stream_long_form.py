@@ -22,7 +22,12 @@ from backend.free.api.chat.chat_recorder import (
 )
 from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.chat_types import ChatMessage
+from backend.free.agent.output_format import WRITTEN_PATH_RE
 from backend.free.agent.tool_call_judge import _extract_file_path
+from backend.free.core.response_dates import fix_weekday_claims
+from backend.i18n_helper import msg
+from backend.free.core.prompt_blocks import local_today
+from backend.free.core.turn_text import user_utterance_text
 from backend.free.llm.editor_filename import derive_editor_filename_stem
 from backend.free.generation.orchestrator import LongFormOrchestrator
 from backend.free.generation.validators import remove_code_fences
@@ -110,6 +115,7 @@ async def _flush_step_queue_split_aware(
     written: list[dict],
     state: AppState,
     extension: str = ".txt",
+    failed: list[dict] | None = None,
 ) -> AsyncIterator[str]:
     """SPLIT モード対応の step_queue flush。
 
@@ -129,17 +135,21 @@ async def _flush_step_queue_split_aware(
             heading = str(step_data.get("heading", ""))
             file_name = step_data.get("file_name")
             content = str(step_data.get("content", ""))
-            written_path = await split_write_single_unit(
-                base_path=base_path,
-                idx=idx,
-                total=total,
-                heading=heading,
-                file_name=file_name,
-                content=content,
-                state=state,
-                used_paths=used_paths,
-                extension=extension,
-            )
+            try:
+                written_path = await split_write_single_unit(
+                    base_path=base_path,
+                    idx=idx,
+                    total=total,
+                    heading=heading,
+                    file_name=file_name,
+                    content=content,
+                    state=state,
+                    used_paths=used_paths,
+                    extension=extension,
+                )
+            except Exception as exc:  # noqa: BLE001 - 1 ユニットの失敗で全体を止めない
+                logger.warning("Long-form SPLIT unit %d write raised: %s", idx, exc)
+                written_path = None
             if written_path:
                 written.append({
                     "path": written_path, "heading": heading, "idx": idx,
@@ -152,6 +162,8 @@ async def _flush_step_queue_split_aware(
                     "status": "done",
                 })
             else:
+                if failed is not None:
+                    failed.append({"heading": heading, "idx": idx})
                 yield sse.step({
                     "type": "long_form_file_written",
                     "detail": f"[{idx + 1}/{total}] {heading} → write failed",
@@ -226,6 +238,7 @@ async def _finalize_long_form_stream(
     private: bool = False,
     long_form_mode: LongFormMode = LongFormMode.CONTINUE,
     split_written: list[dict] | None = None,
+    split_failed: list[dict] | None = None,
     output_target: str = "file",
     rag_used: bool = False,
     rag_top1_score: float | None = None,
@@ -263,6 +276,13 @@ async def _finalize_long_form_stream(
         delivered = text_output
     else:
         delivered = state.full_response
+    if not is_code and delivered:
+        # 月日に添えた曜日を暦で照合する (ユーザーが述べた月日だけ。f_08 §6.3)。
+        # ファイル / エディタ / 履歴は同じ delivered を使う。
+        delivered = fix_weekday_claims(
+            delivered, today=local_today(),
+            grounded=query + "\n" + user_utterance_text(messages),
+        )
     cancelled = cancel_requested(session_id)
     record_long_form_response(
         sess_state, delivered, messages, session_id,
@@ -354,26 +374,45 @@ async def _finalize_long_form_stream(
     elif long_form_mode == LongFormMode.SPLIT and split_written is not None:
         # SPLIT: per-unit 書込みは既に on_step で完了。INDEX.md だけ生成。
         base_path = _extract_file_path(query) or ""
+        index_path = None
         if base_path:
             index_path = await split_write_index(
                 base_path=base_path,
                 written=split_written,
                 state=sess_state,
             )
+            split_status = "failed" if split_failed else "done"
             if index_path:
                 yield sse.step({
                     "type": "task_result",
                     "detail": (
                         f"{len(split_written)} files written; index: {index_path}"
+                        + (f"; {len(split_failed)} failed" if split_failed else "")
                     ),
-                    "status": "done",
+                    "status": split_status,
                 })
             else:
                 yield sse.step({
                     "type": "task_result",
-                    "detail": f"{len(split_written)} files written (no index)",
-                    "status": "done",
+                    "detail": f"{len(split_written)} files written (no index)"
+                    + (f"; {len(split_failed)} failed" if split_failed else ""),
+                    "status": split_status,
                 })
+        if file_output_mode:
+            # 単一ファイルの経路と同じく、本文が 0 字で終わらないよう書込み先を
+            # 1 文で知らせる (2026-09-27 残件、f_08 §5.4)。
+            paths = [str(item.get("path") or "") for item in split_written]
+            if base_path and index_path:
+                paths.append(str(index_path))
+            shown = "、".join(p for p in paths if p)
+            n_failed = len(split_failed or [])
+            if not split_written:
+                yield sse.token(msg("agent.tasks_all_failed"))
+            elif n_failed:
+                # 一部のユニットの書込みが失敗した — 成功分だけを並べて完了と見せない
+                yield sse.token(msg("agent.files_written_with_failures", paths=shown, failed=n_failed))
+            else:
+                yield sse.token(msg("agent.files_written", paths=shown))
         write_result = None
     else:
         write_result = await long_form_write_file(
@@ -387,6 +426,15 @@ async def _finalize_long_form_stream(
             "type": "task_result", "detail": write_result,
             "status": "failed" if write_result.startswith("Error") else "done",
         })
+        if file_output_mode:
+            # トークンを流していないので、このままだと応答本文が 0 字で終わる
+            # (2026-09-26 監査 C08#2)。書込み先を 1 文で知らせる。履歴 / 記憶は
+            # 生成本文のまま (記録は上で済んでいる、f_08 §5.4)。
+            written = WRITTEN_PATH_RE.search(write_result)
+            yield sse.token(
+                msg("agent.files_written", paths=written.group(1).strip())
+                if written else msg("agent.tasks_all_failed")
+            )
     _emit_timing(sess_state, timer, "long_form", state.tokens_generated, mode=mode)
     if state.truncated:
         # 切断の開示は本文の外 (deliberative と同じ扱い)。本文へ注記を混ぜると
@@ -458,6 +506,7 @@ async def stream_long_form(
         split_base_path = _extract_file_path(query) or ""
         split_used_paths: set[str] = set()
         split_written: list[dict] = []
+        split_failed: list[dict] = []
         # ユーザー指示文から拡張子を 1 度だけ推論し、SPLIT 全 unit に共通適用。
         split_extension = _infer_output_extension(query)
 
@@ -469,6 +518,7 @@ async def stream_long_form(
             written=split_written,
             state=state,
             extension=split_extension,
+            failed=split_failed,
         )
 
         async def _flush_with_editor():
@@ -599,6 +649,7 @@ async def stream_long_form(
                 private=private,
                 long_form_mode=long_form_mode,
                 split_written=split_written,
+                split_failed=split_failed,
                 output_target=output_target,
                 rag_used=_lf_rag_used,
                 rag_top1_score=_lf_rag_top1,

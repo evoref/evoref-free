@@ -32,7 +32,7 @@ from backend.free.agent.meta_cognitive_tasks import (
     task_expects_write,
 )
 from backend.free.agent.meta_cognitive_tools import infer_tool_from_task
-from backend.free.agent.output_format import WRITTEN_PATH_RE
+from backend.free.agent.output_format import WRITTEN_PATH_RE, anchor_relative_output_path
 from backend.i18n_helper import msg
 from backend.free.agent.meta_cognitive_utils import (
     contains_code_indicator,
@@ -52,7 +52,11 @@ from backend.log_config import get_logger
 # mixin 側から本体を import すると循環するため、共有物は meta_cognitive_defs に置く。
 from backend.free.agent.meta_cognitive_content import _ContentGenerationMixin
 from backend.free.agent.meta_cognitive_fast_path import _FastPathMixin
-from backend.free.agent.meta_cognitive_task_exec import _TaskExecutionMixin
+from backend.free.agent.meta_cognitive_task_exec import (
+    _TaskExecutionMixin,
+    delivery_roots,
+    relative_to_roots,
+)
 
 # 本体が使う定数。
 from backend.free.agent.meta_cognitive_defs import (
@@ -659,6 +663,10 @@ class MetaCognitiveAgent(
                 dict(self._production_result.metrics)
                 if self._production_result is not None else {}
             ),
+            production_notices=(
+                [str(n) for n in (self._production_result.notes or {}).get("notices") or []]
+                if self._production_result is not None else []
+            ),
         )
 
     async def _plan(
@@ -1231,16 +1239,39 @@ class MetaCognitiveAgent(
         written = 0
         written_paths: list[str] = []
         failed_paths: list[str] = []
+        rejected_paths: list[str] = []
+        replaced: list[dict] = []
         named_target = (
             self._named_new_file_target(original_query) if len(artifacts) == 1 else ""
         )
+        roots = delivery_roots(original_query)
         for art in artifacts:
             filename = art.filename or named_target or self._fallback_artifact_filename(
                 art, original_query,
             )
-            file_path = self._resolve_write_path(
-                filename, original_query, task.description,
+            # 成果物の名前は制作ステージが決めたもの。名指しの無い既存ファイルへの上書きを
+            # 別名へ振り替える段 (§4.x の 3) は通さない — 振り替え先が依頼の名指したファイルだと
+            # SPEC.md の本文でコードを上書きする。代わりに退避してから書く (f_03 §4.4)。
+            file_path = anchor_relative_output_path(
+                self._resolve_write_path_from_query(filename, original_query),
             )
+            if relative_to_roots(file_path, roots) is None:
+                logger.warning(
+                    "Production stage: %s is outside the requested folder(s) %s; not written",
+                    file_path, [str(r) for r in roots],
+                )
+                rejected_paths.append(file_path)
+                failed_paths.append(file_path)
+                continue
+            try:
+                backup = self._back_up_existing(file_path, art.content, result)
+            except Exception as exc:  # noqa: BLE001 - 読み込み専用 (DataReadonlyError) も含めて上書きしない
+                # 退避できないものは上書きしない (壊すものを残さない)
+                logger.warning("Production stage: backup of %s failed; not written: %s", file_path, exc)
+                failed_paths.append(file_path)
+                continue
+            if backup:
+                replaced.append({"path": file_path, "backup": backup})
             _text, entries = await self._write_file(
                 file_path, art.content, tools_registry, on_step, prefix,
             )
@@ -1250,7 +1281,9 @@ class MetaCognitiveAgent(
                 written_paths.append(file_path)
             else:
                 failed_paths.append(file_path)
-        self._record_delivery(written_paths, failed_paths, result)
+        self._record_delivery(
+            written_paths, failed_paths, result, rejected=rejected_paths, replaced=replaced,
+        )
         if written == 0:
             return "Error: production stage artifacts failed to write", tool_calls
         self._record_write_impact(written_paths, result)
@@ -1300,13 +1333,47 @@ class MetaCognitiveAgent(
         return ""
 
     @staticmethod
+    def _back_up_existing(file_path: str, content: str, result: "ProductionResult") -> str:
+        """中身の違う既存ファイルを ``<run>/replaced/`` へ退避する (f_03 §4.4)。
+
+        依頼が名前を挙げていても退避する (指示どおりの更新でも前の版を失わない、独立レビュー
+        2026-09-26: 名前の部分一致で退避を飛ばし、名を挙げた md_toc.py を上書きした)。退避したら
+        退避先を、退避が要らなければ (無い / 中身が同じ) 空文字列を返す。退避できないとき
+        (run の作業フォルダが無い・読み込み専用・書込みの失敗) は例外で呼出側へ — 上書きしない。
+        """
+        path = Path(file_path)
+        if not path.is_file():
+            return ""
+        try:
+            current = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            current = None
+        if current is not None and current.replace("\r\n", "\n") == content.replace("\r\n", "\n"):
+            return ""
+        workspace_root = (result.notes or {}).get("workspace_root")
+        if not workspace_root:
+            raise FileNotFoundError(f"no run folder to back up {path} before overwriting it")
+        from backend.io.atomic import atomic_write_bytes
+
+        target = Path(workspace_root) / "replaced" / path.name
+        stem, n = target.stem, 1
+        while target.exists():
+            n += 1
+            target = target.with_name(f"{stem}.{n}{path.suffix}")
+        atomic_write_bytes(target, path.read_bytes())
+        logger.info("Production stage: backed up %s to %s before overwriting", path, target)
+        return str(target)
+
+    @staticmethod
     def _record_delivery(
         written_paths: list[str], failed_paths: list[str], result: "ProductionResult",
+        *, rejected: list[str] | None = None, replaced: list[dict] | None = None,
     ) -> None:
         """出力先への書込みの結果を events.jsonl へ積む (best-effort、f_10 §7)。
 
         ``run.json`` はパイプラインの結末なので書き直さない。配信で欠けたものは
-        事実としてイベントに積み、読み手が導出する (2026-09-26)。
+        事実としてイベントに積み、読み手が導出する (2026-09-26)。``rejected`` は
+        配信先の根の外で書かなかったパス、``replaced`` は上書き前に退避したファイル。
         """
         workspace_root = (result.notes or {}).get("workspace_root")
         if not workspace_root:
@@ -1315,7 +1382,10 @@ class MetaCognitiveAgent(
             from backend.free.loop.staged.run_record import RunEventLog
 
             RunEventLog(Path(workspace_root)).append(
-                "delivery", {"written": list(written_paths), "failed": list(failed_paths)},
+                "delivery", {
+                    "written": list(written_paths), "failed": list(failed_paths),
+                    "rejected": list(rejected or []), "replaced": list(replaced or []),
+                },
             )
         except Exception as exc:  # noqa: BLE001 - 記録の失敗で書込み結果は覆さない
             logger.warning("Production stage: delivery event log append failed: %s", exc)
@@ -1497,6 +1567,12 @@ class MetaCognitiveAgent(
         generation_params: dict | None = None,
     ) -> int:
         """書き込み期待タスクの失敗時リトライ（最大2件、各1回のみ）"""
+        if self._production_result is not None:
+            # 制作ステージを走らせたターンの書込みタスクは、すべて制作ステージが引き受けた
+            # (``_run_tasks``)。単発の書込み経路で作り直すと予算外の再生成になり、制作が
+            # 失敗したときは退化した本文を依頼のフォルダパスへ書いて done にする
+            # (2026-09-26 ライブ監査 K04、f_03 §4.4)。結果の文字列ではなく実行の事実で見る。
+            return steps
         failed_writes = [
             (i, task) for i, task in enumerate(tasks)
             if task.status == "failed"
@@ -1507,12 +1583,7 @@ class MetaCognitiveAgent(
 
         max_retries = min(2, self.max_steps - steps)
         for idx, (i, task) in enumerate(failed_writes[:max_retries]):
-            if task.result and (
-                "Content generation failed" in task.result
-                # 制作ステージは予算内で走り切った結果。単発の書込み経路で作り直すと
-                # 予算外の再生成になり、書けた成果物も上書きしうる。
-                or "production stage incomplete" in task.result
-            ):
+            if task.result and "Content generation failed" in task.result:
                 logger.info(
                     "Skipping retry for content generation failure: %s",
                     task.description[:80],

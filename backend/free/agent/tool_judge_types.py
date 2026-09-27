@@ -45,6 +45,10 @@ class ToolJudgement:
     action_blocked: bool = False
     #: このターンで「実測しようとしたが実行できなかった」か (上と同じ理由)。
     measurement_blocked: bool = False
+    #: 窓内想起のガードが「答えはこの会話の窓にある」と判断して履歴検索を
+    #: 止めたか。回答側は「過去の会話を検索していない」ではなく「対象はこの
+    #: 会話の中」と注記する (2026-09-26 監査 C05#5、docs/f_03 §3.5)。
+    recall_in_window: bool = False
 
     def __post_init__(self):
         if self.tool_args is None:

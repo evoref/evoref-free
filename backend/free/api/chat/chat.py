@@ -1,7 +1,6 @@
 """チャット API（SSE ストリーミング + 3層エージェントディスパッチ）"""
 
 import asyncio
-import re
 from dataclasses import dataclass, field, replace
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -87,7 +86,7 @@ from backend.free.api.chat._continuation import (
 )
 from backend.edition import is_pro
 from backend.free.core.inference import latest_turn_truncation
-from backend.free.core.turn_text import neutralize_frame_markers
+from backend.free.core.turn_text import append_to_last_user, neutralize_frame_markers
 from backend.free.core.intent_vocab import is_today_scope_query, is_whole_session_scope_query
 from backend.free.core.session_mode import (
     is_create_mode,
@@ -104,6 +103,7 @@ from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.prompt_manager import ensure_static_directives
 from backend.free.agent.prompt_utils import format_fewshot_section
 from backend.free.agent.reactive import ReactiveAgent
+from backend.free.agent.statement_gate import statement_note_for
 from backend.free.agent.router import (
     ComplexityClassifier,
     needs_write_intent_hint,
@@ -128,6 +128,7 @@ from backend.free.generation.production_brief import (
 from backend.free.agent.create_target_gate import names_creation_target
 from backend.utils import estimate_tokens
 from backend.free.llm.generation_gate import begin_chat_turn, current_turn_lease
+from backend.io.id_registry import is_valid_session_id
 from backend.log_config import get_logger
 from backend.trace_context import (
     generate_trace_id,
@@ -166,10 +167,6 @@ async def _with_chat_in_flight(client, inner_gen, lease=None):
         # ターン終了 (切断を含む) で選択済みテンプレートを必ず捨てる
         # (c_16 §4.5.2)。次のターンへ持ち越さない。
         clear_selected_template()
-
-
-# session_id のフォーマット: 英数字・ハイフンのみ、8-64文字
-_SESSION_ID_RE = re.compile(r"^[a-zA-Z0-9\-]{%d,%d}$" % (SESSION_ID_MIN_LENGTH, SESSION_ID_MAX_LENGTH))
 
 
 def _resolve_loop_view_for_agent(state: AppState):
@@ -223,10 +220,10 @@ def _validate_chat_request(req: ChatRequest) -> None:
         raise HTTPException(status_code=400, detail=f"Invalid mode: {req.mode}")
     req.mode = canonical_mode
 
-    if req.session_id is not None and not _SESSION_ID_RE.match(req.session_id):
+    if req.session_id is not None and not is_valid_session_id(req.session_id):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid session_id format: must be {SESSION_ID_MIN_LENGTH}-{SESSION_ID_MAX_LENGTH} alphanumeric/hyphen chars",
+            detail=f"Invalid session_id format: must be {SESSION_ID_MIN_LENGTH}-{SESSION_ID_MAX_LENGTH} lowercase alphanumeric/hyphen chars",
         )
 
     if not req.file_contexts:
@@ -793,6 +790,22 @@ async def _dispatch_continuation(
     )
 
 
+async def _append_statement_note(
+    state: AppState, messages: list, query: str, *, query_vec=None,
+) -> None:
+    """申告ターンに言い換え確認の注記を付ける (判定点 ``plain_statement``、c_17 §3.9)。
+
+    静的 system からは申告の規則を外してあるので、ここで付けないと申告を
+    逐語で復唱しうる。依頼 (「案内文を作りたいです」) には付けない
+    (2026-09-26 監査 C08#1)。
+    """
+    note = await statement_note_for(
+        getattr(state, "statement_gate", None), query, query_vec=query_vec,
+    )
+    if note:
+        append_to_last_user(messages, note)
+
+
 async def _dispatch_reactive_light(
     req: ChatRequest,
     client,
@@ -845,6 +858,7 @@ async def _dispatch_reactive_light(
         # ツール結果は積まれないが、接地注記は全経路で積まれる。
         post_append_reserve_tokens=notes_post_append_reserve_tokens(),
     )
+    await _append_statement_note(state, light_messages, req.message)
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
     args = (
         req.message, light_messages, client, state, session_id,
@@ -1438,6 +1452,12 @@ async def _build_messages_with_search(
         # この経路は deliberative へ流れ、ツール結果 (最大 TOOL_RESULT_MAX_CHARS)
         # と各種注記が組み立て後に最後の user へ積まれる。その分を先に予約する。
         post_append_reserve_tokens=deliberative_post_append_reserve_tokens(),
+    )
+    await _append_statement_note(
+        state, messages, req.message,
+        # create の埋め込みは create 用の instruction で作られており、事例
+        # (chat の instruction) と空間がずれる。ゲートに埋め込み直させる (c_17 §3.9)。
+        query_vec=None if is_create_mode(req.mode) else search_result.query_vec,
     )
 
     sse_notify = SSEFrameBuilder()

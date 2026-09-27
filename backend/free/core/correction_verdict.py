@@ -249,11 +249,72 @@ def build_correction_verify_prompt(
         "前のユーザー発話か、ユーザー発話中の「X ではなく」の X から。無ければ空文字)。\n"
         "correct_value にはユーザー発話が示した正しい値を"
         "**そのまま逐語で** 抜き出してください (無ければ空文字)。\n"
-        "言い換え・要約・補完をしてはいけません。\n\n"
+        "言い換え・要約・補完をしてはいけません。項目名を付け足さず値だけを抜き出します "
+        "(例: 「住んでいるのは盛岡市ではなく花巻市でした」→ wrong_claim=盛岡市, "
+        "correct_value=花巻市)。\n\n"
         f"{prev_user_block}"
         f"ASSISTANT_RESPONSE:\n{prev_response[:RESPONSE_CAP]}\n\n"
         f"USER_UTTERANCE:\n{correction[:QUERY_CAP]}\n"
     )
+
+
+def _is_number_char(ch: str) -> bool:
+    return ch.isdigit() or ch in ",."
+
+
+def narrow_to_new_value(
+    wrong_claim: str, correct_value: str, candidate: str,
+) -> tuple[str, str] | None:
+    """合成された span の組を、訂正発話に逐語で在る差分へ縮める (純粋関数)。
+
+    訂正発話は「A は X ではなく Y」の形なので、項目名と新しい値がつながった
+    ``correct_value`` (「年利4%」「経費200万円」) は発話に無い。LLM は
+    ``wrong_claim`` の形に揃えて ``correct_value`` を合成して返すことが多く、
+    逐語の門で全件落ちていた (2026-09-26 ライブ監査: 4 件とも invalid_span)。
+
+    2 つの共通の前置・後置を剥がした差分 (数字の途中で切れたら数全体へ広げる)
+    が発話に逐語で在るときだけ、差分を含み発話に逐語で現れる最長の部分へ
+    両方を同じ位置で縮めて返す。新しい情報が逐語であるという門の保証は保つ。
+    差分が発話に無ければ None (却下のまま)。
+    """
+    if not wrong_claim or not correct_value:
+        return None
+    limit = min(len(wrong_claim), len(correct_value))
+    pre = 0
+    while pre < limit and wrong_claim[pre] == correct_value[pre]:
+        pre += 1
+    suf = 0
+    while (suf < limit - pre
+           and wrong_claim[-1 - suf] == correct_value[-1 - suf]):
+        suf += 1
+    # 共通部分が数の途中で切れていたら数全体を差分に含める (150/200 → 15/20 にしない)
+    while pre > 0 and _is_number_char(correct_value[pre - 1]) and (
+        _is_number_char(correct_value[pre]) if pre < len(correct_value) - suf else True
+    ):
+        pre -= 1
+    while suf > 0 and _is_number_char(correct_value[len(correct_value) - suf]) and (
+        _is_number_char(correct_value[len(correct_value) - suf - 1])
+        if len(correct_value) - suf - 1 >= pre else True
+    ):
+        suf -= 1
+    c_end = len(correct_value) - suf
+    diff = correct_value[pre:c_end]
+    if not diff.strip():
+        return None
+    target = norm_span(candidate)
+    if norm_span(diff) not in target:
+        return None
+    best: tuple[int, int] = (pre, c_end)
+    for left in range(pre, -1, -1):
+        for right in range(len(correct_value), c_end - 1, -1):
+            if right - left <= best[1] - best[0]:
+                break
+            if norm_span(correct_value[left:right]) in target:
+                best = (left, right)
+                break
+    left, right = best
+    w_end = len(wrong_claim) - (len(correct_value) - right)
+    return strip_copula(wrong_claim[left:w_end]), strip_copula(correct_value[left:right])
 
 
 @dataclass(frozen=True)
@@ -306,7 +367,10 @@ def check_verdict(
     if wrong_claim and norm_span(wrong_claim) not in norm_span(span_source):
         return VerdictCheck(False, "invalid_span", target, wrong_claim, correct_value)
     if correct_value and norm_span(correct_value) not in norm_span(candidate):
-        return VerdictCheck(False, "invalid_span", target, wrong_claim, correct_value)
+        narrowed = narrow_to_new_value(wrong_claim, correct_value, candidate)
+        if narrowed is None:
+            return VerdictCheck(False, "invalid_span", target, wrong_claim, correct_value)
+        wrong_claim, correct_value = narrowed
     if claims_equivalent(wrong_claim, correct_value):
         return VerdictCheck(False, "same_value", target, wrong_claim, correct_value)
     if response_already_states(correct_value, source):

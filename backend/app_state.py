@@ -191,6 +191,8 @@ class AppState:
     layer_shadow: Any = None
     #: 書込み意図の事例ゲート (c_17 / write_intent_gate)。
     write_intent_gate: Any = None
+    #: 申告の確認ゲート (c_17 §3.9 / statement_gate)。言い換え確認の注記の要否。
+    statement_gate: Any = None
     # Reactive 層 (挨拶/日時/キャッシュ即応) の常駐インスタンス。リクエスト毎に
     # 生成すると LRU キャッシュが温まらないため AppState に保持する。
     reactive_agent: "ReactiveAgent | None" = None

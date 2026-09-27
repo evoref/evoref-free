@@ -98,6 +98,64 @@ def is_degenerate_repetition(text: str) -> bool:
     return True
 
 
+#: コードではないファイルの拡張子 (データ / 文書 / 設定)。反復・情報量の判定から外し、staged v2 は
+#: 系統の判定に数えない (``staged_v2_languages.DATA_SUFFIXES`` はこれに拡張子なしを足しただけ)。
+#: データ / 文書は正当な反復構造や記号の多い本文を持つ。この 1 本が SSOT (不変則 #14 (a))。
+DATA_OR_DOCUMENT_SUFFIXES: tuple[str, ...] = (
+    ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml",
+    ".md", ".txt", ".svg",
+    ".xlsx", ".xls", ".ods", ".docx", ".doc", ".odt", ".pptx", ".ppt", ".odp",
+)
+
+
+def file_suffix(path: str) -> str:
+    """パス (``/`` / ``\\`` 区切り) の拡張子を小文字で (``.py``。無ければ空)。"""
+    name = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return "." + name.rsplit(".", 1)[-1].lower() if "." in name.strip(".") else ""
+
+
+#: 中身の無い本文の判定 (:func:`is_low_information`、f_10 §11.1-2)。実測 (2026-09-26、生成物と
+#: 手書きのソース 1,504 件 + レビューの正当な形): 正当な側は空白以外の割合の最小 0.61・非空行の平均長の
+#: 最小 8.4・リスト記号で始まる行の割合の最大 0.33。壊れた側は KV 破損の空白出力 0.33 / 2.2、
+#: K03・K06 の単語サラダ 0.8 / 1.0。
+_MIN_NON_WHITESPACE_RATIO = 0.45
+_MIN_MEAN_LINE_LENGTH = 4.0
+_MEAN_LINE_MIN_LINES = 5
+_MAX_BULLET_LINE_RATIO = 0.6
+_BULLET_MIN_LINES = 3
+#: リスト記号 (``-`` 1 個 / ``,``) で始まる行。CSS のカスタムプロパティ ``--x`` は含めない。
+_BULLET_LINE_RE = re.compile(r"^\s*(?:-(?!-)|,)")
+
+
+def is_low_information(text: str, suffix: str = "") -> bool:
+    """生成した本文に中身が無いか (空白だけ・記号の断片・箇条書きの断片)。
+
+    ``finish_reason=stop`` で返った退化出力 (2026-09-26 ライブ監査: KV の壊れたスロットの
+    空白と ``, system`` だけの 175 バイト、記憶の断片が箇条書きで並んだ単語サラダ) を、空と同じ
+    扱いにするための判定。構造量 3 つのどれか: 空白以外の割合が低い / 非空行が極端に短い /
+    非空行の大半がリスト記号で始まる。英数字の割合は使わない (数値配列・罫線の正当なコードを落とす)。
+    長さに依存する :func:`is_degenerate_repetition` は短い出力で安定しないので使わない。
+    データ / 文書の拡張子 (``suffix``) は判定しない。
+    """
+    if suffix.lower() in DATA_OR_DOCUMENT_SUFFIXES:
+        return False
+    body = (text or "").strip()
+    if not body:
+        return True
+    if sum(not c.isspace() for c in body) / len(body) < _MIN_NON_WHITESPACE_RATIO:
+        return True
+    lines = [line for line in body.splitlines() if line.strip()]
+    if (
+        len(lines) >= _MEAN_LINE_MIN_LINES
+        and sum(len(line.strip()) for line in lines) / len(lines) < _MIN_MEAN_LINE_LENGTH
+    ):
+        return True
+    return (
+        len(lines) >= _BULLET_MIN_LINES
+        and sum(1 for line in lines if _BULLET_LINE_RE.match(line)) / len(lines) >= _MAX_BULLET_LINE_RATIO
+    )
+
+
 def collapse_runaway_repetition(text: str) -> str:
     """LLM の退化出力 (反復暴走) を切除する。
 

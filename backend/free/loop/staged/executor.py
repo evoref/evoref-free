@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
+from backend.free.core.file_names import allows_empty_content
 from backend.free.core.code_syntax import is_python_path, language_label, syntax_error_detail
 from backend.free.core.prompt_blocks import join_shared_context
 from backend.free.core.dependency_constraint import (
@@ -2143,7 +2144,7 @@ class StagedCreateExecutor:
                     notes={"executor": self.name, "stage": "code", **part_notes},
                 )
             code = _pick_primary(files or {}, source_path)
-        if not code.strip():
+        if not code.strip() and not allows_empty_content(source_path):
             logger.warning("staged code stage produced no code for %s", source_path)
             self._fail_task(task, "empty code generation")
             self._emit("code", f"コード生成失敗 (空): {source_path}", "failed", task.task_id)

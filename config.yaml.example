@@ -160,7 +160,9 @@ llama:
                                   #   q4_1: q4_0より高品質, q4_0: 最大圧縮（品質モデル依存）
                                   #   ※ K は V より量子化に敏感。K: q8_0 / V: q4_1 の非対称設定も有効
   cache_type_v: q8_0              # --cache-type-v / KV value 量子化（選択肢は cache_type_k と同一）
-  cache_reuse: 256                # --cache-reuse / 共通 prefix 自動再利用（0=無効）。多ターン chat の prefill コスト削減。
+  cache_reuse: 0                  # --cache-reuse / KV シフトによる部分再利用（0=無効、既定）。共通接頭辞の再利用 (LCP) はこれと独立に働く。
+                                  # ⚠ 2026-09-26: cache_reuse が実働する dense モデル (Qwen2.5-Coder-14B, -np 4 + kv_unified) で slot KV の
+                                  #   破損 (cache_prompt=true でだけ出力が改行のみになる) を観測し、A/B で cache_reuse>0 が引き金と確認した (c_10 §4)。0 のまま使う。
                                   # ⚠ hybrid recurrent (Qwen3.5/3.8) と SWA (gemma-4) では上流が機構ごと無効化するため、
                                   #   launch_llama.py は recurrent メタデータを検出するとフラグを付けず warning だけ出す。
                                   #   ⚠️ SWA モデル（gemma-4 等）では llama.cpp が自動無効化し no-op（毎ターン full re-prefill）。非 SWA base のみ有効

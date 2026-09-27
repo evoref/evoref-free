@@ -5,7 +5,7 @@
 # 構成:
 #   mode (chat | create)
 #     └ fact_type (personal_fact / world_fact / preference / emotion / opinion /
-#                  project / decision / commitment / task / create)
+#                  project / decision / commitment / task)
 #         └ triggers: [str, ...]   # 部分一致、lowercase 化後に比較
 #
 # マッチング規則 (note_builder.candidate_fact_tags):
@@ -241,18 +241,5 @@ create:
     - "fix the"
     - "add the"
     - "refactor"
-  create:
-    - "python"
-    - "javascript"
-    - "typescript"
-    - "class "
-    - "def "
-    - "import "
-    - "function"
-    - バグ
-    - リファクタ
-    - ユニットテスト
-    - 型エラー
-    - "stack trace"
-    - "exception"
-    - "traceback"
+  # ``create`` の節は撤去した (2026-09-26、c_05 §6.3)。依頼全文を create 型
+  # ファクトにして過去の依頼が注入されていた。依頼は ``task`` (create_task) が持つ。

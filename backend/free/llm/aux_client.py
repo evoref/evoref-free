@@ -259,10 +259,11 @@ class AuxClient:
 
     呼出側から見える約束:
 
-    - ``id_slot`` / ``cache_prompt`` は面の互換のため受けるが無視する。スロットは
+    - ``id_slot`` は面の互換のため受けるが無視する。スロットは
       purpose 別方針 (:data:`CHAT_PATH_PURPOSES` → ``classifier_slot``、それ以外
       → ``background_slot``) で決め、チャットスロットには決して触らない。
-      ``cache_prompt`` は ``LocalClient`` 側で常時 ON
+      ``cache_prompt`` は ``LocalClient`` 側で常時 ON で、``False`` を渡したときだけ
+      その要求で切る (退化した出力の作り直し用、c_14 §2.2)
     - 同一スロットへの同時要求は per-slot ロックで直列化する (llama-server 側で
       同じ ``id_slot`` を取り合うと KV を相互に追い出す)。ロック待ちは
       ``queue_wait_sec`` として別計上し、purpose タイムアウトは dispatch から数える
@@ -404,7 +405,9 @@ class AuxClient:
                 return classifier
         return background
 
-    def _with_slot_prefix(self, messages: list[dict], slot: int) -> list[dict]:
+    def _with_slot_prefix(
+        self, messages: list[dict], slot: int, *, constrained: bool,
+    ) -> list[dict]:
         """分類器スロットへ送るプロンプトを、分類器と同じ system で始める形へ整形する。
 
         分類器スロットは判定器 3 種 (分類 / 日付抽出 / 式合成) と
@@ -414,7 +417,14 @@ class AuxClient:
         2026-09-10: 分類器スロット 11 回のヒット率中央値 6%、573 トークン再計算)。
         接頭辞は判定器が ``LocalClient.set_classifier_slot_prefix`` で公開する。
         未公開 (判定器がまだ走っていない / slots < 3) なら整形しない。
+
+        **文法制約の purpose (``constrained``) に限る**。共有 system は「ツールを
+        選び JSON で返す」役割を宣言しており、出力形を文法で縛れない自由文の
+        purpose では区切り文より役割が勝って分類器の JSON を返す (2026-09-26
+        監査 C08#3、docs/c_14 §2.3)。
         """
+        if not constrained:
+            return messages
         classifier = getattr(self.local, "classifier_slot", None)
         if slot != classifier or slot == int(self.local.background_slot):
             return messages
@@ -552,7 +562,7 @@ class AuxClient:
         id_slot: int | None = None,  # noqa: ARG002 - スロットは purpose 別方針で決める
         timeout: float | None = None,
         purpose: str = "",
-        cache_prompt: bool = False,  # noqa: ARG002 - LocalClient 側で常時 ON
+        cache_prompt: bool | None = None,
         response_format: dict | None = None,
         response_schema: type[BaseModel] | None = None,
         deferrable: bool | None = None,
@@ -563,7 +573,8 @@ class AuxClient:
         (``generate_constrained``) を通す。解決できない自由文の purpose
         (``summarize`` / ``create_spec_doc`` 等) は通常生成へ落とす。
         戻り値の ``choices[0].finish_reason`` は経路を問わず埋める
-        (``"length"`` = 切断)。
+        (``"length"`` = 切断)。``cache_prompt`` は ``False`` のときだけ ``LocalClient`` へ
+        通す (壊れたスロット KV を避ける作り直し用、c_14 §2.2)。``None`` は設定値。
 
         Raises:
             AuxTimeoutError: 予算超過 (``TimeoutError`` のサブクラス)。下位が
@@ -577,7 +588,9 @@ class AuxClient:
             purpose, response_format, response_schema,
         )
         slot = self._slot_for(purpose)
-        messages = self._with_slot_prefix(messages, slot)
+        messages = self._with_slot_prefix(
+            messages, slot, constrained=resolved is not None,
+        )
         effective_timeout = (
             timeout if timeout is not None else self.resolve_effective_timeout(purpose)
         )
@@ -597,6 +610,8 @@ class AuxClient:
                     queue_wait, slot, purpose or "<unspecified>",
                 )
             meta: dict = {}
+            # 既定 (None) は送らない — 差し替え実装・既存の呼出面を変えないため
+            cache_kwargs = {"cache_prompt": False} if cache_prompt is False else {}
 
             async def _call() -> dict:
                 if resolved is not None:
@@ -608,6 +623,7 @@ class AuxClient:
                         id_slot=slot,
                         timeout=effective_timeout,
                         result_meta=meta,
+                        **cache_kwargs,
                     )
                     return {"choices": [{
                         "message": {"content": content or ""},
@@ -620,6 +636,7 @@ class AuxClient:
                     max_tokens=max_tokens,
                     id_slot=slot,
                     request_timeout=effective_timeout,
+                    **cache_kwargs,
                 )
                 if not isinstance(out, dict):
                     # stream=False なので dict のはずだが、差し替え実装の事故は握り潰さない
@@ -716,12 +733,14 @@ class AuxClient:
         telemetry: dict | None = None,
         deferrable: bool | None = None,
         system: str | None = None,
+        cache_prompt: bool | None = None,
     ) -> dict:
         """JSON 出力を生成してパースする。パース不能時は空 dict を返す。
 
         ``system`` は呼出を跨いで共有する文脈 (ProductionBrief 等) を別メッセージで
         渡すためのもの。1 通の user に連結すると同じスロットの連続呼出でも接頭辞 KV
         が再利用されない (hybrid recurrent はメッセージ境界でしか戻れない、f_08 §2.2)。
+        ``cache_prompt`` は :meth:`generate` と同じ (``False`` だけが効く)。
 
         ``finish_reason=length`` (max_tokens 到達で JSON が途中で切れた) は
         **修復しない**。``json_repair`` は ``[0, 1,`` を ``[0, 1]`` に閉じるので、
@@ -739,6 +758,7 @@ class AuxClient:
             response_format=response_format,
             response_schema=response_schema,
             deferrable=deferrable,
+            cache_prompt=cache_prompt,
         )
         content = _content_of(result)
         if not content.strip():

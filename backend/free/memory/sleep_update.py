@@ -865,9 +865,11 @@ class SleepTimeWorker:
         # 継承で **訂正の力** を使う前に、「本当に過去の発言の誤りを指して
         # いるか」を判定してノートへ刻む (2026-09-08 夜の監査 G-01 / G-04)。
         ts = time.monotonic()
-        result["corrections_verified"] = await self._step8_0_verify_corrections(
-            llm_client,
-        )
+        (
+            result["corrections_verified"],
+            result["corrections_verified" + INPUT_SUFFIX],
+            result["corrections_deferred"],
+        ) = await self._step8_0_verify_corrections(llm_client)
         step_durations["step8_0_correction_verify"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
@@ -1335,17 +1337,43 @@ class SleepTimeWorker:
 
     # ── Step 8.0 (correction curator) ──────────────────
 
-    async def _step8_0_verify_corrections(self, llm_client=None) -> int:
+    async def _step8_0_verify_corrections(
+        self, llm_client=None,
+    ) -> tuple[int, int, int]:
         """Step 8.0: 字句で立てた訂正候補を検証してノートへ帰属を刻む。
 
         実ロジックは :mod:`backend.free.memory.sleep.correction_curator`
         に分離されている。本メソッドは state を詰め替える薄いラッパ。
-        """
-        from backend.free.memory.sleep.correction_curator import curate_corrections
 
-        return await curate_corrections(
-            self._curatable_notes(), aux_client=llm_client,
+        検証は静穏窓でだけ出す (Step 5.85 と同じ ``_chat_recent``)。チャットの
+        合間に出すと横取りされて全滅する (2026-09-26 監査 #12)。
+
+        Returns:
+            ``(検証したノート数, 検証待ちの候補数, 静穏窓で見送った候補数)``。
+            2 つ目は死活監視の入力件数 (c_07 §7.1) で、aux が無い構成と静穏窓で
+            見送ったサイクルは 0 (母数外 — 見送りは正常動作)。見送った件数は
+            3 つ目に出し、Full の再要求の判定に使う (scheduler)。
+        """
+        from backend.free.memory.sleep.correction_curator import (
+            curate_corrections,
+            pending_notes,
         )
+        from backend.free.memory.sleep.pseudo_query import quiet_seconds
+
+        notes = self._curatable_notes()
+        pending = len(pending_notes(notes)) if llm_client is not None else 0
+        quiet = quiet_seconds(self.config)
+        if pending and self._chat_recent(quiet):
+            logger.info(
+                "Step 8.0: %d correction candidate(s) wait for a quiet window",
+                pending,
+            )
+            return 0, 0, pending
+        verified = await curate_corrections(
+            notes, aux_client=llm_client,
+            should_pause=lambda: self._chat_recent(quiet),
+        )
+        return verified, pending, 0
 
     # ── Step 8 (Chat/Create/MDP Extractor) ─────────────
 

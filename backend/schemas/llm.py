@@ -172,7 +172,10 @@ class LlamaConfig(BaseModel):
     # ``cache_reuse is not supported by this context`` で自動無効化し、毎ターン
     # full re-prefill するため **no-op** (フラグは無害に無視される)。非 SWA base
     # に差し替えた場合のみ有効。
-    cache_reuse: int = Field(default=256, ge=0)
+    # 既定は 0: 2026-09-26 のライブ監査で、cache_reuse が実働する dense モデル
+    # (Qwen2.5-Coder-14B) だけで slot KV の破損を観測した (引き金は未特定、c_10 §4)。
+    # 接頭辞 (LCP) の再利用はこれと独立に働く。雛形・launcher の未指定時と揃える。
+    cache_reuse: int = Field(default=0, ge=0)
     # コンテキスト checkpoint (上流 ``--ctx-checkpoints`` / ``--checkpoint-min-step``)。
     # hybrid recurrent モデル (Qwen3.5/3.8 等) は KV の部分巻き戻しができず、
     # llama-server は「最後の user メッセージ先頭」と、そこから min-step トークン

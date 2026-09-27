@@ -9,7 +9,11 @@
 - ``commitment`` — 締切・予定 (subject = ``mem.commitment.user``)
 - ``create_task`` — タスク依頼 (subject = ``mem.create_task.<project_id>``)
   Loop driver の ``task`` FactType と構造差があるため別 FactType に分離
-- ``create`` — コード関連知識 (subject = ``mem.create.<keyword>``)
+
+``create`` タグ (旧 ``mem.create.<keyword>`` notes = 依頼全文) は書かない
+(2026-09-26 撤去、f_02 §2.3)。subject が依頼の 1 語目で決まり無関係な依頼が
+同じスロットの世代になって、create モードで過去の依頼文が注入された。依頼は
+同じノートの ``create_task`` が持つ。
 
 スコープは可能な限り ``project:<project_id>``
 ``ctx.project_id`` が ``None`` の場合は extractor が no-op となる
@@ -51,7 +55,6 @@ _FACT_TYPE_BY_TAG: dict[str, FactType] = {
     "decision": "decision",
     "commitment": "commitment",
     "task": "create_task",  # D4: task → create_task に変換
-    "create": "create",
 }
 
 _PREDICATE_BY_TAG: dict[str, str] = {
@@ -59,7 +62,6 @@ _PREDICATE_BY_TAG: dict[str, str] = {
     "decision": "decided",
     "commitment": "promised",
     "task": "requested",
-    "create": "notes",
 }
 
 
@@ -82,14 +84,6 @@ def _sanitize_keyword(raw: str) -> str:
     while out and not (out[0].isascii() and out[0].isalnum()):
         out = out[1:]
     return out or _SAFE_KEYWORD_FALLBACK
-
-
-def _create_keyword(note: MemoryNote) -> str:
-    """``create`` subject 用の kind キーワードをノートから導く (サニタイズ済)。"""
-    if note.keywords:
-        return _sanitize_keyword(note.keywords[0])
-    text = " ".join((note.content or "").split())
-    return _sanitize_keyword(text[:24]) if text else "create"
 
 
 def _task_signature(note: MemoryNote) -> str:
@@ -120,10 +114,8 @@ def _build_subject(tag: str, *, project_id: str, note: MemoryNote) -> str:
         return make_mem_subject(
             "create_task", _sanitize_keyword(project_id), _task_signature(note),
         )
-    if tag == "create":
-        return make_mem_subject("create", _create_keyword(note))
-    # フォールバック (理論上到達しない)
-    return make_mem_subject("create", _SAFE_KEYWORD_FALLBACK)
+    # SUPPORTED_TAGS 以外は呼ばれない (``create`` タグは 2026-09-26 に撤去)。
+    raise ValueError(f"CreateExtractor: unsupported tag {tag!r}")
 
 
 class CreateExtractor(BaseExtractor):
@@ -138,7 +130,6 @@ class CreateExtractor(BaseExtractor):
         "decision",
         "commitment",
         "task",
-        "create",
     )
 
     def __init__(self, builder: CreateNoteBuilder | None = None) -> None:

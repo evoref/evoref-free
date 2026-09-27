@@ -11,14 +11,16 @@
 
 **付与順序の契約** (この順に後ろへ積まれる):
 
-1. 動的ブロック (few-shot / RAG / 記憶) — ``prepend_to_last_user`` で **前置**。
+1. 動的ブロック (few-shot / RAG / 記憶 / 現在日時の注記) — ``prepend_to_last_user``
+   で **前置**。
    生クエリは末尾に残る。
    例外: 生クエリが直前の出力を指す照応 (「上の内容を」「さっきの話」) を含む
    ターンだけは ``append_to_last_user`` で **生クエリの後ろ** へ回す。前置すると
    注入ブロックが指示語の参照先を奪うため。system へは回さない (prefix KV
    キャッシュが全損する)。
-2. 最新ターン切り詰めの注記 / 現在日付 / 人格 / 文字数上限の注記 —
-   ``append_to_last_user`` で後置
+2. 最新ターン切り詰めの注記 / 人格 / 文字数上限の注記 —
+   ``append_to_last_user`` で後置。現在日時の注記は 1 へ移した — 生クエリの直後に
+   区切り無しで付くと、ユーザー発言の一部として要約される (2026-09-26 監査 C02#5)
    (``core.inference.build_messages`` / ``build_messages_for_loop``)。
 3. ツール実行結果 + 話題再フォーカス — 後置 (``agent.deliberative``)。
 
@@ -32,7 +34,7 @@
     [動的ブロック + DYNAMIC_CONTEXT_DELIMITER]   ← 前置 (既定)
     生クエリ
     [DYNAMIC_CONTEXT_TRAILING_DELIMITER + 動的ブロック]   ← 後置 (照応ターンのみ)
-    [注記 …]                                     ← 日付 / 人格 / 文字数 / 計測
+    [注記 …]                                     ← 人格 / 文字数 / 計測
     [TOOL_RESULT_HEADER + ツール結果 + 接地指示]   ← deliberative
 
 境界マーカーは本モジュールが唯一の出所で、:func:`split_last_user` が
@@ -168,6 +170,20 @@ def split_last_user(content: str) -> tuple[str, str, str]:
             cut = pos + len(delim)
             return head[:cut], head[cut:], suffix
     return "", head, suffix
+
+
+def user_utterance_text(messages: list[dict]) -> str:
+    """messages の **ユーザーの発言だけ** を連結する (純粋関数)。
+
+    最後の user は :func:`split_last_user` の生クエリ部分だけを採る — 前置の
+    動的ブロック (RAG / 記憶) とツール結果はユーザーが述べたものではない
+    (曜日照合の接地文、docs/f_08 §6.3)。
+    """
+    users = [m for m in messages if m.get("role") == "user"]
+    parts = [str(m.get("content") or "") for m in users[:-1]]
+    if users:
+        parts.append(split_last_user(str(users[-1].get("content") or ""))[1])
+    return "\n".join(parts)
 
 
 def edit_last_user(

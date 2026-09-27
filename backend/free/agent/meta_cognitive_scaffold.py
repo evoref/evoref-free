@@ -18,6 +18,7 @@ from backend.free.core.text_quality import (
 from backend.free.agent.meta_cognitive_write_rescue import (
     _LEAD_IN_LINE_RE,
 )
+from backend.free.agent.output_format import PRODUCTION_WROTE_PATTERN
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +32,9 @@ from backend.free.agent.meta_cognitive_write_rescue import (
 _TASK_LOG_LINE_RE = re.compile(
     r"^\s*(?:[-*]\s*)?\[(?:done|failed|skipped)\]\s"
     r"|^\s*Written\s+\d+\s+bytes\s+to\s+\S"
-    r"|^\s*Content of `[^`]+`\s*:?\s*$",
+    r"|^\s*Content of `[^`]+`\s*:?\s*$"
+    # 制作ステージの結果行 (英語の内部文字列が本文に出た、2026-09-26 ライブ監査 #25)
+    r"|^\s*" + PRODUCTION_WROTE_PATTERN,
 )
 
 #: 生成プロンプトの内部 scaffold マーカー。成果物に現れたら「プロンプトの

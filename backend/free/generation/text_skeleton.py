@@ -29,12 +29,6 @@ __all__ = ["PinnedValue", "TextSkeleton", "extract_pinned_candidates"]
 
 # ── 決定論抽出パターン ──
 
-#: 和文の月日 (年任意)。verbatim 値としてそのまま prompt へ載せる。
-_JP_DATE_VERBATIM_RE = re.compile(r"\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}日")
-
-#: ISO 形式の日付。
-_ISO_DATE_VERBATIM_RE = re.compile(r"(?<!\d)\d{4}-\d{1,2}-\d{1,2}(?!\d)")
-
 _URL_RE = re.compile(r"https?://[^\s)\]}>、。]+")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+")
 _PHONE_RE = re.compile(r"(?<!\d)0\d{1,4}-\d{1,4}-\d{4}(?!\d)")

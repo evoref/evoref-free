@@ -315,6 +315,7 @@ def _write_rich_document(p: Path, content: str) -> str:
     書かず、必要パッケージを案内する明示エラーを返す (fail clearly)。
     """
     from backend.export import get_writer_registry
+    from backend.export.base import ExportError
     from backend.export.content_converter import ContentConverter
     from backend.export.template_context import get_selected_template, mark_template_applied
 
@@ -361,6 +362,11 @@ def _write_rich_document(p: Path, content: str) -> str:
             # 体裁が崩れた文書を成功として黙って出さない (f_11 §9.1)。
             note = " (template style could not be applied; wrote without inherited formatting)"
         return f"Written {result.size_bytes} bytes to {p}{note}"
+    except ExportError as e:
+        if e.code == "no_table_data":
+            # 理由コードを落とさない — 最終応答が理由を添える (docs/f_11 §5.3)
+            return f"Error: invalid output ({e.code}): {e}"
+        return f"Error: {e}"
     except Exception as e:
         return f"Error: {e}"
 

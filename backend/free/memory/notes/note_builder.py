@@ -35,7 +35,12 @@ import yaml
 from backend.free.core.correction_verdict import mask_quoted_speech
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.session_mode import is_create_mode
-from backend.free.core.text_quality import carries_no_assertion, states_no_user_value
+from backend.free.core.correction_target import split_sentences
+from backend.free.core.text_quality import (
+    carries_no_assertion,
+    person_trigger_abstains,
+    states_no_user_value,
+)
 from backend.free.memory.types import MemoryMode, NoteSource
 from backend.io.id_registry import new_id
 from backend.log_config import get_logger
@@ -208,7 +213,7 @@ def _drop_user_subject_tags_from_assistant(
 #: 同梱 default で期待される fact_type 集合 (mode 別)
 _EXPECTED_TAGS: dict[MemoryMode, tuple[str, ...]] = {
     "chat": ("personal_fact", "world_fact", "preference", "emotion", "opinion"),
-    "create": ("project", "decision", "commitment", "task", "create"),
+    "create": ("project", "decision", "commitment", "task"),
 }
 
 _TRIGGERS_LOCK = threading.Lock()
@@ -288,6 +293,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         explicit_only = guard == "explicit"
         single_valued = bool(raw.get("single_valued", False))
         multi_valued = bool(raw.get("multi_valued", False))
+        person_valued = bool(raw.get("person_valued", False))
         patterns = _coerce_patterns(slug, raw.get("patterns"))
     else:
         words = _coerce_triggers(raw)
@@ -295,6 +301,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         explicit_only = False
         single_valued = False
         multi_valued = False
+        person_valued = False
     if not words and not patterns:
         return None
     return AttributeSpec(
@@ -304,6 +311,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         possessor_explicit_only=explicit_only,
         single_valued=single_valued,
         multi_valued=multi_valued,
+        person_valued=person_valued,
         patterns=patterns,
     )
 
@@ -751,6 +759,12 @@ class AttributeSpec:
     #: (2026-09-10 (i) I-19: 提案書の送付日 9/21 が締切 11/15 に畳まれて
     #: 注入されず、few-shot 手本の日付で偶然正答していた)。
     multi_valued: bool = False
+    #: trigger 語が **人** を指すスロット (family)。trigger を含む文がすべて
+    #: 「人の語が斜格にしか現れず、存在述語も願望・評価の文末も無い」形なら
+    #: 当たらなかったことにする (棄権、:func:`person_trigger_abstains`)。
+    #: 「妻と2人で京都へ旅行に行きます」は同行者で家族構成ではない
+    #: (2026-09-26 ライブ監査 #15)。棄権した発話は補完ゲートへ回る。
+    person_valued: bool = False
 
     def _variants(self, word: str) -> tuple[str, ...]:
         """``word`` と、その **並列形** を返す。
@@ -805,10 +819,22 @@ class AttributeSpec:
         (安全側 — 値を落とさない)。
         """
         hit = self._match_in(haystack)
-        if hit:
-            return hit
-        stripped = strip_bracketed(haystack)
-        return self._match_in(stripped) if stripped != haystack else ()
+        if not hit:
+            stripped = strip_bracketed(haystack)
+            hit = self._match_in(stripped) if stripped != haystack else ()
+        if hit and self.person_valued and self._person_mentions_abstain(haystack, hit):
+            return ()
+        return hit
+
+    @staticmethod
+    def _person_mentions_abstain(haystack: str, hit: tuple[str, ...]) -> bool:
+        """人の語を含む文がすべて棄権の形か (:attr:`person_valued`)。"""
+        sentences = [
+            s for s in split_sentences(haystack) if any(w in s for w in hit)
+        ]
+        return bool(sentences) and all(
+            person_trigger_abstains(s, hit) for s in sentences
+        )
 
     def _phrase_starts(self, haystack: str) -> dict[int, int]:
         """trigger の出現位置 → **重なり合う出現をまとめた句の先頭** (所有者ガード用)。

@@ -34,7 +34,9 @@ from backend.free.agent.meta_cognitive_defs import (
     resolve_read_path,
 )
 
+from backend.free.core.response_dates import fix_weekday_claims
 from backend.log_config import get_logger
+from backend.free.core.prompt_blocks import local_today
 
 logger = get_logger("agent.meta_cognitive")
 
@@ -253,7 +255,7 @@ class _FastPathMixin:
 
         # 3. 「この案内文を保存して」型: 書くべき本文は直前の応答そのもの
         previous = previous_answer_write_content(
-            original_query, getattr(self, "_conversation", None),
+            original_query, getattr(self, "_conversation", None), file_path,
         )
         if previous:
             logger.info(
@@ -296,6 +298,16 @@ class _FastPathMixin:
                 )
                 return rescued, None
 
+        if rejection is None:
+            # 月日に添えた曜日を暦で照合する (ユーザーが述べた月日だけ。f_08 §6.3)
+            grounded = "\n".join([original_query, *(
+                str(m.get("content") or "")
+                for m in getattr(self, "_conversation", None) or []
+                if isinstance(m, dict) and m.get("role") == "user"
+            )])
+            content = fix_weekday_claims(
+                content, today=local_today(), grounded=grounded,
+            )
         return content, rejection
 
     @staticmethod

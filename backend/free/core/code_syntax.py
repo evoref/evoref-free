@@ -148,6 +148,26 @@ def _sfc_script_error(code: str, label: str) -> str | None:
     return None
 
 
+#: 誤りをほとんど出さない文法。「構文が通った」を本文かどうかの判定に使えない。
+_ERROR_TOLERANT_LANGUAGES = frozenset({"html"})
+
+
+def checks_syntax(path: str) -> bool:
+    """:func:`syntax_error_detail` がこのパスの構文の誤りを実際に検出できるか。
+
+    ``None`` (誤りなし) と「検査できない」を区別する呼出側 (生成応答からの本文の抜き出し) 用。
+    """
+    if is_python_path(path):
+        return True
+    suffix = Path(path).suffix.lower()
+    if suffix in _SFC_LANGUAGES:
+        return False
+    lang = _TREE_SITTER_LANGUAGES.get(suffix)
+    if lang is None and suffix in _LANGUAGE_OVERLAY:
+        lang = _LANGUAGE_OVERLAY[suffix][0]
+    return lang is not None and lang not in _ERROR_TOLERANT_LANGUAGES and _parser(lang) is not None
+
+
 def syntax_error_detail(code: str, path: str) -> str | None:
     """``path`` の言語で構文を検査し、誤りがあれば ``line N: 理由`` を返す (無ければ ``None``)。"""
     if is_python_path(path):

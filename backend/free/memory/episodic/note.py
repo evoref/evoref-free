@@ -605,6 +605,12 @@ def note_patch(
     return fields, unset
 
 
+def record_mode(record: Evidence) -> str:
+    """ノートを書いたターンのモード (``chat`` / ``create``)。``attrs.mode`` が無ければ ``chat``。"""
+    attrs = getattr(record, "attrs", None) or {}
+    return _ATTR_TO_MODE.get(str(attrs.get("mode") or "chat"), "chat")
+
+
 def evidence_to_note(record: Evidence) -> MemoryNote:
     """``Evidence`` (kind=``note``) から作業用 :class:`MemoryNote` を復元する。
 
@@ -626,7 +632,7 @@ def evidence_to_note(record: Evidence) -> MemoryNote:
         tier=str(attrs.get("tier") or "short"),
         superseded_by=record.superseded_by,
     )
-    note.mode = _ATTR_TO_MODE.get(str(attrs.get("mode") or "chat"), "chat")  # type: ignore[assignment]
+    note.mode = record_mode(record)  # type: ignore[assignment]
     if record.scope.startswith("project:"):
         note.project_id = record.scope.split(":", 1)[1] or None
     provenance = record.provenance[0] if record.provenance else {}

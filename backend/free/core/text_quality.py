@@ -797,8 +797,11 @@ def has_boilerplate_closing(text: str) -> bool:
 #: ないため :func:`carries_no_assertion` が **問いだけの発言を主張ありと誤判定** する
 #: (2026-08-16 ライブ監査で実データから発覚。SemMem ファクト / STM ノートの
 #: 問いゲートも同じ式を使っているため、そちらにも同じ穴があった)。
+#: 英数字に挟まれた「.」(小数・ファイル名・URL・版数) は文末ではない — ファイル名で
+#: 依頼文を割ると前半が言明と判定される (2026-09-27 再監査:
+#: 「…git_study_invite.docx として保存してください。」)。
 _SENTENCE_RE = re.compile(
-    r"(?:[^。．.!！?？\n]|(?<=\d)[.．](?=\d))+"
+    r"(?:[^。．.!！?？\n]|(?<=[0-9A-Za-z_\-])[.．](?=[0-9A-Za-z]))+"
     r"[。．.!！?？]?",
 )
 
@@ -990,6 +993,13 @@ _OTHER_PERSON_NOUN_RE = re.compile(
 _OBLIQUE_AFTER_PERSON_RE = re.compile(
     r"^(?:さん|ちゃん|くん|君|たち|達)?(?:と一緒に|と共に|とともに|と|に|へ|を|から|より|まで)",
 )
+#: 棄権 (:func:`person_trigger_abstains`) に使う斜格 — **同行・起点・方向** だけ。
+#: を格・に格・裸の「と」は家族構成そのものの言明がとる形なので含めない
+#: (「妻を亡くしました」「妻に先立たれました」「夫と共働きです」)。
+_COMPANION_AFTER_PERSON_RE = re.compile(
+    r"^(?:さん|ちゃん|くん|君|たち|達)?"
+    r"(?:と一緒に|と共に|とともに|と[0-9０-９一二三四五六七八九十]+人で|へ|から|より|まで)",
+)
 #: 家族・関係の **存在 / 同居** を述べる述語。これがあれば人の語は属性の値。
 _PERSON_EXISTENCE_RE = re.compile(
     r"(?:います|いる|おります|居ます|暮らし|住んで|同居|一緒に住|人家族|家族で|がいて|もいて)",
@@ -1020,9 +1030,34 @@ def person_trigger_is_oblique(sentence: str, trigger_words: tuple[str, ...]) -> 
     は存在述語があるので家族の値のまま。
     """
     text = (sentence or "").strip()
-    if not text or _PERSON_EXISTENCE_RE.search(text):
-        return False
     if not _WISH_OR_EVALUATION_RE.search(text):
+        return False
+    return _person_only_in_oblique_case(text, trigger_words, _OBLIQUE_AFTER_PERSON_RE)
+
+
+def person_trigger_abstains(sentence: str, trigger_words: tuple[str, ...]) -> bool:
+    """人のトリガ語が斜格にしか現れず、存在述語も願望・評価の文末も無いか (純粋関数)。
+
+    「11月に妻と2人で京都へ2泊3日の旅行に行きます。」の妻は旅行の同行者で、
+    文は家族構成を述べていない (2026-09-26 ライブ監査 #15: ``mem.personal.family``
+    に入った)。:func:`person_trigger_is_oblique` (願望・評価で終わる文) と違い、
+    ここで真の文は **何の属性かを字句で決められない** — ``person_valued`` の
+    スロット (family) は棄権して補完ゲートへ回す (``note_builder.AttributeSpec``)。
+    願望・評価で終わる文は従来どおり抽出側が落とすので、ここでは偽を返す。
+    """
+    text = (sentence or "").strip()
+    if _WISH_OR_EVALUATION_RE.search(text):
+        return False
+    return _person_only_in_oblique_case(
+        text, trigger_words, _COMPANION_AFTER_PERSON_RE,
+    )
+
+
+def _person_only_in_oblique_case(
+    text: str, trigger_words: tuple[str, ...], oblique: re.Pattern[str],
+) -> bool:
+    """トリガ語の全出現の直後が ``oblique`` の助詞で、存在 / 同居の述語が無いか。"""
+    if not text or _PERSON_EXISTENCE_RE.search(text):
         return False
     saw = False
     for word in trigger_words:
@@ -1032,7 +1067,7 @@ def person_trigger_is_oblique(sentence: str, trigger_words: tuple[str, ...]) -> 
         while (pos := text.find(word, search_from)) >= 0:
             search_from = pos + len(word)
             saw = True
-            if not _OBLIQUE_AFTER_PERSON_RE.match(text[pos + len(word):]):
+            if not oblique.match(text[pos + len(word):]):
                 return False
     return saw
 
@@ -1691,13 +1726,16 @@ def extract_calculate_result(prompt_text: str) -> float | None:
     body = m.group("body").strip()
     if not body or body.startswith("Error"):
         return None
-    # ``expr = value`` なら右辺、値だけならそれ。
+    # ``expr = value`` なら右辺、値だけならそれ。右辺の **最初の数** が結果 — 後ろには
+    # 万・億の読み下し (「（万・億で読むと 148万244.28492）」) が続くことがある。
     tail = body.rsplit("=", 1)[-1].strip()
+    if tail.startswith("Error"):  # ``expr = Error: …`` (式つきのエラー文)
+        return None
     nums = _CALC_NUMBER_RE.findall(tail)
     if not nums:
         return None
     try:
-        return float(nums[-1])
+        return float(nums[0])
     except ValueError:
         return None
 

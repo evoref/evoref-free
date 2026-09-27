@@ -1,6 +1,5 @@
 """会話履歴 API"""
 
-import re
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -24,13 +23,12 @@ from backend.free.api.history._history_schemas import (
     StatsResponse,
 )
 from backend.free.history.history_manager import get_history_manager
+from backend.io.id_registry import is_valid_session_id
 from backend.log_config import get_logger
 
 logger = get_logger("api.history")
 
 router = APIRouter(prefix="/api/history", tags=["history"])
-
-_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F]{8,64}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 __all__ = [
     "router",
@@ -122,8 +120,8 @@ async def compact_history():
 
 
 def _validate_session_id(session_id: str) -> None:
-    """session_id の形式チェック（UUID hex）"""
-    if not _SESSION_ID_RE.match(session_id):
+    """session_id の形式チェック (chat 入口と同じ ID 台帳の文法)"""
+    if not is_valid_session_id(session_id):
         raise HTTPException(status_code=422, detail="Invalid session_id format")
 
 

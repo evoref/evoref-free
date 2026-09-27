@@ -21,8 +21,16 @@ import ast
 import logging
 import re
 
+from backend.free.core.intent_vocab import FILE_NAME_IN_TEXT_RE
 from backend.free.core.prompt_blocks import split_shared_context
-from backend.free.generation.validators import is_degenerate_repetition, remove_code_fences
+from backend.free.core.file_names import allows_empty_content
+from backend.free.generation.validators import (
+    DATA_OR_DOCUMENT_SUFFIXES,
+    file_suffix,
+    is_degenerate_repetition,
+    is_low_information,
+    remove_code_fences,
+)
 from backend.free.llm.utils import extract_content
 
 logger = logging.getLogger("backend.free.generation.direct_codegen")
@@ -41,15 +49,12 @@ _MAX_TOKENS_CEILING = 16384
 #: 反復ループで切れた出力を作り直すときの温度の下限。
 _LOOP_RETRY_TEMPERATURE = 0.6
 
-#: 反復の判定から外す拡張子 (データ / 文書は正当な反復構造を持つ)。
-_REPETITIVE_BY_NATURE_SUFFIXES = (".json", ".csv", ".tsv", ".yaml", ".yml", ".md", ".txt", ".svg")
-
-
 def _looping(code: str, file_path: str) -> bool:
     """切れた出力が反復ループか (データ / 文書ファイルは判定しない)。"""
-    if file_path.lower().endswith(_REPETITIVE_BY_NATURE_SUFFIXES):
+    if file_path.lower().endswith(DATA_OR_DOCUMENT_SUFFIXES):
         return False
     return is_degenerate_repetition(code)
+
 
 # 非ストリーミング呼び出しの per-request タイムアウト算出パラメータ。
 # LocalClient の既定タイムアウト (120s) は decode 速度の速い環境向けで、iGPU 等
@@ -130,6 +135,108 @@ def _complete_test_prefix(code: str) -> str:
     return ""
 
 
+#: 開きフェンス。情報文字列は言語とファイル名を持てる (```python / ```python:md_toc.py / ```md_toc.py)。
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,})([^`]*)$")
+_FENCE_CLOSE_RE = re.compile(r"^\s*`{3,}\s*$")
+#: フェンスの前の地の文が「前置き」とみなせる行数の上限 (構文を検査できない言語だけで使う)。
+_LEAD_IN_MAX_LINES = 3
+
+
+def _fence_info(info: str) -> tuple[str, str]:
+    """開きフェンスの情報文字列から (言語, ファイル名) を取る (無いものは空)。"""
+    names = FILE_NAME_IN_TEXT_RE.findall(info)
+    name = names[0].replace("\\", "/").rsplit("/", 1)[-1] if names else ""
+    first = re.split(r"[\s:{},]+", info.strip(), maxsplit=1)[0].lower()
+    lang = "" if "." in first else first
+    return lang, name
+
+
+def _fenced_blocks(text: str) -> list[tuple[str, str, str]]:
+    """行頭のフェンスで囲まれたブロック ``(言語, ファイル名, 本文)`` の列 (閉じていなければ末尾まで)。
+
+    ファイル名は情報文字列、無ければ直前の地の文の行が挙げたもの (``Here is `utils.py`:``)。
+    """
+    blocks: list[tuple[str, str, str]] = []
+    lines = text.splitlines()
+    hint = ""
+    i = 0
+    while i < len(lines):
+        m = _FENCE_OPEN_RE.match(lines[i])
+        if m is None:
+            if lines[i].strip():
+                names = FILE_NAME_IN_TEXT_RE.findall(lines[i])
+                hint = names[-1].replace("\\", "/").rsplit("/", 1)[-1] if names else ""
+            i += 1
+            continue
+        lang, name = _fence_info(m.group(2))
+        body: list[str] = []
+        i += 1
+        while i < len(lines) and not _FENCE_CLOSE_RE.match(lines[i]):
+            body.append(lines[i])
+            i += 1
+        blocks.append((lang, name or hint, "\n".join(body)))
+        hint = ""
+        i += 1
+    return blocks
+
+
+def _parses(code: str, file_path: str) -> bool | None:
+    """構文が通るか (検査できない言語は ``None``)。"""
+    from backend.free.core.code_syntax import checks_syntax, syntax_error_detail
+
+    if not checks_syntax(file_path):
+        return None
+    return syntax_error_detail(code, file_path) is None
+
+
+def _code_for_file(text: str, file_path: str) -> str:
+    """応答からそのファイルの本文を取り出す (f_10 §11.1-2)。
+
+    応答の構造を見てから抜き出す — 文字列リテラルの中の行頭 ```` ```python ```` を開きフェンスと
+    取り違えると本文が消える (独立レビュー 2026-09-26)。
+    1. 行頭のフェンスが無ければ全体 (行末に結合したフェンスは :func:`remove_code_fences` が落とす)
+    2. フェンスで始まらず、全体の構文が通れば全体。検査できない言語は前置きが短いときだけ 3 へ
+    3. 全体が 1 つのフェンスに包まれ、中身の構文が通れば中身全体
+    4. それ以外はブロックに分け、このファイルの名前のブロック、無ければ別のファイルと名指されて
+       いない、言語の合うブロックをつなぐ (K06: コードの後の ``sample.csv`` の中身を落とす)
+    """
+    lines = text.splitlines()
+    fence_rows = [i for i, line in enumerate(lines) if _FENCE_OPEN_RE.match(line)]
+    if not fence_rows:
+        return remove_code_fences(text)
+    first = next((i for i, line in enumerate(lines) if line.strip()), 0)
+    if fence_rows[0] != first:
+        parsed = _parses(text, file_path)
+        if parsed:
+            return text  # 行頭のフェンスは文字列リテラルの中身
+        lead_in = [line for line in lines[: fence_rows[0]] if line.strip()]
+        if parsed is None and len(lead_in) > _LEAD_IN_MAX_LINES:
+            return remove_code_fences(text)
+    else:
+        last = max(i for i, line in enumerate(lines) if line.strip())
+        if last > first and _FENCE_CLOSE_RE.match(lines[last]):
+            inner = "\n".join(lines[first + 1: last])
+            if _parses(inner, file_path):
+                return inner
+    blocks = _fenced_blocks(text)
+    if not blocks:
+        return remove_code_fences(text)
+    from backend.free.core.code_syntax import language_label
+
+    own = file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    named = [body for _lang, name, body in blocks if name.lower() == own]
+    if named:
+        return "\n\n".join(named)
+    candidates = [(lang, body) for lang, name, body in blocks if not name]
+    wanted = {language_label(file_path), file_suffix(file_path).lstrip(".")} - {""}
+    chosen = (
+        [body for lang, body in candidates if lang in wanted]
+        or [body for lang, body in candidates if not lang]
+        or [(candidates or [(b[0], b[2]) for b in blocks])[0][1]]
+    )
+    return remove_code_fences("\n\n".join(chosen))
+
+
 def _extract_code(resp: dict, file_path: str) -> tuple[str, bool]:
     """応答からコードを取り出す。戻り値は ``(code, from_salvage)``。
 
@@ -138,7 +245,7 @@ def _extract_code(resp: dict, file_path: str) -> tuple[str, bool]:
     でも不完全な断片ではないと信頼してよい (直接 content から取った切断済み
     テキストとは区別する — 後者は語尾が切れた不完全コードの可能性がある)。
     """
-    code = remove_code_fences(extract_content(resp).strip())
+    code = _code_for_file(extract_content(resp).strip(), file_path).strip()
     if code:
         return code, False
     salvaged = _salvage_code_from_reasoning(_reasoning_content(resp))
@@ -159,6 +266,7 @@ async def generate_single_file(
     temperature: float = 0.3,
     request_timeout: float | None = None,
     id_slot: int | None = None,
+    stats: dict | None = None,
 ) -> dict[str, str]:
     """instruction から単一ファイルのコードを base モデルへの 1 回の呼び出しで生成する。
 
@@ -180,6 +288,8 @@ async def generate_single_file(
             ``request_timeout`` へそのまま渡す。``None`` (既定) は
             ``sync_request_timeout`` (実質無制限) に委ねる。切断時の再生成
             呼出にも同じ値を使う (再計算しない)。
+        stats: 渡すと、接頭辞 KV を使わずに作り直した回数を ``cache_bypass_retries`` に足す
+            (呼出側が notes に残す)。
 
     Returns:
         ``{file_path: code}``。生成失敗 / 空応答時は空 dict。再生成 (retry) 後も
@@ -211,6 +321,30 @@ async def generate_single_file(
         return {}
 
     code, code_from_salvage = _extract_code(resp, file_path)
+
+    if _finish_reason(resp) != "length" and (
+        (not code.strip() and not allows_empty_content(file_path))
+        or (code.strip() and is_low_information(code, file_suffix(file_path)))
+    ):
+        # 正常終了なのに中身が無い = スロットの接頭辞 KV が壊れている疑い (2026-09-26
+        # ライブ監査 #5: 同じ要求が cache_prompt=true で改行だけ、false で正常)。
+        # 接頭辞 KV を使わずに 1 回だけ作り直す (c_14 §2.2)。
+        logger.warning(
+            "direct codegen returned no content for %s (finish_reason=%s, %d chars); "
+            "regenerating once without the prompt cache",
+            file_path, _finish_reason(resp) or "?", len(code),
+        )
+        if stats is not None:
+            stats["cache_bypass_retries"] = int(stats.get("cache_bypass_retries") or 0) + 1
+        try:
+            resp = await client.generate(
+                messages, stream=False, max_tokens=max_tokens, temperature=temperature,
+                id_slot=slot, request_timeout=request_timeout, cache_prompt=False,
+            )
+        except Exception as exc:
+            logger.warning("direct codegen regeneration failed for %s: %s", file_path, exc)
+            return {}
+        code, code_from_salvage = _extract_code(resp, file_path)
 
     # 切断されたテストファイルは、完結した test 関数までを採る (倍額再生成しない)。
     # テストは列挙が止まらず 4096 → 8192 とも上限まで伸び、約 20 分を使って
@@ -286,5 +420,13 @@ async def generate_single_file(
                 )
 
     if not code.strip():
+        # 空が慣習のファイル (``__init__.py`` 等) は空のまま成果物にする (validators の SSOT)
+        return {file_path: ""} if allows_empty_content(file_path) else {}
+    if is_low_information(code, file_suffix(file_path)):
+        # 中身の無い本文は空と同じ扱い (呼出側が作り直す、f_10 §11.1-2)
+        logger.warning(
+            "direct codegen produced no content for %s (%d chars of whitespace/symbols); discarding",
+            file_path, len(code),
+        )
         return {}
     return {file_path: code}
