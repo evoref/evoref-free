@@ -41,6 +41,7 @@ from backend.free.core.text_quality import (
     person_trigger_abstains,
     states_no_user_value,
 )
+from backend.free.memory._defaults import reset_trigger_path_cache, trigger_cache_key
 from backend.free.memory.types import MemoryMode, NoteSource
 from backend.io.id_registry import new_id
 from backend.log_config import get_logger
@@ -381,7 +382,7 @@ def load_fact_triggers(path: str | Path) -> FactTriggerMap:
 
 def get_fact_triggers(path: str | Path) -> FactTriggerMap:
     """パスをキーとした ``FactTriggerMap`` のキャッシュ取得 (プロセス内シングルトン)。"""
-    key = str(Path(path).resolve())
+    key = trigger_cache_key(path)
     with _TRIGGERS_LOCK:
         cached = _TRIGGERS_CACHE.get(key)
         if cached is not None:
@@ -395,6 +396,7 @@ def reset_fact_triggers_cache() -> None:
     """テスト用: キャッシュ全消去。"""
     with _TRIGGERS_LOCK:
         _TRIGGERS_CACHE.clear()
+    reset_trigger_path_cache()
 
 
 #: 一人称の所有者。``requires_self_possessor`` の判定に使う。
@@ -962,7 +964,7 @@ def load_fact_attributes(path: str | Path) -> FactAttributeMap:
 
 def get_fact_attributes(path: str | Path) -> FactAttributeMap:
     """パスをキーとした ``FactAttributeMap`` のキャッシュ取得。"""
-    key = str(Path(path).resolve())
+    key = trigger_cache_key(path)
     with _ATTRS_LOCK:
         cached = _ATTRS_CACHE.get(key)
         if cached is not None:
@@ -976,6 +978,7 @@ def reset_fact_attributes_cache() -> None:
     """テスト用: キャッシュ全消去。"""
     with _ATTRS_LOCK:
         _ATTRS_CACHE.clear()
+    reset_trigger_path_cache()
 
 
 def resolve_fact_attributes_path(triggers_dir: str | Path | None = None) -> Path:

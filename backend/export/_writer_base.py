@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from backend.export.base import ExportContent, ExportError, WriteResult
+from backend.io.user_file import write_user_bytes
 from backend.log_config import get_logger
 
 logger = get_logger("export._writer_base")
@@ -72,9 +73,10 @@ class BytesWriterBase(ABC):
         content.metadata[BASE_DIR_METADATA_KEY] = str(path.parent)
         data = self._render_bytes(content, ext)
 
+        # 一時ファイル + 置き換え、上書きの前に退避 (f_11 §5.5 / §5.6)。途中で失敗しても
+        # 既存の文書は壊れない (以前は write_bytes で直接書き、失敗すると途中までの文書が残った)。
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+            write_user_bytes(path, data)
         except OSError as e:
             raise ExportError("write_error", f"Failed to write {path}: {e}")
 

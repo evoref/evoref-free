@@ -54,6 +54,25 @@ def _log_timings(label: str, timings: dict[str, float], total_ms: float) -> None
 # ──────────────────────────────────────────────────────────────────────────
 
 
+#: sleep-time の静止を待つ上限 (秒)。超えたら WARNING を出して先へ進む
+#: (停止を無期限に待たせない。停止は kill 前提、c_05 §0.4)。
+_SLEEP_QUIESCE_TIMEOUT_SEC = 8.0
+
+
+async def _shutdown_sleep_quiesce(sleep_scheduler: "SleepTimeScheduler | None") -> None:
+    """走っている sleep-time サイクル (ワーカースレッドを含む) の終わりを待つ。
+
+    ストアを閉じる・書き手ロックを手放すのはこの後。先に進むと、Light の
+    スレッドが閉じたストアへ事象を追記したり、次のプロセスと書き手が重なる。
+    """
+    if sleep_scheduler is None:
+        return
+    try:
+        await sleep_scheduler.shutdown(timeout=_SLEEP_QUIESCE_TIMEOUT_SEC)
+    except Exception as e:
+        logger.warning("Sleep-time quiesce on shutdown failed: %s", e)
+
+
 async def _shutdown_level1_loop(sleep_scheduler: "SleepTimeScheduler") -> None:
     """Level 1 / Level 2 常駐ループ停止（新規起動を防ぐ）"""
     try:
@@ -347,10 +366,13 @@ async def _run_lifespan_shutdown(
 ) -> dict[str, float]:
     """シャットダウンシーケンス全体を実行し、timings を返す。
 
-    順序: stop_level1_loop (新規起動を防ぐ) → cancel (graceful=False) →
-    in-flight タスクが finally で session を保存。
+    順序: sleep-time の静止 (走っているサイクルとスレッドを待つ) →
+    stop_level1_loop (新規起動を防ぐ) → cancel (graceful=False) →
+    in-flight タスクが finally で session を保存 → … → 書き手ロックの解放。
     """
     shutdown_timings: dict[str, float] = {}
+    with _timed(shutdown_timings, "sleep_quiesce"):
+        await _shutdown_sleep_quiesce(ctx.sleep_scheduler)
     with _timed(shutdown_timings, "level1_loop_stop"):
         await _shutdown_level1_loop(ctx.sleep_scheduler)
     with _timed(shutdown_timings, "learning_cancel"):

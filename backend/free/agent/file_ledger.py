@@ -32,16 +32,19 @@ import os
 import re
 from collections import OrderedDict, deque
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 from backend.log_config import get_logger
 
 logger = get_logger("agent.file_ledger")
 
 __all__ = [
+    "current_named_file_paths",
     "file_ledger_scope",
     "forget_current_file",
     "forget_file",
     "last_file_path",
+    "named_file_paths",
     "record_current_file",
     "record_file",
     "references_recent_file",
@@ -56,34 +59,59 @@ MAX_ENTRIES_PER_SESSION = 12
 #: 保持するセッション数。
 MAX_SESSIONS = 16
 
-_ledger: "OrderedDict[str, deque[str]]" = OrderedDict()
 
 
-def _bucket(session_id: str) -> "deque[str]":
+@dataclass(frozen=True, slots=True)
+class _Entry:
+    """台帳の 1 件。
+
+    ``named`` は **記録した時点で** そのパスが依頼文由来の根 (依頼文が挙げた
+    フォルダ / 名指しの記録の親) の配下にあったか。書込みゲート (docs/f_03 §4.y)
+    は ``named`` の記録の親フォルダだけを「書いてよい根」に足す — LLM が自分で
+    選んで読んだパスを、次のターンの書込みの根にしないため。
+    """
+
+    path: str
+    named: bool = False
+
+
+_ledger: "OrderedDict[str, deque[_Entry]]" = OrderedDict()
+
+
+def _bucket(session_id: str) -> "deque[_Entry]":
     existing = _ledger.get(session_id)
     if existing is not None:
         _ledger.move_to_end(session_id)
         return existing
-    created: "deque[str]" = deque(maxlen=MAX_ENTRIES_PER_SESSION)
+    created: "deque[_Entry]" = deque(maxlen=MAX_ENTRIES_PER_SESSION)
     _ledger[session_id] = created
     while len(_ledger) > MAX_SESSIONS:
         _ledger.popitem(last=False)
     return created
 
 
-def record_file(session_id: str, path: str) -> None:
+def _remove(bucket: "deque[_Entry]", path: str) -> bool:
+    """``path`` の記録をすべて外す。外した記録のどれかが ``named`` なら True。"""
+    named = False
+    for entry in [e for e in bucket if e.path == path]:
+        named = named or entry.named
+        bucket.remove(entry)
+    return named
+
+
+def record_file(session_id: str, path: str, *, named: bool = False) -> None:
     """このセッションで触れたファイルのパスを記録する。
 
     同じパスを重ねて記録しない (最後に触れた順を保つため、既存を消して
-    末尾へ積み直す)。
+    末尾へ積み直す)。一度 ``named`` で記録したパスは、後で名指し無しに触れても
+    ``named`` のまま (「同じファイルに追記して」の次のターンも書ける)。
     """
     cleaned = (path or "").strip().strip("\"'")
     if not session_id or not cleaned:
         return
     bucket = _bucket(session_id)
-    while cleaned in bucket:
-        bucket.remove(cleaned)
-    bucket.append(cleaned)
+    named = _remove(bucket, cleaned) or named
+    bucket.append(_Entry(cleaned, named))
 
 
 #: 現在のリクエストの ``session_id``。``tool_ledger`` と同じ理由で contextvar
@@ -99,11 +127,22 @@ def file_ledger_scope(session_id: str):
     return _current_session.set(session_id or "")
 
 
-def record_current_file(path: str) -> None:
+def record_current_file(path: str, *, named: bool = False) -> None:
     """現在のリクエストの宛先へファイルパスを記録する。"""
     session_id = _current_session.get()
     if session_id:
-        record_file(session_id, path)
+        record_file(session_id, path, named=named)
+
+
+def named_file_paths(session_id: str) -> list[str]:
+    """このセッションの ``named`` の記録 (古い順)。"""
+    return [e.path for e in _ledger.get(session_id) or () if e.named]
+
+
+def current_named_file_paths() -> list[str]:
+    """現在のリクエストの宛先の ``named`` の記録 (宛先が無ければ空)。"""
+    session_id = _current_session.get()
+    return named_file_paths(session_id) if session_id else []
 
 
 def forget_file(session_id: str, path: str) -> bool:
@@ -117,10 +156,9 @@ def forget_file(session_id: str, path: str) -> bool:
     """
     cleaned = (path or "").strip().strip("\"'")
     bucket = _ledger.get(session_id)
-    if not bucket or cleaned not in bucket:
+    if not bucket or not any(e.path == cleaned for e in bucket):
         return False
-    while cleaned in bucket:
-        bucket.remove(cleaned)
+    _remove(bucket, cleaned)
     return True
 
 
@@ -132,13 +170,18 @@ def forget_current_file(path: str) -> bool:
     return forget_file(session_id, path)
 
 
-def last_file_path(session_id: str) -> str:
-    """このセッションで最後に触れたファイルのパス (無ければ空文字)。"""
-    bucket = _ledger.get(session_id)
-    return bucket[-1] if bucket else ""
+def last_file_path(session_id: str, *, named_only: bool = False) -> str:
+    """このセッションで最後に触れたファイルのパス (無ければ空文字)。
+
+    ``named_only`` なら ``named`` の記録だけを見る。
+    """
+    for entry in reversed(_ledger.get(session_id) or ()):
+        if entry.named or not named_only:
+            return entry.path
+    return ""
 
 
-def resolve_against_recent_dir(session_id: str, path: str) -> str:
+def resolve_against_recent_dir(session_id: str, path: str, *, named_only: bool = False) -> str:
     """裸のファイル名を「この会話で使っているディレクトリ」へ寄せる。
 
     ``note2.md`` のようにディレクトリを伴わない名前は、そのまま渡すと
@@ -155,13 +198,17 @@ def resolve_against_recent_dir(session_id: str, path: str) -> str:
 
     寄せるのは **区切りを 1 つも含まない名前だけ**。``sub/a.txt`` のような
     相対パスはユーザーが構造を書いているので触らない。
+
+    書込み (``named_only=True``) では ``named`` の記録だけを見る。LLM が自分で
+    選んで読んだファイルの隣は書込みゲート (docs/f_03 §4.y) が断るので、そこへ
+    寄せずに ``outputs_dir`` へ任せる。
     """
     cleaned = (path or "").strip().strip("\"'")
     if not cleaned or not session_id:
         return path
     if os.path.isabs(cleaned) or "/" in cleaned or "\\" in cleaned:
         return path
-    recent = last_file_path(session_id)
+    recent = last_file_path(session_id, named_only=named_only)
     if not recent:
         return path
     parent = os.path.dirname(recent)
@@ -175,12 +222,12 @@ def resolve_against_recent_dir(session_id: str, path: str) -> str:
     return resolved
 
 
-def resolve_current_against_recent_dir(path: str) -> str:
+def resolve_current_against_recent_dir(path: str, *, named_only: bool = False) -> str:
     """現在のリクエストの宛先で :func:`resolve_against_recent_dir` を掛ける。"""
     session_id = _current_session.get()
     if not session_id:
         return path
-    return resolve_against_recent_dir(session_id, path)
+    return resolve_against_recent_dir(session_id, path, named_only=named_only)
 
 
 def reset(session_id: str | None = None) -> None:

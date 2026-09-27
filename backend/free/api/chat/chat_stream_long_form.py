@@ -24,6 +24,8 @@ from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.agent.output_format import WRITTEN_PATH_RE
 from backend.free.agent.tool_call_judge import _extract_file_path
+from backend.free.agent.tools.filesystem import EDIT_REFUSED_UNENCODABLE_RE
+from backend.free.agent.write_gate import WRITE_DENIED_RE
 from backend.free.core.response_dates import fix_weekday_claims
 from backend.i18n_helper import msg
 from backend.free.core.prompt_blocks import local_today
@@ -48,6 +50,8 @@ from backend.free.api.chat.chat_stream_common import (
 )
 
 from backend.free.api.chat.chat_stream_output import (
+    EDIT_REFUSED_MIXED_PREFIX,
+    EDIT_REFUSED_UNREADABLE_PREFIX,
     _WRITE_HINT_RE,
     _infer_output_extension,
     _normalize_editor_text,
@@ -426,15 +430,42 @@ async def _finalize_long_form_stream(
             "type": "task_result", "detail": write_result,
             "status": "failed" if write_result.startswith("Error") else "done",
         })
+        if not file_output_mode and (denied := WRITE_DENIED_RE.match(write_result)):
+            # 本文は流れ済み。保存されなかったことだけを本文の後に知らせる (f_03 §4.y)。
+            yield sse.token("\n\n" + msg(
+                f"agent.write_denied.{denied['code']}", path=denied["path"].strip(),
+            ))
         if file_output_mode:
             # トークンを流していないので、このままだと応答本文が 0 字で終わる
             # (2026-09-26 監査 C08#2)。書込み先を 1 文で知らせる。履歴 / 記憶は
             # 生成本文のまま (記録は上で済んでいる、f_08 §5.4)。
             written = WRITTEN_PATH_RE.search(write_result)
-            yield sse.token(
-                msg("agent.files_written", paths=written.group(1).strip())
-                if written else msg("agent.tasks_all_failed")
-            )
+            if written:
+                text = msg("agent.files_written", paths=written.group(1).strip())
+            elif write_result.startswith(EDIT_REFUSED_UNREADABLE_PREFIX):
+                text = msg(
+                    "agent.edit.unreadable",
+                    path=write_result[len(EDIT_REFUSED_UNREADABLE_PREFIX):],
+                )
+            elif write_result.startswith(EDIT_REFUSED_MIXED_PREFIX):
+                text = msg(
+                    "agent.edit.mixed",
+                    path=write_result[len(EDIT_REFUSED_MIXED_PREFIX):],
+                )
+            elif unencodable := EDIT_REFUSED_UNENCODABLE_RE.match(write_result):
+                text = msg(
+                    "agent.edit.unencodable",
+                    path=unencodable["path"], chars=unencodable["chars"],
+                )
+            elif denied := WRITE_DENIED_RE.match(write_result):
+                # 書込みゲートが断った (docs/f_03 §4.y)。トークンを流していないので、
+                # 断りの 1 文の後に生成本文を流す (書けなかった中身を捨てない)。
+                text = msg(f"agent.write_denied.{denied['code']}", path=denied["path"].strip())
+                if delivered:
+                    text = f"{text}\n\n{delivered}"
+            else:
+                text = msg("agent.tasks_all_failed")
+            yield sse.token(text)
     _emit_timing(sess_state, timer, "long_form", state.tokens_generated, mode=mode)
     if state.truncated:
         # 切断の開示は本文の外 (deliberative と同じ扱い)。本文へ注記を混ぜると

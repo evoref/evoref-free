@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from backend.log_config import get_logger
@@ -17,7 +18,7 @@ logger = get_logger("export.media")
 #: 埋め込み画像の既定の最大幅 (cm)。元画像のアスペクト比は保つ。
 DEFAULT_MAX_WIDTH_CM = 12.0
 
-_URL_PREFIXES = ("http://", "https://", "ftp://", "data:")
+_URL_PREFIXES = ("http://", "https://", "ftp://", "data:", "file:")
 
 #: 相対画像パスの基準ディレクトリを Writer へ渡す ``ExportContent.metadata`` キー。
 #: ``BytesWriterBase.write`` が出力先から設定する。``write_to_bytes`` (API の
@@ -34,9 +35,13 @@ def export_base_dir(content) -> Path | None:
 def resolve_image_path(src: str, base_dir: Path | None = None) -> Path | None:
     """画像の所在を実ファイルへ解決する。解決できなければ ``None``。
 
-    - 絶対パスはそのまま、相対パスは ``base_dir`` (出力先ファイルのある
-      ディレクトリ) から解決する。**プロセスの CWD は使わない**。
-    - ``..`` を含むパスは拒否する (write_file の脱出検査と同じ方針)。
+    - 相対パスは ``base_dir`` (出力先ファイルのあるディレクトリ) から解決する。
+      **プロセスの CWD は使わない**。
+    - 絶対パスは ``base_dir`` か ``outputs_dir`` の内側だけ受ける (``src`` は LLM の
+      出力なので、任意のローカル画像を埋め込ませない)。
+    - UNC (``\\\\host`` / ``//host``)・``\\\\?\\``・``file:`` は常に拒否し、
+      ファイルシステムへ問い合わせない (``is_file()`` だけで SMB 認証が走る)。
+    - ``..`` を含むパス・ドライブ相対 / ルート相対は拒否する。
     - URL は取得しない。
     - 読めないものは落として WARNING。壊れた文書を書くより欠落を選ぶ。
     """
@@ -49,12 +54,27 @@ def resolve_image_path(src: str, base_dir: Path | None = None) -> Path | None:
         logger.warning("image source is a URL; writers do not fetch it: %s", text)
         return None
 
-    if ".." in text.replace("\\", "/").split("/"):
+    normalized = text.replace("\\", "/")
+    if normalized.startswith("//"):
+        logger.warning("image source is a UNC or device path, rejected: %s", text)
+        return None
+
+    if ".." in normalized.split("/"):
         logger.warning("image source contains a '..' segment, rejected: %s", text)
         return None
 
     path = Path(text)
-    if not path.is_absolute():
+    if path.is_absolute():
+        if not _inside_allowed_roots(path, base_dir):
+            logger.warning(
+                "absolute image source is outside the output directories, rejected: %s",
+                text,
+            )
+            return None
+    elif path.drive or path.root:
+        logger.warning("drive- or root-relative image source, rejected: %s", text)
+        return None
+    else:
         if base_dir is None:
             logger.warning(
                 "relative image source needs an output directory, skipped: %s", text,
@@ -70,6 +90,16 @@ def resolve_image_path(src: str, base_dir: Path | None = None) -> Path | None:
         logger.warning("image source is not readable (%r), skipped: %s", e, path)
         return None
     return path
+
+
+def _inside_allowed_roots(path: Path, base_dir: Path | None) -> bool:
+    """絶対パスが出力先のディレクトリか ``outputs_dir`` の内側か (字面で比べる)。"""
+    from backend.config import resolve_outputs_dir
+
+    roots = [resolve_outputs_dir()]
+    if base_dir is not None:
+        roots.append(base_dir)
+    return any(path.is_relative_to(os.path.abspath(root)) for root in roots)
 
 
 def scaled_width_cm(path: Path, max_width_cm: float = DEFAULT_MAX_WIDTH_CM) -> float:

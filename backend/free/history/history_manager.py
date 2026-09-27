@@ -731,14 +731,27 @@ class HistoryManager:
             paths=(self._turns_path(session_id),),
         ))
 
-    def mark_promoted_to_semmem(self, session_id: str) -> bool:
+    def mark_promoted_to_semmem(self, session_id: str, *, wait: bool = True) -> bool:
         """セッションを SemMem 昇格済としてマーク
 
         索引とセッション本体の両方に反映する (再起動後に再昇格しないため)。
 
+        ``wait=False`` なら印付けを書き手スレッドへ積んで待たずに返す
+        (sleep-time の Full がイベントループ上で書き手スレッドを待たない、
+        docs/f_02 §4.3)。書き手スレッドの無い CLI / テストではその場で書く。
+
         Returns:
-            マークに成功したら ``True``、未存在なら ``False``。
+            マークに成功したら ``True``、未存在なら ``False``。``wait=False`` では
+            積めたら ``True`` (readonly なら ``False``)。
         """
+        if not wait:
+            if is_readonly():
+                return False
+            self._run(
+                lambda: self.mark_promoted_to_semmem(session_id),
+                paths=(self._turns_path(session_id),), wait=False,
+            )
+            return True
         if self._find_entry(session_id) is None:
             return False
         if self.update_session_fields(session_id, promoted_to_semmem=True):

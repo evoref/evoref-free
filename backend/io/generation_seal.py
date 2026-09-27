@@ -169,17 +169,25 @@ def store_has_data(store_dir: Path) -> bool:
     """``store/`` に世代印・ロック・``.gitkeep`` 以外のファイルがあるか (世代印の欠落を readonly にする条件)。
 
     空のディレクトリ構成 (setup / ``ensure_local_dirs`` / ``.gitkeep`` の骨組み) はデータではない。
+    退避名と取り残しの一時ファイル (:func:`backend.io.ledger_files.is_residue`) も数えない —
+    初回起動で世代印の原子的書き込み中に kill されると ``.generation.<rand>.tmp`` だけが残り、
+    数えると以後の起動が全て readonly になって掃除 (書ける時だけ) も走らない。
     """
     import os
 
+    from backend.io.ledger_files import is_residue
     from backend.io.writer_lock import LOCK_FILENAME
 
     if not store_dir.is_dir():
         return False
     ignored = {LOCK_FILENAME, SEAL_FILENAME, GITKEEP_FILENAME}
-    for _current, _dirs, files in os.walk(store_dir):
-        if any(name not in ignored for name in files):
-            return True
+    for current, _dirs, files in os.walk(store_dir):
+        rel_dir = Path(current).relative_to(store_dir).as_posix()
+        for name in files:
+            if name in ignored:
+                continue
+            if not is_residue(name if rel_dir == "." else f"{rel_dir}/{name}"):
+                return True
     return False
 
 

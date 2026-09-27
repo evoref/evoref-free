@@ -10,10 +10,28 @@ import io
 from typing import override
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ExportContent, ExportError
+from backend.export.base import ExportContent, ExportError, is_plain_decimal
 
 # UTF-8 BOM（Excel 互換）
 _UTF8_BOM = b"\xef\xbb\xbf"
+
+#: 表計算が数式として読む先頭文字 (OWASP CSV injection、f_11 §3.1)。
+_FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _neutralize_formula(cell: object) -> object:
+    """数式として評価されうるセルの先頭に ``'`` を付ける。
+
+    素の数値 (``-12`` / ``-3.5``) と単独の ``-`` (空欄の記号) は数式にならないので触らない。
+    """
+    if (
+        isinstance(cell, str)
+        and cell.startswith(_FORMULA_LEADS)
+        and cell != "-"
+        and not is_plain_decimal(cell)
+    ):
+        return "'" + cell
+    return cell
 
 
 def _extract_table_data(content: ExportContent) -> list[list[str]]:
@@ -61,7 +79,7 @@ class CsvTsvWriter(BytesWriterBase):
         delimiter = "\t" if ext == ".tsv" else ","
         buf = io.StringIO()
         writer = csv.writer(buf, delimiter=delimiter, lineterminator="\n")
-        writer.writerows(rows)
+        writer.writerows([_neutralize_formula(c) for c in row] for row in rows)
         text = buf.getvalue()
 
         # UTF-8 BOM 付き（Excel 互換）

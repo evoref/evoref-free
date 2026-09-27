@@ -34,11 +34,13 @@ snapshot は 1 版だけ持つ。corpus は事象ログを持たない — 版�
 
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 import threading
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,6 +122,7 @@ from backend.free.rag.evidence.types import (
     from_record,
 )
 from backend.io import AtomicWriter
+from backend.io.readonly import guard_write
 from backend.log_config import get_logger
 from backend.utils import format_utc, utc_now, utc_now_dt
 
@@ -161,6 +164,10 @@ DEFAULT_MAX_UNPACKED_BYTES = 1_073_741_824
 
 #: 版 GC の改名先の接頭辞 (c_16 §5.4)。``installed_versions`` はこれを版として数えない。
 TRASH_PREFIX = ".trash-"
+#: 同じ (id, 版) の入れ直しで中身を比べるための展開先 (``.trash-`` なので GC が回収する)。
+INCOMING_PREFIX = f"{TRASH_PREFIX}incoming-"
+#: install / rebuild が書き手のロックの空きを見に行く間隔 (秒)。
+_WRITE_LOCK_POLL_SEC = 0.05
 
 #: ``package.json`` の第一級フィールド ``kind`` が ProjectMap のパッケージ
 #: (c_16 §4.4)。SSOT は ``backend.free.rag.projectmap.ids.PROJECT_MAP_KIND``
@@ -548,10 +555,38 @@ class InstallResult:
     reused_prebuilt: bool = False
     embedded: int = 0
     errors: list[str] = field(default_factory=list)
+    #: 同じ (id, 版) が同じ内容で既に active だったので何もしなかった (c_16 §4.3)。
+    already_installed: bool = False
 
 
 class CorpusInstallCancelled(Exception):
     """インストール処理がユーザー要求でキャンセルされた。"""
+
+
+class CorpusVersionConflictError(PackageError):
+    """同じ (id, 版) が別の内容で既に active (c_16 §4.3)。版は不変なので置き換えない。
+
+    メッセージ (ログ用、英語) とは別に、利用者への案内の i18n キーを持つ。
+    """
+
+    i18n_key = "api.cartridge_version_conflict"
+
+    def __init__(self, package_id: str, version: str) -> None:
+        super().__init__(
+            f"corpus package {package_id} v{version} is already installed with "
+            "different content; bump the version or uninstall it first",
+        )
+        self.context = {"id": package_id, "version": version}
+
+
+class CorpusBusyError(RuntimeError):
+    """別の install / uninstall / rebuild / GC が走っている (c_16 §4.3)。"""
+
+    i18n_key = "api.cartridge_busy"
+
+    def __init__(self, package_id: str) -> None:
+        super().__init__(f"corpus store is busy; cannot modify package {package_id} now")
+        self.context = {"id": package_id}
 
 
 ProgressCallback = Callable[[dict], Any]
@@ -656,6 +691,9 @@ class CorpusStore:
         #: chunk id → ユーザーの問い (ヒント)。1 チャンク 3 件、全体 500 件で打ち切る。
         self._pq_hints: dict[str, list[str]] = {}
         self._pq_hints_lock = threading.Lock()
+        #: install / uninstall / rebuild / GC を直列化する (c_16 §4.3)。async の側は
+        #: await を跨いで持つので、同期の側はブロックせず取れなければ引く。
+        self._write_lock = threading.Lock()
         #: corpus 側の較正結果 (f_01 §6.6)。``None`` = 未較正 (記憶側の棒へ倒す)。
         self._calibration: dict[str, Any] | None = None
         self._discover()
@@ -1212,6 +1250,18 @@ class CorpusStore:
                 package.id, package.chunk_count, self._large_warn_chunks,
             )
 
+    # ── 書き手の直列化 (c_16 §4.3) ──
+
+    @asynccontextmanager
+    async def _write_locked(self) -> AsyncIterator[None]:
+        """書き手のロックを空くまで待って取る (イベントループは塞がない)。"""
+        while not self._write_lock.acquire(blocking=False):
+            await asyncio.sleep(_WRITE_LOCK_POLL_SEC)
+        try:
+            yield
+        finally:
+            self._write_lock.release()
+
     # ── install ──
 
     @with_embed_priority(P3_BULK)
@@ -1222,6 +1272,26 @@ class CorpusStore:
         progress_cb: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
         internal: bool = False,
+    ) -> InstallResult:
+        """`.evocart` をインストールする (手順は :meth:`_install_locked`)。
+
+        readonly 中は何も消さずに :class:`DataReadonlyError`。他の書き手
+        (install / uninstall / rebuild / GC) が終わるまで待つ。
+        """
+        guard_write(self.corpus_dir)
+        async with self._write_locked():
+            return await self._install_locked(
+                zip_path, progress_cb=progress_cb, cancel_check=cancel_check,
+                internal=internal,
+            )
+
+    async def _install_locked(
+        self,
+        zip_path: Path | str,
+        *,
+        progress_cb: ProgressCallback | None,
+        cancel_check: CancelCheck | None,
+        internal: bool,
     ) -> InstallResult:
         """`.evocart` をインストールする (c_16 §4.3)。
 
@@ -1242,7 +1312,11 @@ class CorpusStore:
 
         7 を最後にするのは、途中で落ちても manifest が「完成している版」を
         指したままにするため。
-        
+
+        同じ (id, 版) が既に active なら版ディレクトリには触らない — 版は不変
+        なので、中身が同じなら no-op、違えば :class:`CorpusVersionConflictError`
+        (:meth:`_reinstall_active_version`)。
+
         ``internal=True`` はこのプロセスが自分で作ったパッケージ (手動取り込み・
         テンプレート登録) だけが渡す。外から持ち込んだパッケージ (既定) は、予約された
         id / kind を名乗れず、同梱の ``prebuilt/`` 埋め込みも採用しない (docs/c_06 §1.5)。
@@ -1259,10 +1333,12 @@ class CorpusStore:
         meta = contents.meta
         if not internal:
             _reject_reserved_identity(meta)
+        if self.manifest.active.get(meta.id) == meta.version:
+            return self._reinstall_active_version(source, meta)
         directory = self.package_dir(meta.id, meta.version)
         if directory.exists():
-            # 未完成の版が残っている / 同じ版の入れ直し。active は最後まで
-            # 旧版を指しているので、ここで消しても検索は生きている。
+            # active でない同じ版 (途中で落ちた install の残骸 / 旧版への巻き戻し)。
+            # active は最後まで別の版を指しているので、消しても検索は生きている。
             shutil.rmtree(str(directory), ignore_errors=True)
         contents = read_package(
             source, directory,
@@ -1370,6 +1446,42 @@ class CorpusStore:
             package.chunk_count, "reused" if result.reused_prebuilt else "rebuilt",
         )
         return result
+
+    def _reinstall_active_version(self, source: Path, meta: PackageMeta) -> InstallResult:
+        """active と同じ (id, 版) の入れ直し (c_16 §4.3)。
+
+        版ディレクトリの外 (``.trash-incoming-<版>``) へ展開して ``docs/`` と
+        他セクションのダイジェストを取り、active 版と同じなら何もしない。
+        違えば (active 版を開けていない場合も) 拒否する。
+        """
+        incoming = self.packages_dir / meta.id / f"{INCOMING_PREFIX}{meta.version}"
+        shutil.rmtree(str(incoming), ignore_errors=True)
+        try:
+            read_package(
+                source, incoming,
+                max_package_bytes=self._max_package_bytes,
+                max_unpacked_bytes=self._max_unpacked_bytes,
+            )
+            digests = (
+                compute_content_digest(incoming / DOCS_DIR),
+                compute_section_digests(incoming),
+            )
+        finally:
+            shutil.rmtree(str(incoming), ignore_errors=True)
+        package = self._packages.get(meta.id)
+        if package is None or digests != (
+            package.meta.content_digest, package.meta.section_digests,
+        ):
+            logger.warning(
+                "Refused to reinstall corpus package %s v%s: the active version "
+                "has different content (or could not be opened)", meta.id, meta.version,
+            )
+            raise CorpusVersionConflictError(meta.id, meta.version)
+        logger.info(
+            "Corpus package %s v%s is already installed with the same content; "
+            "nothing to do", meta.id, meta.version,
+        )
+        return InstallResult(package=package, already_installed=True)
 
     @staticmethod
     def _inspect_templates(directory: Path) -> str | None:
@@ -1579,12 +1691,32 @@ class CorpusStore:
         progress_cb: ProgressCallback | None = None,
         cancel_check: CancelCheck | None = None,
     ) -> InstallResult:
+        """``docs/`` からチャンクと埋め込みを作り直す (手順は :meth:`_rebuild_locked`)。
+
+        readonly 中は何も消さずに :class:`DataReadonlyError`。他の書き手が
+        終わるまで待つ。
+        """
+        guard_write(self.corpus_dir)
+        async with self._write_locked():
+            return await self._rebuild_locked(
+                package_id, progress_cb=progress_cb, cancel_check=cancel_check,
+            )
+
+    async def _rebuild_locked(
+        self,
+        package_id: str,
+        *,
+        progress_cb: ProgressCallback | None,
+        cancel_check: CancelCheck | None,
+    ) -> InstallResult:
         """``docs/`` からチャンクと埋め込みを作り直す (埋め込みモデル切替後)。
 
         ``package.json`` と ``docs/`` は残し、派生物 (snapshot / 索引 /
         埋め込み / centroid / EvidenceStore manifest) だけを捨ててから組み直す。
         ``docs/`` を持たないパッケージ (``templates/`` / ``language/`` だけの
         構成) は rebuild の対象が無いので no-op (c_16 §4.3 / §4.5.1)。
+        組み直しに失敗したら版を空の索引で開き直して一覧に残す (同じ rebuild で
+        再試行できるように)。
         """
         package = self._packages.get(package_id)
         if package is None:
@@ -1620,11 +1752,15 @@ class CorpusStore:
         meta = replace(
             package.meta, content_digest=compute_content_digest(docs_dir),
         )
-        write_package_meta(directory, meta)
-        result = await self._build_version(
-            directory, meta, None,
-            progress_cb=progress_cb, cancel_check=cancel_check,
-        )
+        try:
+            write_package_meta(directory, meta)
+            result = await self._build_version(
+                directory, meta, None,
+                progress_cb=progress_cb, cancel_check=cancel_check,
+            )
+        except BaseException:
+            self._reopen_after_failed_rebuild(package_id, directory, was_loaded)
+            raise
         rebuilt = result.package
         rebuilt.loaded = was_loaded
         self._packages[package_id] = rebuilt
@@ -1644,22 +1780,87 @@ class CorpusStore:
         )
         return result
 
+    def _reopen_after_failed_rebuild(
+        self, package_id: str, directory: Path, was_loaded: bool,
+    ) -> None:
+        """組み直しに失敗した版を開き直して一覧に戻す (派生物は無いので索引は空)。"""
+        try:
+            reopened = self._open_package(directory)
+        except Exception as e:  # noqa: BLE001 — 元の失敗を上げる方を優先する
+            logger.warning(
+                "Failed to reopen corpus package %s after a failed rebuild: %s",
+                package_id, e,
+            )
+            return
+        reopened.loaded = was_loaded
+        self._packages[package_id] = reopened
+        logger.warning(
+            "Rebuild of corpus package %s failed; kept it with an empty index "
+            "(retry the rebuild)", package_id,
+        )
+
     def uninstall(self, package_id: str) -> None:
-        """全版をディスクから消す。"""
+        """全版をディスクから消す (c_16 §4.3)。
+
+        先に ``manifest`` から外して保存し、その後でファイルを消す — 保存に
+        失敗したら何も消えていない。版ディレクトリは ``.trash-<版>`` へ改名して
+        から消すので、掴まれていて消し切れなかった分は GC (Step 5.88) が回収する。
+
+        Raises:
+            DataReadonlyError: readonly 中 (何も消さない)。
+            CorpusBusyError: 他の書き手が走っている (同じスレッドで待つと抜けられない)。
+        """
+        guard_write(self.corpus_dir)
+        if not self._write_lock.acquire(blocking=False):
+            raise CorpusBusyError(package_id)
+        try:
+            self._uninstall_locked(package_id)
+        finally:
+            self._write_lock.release()
+
+    def _uninstall_locked(self, package_id: str) -> None:
+        """:meth:`uninstall` の本体 (書き手のロックの下で呼ぶ)。"""
         package = self._packages.get(package_id)
         if package is None and package_id not in self.manifest.active:
             raise KeyError(f"Corpus package '{package_id}' not found")
+        before = (
+            dict(self.manifest.active),
+            dict(self.manifest.store_prior_overrides),
+            list(self.manifest.loaded),
+        )
+        self.manifest.active.pop(package_id, None)
+        self.manifest.store_prior_overrides.pop(package_id, None)
+        if package_id in self.manifest.loaded:
+            self.manifest.loaded.remove(package_id)
+        try:
+            self.manifest.save()
+        except BaseException:
+            (
+                self.manifest.active,
+                self.manifest.store_prior_overrides,
+                self.manifest.loaded,
+            ) = before
+            raise
         if package is not None:
             _release_package(package)
         self._packages.pop(package_id, None)
         root = self.packages_dir / package_id
         if root.exists():
+            for child in [p for p in root.iterdir() if p.is_dir()]:
+                if child.name.startswith(TRASH_PREFIX):
+                    continue
+                try:
+                    child.rename(root / f"{TRASH_PREFIX}{child.name}")
+                except OSError as e:
+                    logger.warning(
+                        "Could not move %s aside for deletion (in use?): %s", child, e,
+                    )
             shutil.rmtree(str(root), ignore_errors=True)
-        self.manifest.active.pop(package_id, None)
-        self.manifest.store_prior_overrides.pop(package_id, None)
-        if package_id in self.manifest.loaded:
-            self.manifest.loaded.remove(package_id)
-        self.manifest.save()
+            if root.exists():
+                logger.warning(
+                    "Corpus package %s was uninstalled but %s could not be fully "
+                    "deleted; version GC will retry", package_id, root,
+                )
         self._push_language_overlay()
         logger.info("Uninstalled corpus package %s", package_id)
         self._notify("uninstall", package_id)
@@ -1667,10 +1868,22 @@ class CorpusStore:
     def gc_old_versions(self, keep: int = DEFAULT_VERSIONS_KEEP) -> list[tuple[str, str]]:
         """非 active の古い版を消す (直近 ``keep`` 版を保持、c_16 §5.4)。
 
-        active 版は件数に関わらず必ず残す — 消すと検索が空になる。
+        active 版は件数に関わらず必ず残す — 消すと検索が空になる。readonly 中は
+        :class:`DataReadonlyError`、他の書き手が走っていれば何もせず次回へ回す。
         """
         if keep < 1:
             return []
+        guard_write(self.corpus_dir)
+        if not self._write_lock.acquire(blocking=False):
+            logger.info("corpus version GC deferred: another corpus writer is running")
+            return []
+        try:
+            return self._gc_old_versions_locked(keep)
+        finally:
+            self._write_lock.release()
+
+    def _gc_old_versions_locked(self, keep: int) -> list[tuple[str, str]]:
+        """:meth:`gc_old_versions` の本体 (書き手のロックの下で呼ぶ)。"""
         removed: list[tuple[str, str]] = []
         if not self.packages_dir.is_dir():
             return removed
@@ -2556,11 +2769,13 @@ __all__ = [
     "DEFAULT_CORPUS_STORE_PRIOR",
     "DEFAULT_VERSIONS_KEEP",
     "PACKAGES_DIR",
+    "CorpusBusyError",
     "CorpusHit",
     "CorpusInstallCancelled",
     "CorpusManifest",
     "CorpusPackage",
     "CorpusStore",
+    "CorpusVersionConflictError",
     "InstallResult",
     "LanguageOverlay",
     "LanguageOverlayEntry",

@@ -90,7 +90,8 @@ class PathResolver:
         "cache_dir": "cache/",
         "embedding_cache_dir": "cache/embeddings/",
         "profiles_dir": "profiles/",
-        "loop_sandbox_dir": "store/loop_sandbox/",
+        # 利用者のファイルを上書きする前の退避 (f_11 §5.6)。store/ の外 (readonly でも書ける)。
+        "backup_overwrite_dir": "bk/overwrite/",
         "subject_dictionary_file": "store/memory/semantic/subject_dictionary.json",
         # PolicyInterpreter のポリシー (進化対象外のドメイン・モデル非依存)。
         # 進化対象 (agent / long_form) は ``evolved_policies_dir`` (パーティション)。

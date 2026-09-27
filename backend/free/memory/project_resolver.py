@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from backend.io.process_output import decode_process_output
 from backend.log_config import get_logger
 
 logger = get_logger("memory.project_resolver")
@@ -151,7 +152,6 @@ def _default_git_runner(cwd: Path) -> str | None:
         result = subprocess.run(
             ["git", "-C", str(cwd), "config", "--get", "remote.origin.url"],
             capture_output=True,
-            text=True,
             timeout=3.0,
             check=False,
         )
@@ -160,7 +160,7 @@ def _default_git_runner(cwd: Path) -> str | None:
         return None
     if result.returncode != 0:
         return None
-    url = (result.stdout or "").strip()
+    url = decode_process_output(result.stdout).strip()
     return url or None
 
 

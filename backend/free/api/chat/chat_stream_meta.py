@@ -231,9 +231,10 @@ def _meta_cognitive_summary_text(resp) -> str:
     # 1 行に連結された形) が残ることがある。残骸を本文として出すくらいなら
     # タスクの成否をまとめた 1 文の方がユーザーには有用。
     if body and looks_like_task_log_residue(body):
+        # 本文は読んだファイルの中身を含みうるので長さだけ (f_03 §3.2)。
         logger.warning(
             "MetaCognitive body looks like task-log residue; falling back to "
-            "the task summary: %r", body[:120],
+            "the task summary (len=%d)", len(body),
         )
         body = ""
     if body:

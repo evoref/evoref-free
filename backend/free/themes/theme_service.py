@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, TypedDict
 
 from backend.config import get_path_resolver
-from backend.free.themes.theme_installer import ThemeInstallResult
+from backend.free.themes.theme_installer import ThemeInstallResult, is_valid_theme_id
 from backend.io.atomic import atomic_write_text
 from backend.log_config import get_logger
 
@@ -81,6 +82,29 @@ _PREVIEW_MIME: dict[str, str] = {
 }
 
 
+def _is_link_or_reparse_point(path: Path) -> bool:
+    """シンボリックリンク / ジャンクション等の再解析点か (存在しなければ False)"""
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _declared_file(theme_dir: Path, name: object) -> Path | None:
+    """theme.json が指すファイルを theme_dir 配下に限って解決する。外を指せば None"""
+    if not isinstance(name, str) or not name:
+        return None
+    path = theme_dir / name
+    root = theme_dir.resolve()
+    resolved = path.resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        return None
+    return path
+
+
 class ThemeManager:
     """テーマパッケージの管理"""
 
@@ -97,9 +121,10 @@ class ThemeManager:
         themes: list[ThemeInfoResult] = []
 
         for entry in self.themes_dir.iterdir():
-            if not entry.is_dir():
+            theme_dir = self._resolve_theme_dir(entry.name)
+            if theme_dir is None:
                 continue
-            info = self._read_theme_info(entry, builtin=False)
+            info = self._read_theme_info(theme_dir, builtin=False)
             if info:
                 themes.append(info)
 
@@ -160,8 +185,8 @@ class ThemeManager:
         )
 
     def uninstall(self, theme_id: str) -> None:
-        """テーマをアンインストール"""
-        target_dir = self.themes_dir / theme_id
+        """テーマをアンインストール (ID が themes_dir 直下を指さなければ ValueError)"""
+        target_dir = self._theme_path(theme_id)
         if not target_dir.exists():
             raise KeyError(f"Theme '{theme_id}' not found")
 
@@ -173,7 +198,10 @@ class ThemeManager:
 
         # アクティブテーマを削除した場合は残存テーマに自動切替
         if self.active_theme_id == theme_id:
-            remaining = sorted(d.name for d in self.themes_dir.iterdir() if d.is_dir())
+            remaining = sorted(
+                d.name for d in self.themes_dir.iterdir()
+                if self._resolve_theme_dir(d.name) is not None
+            )
             if remaining:
                 self.active_theme_id = remaining[0]
                 self._persist_active_theme(remaining[0], self.color_mode)
@@ -233,8 +261,8 @@ class ThemeManager:
         if meta is not None:
             cli_theme_filename = meta.get("cli_theme", "cli-theme.json")
 
-        cli_theme_path = theme_dir / cli_theme_filename
-        if not cli_theme_path.exists():
+        cli_theme_path = _declared_file(theme_dir, cli_theme_filename)
+        if cli_theme_path is None or not cli_theme_path.exists():
             logger.debug(
                 "CLI theme file not found for theme '%s': %s",
                 self.active_theme_id,
@@ -299,7 +327,9 @@ class ThemeManager:
         """テーマ CSS を読み込んで文字列で返す"""
         colors_cfg = meta.get("colors", {})
         css_filename = colors_cfg.get(color_mode, f"colors-{color_mode}.css")
-        css_path = theme_dir / css_filename
+        css_path = _declared_file(theme_dir, css_filename)
+        if css_path is None:
+            raise ValueError(f"CSS file outside theme directory: {css_filename}")
         if not css_path.exists():
             raise ValueError(f"CSS file not found: {css_filename}")
         return css_path.read_text(encoding="utf-8")
@@ -307,16 +337,16 @@ class ThemeManager:
     def _load_gui_layout(self, theme_dir: Path, meta: dict) -> dict | None:
         """gui-layout.json を読み込む。存在しなければ None"""
         layout_filename = meta.get("gui_layout", "gui-layout.json")
-        layout_path = theme_dir / layout_filename
-        if not layout_path.exists():
+        layout_path = _declared_file(theme_dir, layout_filename)
+        if layout_path is None or not layout_path.exists():
             return None
         return json.loads(layout_path.read_text(encoding="utf-8"))
 
     def _load_cli_theme(self, theme_dir: Path, meta: dict) -> dict | None:
         """cli-theme.json を読み込む。存在しない・パース失敗時は None"""
         cli_theme_filename = meta.get("cli_theme", "cli-theme.json")
-        cli_theme_path = theme_dir / cli_theme_filename
-        if not cli_theme_path.exists():
+        cli_theme_path = _declared_file(theme_dir, cli_theme_filename)
+        if cli_theme_path is None or not cli_theme_path.exists():
             return None
         try:
             return json.loads(cli_theme_path.read_text(encoding="utf-8"))
@@ -416,7 +446,8 @@ class ThemeManager:
 
         # CLI テーマ情報
         cli_theme_filename = meta.get("cli_theme", "cli-theme.json")
-        has_cli_theme = (theme_dir / cli_theme_filename).exists()
+        cli_theme_path = _declared_file(theme_dir, cli_theme_filename)
+        has_cli_theme = cli_theme_path is not None and cli_theme_path.exists()
         has_cli_modules = (theme_dir / "cli-modules").is_dir()
         cli_module_count = len(self.list_cli_modules(theme_id)) if has_cli_modules else 0
 
@@ -449,10 +480,30 @@ class ThemeManager:
         """テーマ ID からディレクトリを解決"""
         if not theme_id:
             return None
-        theme_dir = self.themes_dir / theme_id
+        try:
+            theme_dir = self._theme_path(theme_id)
+        except ValueError:
+            return None
         if theme_dir.exists() and theme_dir.is_dir():
             return theme_dir
         return None
+
+    def _theme_path(self, theme_id: str) -> Path:
+        """テーマ ID を themes_dir 直下のパスへ写す (存在は問わない)。
+
+        ID が不正、リンク / 再解析点、または解決先が themes_dir 直下の同名でなければ
+        ValueError。テーマ ID をパスにするのは必ずここを通す。
+        """
+        if not is_valid_theme_id(theme_id):
+            raise ValueError(f"Invalid theme id: {theme_id!r}")
+        theme_dir = self.themes_dir / theme_id
+        if _is_link_or_reparse_point(theme_dir):
+            raise ValueError(f"Theme directory is a link: {theme_id!r}")
+        root = self.themes_dir.resolve()
+        resolved = theme_dir.resolve()
+        if resolved.parent != root or resolved.name != theme_id:
+            raise ValueError(f"Theme id does not name a directory under themes_dir: {theme_id!r}")
+        return theme_dir
 
     def _update_config(self, updater: Callable[[dict], None]) -> None:
         """config.yaml を読み込み、updater で theme セクションを更新して書き戻す。

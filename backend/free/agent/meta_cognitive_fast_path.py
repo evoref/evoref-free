@@ -11,6 +11,7 @@ from backend.free.agent.meta_cognitive_task_exec import (
 from backend.free.agent.output_format import wants_fetched_table
 from backend.free.agent.file_ledger import forget_current_file
 from backend.free.agent.tool_ledger import mark_last_failed
+from backend.free.agent.write_gate import WRITE_DENIED_RE
 from backend.free.agent.meta_cognitive_utils import (
     call_callback,
     extract_literal_write_content,
@@ -30,9 +31,12 @@ from backend.free.agent.meta_cognitive_utils import (
 
 from backend.free.agent.meta_cognitive_defs import (
     _DATA_BEARING_TOOLS,
-    read_existing_file,
     resolve_read_path,
 )
+from backend.free.agent.meta_cognitive_content import ExistingContentRefused
+from backend.free.agent.tools.filesystem import append_existing_text
+from backend.free.agent.meta_cognitive_content_gate import is_pure_append_request
+from backend.io.text_file import Unreadable
 
 from backend.free.core.response_dates import fix_weekday_claims
 from backend.log_config import get_logger
@@ -148,7 +152,11 @@ class _FastPathMixin:
                 "status": "done" if is_success else "failed",
             })
 
-        logger.info("Tool fast path completed: %s → %s", tool_name, result_text[:80])
+        # 結果本文は出さない (read_file ならファイルの中身そのもの、f_03 §3.2)
+        logger.info(
+            "Tool fast path completed: %s, result_length=%d, success=%s",
+            tool_name, len(result_text), is_success,
+        )
         return result_text, [tool_entry]
 
     async def _execute_write_fast(
@@ -231,9 +239,27 @@ class _FastPathMixin:
         同じ依頼でも経路が変わると実況文が書き込まれた。両経路をここへ
         集約し、解決順序を 1 箇所で決める。
 
+        出力先の既存ファイル (docs/f_11 §5): 追記だけの依頼
+        (``is_pure_append_request``。書き換えの語が同居すれば書き直し) なら
+        どの段で得た本文も ``既存内容 + 区切り + 本文`` へ決定論で連結する
+        (生成段はモデルに追記分だけを出させる)。既存ファイルが読めなければ、
+        追記と生成 (既存内容に依存する本文) は書かずに ``existing_unreadable``
+        で断る。書き直しで既存内容が予算に収まらなければ ``existing_too_large``。
+
         Returns:
             ``(content, rejection)``。``rejection`` が None なら書込み可。
         """
+        loaded = await self._load_existing_for_edit(file_path)
+        unreadable = isinstance(loaded, Unreadable)
+        existing = loaded if isinstance(loaded, str) else ""
+        append = loaded is not None and is_pure_append_request(original_query)
+        if unreadable and append:
+            logger.warning(
+                "Write: refusing to append to unreadable file (%s): %s",
+                loaded.reason, file_path,
+            )
+            return "", "existing_unreadable"
+
         # 1. 取得済みの実テーブル (転記させるとハルシネーション/行脱落が出る)
         if wants_fetched_table(file_path):
             fetched_table = self._extract_fetched_table_markdown()
@@ -242,7 +268,9 @@ class _FastPathMixin:
                     "Write content from fetched table (deterministic): "
                     "%d chars -> %s", len(fetched_table), file_path,
                 )
-                return fetched_table, None
+                return (
+                    append_existing_text(existing, fetched_table) if append else fetched_table
+                ), None
 
         # 2. ユーザーが引用符で本文そのものを指定している (高精度マッチ)
         literal = extract_literal_write_content(original_query, file_path)
@@ -251,7 +279,7 @@ class _FastPathMixin:
                 "Write content from user literal (deterministic): "
                 "%d chars -> %s", len(literal), file_path,
             )
-            return literal, None
+            return (append_existing_text(existing, literal) if append else literal), None
 
         # 3. 「この案内文を保存して」型: 書くべき本文は直前の応答そのもの
         previous = previous_answer_write_content(
@@ -262,17 +290,30 @@ class _FastPathMixin:
                 "Write content from previous answer (deterministic): "
                 "%d chars -> %s", len(previous), file_path,
             )
-            return previous, None
+            return (append_existing_text(existing, previous) if append else previous), None
+
+        # 既存内容を知らずに生成すると、既存ファイルを別物で上書きする
+        if unreadable:
+            logger.warning(
+                "Write: refusing to generate over unreadable file (%s): %s",
+                loaded.reason, file_path,
+            )
+            return "", "existing_unreadable"
 
         if notify_generating:
             await notify_generating()
 
-        # 4. 生成 (棄却されたら 1 度だけ再生成)
-        content = await self._generate_content(
-            original_query, task_description, llm_client, file_path=file_path,
-        )
+        # 4. 生成 (棄却されたら 1 度だけ再生成)。追記では生成物は追記分だけ。
+        compare_with = "" if append else existing
+        try:
+            content = await self._generate_content(
+                original_query, task_description, llm_client, file_path=file_path,
+                existing=existing, append=append,
+            )
+        except ExistingContentRefused as refusal:
+            return "", refusal.code
         content, rejection = self._validate_generated_content(
-            content, file_path, original_query,
+            content, file_path, original_query, existing_content=compare_with,
         )
         if rejection and not content.startswith("(Content generation failed:"):
             logger.warning(
@@ -281,10 +322,10 @@ class _FastPathMixin:
             )
             content = await self._generate_content(
                 original_query, task_description, llm_client,
-                file_path=file_path,
+                file_path=file_path, existing=existing, append=append,
             )
             content, rejection = self._validate_generated_content(
-                content, file_path, original_query,
+                content, file_path, original_query, existing_content=compare_with,
             )
 
         # 5. 救済: 生成が失敗と確定した後に限り、緩い引用抽出で本文を拾う。
@@ -296,10 +337,11 @@ class _FastPathMixin:
                     "Write content rescued from user quote after %s: "
                     "%d chars -> %s", rejection, len(rescued), file_path,
                 )
-                return rescued, None
+                return (append_existing_text(existing, rescued) if append else rescued), None
 
         if rejection is None:
-            # 月日に添えた曜日を暦で照合する (ユーザーが述べた月日だけ。f_08 §6.3)
+            # 月日に添えた曜日を暦で照合する (ユーザーが述べた月日だけ。f_08 §6.3)。
+            # 追記では連結前に掛け、既存内容には手を入れない。
             grounded = "\n".join([original_query, *(
                 str(m.get("content") or "")
                 for m in getattr(self, "_conversation", None) or []
@@ -308,11 +350,14 @@ class _FastPathMixin:
             content = fix_weekday_claims(
                 content, today=local_today(), grounded=grounded,
             )
+            if append:
+                content = append_existing_text(existing, content)
         return content, rejection
 
     @staticmethod
     def _validate_generated_content(
         content: str, file_path: str, instruction: str = "",
+        *, existing_content: str,
     ) -> tuple[str, str | None]:
         """生成コンテンツを scaffold 除去してから書込み適性を検証する。
 
@@ -326,6 +371,8 @@ class _FastPathMixin:
         上書き対象が既に存在する場合は既存内容も渡し、編集依頼なのに 1 文字も
         変わっていない生成 (edit_without_change) を棄却する。書込み自体は
         成功してしまうため、これを見ないと「完了しました」と誤報告される。
+        ``existing_content`` は呼び出し側が :meth:`_load_existing_for_edit` で
+        (イベントループの外で) 読んだもの。新規作成・追記分の検証では空文字。
         """
         if content.startswith("(Content generation failed:"):
             return content, "generation_failed"
@@ -359,7 +406,7 @@ class _FastPathMixin:
             content = without_lead_in
         return content, generated_content_rejection(
             content, file_path, instruction,
-            existing_content=read_existing_file(file_path),
+            existing_content=existing_content,
         )
 
     async def _write_file(
@@ -382,6 +429,10 @@ class _FastPathMixin:
                 tools_registry, "write_file", tool_args,
             )
             is_success = not is_tool_error(result_text)
+            if WRITE_DENIED_RE.match(result_text):
+                # 書込みゲートが断った (docs/f_03 §4.y)。生成した本文は捨てずに
+                # 結果へ添え、最終応答が断りの理由と一緒に見せる。
+                result_text = f"{result_text}\n\n{content}"
             if is_success:
                 verify_error = self._verify_written_file(file_path, content)
                 if verify_error:
@@ -423,12 +474,14 @@ class _FastPathMixin:
 
         「Written N bytes」という成功申告と実ファイルの乖離 (書込み経路の
         取り違え・変換事故) を success にしないための最終ガード。リッチ文書
-        (xlsx/docx 等) は export 変換で内容が変わるため対象外。改行は
-        ``write_text`` のプラットフォーム変換 (LF→CRLF) を正規化して比較する。
-        検証自体の失敗 (読み戻し不可等) は書込み失敗と区別できないため
-        エラーにせず None (成功維持) を返す。
+        (xlsx/docx 等) は export 変換で内容が変わるため対象外。書き手は既存
+        ファイルの符号化・改行・末尾改行を保つ (docs/f_11 §5.5) ので、読み戻しは
+        その符号化のまま行い (``read_text_for_edit``)、改行 (CRLF/LF) と末尾改行
+        1 つの差は正規化して比較する。検証自体の失敗 (読み戻し不可等) は書込み
+        失敗と区別できないためエラーにせず None (成功維持) を返す。
         """
         from backend.free.agent.tools.builtin import _EXPORT_DOC_EXTS
+        from backend.io.text_file import TextFile, read_text_for_edit
 
         try:
             p = Path(file_path)
@@ -436,10 +489,14 @@ class _FastPathMixin:
                 return None
             if len(content) > 2_000_000:
                 return None
-            on_disk = p.read_text(encoding="utf-8")
+            read = read_text_for_edit(p, max_bytes=2_000_000)
         except Exception:
             return None
-        if on_disk.replace("\r\n", "\n") != content.replace("\r\n", "\n"):
+        if not isinstance(read, TextFile):
+            return None
+        on_disk = read.text
+        expected = content.replace("\r\n", "\n").replace("\r", "\n")
+        if on_disk.removesuffix("\n") != expected.removesuffix("\n"):
             return (
                 f"post-write verification failed: on-disk content of "
                 f"'{file_path}' does not match the generated content "
@@ -495,11 +552,18 @@ class _FastPathMixin:
         if not wants_fetched_table(file_path):
             candidate = strip_markdown_wrapper(text)
             if text_looks_like_code(candidate):
-                validated, rejection = self._validate_generated_content(
-                    candidate, file_path, original_query,
+                loaded = await self._load_existing_for_edit(file_path)
+                # 既存ファイルへの追記 / 読めない既存ファイルは合流点に任せる (f_11 §5)
+                defer = isinstance(loaded, Unreadable) or (
+                    loaded is not None and is_pure_append_request(original_query)
                 )
-                if not rejection:
-                    content = validated
+                if not defer:
+                    validated, rejection = self._validate_generated_content(
+                        candidate, file_path, original_query,
+                        existing_content=loaded or "",
+                    )
+                    if not rejection:
+                        content = validated
 
         # それ以外は共通の合流点へ (取得テーブル / ユーザー literal / 直前応答 /
         # 生成 + 再生成 + 救済)。この経路だけ決定論解決を持たず、実況文が本文

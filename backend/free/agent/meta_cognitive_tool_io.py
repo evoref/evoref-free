@@ -115,7 +115,7 @@ def try_parse_tool_dict(text: str) -> dict | None:
 
     try:
         data = json.loads(escape_windows_path_backslashes(text))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return None
     if isinstance(data, dict) and "tool" in data:
         return data
@@ -183,27 +183,18 @@ def parse_template_tool_call(text: str) -> dict | None:
     return {"tool": m.group("name"), "args": _parse_template_args(m.group("args"))}
 
 
-def _find_matching_close_brace(text: str, start: int) -> int | None:
-    """text[start] が '{' のとき、対応する '}' のインデックスを返す（無ければ None）。
-
-    文字列リテラル内の '{' '}' は考慮しない（旧実装と同等の素朴なバランス検出）。
-    """
-    depth = 0
-    for i in range(start, len(text)):
-        match text[i]:
-            case '{':
-                depth += 1
-            case '}':
-                depth -= 1
-                if depth == 0:
-                    return i
-    return None
-
-
 def iter_balanced_brace_substrings(text: str) -> Iterator[str]:
-    """text 内の各 '{' から始まるバランスの取れた {...} 部分文字列を順に yield する。"""
-    for start_match in re.finditer(r'\{', text):
-        start = start_match.start()
-        end = _find_matching_close_brace(text, start)
-        if end is not None:
-            yield text[start:end + 1]
+    """text 内の各 '{' から始まるバランスの取れた {...} 部分文字列を開き位置の順に yield する。
+
+    文字列リテラル内の '{' '}' は考慮しない（素朴なバランス検出）。
+    1 回の走査で対応を取るので、閉じない '{' が大量にあっても線形で終わる。
+    """
+    open_positions: list[int] = []
+    close_of: dict[int, int] = {}
+    for i, ch in enumerate(text):
+        if ch == '{':
+            open_positions.append(i)
+        elif ch == '}' and open_positions:
+            close_of[open_positions.pop()] = i
+    for start in sorted(close_of):
+        yield text[start:close_of[start] + 1]

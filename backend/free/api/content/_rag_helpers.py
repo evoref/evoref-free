@@ -20,6 +20,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from backend.error_handlers import ErrorResponse
+from backend.i18n_helper import msg
 
 
 # ── HTTPException ビルダー ───────────────────────────────────────────
@@ -80,6 +81,17 @@ def rag_no_chunks_error() -> HTTPException:
     """400 — チャンク分割結果が空。"""
     return rag_error(
         400, "E0400", "No chunks generated from file", "api.rag_no_chunks",
+    )
+
+
+def corpus_version_conflict_error(exc: Any) -> HTTPException:
+    """409 — 同じ (id, 版) が別の内容で既にインストールされている (c_16 §4.3)。
+
+    ``exc`` は ``CorpusVersionConflictError``。テンプレート登録の UI は
+    ``message`` をそのまま出すので、利用者の言語で組んで入れる。
+    """
+    return rag_error(
+        409, "E0409", msg(exc.i18n_key, **exc.context), exc.i18n_key, **exc.context,
     )
 
 

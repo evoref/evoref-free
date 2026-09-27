@@ -54,6 +54,7 @@ from typing import Any
 
 import yaml
 
+from backend.free.memory._defaults import reset_trigger_path_cache, trigger_cache_key
 from backend.free.memory.types import MemoryMode
 from backend.log_config import get_logger
 
@@ -362,7 +363,7 @@ def get_pin_triggers(path: str | Path) -> PinTriggers:
     プロセス内シングルトン (パスごとに 1 インスタンス)。テストでは
     ``reset_pin_triggers_cache()`` でキャッシュをクリアできる。
     """
-    key = str(Path(path).resolve())
+    key = trigger_cache_key(path)
     with _TRIGGERS_LOCK:
         cached = _TRIGGERS_CACHE.get(key)
         if cached is not None:
@@ -376,6 +377,7 @@ def reset_pin_triggers_cache() -> None:
     """テスト用: キャッシュ全消去。"""
     with _TRIGGERS_LOCK:
         _TRIGGERS_CACHE.clear()
+    reset_trigger_path_cache()
 
 
 def resolve_pin_triggers_path(triggers_dir: str | Path | None = None) -> Path:

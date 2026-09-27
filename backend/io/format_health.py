@@ -5,7 +5,8 @@ Evidence ストアの readonly をプロセス内に溜めるだけの小さな�
 ここを読むだけで、ポーリングのたびに照合しない (全件の照合は ``evoref doctor``)。
 
 - 載せるのは current 以外 (``newer`` / ``foreign`` / ``unmigratable`` / ``corrupt`` /
-  ``readonly``) だけ。同じファイルを後で読めたら消す。
+  ``readonly``) と保存の失敗 (``unwritable``) だけ。同じファイルを後で読めたら消す
+  (``unwritable`` は後で保存できても消す)。
 - 作り直せる形式 (derived / volatile) は読めなければ捨てて作り直すので載せない。
 - ``backend/io`` の中だけで完結する (pillar を import しない)。
 """
@@ -19,8 +20,10 @@ from backend.io.format_registry import FORMATS
 
 #: 読み取りで current でなかった分類。
 NON_CURRENT_STATES: frozenset[str] = frozenset({"newer", "foreign", "unmigratable", "corrupt"})
+#: 保存に失敗した (次に保存できたら消す)。
+UNWRITABLE = "unwritable"
 #: 1 形式に複数のファイルがあるとき代表に選ぶ順 (先ほど重い)。
-_STATE_ORDER: tuple[str, ...] = ("newer", "unmigratable", "foreign", "readonly", "corrupt")
+_STATE_ORDER: tuple[str, ...] = ("newer", "unmigratable", "foreign", "readonly", UNWRITABLE, "corrupt")
 #: 1 形式の理由に並べるファイルの数。
 _MAX_REASONS = 3
 
@@ -58,6 +61,25 @@ def observe_read(format_id: str, path: Path | str, status: str, detail: str) -> 
     report(format_id, key, status, f"{name}: {detail}" if detail else name)
 
 
+def observe_save_failure(format_id: str, path: Path | str, detail: str) -> None:
+    """版付きファイルの保存の失敗を載せる (:meth:`VersionedJsonFile.save` が呼ぶ)。"""
+    spec = FORMATS.find(format_id)
+    if spec is not None and spec.klass in ("derived", "volatile"):
+        return
+    report(format_id, str(path), UNWRITABLE, f"{Path(path).name}: save failed: {detail}")
+
+
+def observe_save_ok(path: Path | str) -> None:
+    """保存できた。消すのは保存の失敗だけ (壊れて退避した等の読み取りの分類は残す)。"""
+    key = str(path)
+    if key not in _entries:  # 健全な保存でロックを取らない
+        return
+    with _lock:
+        entry = _entries.get(key)
+        if entry is not None and entry[1] == UNWRITABLE:
+            del _entries[key]
+
+
 def snapshot() -> dict[str, dict[str, str]]:
     """``{format_id: {"state", "reason"}}`` (current 以外の形式だけ。健全なら空)。"""
     with _lock:
@@ -81,4 +103,14 @@ def reset() -> None:
         _entries.clear()
 
 
-__all__ = ["NON_CURRENT_STATES", "clear", "observe_read", "report", "reset", "snapshot"]
+__all__ = [
+    "NON_CURRENT_STATES",
+    "UNWRITABLE",
+    "clear",
+    "observe_read",
+    "observe_save_failure",
+    "observe_save_ok",
+    "report",
+    "reset",
+    "snapshot",
+]

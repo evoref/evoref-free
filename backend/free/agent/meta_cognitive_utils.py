@@ -124,7 +124,6 @@ from backend.free.agent.meta_cognitive_content_gate import (
 from backend.free.agent.meta_cognitive_tool_io import (
     command_run_failed,
     _EXIT_CODE_TOOLS,
-    _find_matching_close_brace,
     is_tool_error,
     iter_balanced_brace_substrings,
     _parse_template_args,

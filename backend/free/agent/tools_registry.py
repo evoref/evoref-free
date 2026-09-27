@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -107,7 +108,11 @@ def _resolve_bare_filename(name: str, kwargs: dict) -> None:
     for arg in arg_names:
         value = kwargs.get(arg)
         if isinstance(value, str) and value.strip():
-            resolved = resolve_current_against_recent_dir(value)
+            # 書込みは名指しの記録の隣にだけ寄せる (LLM が自分で選んで読んだ
+            # ファイルの隣は書込みゲートが断る、docs/f_03 §4.y)。
+            resolved = resolve_current_against_recent_dir(
+                value, named_only=(name == "write_file"),
+            )
             if name == "write_file":
                 # 会話に寄せる先が無い裸名 / 相対パスはプロセスの CWD (= リポジトリ
                 # 直下) に落ちる。書込みは既定の出力先へ寄せる (F-05 と同じ規則、
@@ -120,19 +125,46 @@ def _resolve_bare_filename(name: str, kwargs: dict) -> None:
 
 
 def _record_touched_file(name: str, succeeded: bool, kwargs: dict) -> None:
-    """ファイル操作のパスを file 台帳へ落とす。"""
+    """ファイル操作のパスを file 台帳へ落とす。
+
+    ``named`` (依頼文由来の根の配下か) は記録するこの時点で決める
+    (書込みゲート、docs/f_03 §4.y)。
+    """
     if not succeeded:
         return
     arg_names = _FILE_PATH_ARGS.get(name)
     if not arg_names:
         return
     from backend.free.agent.file_ledger import record_current_file
+    from backend.free.agent.write_gate import is_request_named
 
     for arg in arg_names:
         value = kwargs.get(arg)
         if isinstance(value, str) and value.strip():
-            record_current_file(value)
+            record_current_file(value, named=is_request_named(value))
             return
+
+
+async def _deny_write(name: str, kwargs: dict) -> str | None:
+    """パスへ書くツールを書込みゲートに通す (docs/f_03 §4.y)。
+
+    断ったらツール結果の文字列 (``Error: write denied (<code>): <path>``) を返す。
+    許したときは ``kwargs`` のパスを正規化後 (``~`` 展開・``\\\\?\\`` 除去済み) に
+    書き換えて ``None``。判定は実在の祖先を解決するのでスレッドで行う
+    (contextvar はコピーされて届く)。
+    """
+    from backend.free.agent.write_gate import WRITE_PATH_TOOLS, check_write_target
+
+    arg = WRITE_PATH_TOOLS.get(name)
+    value = kwargs.get(arg) if arg else None
+    if not isinstance(value, str):
+        return None
+    normalized, denial = await asyncio.to_thread(check_write_target, value)
+    if denial is None:
+        kwargs[arg] = normalized
+        return None
+    logger.warning("Write denied (%s): %s -> %s", denial.code, name, denial.path)
+    return denial.as_tool_result()
 
 
 @functools.lru_cache(maxsize=256)
@@ -191,13 +223,28 @@ def _coerce_declared_type(value: Any, declared: str) -> Any:
     return value
 
 
+#: 本文を運ぶ引数。短くても中身をログへ出さない。
+_CONTENT_LOG_ARGS: frozenset[str] = frozenset({"content", "diff_text", "text", "body"})
+#: パスを運ぶ引数。長くてもそのまま出す (調査に要る)。
+_PATH_LOG_ARGS: frozenset[str] = frozenset({"file_path", "path", "directory"})
+_LOG_ARG_MAX_CHARS = 80
+
+
 def _summarize_args_for_log(kwargs: dict[str, Any]) -> str:
-    """ログ向けに引数値を 80 文字へ切り詰める (write_file の本文全文を落とさない)。"""
+    """ログ向けの引数要約。本文と長い値は文字数と SHA-256 の先頭 8 桁だけにする。
+
+    backend.log は ``evoref doctor --bundle`` に同梱されるので、ユーザーの
+    ファイル本文や個人情報の断片を残さない (f_03 §3.2)。
+    """
     parts = []
     for k, v in kwargs.items():
         text = repr(v)
-        if len(text) > 80:
-            text = text[:80] + f"...({len(text)} chars)"
+        if k not in _PATH_LOG_ARGS and (
+            k in _CONTENT_LOG_ARGS or len(text) > _LOG_ARG_MAX_CHARS
+        ):
+            raw = v if isinstance(v, str) else text
+            digest = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+            text = f"<len={len(raw)} sha={digest}>"
         parts.append(f"{k}={text}")
     return ", ".join(parts)
 
@@ -400,6 +447,12 @@ class ToolsRegistry:
         # ログにも解決後のパスが出るよう、要約の前に掛ける。
         _resolve_bare_filename(name, kwargs)
 
+        denied = await _deny_write(name, kwargs)
+        if denied is not None:
+            record_current(name, False, reason="write_denied")
+            _record_tool_issue(name, False, denied)
+            return denied
+
         logger.info("Executing tool: %s(%s)", name, _summarize_args_for_log(kwargs))
 
         try:
@@ -432,8 +485,9 @@ class ToolsRegistry:
 
         # 「保存したファイルを読んで」型の暗黙参照を解決する材料。
         # パスはクエリの文字列からは取れないので、実行時に覚えておく
-        # (file_ledger のモジュール docstring を参照)。
-        _record_touched_file(name, succeeded, kwargs)
+        # (file_ledger のモジュール docstring を参照)。``named`` の判定は実在の
+        # 祖先を解決する (UNC で待たされうる) のでスレッドで行う。
+        await asyncio.to_thread(_record_touched_file, name, succeeded, kwargs)
         return result
 
     @staticmethod

@@ -32,6 +32,7 @@ from backend.free.generation.api_contract import (
     build_src_api,
     collect_attr_uses,
 )
+from backend.io.process_output import decode_process_output
 
 if TYPE_CHECKING:
     from backend.free.llm.json_schemas import CodeSpec, CodeSpecModule
@@ -889,7 +890,6 @@ def run_import_smoke(
                 [exe, "-c", _SMOKE_RUNNER, json.dumps(sorted(module_paths))],
                 cwd=tmp,
                 capture_output=True,
-                text=True,
                 timeout=timeout_sec,
             )
     except subprocess.TimeoutExpired:
@@ -903,10 +903,11 @@ def run_import_smoke(
         return result
 
     try:
-        failures = json.loads(proc.stdout.strip() or "[]")
+        failures = json.loads(decode_process_output(proc.stdout).strip() or "[]")
     except (ValueError, TypeError):
         result.warnings.append(
-            f"import スモークテスト出力を解析できません: {proc.stderr[:200]}"
+            "import スモークテスト出力を解析できません: "
+            f"{decode_process_output(proc.stderr)[:200]}"
         )
         return result
 
@@ -1109,7 +1110,7 @@ def run_entry_smoke(
             _write_py_files(tmp, py_files)
             proc = subprocess.run(
                 [exe, "-c", _ENTRY_SMOKE_RUNNER, ep_module],
-                cwd=tmp, capture_output=True, text=True, timeout=timeout_sec,
+                cwd=tmp, capture_output=True, timeout=timeout_sec,
             )
     except subprocess.TimeoutExpired:
         result.warnings.append(
@@ -1121,7 +1122,7 @@ def run_entry_smoke(
         return result
 
     try:
-        data = json.loads(proc.stdout.strip() or "{}")
+        data = json.loads(decode_process_output(proc.stdout).strip() or "{}")
     except (ValueError, TypeError):
         return result  # 解析不能は黙って無視 (advisory)
     if isinstance(data, dict):

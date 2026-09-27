@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import logging
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Literal
@@ -41,12 +42,43 @@ def _make_utf8_stream() -> io.TextIOWrapper:
         return sys.stderr  # type: ignore[return-value]
 
 
+class _SharedRotatingFileHandler(RotatingFileHandler):
+    """複数プロセスが同時に書くログ (cli.log) 用のローテーションハンドラ。
+
+    Windows では他プロセスが開いているファイルを改名できない。素の
+    ``RotatingFileHandler`` は退避 (rename) の失敗で stream を閉じたまま例外になり、
+    以後のレコードが全部落ちて ``--- Logging error ---`` を出し続ける (gui と chat を
+    同時に動かすと踏む)。退避に失敗したら同じファイルを開き直して追記を続け、
+    ``_RETRY_AFTER_SEC`` の間は退避を試みない。
+    """
+
+    _RETRY_AFTER_SEC = 60.0
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._rollover_blocked_until = 0.0
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:  # noqa: N802 (logging の API 名)
+        if time.monotonic() < self._rollover_blocked_until:
+            return False
+        return bool(super().shouldRollover(record))
+
+    def doRollover(self) -> None:  # noqa: N802 (logging の API 名)
+        try:
+            super().doRollover()
+        except OSError:
+            self._rollover_blocked_until = time.monotonic() + self._RETRY_AFTER_SEC
+            if self.stream is None:
+                self.stream = self._open()
+
+
 def _make_rotating_handler(
     path: Path,
     formatter: logging.Formatter,
     max_bytes: int,
     *,
     level: int | None = None,
+    handler_cls: type[RotatingFileHandler] | None = None,
 ) -> RotatingFileHandler | None:
     """ローテーションハンドラを作る。開けなければ ``None`` を返す。
 
@@ -61,7 +93,7 @@ def _make_rotating_handler(
     開けない場合は stderr に警告して縮退する。
     """
     try:
-        handler = RotatingFileHandler(
+        handler = (handler_cls or RotatingFileHandler)(
             path, maxBytes=max_bytes, backupCount=3, encoding="utf-8",
         )
     except OSError as e:
@@ -338,12 +370,13 @@ def setup_cli_logging(
     cli_logger.setLevel(logging.DEBUG)
     cli_logger.propagate = False
 
-    # cli.log ハンドラ (5MB × 3世代) — 同一パスが既に登録済みなら追加しない
+    # cli.log ハンドラ (5MB × 3世代) — 同一パスが既に登録済みなら追加しない。
+    # gui と chat 等が同時に書くので、退避の失敗に耐えるハンドラを使う
     cli_log_path = (log_dir / "cli.log").resolve()
     if not _has_rotating_file_handler(cli_logger, cli_log_path):
         cli_handler = _make_rotating_handler(
             log_dir / "cli.log", formatter, 5 * 1024 * 1024,
-            level=logging.DEBUG,
+            level=logging.DEBUG, handler_cls=_SharedRotatingFileHandler,
         )
         if cli_handler is not None:
             cli_logger.addHandler(cli_handler)

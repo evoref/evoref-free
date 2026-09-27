@@ -113,9 +113,15 @@ if errorlevel 1 (
 rem If a stale llama-server still holds the port, the new process fails to bind
 rem and dies at once, yet the old process keeps answering /health so we wrongly
 rem judge it ready (this is why a model switch could appear to have no effect).
-rem Sweep them out before spawning.
-echo [start] Ensuring no stale llama-server.exe is running...
-taskkill /im "llama-server.exe" /f >nul 2>&1
+rem Sweep them out before spawning. Only our own llama-server is stopped (the
+rem llama ports from config.yaml, image name checked, plus our window title);
+rem "taskkill /im llama-server.exe" would kill every llama-server on the machine.
+echo [start] Ensuring no stale llama-server is holding the llama ports...
+"%VENV_PYTHON%" scripts\stop_services.py --llama-only --timeout 15
+if errorlevel 1 (
+    echo ERROR: a llama port is still held; see the message above.
+    exit /b 1
+)
 
 echo [start] Starting llama-server (base + embedding)...
 rem The launcher adds the trained adapters (--lora / --control-vector, Pro only)

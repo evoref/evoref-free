@@ -1,6 +1,7 @@
 """モデル情報 API + ベースモデル移行 API"""
 
 import asyncio
+from contextlib import AbstractAsyncContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,12 @@ def _get_migrator(state: AppState):
     )
 
 
+def _sleep_exclusive(state: AppState) -> AbstractAsyncContextManager[None]:
+    """sleep-time の外から記憶ストアへ書く区間 (Light のスレッドと重ねない、f_02 §4.3)。"""
+    scheduler = getattr(state, "sleep_scheduler", None)
+    return scheduler.exclusive() if scheduler is not None else nullcontext()
+
+
 @router.post("/migrate", response_model=MigrateResponse)
 async def migrate_model(req: MigrateRequest, state: AppState = Depends(get_app_state)):
     """ベースモデル移行を実行（§22.8.1）"""
@@ -122,11 +129,13 @@ async def migrate_model(req: MigrateRequest, state: AppState = Depends(get_app_s
 
     try:
         migrator = _get_migrator(state)
-        result = migrator.migrate(
-            new_model_path=req.new_model_path,
-            regenerate_context=req.regenerate_context,
-            dry_run=req.dry_run,
-        )
+        # 再生成印はエピソード記憶への書き込み (Light のスレッドと重ねない)。
+        async with _sleep_exclusive(state):
+            result = migrator.migrate(
+                new_model_path=req.new_model_path,
+                regenerate_context=req.regenerate_context,
+                dry_run=req.dry_run,
+            )
     except MigrationBusyError as e:
         raise migration_busy_error(str(e))
     except MigrationError as e:
@@ -638,22 +647,23 @@ async def reembed_facts(
     # 版ディレクトリではなくモデルディレクトリごと落とす — 版を 1 つ残すと
     # ``text_hash`` が一致した行がそのまま流用され、何も再計算されない。
     embeddings_dir = store.evidence.embeddings_model_dir(current_model_id)
-    store.evidence.close()
-    if embeddings_dir.exists():
+    async with _sleep_exclusive(state):
+        store.evidence.close()
+        if embeddings_dir.exists():
+            try:
+                shutil.rmtree(embeddings_dir)
+            except OSError as exc:
+                logger.warning("reembed-facts: failed to drop %s: %s", embeddings_dir, exc)
+        store.load()
+        # 埋め直しの明示の指示なので、埋め込みモデルの変更の確認も兼ねる (c_05 §0.5.7)。
+        store.evidence.confirm_reembed()
+        # 版を積む前に 1 事象も無いと ``create_snapshot`` は何もしないので、
+        # 索引の作り直しだけを目的に直接呼ぶ。
         try:
-            shutil.rmtree(embeddings_dir)
-        except OSError as exc:
-            logger.warning("reembed-facts: failed to drop %s: %s", embeddings_dir, exc)
-    store.load()
-    # 埋め直しの明示の指示なので、埋め込みモデルの変更の確認も兼ねる (c_05 §0.5.7)。
-    store.evidence.confirm_reembed()
-    # 版を積む前に 1 事象も無いと ``create_snapshot`` は何もしないので、
-    # 索引の作り直しだけを目的に直接呼ぶ。
-    try:
-        version = await store.evidence.create_snapshot()
-    except Exception as exc:  # noqa: BLE001 — 失敗しても事象は残る
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    store.load()
+            version = await store.evidence.create_snapshot()
+        except Exception as exc:  # noqa: BLE001 — 失敗しても事象は残る
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        store.load()
     elapsed = time.monotonic() - t0
 
     logger.info(
@@ -689,10 +699,15 @@ def evidence_stores(state: AppState) -> list[tuple[str, Any]]:
 _reembed_tasks: set[asyncio.Task] = set()
 
 
-async def _reembed_stores(stores: list[tuple[str, Any]]) -> None:
+async def _reembed_stores(state: AppState, stores: list[tuple[str, Any]]) -> None:
     for name, store in stores:
         try:
-            count = await store.embed_and_index_snapshot()
+            if name in ("episodic", "semantic"):
+                # 記憶ストアの版と manifest は Light のスレッドも書く (f_02 §4.3)。
+                async with _sleep_exclusive(state):
+                    count = await store.embed_and_index_snapshot()
+            else:
+                count = await store.embed_and_index_snapshot()
         except Exception as exc:  # noqa: BLE001 — 1 ストアの失敗で残りを止めない
             logger.warning("Re-embedding %s after the model change failed: %s", name, exc)
             continue
@@ -716,7 +731,7 @@ async def confirm_reembed(state: AppState = Depends(get_app_state)):
     for _, store in pending:
         store.confirm_reembed()
     if pending:
-        task = asyncio.create_task(_reembed_stores(pending), name="reembed-confirmed")
+        task = asyncio.create_task(_reembed_stores(state, pending), name="reembed-confirmed")
         _reembed_tasks.add(task)
         task.add_done_callback(_reembed_tasks.discard)
     logger.info("Re-embedding confirmed for %d store(s)", len(pending))

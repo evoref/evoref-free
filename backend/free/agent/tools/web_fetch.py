@@ -12,6 +12,7 @@ import socket
 from ipaddress import ip_address
 from urllib.parse import urljoin, urlparse
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 from backend.free.agent.tools.html_text import (
     _contains_markdown_table,
@@ -149,7 +150,11 @@ async def fetch_url(
 
     # 本文抽出: ボイラープレート (nav/menu/footer/リンク一覧) を除去して
     # 本文を分離する。bs4 不在・過剰除去時は naive 抽出へ安全に退避。
-    text = _html_to_text(html_text)
+    # 数 MB の HTML では数十秒かかる (4.7MB で 24.6 秒) ので、イベントループを
+    # 止めないようワーカースレッドで走らせる。
+    text = await run_in_executor_with_context(
+        asyncio.get_running_loop(), None, _html_to_text, html_text,
+    )
 
     # 表を含むページは行の取りこぼしを防ぐため truncate 上限を引き上げる。
     cap = (

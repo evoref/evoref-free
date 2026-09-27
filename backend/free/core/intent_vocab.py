@@ -101,6 +101,39 @@ WRITE_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: 既存ファイルへの**追記** (append) 意図。これが当たり既存ファイルが読めるとき、
+#: 書込みは ``既存内容 + 区切り + 追加分`` の決定論連結になる (docs/f_11 §5)。
+#: 長文経路 (``chat_stream_output.long_form_write_file``) と meta 経路
+#: (``meta_cognitive_fast_path._resolve_write_content``) が同じ判定を使う。
+APPEND_HINT_RE = re.compile(
+    r"(?:追記|追加|append|続き.*(?:書|出力|保存|追加))", re.IGNORECASE,
+)
+
+#: 既存内容を **書き換える** 依頼の動詞 (追記・加筆以外の編集: 差し替え / 修正 /
+#: 削除 …)。追記の語と同居していたら決定論の連結にしない — 連結すると書き換えの
+#: 部分が黙って落ちる (docs/f_11 §5、``meta_cognitive_content_gate.is_pure_append_request``)。
+REVISE_REQUEST_RE = re.compile(
+    r"差し替え|差替え|置き換え|置換|入れ替え|変更|修正|直して|直す|更新"
+    r"|書き換え|書き直|削除|消して|除いて|外して"
+    r"|replace|update|change|modif|edit|rewrite|remove|delete",
+    re.IGNORECASE,
+)
+
+#: 既存内容の変更を求める依頼の動詞 = 書き換え (``REVISE_REQUEST_RE``) + 追記・加筆。
+#: ``meta_cognitive_content_gate.edit_produced_no_change`` が読む。
+#:
+#: ``追記`` / ``書き足`` / ``末尾に`` は 2026-08-26 に追加した。``追加`` はあるが
+#: ``追記`` はその部分文字列ではなく、英語側に ``append`` があるのに日本語側だけ
+#: 欠けていた。そのため「B の中身を A の末尾に**追記**してください」で A 自身の
+#: 内容がそのまま書き戻されても無変更と判定されず、"Written N bytes" と
+#: 「完了しました」が返っていた (ライブ監査 T7-7)。これは ``WRITE_VERB_RE`` で
+#: 2026-08-08 に直したのと同じ語彙ドリフトの再発で、両者の同期は
+#: ``test_audit_findings_20260826`` が検証する。
+EDIT_REQUEST_RE = re.compile(
+    REVISE_REQUEST_RE.pattern + r"|追加|追記|書き足|末尾に|足して|加えて|append",
+    re.IGNORECASE,
+)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 依頼節の切り出し

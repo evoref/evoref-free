@@ -493,6 +493,37 @@ class SnapshotReader:
                 position = start + len(line)
                 yield row, self._parse_line(line, row)
 
+    def raw_rows(self, rows: Iterable[int]) -> dict[int, dict[str, Any] | None]:
+        """複数行の生 dict を 1 回の open で読む (:meth:`raw_at` と同じ値)。
+
+        チャット応答パスが数百行を拾うとき、:meth:`raw_at` を行ごとに呼ぶと
+        行数ぶん open し直す (Windows で 1 回約 74µs + ウイルス対策の検査)。
+        offsets の昇順に並べて前から読み、隣接する行は seek を省く。
+        範囲外の行とファイルが開けないときは ``None`` を入れる。
+        """
+        wanted = sorted({int(r) for r in rows})
+        out: dict[int, dict[str, Any] | None] = {}
+        count = len(self.offsets)
+        valid = [r for r in wanted if 0 <= r < count]
+        for r in wanted:
+            out[r] = None
+        if not valid:
+            return out
+        try:
+            f = self.records_path.open("rb")
+        except OSError:
+            return out
+        with f:
+            position = -1
+            for row in sorted(valid, key=lambda r: int(self.offsets[r])):
+                start = int(self.offsets[row])
+                if start != position:
+                    f.seek(start)
+                line = f.readline()
+                position = start + len(line)
+                out[row] = self._parse_line(line, row)
+        return out
+
     def _parse_line(self, line: bytes, row: int) -> dict[str, Any] | None:
         if not line:
             return None

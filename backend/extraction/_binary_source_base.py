@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import io
+import zipfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -33,6 +34,37 @@ from backend.extraction.base import ExtractionError, ExtractionResult
 from backend.log_config import get_logger
 
 logger = get_logger("extraction._binary_source_base")
+
+#: ZIP コンテナ (OOXML / ODF) の展開後の合計の上限。圧縮率の高い XML は数百 KB の
+#: ファイルが数十 MB に展開され、パースがイベントループ / メモリを長く占有する
+#: (zip bomb も同じ入口)。開く前に中央ディレクトリの申告サイズで見積もる。
+MAX_ZIP_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+
+#: ZIP コンテナの拡張子 (docs/f_11 §5.1)。
+_ZIP_CONTAINER_EXTS = frozenset({".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp"})
+
+
+def _check_zip_uncompressed_size(source: Path | BinaryIO, source_name: str) -> None:
+    """ZIP コンテナの展開後の合計が上限を超えるなら ``too_large`` で止める。
+
+    ZIP として開けないものはここでは判定しない (抽出器が形式エラーを返す)。
+    """
+    if Path(source_name).suffix.lower() not in _ZIP_CONTAINER_EXTS:
+        return
+    try:
+        with zipfile.ZipFile(source) as zf:
+            total = sum(info.file_size for info in zf.infolist())
+    except (zipfile.BadZipFile, OSError):
+        return
+    finally:
+        if not isinstance(source, Path):
+            source.seek(0)
+    if total > MAX_ZIP_UNCOMPRESSED_BYTES:
+        raise ExtractionError(
+            "too_large",
+            f"{source_name} expands to {total} bytes "
+            f"(limit {MAX_ZIP_UNCOMPRESSED_BYTES})",
+        )
 
 
 class BinarySourceExtractorBase(ABC):
@@ -102,6 +134,7 @@ class BinarySourceExtractorBase(ABC):
         source_name: str,
     ) -> ExtractionResult:
         """try/except + empty チェック + ExtractionResult 構築の共通処理"""
+        _check_zip_uncompressed_size(source, source_name)
         try:
             text, metadata = self._extract_from_source(source, source_name)
         except ExtractionError:

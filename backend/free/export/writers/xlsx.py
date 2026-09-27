@@ -9,7 +9,12 @@ from __future__ import annotations
 import io
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ExportContent, ExportError, coerce_cell_value
+from backend.export.base import (
+    ExportContent,
+    ExportError,
+    assign_xlsx_cell,
+    coerce_cell_value,
+)
 
 
 def _extract_tables(content: ExportContent) -> list[tuple[str, list[list[str]]]]:
@@ -66,7 +71,8 @@ def _build_xlsx(content: ExportContent) -> bytes:
 
         for row_idx, row_data in enumerate(rows, 1):
             for col_idx, value in enumerate(row_data, 1):
-                cell = ws.cell(row=row_idx, column=col_idx, value=_coerce_value(value))
+                cell = ws.cell(row=row_idx, column=col_idx)
+                assign_xlsx_cell(cell, _coerce_value(value))
                 # ヘッダー行のスタイル
                 if row_idx == 1:
                     cell.font = Font(bold=True)

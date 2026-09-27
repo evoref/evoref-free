@@ -1,6 +1,6 @@
 """ファイル読込み・テキスト抽出・チャンク分割サービス
 
-CLI の /file コマンドおよび GUI のファイルチャンキング API から利用される
+CLI の /file コマンドおよび GUI の添付取り込み API (POST /api/files/extract) から利用される
 共通ビジネスロジック。テキスト抽出は backend.extraction モジュールに委譲する。
 """
 
@@ -84,11 +84,7 @@ def read_and_chunk(
         raise FileServiceError("empty_content")
 
     # チャンク分割
-    chunker = SemanticChunker(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-    chunks = chunker.chunk(text)
+    chunks = chunk_text(text, chunk_size, chunk_overlap)
 
     logger.debug(
         "read_and_chunk: %s -> %d chars, %d chunks",
@@ -103,6 +99,43 @@ def read_and_chunk(
         chunk_count=len(chunks),
         file_type=file_type,
     )
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> list[str]:
+    """抽出済みテキストを ``read_and_chunk`` と同じ規則でチャンクに分ける"""
+    return SemanticChunker(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    ).chunk(text)
+
+
+def extract_text_from_upload(data: bytes, filename: str) -> str:
+    """アップロードのバイト列からテキストを抽出する (ディスクを経由しない)
+
+    拡張子で抽出器を選ぶ。拡張子の無いファイルは中身の推定をせず非対応とする
+    (パス経路の ``is_likely_text`` はファイルを読む)。
+
+    Raises:
+        FileServiceError: 旧形式 / 非対応形式 / 空 / 抽出失敗
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix in LEGACY_FORMATS:
+        raise FileServiceError(f"legacy_format:{suffix}")
+    registry = get_registry()
+    if not registry.is_supported(suffix):
+        raise FileServiceError(f"unsupported_format:{suffix}")
+    try:
+        text = registry.extract_from_bytes(data, filename).text
+    except ExtractionError as e:
+        _raise_file_service_error(e, Path(filename))
+        raise
+    if not text.strip():
+        raise FileServiceError("empty_content")
+    return text
 
 
 def _extract_text(path: Path, suffix: str) -> str:

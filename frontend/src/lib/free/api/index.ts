@@ -11,6 +11,7 @@ export * from './server';
 export * from './config';
 export * from './mode';
 export * from './chat';
+export * from './files';
 export * from './theme';
 export * from './cartridge';
 export * from './templates';

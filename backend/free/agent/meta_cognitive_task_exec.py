@@ -201,15 +201,19 @@ def _explicit_path_named(query: str, name: str) -> str | None:
     return None
 
 
-def delivery_roots(query: str) -> list[Path]:
+def delivery_roots(query: str, *, implicit: bool = True) -> list[Path]:
     """制作物を配信してよいフォルダ (f_03 §4.4)。
 
     部品は書込み先の確定 (``_resolve_write_path_from_query``) と同じ: 依頼が明示した
     フォルダ (:func:`explicit_query_dirs`、未作成も含む)、``_extract_file_path`` が拾うパス
     (ディレクトリ形ならそれ、ファイル形なら親)。依頼にフォルダが無ければ ``outputs_dir``
     だけ。裸の名前・相対パスの成果物はこのどれかの下に着地する。
+
+    ``implicit=False`` は暗黙参照 (「その中身」→ 直近に触れたファイル) を根にしない
+    — 書込みゲート (f_03 §4.y) は依頼文の文字列だけを証拠に数える。
     """
     from backend.free.agent.tool_call_judge import _extract_file_path
+    from backend.free.agent.tool_judge_args import _extract_file_path_literal
 
     roots: list[Path] = []
 
@@ -219,7 +223,7 @@ def delivery_roots(query: str) -> list[Path]:
 
     for path, _is_output in explicit_query_dirs(query or ""):
         _add(path)
-    qpath = _extract_file_path(query or "")
+    qpath = (_extract_file_path if implicit else _extract_file_path_literal)(query or "")
     if qpath and ("\\" in qpath or "/" in qpath):
         qp = Path(qpath)
         try:

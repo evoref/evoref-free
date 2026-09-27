@@ -223,12 +223,11 @@ class EpisodicStore:
             & (columns.kind == KIND_IDS["note"]),
         )
         notes: list[MemoryNote] = []
-        for row in rows:
-            record_id = snapshot.id_at(int(row))
-            # 事象で書き換わった行はオーバーレイ側が現在値。カラムの tier は
-            # 版を作るまで古いままなので、tier だけは実レコードで見直す
-            # (``patch(tier="long")`` した直後の行がここに混ざる)。
-            record = self.evidence.get(record_id)
+        # 事象で書き換わった行はオーバーレイ側が現在値。カラムの tier は
+        # 版を作るまで古いままなので、tier だけは実レコードで見直す
+        # (``patch(tier="long")`` した直後の行がここに混ざる)。本文は行ごとに
+        # open せず 1 回の open でまとめて読む (チャット応答パスの読み手がある)。
+        for record in self.evidence.get_rows([int(row) for row in rows]):
             if record is None or (record.tier or "short") != tier:
                 continue
             notes.append(evidence_to_note(record))

@@ -33,6 +33,7 @@ from backend.free.agent.tools.builtin import (
     SEARCH_HISTORY_NO_RESULTS_PREFIX,
     _check_path_traversal as check_builtin_path_traversal,
 )
+from backend.free.agent.write_gate import WriteDenial, normalize_write_path
 from backend.free.constants import READ_FILE_META_PREFIX
 from backend.free.core.date_math_cue import (
     conversation_has_date_math_cue,
@@ -1154,14 +1155,20 @@ def _is_search_history_empty(tool_name: str, result_text: str) -> bool:
 def _check_path_traversal(file_path: str, tool_name: str) -> str | None:
     """write_file / read_file のパス検証 (LLM 生成コンテンツ生成前の fail-fast)。
 
-    実体は ``backend.free.agent.tools.builtin._check_path_traversal`` に集約
-    済み (builtin.write_file/read_file 自体もこれを呼ぶため二重防御になる)。
-    ここでは無駄な ``_ensure_write_file_content`` (LLM 呼出し) を避けるため
-    早期に同じ検証を行う。
+    ``write_file`` は書込みゲートの正規化 (``write_gate.normalize_write_path``、
+    docs/f_03 §4.y) で書けない形のパスを、``read_file`` は ``..`` だけを
+    (``tools.builtin._check_path_traversal``) 先に断る。判定の実体は実行時と
+    同じ 1 実装で、ここでは無駄な ``_ensure_write_file_content`` (LLM 呼出し) を
+    避けるために早く呼ぶだけ。書込み範囲 (依頼が挙げたフォルダか) は実行時に
+    ``ToolsRegistry.execute`` が見る (錨付けの前なのでここでは判定しない)。
     """
-    if tool_name not in ("write_file", "read_file"):
+    if tool_name == "write_file":
+        if file_path and normalize_write_path(file_path) is None:
+            return WriteDenial("invalid_path", file_path).as_tool_result()
         return None
-    return check_builtin_path_traversal(file_path)
+    if tool_name == "read_file":
+        return check_builtin_path_traversal(file_path)
+    return None
 
 
 def _emit_tool_running_step(

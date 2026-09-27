@@ -18,7 +18,9 @@ import httpx
 from backend.io.safe_extract import (
     ExtractBudget,
     ExtractLimits,
+    UnsafeArchiveError,
     check_zip_members,
+    normalize_member_name,
     resolve_under,
 )
 from backend.log_config import get_logger
@@ -33,6 +35,20 @@ THEME_LIMITS = ExtractLimits(
 )
 #: テーマ ID はディレクトリ名になるので、先頭がドットや区切りにならない安全な文字だけを許す。
 THEME_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def is_valid_theme_id(theme_id: object) -> bool:
+    """テーマ ID が themes_dir 直下の 1 段のディレクトリ名として安全か。
+
+    ``THEME_ID_RE`` に加え、Windows で別名になる末尾のドット (``x.`` は ``x``) と
+    予約デバイス名 (``con`` / ``nul.txt`` 等) を拒否する。
+    """
+    if not isinstance(theme_id, str) or not THEME_ID_RE.fullmatch(theme_id):
+        return False
+    try:
+        return normalize_member_name(theme_id) is not None
+    except UnsafeArchiveError:
+        return False
 
 # 組み込みテーマディレクトリ名（現在は制約なし — 全テーマ削除可能）
 BUILTIN_THEMES: set[str] = set()
@@ -138,7 +154,7 @@ def install_theme(zip_path: Path, themes_dir: Path) -> ThemeInstallResult:
         # theme_id の決定（ZIP 内のルートディレクトリ名、またはメタデータの name を slug 化）
         theme_id = _detect_theme_id(names, meta)
 
-        if not THEME_ID_RE.fullmatch(theme_id):
+        if not is_valid_theme_id(theme_id):
             raise ValueError(f"Invalid theme id: {theme_id!r}")
 
         # 組み込みテーマと同名は禁止

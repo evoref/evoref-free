@@ -1,153 +1,167 @@
-"""ファイル管理 API エンドポイント"""
+"""添付ファイルの取り込み API (f_03 §11)
+
+POST /api/files/extract — multipart の 1 ファイルからテキストを抽出し、チャット
+要求の ``file_contexts`` にそのまま載せられるチャンクを返す。保存しない。
+
+本文は受信中に上限を数えながらメモリに読み、上限まではメモリに留める multipart
+解析器で分ける (Starlette の既定は 1 MB を超えるファイルを OS の一時ディレクトリへ
+書き出す)。抽出は ``extract_from_bytes`` なので一時ファイルも作らない。
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
+from collections.abc import AsyncGenerator
+from pathlib import PureWindowsPath
+from typing import Any
 
-from fastapi import APIRouter, Depends, UploadFile, File, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Request
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
-from backend.app_state import AppState, get_app_state
-from backend.free.api.system._file_helpers import (
-    file_invalid_error,
-    file_not_found_error,
-    file_path_not_found_error,
-    file_summary_dict,
-    file_upload_dict,
-    require_file_manager,
+from backend.error_handlers import ErrorResponse
+from backend.free.api.chat.chat_constants import (
+    MAX_FILE_CONTEXT_TOTAL_CHARS,
+    MAX_FILE_CONTEXT_TOTAL_CHUNKS,
+)
+from backend.free.api.schemas import FileExtractResponse
+from backend.free.services.file_service import (
+    FileServiceError,
+    chunk_text,
+    extract_text_from_upload,
+    get_supported_extensions,
 )
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 logger = get_logger("api.files")
 
-
-class ReadAndChunkRequest(BaseModel):
-    """ファイル読込み・チャンキングリクエスト"""
-    file_path: str
-    chunk_size: int = 512
-    chunk_overlap: int = 128
-
-
-class ReadAndChunkResponse(BaseModel):
-    """ファイル読込み・チャンキングレスポンス"""
-    filename: str
-    path: str
-    chunks: list[str]
-    total_chars: int
-    chunk_count: int
-    file_type: str
-
 router = APIRouter(prefix="/api/files", tags=["files"])
 
+#: 添付 1 件の上限 (フロントの ``FILE_MAX_SIZE_BYTES`` と同じ値)
+MAX_EXTRACT_FILE_BYTES = 10 * 1024 * 1024
 
-@router.post("/upload")
-async def upload_file(
-    state: AppState = Depends(get_app_state),
-    file: UploadFile = File(...),
-    session_id: str = Query(default="default"),
-):
-    """ファイルをアップロード"""
-    logger.debug(
-        "POST /api/files/upload: filename=%s, session=%s",
-        file.filename, session_id,
+#: multipart の境界・ヘッダの分として本文の上限に足す余裕
+_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+
+_MAX_REQUEST_BYTES = MAX_EXTRACT_FILE_BYTES + _MULTIPART_OVERHEAD_BYTES
+
+
+class _InMemoryMultiPartParser(MultiPartParser):
+    """上限までのファイルを SpooledTemporaryFile のメモリ側に留める解析器"""
+
+    spool_max_size = _MAX_REQUEST_BYTES
+
+
+def _error(status_code: int, message: str, i18n_key: str, **context: Any) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=ErrorResponse(
+            code=f"E0{status_code}", message=message, i18n_key=i18n_key, context=context,
+        ).to_dict(),
     )
-    mgr = require_file_manager(state)
-
-    data = await file.read()
-    logger.debug("File read: %d bytes", len(data))
-    try:
-        info = mgr.upload(data, file.filename or "unnamed", session_id)
-    except ValueError as e:
-        raise file_invalid_error(str(e))
-
-    logger.debug("File uploaded: id=%s, mime=%s", info.file_id, info.mime_type)
-    return file_upload_dict(info)
 
 
-@router.get("")
-async def list_files(
-    state: AppState = Depends(get_app_state),
-    session_id: str = Query(default="default"),
-):
-    """セッション内のファイル一覧"""
-    logger.debug("GET /api/files: session=%s", session_id)
-    mgr = require_file_manager(state)
-
-    files = mgr.list_files(session_id)
-    logger.debug("Listed %d files for session %s", len(files), session_id)
-    return [file_summary_dict(f) for f in files]
+def _no_file_error() -> HTTPException:
+    return _error(400, "A multipart field 'file' with a filename is required",
+                  "api.file_extract_no_file")
 
 
-@router.get("/{file_id}/content")
-async def get_file_content(file_id: str, state: AppState = Depends(get_app_state)):
-    """ファイルの内容を取得"""
-    logger.debug("GET /api/files/%s/content", file_id)
-    mgr = require_file_manager(state)
-
-    content = mgr.get_content(file_id)
-    if content is None:
-        raise file_not_found_error(file_id)
-    return {"content": content}
+def _too_large_error(filename: str) -> HTTPException:
+    return _error(
+        413, f"File exceeds {MAX_EXTRACT_FILE_BYTES} bytes", "api.file_extract_too_large",
+        filename=filename, limit_mb=MAX_EXTRACT_FILE_BYTES // (1024 * 1024),
+    )
 
 
-@router.put("/{file_id}/content")
-async def update_file_content(file_id: str, body: dict, state: AppState = Depends(get_app_state)):
-    """ファイルの内容を更新"""
-    logger.debug("PUT /api/files/%s/content: content_len=%d", file_id, len(body.get("content", "")))
-    mgr = require_file_manager(state)
-
-    content = body.get("content", "")
-    if not mgr.update_file(file_id, content):
-        raise file_not_found_error(file_id)
-    return {"status": "updated"}
-
-
-@router.delete("/{file_id}")
-async def delete_file(file_id: str, state: AppState = Depends(get_app_state)):
-    """ファイルを削除"""
-    logger.debug("DELETE /api/files/%s", file_id)
-    mgr = require_file_manager(state)
-
-    if not mgr.delete_file(file_id):
-        raise file_not_found_error(file_id)
-    logger.debug("File deleted: %s", file_id)
-    return {"status": "deleted"}
+async def _read_body_capped(request: Request) -> bytes:
+    """本文を上限まで読む。超えた時点で 413 (全体を受け取ってから測らない)"""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _MAX_REQUEST_BYTES:
+        raise _too_large_error("")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _MAX_REQUEST_BYTES:
+            raise _too_large_error("")
+    return bytes(body)
 
 
-@router.post("/read-and-chunk", response_model=ReadAndChunkResponse)
-async def read_and_chunk_file(body: ReadAndChunkRequest):
-    """ローカルファイルを読込みチャンク分割する
+def _extract_chunks(data: bytes, filename: str) -> tuple[list[str], int, bool]:
+    """抽出して ``file_contexts`` の上限に収まるチャンクを返す (イベントループの外で呼ぶ)
 
-    CLI の /file コマンドと同等の機能を API 経由で提供する。
+    Returns:
+        (チャンク, 本文全体の文字数, 上限に合わせて切ったか)
     """
-    import asyncio
+    text = extract_text_from_upload(data, filename)
+    # 上限を超える本文は分割の前に切る (分割は本文長に比例して遅い)
+    truncated = len(text) > MAX_FILE_CONTEXT_TOTAL_CHARS
+    chunks: list[str] = []
+    used = 0
+    for chunk in chunk_text(text[:MAX_FILE_CONTEXT_TOTAL_CHARS]):
+        if len(chunks) >= MAX_FILE_CONTEXT_TOTAL_CHUNKS or used + len(chunk) > MAX_FILE_CONTEXT_TOTAL_CHARS:
+            truncated = True
+            break
+        chunks.append(chunk)
+        used += len(chunk)
+    return chunks, len(text), truncated
 
-    from backend.free.services.file_service import (
-        FileServiceError,
-        read_and_chunk,
-    )
 
-    logger.debug(
-        "POST /api/files/read-and-chunk: path=%s, chunk_size=%d",
-        body.file_path, body.chunk_size,
-    )
+@router.post("/extract", response_model=FileExtractResponse)
+async def extract_file(request: Request) -> FileExtractResponse:
+    """添付 1 件からテキストを抽出してチャンクを返す (保存しない)"""
+    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+        raise _no_file_error()
 
-    p = Path(body.file_path)
-    if not p.exists():
-        raise file_path_not_found_error(body.file_path)
+    body = await _read_body_capped(request)
+
+    async def _once() -> AsyncGenerator[bytes, None]:
+        yield body
 
     try:
-        result = await asyncio.to_thread(
-            read_and_chunk, p, body.chunk_size, body.chunk_overlap,
-        )
-    except FileServiceError as e:
-        raise file_invalid_error(str(e))
+        form = await _InMemoryMultiPartParser(
+            request.headers, _once(), max_files=1, max_fields=0,
+        ).parse()
+    except MultiPartException as exc:
+        logger.info("Rejected attachment upload: %s", exc)
+        raise _no_file_error() from exc
 
-    return ReadAndChunkResponse(
-        filename=result.filename,
-        path=result.path,
-        chunks=result.chunks,
-        total_chars=result.total_chars,
-        chunk_count=result.chunk_count,
-        file_type=result.file_type,
+    try:
+        upload = form.get("file")
+        if not isinstance(upload, UploadFile) or not upload.filename:
+            raise _no_file_error()
+        # ブラウザ以外はパス付きの名前を送れる。表示とモデルへの注入には名前だけ使う
+        filename = PureWindowsPath(upload.filename).name
+        data = await upload.read()
+    finally:
+        await form.close()
+
+    if len(data) > MAX_EXTRACT_FILE_BYTES:
+        raise _too_large_error(filename)
+    suffix = PureWindowsPath(filename).suffix.lower()
+    if suffix not in get_supported_extensions():
+        raise _error(415, f"Unsupported file format: {suffix or '(none)'}",
+                     "api.file_extract_unsupported", filename=filename, ext=suffix)
+
+    loop = asyncio.get_running_loop()
+    try:
+        chunks, chars, truncated = await run_in_executor_with_context(
+            loop, None, _extract_chunks, data, filename,
+        )
+    except FileServiceError as exc:
+        code = str(exc)
+        logger.info("Attachment extraction failed for %s: %s", filename, code)
+        if code.startswith(("legacy_format", "unsupported_format")):
+            raise _error(415, f"Unsupported file format: {suffix}",
+                         "api.file_extract_unsupported", filename=filename, ext=suffix) from exc
+        if code in ("empty_content", "scan_only_pdf"):
+            raise _error(422, "No text could be extracted", "api.file_extract_empty",
+                         filename=filename) from exc
+        raise _error(422, f"Extraction failed: {code}", "api.file_extract_failed",
+                     filename=filename) from exc
+
+    logger.debug(
+        "Extracted attachment %s: %d bytes -> %d chars, %d chunks (truncated=%s)",
+        filename, len(data), chars, len(chunks), truncated,
     )
+    return FileExtractResponse(filename=filename, chunks=chunks, truncated=truncated, chars=chars)

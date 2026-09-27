@@ -28,3 +28,12 @@ export const FILE_MAX_SIZE_BYTES = 10 * 1024 * 1024;
 
 /** 添付ファイルの最大サイズ表示用 (MB) */
 export const FILE_MAX_SIZE_MB = 10;
+
+/**
+ * チャット要求の `file_contexts` の合計上限 (全添付の合計)。超えるとバックエンドが
+ * 要求ごと 400 で断るので、送る前に後ろのチャンクから落とす。値は backend
+ * `chat_constants.MAX_FILE_CONTEXT_TOTAL_CHUNKS` / `MAX_FILE_CONTEXT_TOTAL_CHARS`
+ * と同じ (`backend/tests/test_frontend_type_parity.py` が一致を検査する)。
+ */
+export const FILE_CONTEXT_MAX_TOTAL_CHUNKS = 100;
+export const FILE_CONTEXT_MAX_TOTAL_CHARS = 500_000;

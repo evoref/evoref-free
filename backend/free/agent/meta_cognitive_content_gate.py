@@ -30,6 +30,12 @@ from backend.free.core.script_ranges import (
     KANJI,
 )
 from backend.free.core.file_names import allows_empty_content
+from backend.free.core.intent_vocab import (
+    APPEND_HINT_RE,
+    EDIT_REQUEST_RE,
+    REVISE_REQUEST_RE,
+)
+from backend.free.core.predicate import LexicalPredicate
 from backend.free.generation.validators import file_suffix, is_low_information
 
 
@@ -322,29 +328,37 @@ def looks_like_task_restatement(content: str, file_path: str) -> bool:
     return file_path in content or (bool(basename) and basename in content)
 
 
-#: 既存内容の変更を求める依頼の動詞。
-#:
-#: ``追記`` / ``書き足`` / ``末尾に`` は 2026-08-26 に追加した。``追加`` はあるが
-#: ``追記`` はその部分文字列ではなく、英語側に ``append`` があるのに日本語側だけ
-#: 欠けていた。そのため「B の中身を A の末尾に**追記**してください」で A 自身の
-#: 内容がそのまま書き戻されても無変更と判定されず、"Written N bytes" と
-#: 「完了しました」が返っていた (ライブ監査 T7-7)。
-#:
-#: これは ``intent_vocab.WRITE_VERB_RE`` で 2026-08-08 に直したのと **同じ
-#: 語彙ドリフトが別の正規表現で再発** したもの。両者の同期は
-#: ``test_audit_findings_20260826`` が検証する。
-_EDIT_REQUEST_RE = re.compile(
-    r"差し替え|差替え|置き換え|置換|入れ替え|変更|修正|直して|直す|更新"
-    r"|書き換え|書き直|追加|追記|書き足|末尾に|足して|加えて"
-    r"|削除|消して|除いて|外して"
-    r"|replace|update|change|modif|edit|rewrite|append|remove|delete",
-    re.IGNORECASE,
-)
+#: 既存内容の変更を求める依頼の動詞 (定義と経緯は ``core.intent_vocab.EDIT_REQUEST_RE``)。
+_EDIT_REQUEST_RE = EDIT_REQUEST_RE
 
 
 def is_edit_request(text: str) -> bool:
     """既存内容の変更を求める依頼か (``_EDIT_REQUEST_RE``、純粋関数)。"""
     return bool(_EDIT_REQUEST_RE.search(text or ""))
+
+
+def _edit_mode_label(query: str) -> str:
+    """既存ファイルの編集の種類 (``edit_mode_predicate`` の字句段)。
+
+    ``"revise"`` = 書き換えの語がある (追記の語と同居していても)、``"append"`` =
+    追記の語だけ、``""`` = どちらも無い。
+    """
+    if REVISE_REQUEST_RE.search(query or ""):
+        return "revise"
+    if APPEND_HINT_RE.search(query or ""):
+        return "append"
+    return ""
+
+
+#: 判定点としての編集の種類 (c_17 / CLAUDE.md #14)。追記の語だけの依頼を
+#: 決定論の連結 (docs/f_11 §5) へ回すかの判定。書き換えの語が同居する依頼を
+#: 連結すると書き換えが黙って落ちる (2026-09-27 レビュー)。
+edit_mode_predicate = LexicalPredicate("edit_mode", _edit_mode_label, evidence="lexical")
+
+
+def is_pure_append_request(query: str) -> bool:
+    """追記だけを求める依頼か (書き換えの語が同居していない)。"""
+    return edit_mode_predicate.evaluate(query).value == "append"
 
 
 def _normalize_for_content_compare(text: str) -> str:

@@ -433,7 +433,11 @@ def list_runs(
     create_dir: Path | str, session_id: str | None = None,
     *, stale_after_sec: float = STALE_RUNNING_AFTER_SEC,
 ) -> list[tuple[RunRecord, RunStatus]]:
-    """``create_dir`` 配下の run 一覧を ``started_at`` 降順で返す (壊れた run はスキップ)。"""
+    """``create_dir`` 配下の run 一覧を ``started_at`` 降順で返す (壊れた run はスキップ)。
+
+    ``session_id`` で絞るときは ``run.json`` だけで振り落としてから状態を導く
+    (他セッションの ``events.jsonl`` は読まない。create のターン入口が毎ターン呼ぶ)。
+    """
     root = Path(create_dir)
     if not root.is_dir():
         return []
@@ -445,14 +449,13 @@ def list_runs(
         # run.json の無い作業場は run record 導入前の workspace で、壊れた run ではない。
         if not (entry / RUN_FILE).is_file():
             continue
-        loaded = _load_run(entry, stale_after_sec=stale_after_sec)
-        if loaded is None:
+        record = _load_record(entry)
+        if record is None:
             skipped += 1
             continue
-        record, status = loaded
         if session_id is not None and record.session_id != session_id:
             continue
-        out.append((record, status))
+        out.append((record, _derive_status(entry, record, stale_after_sec)))
     if skipped:
         logger.warning("list_runs: skipped %d unreadable run(s) under %s", skipped, root)
     out.sort(key=lambda t: _sort_key(t[0].started_at), reverse=True)
@@ -483,13 +486,31 @@ def read_events(
 def _load_run(
     workspace_root: Path, *, stale_after_sec: float = STALE_RUNNING_AFTER_SEC,
 ) -> tuple[RunRecord, RunStatus] | None:
+    record = _load_record(workspace_root)
+    if record is None:
+        return None
+    return record, _derive_status(workspace_root, record, stale_after_sec)
+
+
+def _load_record(workspace_root: Path) -> RunRecord | None:
+    """``run.json`` だけを読む (読めなければ ``None``)。"""
     store = RunRecordStore(workspace_root)
     if not store.load() or store.record is None:
         return None
-    last_event = RunEventLog(workspace_root).latest()
-    return store.record, derive_run_status(
-        store.record, last_event, stale_after_sec=stale_after_sec,
-    )
+    return store.record
+
+
+def _derive_status(
+    workspace_root: Path, record: RunRecord, stale_after_sec: float,
+) -> RunStatus:
+    """:func:`derive_run_status` と同じ。最新イベントは要る場合だけ読む。
+
+    ``running`` / ``blocked`` / ``exit_kind`` 記録済みは ``run.json`` だけで決まり、
+    ``events.jsonl`` の全行走査を省ける。
+    """
+    needs_event = record.activity_state not in ("running", "blocked") and not record.exit_kind
+    last_event = RunEventLog(workspace_root).latest() if needs_event else None
+    return derive_run_status(record, last_event, stale_after_sec=stale_after_sec)
 
 
 # ===========================================================================

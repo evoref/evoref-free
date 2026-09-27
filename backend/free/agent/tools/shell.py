@@ -6,12 +6,11 @@
 from __future__ import annotations
 
 import asyncio
-import locale
 import re
 import subprocess
-import sys
 
 from pathlib import Path
+from backend.io.process_output import decode_process_output as _decode_subprocess_output
 from backend.log_config import get_logger
 from backend.free.constants import (
     COMMAND_EXIT_CODE_PREFIX,
@@ -89,37 +88,6 @@ def _mkdir_safe(dir_path: str) -> str:
         return f"Directory ensured: {dir_path}"
     except Exception as e:
         return f"Error: {e}"
-
-
-def _decode_subprocess_output(raw: bytes) -> str:
-    """子プロセス出力をロケール依存で安全にデコードする。
-
-    Windows の子プロセス (cmd / git / python 等) は OEM コードページ
-    (日本語環境では cp932) で出力するため、utf-8 固定 decode では日本語が
-    mojibake 化する。一方 ``scripts/evoref*.bat`` は ``PYTHONUTF8=1`` を立てる
-    ため python 子プロセスは UTF-8 で出力し、cp932 を先に試すと UTF-8 の
-    日本語が「成功裏に」mojibake へ化ける。厳格 utf-8 → OEM/mbcs →
-    ロケール推奨エンコーディング → utf-8(replace) の順でフォールバックする
-    (cli/pid_manager._decode_windows_console_output と同方針)。
-    """
-    if not raw:
-        return ""
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-    candidates: list[str] = []
-    if sys.platform == "win32":
-        candidates.extend(["oem", "mbcs"])
-    pref = locale.getpreferredencoding(False)
-    if pref and pref.lower() not in {c.lower() for c in candidates}:
-        candidates.append(pref)
-    for enc in candidates:
-        try:
-            return raw.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return raw.decode("utf-8", errors="replace")
 
 
 async def _run_command_async_impl(

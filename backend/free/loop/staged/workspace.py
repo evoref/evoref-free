@@ -243,13 +243,16 @@ class WorkspaceManager:
         rel = _safe_rel(logical_path)
         ws_rel = f"{_KIND_SUBDIR[kind]}/{rel}" if kind != "spec" else rel
         target = self.root / ws_rel
-        with AtomicWriter(target) as f:
-            f.write(content)
+        # バイト列で書く: テキストモードは Windows で LF を CRLF にし、記録するハッシュ
+        # (LF の文字列) とも、検証した scratch (LF) とも食い違う (f_10、2026-09-27)。
+        data = content.encode("utf-8")
+        with AtomicWriter(target, mode="wb") as f:
+            f.write(data)
         sha = _sha256(content)
         now = time.time()
         wf = WorkspaceFile(
             logical_path=rel, kind=kind, workspace_path=ws_rel, sha256=sha,
-            bytes=len(content.encode("utf-8")), produced_by_task=task_id,
+            bytes=len(data), produced_by_task=task_id,
             stage=stage, last_updated=now, covers=tuple(covers),
         )
 

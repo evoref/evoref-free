@@ -32,7 +32,6 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.config.config_api import router as config_router
     from backend.free.api.content.cartridges import router as cartridges_router
     from backend.free.api.content.templates import router as templates_router
-    from backend.free.api.system.files import router as files_router
     from backend.free.api.model.prompts import router as prompts_router
     from backend.free.api.model.aux_prompts import router as aux_prompts_router
     from backend.free.api.history.history import router as history_router
@@ -43,7 +42,7 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.learning.optimize import router as optimize_router
     from backend.free.api.learning.fewshot import router as fewshot_router
     from backend.free.api.system.export_file import router as export_file_router
-    from backend.free.api.system.diffs import router as diffs_router
+    from backend.free.api.system.files import router as files_router
     from backend.free.api.system.server_control import router as server_control_router
     from backend.free.api.config.mode import router as mode_router
     from backend.free.api.system.system import router as system_router
@@ -58,7 +57,6 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(config_router)
     app.include_router(cartridges_router)
     app.include_router(templates_router)
-    app.include_router(files_router)
     app.include_router(prompts_router)
     app.include_router(aux_prompts_router)
     app.include_router(history_router)
@@ -69,7 +67,7 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(optimize_router)
     app.include_router(fewshot_router)
     app.include_router(export_file_router)
-    app.include_router(diffs_router)
+    app.include_router(files_router)
     app.include_router(server_control_router)
     app.include_router(mode_router)
     app.include_router(system_router)
@@ -81,4 +79,4 @@ def setup_free(app: FastAPI) -> None:
     import backend.free.export  # noqa: F401
 
     register_free()
-    logger.info("Free edition initialized: 26 routers registered")
+    logger.info("Free edition initialized: 24 routers registered")
