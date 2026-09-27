@@ -30,6 +30,7 @@ from backend.free.core.session_mode import (
     is_valid_session_mode,
     normalize_session_mode,
 )
+from backend.free.memory._defaults import reset_trigger_path_cache, trigger_cache_key
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import (
     Provenance,
@@ -107,7 +108,7 @@ def _get_classify_triggers(
     path: str | Path,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """パスをキーとしたプロセス内キャッシュ取得。"""
-    key = str(Path(path).resolve())
+    key = trigger_cache_key(path)
     with _CLASSIFY_LOCK:
         cached = _CLASSIFY_CACHE.get(key)
         if cached is not None:
@@ -121,6 +122,7 @@ def reset_classify_triggers_cache() -> None:
     """テスト用: キャッシュ全消去。"""
     with _CLASSIFY_LOCK:
         _CLASSIFY_CACHE.clear()
+    reset_trigger_path_cache()
 
 
 def resolve_classify_triggers_path(triggers_dir: str | Path | None = None) -> Path:
@@ -340,7 +342,8 @@ def promote_history_to_semmem(
                 entry.session_id, exc,
             )
             continue
-        history_manager.mark_promoted_to_semmem(entry.session_id)
+        # 書き手スレッドへ積むだけ (ループ上で書き手スレッドを待たない、f_02 §4.3)。
+        history_manager.mark_promoted_to_semmem(entry.session_id, wait=False)
         promoted += 1
 
     if promoted:

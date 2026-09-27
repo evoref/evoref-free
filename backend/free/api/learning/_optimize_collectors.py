@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
 from backend.free.api.learning._learning_collectors import latest_level2_run
@@ -27,6 +26,7 @@ from backend.free.api.learning._optimize_schemas import (
     PromptHistoryEntry,
     PromptModeStatus,
 )
+from backend.utils import epoch_to_utc
 
 if TYPE_CHECKING:
     from backend.free.agent.aux_prompt_manager import AuxPromptManager
@@ -128,10 +128,8 @@ def extract_scheduler_params(scheduler: object | None) -> dict[str, int]:
 
 
 def _format_iso_or_none(epoch_seconds: float) -> str | None:
-    """正の epoch 秒を `YYYY-MM-DDTHH:MM:SSZ` 形式に整形。0 以下は `None`。"""
-    if epoch_seconds <= 0:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch_seconds))
+    """正の epoch 秒を永続化と同じ ISO 8601 (μs, ``Z``) に整形。0 以下は `None`。"""
+    return epoch_to_utc(epoch_seconds)
 
 
 def format_run_timestamps(

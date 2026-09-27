@@ -9,6 +9,8 @@ Trigger D: 夜間（schedule_hour）に Level 2 をトリガー
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -336,6 +338,61 @@ class SleepTimeScheduler:
         self._suspended_reason = reason
         self._worker = None
         logger.warning("Sleep-time suspended: %s", reason)
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        """sleep-time の外から記憶ストアへ書く区間 (:meth:`SleepTimeWorker.exclusive`)。
+
+        ワーカーが無ければ (未配線 / readonly / 停止中) 待たない。
+        """
+        worker = self._worker
+        guard = getattr(worker, "exclusive", None)
+        if guard is None:
+            yield
+            return
+        async with guard():
+            yield
+
+    async def shutdown(self, timeout: float) -> bool:
+        """シャットダウンの先頭で sleep-time を静止させる (docs/c_02 §2)。
+
+        ワーカーを外して新しいサイクルを起こさない → Light / Full / 保守 snapshot /
+        tail のタスクを取り消して待つ → ワーカーのサイクルロックを取る (shield で
+        守られた Light のスレッドや版の生成の終わりを待つ) → executor の仕事の
+        終わりを待つ。全体を ``timeout`` 秒で打ち切る。
+
+        Returns:
+            ``timeout`` 内に静止できたら ``True``。
+        """
+        worker = self._worker
+        self._suspended_reason = "shutting down"
+        self._worker = None
+        if worker is not None:
+            worker.cancel()
+        tasks = [
+            task for task in (
+                self._light_task, self._full_task, self._snapshot_task, self._tail_task,
+            )
+            if task is not None and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+
+        async def _settle() -> None:
+            if tasks:
+                await asyncio.wait(tasks)
+            quiesce = getattr(worker, "quiesce", None)
+            if quiesce is not None:
+                await quiesce()
+
+        try:
+            await asyncio.wait_for(_settle(), timeout)
+        except TimeoutError:
+            logger.warning(
+                "Sleep-time did not quiesce within %.1fs; closing stores anyway", timeout,
+            )
+            return False
+        return True
 
     def set_worker(self, worker) -> None:
         """SleepTimeWorker を設定

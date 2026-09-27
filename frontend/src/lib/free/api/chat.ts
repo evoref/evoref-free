@@ -4,6 +4,7 @@ import { STREAM_CHUNK_TIMEOUT_MS } from '$lib/free/constants';
 import { loggedFetch as fetch, devLog, IS_DEV } from '$lib/devlog';
 import { BASE_URL, cancelStreamingOperation, parseApiError } from './_client';
 import { readSseFrames, SSE_FRAME_TYPES, type SSEFrameType } from './sse_frames';
+import type { FileContext } from './files';
 
 export interface TokenInfo {
 	used: number;
@@ -137,7 +138,8 @@ export async function* chatStream(
 	message: string,
 	mode: string,
 	sessionId?: string,
-	files?: string[],
+	/** 添付から抽出したチャンク (`extractFile` の応答)。バックエンドが本文に注入する */
+	fileContexts?: FileContext[],
 	signal?: AbortSignal,
 	corpusMode: CorpusMode = 'auto',
 	/** 選択中の文書テンプレート鍵 (`<package_id>:<entry_id>`)。このターンだけ効く */
@@ -160,7 +162,7 @@ export async function* chatStream(
 				message,
 				mode,
 				session_id: sessionId,
-				files,
+				file_contexts: fileContexts,
 				corpus_mode: corpusMode,
 				template
 			}),

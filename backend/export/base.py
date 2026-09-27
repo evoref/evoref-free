@@ -6,6 +6,7 @@ ExportContent, WriteResult, FileWriter Protocol, ExportError を提供する。
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Protocol
@@ -120,23 +121,43 @@ class ExportContent:
     raw_data: Any = None    # 構造化データ（csv/xlsx/json 用: list[dict] 等）
 
 
+#: 数値にしてよい表記 (f_11 §3.1)。任意の ``-``、先頭 0 の無い整数部、任意の小数部だけ。
+#: ``int()`` / ``float()`` は ``0012`` / ``+81`` / ``1_000`` / ``NaN`` / ``1e400`` も受けてしまう。
+_PLAIN_DECIMAL_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
+#: 表計算 (IEEE 754 倍精度) が保てる 10 進の有効桁。超えると末尾が化ける (カード番号等)。
+_MAX_NUMERIC_DIGITS = 15
+
+
+def is_plain_decimal(text: str) -> bool:
+    """``text`` が数値として書いてよい素の 10 進表記か (f_11 §3.1)。"""
+    return (
+        _PLAIN_DECIMAL_RE.fullmatch(text) is not None
+        and sum(c.isdigit() for c in text) <= _MAX_NUMERIC_DIGITS
+    )
+
+
 def coerce_cell_value(value: object) -> object:
     """表セルの文字列を数値へ型推定する (xlsx / ods 共通)。
 
-    "1200" を文字列のままセルへ入れると表計算側で集計できない。数値に
-    見えないものはそのまま返す。
+    "1200" を文字列のままセルへ入れると表計算側で集計できない。素の 10 進
+    表記 (:func:`is_plain_decimal`) だけを数値にし、それ以外はそのまま返す。
     """
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not is_plain_decimal(value):
         return value
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        pass
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        pass
-    return value
+    return float(value) if "." in value else int(value)
+
+
+def assign_xlsx_cell(cell: Any, value: object) -> None:
+    """openpyxl のセルへ値を入れる。``=`` 始まりの文字列を数式にしない (f_11 §3.1)。
+
+    openpyxl は ``=`` で始まる str を数式セルにするので、LLM の出力や差し込み値が
+    ``=HYPERLINK(...)`` なら開いた人の Excel で評価される。文字列セルへ戻し、Excel が
+    ``'`` 付きで入力されたセルに付けるのと同じ ``quotePrefix`` を立てる。
+    """
+    cell.value = value
+    if isinstance(value, str) and value.startswith("="):
+        cell.data_type = "s"
+        cell.quotePrefix = True
 
 
 @dataclass

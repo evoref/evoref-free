@@ -32,21 +32,18 @@ from backend.free.api.learning._learning_schemas import (
     PolicyEvolverDomainStatus,
     PriorityRequestEntry,
 )
+from backend.utils import epoch_to_utc
 
 
 # ── タイムスタンプ整形 ──────────────────────────────────────────────────
 
 
 def ts_to_iso(ts: float | None) -> str | None:
-    """float タイムスタンプ (epoch 秒) を `YYYY-MM-DDTHH:MM:SSZ` 形式に変換。
+    """float タイムスタンプ (epoch 秒) を永続化と同じ ISO 8601 (μs, ``Z``) に変換。
 
     `None` / 0 以下の値は `None` を返す。
     """
-    import time as _time
-
-    if ts is None or ts <= 0:
-        return None
-    return _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(ts))
+    return epoch_to_utc(ts)
 
 
 def latest_level2_run(raw_last_level2_run: object) -> float:

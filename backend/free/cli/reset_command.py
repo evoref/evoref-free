@@ -41,7 +41,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from backend.config import PathResolver
-from backend.data_root import DataRootError, data_path, generation_root, resolve_data_root, store_root
+from backend.data_root import (
+    DataRootError,
+    data_path,
+    generation_dirs,
+    generation_root,
+    resolve_data_root,
+    store_root,
+)
 from backend.io import ledger_files
 from backend.io.generation_seal import GITKEEP_FILENAME, SEAL_FILENAME
 from backend.io.writer_lock import LOCK_FILENAME, WriterLockHeld, acquire_writer_lock
@@ -60,8 +67,8 @@ RETRACT_BY = "cli.reset"
 
 # evoref-ctl.bat が立てるウィンドウタイトル (start "<title>" ...)。
 _WINDOW_TITLES = ("llama-server", "evoref-backend", "evoref-frontend")
-_FRONTEND_PORT = 5173
-_DEFAULT_PORTS = [8000, 8080, 8082]
+#: config.yaml が読めないときの停止対象 (既定の 8000 / 8080 / 8082)。
+_DEFAULT_CONFIG: dict = {"embedding": {"backend": "llama-cpp", "llama_port": 8082}}
 
 
 @dataclass(slots=True)
@@ -77,6 +84,23 @@ class ResetReport:
     #: ``--memory`` で残した (作り直したストアへ入れ直した) ``learn.*`` ファクトの数。
     kept_learning: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+def looks_like_data_root(data_root: Path) -> bool:
+    """``data_root`` が evoref のデータ根に見えるか (消してよいか)。
+
+    存在しない / 空 / 世代フォルダ ``g<N>/`` の下に ``store/`` か ``cache/`` がある、の
+    どれか。setup が作る骨組みは ``g1/store/`` を持つので通る。``--data-root D:\\`` の
+    ような打ち間違いで ``logs/`` ``tmp/`` の中身を消さないための検査。
+    """
+    if not data_root.exists():
+        return True
+    if data_root.is_dir() and not any(data_root.iterdir()):
+        return True
+    return any(
+        (gen / "store").is_dir() or (gen / "cache").is_dir()
+        for gen in generation_dirs(data_root).values()
+    )
 
 
 def _remove(path: Path, *, retries: int, delay: float) -> str | None:
@@ -296,50 +320,63 @@ def reset_data_root(
 # ────────────────────────────────────────────
 
 
-def _config_ports(project_root: Path) -> list[int]:
-    """config.yaml から停止対象ポートを集める。読めなければ既定ポート。"""
-    from backend.free.cli.pid_manager import collect_configured_ports
+def _expected_images(project_root: Path) -> dict[int, tuple[str, ...]]:
+    """config.yaml の停止対象ポート → kill してよいイメージ名。読めなければ既定ポート。"""
+    from backend.free.cli.pid_manager import expected_images_by_port
 
     try:
         import yaml
 
         cfg = yaml.safe_load((project_root / "config.yaml").read_text(encoding="utf-8")) or {}
-        ports = list(collect_configured_ports(cfg)) or list(_DEFAULT_PORTS)
     except Exception as e:  # noqa: BLE001 — config が読めなくても停止は続ける
         print(f"[reset] WARNING: failed to read config ports ({e}); using defaults")
-        ports = list(_DEFAULT_PORTS)
-    if _FRONTEND_PORT not in ports:
-        ports.append(_FRONTEND_PORT)
-    return ports
+        cfg = _DEFAULT_CONFIG
+    return expected_images_by_port(cfg, include_frontend=True)
 
 
 def _taskkill_window_titles() -> None:
-    """Windows: evoref-ctl.bat が立てたウィンドウ単位でツリー kill する。"""
+    """Windows: evoref-ctl.bat が立てたウィンドウ単位でツリー kill する。
+
+    イメージ名での kill (``/IM llama-server.exe``) はマシン上の全 llama-server を
+    巻き添えにするので使わない (ポートの占有者はイメージ名を確かめて kill する)。
+    """
     if sys.platform != "win32":
         return
-    commands = [["taskkill", "/F", "/T", "/FI", f"WINDOWTITLE eq {t}"] for t in _WINDOW_TITLES]
-    commands.append(["taskkill", "/F", "/IM", "llama-server.exe"])
-    for cmd in commands:
+    for title in _WINDOW_TITLES:
         try:
-            subprocess.run(cmd, capture_output=True, timeout=15)
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/FI", f"WINDOWTITLE eq {title}"],
+                capture_output=True, timeout=15,
+            )
         except (OSError, subprocess.SubprocessError):
             pass
 
 
 def stop_services(project_root: Path, *, wait_timeout: float = 30.0) -> bool:
-    """全サービス (backend + llama-server + frontend) を止め、ポートの解放を待つ。"""
+    """全サービス (backend + llama-server + frontend) を止め、ポートの解放を待つ。
+
+    ポートの占有者はイメージ名が役割どおりのときだけ kill する。evoref のものでない
+    占有者は残して ``False`` を返す (待たない)。
+    """
     from backend.free.cli.pid_manager import find_port_occupants, kill_port_occupants
 
-    ports = _config_ports(project_root)
+    expected = _expected_images(project_root)
+    ports = list(expected)
     _taskkill_window_titles()
     own_pid = os.getpid()
-    kill_port_occupants([o for o in find_port_occupants(ports) if o.pid != own_pid])
+    occupants = [o for o in find_port_occupants(ports) if o.pid != own_pid]
+    killed = kill_port_occupants(occupants, expected=expected)
+    foreign = [o for o in occupants if o not in killed]
+    for occ in foreign:
+        print(f"[reset] WARNING: not stopping {occ.summary}: not an evoref process")
+    foreign_ports = {o.port for o in foreign}
+    ports = [p for p in ports if p not in foreign_ports]
     deadline = time.monotonic() + wait_timeout
     while time.monotonic() < deadline:
         if not find_port_occupants(ports):
-            return True
+            return not foreign
         time.sleep(0.5)
-    return not find_port_occupants(ports)
+    return not foreign and not find_port_occupants(ports)
 
 
 # ────────────────────────────────────────────
@@ -421,6 +458,9 @@ def run_reset(argv: list[str]) -> int:
         data_root = resolve_data_root(args.data_root, root=project_root)
     except DataRootError as e:
         render_error(console, msg("cli.data_root_invalid", detail=str(e)))
+        return 1
+    if not looks_like_data_root(data_root):
+        render_error(console, msg("cli.reset_not_data_root", data_root=str(data_root)))
         return 1
     if not args.yes and not _confirmed(console, data_root, args):
         render_info(console, msg("cli.reset_aborted"))

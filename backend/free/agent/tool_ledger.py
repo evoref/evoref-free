@@ -188,6 +188,15 @@ def current_session_id() -> str:
     return target[0] if target else ""
 
 
+def current_query() -> str:
+    """現在のリクエストの依頼文 (ユーザーの発話。未設定なら空文字)。
+
+    書込みゲート (``write_gate``) が「依頼が挙げたフォルダ」を決める材料。
+    """
+    target = _current_target.get()
+    return target[1] if target else ""
+
+
 #: 失敗理由 -> i18n キー。未知の理由は理由なしの「失敗」へ縮退させる。
 _REASON_KEYS: dict[str, str] = {
     "timeout": "agent.tool_ledger.failure_timeout",

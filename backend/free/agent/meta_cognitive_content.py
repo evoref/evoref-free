@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import time
 
-from pathlib import Path
 from backend.config import resolve_context_size_for_mode
 from backend.free.agent.context_budget import SEND_GUARD_RESERVE_TOKENS
 from backend.free.core.prompt_blocks import current_datetime_block
@@ -25,6 +24,8 @@ from backend.free.agent.meta_cognitive_utils import (
     truncate_repetition,
     unwrap_sole_code_fence,
 )
+from backend.io.text_file import Unreadable
+from backend.trace_context import run_in_executor_with_context
 from backend.utils import estimate_tokens as _estimate_tokens
 
 from backend.free.agent.meta_cognitive_defs import (
@@ -40,6 +41,24 @@ from backend.free.agent.meta_cognitive_defs import (
 from backend.log_config import get_logger
 
 logger = get_logger("agent.meta_cognitive")
+
+
+class ExistingContentRefused(Exception):
+    """既存内容を踏まえた書込みができないので書かない (docs/f_11 §5)。
+
+    ``code`` は書込み棄却の理由コード (``existing_unreadable`` /
+    ``existing_too_large``)。``meta_cognitive_defs._WRITE_REJECTION_REASON_JA``
+    が利用者向けの説明を持つ。
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+#: 追記の生成でモデルに見せる既存内容の末尾の上限 (文字)。書き方を揃えるための
+#: 抜粋で、既存内容そのものはモデルを通さず連結する。
+_APPEND_TAIL_MAX_CHARS = 4000
 
 
 def note_stream_truncation(agent: object, stream: object, step: str) -> bool:
@@ -88,11 +107,28 @@ class _ContentGenerationMixin:
         task_description: str,
         llm_client,
         file_path: str = "",
+        *,
+        existing: str | None = None,
+        append: bool = False,
     ) -> str:
-        """write_file 用のコンテンツを LLM に生成させる"""
+        """write_file 用のコンテンツを LLM に生成させる
+
+        ``existing`` は出力先の既存内容 (読み済みなら渡す。``None`` ならここで読む)。
+        ``append`` が真なら既存内容の末尾の抜粋だけを見せて **追記する部分だけ** を
+        生成させる — 連結は呼び出し側が決定論で行う (docs/f_11 §5)。
+
+        Raises:
+            ExistingContentRefused: 既存ファイルが読めない / 書き直しに要る既存内容の
+                全体が予算に収まらない。
+        """
         ctx_size = resolve_context_size_for_mode(self.config, self._mode)
 
-        existing_content = self._read_existing_file(file_path)
+        if existing is None:
+            loaded = self._read_existing_file(file_path)
+            if isinstance(loaded, Unreadable):
+                raise ExistingContentRefused("existing_unreadable")
+            existing = loaded or ""
+        existing_content = existing
         user_prompt = f"{original_query}\n\nタスク: {task_description}"
         # 「この案内文を保存して」のように直前の成果物を指す依頼は、クエリと
         # タスク文だけでは書くべき本文が決まらない。素材が無いままだと小型
@@ -120,9 +156,14 @@ class _ContentGenerationMixin:
         # 前ステップで取得した実データ (fetch_url 等) を「使うべき素材」として注入し、
         # データに無い内容の創作 (ハルシネーション) を抑止する。
         user_prompt = self._inject_fetched_data(user_prompt, ctx_size)
-        user_prompt = self._inject_existing_content(
-            user_prompt, existing_content, file_path, ctx_size,
-        )
+        if append:
+            user_prompt = self._inject_append_tail(
+                user_prompt, existing_content, file_path, ctx_size,
+            )
+        else:
+            user_prompt = self._inject_existing_content(
+                user_prompt, existing_content, file_path, ctx_size,
+            )
 
         # Level 1 で進化した few-shot を参考例として system に注入する
         system_content = CONTENT_GENERATION_PROMPT
@@ -173,10 +214,17 @@ class _ContentGenerationMixin:
             system_content + user_prompt, ctx_size,
         )
 
-        return await self._stream_and_clean(
+        generated = await self._stream_and_clean(
             llm_client, messages, gen_max_tokens,
             preserve_markdown=file_path.lower().endswith((".md", ".markdown")),
         )
+        if append:
+            # 「完全なファイルを出す」癖で既存内容ごと出したら、既存部分を落とす
+            # (連結は呼び出し側が行うので、残すと既存内容が二重になる)。
+            body = existing_content.rstrip()
+            if body and generated.startswith(body):
+                generated = generated[len(body):].lstrip("\n")
+        return generated
 
     #: 生成プロンプトに添える直近会話の上限。
     #:
@@ -282,36 +330,58 @@ class _ContentGenerationMixin:
         return f"{date_ctx}\n\n{user_prompt}"
 
     @staticmethod
-    def _read_existing_file(file_path: str) -> str:
-        """既存ファイルの内容を読み込む（存在しなければ空文字列）
+    def _read_existing_file(file_path: str) -> str | Unreadable | None:
+        """既存ファイルの内容を読み込む（存在しなければ ``None``）
 
-        ``.docx`` 等のリッチ文書は extraction レジストリ経由で本文へ変換する。
-        ``read_text`` は OOXML / ODF / PDF で ``UnicodeDecodeError`` になり、
-        例外を握り潰して空文字を返すと ``_inject_existing_content`` が丸ごと
-        no-op になる。結果として「末尾に 1 節追加して、他はそのまま」の依頼で
-        **既存の全内容が別物に書き換わる** (2026-09-16 実測: 1〜5 章が消えて
-        まったく違う 1〜5 章になった)。成功報告は出るのでユーザーからは
-        気付けない。設計書 docs/f_11_file_export.md §5.1。
+        読み手は ``filesystem.read_existing_text`` の 1 本 (docs/f_11 §5)。
+        ``.docx`` 等のリッチ文書は extraction レジストリ経由で本文へ変換し、
+        テキストは UTF-8 / cp932 を厳格に読む。以前は utf-8 だけで読んで失敗を
+        空文字に握り潰していたため、``_inject_existing_content`` が丸ごと no-op に
+        なり、「末尾に 1 節追加して、他はそのまま」の依頼で **既存の全内容が
+        別物に書き換わった** (2026-09-16 実測)。読めないものは
+        :class:`Unreadable` で返し、呼び出し側が編集を断る。同期 I/O なので
+        イベントループからは :meth:`_load_existing_for_edit` 経由で呼ぶ。
         """
+        from backend.free.agent.tools.filesystem import read_existing_text
+
+        return read_existing_text(file_path)
+
+    async def _load_existing_for_edit(self, file_path: str) -> str | Unreadable | None:
+        """:meth:`_read_existing_file` をイベントループの外で呼ぶ。"""
         if not file_path:
-            return ""
-        p = Path(file_path)
-        if not (p.exists() and p.is_file()):
-            return ""
-        from backend.free.agent.tools.filesystem import (
-            extract_document_text,
-            is_extracted_document,
+            return None
+        return await run_in_executor_with_context(
+            asyncio.get_running_loop(), None, self._read_existing_file, file_path,
         )
 
-        if is_extracted_document(p):
-            # 抽出に失敗したリッチ文書は「読めなかった」として扱う。素の
-            # デコードへ落とすと、壊れた .docx のバイト列がたまたま UTF-8 と
-            # して通り、コンテナの中身が本文として生成プロンプトへ入る。
-            return extract_document_text(p) or ""
-        try:
-            return p.read_text(encoding="utf-8")
-        except Exception:
-            return ""
+    @staticmethod
+    def _inject_append_tail(
+        user_prompt: str,
+        existing_content: str,
+        file_path: str,
+        ctx_size: int,
+    ) -> str:
+        """追記の生成用に既存内容の **末尾の抜粋** だけを添える (docs/f_11 §5)。
+
+        既存内容はモデルを通さずに連結するので、ここで見せるのは書き方と続きの
+        位置を合わせるための末尾だけ。予算 (ctx/2 の残り) と
+        ``_APPEND_TAIL_MAX_CHARS`` の小さい方に収め、行の途中からは始めない。
+        """
+        if not existing_content:
+            return user_prompt
+        base_tokens = _estimate_tokens(CONTENT_GENERATION_PROMPT + user_prompt)
+        # token 予算をおおまかに char 予算へ換算 (日本語混在で ~2 char/token 見込み)
+        budget_chars = min(_APPEND_TAIL_MAX_CHARS, max(ctx_size // 2 - base_tokens, 0) * 2)
+        tail = existing_content.rstrip("\n")
+        if len(tail) > budget_chars:
+            tail = tail[len(tail) - budget_chars:]
+            tail = tail.split("\n", 1)[1] if "\n" in tail else tail
+        return user_prompt + (
+            f"\n\n{EXISTING_CONTENT_BLOCK_HEADING} ({file_path}) の末尾\n"
+            f"```\n{tail}\n```\n"
+            "既存の内容はそのまま残り、あなたの出力はこの後ろに連結される。"
+            "出力するのは追記する部分だけ。既存の内容を繰り返さないこと。"
+        )
 
     @staticmethod
     def _inject_existing_content(
@@ -320,7 +390,15 @@ class _ContentGenerationMixin:
         file_path: str,
         ctx_size: int,
     ) -> str:
-        """既存ファイル内容をプロンプトに注入する"""
+        """既存ファイル内容をプロンプトに注入する
+
+        書き直しは既存内容の **全体** を踏まえないと成立しない。予算 (ctx/2) に
+        収まらなければ注入を飛ばさずに断る — 以前は飛ばして素のプロンプトを返し、
+        モデルは既存内容を知らないまま全文を作り直して上書きした (docs/f_11 §5)。
+
+        Raises:
+            ExistingContentRefused: 既存内容が予算に収まらない (``existing_too_large``)。
+        """
         if not existing_content:
             return user_prompt
         base_tokens = _estimate_tokens(
@@ -343,11 +421,12 @@ class _ContentGenerationMixin:
                 f"「ヘッドランプ（500ml〜1L）」は誤り。"
             )
         else:
-            logger.info(
-                "Skipping existing content injection: "
-                "base=%d + existing=%d tokens > ctx_size/2=%d",
-                base_tokens, existing_tokens, ctx_size // 2,
+            logger.warning(
+                "Refusing rewrite: existing content does not fit the budget "
+                "(base=%d + existing=%d tokens > ctx_size/2=%d): %s",
+                base_tokens, existing_tokens, ctx_size // 2, file_path,
             )
+            raise ExistingContentRefused("existing_too_large")
         return user_prompt
 
     def _inject_fetched_data(self, user_prompt: str, ctx_size: int) -> str:

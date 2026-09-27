@@ -6,19 +6,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 from pathlib import Path
 from backend.app_state import AppState
+from backend.free.agent.meta_cognitive_content_gate import is_pure_append_request
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.free.agent.tool_call_judge import _extract_file_path
-from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE
+from backend.free.agent.tools.filesystem import append_existing_text, read_existing_text
+from backend.free.core.intent_vocab import APPEND_HINT_RE, EXPLICIT_WINDOWS_PATH_RE
 from backend.free.agent.output_format import (
     anchor_relative_output_path,
     infer_output_extension,
 )
 from backend.free.generation.document_gate import is_document_format
 from backend.free.generation.validators import remove_code_fences
+from backend.io.text_file import Unreadable
+from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_compact_stamp
 
 from backend.free.agent.output_format import MD_HINT_RE
@@ -37,10 +42,13 @@ _WRITE_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 追記（append）意図の判定パターン
-_APPEND_HINT_RE = re.compile(
-    r"(?:追記|追加|append|続き.*(?:書|出力|保存|追加))", re.IGNORECASE,
-)
+# 追記（append）意図の判定パターン (定義は core.intent_vocab が SSOT)
+_APPEND_HINT_RE = APPEND_HINT_RE
+
+#: 読めない既存ファイルへの追記を断った結果 (``long_form_write_file`` の戻り値の先頭)。
+EDIT_REFUSED_UNREADABLE_PREFIX = "Error: edit refused (existing_unreadable): "
+#: 追記と書き換えが同居する依頼を断った結果 (同上)。
+EDIT_REFUSED_MIXED_PREFIX = "Error: edit refused (mixed_edit): "
 
 # 既存ファイル参照が必要なパターン（追記・修正・確認+書く）
 _NEEDS_EXISTING_RE = re.compile(
@@ -58,9 +66,13 @@ _NEEDS_EXISTING_RE = re.compile(
 # 「X を参照して Y を作成」のように出力対象が分離するケースを拾えない。
 # 本パターンは「参照源」だけを検知し、出力先シフトと既存内容の context 取り込み
 # (read_existing_for_append) のトリガとして使う。
+#: 英語の語は **単語としてだけ** 当てる。部分文字列で当てていた頃は
+#: ``C:\tmp\reader\x.md`` / ``thread`` / ``readme`` のようにパスや別の語に
+#: ``read`` を含むだけで出力先がずれ、追記が元のファイルに届かなかった
+#: (2026-09-27 レビュー)。前後がパスの一部 (英数字・``\`` ``/`` ``.`` ``-``) なら外す。
 _READ_REF_RE = re.compile(
-    r"(?:参照|参考|読[みむ]|見て|これを|これに|を基に|を元に|に基づ|"
-    r"based on|refer(?: to)?|read)",
+    r"(?:参照|参考|読[みむ]|見て|これを|これに|を基に|を元に|に基づ"
+    r"|(?<![A-Za-z0-9_\\/.\-])(?:based on|refer(?:ence|ring|s)?(?: to)?|read)(?![A-Za-z0-9_\\/]))",
     re.IGNORECASE,
 )
 
@@ -388,7 +400,11 @@ async def split_write_single_unit(
     # ファイル先頭に機能名 (heading) を付与すると、ユーザーが内容を識別しやすい
     body = f"# {heading}\n\n{cleaned}\n" if heading else f"{cleaned}\n"
     try:
-        await registry.execute("write_file", file_path=out_path, content=body)
+        result = str(await registry.execute("write_file", file_path=out_path, content=body))
+        if result.startswith("Error"):
+            # 書込みゲートの断り (docs/f_03 §4.y) などツールの失敗は戻り値で届く
+            logger.warning("Long-form SPLIT unit %d not written: %s", idx, result[:200])
+            return None
         used_paths.add(out_path)
         logger.info(
             "Long-form SPLIT unit [%d/%d] written: %s", idx + 1, total, out_path,
@@ -422,9 +438,12 @@ async def split_write_index(
         lines.append(f"- [{item['heading']}](./{rel})")
     body = "\n".join(lines) + "\n"
     try:
-        await registry.execute(
+        result = str(await registry.execute(
             "write_file", file_path=str(index_path), content=body,
-        )
+        ))
+        if result.startswith("Error"):
+            logger.warning("Long-form SPLIT index not written: %s", result[:200])
+            return None
         logger.info("Long-form SPLIT index written: %s", index_path)
         return str(index_path)
     except Exception as e:
@@ -483,12 +502,27 @@ async def long_form_write_file(
         content = dedup_verbatim_paragraphs(content)
 
     try:
-        # 追記モード: 既存ファイルの内容に連結
-        if _APPEND_HINT_RE.search(query) and registry.has("read_file"):
-            existing = await registry.execute("read_file", file_path=file_path)
-            if not is_tool_error(existing):
-                content = existing.rstrip() + "\n\n" + content
-                logger.info("Long-form append mode: prepended %d chars from %s", len(existing), file_path)
+        # 追記モード: 既存ファイルを生のまま読み、決定論で連結する (f_08 §5.3)。
+        # read_file ツールの出力はメタ行付き・50,000 字で切り詰めなので使わない。
+        if _APPEND_HINT_RE.search(query):
+            existing = await run_in_executor_with_context(
+                asyncio.get_running_loop(), None, read_existing_text, file_path,
+            )
+            if isinstance(existing, Unreadable):
+                logger.warning(
+                    "Long-form append refused: existing file is unreadable (%s): %s",
+                    existing.reason, file_path,
+                )
+                return f"{EDIT_REFUSED_UNREADABLE_PREFIX}{file_path}"
+            if existing and not is_pure_append_request(query):
+                # 書き換えの語が同居する依頼。長文の生成は末尾を文脈にした続きしか
+                # 書けないので、連結すれば書き換えが黙って落ち、上書きすれば既存
+                # 内容が消える。どちらもせずに断る。
+                logger.warning("Long-form append refused: request also revises %s", file_path)
+                return f"{EDIT_REFUSED_MIXED_PREFIX}{file_path}"
+            if existing:
+                content = append_existing_text(existing, content)
+                logger.info("Long-form append mode: kept %d chars from %s", len(existing), file_path)
 
         result = await registry.execute("write_file", file_path=file_path, content=content)
         logger.info("Long-form file output: %s", result)

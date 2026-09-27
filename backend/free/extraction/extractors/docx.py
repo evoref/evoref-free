@@ -90,7 +90,7 @@ class DocxExtractor(BinarySourceExtractorBase):
         return 0
 
     @classmethod
-    def _paragraph_line(cls, para) -> str:
+    def _paragraph_line(cls, para, style_name: str) -> str:
         """1 段落を Markdown 行にする。
 
         **見出しは ``#`` を付けて出す** (2026-09-16、docs/f_11 §5.1)。抽出は
@@ -106,10 +106,6 @@ class DocxExtractor(BinarySourceExtractorBase):
         text = para.text.strip()
         if not text:
             return ""
-        try:
-            style_name = para.style.name
-        except Exception:  # pragma: no cover - スタイル欠損の文書
-            style_name = ""
         level = cls._heading_level(style_name)
         if level:
             return f"{'#' * level} {text}"
@@ -146,9 +142,25 @@ class DocxExtractor(BinarySourceExtractorBase):
 
         以前は段落を全部出してから表を末尾にまとめていたため、表が本来の
         位置から離れ、読み戻して書き直すと節の順序が入れ替わっていた。
+
+        スタイル名はスタイル ID ごとに 1 回だけ解決する。``para.style`` は段落ごとに
+        全スタイルを XPath で引き直し (ID 無しなら既定スタイルの解決も毎回)、
+        30 万段落の文書で 232 秒掛かった (docs/f_11 §5.1)。
         """
+        from docx.enum.style import WD_STYLE_TYPE
         from docx.table import Table
         from docx.text.paragraph import Paragraph
+
+        style_names: dict[str | None, str] = {}
+
+        def style_name_of(style_id: str | None) -> str:
+            if style_id not in style_names:
+                try:
+                    style = doc.part.get_style(style_id, WD_STYLE_TYPE.PARAGRAPH)
+                    style_names[style_id] = style.name or ""
+                except Exception:  # pragma: no cover - スタイル欠損の文書
+                    style_names[style_id] = ""
+            return style_names[style_id]
 
         lines: list[str] = []
         para_count = 0
@@ -156,7 +168,7 @@ class DocxExtractor(BinarySourceExtractorBase):
         for child in doc.element.body.iterchildren():
             tag = child.tag.rsplit("}", 1)[-1]
             if tag == "p":
-                line = cls._paragraph_line(Paragraph(child, doc))
+                line = cls._paragraph_line(Paragraph(child, doc), style_name_of(child.style))
                 if line:
                     lines.append(line)
                     para_count += 1

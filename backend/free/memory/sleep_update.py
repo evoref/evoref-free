@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 
@@ -51,9 +52,35 @@ INPUT_SUFFIX = "_input"
 
 logger = get_logger("memory.sleep_update")
 
+_T = TypeVar("_T")
+
 #: ``_save_state`` 用の 1 スレッド executor。保存を直列化して順序を保つ
 #: (:meth:`SleepTimeWorker._save_state_async`)。
 _SAVE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="episodic-save")
+
+
+
+async def _run_off_loop(fn: Callable[..., _T], *args: Any) -> _T:
+    """``fn`` を ``_SAVE_EXECUTOR`` で走らせ、**スレッドが終わるまで** 待つ。
+
+    取り消されても (Light は応答開始・入力のたびに取り消される) スレッドの
+    終わりを待ってから ``CancelledError`` を送り直す。待たずに抜けると呼出側の
+    サイクルロックが外れ、次のサイクル・snapshot・シャットダウンがまだ書いて
+    いるスレッドと重なる (``concurrent writer`` / ``os.replace`` の共有違反 /
+    同じターンの二重ノート化)。スレッドの例外はそのまま送出する。
+    """
+    loop = asyncio.get_running_loop()
+    future = run_in_executor_with_context(loop, _SAVE_EXECUTOR, fn, *args)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                continue
+        raise
+
 
 #: 最後の追記からこの秒数を過ぎたアクティブなセッションは sleep-time に畳む。
 _HISTORY_FOLD_IDLE_SECONDS = 1800.0
@@ -142,6 +169,10 @@ class SleepTimeWorker:
         #: という不変則 (c_16 §2.1) を **慣習ではなくロックで** 守る。Full は
         #: 待って直列化し、Light は取れなければ飛ばす (:meth:`run_light`)。
         self._cycle_lock = asyncio.Lock()
+        #: Light のワーカースレッドが記憶ストアへ書いている区間の排他。サイクル
+        #: の外からストアへ書く経路 (モデル移行・再埋め込み・reindex) は
+        #: :meth:`exclusive` でこの区間の終わりを待つ (docs/f_02 §4.3)。
+        self._store_write_lock = asyncio.Lock()
         # ── Step 8 (Extractor) 用 ──
         self._semantic_store_provider = semantic_store_provider
         self._current_project_id = current_project_id
@@ -225,6 +256,37 @@ class SleepTimeWorker:
     def cancel(self) -> None:
         """実行中の処理をキャンセル（現在のステップ完了後に停止）"""
         self._cancelled = True
+
+    @asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        """サイクルの外から episodic / SemMem へ書く区間 (Light のスレッドと重ねない)。
+
+        持つのはスレッドが書いている区間だけ (数十 ms) なので、走っている Full の
+        終わりまでは待たない。ループ上の書き込み同士は従来どおり await の境目で
+        入れ替わる。
+        """
+        async with self._store_write_lock:
+            yield
+
+    async def _off_loop(self, fn: Callable[..., _T], *args: Any) -> _T:
+        """ストアへ書く ``fn`` をワーカースレッドで走らせる (:meth:`exclusive` と排他)。"""
+        async with self._store_write_lock:
+            return await _run_off_loop(fn, *args)
+
+    async def quiesce(self) -> None:
+        """シャットダウン用: 走っているサイクルとスレッドの終わりを待つ。
+
+        サイクルロックは **取ったまま返す** — 以後の Light / snapshot は飛ばし、
+        Full はロック待ちのまま何もしない。ストアを閉じる・書き手ロックを手放すのは
+        この後 (docs/c_02 §2)。``_SAVE_EXECUTOR`` と ProjectMap の executor に積まれた
+        仕事 (取り消されたサイクルが残したものを含む) の終わりも待つ。
+        """
+        from backend.free.memory.sleep.project_map import wait_builds_finished
+
+        self._cancelled = True
+        await self._cycle_lock.acquire()
+        await asyncio.wrap_future(_SAVE_EXECUTOR.submit(lambda: None))
+        await wait_builds_finished()
 
     def _check_cancelled(self) -> bool:
         """キャンセルチェック"""
@@ -365,15 +427,17 @@ class SleepTimeWorker:
         logger.info(
             "Sleep-time Light started (%d episodic record(s))", len(self.episodic),
         )
+        # E1 / E4 / E5 の同期 I/O はワーカースレッドで (応答のストリーミングと
+        # 重なるので、ループ上に置くとその間トークンが流れない、f_02 §4.3)。
         try:
             ts = time.monotonic()
-            result["notes_created"] = self._step_e1_build_notes()
+            result["notes_created"] = await self._off_loop(self._step_e1_build_notes)
             step_durations["step_e1_note_build"] = round(time.monotonic() - ts, 3)
             if self._check_cancelled():
                 return result
 
             ts = time.monotonic()
-            result["touched"] = self.episodic.flush_touch()
+            result["touched"] = await self._off_loop(self.episodic.flush_touch)
             step_durations["step_e4_touch_flush"] = round(time.monotonic() - ts, 3)
 
             ts = time.monotonic()
@@ -390,11 +454,12 @@ class SleepTimeWorker:
             step_durations["step8_7_knowledge_fetch"] = round(time.monotonic() - ts, 3)
         finally:
             ts = time.monotonic()
-            self.episodic.save_progress()
             store = self._semantic_store()
             if store is not None:
+                # SemMem にはループ上の書き手 (Level 1 の learn.* / 記憶 API) が
+                # いるので、事象を足す保持方針と touch はループに残す。
                 self._semantic_housekeeping(store)
-                store.save_manifest()
+            await self._off_loop(self._save_light_state, store)
             step_durations["step_e5_save_progress"] = round(time.monotonic() - ts, 3)
             await self._save_state_async()
 
@@ -426,6 +491,12 @@ class SleepTimeWorker:
             )
 
         return result
+
+    def _save_light_state(self, semantic_store) -> None:
+        """(ワーカースレッド) ノート化の進捗と SemMem の manifest を書く。"""
+        self.episodic.save_progress()
+        if semantic_store is not None:
+            semantic_store.save_manifest()
 
     # ── エピソード記憶のライフサイクル (c_16 §4.1) ──────────
 
@@ -987,7 +1058,8 @@ class SleepTimeWorker:
 
         # Step 10b (補助): 履歴ファイル本体の圧縮処理
         ts = time.monotonic()
-        result["compressed"] = self._step10_compact_sessions()
+        # 履歴の書き手スレッドの結果を待つので、ループの外で呼ぶ。
+        result["compressed"] = await _run_off_loop(self._step10_compact_sessions)
         step_durations["step10b_history_compact"] = round(time.monotonic() - ts, 3)
 
         # Step 10b-2: 手本 (few-shot) の埋め込みを遡って生成する。
@@ -1777,8 +1849,7 @@ class SleepTimeWorker:
         で trace_id を保ったままスレッドへ逃がす。専用の 1 スレッド executor
         なので保存同士は直列化され、順序が入れ替わらない。
         """
-        loop = asyncio.get_running_loop()
-        await run_in_executor_with_context(loop, _SAVE_EXECUTOR, self._save_state)
+        await _run_off_loop(self._save_state)
 
     def _save_state(self) -> None:
         """メモリ状態を永続化 (ノート化の進捗 + 経験バッファ)。"""

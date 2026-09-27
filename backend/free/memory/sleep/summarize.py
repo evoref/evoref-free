@@ -15,11 +15,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -171,7 +174,12 @@ async def summarize_unsummarized_sessions(
             }
             if not session.lang:
                 fields["lang"] = detect_lang(summary)
-            if not mgr.update_session_fields(entry.session_id, **fields):
+            # 書き手スレッドの結果を待つので、ループの外で呼ぶ (f_02 §4.3)。
+            written = await run_in_executor_with_context(
+                asyncio.get_running_loop(), None,
+                partial(mgr.update_session_fields, entry.session_id, **fields),
+            )
+            if not written:
                 continue
             # ベクトルは埋め込みモデルごとの束へ (埋め込みモデルの model_key が鍵、無い構成は
             # model_name。無記名だと替えた後に新旧のベクトルが次元一致だけで見分けられない)。

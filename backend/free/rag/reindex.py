@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -215,12 +216,16 @@ async def run_reindex(
     result = ReindexResult()
 
     if cartridge_id is None:
-        result.memory_notes_reset = await reindex_evidence_store(
-            getattr(state, "episodic_memory", None), embedder, "episodic",
-        )
-        result.rag_chunks = await reindex_evidence_store(
-            getattr(state, "semantic_memory", None), embedder, "semantic",
-        )
+        # 記憶ストアの版と manifest は sleep-time の Light もワーカースレッドで書く
+        # ので、その区間の終わりを待って重ねない (docs/f_02 §4.3)。
+        scheduler = getattr(state, "sleep_scheduler", None)
+        async with scheduler.exclusive() if scheduler is not None else nullcontext():
+            result.memory_notes_reset = await reindex_evidence_store(
+                getattr(state, "episodic_memory", None), embedder, "episodic",
+            )
+            result.rag_chunks = await reindex_evidence_store(
+                getattr(state, "semantic_memory", None), embedder, "semantic",
+            )
 
     manager = getattr(state, "cartridge_manager", None)
     if manager is not None:

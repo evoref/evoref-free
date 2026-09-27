@@ -11,6 +11,7 @@ import io
 import re
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree
 
 #: ``.dotx`` / ``.potx`` / ``.xltx`` → 本体形式への変換材料
 #: (拡張子, ``[Content_Types].xml`` の main part 名, その語幹)。
@@ -74,8 +75,9 @@ def inspect_office_file(path: Path | str) -> str | None:
     - zip 内に ``vbaProject.bin`` がある (VBA マクロ)
     - ``[Content_Types].xml`` にマクロ有効の content-type がある
       (``.docm`` / ``.xlsm`` / ``.pptm`` を拡張子だけ変えたもの)
-    - ``.rels`` に ``attachedTemplate`` で ``TargetMode="External"`` の
-      関係がある (外部テンプレートの読み込み)
+    - 開いただけで外へ取りに行く参照 (:func:`_external_reference_reason`)。
+      外部テンプレート・外部画像・OLE リンク・UNC / ``file:`` へのリンク・
+      ``xl/externalLinks/``・DDE / INCLUDE 系フィールド
     """
     path = Path(path)
     try:
@@ -92,14 +94,84 @@ def inspect_office_file(path: Path | str) -> str | None:
                 if "macroEnabled" in content_types:
                     return "declares a macro-enabled content type"
 
-            for name in names:
-                if not name.endswith(".rels"):
-                    continue
-                rels = zf.read(name).decode("utf-8", errors="replace")
-                if "attachedTemplate" in rels and 'TargetMode="External"' in rels:
-                    return "references an external attached template"
+            return _external_reference_reason(zf)
     except zipfile.BadZipFile:
         return "not a valid Office (zip) file"
+
+
+#: ``TargetMode="External"`` のとき宛先を問わず拒否する関係の種別 (Type の末尾)
+#: → 理由に出す名前。どれも文書を開いた時点で Office が宛先を取りに行く
+#: (UNC なら SMB 認証で NTLM が相手へ渡る、c_16 §4.5.2)。
+_FETCHING_EXTERNAL_RELS: dict[str, str] = {
+    "attachedTemplate": "attached template",
+    "image": "image",
+    "oleObject": "OLE object",
+    "externalLink": "workbook link",
+    "frame": "frame",
+}
+#: 上以外の外部関係 (主にハイパーリンク) で通す宛先。``file:`` / UNC / ドライブパスは拒否。
+_SAFE_EXTERNAL_SCHEMES = ("http://", "https://", "mailto:")
+#: ブックの外部参照パート (``.xlsx``)。DDE リンクもここに入る。
+_EXTERNAL_LINK_PART_PREFIX = "xl/externallinks/"
+#: 外部のファイルやプログラムを読むフィールドコード (``.docx``)。
+_EXTERNAL_FIELD_RE = re.compile(
+    r"(?<![A-Za-z])(DDEAUTO|DDE|INCLUDETEXT|INCLUDEPICTURE)(?![A-Za-z])", re.IGNORECASE,
+)
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _external_reference_reason(zf: zipfile.ZipFile) -> str | None:
+    """外部参照を 1 つでも持てば拒否理由を返す (c_16 §4.5.2)。"""
+    for name in zf.namelist():
+        lowered = name.lower()
+        if lowered.startswith(_EXTERNAL_LINK_PART_PREFIX):
+            return f"contains an external workbook link part ({name})"
+        if lowered.endswith(".rels"):
+            reason = _rels_reason(zf.read(name))
+        elif lowered.startswith("word/") and lowered.endswith(".xml"):
+            reason = _field_reason(zf.read(name))
+        else:
+            continue
+        if reason is not None:
+            return f"{reason} ({name})"
+    return None
+
+
+def _parse_xml(data: bytes) -> ElementTree.Element | None:
+    try:
+        return ElementTree.fromstring(data)
+    except ElementTree.ParseError:
+        return None
+
+
+def _rels_reason(data: bytes) -> str | None:
+    root = _parse_xml(data)
+    if root is None:
+        return "has an unreadable relationships part"
+    for rel in root.iter():
+        if not rel.tag.endswith("Relationship"):
+            continue
+        if (rel.get("TargetMode") or "").lower() != "external":
+            continue
+        kind = (rel.get("Type") or "").rsplit("/", 1)[-1]
+        if kind in _FETCHING_EXTERNAL_RELS:
+            return f"references an external {_FETCHING_EXTERNAL_RELS[kind]}"
+        target = (rel.get("Target") or "").strip().lower()
+        if not target.startswith(_SAFE_EXTERNAL_SCHEMES):
+            return "links to a local or network (UNC) path"
+    return None
+
+
+def _field_reason(data: bytes) -> str | None:
+    root = _parse_xml(data)
+    if root is None:
+        return "has an unreadable document part"
+    # フィールドコードは run をまたいで割られる (``DD`` + ``E``) ので連結してから見る。
+    codes = [el.text or "" for el in root.iter(f"{_W_NS}instrText")]
+    codes += [el.get(f"{_W_NS}instr") or "" for el in root.iter(f"{_W_NS}fldSimple")]
+    match = _EXTERNAL_FIELD_RE.search("".join(codes))
+    if match is not None:
+        return f"has an external {match.group(1).upper()} field"
     return None
 
 

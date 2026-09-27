@@ -20,10 +20,12 @@ from backend.free.cli.config_loader import _find_project_root
 from backend.free.cli.develop_mode_setup import add_data_root_flag, setup_develop_mode
 from backend.free.cli.edition_validator import validate_edition_arg
 from backend.free.cli.pid_manager import (
-    _run_windows_console_command,
+    IMAGE_LLAMA,
     acquire_pid,
     check_pid,
     collect_configured_ports,
+    expected_images_by_port,
+    find_port_occupant,
     find_port_occupants,
     force_release_stale_pid,
     kill_port_occupants,
@@ -70,10 +72,22 @@ class AutoServeState:
 
 
 def _open_stderr_log(project_root: Path, name: str):
-    """サブプロセスの stderr をキャプチャするログファイルを開く"""
+    """サブプロセスの stderr をキャプチャするログファイルを開く
+
+    直前の起動のログは ``<name>.stderr.log.1`` へ 1 世代だけ退避する (前回の
+    クラッシュの原因を次の起動で消さない)。退避できなければ追記で開く。
+    """
     log_dir = resolve_data_path("logs_dir", project_root)
     log_dir.mkdir(parents=True, exist_ok=True)
-    return open(log_dir / f"{name}.stderr.log", "w", encoding="utf-8")
+    path = log_dir / f"{name}.stderr.log"
+    mode = "w"
+    if path.exists():
+        try:
+            path.replace(path.with_name(path.name + ".1"))
+        except OSError as e:
+            logger.warning("Failed to keep previous %s (%s); appending", path.name, e)
+            mode = "a"
+    return open(path, mode, encoding="utf-8")
 
 
 # ────────────────────────────────────────────
@@ -201,6 +215,22 @@ def _resolve_startup_config(
     return config
 
 
+def _render_port_kill_result(console, occupants: list, killed: list) -> None:
+    """``--force`` で kill した占有者と、evoref のものでないため残した占有者を表示する。"""
+    for occ in occupants:
+        name = occ.process_name or "unknown"
+        if occ in killed:
+            render_info(
+                console,
+                msg("cli.force_killing_port", port=occ.port, pid=occ.pid, name=name),
+            )
+        else:
+            render_error(
+                console,
+                msg("cli.force_port_foreign", port=occ.port, pid=occ.pid, name=name),
+            )
+
+
 def _resolve_port_conflicts(config: dict, console, force: bool) -> bool:
     """ポート競合を検出し、必要なら kill して再確認する。継続可なら ``True``。"""
     ports = collect_configured_ports(config)
@@ -211,12 +241,8 @@ def _resolve_port_conflicts(config: dict, console, force: bool) -> bool:
         render_info(console, msg("cli.hint_use_force"))
         return True
 
-    for occ in occupants:
-        render_info(
-            console,
-            msg("cli.force_killing_port", port=occ.port, pid=occ.pid, name=occ.process_name or "unknown"),
-        )
-    kill_port_occupants(occupants)
+    killed = kill_port_occupants(occupants, expected=expected_images_by_port(config))
+    _render_port_kill_result(console, occupants, killed)
     time.sleep(1)
     still_occupied = find_port_occupants(ports)
     if still_occupied:
@@ -1163,13 +1189,8 @@ async def _kill_auto_serve_port_conflicts(
     occupants = find_port_occupants(ports)
     if not occupants:
         return
-    for occ in occupants:
-        render_info(
-            console,
-            msg("cli.force_killing_port", port=occ.port, pid=occ.pid,
-                name=occ.process_name or "unknown"),
-        )
-    kill_port_occupants(occupants)
+    killed = kill_port_occupants(occupants, expected=expected_images_by_port(cfg_pre))
+    _render_port_kill_result(console, occupants, killed)
     await asyncio.sleep(1)
 
 
@@ -1345,40 +1366,10 @@ def _kill_process_tree(pid: int) -> None:
 
 
 def _kill_by_port(port: int) -> None:
-    """指定ポートで LISTEN しているプロセスを終了"""
-    if sys.platform == "win32":
-        # netstat でポートを使用中の PID を取得。
-        # 日本語ロケール (cp932) 環境で UnicodeDecodeError を起こさないよう
-        # bytes で受けてから安全にデコードする
-        stdout = _run_windows_console_command(["netstat", "-ano"])
-        for line in stdout.splitlines():
-            # TCP    0.0.0.0:8080    0.0.0.0:0    LISTENING    12345
-            # TCP    127.0.0.1:8080  0.0.0.0:0    LISTENING    12345
-            if f":{port}" not in line or "LISTENING" not in line:
-                continue
-            parts = line.split()
-            # ポートの正確な一致を確認 (:80 が :8080 に誤マッチしないよう)
-            local_addr = parts[1] if len(parts) >= 5 else ""
-            if not local_addr.endswith(f":{port}"):
-                continue
-            pid_str = parts[-1]
-            if pid_str.isdigit():
-                pid = int(pid_str)
-                logger.debug("Killing process on port %d: pid=%d", port, pid)
-                _kill_process_tree(pid)
-    else:
-        try:
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for pid_str in result.stdout.strip().split():
-                if pid_str.isdigit():
-                    pid = int(pid_str)
-                    logger.debug("Killing process on port %d: pid=%d", port, pid)
-                    _kill_process_tree(pid)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+    """llama のポートで LISTEN している llama-server を終了 (別のイメージなら残す)"""
+    occ = find_port_occupant(port)
+    if occ is not None:
+        kill_port_occupants([occ], expected={port: IMAGE_LLAMA})
 
 
 def _auto_serve_cleanup(state: AutoServeState, console) -> None:

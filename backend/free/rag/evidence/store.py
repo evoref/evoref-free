@@ -764,7 +764,7 @@ class EvidenceStore:
         applied = 0
         try:
             for event in self.events.iter_since(self.manifest.folded_through):
-                self._apply_event(event)
+                self._apply_event(event, in_place=True)
                 applied += 1
         except EvidenceVersionError as e:
             self._enter_readonly(f"the event log holds a newer record version: {e}")
@@ -781,16 +781,25 @@ class EvidenceStore:
                 "record version",
             )
 
-    def _apply_event(self, event: dict[str, Any]) -> None:
-        """1 事象をオーバーレイへ適用する (畳み込みと同じ意味論)。"""
+    def _apply_event(self, event: dict[str, Any], *, in_place: bool = False) -> None:
+        """1 事象をオーバーレイへ適用する (畳み込みと同じ意味論)。
+
+        オーバーレイは **写しに書いて参照を差し替える** (copy-on-write)。Light は
+        事象をワーカースレッドで適用する (docs/f_02 §4.3) ので、ループ上の読み手
+        (:meth:`active_mask` の走査など) が掴んでいる dict を書き換えると
+        ``dictionary changed size during iteration`` になる。``in_place`` は
+        読み手のいない起動時の replay 用 (事象数に比例したコピーを避ける)。
+        """
         if self._events_during_build is not None:
             self._events_during_build.append(event)
         folded = SnapshotWriter.fold(self._existing_for(event), [event])
+        overlay = self._overlay if in_place else dict(self._overlay)
         for record in folded:
             known = self._snapshot is not None and self._snapshot.row_of(record.id) is not None
-            if not known and record.id not in self._overlay:
+            if not known and record.id not in overlay:
                 self._tail_ids.append(record.id)
-            self._overlay[record.id] = record
+            overlay[record.id] = record
+        self._overlay = overlay
 
     def _existing_for(self, event: dict[str, Any]) -> list[Evidence]:
         """事象が参照するレコードの現在値だけを集める (全件展開しない)。"""
@@ -821,6 +830,31 @@ class EvidenceStore:
         if self._snapshot is None:
             return None
         return self._snapshot.get(record_id)
+
+    def get_rows(self, rows: Sequence[int]) -> list[Evidence | None]:
+        """snapshot の行を ``rows`` の順に引く (オーバーレイ優先。:meth:`get` と同じ値)。
+
+        オーバーレイに無い行だけを :meth:`SnapshotReader.raw_rows` で 1 回の
+        open にまとめて読む。
+        """
+        snapshot = self._snapshot
+        if snapshot is None:
+            return [None] * len(rows)
+        # オーバーレイは copy-on-write で差し替わるので、1 回の呼出では同じ世代を見る。
+        overlay = self._overlay
+        out: list[Evidence | None] = []
+        missing: list[int] = []
+        for row in rows:
+            record = overlay.get(snapshot.id_at(int(row)))
+            out.append(record)
+            if record is None:
+                missing.append(int(row))
+        if missing:
+            raws = snapshot.raw_rows(missing)
+            for i, row in enumerate(rows):
+                if out[i] is None:
+                    out[i] = snapshot.record_from_raw(raws.get(int(row)), int(row))
+        return out
 
     def __len__(self) -> int:
         base = len(self._snapshot) if self._snapshot is not None else 0
@@ -1268,8 +1302,11 @@ class EvidenceStore:
         return self.touch(ids, by=by) if ids else 0
 
     def save_manifest(self) -> None:
-        """manifest を書き出す (``events_since_snapshot`` の永続化)。"""
-        self.manifest.save()
+        """manifest を書き出す (``events_since_snapshot`` の永続化)。
+
+        内容が前回読んだ / 書いたものと同じなら書かない (:meth:`EvidenceManifest.save_if_changed`)。
+        """
+        self.manifest.save_if_changed()
 
     # ── ベクトル索引 (c_16 §6.1) ──
 

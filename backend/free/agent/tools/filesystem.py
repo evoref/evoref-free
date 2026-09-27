@@ -9,12 +9,21 @@ from __future__ import annotations
 import calendar
 import os
 import re
-import subprocess
 
 from pathlib import Path
 from backend.data_root import DEFAULT_DIRNAME, ISOLATED_DIRNAME
 from backend.log_config import get_logger
+from backend.free.agent.write_gate import has_parent_segment
+from backend.free.core.response_arithmetic import LIST_ITEM_RE
 from backend.free.constants import READ_FILE_META_PREFIX
+from backend.free.services.diff_service import DiffServiceError, apply_diff_to_file
+from backend.io.text_file import (
+    TextFile,
+    Unreadable,
+    decode_text_for_display,
+    read_text_for_edit,
+)
+from backend.io.user_file import UnencodableTextError, write_user_text
 
 logger = get_logger("agent.tools.builtin")
 
@@ -30,10 +39,6 @@ _WALK_EXCLUDED_DIRS = frozenset({
     "node_modules", "__pycache__", ".git", "models",
     DEFAULT_DIRNAME, ISOLATED_DIRNAME,
 })
-
-#: read_file のデコード候補 (先頭から順に厳格デコードを試す)。BOM 付きは
-#: utf-8-sig、Windows 既定のメモ帳 / 旧ツール出力は cp932。
-_READ_FILE_ENCODINGS = ("utf-8", "utf-8-sig", "cp932")
 
 #: バイト列をテキストとしてデコードせず extraction レジストリ経由で読む形式。
 #: OOXML / ODF は ZIP、PDF は独自バイナリなので、素のデコードは中身ではなく
@@ -78,29 +83,54 @@ def extract_document_text(path: Path) -> str | None:
         return None
 
 
-def _decode_text_file(raw: bytes) -> tuple[str, str]:
-    """ファイルのバイト列をデコードし ``(本文, 使ったエンコーディング)`` を返す。
+def read_existing_text(file_path: str | Path) -> str | Unreadable | None:
+    """編集の素材として出力先の既存ファイルの**全文**を読む (docs/f_11 §5)。
 
-    改行は ``Path.read_text`` (universal newlines) と同じく ``\\n`` へ正規化する。
-    全候補で失敗した場合は utf-8 の置換デコードに落ちる。
+    既存ファイルを踏まえる書込み (追記・書き直し) の読み手はこの 1 本。
+    ``read_file`` ツールの出力 (メタ行付き・50,000 字で切り詰め) を素材に
+    使ってはいけない。無ければ ``None``、読めなければ :class:`Unreadable`
+    (呼び出し側は編集を断る)。リッチ文書は extraction レジストリ経由で
+    Markdown として読む。同期 I/O なのでイベントループの外で呼ぶ。
     """
-    if raw.startswith(b"\xef\xbb\xbf"):
-        candidates: tuple[str, ...] = ("utf-8-sig",)
-    else:
-        candidates = tuple(e for e in _READ_FILE_ENCODINGS if e != "utf-8-sig")
-    text: str | None = None
-    used = "utf-8"
-    for enc in candidates:
-        try:
-            text = raw.decode(enc)
-            used = enc
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        text = raw.decode("utf-8", errors="replace")
-        used = "utf-8 (replace)"
-    return text.replace("\r\n", "\n").replace("\r", "\n"), used
+    if not file_path:
+        return None
+    p = Path(file_path)
+    if not is_extracted_document(p):
+        result = read_text_for_edit(p, max_bytes=_TOOL_MAX_FILE_READ_BYTES)
+        return result.text if isinstance(result, TextFile) else result
+    try:
+        if not p.exists():
+            return None
+        if not p.is_file():
+            return Unreadable("not_a_file")
+        size = p.stat().st_size
+    except OSError as e:
+        return Unreadable("os_error", str(e))
+    if size > _TOOL_MAX_FILE_READ_BYTES:
+        return Unreadable("too_large", f"{size} bytes > {_TOOL_MAX_FILE_READ_BYTES}")
+    extracted = extract_document_text(p)
+    return extracted if extracted is not None else Unreadable("extraction_failed")
+
+
+def append_existing_text(existing: str, addition: str) -> str:
+    """``既存内容 + 区切り + 追加分`` を作る (docs/f_11 §5、純粋関数)。
+
+    区切りは既存内容の書き方に合わせる: 空行で段落を分けていれば空行、行単位
+    (CSV / 1 行 1 項目) なら改行 1 つ。既存内容が改行で終わっていれば結果も
+    改行で終える。既存内容は 1 文字も変えない (末尾の改行だけを付け直す)。
+    """
+    body = existing.rstrip("\n")
+    addition = addition.strip("\n")
+    if not body:
+        return addition
+    # 箇条書きの末尾へ項目を足すときは空行を挟まない (リストが 2 つに割れる)。
+    continues_list = bool(
+        LIST_ITEM_RE.match(body.rsplit("\n", 1)[-1])
+        and LIST_ITEM_RE.match(addition.split("\n", 1)[0])
+    )
+    separator = "\n\n" if "\n\n" in body and not continues_list else "\n"
+    tail = "\n" if existing.endswith("\n") else ""
+    return f"{body}{separator}{addition}{tail}"
 
 
 def read_file(
@@ -142,7 +172,7 @@ def read_file(
         if extracted is not None:
             content, used_encoding = extracted, "extracted"
         else:
-            content, used_encoding = _decode_text_file(p.read_bytes())
+            content, used_encoding = decode_text_for_display(p.read_bytes())
         lines = content.splitlines()
         header = (
             f"{READ_FILE_META_PREFIX}{file_path}"
@@ -372,25 +402,27 @@ def _write_rich_document(p: Path, content: str) -> str:
 
 
 def _check_path_traversal(file_path: str) -> str | None:
-    """``..`` セグメントを含む相対パス指定を拒否する。
+    """``..`` セグメントを含むパス指定を拒否する。
 
-    write_file / read_file 共通のガード。LLM が意図しない (幻覚・プロンプト
-    インジェクション由来の) ``..`` を含むパスを発行し、呼び出し元が想定した
-    範囲外のファイルを書き換え/読み出ししてしまう事故を防ぐ。本ツールには
-    固定のワークスペースルート概念が無い (ユーザーが任意の絶対パスを指定して
-    書き込む用途を意図的にサポートしている) ため、絶対パス自体は許可し
-    ``..`` 相対脱出のみを検査対象とする。
+    write_file / read_file / apply_diff 共通のガード。LLM が意図しない (幻覚・
+    プロンプトインジェクション由来の) ``..`` を含むパスで、呼び出し元が想定した
+    範囲外を読み書きする事故を防ぐ。判定は書込みゲートと同じ 1 実装
+    (``write_gate.has_parent_segment``)。書込みの範囲そのもの (絶対パスをどこまで
+    許すか) は ``ToolsRegistry.execute`` の書込みゲートが決める (docs/f_03 §4.y)。
     """
-    if not file_path:
+    if not isinstance(file_path, str) or not file_path:
         return None
-    try:
-        normalized = file_path.replace("\\", "/")
-        if ".." in normalized.split("/"):
-            logger.warning("Path traversal detected in tool args: %s", file_path)
-            return f"Error: path traversal not allowed: {file_path}"
-    except (AttributeError, TypeError):
-        pass
+    if has_parent_segment(file_path):
+        logger.warning("Path traversal detected in tool args: %s", file_path)
+        return f"Error: path traversal not allowed: {file_path}"
     return None
+
+
+#: 書き手が既存ファイルの符号化で表せない文字を断ったときの ``write_file`` の戻り値
+#: (``Error: edit refused (unencodable): <path> (<文字>)``、docs/f_11 §5.5)。
+EDIT_REFUSED_UNENCODABLE_RE = re.compile(
+    r"^Error: edit refused \(unencodable\): (?P<path>.+) \((?P<chars>[^()]*)\)$",
+)
 
 
 def write_file(file_path: str, content: str) -> str:
@@ -404,7 +436,9 @@ def write_file(file_path: str, content: str) -> str:
     影響しない。ディレクトリ配下の点検は list_directory / read_file を使う。
 
     ``.docx`` 等のリッチ文書形式 (``_EXPORT_DOC_EXTS``) は export フレームワーク
-    経由で実体を生成する。それ以外は UTF-8 テキストとして書き込む。
+    経由で実体を生成する。それ以外は利用者のファイルの書き手 (``write_user_text``、
+    docs/f_11 §5.5) で書く: 既存ファイルを読めればその符号化・改行を保ち、中身が
+    違えば上書きの前に退避する。新規は UTF-8 / LF。
     """
     traversal_error = _check_path_traversal(file_path)
     if traversal_error:
@@ -418,14 +452,15 @@ def write_file(file_path: str, content: str) -> str:
     if p.suffix.lower() in _EXPORT_DOC_EXTS:
         return _write_rich_document(p, content)
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        # 書込み後のファイルサイズを stat で読む。len(content) は文字数なので
-        # UTF-8 マルチバイト (日本語等) で乖離し、encode しても Windows の
-        # 改行変換 (write_text は newline=None = LF -> CRLF) の分だけ足りない
-        # (2026-07-26 実測: 報告 274 bytes に対し実ファイル 284 bytes、差は
-        # 改行 10 個分)。"bytes" と明記する以上、実体と一致させる。
-        return f"Written {p.stat().st_size} bytes to {file_path}"
+        existing = read_text_for_edit(p, max_bytes=_TOOL_MAX_FILE_READ_BYTES)
+        result = write_user_text(
+            p, content, like=existing if isinstance(existing, TextFile) else None,
+        )
+        # 報告は書いたバイト数 (文字数ではない、2026-07-26)。形式は変えない —
+        # output_format.WRITTEN_PATH_RE と CLI の chat_loop が読む。
+        return f"Written {result.bytes_written} bytes to {file_path}"
+    except UnencodableTextError as e:
+        return f"Error: edit refused (unencodable): {file_path} ({e.chars})"
     except Exception as e:
         return f"Error: {e}"
 
@@ -539,36 +574,12 @@ def _walk_tree(path: Path, lines: list[str], prefix: str, depth: int, max_depth:
             _walk_tree(entry, lines, prefix + extension, depth + 1, max_depth)
 
 
-def _check_diff_header_paths(p: Path, diff_text: str) -> str | None:
-    """diff ヘッダ (``---`` / ``+++``) のパスが ``p`` と同じディレクトリを指すか検査する。
-
-    ``patch -p0`` は ``cwd=p.parent`` でヘッダのパスをそのまま使うため、
-    ``../etc/x`` や絶対パスを書いたヘッダは ``file_path`` の外を書き換える。
-    """
-    parent = p.resolve().parent
-    for line in diff_text.splitlines():
-        if not (line.startswith("--- ") or line.startswith("+++ ")):
-            continue
-        target = line[4:].split("\t", 1)[0].strip()
-        if not target or target == "/dev/null":
-            continue
-        if ".." in target.replace("\\", "/").split("/"):
-            return f"Error: path traversal not allowed in diff header: {target}"
-        try:
-            resolved = (p.parent / target).resolve()
-        except (OSError, ValueError):
-            return f"Error: invalid path in diff header: {target}"
-        if resolved.parent != parent:
-            return (
-                f"Error: diff header path is outside the target directory: {target}"
-            )
-    return None
-
-
 def apply_diff(file_path: str, diff_text: str) -> str:
-    """unified diff をファイルに適用する
+    """unified diff を既存の 1 ファイルへ適用する (docs/f_11 §5.7)。
 
-    失敗時は原文を保持し、エラーメッセージを返す。
+    外部の ``patch`` は使わず ``diff_service.apply_diff_to_file`` で当てる: 見出しは
+    適用先そのものを指すこと、1 ファイルだけ、文脈はファイル全体で一意に完全一致
+    (fuzz なし)。符号化・改行を保ち、上書きの前に退避する。失敗時はファイルに触れない。
     """
     traversal_error = _check_path_traversal(file_path)
     if traversal_error:
@@ -578,31 +589,16 @@ def apply_diff(file_path: str, diff_text: str) -> str:
         return f"Error: File not found: {file_path}"
     if not p.is_file():
         return f"Error: Not a file: {file_path}"
-    header_error = _check_diff_header_paths(p, diff_text)
-    if header_error:
-        return header_error
-
     try:
-        original = p.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as e:
+        result = apply_diff_to_file(p, diff_text, max_bytes=_TOOL_MAX_FILE_READ_BYTES)
+    except DiffServiceError as e:
+        if e.code == "existing_unreadable":
+            return f"Error: edit refused (existing_unreadable): {file_path}"
+        return f"Error: Diff failed: {e}"
+    except UnencodableTextError as e:
+        return f"Error: edit refused (unencodable): {file_path} ({e.chars})"
+    except Exception as e:
         return f"Error: {e}"
-
-    try:
-        result = subprocess.run(
-            ["patch", "-p0", "--no-backup-if-mismatch"],
-            input=diff_text,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            cwd=p.parent,
-        )
-        if result.returncode == 0:
-            return f"Diff applied successfully to {file_path}"
-        # 適用失敗: 原文を復元
-        p.write_text(original, encoding="utf-8")
-        return f"Error: Diff failed: {result.stderr.strip()}"
-    except FileNotFoundError:
-        return "Error: 'patch' command not found. Install GNU patch."
-    except subprocess.TimeoutExpired:
-        p.write_text(original, encoding="utf-8")
-        return "Error: Diff application timed out"
+    if result.already_applied:
+        return f"Diff already applied to {file_path} (no changes written)"
+    return f"Diff applied successfully to {file_path}"

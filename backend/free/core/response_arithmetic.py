@@ -279,7 +279,7 @@ def find_conclusion_contradiction(text: str) -> str | None:
 # 内訳の和は 11万7000円。判定は構造と数値だけで決まり、語彙を持たない。
 
 #: 箇条書きの 1 行 (``-`` / ``*`` / ``+`` / ``・`` / ``1.`` / ``1)``)。
-_LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)(?:[-*+・•]|\d{1,2}[.)])\s+(?P<body>\S.*)$")
+LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)(?:[-*+・•]|\d{1,2}[.)])\s+(?P<body>\S.*)$")
 
 #: 「<ラベル>: <値>」の区切り。ラベル側は短い語に限る (文を拾わない)。
 _LABEL_VALUE_RE = re.compile(r"^(?P<label>[^:：\n]{1,30}?)\s*[:：]\s*(?P<rest>.+)$")
@@ -343,7 +343,7 @@ def find_breakdown_contradictions(text: str) -> list[str]:
     lines = [line.expandtabs(4) for line in (text or "").splitlines()]
     found: list[str] = []
     for i, line in enumerate(lines):
-        head = _LIST_ITEM_RE.match(line)
+        head = LIST_ITEM_RE.match(line)
         if head is None:
             continue
         parent = _parse_amount_item(head.group("body"))
@@ -358,7 +358,7 @@ def find_breakdown_contradictions(text: str) -> list[str]:
             indent = len(below) - len(below.lstrip())
             if indent <= parent_indent:
                 break
-            item = _LIST_ITEM_RE.match(below)
+            item = LIST_ITEM_RE.match(below)
             if item is None:
                 continue
             if child_indent is None:

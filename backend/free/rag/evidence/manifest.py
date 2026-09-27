@@ -108,6 +108,8 @@ class EvidenceManifest(VersionedJsonFile):
         self.extra: dict[str, Any] = {}
         #: payload の既知でないトップレベルキー (新しいコードが足したもの)。書き戻しで同じ位置へ戻す。
         self.unknown: dict[str, Any] = {}
+        #: 最後に読んだ / 書いた payload (:meth:`save_if_changed` の比較元)。
+        self._persisted_payload: dict[str, Any] | None = None
 
     # ── 便宜 API ──
 
@@ -131,6 +133,27 @@ class EvidenceManifest(VersionedJsonFile):
         return name
 
     # ── 永続化 ──
+
+    def save_if_changed(self) -> bool:
+        """前回読んだ / 書いた内容から変わっていれば書く。書いたら ``True``。
+
+        manifest は fsync 付きで書くので、Light のように毎ターン呼ぶ経路で
+        同じ内容を書き直さない。``events_since_snapshot`` は起動時の replay が
+        事象ログから数え直すので、書かずに落ちても失われない。
+        """
+        if (
+            self._persisted_payload is not None
+            and self._to_payload() == self._persisted_payload
+            and self._target(None).exists()
+        ):
+            return False
+        return self.save()
+
+    def _on_save_success(self, _path: Path) -> None:
+        self._persisted_payload = self._to_payload()
+
+    def _on_load_success(self, _path: Path) -> None:
+        self._persisted_payload = self._to_payload()
 
     def _to_payload(self) -> dict[str, Any]:
         return {

@@ -272,6 +272,16 @@ def _jsonl_renderer(
 # ---------------------------------------------------------------------------
 
 
+def _generation(path: Path, gen: int) -> Path:
+    """退避世代のパス ``<category>_<date>.jsonl.<gen>`` (``.jsonl`` を残す)。"""
+    return path.with_name(f"{path.name}.{gen}")
+
+
+#: 旧実装が ``with_suffix`` で作っていた退避名 ``<category>_<YYYY-MM-DD>.<N>``
+#: (``*.jsonl*`` に掛からず残り続けた)。retention で同じ日数規則で消す。
+_LEGACY_GENERATION_RE = re.compile(r"[a-z_]+_\d{4}-\d{2}-\d{2}\.\d+")
+
+
 class _DebugFileSink:
     """カテゴリ別 JSONL ファイルへの追記とローテーションを担う sink。
 
@@ -327,8 +337,11 @@ class _DebugFileSink:
         各 rename / unlink は個別に try/except し、Windows で他プロセスが
         オープン中のファイルに対する PermissionError でも残りの世代シフト
         は継続する (旧 ``DebugLogger._rotate`` と同等)。
+
+        世代名は ``<category>_<date>.jsonl.<N>`` (拡張子を残す)。掃除の glob
+        (``*.jsonl*``) と LogIngestor の取りこぼし回収 (``<name>.jsonl.1``) が読む名前。
         """
-        oldest = path.with_suffix(f".{self.max_log_generations}")
+        oldest = _generation(path, self.max_log_generations)
         if oldest.exists():
             try:
                 oldest.unlink()
@@ -339,8 +352,8 @@ class _DebugFileSink:
                 )
 
         for gen in range(self.max_log_generations - 1, 0, -1):
-            src = path.with_suffix(f".{gen}")
-            dst = path.with_suffix(f".{gen + 1}")
+            src = _generation(path, gen)
+            dst = _generation(path, gen + 1)
             if not src.exists():
                 continue
             try:
@@ -353,7 +366,7 @@ class _DebugFileSink:
                     src.name, dst.name, exc,
                 )
 
-        dst1 = path.with_suffix(".1")
+        dst1 = _generation(path, 1)
         try:
             if dst1.exists():
                 dst1.unlink()
@@ -370,7 +383,10 @@ class _DebugFileSink:
             return
         try:
             now = datetime.now(timezone.utc)
-            for log_file in self.log_dir.glob("*.jsonl*"):
+            legacy = [
+                p for p in self.log_dir.iterdir() if _LEGACY_GENERATION_RE.fullmatch(p.name)
+            ]
+            for log_file in [*self.log_dir.glob("*.jsonl*"), *legacy]:
                 try:
                     mtime = datetime.fromtimestamp(
                         log_file.stat().st_mtime, tz=timezone.utc,

@@ -18,6 +18,19 @@ class FileContext(BaseModel):
     chunks: list[str]
 
 
+class FileExtractResponse(BaseModel):
+    """``POST /api/files/extract`` の応答 (f_03 §11)。
+
+    ``filename`` / ``chunks`` はそのまま ``FileContext`` の 1 件になる。
+    """
+    filename: str
+    chunks: list[str]
+    #: チャット要求の ``file_contexts`` 上限に合わせて後ろを落としたか
+    truncated: bool
+    #: 抽出した本文全体の文字数 (切る前)
+    chars: int
+
+
 class ChatRequest(BaseModel):
     message: str
     mode: str = "chat"
@@ -151,10 +164,10 @@ class CapabilityInfo(BaseModel):
 
 
 class FormatHealthInfo(BaseModel):
-    """読み手が current として読めなかった形式 1 つ (``data_health.formats`` の値)。
+    """読み手が current として読めなかった、または保存できなかった形式 1 つ (``data_health.formats`` の値)。
 
     ``state`` は ``newer`` / ``foreign`` / ``unmigratable`` / ``corrupt`` (版付きファイルの
-    読み取りの分類) か ``readonly`` (Evidence ストア)。``reason`` は英語 (ファイル名と理由)。
+    読み取りの分類)、``unwritable`` (保存の失敗) か ``readonly`` (Evidence ストア)。``reason`` は英語 (ファイル名と理由)。
     """
     state: str
     reason: str = ""

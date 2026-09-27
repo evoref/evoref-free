@@ -33,6 +33,9 @@ from backend.free.agent.meta_cognitive_tasks import (
 )
 from backend.free.agent.meta_cognitive_tools import infer_tool_from_task
 from backend.free.agent.output_format import WRITTEN_PATH_RE, anchor_relative_output_path
+from backend.free.agent.write_gate import WRITE_DENIED_RE
+from backend.io.text_file import decode_text_prefix_for_display
+from backend.io.user_file import record_backups
 from backend.i18n_helper import msg
 from backend.free.agent.meta_cognitive_utils import (
     contains_code_indicator,
@@ -1251,7 +1254,7 @@ class MetaCognitiveAgent(
             )
             # 成果物の名前は制作ステージが決めたもの。名指しの無い既存ファイルへの上書きを
             # 別名へ振り替える段 (§4.x の 3) は通さない — 振り替え先が依頼の名指したファイルだと
-            # SPEC.md の本文でコードを上書きする。代わりに退避してから書く (f_03 §4.4)。
+            # SPEC.md の本文でコードを上書きする。代わりに書き手が退避してから書く (f_03 §4.4)。
             file_path = anchor_relative_output_path(
                 self._resolve_write_path_from_query(filename, original_query),
             )
@@ -1263,18 +1266,13 @@ class MetaCognitiveAgent(
                 rejected_paths.append(file_path)
                 failed_paths.append(file_path)
                 continue
-            try:
-                backup = self._back_up_existing(file_path, art.content, result)
-            except Exception as exc:  # noqa: BLE001 - 読み込み専用 (DataReadonlyError) も含めて上書きしない
-                # 退避できないものは上書きしない (壊すものを残さない)
-                logger.warning("Production stage: backup of %s failed; not written: %s", file_path, exc)
-                failed_paths.append(file_path)
-                continue
-            if backup:
-                replaced.append({"path": file_path, "backup": backup})
-            _text, entries = await self._write_file(
-                file_path, art.content, tools_registry, on_step, prefix,
-            )
+            # 中身の違う既存ファイルは、書き手 (backend/io/user_file.py) が上書きの前に
+            # bk/overwrite/ へ退避する。退避できなければ書かない (f_11 §5.6)。
+            with record_backups() as backups:
+                _text, entries = await self._write_file(
+                    file_path, art.content, tools_registry, on_step, prefix,
+                )
+            replaced.extend({"path": file_path, "backup": str(b)} for _, b in backups)
             tool_calls.extend(entries)
             if entries and entries[-1].get("success"):
                 written += 1
@@ -1331,38 +1329,6 @@ class MetaCognitiveAgent(
         if "code_files" in notes and not notes["code_files"]:
             return "no code files were produced"
         return ""
-
-    @staticmethod
-    def _back_up_existing(file_path: str, content: str, result: "ProductionResult") -> str:
-        """中身の違う既存ファイルを ``<run>/replaced/`` へ退避する (f_03 §4.4)。
-
-        依頼が名前を挙げていても退避する (指示どおりの更新でも前の版を失わない、独立レビュー
-        2026-09-26: 名前の部分一致で退避を飛ばし、名を挙げた md_toc.py を上書きした)。退避したら
-        退避先を、退避が要らなければ (無い / 中身が同じ) 空文字列を返す。退避できないとき
-        (run の作業フォルダが無い・読み込み専用・書込みの失敗) は例外で呼出側へ — 上書きしない。
-        """
-        path = Path(file_path)
-        if not path.is_file():
-            return ""
-        try:
-            current = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            current = None
-        if current is not None and current.replace("\r\n", "\n") == content.replace("\r\n", "\n"):
-            return ""
-        workspace_root = (result.notes or {}).get("workspace_root")
-        if not workspace_root:
-            raise FileNotFoundError(f"no run folder to back up {path} before overwriting it")
-        from backend.io.atomic import atomic_write_bytes
-
-        target = Path(workspace_root) / "replaced" / path.name
-        stem, n = target.stem, 1
-        while target.exists():
-            n += 1
-            target = target.with_name(f"{stem}.{n}{path.suffix}")
-        atomic_write_bytes(target, path.read_bytes())
-        logger.info("Production stage: backed up %s to %s before overwriting", path, target)
-        return str(target)
 
     @staticmethod
     def _record_delivery(
@@ -1588,6 +1554,10 @@ class MetaCognitiveAgent(
                     "Skipping retry for content generation failure: %s",
                     task.description[:80],
                 )
+                continue
+            if task.result and WRITE_DENIED_RE.match(task.result):
+                # 書込みゲートの判定は作り直しても変わらない (docs/f_03 §4.y)。
+                logger.info("Skipping retry for a denied write: %s", task.description[:80])
                 continue
             logger.info("Retrying failed write task [%d]: %s",
                         idx + 1, task.description[:80])
@@ -1878,11 +1848,15 @@ class MetaCognitiveAgent(
         if path.suffix.lower() in _EXPORT_DOC_EXTS:
             return ""
         try:
-            data = path.read_bytes()[:_WRITTEN_PREVIEW_READ_BYTES]
+            with path.open("rb") as f:
+                data = f.read(_WRITTEN_PREVIEW_READ_BYTES + 1)
         except OSError as e:
             logger.warning("Written content preview unavailable (%s): %s", path, e)
             return ""
-        text = data.decode("utf-8", errors="replace")
+        truncated = len(data) > _WRITTEN_PREVIEW_READ_BYTES
+        data = data[:_WRITTEN_PREVIEW_READ_BYTES]
+        # 書き手は cp932 / BOM / CRLF を保つので、見せる側も同じ規則で読む。
+        text = decode_text_prefix_for_display(data, truncated=truncated)
         if not text.strip():
             return ""
         lines = text.splitlines()
@@ -1918,6 +1892,24 @@ class MetaCognitiveAgent(
             return ""
         reason = _WRITE_REJECTION_REASON_JA.get(m.group(1))
         return f": {reason}" if reason else ""
+
+    @staticmethod
+    def _write_denied_note(result: str) -> str:
+        """書込みゲートが断った結果の注記と、書くはずだった本文 (該当しなければ空。純粋関数)。
+
+        ツール結果 ``Error: write denied (<code>): <path>`` を i18n
+        ``agent.write_denied.<code>`` に写す。meta の書込み経路はその後ろに生成した
+        本文を添えている (``_write_file``) ので、フェンス付きで残す (docs/f_03 §4.y)。
+        """
+        m = WRITE_DENIED_RE.match(result or "")
+        if m is None:
+            return ""
+        note = msg(f"agent.write_denied.{m.group('code')}", path=m.group("path").strip())
+        body = (result or "")[m.end():].strip("\n")
+        if not body.strip():
+            return f"    {note}"
+        fence = "````" if "```" in body else "```"
+        return "\n".join([f"    {note}", fence, body.rstrip(), fence])
 
     @staticmethod
     def _partial_write_note(result: str) -> str:
@@ -1985,8 +1977,14 @@ class MetaCognitiveAgent(
                 MetaCognitiveAgent._partial_write_note(task.result or "")
                 if task.status == "failed" else ""
             )
+            denied = (
+                MetaCognitiveAgent._write_denied_note(task.result or "")
+                if task.status == "failed" else ""
+            )
             if partial:
                 parts.append(f"    {partial}")
+            elif denied:
+                parts.append(denied)
             elif task.status == "failed" and task_expects_write(task.description):
                 # write 期待タスクの失敗時、無関係なツール結果 (誤ってハイジャック
                 # された fetch_url の webpage 抽出テキスト等) をそのままユーザーへ

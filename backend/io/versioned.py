@@ -71,6 +71,9 @@ class ReadResult:
     payload: Any = None
     version: int | None = None
     detail: str = ""
+    #: ファイルを開けなかった (権限・共有違反などの OSError)。中身の分類ではないので、
+    #: 次に読めたら ``readonly`` を解く。
+    transient: bool = False
 
     @property
     def ok(self) -> bool:
@@ -162,7 +165,7 @@ def _classify(
         return ReadResult("absent")
     except OSError as e:
         # 読めない理由が権限・ロックなら中身は無事かもしれない — 改名も上書きもしない。
-        return ReadResult("foreign", detail=f"unreadable: {e}")
+        return ReadResult("foreign", detail=f"unreadable: {e}", transient=True)
     return read_versioned_bytes(
         data, format_id=format_id, format_version=format_version, migrations=migrations,
     )
@@ -232,25 +235,32 @@ def write_payload(path: Path | str, payload: Any, spec: FormatSpec, *, component
     )
 
 
-def quarantine(path: Path | str, kind: str = "corrupt") -> Path | None:
-    """``path`` を ``<name>.<kind>-<utcstamp>`` へ改名する。失敗なら ``None``。
-
-    既存の退避と名前が衝突したら ``-1`` / ``-2`` … を足す (上書きしない)。
-    """
-    from backend.io.readonly import DataReadonlyError, guard_write
+def quarantine_path(path: Path, kind: str = "corrupt") -> Path:
+    """``path`` の退避先 ``<name>.<kind>-<utcstamp>`` (既存と衝突したら ``-1`` / ``-2`` …)。"""
     from backend.utils import utc_compact_stamp
 
-    path = Path(path)
-    try:
-        guard_write(path)
-    except DataReadonlyError:
-        return None  # readonly 中は退避もしない (呼出側は readonly で続ける)
     base = f"{path.name}.{kind}-{utc_compact_stamp()}"
     target = path.with_name(base)
     n = 0
     while target.exists():
         n += 1
         target = path.with_name(f"{base}-{n}")
+    return target
+
+
+def quarantine(path: Path | str, kind: str = "corrupt") -> Path | None:
+    """``path`` を ``<name>.<kind>-<utcstamp>`` へ改名する。失敗なら ``None``。
+
+    既存の退避と名前が衝突したら ``-1`` / ``-2`` … を足す (上書きしない)。
+    """
+    from backend.io.readonly import DataReadonlyError, guard_write
+
+    path = Path(path)
+    try:
+        guard_write(path)
+    except DataReadonlyError:
+        return None  # readonly 中は退避もしない (呼出側は readonly で続ける)
+    target = quarantine_path(path, kind)
     try:
         path.rename(target)
     except OSError as e:
@@ -283,6 +293,8 @@ class VersionedJsonFile:
     path: Path | None = None
     #: 読み取りで書き戻すと壊す状態になった (以後の save を拒否する)。
     readonly: bool = False
+    #: ``readonly`` の理由がファイルを開けなかったことだけ (次に読めたら解く)。
+    _readonly_transient: bool = False
     #: 直近の読み取りの分類。
     last_status: ReadStatus | None = None
 
@@ -312,10 +324,12 @@ class VersionedJsonFile:
                 indent=2 if spec.human_edited else None,
             )
         except (OSError, TypeError, ValueError) as e:
+            format_health.observe_save_failure(spec.format_id, target, str(e))
             if self.RAISE_ON_SAVE_ERROR:
                 raise
             self._logger().warning("Failed to save %s to %s: %s", type(self).__name__, target, e)
             return False
+        format_health.observe_save_ok(target)
         self._on_save_success(target)
         return True
 
@@ -340,6 +354,10 @@ class VersionedJsonFile:
                 result = ReadResult("corrupt", version=result.version, detail=f"payload: {e}")
                 self.last_status = "corrupt"
             else:
+                if self._readonly_transient:
+                    self.readonly = self._readonly_transient = False
+                    self._logger().info("%s at %s is readable again; saving is resumed",
+                                        type(self).__name__, target)
                 self._on_load_success(target)
                 return True
         detail = result.detail or f"format_version {result.version} > {spec.version}"
@@ -351,6 +369,10 @@ class VersionedJsonFile:
             )
             return False
         if result.status in READONLY_STATUSES:
+            # 中身が原因の readonly (新しい版など) は一時的な理由で上書きしない
+            self._readonly_transient = result.transient and (
+                not self.readonly or self._readonly_transient
+            )
             self.readonly = True
             self._logger().error(
                 "Refusing to load %s from %s (%s: %s). The file is left untouched and "
@@ -367,6 +389,7 @@ class VersionedJsonFile:
         moved = quarantine(target)
         if moved is None:
             self.readonly = True
+            self._readonly_transient = False
             self._logger().error(
                 "%s at %s is unreadable (%s) and could not be moved aside; "
                 "running read-only so it is not overwritten",
@@ -478,6 +501,7 @@ __all__ = [
     "build_envelope",
     "producer_edition",
     "quarantine",
+    "quarantine_path",
     "read_payload",
     "read_versioned",
     "read_versioned_bytes",

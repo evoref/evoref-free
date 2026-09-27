@@ -149,7 +149,8 @@ def gpu_memory_snapshot(timeout_sec: float = 2.0) -> list[dict[str, object]] | N
     ]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout_sec, check=False,
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout_sec, check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         logger.debug("nvidia-smi --query-gpu failed: %s", e)
@@ -194,6 +195,8 @@ def nvidia_smi_snapshot(timeout_sec: float = 3.0) -> dict[int, int] | None:
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_sec,
             check=False,
         )

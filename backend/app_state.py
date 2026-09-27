@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.agent.agent_tracer import AgentTracer
     from backend.free.agent.feedback import FeedbackCollector
-    from backend.free.agent.file_manager import SessionFileManager
     from backend.free.agent.learned_patterns import LearnedPatternStore
     from backend.free.agent.prompt_manager import SystemPromptManager
     from backend.free.agent.reactive import ReactiveAgent
@@ -172,7 +171,6 @@ class AppState:
     prompt_manager: SystemPromptManager | None = None
     aux_prompt_manager: AuxPromptManager | None = None
     feedback_collector: FeedbackCollector | None = None
-    file_manager: SessionFileManager | None = None
     learned_patterns_store: LearnedPatternStore | None = None
     tools_registry: ToolsRegistry | None = None
     tool_call_judge: ToolCallJudge | None = None

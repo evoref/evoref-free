@@ -293,7 +293,7 @@ def _stop_external_server(name: ServerName, cfg: dict) -> tuple[bool, str]:
     Returns:
         (success, message)
     """
-    from backend.free.cli.pid_manager import find_port_occupant, kill_port_occupants
+    from backend.free.cli.pid_manager import find_port_occupant
 
     endpoint = _resolve_endpoint(name, cfg)
     if endpoint is None:
@@ -308,10 +308,23 @@ def _stop_external_server(name: ServerName, cfg: dict) -> tuple[bool, str]:
         "server_control: stopping external %s on port %d (pid=%d, name=%s)",
         name, port, occupant.pid, occupant.process_name,
     )
-    killed = kill_port_occupants([occupant])
-    if not killed:
-        return (False, "failed to kill port occupant")
+    if not _kill_llama_occupant(occupant):
+        return (False, _foreign_occupant_message(occupant))
     return (True, f"stopped external process pid={occupant.pid}")
+
+
+def _kill_llama_occupant(occupant) -> bool:
+    """ポートの占有者が llama-server なら kill して ``True``。別のイメージなら何もしない。"""
+    from backend.free.cli.pid_manager import IMAGE_LLAMA, kill_port_occupants
+
+    return bool(kill_port_occupants([occupant], expected={occupant.port: IMAGE_LLAMA}))
+
+
+def _foreign_occupant_message(occupant) -> str:
+    return (
+        f"port {occupant.port} is held by a non-llama-server process "
+        f"(pid={occupant.pid}, name={occupant.process_name or 'unknown'}); not killing it"
+    )
 
 
 def stop_server_process(
@@ -423,11 +436,14 @@ async def start_server(
             if force:
                 # --force: ポート占有プロセスを kill して再起動
                 logger.info("server_control: force-killing occupant on port %d", port)
-                from backend.free.cli.pid_manager import find_port_occupant, kill_port_occupants
+                from backend.free.cli.pid_manager import find_port_occupant
                 occ = find_port_occupant(port)
-                if occ:
-                    kill_port_occupants([occ])
-                    # port 解放待ちは下の wait_port_released に一本化
+                if occ and not _kill_llama_occupant(occ):
+                    return ServerActionResponse(
+                        name=name, action="start", success=False,
+                        message=_foreign_occupant_message(occ),
+                    )
+                # port 解放待ちは下の wait_port_released に一本化
             else:
                 # 外部起動済み — 遅延接続を試みる
                 await _try_reconnect(name, state, cfg)

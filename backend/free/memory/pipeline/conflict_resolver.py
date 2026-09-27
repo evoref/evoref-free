@@ -176,7 +176,7 @@ class ConflictResolver:
 
     @staticmethod
     def drop_truncated_notes(short_term: "EpisodicWorkspace") -> int:
-        """コードフェンスが閉じていない非 user ノートを作業領域から外す (純関数的)。
+        r"""コードフェンスが閉じていない非 user ノートを作業領域から外す (純関数的)。
 
         user 発話のノートは本人の書いたままなので触らない。統合 / 要約由来の
         ノートで奇数個の ``\`\`\``` は生成の切断の印 (2026-09-12 実機で 2 件)。

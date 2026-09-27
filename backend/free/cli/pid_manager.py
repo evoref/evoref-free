@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import json
 import locale
 import os
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from backend.log_config import get_logger
 
 logger = get_logger("cli.pid_manager")
 
 PID_FILE = "evoref.pid"
+
+# ポートの役割ごとに「kill してよい」イメージ名の接頭辞 (拡張子を除く小文字)。
+# ポートの占有者はこれに一致するときだけ kill する (c_09 §2.1)。
+IMAGE_LLAMA: tuple[str, ...] = ("llama-server",)
+#: backend (uvicorn) と ``evoref serve`` 自身。``python`` は ``pythonw`` / ``python3.12`` も含む。
+IMAGE_BACKEND: tuple[str, ...] = ("python", "evoref", "uvicorn")
+IMAGE_FRONTEND: tuple[str, ...] = ("node",)
+FRONTEND_PORT = 5173
 
 
 # ────────────────────────────────────────────
@@ -86,6 +96,94 @@ class PortOccupant:
         return f":{self.port} → PID {self.pid}{name_part}"
 
 
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """PID の再利用を見分けるためのプロセスの同一性 (イメージ名と生成時刻)"""
+    name: str
+    #: 生成時刻 (比較にだけ使う値。Windows は epoch 秒、Linux は起動からの tick)。
+    create_time: float | None = None
+
+
+def _image_matches(name: str, prefixes: Sequence[str]) -> bool:
+    """イメージ名 (``python.exe`` / ``llama-server``) が接頭辞のどれかに一致するか"""
+    stem = PureWindowsPath(name).name.lower()
+    if stem.endswith(".exe"):
+        stem = stem[:-4]
+    return bool(stem) and any(stem.startswith(p) for p in prefixes)
+
+
+# ────────────────────────────────────────────
+# プロセスの同一性
+# ────────────────────────────────────────────
+
+def get_process_identity(pid: int) -> ProcessIdentity | None:
+    """``pid`` のプロセスのイメージ名と生成時刻。生きていなければ ``None``"""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        return _process_identity_windows(pid)
+    return _process_identity_unix(pid)
+
+
+def _process_identity_windows(pid: int) -> ProcessIdentity | None:
+    """Windows: OpenProcess + QueryFullProcessImageNameW + GetProcessTimes"""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetProcessTimes.argtypes = (
+        (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    )
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return None
+    try:
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != still_active:
+            return None  # 終了済み (誰かがハンドルを持っているだけ)
+        name = ""
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            name = PureWindowsPath(buf.value).name
+        create_time: float | None = None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            create_time = ticks / 10_000_000 - 11_644_473_600
+        return ProcessIdentity(name=name, create_time=create_time)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_identity_unix(pid: int) -> ProcessIdentity | None:
+    """Unix: signal 0 で生存確認、ps でイメージ名、/proc で生成時刻 (無ければ ``None``)"""
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass  # 他ユーザーのプロセス (生きている)
+    except OSError:
+        return None
+    create_time: float | None = None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        # comm は括弧内で空白を含みうるので最後の ")" の後ろから数える (starttime は 22 番目)
+        create_time = float(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        pass
+    return ProcessIdentity(name=_get_process_name_unix(pid), create_time=create_time)
+
+
 # ────────────────────────────────────────────
 # PID ファイル管理
 # ────────────────────────────────────────────
@@ -97,59 +195,84 @@ def _pid_path(project_root: Path) -> Path:
     return resolve_data_path("run_dir", project_root) / PID_FILE
 
 
-def _is_process_alive(pid: int) -> bool:
-    """指定 PID のプロセスが生存しているか確認"""
-    if sys.platform == "win32":
-        # Windows: OpenProcess で存在確認
-        import ctypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
+def _read_pid_record(pid_file: Path) -> tuple[int, ProcessIdentity | None] | None:
+    """PID ファイルを読む。旧形式 (数字だけ) は同一性 ``None``。読めなければ ``None``"""
+    try:
+        text = pid_file.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        logger.warning("Unreadable PID file: %s", e)
+        return None
+    try:
+        return int(text), None
+    except ValueError:
+        pass
+    try:
+        record = json.loads(text)
+        pid = record["pid"]
+        name = record.get("name") or ""
+        create_time = record.get("create_time")
+        if not isinstance(pid, int) or not isinstance(name, str):
+            raise TypeError("pid / name")
+        if create_time is not None:
+            create_time = float(create_time)
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        logger.warning("Invalid PID file: %s", e)
+        return None
+    return pid, ProcessIdentity(name=name, create_time=create_time)
+
+
+def _is_recorded_process(pid: int, recorded: ProcessIdentity | None) -> bool:
+    """``pid`` のプロセスが PID ファイルに記録したプロセスそのものか
+
+    PID は再利用されるので生きているだけでは足りない。記録した名前と生成時刻が
+    一致するときだけ真。旧形式 (同一性なし) は python / evoref / uvicorn のときだけ信じる。
+    """
+    current = get_process_identity(pid)
+    if current is None:
         return False
-    else:
-        # Unix: signal 0 で存在確認
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+    if recorded is None:
+        return _image_matches(current.name, IMAGE_BACKEND)
+    if not current.name or current.name.lower() != recorded.name.lower():
+        return False
+    if recorded.create_time is None or current.create_time is None:
+        return recorded.create_time is None and current.create_time is None
+    return abs(current.create_time - recorded.create_time) < 1e-3
 
 
 def check_pid(project_root: Path) -> int | None:
-    """既存の PID ファイルを確認し、生存中のプロセス PID を返す
+    """既存の PID ファイルを確認し、生存中の evoref プロセス PID を返す
 
     Returns:
-        生存中のプロセスの PID、または None（PID ファイルなし or プロセス死亡）
+        記録したプロセスが生きていればその PID、または None（PID ファイルなし /
+        プロセス死亡 / PID が別のプロセスに再利用されている）
     """
     pid_file = _pid_path(project_root)
     if not pid_file.exists():
         return None
 
-    try:
-        pid = int(pid_file.read_text(encoding="utf-8").strip())
-    except (ValueError, OSError) as e:
-        logger.warning("Invalid PID file, removing: %s", e)
+    record = _read_pid_record(pid_file)
+    if record is None:
         _remove_pid_file(pid_file)
         return None
+    pid, recorded = record
 
-    if _is_process_alive(pid):
+    if _is_recorded_process(pid, recorded):
         logger.debug("Process %d is still alive", pid)
         return pid
 
-    logger.debug("Process %d is dead, removing stale PID file", pid)
+    logger.debug("Process %d is gone or reused, removing stale PID file", pid)
     _remove_pid_file(pid_file)
     return None
 
 
 def acquire_pid(project_root: Path) -> bool:
-    """PID ファイルを取得（現在のプロセス ID を記録）
+    """PID ファイルを取得（現在のプロセス ID と同一性を記録）
 
     Returns:
         True: 取得成功、False: 既に別プロセスが起動中
     """
+    from backend.io.atomic import atomic_write_text
+
     existing_pid = check_pid(project_root)
     if existing_pid is not None:
         return False
@@ -157,9 +280,12 @@ def acquire_pid(project_root: Path) -> bool:
     pid_file = _pid_path(project_root)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
 
+    pid = os.getpid()
+    me = get_process_identity(pid) or ProcessIdentity(name="")
+    record = {"pid": pid, "name": me.name, "create_time": me.create_time}
     try:
-        pid_file.write_text(str(os.getpid()), encoding="utf-8")
-        logger.debug("PID file created: %s (pid=%d)", pid_file, os.getpid())
+        atomic_write_text(pid_file, json.dumps(record))
+        logger.debug("PID file created: %s (pid=%d)", pid_file, pid)
         return True
     except OSError as e:
         logger.error("Failed to create PID file: %s", e)
@@ -176,24 +302,27 @@ def release_pid(project_root: Path) -> None:
 def force_release_stale_pid(project_root: Path) -> int | None:
     """stale な PID ファイルを強制削除し、古い PID を返す
 
-    プロセスが生きている場合は kill してから PID ファイルを削除する。
+    記録したプロセスが生きている場合だけ kill してから PID ファイルを削除する。
+    PID が別のプロセスに再利用されていれば kill せずファイルだけ消す。
 
     Returns:
-        kill した PID、または None（PID ファイルなし）
+        PID ファイルにあった PID、または None（PID ファイルなし / 読めない）
     """
     pid_file = _pid_path(project_root)
     if not pid_file.exists():
         return None
 
-    try:
-        pid = int(pid_file.read_text(encoding="utf-8").strip())
-    except (ValueError, OSError):
+    record = _read_pid_record(pid_file)
+    if record is None:
         _remove_pid_file(pid_file)
         return None
+    pid, recorded = record
 
-    if _is_process_alive(pid):
+    if _is_recorded_process(pid, recorded):
         logger.info("Force killing stale evoref process: pid=%d", pid)
         _kill_process_tree(pid)
+    else:
+        logger.info("PID %d is not the recorded evoref process; removing PID file only", pid)
     _remove_pid_file(pid_file)
     return pid
 
@@ -232,17 +361,36 @@ def find_port_occupants(ports: list[int]) -> list[PortOccupant]:
     return occupants
 
 
-def kill_port_occupants(occupants: list[PortOccupant]) -> list[PortOccupant]:
-    """ポート占有プロセスを kill
+def kill_port_occupants(
+    occupants: list[PortOccupant],
+    *,
+    expected: Mapping[int, Sequence[str]],
+) -> list[PortOccupant]:
+    """ポート占有プロセスのうち、イメージ名がポートの役割どおりのものだけ kill
+
+    ``expected`` はポート → kill してよいイメージ名の接頭辞 (``IMAGE_*``)。
+    載っていないポートや名前が一致しない占有者 (別用途の llama-server や
+    無関係なアプリ) は kill せず WARNING を出す。
 
     Returns:
-        実際に kill したプロセスのリスト
+        実際に kill したプロセスのリスト (kill しなかったものは含まない)
     """
     killed: list[PortOccupant] = []
     seen_pids: set[int] = set()
     for occ in occupants:
         if occ.pid in seen_pids:
             killed.append(occ)
+            continue
+        name = occ.process_name
+        if not name:
+            identity = get_process_identity(occ.pid)
+            name = identity.name if identity is not None else ""
+        allowed = expected.get(occ.port, ())
+        if not _image_matches(name, allowed):
+            logger.warning(
+                "Not killing port occupant %s: image %r is not one of %s",
+                occ.summary, name or "unknown", list(allowed),
+            )
             continue
         seen_pids.add(occ.pid)
         logger.info("Killing port occupant: %s", occ.summary)
@@ -280,7 +428,7 @@ def _find_port_occupant_unix(port: int) -> PortOccupant | None:
     try:
         result = subprocess.run(
             ["lsof", "-iTCP:{port}".format(port=port), "-sTCP:LISTEN", "-nP", "-t"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
         for pid_str in result.stdout.strip().split():
             if pid_str.isdigit():
@@ -312,7 +460,7 @@ def _get_process_name_unix(pid: int) -> str:
     try:
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "comm="],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
         return result.stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
@@ -364,3 +512,22 @@ def collect_configured_ports(config: dict) -> list[int]:
         ports.append(embed_cfg["llama_port"])
 
     return ports
+
+
+def expected_images_by_port(
+    config: dict, *, include_frontend: bool = False,
+) -> dict[int, tuple[str, ...]]:
+    """config.yaml のポート → そのポートで kill してよいイメージ名
+
+    範囲は :func:`collect_configured_ports` と同じ (``include_frontend`` で 5173 を足す)。
+    """
+    expected: dict[int, tuple[str, ...]] = {
+        config.get("server", {}).get("port", 8000): IMAGE_BACKEND,
+        config.get("llama", {}).get("port", 8080): IMAGE_LLAMA,
+    }
+    embed_cfg = config.get("embedding", {})
+    if embed_cfg.get("backend") == "llama-cpp" and embed_cfg.get("llama_port"):
+        expected[embed_cfg["llama_port"]] = IMAGE_LLAMA
+    if include_frontend:
+        expected[FRONTEND_PORT] = IMAGE_FRONTEND
+    return expected

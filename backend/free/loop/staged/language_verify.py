@@ -178,8 +178,15 @@ def _matches_approved_command(
 
 
 def _minimal_env() -> dict[str, str]:
-    """verify の子プロセスへ渡す最小環境 (存在する変数だけ写す)。"""
-    return {name: os.environ[name] for name in _MINIMAL_ENV_VARS if name in os.environ}
+    """verify の子プロセスへ渡す最小環境 (存在する変数だけ写す)。
+
+    Python の子は UTF-8 で書かせる (最小環境ではサーバの ``PYTHONUTF8`` が
+    落ちるため、既定だと cp932 で書かれ、失敗理由の日本語が化ける)。
+    """
+    env = {name: os.environ[name] for name in _MINIMAL_ENV_VARS if name in os.environ}
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def _render_args(args: tuple[str, ...], *, workspace: Path, target: Path) -> tuple[str, ...] | None:

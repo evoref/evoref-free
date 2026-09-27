@@ -198,8 +198,13 @@ _WRITE_REJECTION_REASON_JA: dict[str, str] = {
     "edit_without_change": "内容が変わらなかったため",
     "task_restatement": "生成された本文が依頼の言い換えだったため",
     "no_table_data": "保存する本文に表が無かったため",
+    # 既存ファイルを踏まえられない編集は書かない (docs/f_11 §5)
+    "existing_unreadable": "既存ファイルを文字化けなく読めず、内容を失うおそれがあったため",
+    "existing_too_large": "既存ファイルが大きすぎて、全体を踏まえた書き直しができないため",
+    # 書き手 (write_file) が既存ファイルの符号化で表せない文字を断った (docs/f_11 §5.5)
+    "unencodable": "既存ファイルの文字コードで表せない文字を含み、内容を壊すおそれがあったため",
 }
-_WRITE_REJECTION_RE = re.compile(r"invalid output \(([a-z_]+)\)")
+_WRITE_REJECTION_RE = re.compile(r"(?:invalid output|edit refused) \(([a-z_]+)\)")
 
 # 制作ステージが未完了のまま **書けた分は書いた** 結果 (``_execute_production_task``)。
 # 「書き込みが実行されませんでした」と区別して、書いたファイルと未完了の理由を伝える。
@@ -280,24 +285,6 @@ _CODE_LANGUAGES: frozenset[str] = frozenset({
     "python", "javascript", "typescript", "go", "rust",
     "java", "c", "cpp", "csharp", "ruby", "php", "bash",
 })
-
-
-def read_existing_file(file_path: str) -> str:
-    """既存ファイルの内容を読み込む（存在しなければ空文字列）。
-
-    ``_FastPathMixin`` の検証 (staticmethod で ``self`` を持たない) と
-    ``_ContentGenerationMixin`` のプロンプト組み立ての双方から使うため、
-    クラスの外に置く。
-    """
-    if not file_path:
-        return ""
-    p = Path(file_path)
-    if p.exists() and p.is_file():
-        try:
-            return p.read_text(encoding="utf-8")
-        except Exception:
-            pass
-    return ""
 
 
 def resolve_read_path(

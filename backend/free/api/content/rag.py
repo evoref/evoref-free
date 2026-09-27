@@ -22,6 +22,7 @@ from backend.app_state import AppState, get_app_state
 from backend.i18n_helper import msg
 from backend.free.api.content._rag_helpers import (
     corpus_store_not_initialized_error,
+    corpus_version_conflict_error,
     embedder_not_initialized_error,
     rag_file_empty_error,
     rag_filename_required_error,
@@ -37,6 +38,7 @@ from backend.free.rag.corpus import (
     package_filename,
     write_package,
 )
+from backend.free.rag.corpus.store import CorpusVersionConflictError
 from backend.free.rag.text_extractor import (
     SUPPORTED_DOC_EXTENSIONS,
     extract_text_from_bytes,
@@ -121,8 +123,9 @@ async def ingest_document(
     """アップロード文書を corpus パッケージにして取り込む (c_16 §4.3)。
 
     パッケージ id は ``manual-<sha8>`` (sha8 = 本文 UTF-8 の sha256 先頭 8
-    hex)、版は :data:`MANUAL_PACKAGE_VERSION` 固定。同じ内容を入れ直しても
-    同じ版へ上書きされ、内容が変われば別パッケージになる。
+    hex)、版は :data:`MANUAL_PACKAGE_VERSION` 固定。同じ内容の入れ直しは
+    何もしない (c_16 §4.3)。内容が変われば別パッケージになる。本文が同じで
+    文書名だけ違うと同じ id・同じ版で ``docs/`` が違うので 409 で断る。
     """
     if not file.filename:
         raise rag_filename_required_error()
@@ -158,6 +161,10 @@ async def ingest_document(
         try:
             write_package({doc_name: doc_text}, zip_path, meta)
             info = await manager.install(zip_path, embedder=state.embedder, internal=True)
+        except CorpusVersionConflictError as exc:
+            # 同じ本文で文書名だけ違う再投入 (同じ id・同じ版で docs/ が違う)
+            logger.warning("Manual ingest rejected %s: %s", file.filename, exc)
+            raise corpus_version_conflict_error(exc) from exc
         except PackageError as exc:
             # 「文書が無い」「チャンクが 0 件」はどちらも投入内容の問題。
             logger.warning("Manual ingest rejected %s: %s", file.filename, exc)

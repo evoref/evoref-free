@@ -26,8 +26,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from backend.export.base import WriteResult
-from backend.io.atomic import atomic_write_bytes
+from backend.export.base import WriteResult, assign_xlsx_cell
+from backend.io.user_file import write_user_bytes
 from backend.log_config import get_logger
 
 logger = get_logger("export.template_writer")
@@ -731,11 +731,11 @@ def _fill_xlsx_cell(cell: Any, field_by_name: dict[str, FieldSpec], values: dict
             cell.value = values[name]
             return True
         if name in scalar_map:
-            cell.value = scalar_map[name]
+            assign_xlsx_cell(cell, scalar_map[name])
             return True
         return False
     new_text, ok = _replace_xlsx_text(text, lambda name: scalar_map.get(name))
-    cell.value = new_text
+    assign_xlsx_cell(cell, new_text)
     return ok
 
 
@@ -784,7 +784,7 @@ def _expand_xlsx_repeat(ws: Any, field: FieldSpec, rows_data: list[dict]) -> boo
                     else:
                         cell.value = v
                     continue
-                cell.value = "" if raw is None else str(raw)
+                assign_xlsx_cell(cell, "" if raw is None else str(raw))
                 continue
 
             def _resolve(name: str, rv=row_values) -> str | None:
@@ -794,7 +794,7 @@ def _expand_xlsx_repeat(ws: Any, field: FieldSpec, rows_data: list[dict]) -> boo
                 return None
 
             new_text, row_ok = _replace_xlsx_text(text, _resolve)
-            cell.value = new_text
+            assign_xlsx_cell(cell, new_text)
             ok = ok and row_ok
         return ok
 
@@ -880,7 +880,7 @@ def fill_template(
         raise TemplateFillError(f"unsupported template base extension: {ext}")
 
     data = filler(base_path, field_specs, values)
-    atomic_write_bytes(out_path, data)
+    write_user_bytes(out_path, data)
     metadata: dict[str, Any] = {"template_applied": True}
     if provenance:
         metadata["template"] = provenance

@@ -145,4 +145,17 @@ async def update_project_map(
         return updated
 
 
-__all__ = ["is_project_map_update_running", "quiet_seconds", "update_project_map"]
+async def wait_builds_finished() -> None:
+    """ここまでに積んだ構築の終わりを待つ (シャットダウン用)。
+
+    executor は 1 スレッドなので、後ろに積んだ空の仕事が走れば前の構築は終わっている。
+    """
+    await asyncio.wrap_future(_PROJECT_MAP_EXECUTOR.submit(lambda: None))
+
+
+__all__ = [
+    "is_project_map_update_running",
+    "quiet_seconds",
+    "update_project_map",
+    "wait_builds_finished",
+]

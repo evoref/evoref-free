@@ -23,6 +23,7 @@ from backend.free.api.content._cartridge_serializers import (
 from backend.free.core.sse import SSEFrameBuilder
 from backend.free.rag.cartridge_manager import CartridgeInstallCancelled
 from backend.free.rag.corpus.package import PackageFormatError
+from backend.free.rag.corpus.store import CorpusBusyError, CorpusVersionConflictError
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, set_trace_id
@@ -130,6 +131,10 @@ async def install_cartridge(
     start = time.time()
     try:
         info = await mgr.install(tmp_path, embedder=embedder)
+    except CorpusVersionConflictError as e:
+        raise _cartridge_error(
+            409, "E0514", msg(e.i18n_key, **e.context), i18n_key=e.i18n_key, **e.context,
+        )
     except PackageFormatError as e:
         raise _cartridge_error(
             400, "E0510", msg(e.i18n_key, **e.context), i18n_key=e.i18n_key, **e.context,
@@ -248,6 +253,10 @@ async def delete_cartridge(cartridge_id: str, state: AppState = Depends(get_app_
     mgr = _get_manager(state)
     try:
         mgr.uninstall(cartridge_id)
+    except CorpusBusyError as e:
+        raise _cartridge_error(
+            409, "E0515", msg(e.i18n_key), i18n_key=e.i18n_key, **e.context,
+        )
     except KeyError:
         raise _cartridge_error(
             404, "E0504", f"Cartridge '{cartridge_id}' not found",
@@ -314,6 +323,8 @@ async def install_cartridge_stream(
             await queue.put({"__result__": payload})
         except CartridgeInstallCancelled:
             await queue.put({"__cancelled__": True})
+        except CorpusVersionConflictError as e:
+            await queue.put({"__error__": {"code": "E0514", "message": msg(e.i18n_key, **e.context)}})
         except PackageFormatError as e:
             # G0 / 新しい版のパッケージは案内の文言で返す (UI はこの message を出す)
             await queue.put({"__error__": {"code": "E0510", "message": msg(e.i18n_key, **e.context)}})

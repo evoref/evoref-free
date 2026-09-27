@@ -8,6 +8,7 @@ long_form (api 層 ``chat_streaming``) と meta_cognitive (agent 層) の双方�
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -244,8 +245,11 @@ def anchor_relative_output_path(file_path: str) -> str:
     規則 (書込み経路すべてで共通):
 
     - 絶対パス (``E:\\tmp\\a.md`` / ``/home/u/a.md``) → そのまま
-    - ``./`` ``../`` ``~`` 始まり → **明示的な相対指定** なのでそのまま
-      (``..`` は ``write_file`` の traversal ガードが別途拒否する)
+    - ``~`` / ``~/`` / ``~\\`` 始まり → ホームへ展開
+    - ``./`` ``../`` 始まり → **明示的な相対指定** なのでそのまま
+      (``..`` は書込みゲートが ``invalid_path`` で断る、docs/f_03 §4.y)
+    - Windows のルート相対 (``\\x`` / ``/tmp/x.md``)・ドライブ相対 (``C:x``) →
+      そのまま (寄せるとドライブ直下へ落ちる。書込みゲートが断る)
     - それ以外の相対パス (``compose.yaml`` / ``deploy/compose.yaml``) →
       ``<outputs_dir>/<相対パス>``
 
@@ -258,7 +262,9 @@ def anchor_relative_output_path(file_path: str) -> str:
     if not file_path:
         return file_path
     normalized = file_path.replace("\\", "/")
-    if normalized.startswith(("./", "../", "~")):
+    if normalized == "~" or normalized.startswith("~/"):
+        return os.path.expanduser(file_path)
+    if normalized.startswith(("./", "../", "/")):
         return file_path
     p = Path(file_path)
     # ドライブ文字付き (``E:\tmp``) は POSIX 上で is_absolute() が False に

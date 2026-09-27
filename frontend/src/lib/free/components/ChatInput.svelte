@@ -30,8 +30,10 @@
 		cancelChat,
 		confirmReembed,
 		listTemplates,
+		type FileContext,
 		type TemplateSummary
 	} from '$lib/free/api';
+	import { prepareAttachments } from '$lib/free/services/attachments';
 	import { handleApiCall } from '$lib/free/utils/error';
 	import { get } from 'svelte/store';
 	import { themeSlots } from '$lib/free/stores/theme';
@@ -106,6 +108,8 @@
 	}
 
 	let inputText = $state('');
+	/** 送信前の添付の抽出中 (二重送信を受けない) */
+	let extracting = $state(false);
 	let textarea: HTMLTextAreaElement | undefined = $state();
 	let abortController: AbortController | null = null;
 	let cancelled = false;
@@ -143,8 +147,22 @@
 		// モード切替 (llama-server のモデル入替を伴い数十秒かかる) の最中に
 		// 送ると、切替完了時の messages 差し替えでターンごと破棄される。
 		if ($modeRestartStatus === 'restarting') return;
+		if (extracting) return;
 
-		const files = get(attachedFiles).map((f) => f.name);
+		// 添付は送信のたびにバックエンドで抽出し、中身を file_contexts で送る
+		// (保存しない、f_03 §11)。以前はファイル名だけを送り、中身はモデルに
+		// 届いていなかった。取り込めなかった添付はトーストで知らせ、📎 にも出さない。
+		const pending = get(attachedFiles);
+		let files: string[] = [];
+		let fileContexts: FileContext[] = [];
+		if (pending.length > 0) {
+			extracting = true;
+			try {
+				({ names: files, fileContexts } = await prepareAttachments(pending));
+			} finally {
+				extracting = false;
+			}
+		}
 		// 選択中のテンプレートはこのターンにだけ効かせる (先に読み、送信後は
 		// 「なし」へ戻す。c_16 §4.5.2 — 貼り付いたまま別の依頼に効くのを防ぐ)。
 		const templateKey = get(selectedTemplate);
@@ -186,7 +204,7 @@
 		});
 
 		try {
-			for await (const event of chatStream(text, mode, turnSessionId, files, abortController.signal, get(corpusMode), templateKey)) {
+			for await (const event of chatStream(text, mode, turnSessionId, fileContexts, abortController.signal, get(corpusMode), templateKey)) {
 				if (event.type === 'token' && event.token) {
 					appendToLastAssistant(event.token);
 				} else if (event.type === 'agent_layer') {
@@ -472,7 +490,7 @@
 			<button
 				class="send-btn"
 				onclick={handleSend}
-				disabled={!inputText.trim() || $modeRestartStatus === 'restarting'}
+				disabled={!inputText.trim() || $modeRestartStatus === 'restarting' || extracting}
 				aria-label={$t('chat.send')}
 			>
 				{$t('chat.send')}

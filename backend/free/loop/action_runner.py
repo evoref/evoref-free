@@ -38,6 +38,7 @@ from backend.free.harness.action import (
     RunCommandAction,
     SearchAction,
 )
+from backend.io.process_output import decode_process_output
 from backend.log_config import get_logger
 
 logger = get_logger("loop.action_runner")
@@ -220,7 +221,6 @@ class ActionRunner:
                 list(action.command),
                 cwd=str(cwd),
                 capture_output=True,
-                text=True,
                 timeout=self.config.command_timeout_sec,
                 check=False,
                 shell=False,
@@ -231,7 +231,7 @@ class ActionRunner:
                 action=action,
                 success=False,
                 error=f"timeout after {self.config.command_timeout_sec:.0f}s",
-                output=_tail(getattr(exc, "stdout", None)),
+                output=_tail(decode_process_output(getattr(exc, "stdout", None))),
                 duration_ms=(time.perf_counter() - t0) * 1000.0,
                 metadata={"executor": "action_runner", "timeout": "true"},
             )
@@ -248,8 +248,11 @@ class ActionRunner:
         return ActionResult(
             action=action,
             success=ok,
-            output=_tail(cp.stdout),
-            error=(None if ok else _tail(cp.stderr) or f"rc={cp.returncode}"),
+            output=_tail(decode_process_output(cp.stdout)),
+            error=(
+                None if ok
+                else _tail(decode_process_output(cp.stderr)) or f"rc={cp.returncode}"
+            ),
             duration_ms=duration_ms,
             metadata={
                 "executor": "action_runner",

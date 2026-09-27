@@ -50,6 +50,7 @@ __all__ = [
     "TOMBSTONE_MARKER",
     "TOMBSTONE_REASON_FIELD",
     "TOMBSTONE_TS_FIELD",
+    "terminate_torn_tail",
 ]
 
 T = TypeVar("T")
@@ -68,6 +69,30 @@ TOMBSTONE_REASON_FIELD = "_reason"
 ROW_VERSION_FIELD = "_v"
 
 _ROW_OK, _ROW_BAD, _ROW_NEWER = 0, 1, 2
+
+
+def terminate_torn_tail(path: Path) -> None:
+    """追記の前に、末尾が改行で終わっていなければ改行を 1 つ足す。
+
+    途中で切れた行 (kill・電源断・追記の失敗) を **切り詰めず** 改行で終端する — 断片は
+    壊れた行として読み手が飛ばし、物理行の位置は保たれる。切り詰めると、行番号で位置を
+    持つ読み手 (事象ログの ``folded_through``) がずれて以後の事象を畳まなくなる
+    (c_05 §0.5.8)。:class:`JSONLAppendStore` と書き手スレッドが使う。
+    """
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return
+    if size == 0:
+        return
+    with path.open("rb") as f:
+        f.seek(size - 1)
+        last = f.read(1)
+    if last == b"\n":
+        return
+    with path.open("ab") as f:
+        f.write(b"\n")
+    logger.warning("Terminated a torn last line in %s (%d bytes)", path, size)
 
 
 class JSONLAppendStore(Generic[T]):
@@ -208,30 +233,28 @@ class JSONLAppendStore(Generic[T]):
             raise DataReadonlyError(self._path, f"{self._newer_rows} row(s) of a newer _v")
 
     def _terminate_torn_tail(self) -> None:
-        """末尾が改行で終わっていなければ改行を 1 つ足す (ロックの下で最初の追記の前に 1 回)。
+        """末尾の途中切れを終端する (ロックの下で最初の追記の前に 1 回、追記の失敗後は再び)。
 
-        途中で切れた行 (kill・電源断) を **切り詰めず** 改行で終端する — 断片は壊れた行
-        として読み手が飛ばし、物理行の位置は保たれる。切り詰めると、行番号で位置を
-        持つ読み手 (事象ログの ``folded_through``) がずれて以後の事象を畳まなくなる
-        (c_05 §0.5.8)。readonly の間は ``guard_write`` が先に止めるので修復もしない。
+        readonly の間は ``guard_write`` が先に止めるので修復もしない。
         """
         if self._tail_checked:
             return
         self._tail_checked = True
+        terminate_torn_tail(self._path)
+
+    def _append_line(self, text: str) -> None:
+        """1 行を追記する (ロックの下)。途中で失敗したら次の追記の前に末尾を検査し直す。
+
+        ENOSPC や close 時の flush 失敗では行の前半だけが残りうる。検査済みのまま次の行を
+        足すと断片に連結され、その行ごと読めなくなる。
+        """
+        self._terminate_torn_tail()
         try:
-            size = self._path.stat().st_size
-        except FileNotFoundError:
-            return
-        if size == 0:
-            return
-        with self._path.open("rb") as f:
-            f.seek(size - 1)
-            last = f.read(1)
-        if last == b"\n":
-            return
-        with self._path.open("ab") as f:
-            f.write(b"\n")
-        logger.warning("Terminated a torn last line in %s (%d bytes)", self._path, size)
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except BaseException:
+            self._tail_checked = False
+            raise
 
     # ── 書き込み API ──────────────────────────────────────────────────
 
@@ -268,9 +291,7 @@ class JSONLAppendStore(Generic[T]):
         with self._lock:
             self._guard_newer()
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._terminate_torn_tail()
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            self._append_line(line)
             self._total_lines += 1
             self._live_keys.add(key)
 
@@ -297,10 +318,8 @@ class JSONLAppendStore(Generic[T]):
         guard_write(self._path)
         with self._lock:
             self._guard_newer()
-            self._terminate_torn_tail()
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(marker + "\n")
+            self._append_line(marker)
             self._total_lines += 1
             self._live_keys.discard(key)
 
@@ -332,9 +351,12 @@ class JSONLAppendStore(Generic[T]):
         return self._rewrite_locked()
 
     def _rewrite_locked(self) -> bool:
-        items = self._load_locked()
+        unreadable: list[str] = []
+        items = self._load_locked(unreadable)
         if self._newer_rows:
             return False  # 新しい版の行を落として書き直さない (c_05 §0.4.5)
+        if unreadable:
+            self._set_aside_unreadable(unreadable)
         before_lines = self._total_lines
         before_dead = before_lines - len(items)
         with AtomicWriter(self._path, debug_logger=self._debug_logger) as f:
@@ -357,6 +379,22 @@ class JSONLAppendStore(Generic[T]):
                 logger.warning("DebugLogger.log_memory_op failed: %s", log_err)
         return True
 
+    def _set_aside_unreadable(self, lines: list[str]) -> None:
+        """読めない行を ``<name>.corrupt-<utcstamp>`` へ写す (書き直しで消す前に、c_05 §0.5.8)。
+
+        書けなければ送出して書き直しを止める (読めない行を失わない)。
+        """
+        from backend.io.versioned import quarantine_path
+
+        target = quarantine_path(self._path)
+        with AtomicWriter(target, fsync=True, debug_logger=self._debug_logger) as f:
+            for line in lines:
+                f.write(line + "\n")
+        logger.warning(
+            "Compaction of %s set aside %d unreadable row(s) in %s",
+            self._path, len(lines), target.name,
+        )
+
     # ── 読み込み API ──────────────────────────────────────────────────
 
     def load_all(self) -> dict[str, T]:
@@ -368,7 +406,8 @@ class JSONLAppendStore(Generic[T]):
         with self._lock:
             return self._load_locked()
 
-    def _load_locked(self) -> dict[str, T]:
+    def _load_locked(self, unreadable: list[str] | None = None) -> dict[str, T]:
+        """``unreadable`` を渡すと、読めずに飛ばした行 (版が新しい行を除く) をそこへ集める。"""
         if not self._path.exists():
             self._set_newer(0)
             return {}
@@ -385,10 +424,14 @@ class JSONLAppendStore(Generic[T]):
                     logger.warning(
                         "skipping malformed JSONL line in %s: %s", self._path, e,
                     )
+                    if unreadable is not None:
+                        unreadable.append(line)
                     continue
                 row = self._row_state(obj)
                 if row == _ROW_NEWER:
                     newer += 1
+                if row == _ROW_BAD and unreadable is not None:
+                    unreadable.append(line)
                 if row != _ROW_OK:
                     continue
                 if isinstance(obj, dict) and obj.get(TOMBSTONE_MARKER):
@@ -402,6 +445,8 @@ class JSONLAppendStore(Generic[T]):
                     logger.warning(
                         "skipping unparsable item in %s: %s", self._path, e,
                     )
+                    if unreadable is not None:
+                        unreadable.append(line)
                     continue
                 result[self._key_of(item)] = item
         self._set_newer(newer)

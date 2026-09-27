@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from backend.io.atomic import AtomicWriter
+from backend.io.jsonl_store import terminate_torn_tail
 from backend.io.readonly import DataReadonlyError, guard_write
 from backend.log_config import get_logger
 
@@ -339,31 +340,10 @@ class ChatWriter:
 
     def _open_append(self, path: Path) -> BinaryIO:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 開くたびに末尾を見る (ハンドルを持っている間は自分しか書かない)。
-        self._terminate_torn_tail(path)
+        # 開くたびに末尾を見る (ハンドルを持っている間は自分しか書かない。書けなかった
+        # ハンドルは _execute が捨てるので、次の追記は開き直して検査し直す)。
+        terminate_torn_tail(path)
         return open(path, "ab")  # noqa: SIM115 — ハンドルは書き手が保持する
-
-    @staticmethod
-    def _terminate_torn_tail(path: Path) -> None:
-        """追記用に初めて開くとき、末尾が改行で終わっていなければ改行で終端する。
-
-        途中で切れた行 (kill・電源断) を切り詰めない — 断片は壊れた行として読み手が
-        飛ばし、物理行の位置は保たれる (c_05 §0.5.8)。
-        """
-        try:
-            size = path.stat().st_size
-        except FileNotFoundError:
-            return
-        if size == 0:
-            return
-        with open(path, "rb") as f:
-            f.seek(size - 1)
-            last = f.read(1)
-        if last == b"\n":
-            return
-        with open(path, "ab") as f:
-            f.write(b"\n")
-        logger.warning("Terminated a torn last line in %s (%d bytes)", path, size)
 
     @staticmethod
     def _replace(path: Path, data: Any, fsync: bool) -> None:

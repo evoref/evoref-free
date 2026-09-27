@@ -132,6 +132,7 @@ from backend.io.id_registry import is_valid_session_id
 from backend.log_config import get_logger
 from backend.trace_context import (
     generate_trace_id,
+    run_in_executor_with_context,
     set_private,
     set_private_text,
     set_trace_id,
@@ -1945,6 +1946,22 @@ async def _run_template_fill(
     coerced.update(compute_values(field_specs, coerced))
     ext = Path(selected.base_path).suffix.lower()
     out_path = _resolve_template_fill_output_path(req, selected, ext)
+    # TemplateWriter はツールのレジストリを通らないので、書込みゲートを明示的に
+    # 通す (docs/f_03 §4.y / f_11 §9.2)。断ったら書かず、入れる予定だった値を返す。
+    from backend.free.agent.write_gate import check_write_target
+
+    normalized, denial = await asyncio.to_thread(
+        check_write_target, str(out_path), query=req.message,
+    )
+    if denial is not None:
+        logger.warning(
+            "template_fill: write denied (%s): %s", denial.code, denial.path,
+        )
+        summary = _format_template_fill_summary(out_path, field_specs, coerced)
+        values = summary.split("\n", 1)[1] if "\n" in summary else ""
+        note = msg(f"agent.write_denied.{denial.code}", path=denial.path)
+        return f"{note}\n{values}" if values else note
+    out_path = Path(normalized)
     try:
         fill_template(
             selected.base_path, field_specs, coerced, out_path,
@@ -2680,11 +2697,16 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     )
     reason = getattr(classifier, "_last_classify_reason", "default")
     # 問い返し (needs_input、Phase 3b) 再開中のセッションかどうか。層の上書き
-    # (下記) と帳票穴埋めへの分岐抑止 (f_10 §7、再開経路を横取りしない) の
-    # 両方がこの 1 回の判定を使う。
-    needs_input_pending = (
-        is_create_mode(req.mode) and _find_needs_input_run(session_id) is not None
+    # (下記)・帳票穴埋めへの分岐抑止 (f_10 §7、再開経路を横取りしない)・
+    # 再開する run の引き継ぎ (meta 分岐) がこの 1 回の判定を使う。run 台帳の
+    # 読み出しはディスク I/O なのでイベントループの外で行う。
+    needs_input_run = (
+        await run_in_executor_with_context(
+            asyncio.get_running_loop(), None, _find_needs_input_run, session_id,
+        )
+        if is_create_mode(req.mode) else None
     )
+    needs_input_pending = needs_input_run is not None
     if layer != "meta_cognitive" and needs_input_pending:
         # 問い返し中のセッションの次の発話は回答なので、router の層に関わらず
         # meta (再開) へ回す。短い「…に保存して」が deliberative に振られて
@@ -2927,7 +2949,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
                     # brief 先頭へ足し、resume_of として新 run へ引き継ぐ
                     # (f_10 §7)。
                     resume_of: str | None = None
-                    resume_run = _find_needs_input_run(session_id)
+                    resume_run = needs_input_run
                     if resume_run is not None:
                         resume_of = resume_run.run_id
                         question = str(resume_run.to_dict().get("question", ""))

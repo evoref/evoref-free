@@ -21,6 +21,7 @@ from backend.app_state import AppState, get_app_state
 from backend.free.api._error_responses import api_error
 from backend.free.api.content._rag_helpers import (
     corpus_store_not_initialized_error,
+    corpus_version_conflict_error,
     rag_file_empty_error,
     rag_filename_required_error,
     rag_unsupported_format_error,
@@ -33,6 +34,7 @@ from backend.free.rag.corpus.package import (
     package_filename,
     write_package,
 )
+from backend.free.rag.corpus.store import CorpusVersionConflictError
 from backend.free.rag.corpus.templates import (
     BASE_SUFFIXES,
     TEMPLATES_FORMAT_VERSION,
@@ -145,6 +147,22 @@ async def register_template(
         "lang": str(lang or "ja"),
         "base": base_name,
     }
+    response = {
+        "key": f"{package_id}:base",
+        "package": package_id,
+        "version": meta.version,
+        "doc_type": doc_type,
+        "aliases": clean_aliases,
+    }
+
+    installed = manager.corpus.get(package_id)
+    if installed is not None and installed.version == meta.version and [
+        (e.id, e.doc_type, list(e.aliases), e.lang, e.base) for e in installed.templates
+    ] == [(entry["id"], doc_type, clean_aliases, entry["lang"], base_name)]:
+        # 同じ登録のやり直しは何もしない (c_16 §4.3)。manifest.json の封筒は書くたびに
+        # written_at が変わるので、パッケージの digest ではここを同じと判定できない
+        logger.info("Template package %s is already registered as-is", package_id)
+        return response
 
     with tempfile.TemporaryDirectory(prefix="evoref-template-") as tmp:
         staging = Path(tmp) / "src"
@@ -156,6 +174,10 @@ async def register_template(
         try:
             write_package(staging, zip_path, meta)
             info = await manager.install(zip_path, internal=True)
+        except CorpusVersionConflictError as exc:
+            # 同じファイルを別の様式名・別名で登録し直した (同じ id・同じ版で中身が違う)
+            logger.warning("Template registration rejected %s: %s", file.filename, exc)
+            raise corpus_version_conflict_error(exc) from exc
         except PackageError as exc:
             logger.warning("Template registration rejected %s: %s", file.filename, exc)
             raise api_error(400, "E0400", str(exc)) from exc
@@ -164,13 +186,7 @@ async def register_template(
         "Registered template package %s v%s from %s (doc_type=%s)",
         info.id, info.version, file.filename, doc_type,
     )
-    return {
-        "key": f"{info.id}:base",
-        "package": info.id,
-        "version": info.version,
-        "doc_type": doc_type,
-        "aliases": clean_aliases,
-    }
+    return response
 
 
 __all__ = ["router"]
