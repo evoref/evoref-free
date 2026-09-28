@@ -41,7 +41,14 @@ from backend.export.template_context import (
     set_selected_template,
     set_template_hint,
 )
+from backend.free.agent.file_reference_gate import (
+    LOCATE_LABEL as RECENT_FILE_LOCATE_LABEL,
+    WRITE_LABEL as RECENT_FILE_WRITE_LABEL,
+    recent_file_context,
+    recent_file_reference_verdict,
+)
 from backend.free.agent.router import indicates_write_destination
+from backend.free.core.predicate import Verdict
 from backend.free.agent.tool_call_judge import (
     _extract_file_path,
     _recent_dialogue_text,
@@ -89,6 +96,7 @@ from backend.free.core.inference import latest_turn_truncation
 from backend.free.core.turn_text import append_to_last_user, neutralize_frame_markers
 from backend.free.core.intent_vocab import is_today_scope_query, is_whole_session_scope_query
 from backend.free.core.session_mode import (
+    is_chat_mode,
     is_create_mode,
     canonicalize_session_mode,
     normalize_session_mode,
@@ -109,7 +117,7 @@ from backend.free.agent.router import (
     needs_write_intent_hint,
 )
 from backend.free.agent.issue_ledger import issue_ledger_scope
-from backend.free.agent.file_ledger import file_ledger_scope
+from backend.free.agent.file_ledger import file_ledger_scope, last_written_path
 from backend.free.agent.tool_ledger import set_ledger_target
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.harness import LongFormHarness
@@ -646,6 +654,12 @@ async def _gate_reactive_light(
     )
     if blocked:
         return "deliberative", judge_task, "blocked_action"
+    # 分類器の calculate が門で落ちた回も同じ。軽量パスでは「計算を検証できなかった」
+    # 注記 (deliberative の _CALCULATION_REJECTED_GUIDANCES) が付かず、短い再計算の依頼
+    # (「金利1.5%じゃなくて1.2%だった」) で暗算の値が検証済みの口調で出る
+    # (2026-09-28 独立レビュー、docs/f_03 §3.1)。
+    if judgement is not None and judgement.calculation_rejected:
+        return "deliberative", judge_task, "calculation_rejected"
     return "light", judge_task, "judge_no_tool"
 
 
@@ -942,6 +956,26 @@ def _answered_attributes(
     return frozenset(asked & covered)
 
 
+def _unanswered_attributes(
+    query: str, mode: str, covered: set[str],
+) -> frozenset[str]:
+    """クエリが尋ねている属性のうち、**今回注入されなかった** もの。
+
+    ``search_history`` を抑止したとき (尋ねた ∩ 注入済み ≠ ∅) の注記を分ける
+    ための材料 (独立レビュー H1)。全部載ったターンにだけ「記憶の値で答えよ」を
+    付け、一部だけのターンは載っていない事柄に「確認できていない」を残す。
+    抑止が起きない (∩ が空) ターンでは使わないので空集合を返す。
+    """
+    if not covered:
+        return frozenset()
+    from backend.free.memory.pipeline.injector import MemoryInjector
+
+    asked = MemoryInjector._asked_attributes(query, normalize_session_mode(mode))
+    if not asked & covered:
+        return frozenset()
+    return frozenset(asked - covered)
+
+
 #: 成果物ブロックへ割り当てる文字数の上限。動的ブロック全体の予算は
 #: ``build_messages`` が決めるので、ここは「渡す前に常識的な大きさへ畳む」
 #: ための上限にすぎない (入り切らなければ build_messages 側が更に切る)。
@@ -1067,6 +1101,9 @@ class RoutePlan:
     #: の間、``layer`` による通常のディスパッチ (meta_cognitive / deliberative)
     #: は使わない (``_route_for_template_fields`` が判定)。
     route_to_template_fill: bool = False
+    #: 判定点 ``recent_file_reference`` が ``write`` のときの宛先 (直近のファイル)。
+    #: meta は計画せずにこのファイルへの write-fast に入る (docs/f_03 §4.3)。
+    recent_file_target: str = ""
 
     @property
     def speculate_judge(self) -> bool:
@@ -1296,7 +1333,9 @@ def _build_template_hint(
     return {"kind": kind, "templates": templates}
 
 
-def _plan_output_target(req: ChatRequest) -> tuple[str, str | None]:
+def _plan_output_target(
+    req: ChatRequest, file_reference: "Verdict | None" = None,
+) -> tuple[str, str | None]:
     """``(output_target, editor_route)`` を発話とモードから決める。
 
     create モード:
@@ -1310,6 +1349,10 @@ def _plan_output_target(req: ChatRequest) -> tuple[str, str | None]:
     "file" だったため、パスを一切含まない依頼でも「書き込む」プランが組まれ、
     write_file を撃ちようがないまま failed になり成果物が捨てられていた
     (2026-09-06 監査 F-02)。
+
+    判定点 ``recent_file_reference`` が ``write`` (「保存したファイルに追記して」)
+    なら、宛先は直近のファイル (会話 / file_ledger から解決) なので file。層の
+    振り分けと同じ ``Verdict`` を受ける (docs/f_03 §1.6)。
     """
     if is_create_mode(req.mode):
         # 宛先の判定は chat と同じ 1 本。以前は ``_extract_file_path`` (名前の字句
@@ -1325,7 +1368,30 @@ def _plan_output_target(req: ChatRequest) -> tuple[str, str | None]:
         else:
             target = "editor"
         return target, ("editor" if target == "editor" else "chat")
+    if file_reference is not None and file_reference.fired:
+        if file_reference.value == RECENT_FILE_WRITE_LABEL:
+            return "file", None
+        if file_reference.value == RECENT_FILE_LOCATE_LABEL:
+            # 所在の問いはチャットで答える (パスを事実として注入する)。
+            return "chat", None
     return ("file" if indicates_write_destination(req.message) else "chat"), None
+
+
+def _recent_file_write_target(file_reference: "Verdict | None", session_id: str) -> str:
+    """判定点 ``recent_file_reference`` が ``write`` なら、その宛先 (直近のファイル) を返す。
+
+    宛先は判定の文脈 (``recent_file_context``) と同じ台帳 — 会話から復元した後の
+    file_ledger で **最後に書いた** ファイル (読んだだけのファイルではない、
+    2026-09-28 レビュー H1)。meta は宛先を確定したうえで write-fast か計画に入る
+    (docs/f_03 §4.3)。``write`` 以外 (棄権・所在・不発) は空文字列。
+    """
+    if (
+        file_reference is None
+        or not file_reference.fired
+        or file_reference.value != RECENT_FILE_WRITE_LABEL
+    ):
+        return ""
+    return last_written_path(session_id)
 
 
 async def _build_messages_with_search(
@@ -2397,6 +2463,7 @@ async def _dispatch_meta_cognitive(
     output_target: str = "file",
     brief: str = "",
     production_stage: "_ProductionStageSelector | None" = None,
+    recent_file_target: str = "",
 ) -> StreamingResponse | ChatResponse:
     """Meta-Cognitive (通常) 経路: 計画 + ツールループ。
 
@@ -2444,6 +2511,9 @@ async def _dispatch_meta_cognitive(
         production_stage=production_stage,
         brief=brief,
         write_impact_classifier=_make_write_impact_classifier(state),
+        # 直近ファイルへの書込み (判定点 recent_file_reference = write) の宛先。
+        # 渡されたら計画せずに write-fast へ入る (docs/f_03 §4.3)。
+        recent_file_target=recent_file_target,
     )
     keepalive_sec = cfg.get("streaming", {}).get(
         "keepalive_interval_sec", DEFAULT_KEEPALIVE_INTERVAL_SEC,
@@ -2532,6 +2602,10 @@ async def _dispatch_deliberative(
         # 実際に注入されたファクトの属性スロット。「この属性の現在値はもう
         # プロンプトに載っている」を判定して search_history を抑止する。
         answered_attributes=_answered_attributes(
+            req.message, req.mode, ctx.covered_attributes,
+        ),
+        # 尋ねたのに載らなかった属性。抑止したときの注記を「一部だけ」側にする。
+        unanswered_attributes=_unanswered_attributes(
             req.message, req.mode, ctx.covered_attributes,
         ),
     )
@@ -2682,7 +2756,20 @@ async def _chat_turn(req: ChatRequest, state: AppState):
         except Exception as e:  # pragma: no cover - 縮退で吸収する
             logger.warning("Write intent gate failed, falling back: %s", e)
 
-    output_target, editor_route = _plan_output_target(req)
+    # 直近ファイルへの参照 (「保存したファイルに追記して」/「…の場所は」) の
+    # 判定点 (c_17 §3.11)。ターンに 1 回だけ評価して記録し、層の振り分けと
+    # output_target が同じ Verdict を読む (別々に評価すると記録が二重になり、
+    # 片方だけ直ると「層は書込み、output_target は chat」になる)。
+    # 台帳はプロセス内だけなので、評価の前に会話履歴の書込み報告から復元し、
+    # 直近のファイルが無ければ write にしない (書込み先の無いタスクを meta に
+    # 入れない。後段のツール判定も復元した台帳を読む)。
+    file_reference: Verdict | None = (
+        recent_file_reference_verdict(
+            req.message, recent_file_context(session_id, history),
+        )
+        if is_chat_mode(req.mode) else None
+    )
+    output_target, editor_route = _plan_output_target(req, file_reference)
     # このターンで write_file が使う体裁継承テンプレート (c_16 §4.5.2)。
     # ツール引数は増やさず、ターンスコープの contextvar (f_11 §9.1) で運ぶ。
     # 判定点 template_select は 1 回だけ評価し (verdict / candidates を
@@ -2694,6 +2781,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
         req.message, mode=req.mode,
         context=lambda: _recent_dialogue_text(history),
         write_intent_hint=write_intent_hint,
+        file_reference=file_reference,
     )
     reason = getattr(classifier, "_last_classify_reason", "default")
     # 問い返し (needs_input、Phase 3b) 再開中のセッションかどうか。層の上書き
@@ -2737,6 +2825,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
         output_target=output_target,
         editor_route=editor_route,
         route_to_template_fill=route_to_template_fill,
+        recent_file_target=_recent_file_write_target(file_reference, session_id),
     )
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",
@@ -2821,7 +2910,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
             plan.speculate_judge
             and state.tool_call_judge is not None
             and state.tools_registry is not None
-            and not query_short_circuits_tool_judge(req.message)
+            and not query_short_circuits_tool_judge(req.message, mode=req.mode)
         ):
             judge_task = asyncio.create_task(
                 state.tool_call_judge.judge(
@@ -2980,6 +3069,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
                     output_target=plan.output_target,
                     brief=brief,
                     production_stage=production_stage,
+                    recent_file_target=plan.recent_file_target,
                 )
             case _:
                 return await _dispatch_deliberative(

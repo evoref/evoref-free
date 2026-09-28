@@ -134,7 +134,20 @@ class EvidenceEventLog:
         at: str | None = None,
     ) -> dict[str, Any]:
         """1 事象を追記して、書いた行 (dict) を返す。"""
-        event = {
+        event = self._make_event(op, record_id, payload, by=by, at=at)
+        self._store_for(self._month_of(event["at"])).append(event)
+        return event
+
+    def _make_event(
+        self,
+        op: EventOp,
+        record_id: str,
+        payload: dict[str, Any],
+        *,
+        by: str | None = None,
+        at: str | None = None,
+    ) -> dict[str, Any]:
+        return {
             "_v": EVENT_VERSION,
             "op": op,
             "id": record_id,
@@ -142,8 +155,6 @@ class EvidenceEventLog:
             "by": by or self.by,
             "payload": payload,
         }
-        self._store_for(self._month_of(event["at"])).append(event)
-        return event
 
     def append_create(self, record: dict[str, Any], *, by: str | None = None) -> dict[str, Any]:
         """新しい id の完全な Evidence レコードを ``create`` する。
@@ -161,6 +172,29 @@ class EvidenceEventLog:
         if not record_id:
             raise ValueError("put event requires record['id']")
         return self.append("put", record_id, {"record": record}, by=by)
+
+    def append_puts(
+        self, records: list[dict[str, Any]], *, by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """完全な Evidence レコードを順に ``put`` する (1 レコード = 1 行、形は :meth:`append_put` と同じ)。
+
+        月ファイルは開き直さず、同じ月の続きをまとめて 1 回で書く。
+        """
+        events: list[dict[str, Any]] = []
+        for record in records:
+            record_id = str(record.get("id") or "")
+            if not record_id:
+                raise ValueError("put event requires record['id']")
+            events.append(self._make_event("put", record_id, {"record": record}, by=by))
+        months = [self._month_of(event["at"]) for event in events]
+        start = 0
+        while start < len(events):
+            end = start + 1
+            while end < len(events) and months[end] == months[start]:
+                end += 1
+            self._store_for(months[start]).append_many(events[start:end])
+            start = end
+        return events
 
     def append_patch(
         self,

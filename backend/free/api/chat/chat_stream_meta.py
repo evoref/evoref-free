@@ -20,6 +20,7 @@ from backend.free.api.schemas import (
     TokenInfo,
 )
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
+from backend.free.constants import search_history_display_text
 from backend.free.agent.output_format import PRODUCTION_WROTE_RE, WRITTEN_PATH_RE
 from backend.free.agent.meta_cognitive_utils import (
     looks_like_task_log_residue,
@@ -245,18 +246,27 @@ def _meta_cognitive_summary_text(resp) -> str:
     # だけだと、ユーザーは書き込まれた先を確認する手掛かりが本文に無い
     # (2026-08-09 ライブ監査で指摘)。
     written = _written_paths(resp.tasks)
+    # 書込みに失敗したタスクの「どのファイルへの何が / 変わっていないか」
+    # (docs/f_03 §4.3)。件数の 1 文だけでは何が失敗したか分からない (2026-09-28 R2)。
+    notes = [
+        note for note in (
+            getattr(t, "failure_note", "") for t in resp.tasks if t.status == "failed"
+        ) if isinstance(note, str) and note
+    ]
     if failed and written:
         # 成果物は配信済みなのに「失敗しました」だけを返さない (f_10 §5-4 の
         # 警告付き配信)。2026-09-20 実機: 参考テストが赤いだけで 4 ファイルは
         # 依頼フォルダへ配信済みだったのに、本文が書込み先に触れなかった。
-        return msg(
+        return "\n".join([msg(
             "agent.files_written_with_failures",
             paths="、".join(written), failed=failed,
-        )
+        ), *notes])
     if failed and not done:
-        return msg("agent.tasks_all_failed")
+        return "\n".join([msg("agent.tasks_all_failed"), *notes])
     if failed:
-        return msg("agent.tasks_partially_done", done=done, failed=failed)
+        return "\n".join([
+            msg("agent.tasks_partially_done", done=done, failed=failed), *notes,
+        ])
     if written:
         return msg("agent.files_written", paths="、".join(written))
     if done == 1:
@@ -280,6 +290,17 @@ def _truncate_step_description(description: str) -> str:
     if len(text) <= _STEP_DESCRIPTION_MAX_CHARS:
         return text
     return text[:_STEP_DESCRIPTION_MAX_CHARS] + "…"
+
+
+def _task_result_detail(task) -> str:
+    """meta 経路の ``task_result`` の表示文 (純粋関数)。
+
+    search_history の由来見出し (モデル向けの指示文) は短いラベルにする (F12)。
+    """
+    detail = _truncate_step_description(task.description)
+    if task.result:
+        detail += f" — {search_history_display_text(task.result)[:500]}"
+    return detail
 
 
 def _written_paths(tasks) -> list[str]:
@@ -326,9 +347,7 @@ async def _emit_meta_cognitive_result_frames(resp) -> AsyncIterator[str]:
             # 「E:\tmp に inventory_notes.txt というファイルを作って、ここまでの
             # 試算結果を3行で書いてください。 Written 158 bytes to ...」)。
             # 見出しは短く保ち、結果を主役にする。
-            detail = _truncate_step_description(task.description)
-            if task.result:
-                detail += f" — {task.result[:500]}"
+            detail = _task_result_detail(task)
             logger.debug(
                 "MetaCognitive task_result: status=%s, detail=%s",
                 task.status, detail[:120],
@@ -439,6 +458,8 @@ def _finalize_meta_cognitive_stream(
         # 内部生成の切断は経験へ刻む (deliberative の ``truncated=`` と同じ)。
         truncated=bool(getattr(resp, "truncated", False)),
         template=str(production_metrics.get("template") or ""),
+        # 制作ステージの検査の 3 値 (未検査は経験の成否をラベル無しにする、f_04 §2.5)
+        production_checks=list(getattr(resp, "production_checks", None) or []),
         **meta_last_command_call(resp),
     )
 

@@ -40,6 +40,7 @@ from backend.free.memory.types import (
 from backend.free.core.correction_verdict import (
     POINTING_TARGETS as _POINTING_TARGETS,
 )
+from backend.free.core.numerals import kanji_number_value
 from backend.free.core.relative_date import annotate_relative_dates
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
@@ -110,7 +111,6 @@ _DATE_SHIFT_RE = re.compile(
     r"(?P<n>\d+|[一二三四五六七八九十]+)\s*(?P<unit>日|週間|週|か月|ヶ月|カ月|ヵ月|月)\s*"
     r"(?P<dir>延期|後ろ倒し|繰り下げ|遅らせ|遅れ|前倒し|繰り上げ|早め)",
 )
-_KANJI_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 #: 言明の中の「<相対表現> (YYYY-MM-DD)」または裸の「(YYYY-MM-DD)」。
 _ANNOTATED_DATE_RE = re.compile(
     r"(?:(?:先々週|再来週|今週|来週|先週)\s*の?\s*[月火水木金土日]曜日?\s*"
@@ -126,7 +126,8 @@ def date_shift_days(content: str) -> int | None:
     if m is None:
         return None
     raw = m.group("n")
-    n = int(raw) if raw.isdigit() else sum(_KANJI_NUM.get(ch, 0) for ch in raw)
+    # 読み取りは core.numerals の 1 本 (字の和で読んでいた頃は「二十」が 12 だった)。
+    n = kanji_number_value(raw) or 0
     if n <= 0:
         return None
     unit = m.group("unit")

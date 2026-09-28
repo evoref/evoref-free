@@ -74,8 +74,12 @@ from typing import Any, Iterable, Literal
 
 import numpy as np
 
-from backend.free.memory.attribute_key import attribute_key
+from backend.free.core.correction_verdict import norm_span
+from backend.free.memory.attribute_key import attribute_key, is_generic_slot
+from backend.free.memory.notes.note_builder import is_multi_valued_subject
+from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.protocols import SemanticFactStoreProtocol
+from backend.free.memory.semantic.fact import fact_carries_span, fact_value_update
 from backend.free.memory.semantic.namespaces import namespace_of, policy_for
 from backend.free.memory.types import SemanticFact
 from backend.io.codec import CodecError, codec_for, persisted
@@ -675,20 +679,46 @@ class SemanticConflictResolver:
         ``mem.personal.user`` へフォールバックするため、無関係な事実が同居する。
         そのまま束ねると偽の競合になるので、類似度で塊に割ってから競合とみなす
         (:func:`split_by_attribute_similarity`)。
+
+        **宣言済みの多値スロット** (``multi_valued: true``) は値の違いを競合に
+        しない — 訂正由来のファクトが旧値の span を持つときだけ、その span を
+        本文に含む古い兄弟と組にする (:func:`_correction_span_groups`、不変則 #13 /
+        2026-09-27 監査 M1)。``mem.world.assertion.*`` も訂正は同じく span で絞り、
+        訂正でない言い直しだけを従来どおり類似度の塊で競合にする (F8)。**セッション要約** は subject が ``session_id[:12]``
+        で重なるので、provenance の ``session_id`` の組までを束ねる鍵に含める
+        (別会話の要約を互いに disputed にしない、M4)。
         """
         active = self.store.all_facts(include_superseded=False)
-        buckets: dict[tuple[str, str, str], list[SemanticFact]] = {}
+        buckets: dict[tuple[str, str, str, tuple[str, ...]], list[SemanticFact]] = {}
         for f in active:
             if f.veracity == "disputed":
                 continue
             buckets.setdefault(
-                (namespace_of(f.subject), f.subject, f.predicate), [],
+                (namespace_of(f.subject), f.subject, f.predicate, _session_key(f)), [],
             ).append(f)
         groups: list[list[SemanticFact]] = []
-        for facts in buckets.values():
+        for (_ns, subject, _predicate, _sessions), facts in buckets.items():
             if len(facts) < 2:
                 continue
             facts.sort(key=lambda x: x.created_at)
+            if _is_declared_multi_valued(subject):
+                groups.extend(_correction_span_groups(facts))
+                continue
+            if subject.startswith(_ASSERTION_SUBJECT_PREFIX):
+                # assertion は宣言が無くても多値が既定 (Step 8.4 と同じ、F8)。span を
+                # 持つ訂正は span で絞り、それ以外 (訂正でない言い直しと、span の無い
+                # 訂正) は従来どおり類似度の塊で競合にする — span の無い訂正は
+                # user_correction の勝者になる (独立レビュー M-a)。
+                span_groups = _correction_span_groups(facts)
+                groups.extend(span_groups)
+                claimed = {f.id for group in span_groups for f in group}
+                facts = [
+                    f for f in facts
+                    if f.id not in claimed
+                    and not (f.from_correction and fact_value_update(f))
+                ]
+                if len(facts) < 2:
+                    continue
             for cluster in split_by_attribute_similarity(
                 facts, self.attribute_similarity_threshold,
             ):
@@ -855,6 +885,58 @@ class SemanticConflictResolver:
         if isinstance(scope, str) and scope:
             return scope
         return "global"
+
+
+#: Step 8.4 の world assertion の subject 接頭辞 (``sleep.extraction`` と同じ)。
+_ASSERTION_SUBJECT_PREFIX = "mem.world.assertion."
+
+
+def _is_declared_multi_valued(subject: str) -> bool:
+    """``fact_attributes.yaml`` で ``multi_valued: true`` と宣言されたスロットか。
+
+    汎用スロット (``mem.<kind>.user``) は :func:`is_multi_valued_subject` では多値だが、
+    ここでは含めない — 無関係な値の寄せ場なので、属性類似度で塊に割ってから
+    競合を見る従来の扱い (:func:`split_by_attribute_similarity`) が要る。
+    """
+    return is_multi_valued_subject(subject) and not is_generic_slot(subject)
+
+
+def _session_key(fact: SemanticFact) -> tuple[str, ...]:
+    """競合を束ねる鍵のうち会話の部分 (セッション要約だけ、それ以外は空)。"""
+    if not is_session_summary_subject(fact.subject):
+        return ()
+    sessions, _notes = _provenance_keys(fact)
+    return tuple(sorted(sessions | set(fact.session_ids or ())))
+
+
+def _correction_span_groups(facts: list[SemanticFact]) -> list[list[SemanticFact]]:
+    """多値スロットの競合: 訂正と、その旧値の span を含む古い兄弟の組だけ。
+
+    ``facts`` は created_at 昇順。新しい訂正から順に宛先を取り、1 つの兄弟は
+    1 つの訂正にしか組ませない。span の無い訂正と、訂正でない値の違いは並列の
+    値なので組にしない (Step 8 の ``_supersede_corrected_slots`` と同じ規則)。
+    """
+    groups: list[list[SemanticFact]] = []
+    claimed: set[str] = set()
+    for correction in reversed(facts):
+        if not correction.from_correction or correction.id in claimed:
+            continue
+        needle = norm_span(fact_value_update(correction))
+        if not needle:
+            continue
+        losers = [
+            f for f in facts
+            if f.id != correction.id and f.id not in claimed
+            and f.predicate == correction.predicate
+            and f.created_at < correction.created_at
+            and fact_carries_span(f, needle)
+        ]
+        if not losers:
+            continue
+        claimed.update(f.id for f in losers)
+        claimed.add(correction.id)
+        groups.append([*losers, correction])
+    return groups
 
 
 def _provenance_keys(

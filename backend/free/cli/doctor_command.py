@@ -56,6 +56,12 @@ def render_human(report: dict[str, Any], data_root: Path) -> list[str]:
 
     summary = report["summary"]
     lines = [msg("cli.doctor_header", data_root=str(data_root))]
+    runtime = report.get("runtime") or {}
+    if runtime:
+        lines.append(msg("cli.doctor_runtime", python=runtime.get("python") or "?", deps=" / ".join(
+            f"{name}: {msg('cli.doctor_dependency_installed' if ok else 'cli.doctor_dependency_missing')}"
+            for name, ok in (runtime.get("optional_dependencies") or {}).items()
+        )))
     if report.get("serve_running"):
         lines.append(msg("cli.doctor_serve_running"))
     lines.append(msg("cli.doctor_scanned", formats=len(report["formats"]), files=summary["files"]))

@@ -69,6 +69,10 @@ async def switch_mode(
     # モード状態を更新。resolver 側の active_mode も同期する (ダッシュボード等の
     # 「現在モードのアダプタ」既定表示に使われる、Level2Runner は mode を明示
     # 引数で受け取るためこれには依存しない)。
+    # 学習パーティション全体の束ね直しはしない (f_04 §1.2.0)。経験・プロンプト・
+    # aux 較正は書込み・読込みのたびに「載っているモデル」(/props) の model_key で
+    # 置き場を決める — チャットと create の並行、Level 1 実行中、書き手スレッドに
+    # 積まれた未書出しの経験を取り違えないため。
     state.current_mode = new_mode
     get_path_resolver().set_active_mode(new_mode)
 

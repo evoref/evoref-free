@@ -18,8 +18,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from backend.config import get_path_resolver, mode_base_model_raw
+from backend.free.core.session_mode import normalize_session_mode
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
@@ -34,6 +37,64 @@ RESUMMARIZE_MIN_TURNS = 10
 
 #: 要約プロンプトへ載せるターン数 (末尾から)。
 _SUMMARY_TURN_WINDOW = 20
+
+#: 要約の出力上限。切れたら倍にして 1 回だけ作り直す (:func:`_generate_summary`)。
+_SUMMARY_MAX_TOKENS = 128
+
+#: 作り直しても切れた会話の ``{session_id: その時点の turn_count}``。会話が伸びる
+#: まで要約に出さない — 256 でも切れる会話が毎回の Full で 2 回ずつ永久に再試行
+#: されていた (2026-09-27 独立レビュー)。プロセス内だけの印 (再起動で 1 回だけ
+#: 再試行する) で、セッション索引の形式は変えない。
+_TRUNCATED_AT: dict[str, int] = {}
+
+
+def chat_summary_skip_modes() -> frozenset[str]:
+    """要約を見送るセッションの mode (配信モデルが chat のモデルと違う間は ``chat``)。
+
+    create モードで ``create_model`` が別のモデルだと、Full の要約は chat の会話も
+    そのモデルが作る (2026-09-27 監査 M3: Coder-14B が chat の会話を要約した)。
+    chat のモデルに戻ってから作る。解決できなければ見送らない (従来どおり)。
+    """
+    try:
+        resolver = get_path_resolver()
+        active = resolver.active_mode
+        if active == "chat":
+            return frozenset()
+        serving = mode_base_model_raw(resolver.models, active, default="")
+        chat = mode_base_model_raw(resolver.models, "chat", default="")
+    except Exception as exc:  # noqa: BLE001 - 解決できなければ従来どおり要約する
+        logger.debug("Failed to resolve the serving model for summaries: %s", exc)
+        return frozenset()
+    if serving and chat and Path(serving).name != Path(chat).name:
+        return frozenset({"chat"})
+    return frozenset()
+
+
+async def _generate_summary(llm_client: Any, turns_text: str, session_id: str) -> str | None:
+    """要約を 1 つ作る。``finish_reason=length`` なら上限を倍にして 1 回だけ作り直す。
+
+    それでも切れたら ``None`` (保存しない)。切れた要約が保存・昇格され、途中で
+    途切れた文と誤答の日付が事実として運ばれた (2026-09-27 監査 M3)。
+    """
+    for max_tokens in (_SUMMARY_MAX_TOKENS, _SUMMARY_MAX_TOKENS * 2):
+        result = await llm_client.generate(
+            messages=[{
+                "role": "user",
+                "content": f"以下の会話を1-2文で要約してください:\n\n{turns_text}",
+            }],
+            stream=False,
+            max_tokens=max_tokens,
+            purpose="summarize",
+            id_slot=getattr(llm_client, "background_slot", -1),
+        )
+        choice = result["choices"][0]
+        if str(choice.get("finish_reason") or "") != "length":
+            return choice["message"]["content"].strip()
+        logger.warning(
+            "Summary for session %s was truncated at max_tokens=%d; not saved as is",
+            session_id, max_tokens,
+        )
+    return None
 
 
 def needs_summary(entry: object) -> bool:
@@ -70,6 +131,7 @@ async def summarize_unsummarized_sessions(
     batch_size: int = 5,
     is_cancelled: Callable[[], bool] | None = None,
     should_pause: Callable[[], bool] | None = None,
+    skip_modes: frozenset[str] = frozenset(),
 ) -> int:
     """未要約セッションに LLM 要約 + 埋め込みベクトルを生成する。
 
@@ -99,6 +161,8 @@ async def summarize_unsummarized_sessions(
         should_pause: ``True`` を返したらセッション境界でループを打ち切る
             協調 yield。未要約のセッションは ``summary`` が付かないままなので
             次サイクルが拾う。
+        skip_modes: このサイクルで要約しないセッションの mode
+            (:func:`chat_summary_skip_modes`)。見送ったセッションは次サイクルが拾う。
 
     Returns:
         実際に要約を生成できたセッション数。
@@ -141,6 +205,11 @@ async def summarize_unsummarized_sessions(
             # 1〜2 ターン伸びるたびに作り直さない — 同じセッションが 20 サイクルで
             # 26 回要約されていた (2026-09-12 実測、入力は末尾 20 ターン固定)。
             continue
+        if skip_modes and normalize_session_mode(getattr(entry, "mode", None)) in skip_modes:
+            continue
+        turn_count = int(getattr(entry, "turn_count", 0) or 0)
+        if _TRUNCATED_AT.get(entry.session_id) == turn_count:
+            continue
 
         session = mgr.get_session(entry.session_id)
         if session is None or not session.turns:
@@ -156,17 +225,11 @@ async def summarize_unsummarized_sessions(
             for t in session.turns[-_SUMMARY_TURN_WINDOW:]
         )
         try:
-            result = await llm_client.generate(
-                messages=[{
-                    "role": "user",
-                    "content": f"以下の会話を1-2文で要約してください:\n\n{turns_text}",
-                }],
-                stream=False,
-                max_tokens=128,
-                purpose="summarize",
-                id_slot=getattr(llm_client, "background_slot", -1),
-            )
-            summary = result["choices"][0]["message"]["content"].strip()
+            summary = await _generate_summary(llm_client, turns_text, entry.session_id)
+            if summary is None:
+                _TRUNCATED_AT[entry.session_id] = turn_count
+                continue
+            _TRUNCATED_AT.pop(entry.session_id, None)
             emb = await embedder.embed([summary], is_query=False)
             # 要約の基にしたターン数を刻む。会話がここから伸びたら次回作り直す。
             fields: dict[str, Any] = {

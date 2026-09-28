@@ -87,7 +87,9 @@ def attribute_key(subject: str) -> str | None:
     注入されていた。
 
     会話要約 (``mem.decision.history.session.<id>``) は末尾がセッション ID
-    なので互いに衝突せず、そのまま残る。
+    (の先頭 12 文字) なので、別の会話の要約が同じキーを共有しうる
+    (``audit0927-c04`` と ``audit0927-c05``)。競合の検出は provenance の
+    ``session_id`` で束ね直す (``SemanticConflictResolver._detect_groups``)。
 
     Returns:
         属性キー。取り出せない (階層が浅い / 汎用語) 場合は ``None``。

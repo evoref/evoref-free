@@ -35,6 +35,7 @@ from backend.free.memory.notes.note_builder import (
     is_multi_valued_subject,
     is_single_valued_subject,
 )
+from backend.free.memory.semantic.fact import fact_carries_span, fact_value_update
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -67,8 +68,7 @@ def persist_facts(
     Returns:
         実際に書き込まれたファクト数。
     """
-    written = 0
-    persisted: list = []
+    kept: list = []
     # 同じスロット名 (subject の末尾) と同じ本文を持つファクトが kind 違いで
     # 並ぶことがある (color / beverage は personal_fact と preference の両節に
     # あり、一人称の申告は両タグに当たる)。同じ値を 2 件 live にしない
@@ -84,23 +84,93 @@ def persist_facts(
             )
             continue
         seen_values.add(key)
-        try:
-            store.add_fact(fact)
-            written += 1
-            persisted.append(fact)
-        except Exception as exc:
-            logger.warning(
-                "Step 8 [%s]: failed to add fact %s: %s",
-                label, fact.id, exc,
-            )
-    _supersede_corrected_slots(store, persisted, label)
-    _retire_assertions_contradicted_by_change(store, persisted, label)
+        kept.append(fact)
+    written = len(write_sleep_facts(store, kept, label=label))
     if written:
         logger.debug("Step 8 [%s]: persisted %d facts", label, written)
     return written
 
 
+def write_sleep_facts(
+    store: "SemanticFactStore", facts: list, *, label: str,
+) -> list:
+    """sleep-time の SemMem 書込みの **共通入口** (不変則 #13)。
+
+    Step 8 / 8.3 / 8.4 / 8.5 / 8.6 / 9 のファクト追加はすべてここを通す。以前は
+    Step 8.4 (``assertion_curator``) が ``store.add_fact`` を直に呼び、#13 の畳みが
+    Step 8 の出力にしか掛かっていなかった (2026-09-27 監査 F8: 訂正がファクトに
+    ならないまま turn0 の「試験日は2027年4月18日です。」が assertion として作られた)。
+
+    1. ``private`` のファクトは書かない (private セッションの記憶は SemMem へ昇格
+       させない。キュレーターの ``public_notes`` と二重の防御)
+    2. mem が所有しない型 (``FACT_OWNERSHIP``) は書かない (loop / learn の型は
+       各 Fact View を通す)
+    3. 行が置き換える旧値の span (``value_update``) を ``attrs.value_update`` へ
+       載せ、Step 6B と到着時の畳みが後から読めるようにする
+    4. 書いた後に #13 の畳みを掛ける — ``mem.*`` の属性スロットと
+       ``mem.world.assertion.*`` だけ (セッション要約・``idx.*`` には掛けない)
+
+    ``sleep/*`` の ``.add_fact(`` 直呼びは ``test_sleep_fact_write_entry.py`` が禁止する。
+
+    Returns:
+        書き込めたファクト (入力の順)。
+    """
+    from backend.free.memory.ownership import can_write
+
+    persisted: list = []
+    for fact in facts:
+        if getattr(fact, "private", False):
+            logger.warning(
+                "Step 8 [%s]: private fact %s not written to SemMem", label, fact.subject,
+            )
+            continue
+        try:
+            owned = can_write("mem", fact.type)
+        except KeyError:
+            owned = False
+        if not owned:
+            logger.warning(
+                "Step 8 [%s]: %s (%s) is not owned by EvorefMem; not written",
+                label, fact.subject, fact.type,
+            )
+            continue
+        span = getattr(fact, "value_update", None)
+        if span:
+            fact._extra = {**(getattr(fact, "_extra", None) or {}), "value_update": str(span)}
+        try:
+            store.add_fact(fact)
+        except Exception as exc:
+            logger.warning(
+                "Step 8 [%s]: failed to add fact %s: %s", label, fact.id, exc,
+            )
+            continue
+        persisted.append(fact)
+    foldable = [fact for fact in persisted if _is_foldable(fact)]
+    if foldable:
+        _supersede_corrected_slots(store, foldable, label)
+        _retire_assertions_contradicted_by_change(store, foldable, label)
+    return persisted
+
+
+def _is_foldable(fact: object) -> bool:
+    """#13 の畳みを掛ける subject か (属性スロットと assertion。要約・索引は除く)。"""
+    from backend.free.memory.notes.subject_ns import is_session_summary_subject
+
+    subject = str(getattr(fact, "subject", "") or "")
+    return subject.startswith("mem.") and not is_session_summary_subject(subject)
+
+
 _ASSERTION_SUBJECT_PREFIX = "mem.world.assertion."
+
+
+def _folds_as_multi_valued(subject: str) -> bool:
+    """畳む範囲を旧値の span で絞るスロットか (不変則 #13)。
+
+    ``multi_valued: true`` の宣言済みスロットと汎用スロットに加え、宣言を持たない
+    ``mem.world.assertion.*`` も多値を既定にする — 同じ slug に並ぶ値 (試験が 2 つ:
+    応用情報 4/25 と基本情報 10/12) を訂正 1 件で全部畳まない (2026-09-27 監査 F8)。
+    """
+    return is_multi_valued_subject(subject) or subject.startswith(_ASSERTION_SUBJECT_PREFIX)
 
 
 def _old_value_spans(fact: object) -> list[str]:
@@ -255,7 +325,7 @@ def _supersede_corrected_slots(
         # を旧値の言明へ置換した行、J-03) が旧世代を畳む側に回る。
         return bool(
             getattr(fact, "from_correction", False)
-            or getattr(fact, "value_update", False)
+            or fact_value_update(fact)
             or is_single_valued_subject(getattr(fact, "subject", "") or "")
         )
 
@@ -283,16 +353,13 @@ def _supersede_corrected_slots(
             continue
         # 本人の値更新は **旧値を含む世代だけ** を畳む。schedule のような並列多値
         # スロットで全兄弟を畳むと、別の予定 (提案書の送付日) まで消える。
-        update_span = str(getattr(fact, "value_update", "") or "")
+        update_span = fact_value_update(fact)
         if update_span:
             from backend.free.core.correction_verdict import norm_span
 
             needle = norm_span(update_span)
-            siblings = [
-                o for o in siblings
-                if needle and needle in norm_span(str(getattr(o, "object", "") or ""))
-            ]
-        elif is_multi_valued_subject(fact.subject):
+            siblings = [o for o in siblings if fact_carries_span(o, needle)]
+        elif _folds_as_multi_valued(fact.subject):
             # **並列多値スロットは、どの要素を置き換えるか特定できないなら
             # 畳まない。** 単値スロットの全畳みは「単値」の定義そのものだが、
             # 多値 (family / schedule) で同じことをすると、無関係な兄弟が
@@ -388,7 +455,18 @@ def _retire_stale_arrivals_into_corrected_slots(
     ``from_correction`` の live 値があるなら、自分は既に無効化された世代**。
     訂正は自分より前の発言しか無効化できない (G-04) という既存の原則の対偶で、
     符号が逆になっただけ。
+
+    **多値スロットでは宛先で絞る** (不変則 #13、2026-09-27 監査 F8): 訂正が旧値の
+    span を持つなら、その span を本文に含む到着だけを畳む (試験が 2 つあるとき、
+    訂正済みの応用情報の slot へ後から届いた基本情報の日付を消さない)。span の無い
+    訂正は、宣言済みの多値スロットでは従来どおり畳み (span を永続化する前に書かれた
+    訂正で F-14 を失わないため)、``mem.world.assertion.*`` では畳まない。span の無い
+    畳みは **訂正と会話 (session) か元ノートを共有する到着に限る** — 別セッションの
+    「息子は中学1年です。」が、value_update の無い「夫と小学 4 年の娘の3人」の訂正で
+    畳まれた (2026-09-27 独立レビュー M-b、M1 と同じ実害の別経路)。
     """
+    from backend.free.core.correction_verdict import norm_span
+
     retired = 0
     for fact in persisted:
         if getattr(fact, "superseded_by", None):
@@ -404,6 +482,7 @@ def _retire_stale_arrivals_into_corrected_slots(
                 "Step 8 [%s]: failed to list slot %s: %s", label, fact.subject, exc,
             )
             continue
+        multi = _folds_as_multi_valued(fact.subject)
         winner = None
         for other in siblings:
             if other.id == fact.id or other.predicate != fact.predicate:
@@ -412,6 +491,15 @@ def _retire_stale_arrivals_into_corrected_slots(
                 continue
             if getattr(other, "created_at", 0.0) <= getattr(fact, "created_at", 0.0):
                 continue
+            if multi:
+                needle = norm_span(fact_value_update(other))
+                if needle and not fact_carries_span(fact, needle):
+                    continue
+                if not needle and (
+                    fact.subject.startswith(_ASSERTION_SUBJECT_PREFIX)
+                    or not _shares_origin(fact, other)
+                ):
+                    continue
             if winner is None or other.created_at > winner.created_at:
                 winner = other
         if winner is None:
@@ -431,6 +519,23 @@ def _retire_stale_arrivals_into_corrected_slots(
             label, fact.id, winner.id,
         )
     return retired
+
+
+def _shares_origin(a: object, b: object) -> bool:
+    """2 つのファクトが同じ会話 (session) か同じ元ノートに由来するか (純粋関数)。"""
+    def _origin(fact: object) -> tuple[set[str], set[str]]:
+        sessions = set(getattr(fact, "session_ids", None) or ())
+        notes: set[str] = set()
+        for prov in getattr(fact, "provenances", None) or ():
+            if getattr(prov, "session_id", None):
+                sessions.add(prov.session_id)
+            if getattr(prov, "note_id", None):
+                notes.add(prov.note_id)
+        return sessions, notes
+
+    a_sessions, a_notes = _origin(a)
+    b_sessions, b_notes = _origin(b)
+    return bool(a_sessions & b_sessions or a_notes & b_notes)
 
 
 #: ``mem.<kind>.<attr>`` の ``kind`` → ``FactType``。値アンカー用の逆引き。
@@ -840,4 +945,5 @@ __all__ = [
     "extract_and_split_semantic_facts",
     "extract_semantic_facts",
     "persist_facts",
+    "write_sleep_facts",
 ]

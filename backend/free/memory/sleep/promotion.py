@@ -32,6 +32,7 @@ from backend.free.core.session_mode import (
 )
 from backend.free.memory._defaults import reset_trigger_path_cache, trigger_cache_key
 from backend.free.memory.notes.subject_ns import make_mem_subject
+from backend.free.memory.sleep.extraction import write_sleep_facts
 from backend.free.memory.types import (
     Provenance,
     SemanticFact,
@@ -332,7 +333,8 @@ def promote_history_to_semmem(
             ),
         ]
         try:
-            store.add_fact(fact)
+            if not write_sleep_facts(store, [fact], label="promotion"):
+                continue
             _supersede_earlier_summaries(
                 store, subject, fact, entry.session_id,
             )

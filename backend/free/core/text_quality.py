@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable, Sequence
 from functools import cache
+from backend.free.core.numerals import kanji_number_value
+from backend.free.core.response_arithmetic import iter_ja_numbers, normalize_numerals
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
     HIRAGANA,
@@ -979,13 +981,21 @@ _SELF_REFERENCE_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく|うち)
 
 #: 本人以外の人を指す名詞 (家族・続柄・関係者・三人称)。この語に主格 / 主題の
 #: 助詞が続く節は **その人についての** 述語で、本人の属性ではない。
-_OTHER_PERSON_NOUN_RE = re.compile(
+_OTHER_PERSON_NOUN = (
     r"(?:妹|弟|姉|兄|母|父|両親|祖父|祖母|夫|妻|主人|旦那|家内|息子|娘|子ども|子供|"
     r"孫|叔父|叔母|甥|姪|いとこ|従兄弟|従姉妹|親戚|友人|友達|同僚|上司|部下|同期|"
     r"先輩|後輩|恋人|彼氏|彼女|彼|パートナー|ルームメイト|隣人|知人|先生|社長)"
     r"(?:さん|ちゃん|くん|君|たち|達)?"
-    r"(?:が|は|も)",
+    # 語の境界: 直後が助詞・区切り・括弧 (「夫婦」「社長室」「娘道成寺」を人と読まない)
+    r"(?=[がはもをにでとのへやか、。，,・（(「」）)\s]|$)"
 )
+_OTHER_PERSON_NOUN_RE = re.compile(_OTHER_PERSON_NOUN + r"(?:が|は|も)")
+#: 値の後ろ (同じ節の中) に続く「…の<本人以外の人>」— 値がその人を修飾している
+#: (「卵アレルギーの子ども」)。名詞の一覧は :data:`_OTHER_PERSON_NOUN_RE` と共有する。
+_MODIFIED_PERSON_RE = re.compile(
+    r"[^、。，,！!？?\n]{0,12}?の(?P<person>" + _OTHER_PERSON_NOUN + r")",
+)
+_PERSON_HONORIFIC_TAIL_RE = re.compile(r"(?:さん|ちゃん|くん|君|たち|達)$")
 
 
 #: 人を指す語の直後の斜格の助詞。「息子と一緒に」「妻に」「娘を」— その人は
@@ -1124,6 +1134,64 @@ def attribute_belongs_to_another_person(
             if last_self > last_other:
                 return False
     return saw_trigger
+
+
+#: 一人称の直後の「の<本人以外の人>」(「私の娘の」— 持ち主は娘)。
+_SELF_THEN_OTHER_RE = re.compile(r"の" + _OTHER_PERSON_NOUN)
+#: 一人称が持ち主 / 主語として立つ形 (直後が の / は / が / も)。
+_SELF_OWNER_TAIL_RE = re.compile(r"[のはがも]")
+
+
+def names_self_as_owner(sentence: str) -> bool:
+    """文に一人称が属性の持ち主 / 主語として現れるか (純粋関数)。
+
+    「すみません、**私の**アレルギーは卵ではなく小麦でした。」は主語を省いて
+    いない本人の訂正 (独立レビュー M3)。「私の娘のアレルギーは…」のように
+    一人称の後に本人以外の人が続く形は、持ち主がその人なので数えない。
+    一人称の語は :data:`_SELF_REFERENCE_RE`、人名詞は
+    :data:`_OTHER_PERSON_NOUN_RE` と同じ一覧を使う。
+    """
+    text = sentence or ""
+    for m in _SELF_REFERENCE_RE.finditer(text):
+        tail = text[m.end():]
+        if _SELF_THEN_OTHER_RE.match(tail):
+            continue
+        if _SELF_OWNER_TAIL_RE.match(tail):
+            return True
+    return False
+
+
+def value_modifies_another_person(
+    sentence: str, value: str, own_words: tuple[str, ...] = (),
+) -> bool:
+    """``value`` が同じ節の中で「…の<本人以外の人>」を修飾しているか (純粋関数)。
+
+    「卵アレルギーの子ども（5歳）がいます。」の卵は子どもの属性で、主語を省いた
+    訂正「アレルギーは卵ではなく小麦でした」の旧値の持ち主は子ども
+    (2026-09-27 監査 F10)。:func:`attribute_belongs_to_another_person` は値の
+    **前** の主語 (「妹が…住んで」) を見るので、後ろから修飾される人を拾えない。
+    人名詞の一覧は同じもの (:data:`_OTHER_PERSON_NOUN_RE`) を使う。
+
+    ``own_words`` の人 (呼出側のスロットのトリガ語。family の「娘」「夫」) は
+    本人以外と数えない — 「小学3年の娘」の娘は家族スロットの値そのもの。
+    ``value`` の全出現が他者を修飾しているときだけ True。
+    """
+    text = sentence or ""
+    if not text or not value:
+        return False
+    own = {w for w in own_words if w}
+    saw = False
+    search_from = 0
+    while (pos := text.find(value, search_from)) >= 0:
+        search_from = pos + len(value)
+        saw = True
+        m = _MODIFIED_PERSON_RE.match(text, pos + len(value))
+        if m is None:
+            return False
+        person = _PERSON_HONORIFIC_TAIL_RE.sub("", m.group("person"))
+        if person in own:
+            return False
+    return saw
 
 
 #: 従属節の切れ目 (接続助詞 + 読点)。依頼文の中で「言明の節」と「依頼の節」を
@@ -1352,12 +1420,6 @@ __all__ = [
     "fabricated_household_count",
 ]
 
-#: 人数の表記に現れる漢数字 (1〜99 まで)。世帯の人数はこの範囲で足りる。
-_KANJI_DIGITS = {
-    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-    "六": 6, "七": 7, "八": 8, "九": 9,
-}
-
 #: 「N 人」「N 名」の N。漢数字・全角・半角を受ける。
 _PERSON_COUNT_RE = re.compile(r"([0-9０-９一二三四五六七八九十]{1,4})\s*[人名]")
 
@@ -1369,18 +1431,12 @@ _HOUSEHOLD_WINDOW_CHARS = 40
 
 
 def _person_count_to_int(token: str) -> int | None:
-    """「4」「４」「四」「十二」を int へ (1〜99、読めなければ ``None``)。"""
-    t = token.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-    if t.isdigit():
-        return int(t)
-    if "十" in t:
-        head, _, tail = t.partition("十")
-        tens = _KANJI_DIGITS.get(head, 1) if head else 1
-        ones = _KANJI_DIGITS.get(tail, 0) if tail else 0
-        if (head and head not in _KANJI_DIGITS) or (tail and tail not in _KANJI_DIGITS):
-            return None
-        return tens * 10 + ones
-    return _KANJI_DIGITS.get(t)
+    """「4」「４」「四」「十二」を int へ (読めなければ ``None``)。
+
+    読み取りは :func:`backend.free.core.numerals.kanji_number_value` の 1 本
+    (不変則 #14(a)、2026-09-28 レビュー M3)。
+    """
+    return kanji_number_value(token)
 
 
 def _person_counts_in(text: str) -> set[int]:
@@ -1654,6 +1710,101 @@ def cites_reference_material(text: str) -> bool:
     return bool(_REFERENCE_LABEL_RE.search(text or ""))
 
 
+#: プロンプトに載せる参考枠の見出し名 → 応答で使う普通の語 (ja, en)。
+#: 出す側は ``inference._SEMMEM_BLOCK_LABEL`` / ``_FILES_HEADER`` /
+#: ``RAG_ENTRY_PREFIX`` / ``prompt_manager.REFERENCE_BLOCK_DIRECTIVES`` /
+#: ``conflict_review`` の見出し / :data:`SYSTEM_MEASUREMENT_MARKER` / 注記の見出し
+#: で、ここが一覧の SSOT (docs/f_02 §8.4)。範囲は **システムがプロンプトへ角括弧で
+#: くくって載せる枠名** に限る — ノートの先頭マーク ``[要約]`` はモデルが普通の
+#: 見出しとして書く語なので含めない。英語の語は冠詞なし (付けるかは文脈で決める)。
+INTERNAL_FRAME_HEADINGS: dict[str, tuple[str, str]] = {
+    "関連する記憶": ("以前の記録", "earlier records"),
+    "参考情報": ("資料", "reference material"),
+    "参考例": ("例", "example"),
+    "添付ファイル": ("添付ファイル", "attached file"),
+    "記憶の競合 — 未解決": ("記録の食い違い", "conflicting records"),
+    "記憶の競合": ("記録の食い違い", "conflicting records"),
+    "Memory conflicts — unresolved": ("記録の食い違い", "conflicting records"),
+    SYSTEM_MEASUREMENT_MARKER.strip("[]"): ("計測結果", "measurement"),
+    "訂正の対象": ("訂正の対象", "correction target"),
+    "可視範囲": ("会話の範囲", "visible range"),
+    "直前に作成した成果物": ("直前に作成した成果物", "previous output"),
+    "この結果の実測値": ("実測値", "measured values"),
+    "今日の他の会話 — システムが履歴索引から確定した事実": ("今日の他の会話", "today's other conversations"),
+}
+
+#: 見出しを囲む括弧 (半角 / 全角の角括弧、隅付き、鉤括弧)。応答では全角の
+#: 「［関連する記憶］」と「「関連する記憶」」も出ている (2026-09-27 監査)。
+#: 鉤括弧は応答側の言及の形 (:data:`_PROVIDED_BEFORE_RE`) の直後に限る。
+FRAME_HEADING_OPENERS = "[［【「"
+_FRAME_HEADING_CLOSERS = "]］】」"
+
+#: 括弧でくくられた見出し名 (``[参考情報 2]`` のような番号付きを含む)。
+#: 括弧の中が見出し名 (+ 番号) **だけ** のときに限る — 「「関連する記憶力の研究」」
+#: 「[注意]」「[1, 2, 3]」は当たらない。長い名前を先に並べる (「記憶の競合 — 未解決」
+#: を「記憶の競合」で切らない)。直後が ``(`` なら Markdown のリンクなので当たらない。
+FRAME_HEADING_RE = re.compile(
+    "(?P<open>[" + re.escape(FRAME_HEADING_OPENERS) + r"])\s*(?P<name>"
+    + "|".join(re.escape(n) for n in sorted(INTERNAL_FRAME_HEADINGS, key=len, reverse=True))
+    + r")\s*[0-9０-９]*\s*[" + re.escape(_FRAME_HEADING_CLOSERS) + r"](?!\()",
+)
+#: 鉤括弧の見出しを言い換えてよい直前の形 (「ご提示いただいた「関連する記憶」」)。
+_PROVIDED_BEFORE_RE = re.compile(
+    r"(?:ご?提示|ご?提供|与え|注入)(?:いただいた|頂いた|された|られた)\s*$",
+)
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+#: 英語の語の前に冠詞を足さなくてよい直前の語。
+_EN_DETERMINER_BEFORE_RE = re.compile(
+    r"\b(?:the|a|an|this|that|these|those|your|my|our|its)\s*$", re.IGNORECASE,
+)
+
+
+def _inside_code(before: str) -> bool:
+    """``before`` の末尾がコードブロック / インラインコードの内側か。"""
+    if before.count("```") % 2 == 1:
+        return True
+    line = before.rsplit("\n", 1)[-1].replace("```", "")
+    return line.count("`") % 2 == 1
+
+
+def rewrite_frame_headings(text: str, *, context: str = "", query: str = "") -> str:
+    """応答に出た参考枠の見出し名を普通の語へ言い換える (純粋関数、出力検査)。
+
+    ``[関連する記憶]`` はユーザーに見えない内部の枠の名前で、応答に出ると
+    「ご提示いただいた [関連する記憶]（…）は」のように、ユーザーが示していない
+    資料をユーザーのものとして扱う文になる (2026-09-27 監査 F11 / C01#5)。
+    消すと文の主語が抜けるので言い換える。本文 (見出しを除く) か ``context``
+    (ストリーミングで直前に出した本文) に日本語があれば日本語の語、英字だけなら
+    英語の語 (直前に冠詞・限定詞が無ければ ``the`` を付ける)。
+
+    書き換えないもの (独立レビュー M2): コードブロック / インラインコードの内側、
+    Markdown のリンク (直後が ``(``)、応答側の言及の形の後ろでない鉤括弧、
+    ユーザーの発話 (``query``) にそのまま現れる枠名 (ユーザーが持ち込んだ語)。
+    """
+    if not text or FRAME_HEADING_RE.search(text) is None:
+        return text
+    rest = FRAME_HEADING_RE.sub("", context + text)
+    # 英語と決めるのは英単語 (2 文字以上) があるときだけ — 「[x]」の 1 文字では
+    # 決めない (ストリーミングでは後ろの本文がまだ見えない)。
+    english = not _JA_CHAR_RE.search(rest) and bool(_LATIN_WORD_RE.search(rest))
+
+    def _replace(m: re.Match[str]) -> str:
+        name = m.group("name")
+        before = context + text[:m.start()]
+        if query and name in query:
+            return m.group(0)
+        if _inside_code(before):
+            return m.group(0)
+        if m.group("open") == "「" and not _PROVIDED_BEFORE_RE.search(before):
+            return m.group(0)
+        ja, en = INTERNAL_FRAME_HEADINGS[name]
+        if not english:
+            return ja
+        return en if _EN_DETERMINER_BEFORE_RE.search(before) else f"the {en}"
+
+    return FRAME_HEADING_RE.sub(_replace, text)
+
+
 def abstains_on_reference_material(text: str) -> bool:
     """応答が「提供された参考情報には記載が無い」と述べて答えを差し控えているか (純粋関数)。
 
@@ -1740,11 +1891,6 @@ def extract_calculate_result(prompt_text: str) -> float | None:
         return None
 
 
-#: 応答本文の数値 (桁区切り / 万進 / 全角)。
-_RESPONSE_NUMBER_RE = re.compile(
-    r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?P<unit>兆|億|千万|百万|万|千)?",
-)
-_MYRIAD_SCALE = {"兆": 1e12, "億": 1e8, "千万": 1e7, "百万": 1e6, "万": 1e4, "千": 1e3}
 #: 単位換算で正当に現れうる倍率 (分↔時↔日、%、万単位)。増やすほど偶然の
 #: 一致で見逃す (月割 1/12 を入れると T03 の「約140万円」が結果/12 に 2.9% で
 #: 当たり、誤答が成功のままになった)。
@@ -1752,19 +1898,13 @@ _RESULT_SCALES = (1.0, 60.0, 1 / 60.0, 24.0, 1 / 24.0, 100.0, 0.01, 1e4, 1e-4)
 
 
 def _response_numbers(text: str) -> list[float]:
-    out: list[float] = []
-    for m in _RESPONSE_NUMBER_RE.finditer(
-        (text or "").translate(str.maketrans("０１２３４５６７８９．，", "0123456789.,")),
-    ):
-        try:
-            value = float(m.group("num").replace(",", ""))
-        except ValueError:
-            continue
-        unit = m.group("unit")
-        if unit:
-            value *= _MYRIAD_SCALE[unit]
-        out.append(value)
-    return out
+    """応答本文の数値 (純粋関数)。読みは ``response_arithmetic.iter_ja_numbers`` の 1 本。
+
+    「2 万 4,667 円」は 24667 の 1 つ。以前の読み手は単位を 1 つしか見ず 20000 と
+    4667 に割っていたため、calculate の結果 24666.67 をそのまま述べた回答を
+    「結果の無視」と判定した (2026-09-27 監査 C01#3)。
+    """
+    return [n.value for n in iter_ja_numbers(text)]
 
 
 def ignores_calculate_result(response: str, result: float | None) -> str | None:
@@ -1778,6 +1918,10 @@ def ignores_calculate_result(response: str, result: float | None) -> str | None:
     一致しなければ「使っていない」。本文に数値が無いターンは判定しない
     (使ったかどうかを数で確かめられない)。
 
+    **大きさで比べる**。本文の数は符号を読まない (「7万4千円不足します」「12.5%減少」
+    は負の結果を言葉で述べる) ので、符号付きで比べると負の結果に正しく答えた
+    ターンがすべて「無視」になる (独立レビュー H1)。
+
     Returns:
         失敗理由。使っている / 判定不能なら ``None``。
     """
@@ -1789,8 +1933,8 @@ def ignores_calculate_result(response: str, result: float | None) -> str | None:
     magnitude = abs(result)
     for value in numbers:
         for scale in _RESULT_SCALES:
-            expected = result * scale
-            tolerance = max(abs(expected) * 0.05, 0.5 if magnitude >= 1 else 0.005)
+            expected = magnitude * scale
+            tolerance = max(expected * 0.05, 0.5 if magnitude >= 1 else 0.005)
             if abs(value - expected) <= tolerance:
                 return None
     return f"calculate result {result:g} does not appear in the answer"
@@ -1813,18 +1957,17 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
     if result is None or result != result or result == 0:
         return []
     out: list[str] = []
-    for m in _RESPONSE_NUMBER_RE.finditer(_CODE_FENCE_RE.sub("\n", text or "")):
-        if m.group("unit"):
+    # 全角の「２７．８」も読む (位置を保つ正規化。読み手と同じ綴りで小数桁を数える)
+    body = normalize_numerals(_CODE_FENCE_RE.sub("\n", text or ""))
+    magnitude = abs(result)  # 本文の数は符号を読まない (ignores_calculate_result と同じ)
+    for num in iter_ja_numbers(body):
+        if num.has_unit:
             continue
-        raw = m.group("num")
-        try:
-            value = float(raw.replace(",", ""))
-        except ValueError:
-            continue
+        raw = body[num.start:num.end].strip()
         decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
-        if abs(value - result) > 10 ** -decimals:
+        if abs(num.value - magnitude) > 10 ** -decimals:
             continue  # 最小桁 1 つぶんより離れた数は別の量 (基準値の 25 等)
-        if round(result, decimals) != round(value, decimals) and raw not in out:
+        if round(magnitude, decimals) != round(num.value, decimals) and raw not in out:
             out.append(raw)
     return out
 

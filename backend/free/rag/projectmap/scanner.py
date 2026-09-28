@@ -81,6 +81,20 @@ def _is_excluded_dir(name: str, exclude_globs: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in exclude_globs)
 
 
+def _is_nested_checkout(directory: Path) -> bool:
+    """``.git`` が **ファイル** のディレクトリ (入れ子の git worktree / submodule) か (c_16 §4.4)。
+
+    別のチェックアウトはこのプロジェクトの構造ではない (2026-09-28 R13: ``.claude/worktrees/``
+    の worktree が走査の 96% を占めた)。ルート自身には掛けない — 呼出元は子ディレクトリだけを渡す。
+    stat が失敗したら (EACCES 等) 入れ子ではないとして続ける — ``os.walk`` と同じく、読めない
+    ディレクトリ 1 つで走査全体を落とさない。
+    """
+    try:
+        return (directory / ".git").is_file()
+    except OSError:
+        return False
+
+
 def _matches_exclude_glob(rel_posix: str, exclude_globs: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(rel_posix, pattern) for pattern in exclude_globs)
 
@@ -129,7 +143,9 @@ def scan_project(
     # ``os.walk`` で降りる前に刈る (``search_code`` ツールと同じ形)。
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = sorted(
-            d for d in dirnames if not _is_excluded_dir(d, exclude_globs)
+            d for d in dirnames
+            if not _is_excluded_dir(d, exclude_globs)
+            and not _is_nested_checkout(Path(dirpath) / d)
         )
         rel_dir = Path(dirpath).relative_to(base)
         for filename in filenames:

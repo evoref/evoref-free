@@ -13,10 +13,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from backend.free.core.correction_target import (
+    CONTRAST_MARKER,
+    contrast_pairs,
+    wrong_side_spans,
+)
 from backend.free.core.date_math_cue import (
     DATE_MATH_CUE_RE,
+    DAY_COUNT_ASK_RE,
+    YEAR_REMAINDER_RE,
+    asks_day_count,
     query_has_date_math_cue,
 )
+from backend.free.core.numerals import kanji_number_value
+from backend.free.core.response_dates import nearest_date
+from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
 from backend.free.core.relative_date import (
     WEEK_OF_WEEKDAY_RE,
     WEEK_OFFSETS,
@@ -265,18 +276,9 @@ def _absolute_weekday_command(query: str) -> str:
     )
 
 
-#: 「あと何日」「何日間」「残り日数」等、**2 点間の日数** を尋ねる語。
-_DAY_COUNT_ASK_RE = re.compile(
-    # ``何日です`` は「何月何日ですか」(= 日付を訊く問い) も飲み込む。年なし日付を
-    # 読むようになって初めて実害が出た: 「9 月 14 日の 3 週間前は何月何日ですか？」
-    # が日数カウント側に取られ、``days: 20`` (今日から 9/14 までの日数) を返した。
-    # 直前が ``何月`` のときだけ除外し、「あと何日ですか」は従来どおり拾う。
-    r"何日間|あと何日|残り\s*(?:の)?\s*日数|日数は|何日ある|(?<!何月)何日です"
-    r"|まで(?:は)?\s*何日"
-    r"|(?<![A-Za-z])how\s+many\s+days(?![A-Za-z])"
-    r"|(?<![A-Za-z])days\s+(?:left|remaining|until)(?![A-Za-z])",
-    re.IGNORECASE,
-)
+#: 「あと何日」「何日間」「残り日数」等、**2 点間の日数** を尋ねる語。SSOT は
+#: :mod:`backend.free.core.date_math_cue` (層 5.97 の手掛かりと 1 本、2026-09-27)。
+_DAY_COUNT_ASK_RE = DAY_COUNT_ASK_RE
 
 #: 「今週 / 来週 / 再来週 / 先週 / 先々週」の何曜日、という指定。
 #:
@@ -333,12 +335,9 @@ _DAY_COUNT_BACKWARD_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: 「今年の残り」「年末まで」— 年末までの日数。
-_YEAR_REMAINDER_RE = re.compile(
-    r"今年.{0,6}(?:残り|あと)|年末まで|(?:残り|あと).{0,4}今年"
-    r"|(?<![A-Za-z])rest\s+of\s+(?:the\s+)?year(?![A-Za-z])",
-    re.IGNORECASE,
-)
+#: 「今年の残り」「年末まで」— 年末までの日数。SSOT は core.date_math_cue
+#: (corpus 省略の「両端が閉じた日数の問い」と同じ定義)。
+_YEAR_REMAINDER_RE = YEAR_REMAINDER_RE
 
 
 #: ``_iter_query_dates`` が返す 1 件。``year`` が ``None`` なら年が書かれて
@@ -441,6 +440,104 @@ def _iter_query_dates(query: str) -> list[_QueryDate]:
     return found
 
 
+def _wrong_side_ranges(text: str) -> list[tuple[int, int]]:
+    """訂正文の「誤りの側」(:func:`wrong_side_spans`) の文字位置の範囲 (純粋関数)。
+
+    誤りの側の判定は訂正宛先と同じ SSOT を使い、ここは位置を引くだけ
+    (区間は各文の先頭から印までの逐語の部分文字列で、出現順に並ぶ)。
+    """
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for span in wrong_side_spans(text or ""):
+        if not span:
+            continue
+        at = (text or "").find(span, cursor)
+        if at < 0:
+            continue
+        ranges.append((at, at + len(span)))
+        cursor = at + len(span)
+    return ranges
+
+
+#: 対比の印の後ろに付く「て」と読点 (「じゃなくて、」)。区間を消すときに印と一緒に落とす。
+_CONTRAST_TAIL_RE = re.compile(r"て?[、，,]?\s*")
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectedSpan:
+    """訂正の **誤りの側** の区間 (``text[start:end]``)。
+
+    ``marker_end`` は対比の形 (「X ではなく Y」) のときだけ印 (と「て」「、」) の
+    終わりを指し、``text[start:marker_end]`` を消すと訂正後の文になる。対比の形で
+    ないとき (「4月18日は間違いで」) は ``None``。
+    """
+
+    start: int
+    end: int
+    marker_end: int | None
+
+
+def corrected_value_spans(text: str) -> list[CorrectedSpan]:
+    """訂正文の誤りの側の区間 (純粋関数)。規則層・抽出器の文脈・会話の終点が共有する。
+
+    **対比の形 (``contrast_pairs``) の旧値の区間を第一に** 採り、対比の形が 1 つも
+    無いときだけ ``wrong_side_spans`` (文頭から誤りの印まで) に落ちる。後者は区間が
+    広く、「申込締切は1月10日、試験日は4月18日ではなく4月25日です」で 1月10日まで
+    誤りの側に入れていた (独立レビュー、不変則 #14(a): 2 系統の判定の食い違い)。
+    """
+    text = text or ""
+    spans: list[CorrectedSpan] = []
+    cursor = 0
+    for old, _new in contrast_pairs(text):
+        m = re.compile(re.escape(old) + r"\s*" + CONTRAST_MARKER).search(text, cursor)
+        if m is None:
+            continue
+        tail = _CONTRAST_TAIL_RE.match(text, m.end())
+        spans.append(CorrectedSpan(m.start(), m.start() + len(old), tail.end()))
+        cursor = m.end()
+    if spans:
+        return spans
+    return [CorrectedSpan(s, e, None) for s, e in _wrong_side_ranges(text)]
+
+
+def _drop_corrected_dates(text: str, dates: list[_QueryDate]) -> list[_QueryDate]:
+    """訂正の **誤りの側** にある日付を除く (純粋関数)。
+
+    「試験日は4月18日ではなく4月25日でした。残り日数と…計算し直して」は日付が
+    2 つあるので 2 点間の形に取られ、4/18→4/25 の 7 日を組んでいた
+    (2026-09-27 ライブ監査 C09#4、正 210 日)。4月18日は訂正前の値で、数える
+    相手ではない。
+    """
+    spans = corrected_value_spans(text)
+    if not spans:
+        return dates
+    return [d for d in dates if not any(s.start <= d.start < s.end for s in spans)]
+
+
+def without_corrected_dates(text: str) -> str:
+    """訂正の誤り側の **日付** を落とした文 (純粋関数)。
+
+    対比の形は旧値と印ごと落として訂正後の文にする (「4月18日ではなく4月25日
+    でした」「4月18日じゃなくて4月25日です」→「4月25日でした / です」)。対比の
+    形でない訂正は誤りの側にある日付の綴りだけを落とす。日付演算の抽出器へ渡す
+    文脈に使う (tool_call_judge、docs/f_03 §3.1.2)。
+    """
+    text = text or ""
+    cuts: list[tuple[int, int]] = []
+    dates = _iter_query_dates(text)
+    for span in corrected_value_spans(text):
+        inner = [d for d in dates if span.start <= d.start < span.end]
+        if not inner:
+            continue
+        if span.marker_end is not None:
+            cuts.append((span.start, span.marker_end))
+        else:
+            cuts.extend((d.start, d.end) for d in inner)
+    for start, end in sorted(cuts, reverse=True):
+        text = text[:start] + text[end:]
+    return text
+
+
 def _day_count_command(query: str) -> str:
     """日数を数えるクエリ用に、差分まで Python に計算させるコマンドを返す。
 
@@ -470,9 +567,9 @@ def _day_count_command(query: str) -> str:
     (:data:`_PARTIAL_DATE_RE`)。年を要求していた頃は「9 月 14 日まであと何日
     ですか？」が now-only コマンドへ落ち、日数はモデルの暗算に残っていた。
     """
-    if not _DAY_COUNT_ASK_RE.search(query or ""):
+    if not asks_day_count(query or ""):
         return ""
-    dates = _iter_query_dates(query)
+    dates = _drop_corrected_dates(query, _iter_query_dates(query))
     if len(dates) >= 2:
         a, b = dates[0], dates[1]
         return (
@@ -581,9 +678,8 @@ def _build_datetime_command(query: str) -> str:
         return day_count
     # 「来週の金曜日」型は数字を伴わないので相対オフセットに掛からず、絶対日付
     # でもないため now-only へ落ちて曜日→日付の変換が暗算に残っていた。
-    # 日数カウントが空を返した後に見る — 「今週の金曜日は何日ですか？」は
-    # ``何日です`` で日数側の語彙に掛かるが両端が決まらず空になるので、ここで
-    # 拾える (now-only より常に情報が多い)。
+    # 日数カウントが空を返した後に見る (日数の語彙に掛かっても両端が決まらなければ
+    # 空になるので、ここで拾える。now-only より常に情報が多い)。
     week_of = _week_of_weekday_command(query)
     if week_of:
         return week_of
@@ -1279,15 +1375,10 @@ _YEARLESS_FUTURE_DAYS = 275
 
 def _resolve_yearless(month: int, day: int, today: datetime.date) -> datetime.date | None:
     """年なしの月日を、今日に最も近い巡り (窓内) の日付にする (純粋関数)。"""
-    for year in (today.year - 1, today.year, today.year + 1):
-        try:
-            cand = datetime.date(year, month, day)
-        except ValueError:
-            continue
-        delta = (cand - today).days
-        if -_YEARLESS_PAST_DAYS <= delta <= _YEARLESS_FUTURE_DAYS:
-            return cand
-    return None
+    return nearest_date(
+        month, day, today,
+        past_days=_YEARLESS_PAST_DAYS, future_days=_YEARLESS_FUTURE_DAYS,
+    )
 
 
 #: 「<月>の営業日数」— 期間が月で閉じている数え上げ。月は閉じた集合なので
@@ -1383,30 +1474,19 @@ _NTH_WEEKDAY_OF_MONTH_RE = re.compile(
     r"(?:の)?\s*(?:第\s*(?P<nth>[1-5１-５一二三四五])|(?P<last>最終|最後の))"
     r"\s*(?P<wd>[月火水木金土日])曜"
 )
-_KANJI_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
 
 #: 「N 営業日 前 / 後」— 手掛かり語 + 数量 + 向きで閉じた演算。抽出器が
 #: ``kind: none`` を返したときの決定論の下限 (2026-09-12 (b))。
 _BUSINESS_DAY_OFFSET_RE = re.compile(
     r"(?P<n>\d+|[一二三四五六七八九十]+)\s*(?:営業日|稼働日)\s*(?P<dir>前|後|以内)",
 )
-_KANJI_NUMERALS = {c: i for i, c in enumerate("〇一二三四五六七八九十")}
-
-
 def _kanji_or_digit_to_int(token: str) -> int | None:
-    """「3」「三」「十二」を整数に (十の位まで、純粋関数)。"""
-    if token.isdigit():
-        return int(token)
-    if not token or any(c not in _KANJI_NUMERALS for c in token):
-        return None
-    if "十" not in token:
-        return _KANJI_NUMERALS[token] if len(token) == 1 else None
-    tens, _, ones = token.partition("十")
-    t = 1 if tens == "" else _KANJI_NUMERALS.get(tens)
-    o = 0 if ones == "" else _KANJI_NUMERALS.get(ones)
-    if t is None or o is None or t == 0:
-        return None
-    return t * 10 + o
+    """「3」「三」「十二」を整数に (純粋関数)。
+
+    読み取りは ``core.numerals.kanji_number_value`` の 1 本 (不変則 #14(a)、
+    2026-09-28 再レビュー 6)。
+    """
+    return kanji_number_value(token)
 
 
 def business_day_offset_from_query(query: str) -> DateIntentParams | None:
@@ -1453,9 +1533,9 @@ def nth_weekday_of_month_from_query(
         target = last_day - datetime.timedelta(days=(last_day.weekday() - weekday) % 7)
     else:
         nth_raw = m.group("nth")
-        nth = _KANJI_DIGITS.get(nth_raw) or int(nth_raw.translate(
-            str.maketrans("１２３４５", "12345"),
-        ))
+        nth = kanji_number_value(nth_raw)
+        if nth is None:
+            return None
         first = datetime.date(y, mo, 1)
         offset = (weekday - first.weekday()) % 7
         target = first + datetime.timedelta(days=offset + 7 * (nth - 1))
@@ -1565,6 +1645,112 @@ def previous_answer_date(
             if found is not None:
                 return found
             return None
+    return None
+
+
+#: 日数の問いの終点を名指しする名詞 (「試験日まで」「納期まで」)。漢字・カタカナ
+#: 2 字以上が「まで」に直結する形だけを採る (「今日から」の起点語は別に除く)。
+_DAY_COUNT_TARGET_NOUN_RE = re.compile(
+    f"([{KANJI}{KANJI_MARKS}{KATAKANA_WORD}]{{2,}})\\s*まで",
+)
+#: 終点の名詞にならない語 (起点・現在を指す)。
+_DAY_COUNT_ORIGIN_NOUNS = frozenset({"今日", "本日", "現在", "明日", "昨日"})
+#: 文の境界 (日付と名詞が同じ文にあるかを見る)。
+_SENTENCE_BOUNDARY_RE = re.compile(r"[。．！？!?\n]")
+
+
+def _sentence_start(text: str, pos: int) -> int:
+    """``text`` の位置 ``pos`` を含む文の先頭位置 (純粋関数)。"""
+    start = 0
+    for m in _SENTENCE_BOUNDARY_RE.finditer(text, 0, pos):
+        start = m.end()
+    return start
+
+
+def _next_occurrence(d: _QueryDate, today: datetime.date) -> datetime.date | None:
+    """日付を実日付に (年なしは今日以降の最初の巡り、純粋関数)。"""
+    if d.year is not None:
+        try:
+            return datetime.date(d.year, d.month, d.day)
+        except ValueError:
+            return None
+    for year in range(today.year, today.year + 9):
+        try:
+            cand = datetime.date(year, d.month, d.day)
+        except ValueError:
+            continue
+        if cand >= today:
+            return cand
+    return None
+
+
+def day_count_target_from_conversation(
+    query: str, conversation: list[dict] | None, today: datetime.date,
+) -> DateIntentParams | None:
+    """日数の問いの **終点を会話から継ぐ** (純粋関数)。継げなければ ``None``。
+
+    「今日から試験日まであと何日ありますか？」は発話に日付が無く、規則層
+    (:func:`_day_count_command`) は now-only に落ち、日数はモデルの暗算になった
+    (2026-09-27 ライブ監査 C09#2: 173 日、正 203 日)。終点は 1 ターン前の
+    「試験日は2027年4月18日です。」にある。
+
+    推測はしない (独立レビュー 2026-09-27 の反例):
+
+    - 候補は **その名詞を主題に置いた日付** だけ — 日付の直前の区間 (同じ文の
+      前の日付の後ろ、または文頭から当該日付まで) に「<名詞> は / が / :」がある
+      もの。「申込締切は1月10日、試験日は4月18日です。」で「申込締切まで」なら
+      1月10日 (同じ文の 4月18日は試験日の値)。
+    - 候補が 2 つ以上 (「次の試験日は…。前回の試験日は…」) なら棄権する。
+    - 未来向きの問い (「あと何日」) で終点が今日より前なら棄権する。
+
+    候補は新しい発話から探し、候補を持つ最初の発話だけを見る。今回の発話は
+    内容の一致で飛ばす (末尾に積まれている)。棄権・該当なしは ``None``
+    (呼出側は抽出器に任せる)。
+    """
+    text = query or ""
+    if not asks_day_count(text) or _YEAR_REMAINDER_RE.search(text):
+        return None
+    if _drop_corrected_dates(text, _iter_query_dates(text)):
+        return None
+    nouns = [
+        n for n in _DAY_COUNT_TARGET_NOUN_RE.findall(text)
+        if n not in _DAY_COUNT_ORIGIN_NOUNS
+    ]
+    if not nouns:
+        return None
+    topic_re = re.compile(
+        "(?:" + "|".join(re.escape(n) for n in nouns) + r")\s*(?:は|が|:|：)",
+    )
+    backward = bool(_DAY_COUNT_BACKWARD_RE.search(text))
+    current = " ".join(text.split())
+    for msg in reversed(conversation or []):
+        if str(msg.get("role") or "") != "user":
+            continue
+        content = str(msg.get("content") or "")
+        if " ".join(content.split()) == current:
+            continue
+        candidates: list[_QueryDate] = []
+        previous_end = 0
+        for d in _drop_corrected_dates(content, _iter_query_dates(content)):
+            lead = content[max(previous_end, _sentence_start(content, d.start)):d.start]
+            previous_end = d.end
+            if topic_re.search(lead):
+                candidates.append(d)
+        if not candidates:
+            continue
+        if len(candidates) > 1:
+            logger.info(
+                "day count target abstained: %d candidate dates for %s",
+                len(candidates), nouns,
+            )
+            return None
+        target = _next_occurrence(candidates[0], today)
+        if target is None or (target < today and not backward):
+            return None
+        return DateIntentParams(
+            kind="days_between", start=None, end=target, n=0,
+            skip_weekends=False, holidays=(), count_start_day=False,
+        )
     return None
 
 
@@ -1737,7 +1923,7 @@ def recalled_command_fits_query(
     # リコール層はビルダを通らないので、過去ターンの now-only コマンドを
     # 引き当てると ``date_intent`` 層 (日付演算の唯一の受け皿) の前に確定して
     # しまい、暗算に戻る。日付演算を含むコマンドは従来どおり通す。
-    if _DATE_MATH_CUE_RE.search(query or "") and not _DATE_ARITHMETIC_RE.search(
+    if query_has_date_math_cue(query or "") and not _DATE_ARITHMETIC_RE.search(
         command,
     ):
         return False
@@ -1791,6 +1977,14 @@ def _infer_executable_command(query: str) -> str:
     if is_practice_advice_query(query):
         logger.debug("Practice/advice question, no executable command: %s", query[:50])
         return ""
+    # 日数の問いは「何日」を含まない形もある (「残り日数と総勉強時間を計算し
+    # 直してください」)。日時の入口 (``何日`` 等、表の先頭) に掛からず規則層を
+    # 素通りし、訂正後の 4/25 までの日数が暗算になっていた (2026-09-27 監査
+    # C09#4、独立レビュー)。両端が発話で閉じるときだけコマンドが返る。日時の
+    # ビルダも最初に同じ ``_day_count_command`` を試すので、表の順序と矛盾しない。
+    day_count = _day_count_command(query)
+    if day_count:
+        return day_count
     for pattern, command in _EXECUTABLE_QUERY_COMMANDS:
         if pattern.search(query):
             if callable(command):

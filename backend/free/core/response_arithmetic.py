@@ -21,6 +21,7 @@ few-shot の正例採用ゲート (EvorefLearn) と、ターン成否の決定�
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 #: ``A <op> B (= | ≈ | →) C`` 形式の主張。
 #:
@@ -117,12 +118,64 @@ def find_arithmetic_contradictions(text: str) -> list[str]:
 #: 桁区切りだけを見る素の数値抽出だと ``1,096万4,771`` が ``1,096`` と
 #: ``4,771`` の 2 値に割れ、冒頭の主張値を復元できない。万の前の小数
 #: (「1.5万」) も受ける — 受けないと 15000 が 1.5 と読まれていた。
-_JA_NUMBER_RE = re.compile(
-    r"(?<![\d.,])(?=\d)"
-    r"(?:(?P<oku>\d[\d,]*)\s*億\s*)?"
-    r"(?:(?P<man>\d[\d,]*(?:\.\d+)?)\s*万\s*)?"
-    r"(?P<base>\d[\d,]*(?:\.\d+)?)?",
+#:
+#: **本文の数の読み取りはこの 1 本** (不変則 #14(a))。calculate の結果との突き合わせ
+#: (``text_quality.ignores_calculate_result``) も同じ読みを使う — 別の読み手
+#: (単位を 1 つしか見ない) は「2 万 4,667」を 20000 と 4667 に割り、結果 24666.67 を
+#: 使った回答を「結果の無視」と誤判定した (2026-09-27 監査 C01#3)。
+#:
+#: 数と単位のあいだの空白は許すが **改行は許さない** (「707万\n2. 構成比」を
+#: 7070002 と読まない)。単位の係数は千・百の連鎖を持てる (「3千万」「1万2千3百」
+#: 「5千5百円」)。
+#:
+#: **単位のあとに空白を挟んで次の群をつなぐ** のは、次の群が 3 桁以上・桁区切り付き・
+#: 千/百付きのときだけ (「2 万 4,667」「6857 万 9100」「2 万 6 千円」はつなぐ)。
+#: 「家賃 8 万 2 年分」「年収 500万 3年目」の短い数は別の量 (独立レビュー M2)。
+#: 素の群の直後に空白を挟んで万・億・兆が来るなら、その数は次の数の係数 (「12万 15万」
+#: を 120015 と読まない)。
+_JA_NUM = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_JA_SP = r"[ \t　]*"
+#: 数の末尾 (桁や小数が続かない)。係数の途中で切って次の群へ回すのを防ぐ。
+_JA_NUM_END = r"(?!\d)(?!\.\d)"
+_JA_JOIN = (
+    r"(?:[ \t　]+(?=\d{1,3},\d{3}|\d{3}|" + _JA_NUM + _JA_SP + r"[千百]))?"
 )
+
+
+def _ja_coefficient(group: str) -> str:
+    """単位の係数 (「3千」「5百」「2千3百」「12」「1,855.33」)。"""
+    return (
+        rf"(?=\d)(?:(?P<{group}_k>{_JA_NUM}){_JA_SP}千)?"
+        rf"(?:(?P<{group}_h>{_JA_NUM}){_JA_SP}百)?"
+        rf"(?:(?P<{group}_n>{_JA_NUM}){_JA_NUM_END})?"
+    )
+
+
+def _ja_chunk(group: str, unit: str) -> str:
+    """「<係数><単位>」の 1 群 (単位が空なら素の数の群)。"""
+    if unit:
+        return rf"(?:{_ja_coefficient(group)}{_JA_SP}{unit}{_JA_JOIN})?"
+    return rf"(?:{_ja_coefficient(group)}(?!{_JA_SP}[兆億万]))?"
+
+
+_JA_NUMBER_RE = re.compile(
+    r"(?<![\d.])(?=\d)"
+    + _ja_chunk("cho", "兆") + _ja_chunk("oku", "億") + _ja_chunk("man", "万")
+    + _ja_chunk("base", ""),
+)
+#: 単位の組 (小さい順): 群名 → 倍率。
+_JA_UNITS: tuple[tuple[str, float], ...] = (
+    ("base", 1.0), ("man", 1e4), ("oku", 1e8), ("cho", 1e12),
+)
+#: 係数の内訳 (小さい順): 接尾辞 → 倍率。
+_JA_COEF_PARTS: tuple[tuple[str, float], ...] = (("n", 1.0), ("h", 100.0), ("k", 1000.0))
+#: 全角の数字・小数点・桁区切りを半角へ (1 文字 → 1 文字なので位置は変わらない)。
+_FULLWIDTH_NUMERALS = str.maketrans("０１２３４５６７８９．，", "0123456789.,")
+
+
+def normalize_numerals(text: str) -> str:
+    """全角の数字・小数点・桁区切りを半角へ (位置を保つ。純粋関数)。"""
+    return (text or "").translate(_FULLWIDTH_NUMERALS)
 
 #: 「= 2,795,126」形式の計算結果 (右辺)。本文が計算を **実際に行っている**
 #: ことの証拠として要求する。式が 1 つも無い応答は照合対象にしない。
@@ -163,30 +216,61 @@ _APPROX_REL_TOLERANCE = 0.05
 _MIN_CONCLUSION_DIGITS = 4
 
 
+def _ja_terms(match: re.Match) -> list[tuple[str, float, float]]:
+    """``_JA_NUMBER_RE`` のマッチを「数字の綴り × 倍率」の項へ (小さい桁から)。
+
+    「2万6千円」→ ``[("6", 1000), ("2", 10000)]``、「3千万」→ ``[("3", 1e7)]``。
+    """
+    terms: list[tuple[str, float, float]] = []
+    for group, unit in _JA_UNITS:
+        for part, sub in _JA_COEF_PARTS:
+            literal = match.group(f"{group}_{part}")
+            if literal is not None:
+                terms.append((literal, _to_float(literal), unit * sub))
+    return terms
+
+
 def _parse_ja_number(match: re.Match) -> float | None:
     """``_JA_NUMBER_RE`` のマッチを数値へ (単位が 1 つも無ければ素の数値)。"""
-    oku, man, base = match.group("oku"), match.group("man"), match.group("base")
-    if oku is None and man is None and base is None:
-        return None
-    total = 0.0
-    if oku is not None:
-        total += _to_float(oku) * 100_000_000
-    if man is not None:
-        total += _to_float(man) * 10_000
-    if base is not None:
-        total += _to_float(base)
-    return total
+    terms = _ja_terms(match)
+    return sum(value * mult for _, value, mult in terms) if terms else None
 
 
-def _iter_ja_numbers(text: str) -> list[tuple[int, int, float]]:
-    """本文中の数値を ``(start, end, value)`` で列挙する (純粋関数)。"""
-    out: list[tuple[int, int, float]] = []
-    for m in _JA_NUMBER_RE.finditer(text or ""):
+class JaNumber(NamedTuple):
+    """本文中の数値 1 つ (万・億の複合表記は 1 つにまとめる)。"""
+
+    start: int
+    end: int
+    value: float
+    #: 表記の最小桁 (「27.8」→ 0.1、「11.4万」→ 1000、「2万4,667」→ 1)。
+    scale: float
+    #: 万・億・兆・千・百のどれかを含む表記か。
+    has_unit: bool
+    #: 単位付きの項 (係数の値, 倍率)。「2,850万」→ ``((2850, 1e4),)``、
+    #: 「2万6千円」→ ``((6, 1000), (2, 1e4))``。素の数の項は含めない。
+    unit_terms: tuple[tuple[float, float], ...] = ()
+
+
+def iter_ja_numbers(text: str) -> list[JaNumber]:
+    """本文中の数値を出現順に列挙する (純粋関数)。
+
+    「2 万 4,667」「12万6,667円」「3857万9100」「1億2000万」「561.4 万円」「2万6千円」
+    「1万2千3百」はそれぞれ 1 つの数。桁区切り (``1,234``) と小数を読む。全角の数字・
+    小数点・桁区切りもここで読む (位置は元の ``text`` のまま)。符号は読まない
+    (大きさだけ)。
+    """
+    out: list[JaNumber] = []
+    for m in _JA_NUMBER_RE.finditer(normalize_numerals(text)):
         if not m.group(0):
             continue
-        value = _parse_ja_number(m)
-        if value is not None:
-            out.append((m.start(), m.end(), value))
+        terms = _ja_terms(m)
+        if not terms:
+            continue
+        unit_terms = tuple((value, mult) for _, value, mult in terms if mult != 1.0)
+        out.append(JaNumber(
+            m.start(), m.end(), sum(v * mult for _, v, mult in terms),
+            _literal_scale(m), bool(unit_terms), unit_terms,
+        ))
     return out
 
 
@@ -211,18 +295,18 @@ def _find_lead_conclusion(text: str) -> tuple[int, int, float, str] | None:
     lead = _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), raw)
     # 強調表記が最優先 (モデルは結論を太字にする)。
     for m in _BOLD_RE.finditer(lead):
-        nums = _iter_ja_numbers(m.group(1))
+        nums = iter_ja_numbers(m.group(1))
         if nums:
-            start, end, value = nums[0]
+            first = nums[0]
             return (
-                m.start(1) + start, m.start(1) + end, value,
+                m.start(1) + first.start, m.start(1) + first.end, first.value,
                 m.group(1),
             )
     # 強調が無ければ「<数値><単位>です」型の断定を探す。
-    for start, end, value in _iter_ja_numbers(lead):
-        tail = _ASSERTION_TAIL_RE.match(lead[end:])
+    for num in iter_ja_numbers(lead):
+        tail = _ASSERTION_TAIL_RE.match(lead[num.end:])
         if tail is not None:
-            return start, end, value, lead[start:end + tail.end()]
+            return num.start, num.end, num.value, lead[num.start:num.end + tail.end()]
     return None
 
 
@@ -248,8 +332,8 @@ def find_conclusion_contradiction(text: str) -> str | None:
 
     tolerance = _conclusion_tolerance(literal, value)
     others = [
-        v for (s, e, v) in _iter_ja_numbers(body)
-        if not (s >= start and e <= end)
+        n.value for n in iter_ja_numbers(body)
+        if not (n.start >= start and n.end <= end)
     ]
     if not others:
         return None
@@ -296,12 +380,12 @@ _NON_ADDITIVE_UNITS = frozenset({"%", "％", "倍", "割"})
 
 def _literal_scale(match: re.Match) -> float:
     """``_JA_NUMBER_RE`` のマッチが表す値の最小桁 (「11.4万」→ 1000)。"""
-    for group, unit in (("base", 1.0), ("man", 10_000.0), ("oku", 100_000_000.0)):
-        literal = match.group(group)
-        if literal is not None:
-            decimals = len(literal.split(".")[1]) if "." in literal else 0
-            return unit * 10.0 ** -decimals
-    return 1.0
+    terms = _ja_terms(match)
+    if not terms:
+        return 1.0
+    literal, _, mult = terms[0]
+    decimals = len(literal.split(".")[1]) if "." in literal else 0
+    return mult * 10.0 ** -decimals
 
 
 def _parse_amount_item(body: str) -> tuple[str, float, str, float, bool] | None:
@@ -387,7 +471,7 @@ def format_ja_large_number(value: float) -> str | None:
     """1 万以上の数を「148万244.28492」のように万・億で読み下す (純粋関数)。
 
     計算結果を万表記へ直す変換をモデルに任せると写し間違える (2026-09-27 実機:
-    1480244.28492 を「148 万 2,244 円」)。読み取り側 (:func:`_iter_ja_numbers`) と
+    1480244.28492 を「148 万 2,244 円」)。読み取り側 (:func:`iter_ja_numbers`) と
     往復で一致する形だけを返す。1 万未満・非有限は None。
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):

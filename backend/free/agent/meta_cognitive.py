@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from backend.config import resolve_context_size_for_mode
+from backend.free.core.markdown_fence import close_open_fence, outer_fence
 from backend.free.agent.context_budget import (
     OUTPUT_RESERVE_TOKENS,
     resolve_meta_cognitive_loop_budget,
@@ -32,6 +33,10 @@ from backend.free.agent.meta_cognitive_tasks import (
     task_expects_write,
 )
 from backend.free.agent.meta_cognitive_tools import infer_tool_from_task
+from backend.free.agent.meta_cognitive_content_gate import (
+    is_edit_request,
+    is_pure_append_request,
+)
 from backend.free.agent.output_format import WRITTEN_PATH_RE, anchor_relative_output_path
 from backend.free.agent.write_gate import WRITE_DENIED_RE
 from backend.io.text_file import decode_text_prefix_for_display
@@ -68,13 +73,14 @@ from backend.free.agent.meta_cognitive_defs import (
     _EXT_LANGUAGE_MAP,
     _LANGUAGE_EXT_MAP,
     _LANGUAGE_KEYWORDS,
+    _PARTIAL_WRITE_CHECKS_NOT_RUN_RE,
     _PARTIAL_WRITE_FILES_FAILED_RE,
     _PARTIAL_WRITE_RE,
     _PARTIAL_WRITE_TASKS_FAILED_RE,
     _PARTIAL_WRITE_VALIDATION_RE,
     PLAN_SYSTEM_PROMPT,
     _WRITE_REJECTION_RE,
-    _WRITE_REJECTION_REASON_JA,
+    _WRITE_REJECTION_CODES,
 )
 
 # 分割前から ``meta_cognitive.<名前>`` で見えていたプロンプト / 定数。参照元を
@@ -212,8 +218,13 @@ class MetaCognitiveAgent(
         production_stage: "ProductionHarness | None" = None,
         brief: str = "",
         write_impact_classifier: Callable[[list[str]], list[dict]] | None = None,
+        recent_file_target: str = "",
     ) -> None:
         self.max_steps = max_steps
+        # 判定点 recent_file_reference = write のターンの宛先 (直近のファイル)。
+        # chat.py が計画の前に台帳から確定して渡す。空でなければ計画の LLM を
+        # 呼ばず、このファイルへの write-fast 1 タスクにする (docs/f_03 §4.3)。
+        self._recent_file_target = recent_file_target
         cfg = config or {}
         self.config = cfg
         # ツールループ用 system に注入する SemMem メモリブロック
@@ -559,12 +570,19 @@ class MetaCognitiveAgent(
             # Step 1: タスク計画を生成。staged v2 の create は制作ステージが依頼全体を
             # 引き受けるので、計画は「制作タスク 1 件」と決まっている — LLM を呼ばない
             # (f_10 §11。旧経路では 1,000 トークン超の prefill で毎回 15 秒前後かかっていた)。
-            if getattr(self._production_stage, "deterministic_plan", False):
+            recent_write = self._recent_file_write_plan(query)
+            if recent_write is not None:
+                tasks = recent_write
+            elif getattr(self._production_stage, "deterministic_plan", False):
                 tasks = [TaskItem(description=f"Create the requested deliverable: {query}")]
             else:
                 tasks = await self._plan(query, conversation, llm_client, on_step)
             if not tasks:
                 tasks = [TaskItem(description=query)]
+            # 計画に回した直近ファイルへの書込み (前段・後段・書き換え) は、パスの無い
+            # 変更タスクへ確定済みの宛先を差し込む (docs/f_03 §4.3)
+            if recent_write is None:
+                self._attach_recent_file_target(tasks)
 
             # 同一ファイル対象のタスクをマージ
             tasks = merge_same_file_tasks(tasks)
@@ -613,6 +631,8 @@ class MetaCognitiveAgent(
                     all_tool_calls, steps, len(tasks), on_step,
                     generation_params=generation_params,
                 )
+            # 書込みに失敗したタスクへ「どのファイルへの何が / 変わっていないか」を刻む
+            self._annotate_write_failures(tasks, query, all_tool_calls)
 
         # Step 3: 最終応答を組み立て
         if self._needs_input_question:
@@ -668,6 +688,11 @@ class MetaCognitiveAgent(
             ),
             production_notices=(
                 [str(n) for n in (self._production_result.notes or {}).get("notices") or []]
+                if self._production_result is not None else []
+            ),
+            production_checks=(
+                [dict(c) for c in (self._production_result.notes or {}).get("checks") or []
+                 if isinstance(c, dict)]
                 if self._production_result is not None else []
             ),
         )
@@ -760,6 +785,123 @@ class MetaCognitiveAgent(
             "Plan response did not contain a 'tasks' list: %r", data,
         )
         return []
+
+    def _recent_file_write_plan(self, query: str) -> list[TaskItem] | None:
+        """直近ファイルへの唯一の追記の依頼なら、計画せずに write-fast の 1 タスクを返す。
+
+        判定点 ``recent_file_reference`` が ``write`` を返したターン (chat.py が宛先を
+        渡す) のうち、書込みの述語が発話の唯一の依頼 (``is_sole_write_request``) で、
+        追記だけの依頼 (``is_pure_append_request``) に限る。以前は計画の LLM が
+        「read_file + パスの無い追記タスク」に分け、追記タスクで分類器が
+        ``draft_document`` を選んで書込みまで進まなかった (2026-09-28 実機再監査 R2、
+        C05#5)。タスク文にパスを入れるので ``infer_tool_from_task`` が
+        ``write_file(<宛先>)`` を決定論で返し、write-fast が既存の内容を読んでから
+        追記分を生成・連結する (docs/f_03 §4.3)。前段・後段のある依頼と書き換えは
+        計画に回す (レビュー H2 / M1: 1 タスクに潰すと残りの段が消えた)。
+        """
+        from backend.free.agent.file_reference_gate import is_sole_write_request
+
+        target = self._recent_file_target
+        if not target or self._output_target != "file" or self._production_stage is not None:
+            return None
+        if not (is_sole_write_request(query) and is_pure_append_request(query)):
+            logger.info(
+                "Recent file write is not a sole append request; planning with the "
+                "target resolved: %s", target,
+            )
+            return None
+        logger.info(
+            "Plan skipped: recent file write target resolved before planning: %s",
+            target,
+        )
+        if self._debug_logger is not None:
+            self._debug_logger.log_decision(
+                decision_point="meta_cognitive_llm_route",
+                chosen="recent_file_write",
+                candidates=["aux_plan", "single_task_fallback", "recent_file_write"],
+                reason="recent_file_reference_write",
+                scope="request",
+            )
+        return [TaskItem(description=f"Write the requested change to {target}")]
+
+    def _attach_recent_file_target(self, tasks: list[TaskItem]) -> None:
+        """計画のパスの無い最初の変更タスクへ、確定済みの直近ファイルの宛先を足す。
+
+        計画のタスク文は「Append the weather to the saved file」のようにパスを
+        持たないことが多く、そのままだと write まで進まないか、会話の別のパスへ
+        向く。変更依頼 (``is_edit_request``) のタスクだけを対象にし、別の成果物を
+        作るタスク (「Create a new memo」) には足さない (docs/f_03 §4.3)。
+        """
+        from backend.free.agent.tool_judge_args import extract_write_target_path
+
+        target = self._recent_file_target
+        if not target or self._output_target != "file" or self._production_stage is not None:
+            return
+        for task in tasks:
+            if (
+                task_expects_write(task.description)
+                and is_edit_request(task.description)
+                and not extract_write_target_path(task.description)
+            ):
+                logger.info(
+                    "Recent file target attached to planned task: %s -> %s",
+                    task.description[:80], target,
+                )
+                task.description = f"{task.description} and save it to {target}"
+                return
+
+    def _task_write_target(self, task: TaskItem) -> str:
+        """失敗した書込みタスクの、利用者へ名指してよい宛先 (無ければ空文字列)。
+
+        名指すのはタスク文の書込み先 (裸の名前は会話の同じ名前のフルパスへ) か、
+        直近ファイルの宛先 (判定点 recent_file_reference = write) から得たときだけ。
+        会話の最後に出たパスは使わない — 「other.txt には触れないで」の other.txt を
+        名指した (2026-09-28 レビュー M3)。
+        """
+        from backend.free.agent.tool_call_judge import _resolve_referenced_path
+        from backend.free.agent.tool_judge_args import extract_write_target_path
+
+        path = extract_write_target_path(task.description) or ""
+        if path:
+            return _resolve_referenced_path(path, getattr(self, "_conversation", None)) or path
+        return self._recent_file_target
+
+    def _annotate_write_failures(
+        self, tasks: list[TaskItem], query: str, all_tool_calls: list[dict],
+    ) -> None:
+        """書込みを期待して失敗したタスクへ利用者向けの注記を刻む (docs/f_03 §4.3)。
+
+        書込みゲートの断り・制作ステージの未完了は各自の注記を持つので触らない。
+        制作ステージのターンはハーネスが ``write_file`` を経ずに書くので、
+        「変更されていない」を言えず対象外。「変更されていない」は、このターンに
+        パスへ書くツールを 1 度も撃っていない (実行して失敗した・別の宛先へ撃った
+        可能性を残さない) ときだけ添える。パスへ書くツールは ``write_file`` に限らない
+        (``write_gate.WRITE_PATH_TOOLS``: apply_diff 等)。
+        """
+        from backend.free.agent.write_gate import WRITE_PATH_TOOLS
+
+        if self._production_result is not None:
+            return
+        append = is_pure_append_request(query)
+        wrote_any = any(tc.get("tool") in WRITE_PATH_TOOLS for tc in all_tool_calls)
+        for task in tasks:
+            if task.status != "failed" or not task_expects_write(task.description):
+                continue
+            result = task.result or ""
+            if self._partial_write_note(result) or self._write_denied_note(result):
+                continue
+            target = self._task_write_target(task)
+            reason = self._write_failure_reason(result)
+            if not target:
+                note = msg("agent.write_failed.no_target", reason=reason)
+            else:
+                note = msg(
+                    "agent.write_failed.append" if append else "agent.write_failed.write",
+                    path=target, reason=reason,
+                )
+            if not wrote_any:
+                note += msg("agent.write_failed.unchanged")
+            task.failure_note = note
 
     @staticmethod
     def _ensure_build_task(
@@ -1326,6 +1468,11 @@ class MetaCognitiveAgent(
         unresolved = int(notes.get("validation_errors") or 0)
         if unresolved:
             return f"{unresolved} validation error(s) remain"
+        # 生成コードが作業フォルダの外へ書こうとして検査できなかった (staged v2、f_10 §12.4)。
+        # 「未検査」を完了と報告すると成功の教師になる (独立レビュー)
+        blocked = list(notes.get("incomplete_checks") or [])
+        if blocked:
+            return f"{len(blocked)} check(s) could not be run: {', '.join(blocked)}"
         if "code_files" in notes and not notes["code_files"]:
             return "no code files were produced"
         return ""
@@ -1871,14 +2018,19 @@ class MetaCognitiveAgent(
                     lines=len(body.splitlines()),
                     total=len(lines),
                 )
+                # 切った位置でコードブロックが開いていたら閉じる。開いたままだと
+                # 囲みの閉じがその内側を閉じる形になり、``` が奇数のノートを
+                # sleep-time が「切れた生成」として記憶から外した (2026-09-27 M8)。
+                body = close_open_fence(body)
         lang = _PREVIEW_FENCE_LANGUAGES.get(
             path.suffix.lower(), path.suffix.lower().lstrip("."),
         )
+        fence = outer_fence(body)
         parts = [
             msg("agent.written_content_header", path=str(path)),
-            f"```{lang}",
+            f"{fence}{lang}",
             body,
-            "```",
+            fence,
         ]
         if note:
             parts.append(note)
@@ -1890,8 +2042,11 @@ class MetaCognitiveAgent(
         m = _WRITE_REJECTION_RE.search(result or "")
         if m is None:
             return ""
-        reason = _WRITE_REJECTION_REASON_JA.get(m.group(1))
-        return f": {reason}" if reason else ""
+        code = m.group(1)
+        if code not in _WRITE_REJECTION_CODES:
+            return ""
+        # 文面は UI の言語 (i18n、不変則 #6)
+        return f": {msg(f'agent.write_rejection.{code}')}"
 
     @staticmethod
     def _write_denied_note(result: str) -> str:
@@ -1908,7 +2063,7 @@ class MetaCognitiveAgent(
         body = (result or "")[m.end():].strip("\n")
         if not body.strip():
             return f"    {note}"
-        fence = "````" if "```" in body else "```"
+        fence = outer_fence(body)
         return "\n".join([f"    {note}", fence, body.rstrip(), fence])
 
     @staticmethod
@@ -1918,6 +2073,8 @@ class MetaCognitiveAgent(
         実インシデント (2026-09-25): create の「add.py に保存して」で add.py は
         ``outputs/`` に書けたのに、自動生成したテストが 1 件落ちてタスクが
         failed になり、最終応答は「(書き込みが実行されませんでした)」だけだった。
+        文面は i18n ``create.incomplete.*`` (2026-09-27、以前は日本語のハードコードの
+        括弧書きで、内部文言のまま本文に出た — 不変則 #6、ライブ監査 S4)。
         """
         m = _PARTIAL_WRITE_RE.search(result or "")
         if m is None:
@@ -1925,41 +2082,36 @@ class MetaCognitiveAgent(
         reason = m.group("reason")
         pieces: list[str] = []
         if "timed out" in reason:
-            pieces.append("時間切れで打ち切りました")
+            pieces.append(msg("create.incomplete.reason.timed_out"))
         failed = _PARTIAL_WRITE_TASKS_FAILED_RE.search(reason)
         if failed:
-            pieces.append(f"検証などのタスクが {failed.group(1)} 件失敗しました")
+            pieces.append(msg("create.incomplete.reason.tasks_failed", count=failed.group(1)))
         unresolved = _PARTIAL_WRITE_VALIDATION_RE.search(reason)
         if unresolved:
-            pieces.append(
-                f"自動検証で未解決のエラーが {unresolved.group(1)} 件残っています"
-                " (GENERATION_ISSUES.md を参照)",
-            )
+            pieces.append(msg("create.incomplete.reason.validation_errors", count=unresolved.group(1)))
+        not_run = _PARTIAL_WRITE_CHECKS_NOT_RUN_RE.search(reason)
+        if not_run:
+            pieces.append(msg("create.incomplete.reason.checks_not_run", count=not_run.group(1)))
         if "no code files were produced" in reason:
-            pieces.append("コードのファイルが 1 本も生成されませんでした")
+            pieces.append(msg("create.incomplete.reason.no_code_files"))
         unwritten = _PARTIAL_WRITE_FILES_FAILED_RE.search(reason)
         if unwritten:
-            pieces.append(
-                f"{unwritten.group('n')} 件のファイルを書き込めませんでした"
-                f" ({unwritten.group('paths')})",
-            )
-        reason_ja = "、".join(pieces) or reason
+            pieces.append(msg(
+                "create.incomplete.reason.files_failed",
+                count=unwritten.group("n"), paths=unwritten.group("paths"),
+            ))
+        reasons = msg("create.incomplete.separator").join(pieces) or reason
         if m.group("verb") == "generated":
             # 出力先が editor / chat: 書き込みではないので「書き込んだ」とは言わない
-            return f"(成果物は出力しました。ただし制作は完了していません: {reason_ja})"
+            return msg("create.incomplete.generated", reasons=reasons)
         if m.group("count") is None:
             # 2 つ目以降の制作タスク: 成果物は最初の制作タスクがまとめて扱った
             # (出力先が editor / chat なら書き込みではないので「書き込んだ」とは言わない)
-            return (
-                "(成果物は上の制作タスクでまとめて扱いました。ただし制作は"
-                f"完了していません: {reason_ja})"
-            )
+            return msg("create.incomplete.grouped", reasons=reasons)
         paths = m.group("paths") or ""
-        where = f" ({paths})" if paths else ""
-        return (
-            f"(ファイルは書き込みました{where}。ただし制作は完了していません: "
-            f"{reason_ja})"
-        )
+        if paths:
+            return msg("create.incomplete.written", paths=paths, reasons=reasons)
+        return msg("create.incomplete.written_no_paths", reasons=reasons)
 
     @staticmethod
     def _build_final_response(
@@ -1990,9 +2142,13 @@ class MetaCognitiveAgent(
                 # された fetch_url の webpage 抽出テキスト等) をそのままユーザーへ
                 # 露出させない。ただし **自前の棄却理由コード** は安全に出せるので
                 # 添える (理由を伏せるとモデルが次のターンで作り話をする。
-                # _WRITE_REJECTION_REASON_JA のコメント参照)。
-                reason = MetaCognitiveAgent._write_failure_reason(task.result or "")
-                parts.append(f"    (書き込みが実行されませんでした{reason})")
+                # _WRITE_REJECTION_CODES のコメント参照)。
+                if task.failure_note:
+                    # どのファイルへの何が失敗し、ファイルが無事か (docs/f_03 §4.3)
+                    parts.append(f"    {task.failure_note}")
+                else:
+                    reason = MetaCognitiveAgent._write_failure_reason(task.result or "")
+                    parts.append(f"    (書き込みが実行されませんでした{reason})")
                 # ここで ``task.result`` を出してはいけない。中身は
                 # 「このタスクが生成した成果物」とは限らず、ハイジャックされた
                 # 別ツールの出力 (fetch_url の webpage 抽出等) でありうる —

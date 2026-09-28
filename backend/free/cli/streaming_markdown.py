@@ -24,10 +24,11 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 
-# コードブロック開始パターン: ```lang or ``` （インデント許容）
-_FENCE_OPEN = re.compile(r"^(\s*)```(\w*)\s*$")
-# コードブロック終了パターン: ``` （インデント許容）
-_FENCE_CLOSE = re.compile(r"^\s*```\s*$")
+# コードブロック開始パターン: ```lang or ``` （インデント許容）。本文に ``` を含む
+# ブロックは 4 連以上で囲まれる (書き込んだ内容の提示、f_03 §1.4) ので長さも拾う。
+_FENCE_OPEN = re.compile(r"^(\s*)(`{3,})(\w*)\s*$")
+# コードブロック終了パターン: ``` （インデント許容）。開きと同じ長さ以上で閉じる。
+_FENCE_CLOSE = re.compile(r"^\s*(`{3,})\s*$")
 
 # Markdown インライン書式パターン
 _INLINE_CODE = re.compile(r"`([^`]+)`")
@@ -161,6 +162,7 @@ class StreamingMarkdownRenderer:
         self._code_buffer = ""
         self._code_lang = ""
         self._code_indent = ""              # コードブロック開始行のインデント
+        self._code_fence = "```"            # コードブロック開始行のバッククォート列
         self._code_lines = 0
         self._spinner_iter = itertools.cycle(_SPINNER_FRAMES)
         self._spinner_shown = False
@@ -207,14 +209,16 @@ class StreamingMarkdownRenderer:
             if m:
                 self._in_code_block = True
                 self._code_indent = m.group(1)   # 開始行のインデントを記録
-                self._code_lang = m.group(2) or ""
+                self._code_fence = m.group(2)
+                self._code_lang = m.group(3) or ""
                 self._code_buffer = ""
                 self._code_lines = 0
                 self._start_spinner()
                 return
             self._print_text(line)
         else:
-            if _FENCE_CLOSE.match(stripped):
+            closing = _FENCE_CLOSE.match(stripped)
+            if closing and len(closing.group(1)) >= len(self._code_fence):
                 self._stop_spinner()
                 self._render_code_block()
                 self._in_code_block = False

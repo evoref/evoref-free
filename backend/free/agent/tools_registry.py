@@ -141,7 +141,9 @@ def _record_touched_file(name: str, succeeded: bool, kwargs: dict) -> None:
     for arg in arg_names:
         value = kwargs.get(arg)
         if isinstance(value, str) and value.strip():
-            record_current_file(value, named=is_request_named(value))
+            record_current_file(
+                value, named=is_request_named(value), written=(name == "write_file"),
+            )
             return
 
 

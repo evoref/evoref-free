@@ -15,7 +15,11 @@ import numpy as np
 from backend.exceptions import RAGError
 from backend.i18n_helper import prompt_locale
 from backend.log_config import get_logger
-from backend.free.core.date_math_cue import query_has_date_math_cue
+from backend.free.core.date_math_cue import (
+    day_count_closed_in_query,
+    day_count_is_the_only_cue,
+    query_has_date_math_cue,
+)
 from backend.free.core.inference import eligible_rag_indices
 from backend.free.core.intent_vocab import refers_to_ongoing_session, refers_to_previous_output
 from backend.free.core.session_mode import is_create_mode
@@ -1863,8 +1867,15 @@ def corpus_layer_skipped_for_query(query: str) -> bool:
     照応 (「その日」) と組み合わさる形が典型で、設計書に同じ例文があると
     較正済みの棒でも通ってしまう。手掛かり語だけの問い (「設計書では祝日の
     扱いをどう決めていますか」) は文書への問いでありうるので切らない。
+
+    手掛かりが **日数の問いだけ** のときは、発話だけで両端が閉じる (日付がある /
+    今年の残り) ときに限る。「設計書 v2 の締切まであと何日？」は数量 (v2) を
+    持つが終点は文書にある — 日数の語彙を手掛かりに合成した 2026-09-27 に、
+    こうした問いで corpus を引かなくなっていた (独立レビュー)。
     """
     text = query or ""
+    if day_count_is_the_only_cue(text):
+        return day_count_closed_in_query(text)
     return query_has_date_math_cue(text) and bool(NUMERAL_HINT_RE.search(text))
 
 

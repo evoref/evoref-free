@@ -190,7 +190,7 @@ class PseudoQueryIndex:
             self.load()
         now = utc_now()
         confidence = derive_confidence("document", 0)
-        count = 0
+        records: list[Evidence] = []
         for position, question in enumerate(questions):
             text = (question or "").strip()
             if not text:
@@ -203,7 +203,7 @@ class PseudoQueryIndex:
             }
             if hinted_from is not None and position >= hinted_from:
                 attrs["from_hint"] = True
-            record = Evidence(
+            records.append(Evidence(
                 id=pseudo_query_id(target_id, position, text),
                 kind=PSEUDO_QUERY_KIND,
                 store="corpus",
@@ -213,9 +213,8 @@ class PseudoQueryIndex:
                 created_at=now,
                 confidence=confidence,
                 attrs=attrs,
-            )
-            self._store.put(record, by="pseudo_query_gen")
-            count += 1
+            ))
+        count = self._store.put_many(records, by="pseudo_query_gen")
         if count:
             self._pending_targets.add(target_id)
         return count

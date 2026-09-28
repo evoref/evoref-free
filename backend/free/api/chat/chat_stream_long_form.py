@@ -79,6 +79,9 @@ class _LongFormStreamState:
     #: 品質ゲートが検出した問題数。ユーザーには警告ステップとして見せている
     #: ため、成否シグナルにも同じ判断を反映させる (下の log_outcome 参照)。
     validation_errors: int = 0
+    #: ``judge_long_form_success`` の結果。結末 JSONL の ``success`` と経験の
+    #: ``turn_outcome`` が **同じ判定** を読む (2026-09-27 監査 C07#2)。
+    quality_ok: bool = True
     #: 生成ストリームが ``finish_reason=length`` で切れたか (``TokenStream.outcome``
     #: を公開するストリームのみ観測できる)。開示は本文の外 (``sse.output_truncated``)。
     truncated: bool = False
@@ -288,6 +291,8 @@ async def _finalize_long_form_stream(
             grounded=query + "\n" + user_utterance_text(messages),
         )
     cancelled = cancel_requested(session_id)
+    # ターンの成否はここで 1 回だけ決め、結末 JSONL と経験の両方へ渡す。
+    state.quality_ok = judge_long_form_success(metrics, query, delivered)
     record_long_form_response(
         sess_state, delivered, messages, session_id,
         query, mode, state.tokens_generated, metrics,
@@ -297,6 +302,7 @@ async def _finalize_long_form_stream(
         # キャンセルで途中まで流した本文は経験に採らない / 切断は経験へ刻む。
         cancelled=cancelled,
         truncated=state.truncated,
+        long_form_success=state.quality_ok,
     )
     state.recorded = True
 
@@ -712,8 +718,9 @@ async def stream_long_form(
                 state, session_id,
                 started_at=t_start,
                 completed=outcome_success,
-                # 品質ゲートの結果は完走とは別の軸で渡す (切断と混同しない)
-                success=not stream_state.validation_errors,
+                # 品質ゲートの結果は完走とは別の軸で渡す (切断と混同しない)。
+                # 経験の turn_outcome と同じ判定 (judge_long_form_success) を読む。
+                success=stream_state.quality_ok,
                 errored=errored,
                 tokens_out=stream_state.tokens_generated,
                 signals={

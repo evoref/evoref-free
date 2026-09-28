@@ -1,9 +1,10 @@
 """補助タスク purpose 別 timeout の自己較正値の永続化 (model-keyed)
 
 `AuxClient` が観測したタイムアウトから反応的に引き上げた purpose 別 timeout
-天井を、ベースモデルの GGUF ファイル名でキー化して JSON 永続化する。モデルを
-切り替えた際に別モデルの較正値を誤用しないよう、ファイル名が一致する entry
-のみをロードする。
+天井を、応答したモデルの ``model_key`` でキー化して JSON 永続化する (置き場も
+そのモデルのパーティション、f_04 §1.2.0)。モデルを切り替えた際に別モデルの
+較正値を誤用しないよう、``model_key`` が一致する entry のみをロードする
+(2026-09-27 以前の GGUF ファイル名キーの entry は読まない)。
 
 レイヤー責務:
 - `AuxClient`             — ドメイン (レイテンシ観測、天井引き上げ判定)
@@ -18,6 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from backend.io.format_registry import FormatSpec, register_format
+from backend.io.id_registry import is_valid_id
 from backend.io.versioned import VersionedPayloadFile
 from backend.log_config import get_logger
 from backend.utils import utc_now
@@ -49,7 +51,7 @@ class AuxCalibrationStore:
     ペイロード構造 (版付き封筒の ``payload``)::
 
         {
-          "<base_model_filename>": {
+          "<model_key>": {
             "timeouts": {"<purpose>": <float seconds>, ...},
             "samples": {"<purpose>": [<float seconds>, ...], ...},
             "calibrated_at": "<ISO8601 Z>",
@@ -77,15 +79,15 @@ class AuxCalibrationStore:
         return f.payload if isinstance(f.payload, dict) else {}
 
     @staticmethod
-    def load_timeouts(path: str | Path, model_filename: str) -> dict[str, float]:
+    def load_timeouts(path: str | Path, model_key: str) -> dict[str, float]:
         """指定モデルの purpose 別 timeout 較正値のみを返す。
 
         ファイル未存在 / モデル未登録 / 型不一致は空 dict を返す。float 化できない
         値は警告して無視する (後方互換 + 破損耐性)。
         """
-        if not model_filename:
+        if not model_key:
             return {}
-        entry = AuxCalibrationStore.load_all(path).get(model_filename)
+        entry = AuxCalibrationStore.load_all(path).get(model_key)
         if not isinstance(entry, dict):
             return {}
         raw = entry.get("timeouts")
@@ -99,16 +101,16 @@ class AuxCalibrationStore:
                 logger.warning(
                     "Ignoring non-numeric calibrated timeout "
                     "(model=%s purpose=%s value=%r)",
-                    model_filename, purpose, value,
+                    model_key, purpose, value,
                 )
         return result
 
     @staticmethod
-    def load_samples(path: str | Path, model_filename: str) -> dict[str, list[float]]:
+    def load_samples(path: str | Path, model_key: str) -> dict[str, list[float]]:
         """指定モデルの purpose 別成功所要秒サンプルを返す (無ければ空 dict)。"""
-        if not model_filename:
+        if not model_key:
             return {}
-        entry = AuxCalibrationStore.load_all(path).get(model_filename)
+        entry = AuxCalibrationStore.load_all(path).get(model_key)
         if not isinstance(entry, dict):
             return {}
         raw = entry.get("samples")
@@ -131,7 +133,7 @@ class AuxCalibrationStore:
     @staticmethod
     def save_timeouts(
         path: str | Path,
-        model_filename: str,
+        model_key: str,
         timeouts: dict[str, float],
         *,
         samples: dict[str, list[float]] | None = None,
@@ -151,37 +153,41 @@ class AuxCalibrationStore:
         較正して保存 (4 purposes) した 22 秒後に、別インスタンスの
         ``note_evolution`` 保存 (3 purposes) がそれを消した。
         """
-        if not model_filename:
+        if not model_key:
             return
         p = Path(path)
         data = AuxCalibrationStore.load_all(p)
-        previous = data.get(model_filename)
+        if is_valid_id(model_key, "mk_"):
+            # model_key で書くファイルでは、読まない旧キー (GGUF 名、2026-09-27 以前) を
+            # 持ち越さない (f_04 §1.2.0)。
+            data = {k: v for k, v in data.items() if is_valid_id(k, "mk_")}
+        previous = data.get(model_key)
         merged_timeouts: dict[str, float] = {}
         merged_samples: dict[str, list[float]] = {}
         if isinstance(previous, dict):
             merged_timeouts.update(
-                AuxCalibrationStore.load_timeouts(p, model_filename),
+                AuxCalibrationStore.load_timeouts(p, model_key),
             )
             merged_samples.update(
-                AuxCalibrationStore.load_samples(p, model_filename),
+                AuxCalibrationStore.load_samples(p, model_key),
             )
         merged_timeouts.update({str(k): float(v) for k, v in timeouts.items()})
         if samples:
             merged_samples.update({
                 str(k): [float(x) for x in v] for k, v in samples.items()
             })
-        data[model_filename] = {
+        data[model_key] = {
             "timeouts": merged_timeouts,
             "calibrated_at": utc_now(),
             "source": "reactive",
         }
         if merged_samples:
-            data[model_filename]["samples"] = merged_samples
+            data[model_key]["samples"] = merged_samples
         f = _calibration_file(p)
         f.RAISE_ON_SAVE_ERROR = True
         f.payload = data
         f.save()
         logger.info(
             "Saved aux calibration for model=%s (%d purposes, %d updated) to %s",
-            model_filename, len(merged_timeouts), len(timeouts), p,
+            model_key, len(merged_timeouts), len(timeouts), p,
         )

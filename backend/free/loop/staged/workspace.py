@@ -12,6 +12,7 @@ SemMem (artifact/progress/failure ファクト) は内容を持たない進捗�
     src/<logical_path>       生成コード (パス忠実)
     tests/<logical_path>     生成テスト (パス忠実)
     tests/_runs/<task>.<n>.json  テスト実行の詳細ログ
+    tests/_dropped/<name>    lint が何かを落とした生成テストの lint 前の本文 (manifest に載せない)
 
 全書き込みは :class:`AtomicWriter` 経由 (crash 耐性)。manifest の更新は
 in-process Lock 下の read-modify-write + fsync で原子化する。
@@ -398,6 +399,16 @@ class WorkspaceManager:
             }
 
         self._update_manifest(_mut)
+
+    def record_dropped_test(self, logical_path: str, source: str) -> str:
+        """lint が何かを落とした生成テストの lint 前の本文を ``tests/_dropped/`` に残す (f_10 §11.1-4)。
+
+        配信物でも実行対象でもないので manifest の files には載せない。戻り値は作業フォルダからの相対パス。
+        """
+        rel = f"tests/_dropped/{_safe_rel(logical_path)}"
+        with AtomicWriter(self.root / rel, mode="wb") as f:
+            f.write(source.encode("utf-8"))
+        return rel
 
     def get_test_result(self, task_id: str) -> StageTestResult | None:
         m = self.read_manifest()

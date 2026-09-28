@@ -106,8 +106,12 @@ _SENTENCE_WITH_TERMINAL_RE = re.compile(r"[^。！？!?\n]+[。！？!?]*")
 _CONTRAST_RE = re.compile(
     r"(?P<head>[^、，,。．！？!?\n]*?)\s*" + CONTRAST_MARKER + r"[、，,]?\s*"
     r"(?P<new>[^。．、，,！？!?\n]{1,40}?)\s*"
-    r"(?:です|でした|にします|にしました|になりました|に変わりました|に変更|へ変更|にした)",
+    r"(?P<pred>です|でした|にします|にしました|になりました|に変わりました|に変更|へ変更|にした)",
 )
+#: 対比の述語のうち **言い直し** (前の値を正す) と読めるもの — 断定だけ。変更の
+#: 述語 (にします / に変わりました / に変更 …) は計画・前提の変更で、前の値の誤りを
+#: 正しているのではない (:func:`restatement_pairs`)。
+_RESTATEMENT_PREDICATES = frozenset({"です", "でした"})
 #: 旧値の区間を切る主題・格の助詞 (の文字)。
 _CONTRAST_PARTICLES = frozenset("はがをもにで")
 #: 旧値の最大長 (区切りの無い長い前置きを値にしない)。
@@ -176,13 +180,38 @@ def contrast_pairs(text: str) -> list[tuple[str, str]]:
     - X がひらがな 1 文字 (「走るのではなく」の の) は機能語の断片なので採らない。
       1 文字でも漢字・カタカナ・英数は採る (「妻ではなく夫です」、F-02)。
     """
-    out: list[tuple[str, str]] = []
+    return [(old, new) for old, new, _pred, _end in _contrast_matches(text)]
+
+
+#: 述語の後ろに残ってよいもの (文末まで何も続かない)。「でしたが」「でしたっけ」
+#: 「でした、と言われたら」は言い直しの断定ではない。
+_SENTENCE_END_RE = re.compile(r"[\s。．.！!]*")
+
+
+def restatement_pairs(text: str, *, sentence_final: bool = False) -> list[tuple[str, str]]:
+    """:func:`contrast_pairs` のうち、断定 (です / でした) で閉じる言い直しだけ (純粋関数)。
+
+    「試験日は4月18日ではなく4月25日でした」は前の値を正している。「2泊3日では
+    なく1泊2日に変更になりました」は計画の変更で、前の値が誤っていたのではない。
+    分解は :func:`contrast_pairs` と同じ 1 実装 (不変則 #14a)。
+
+    ``sentence_final`` なら述語の直後が文末のものだけ (``text`` は 1 文を渡す)。
+    """
+    return [
+        (old, new) for old, new, pred, end in _contrast_matches(text)
+        if pred in _RESTATEMENT_PREDICATES
+        and (not sentence_final or _SENTENCE_END_RE.fullmatch(text[end:]))
+    ]
+
+
+def _contrast_matches(text: str) -> list[tuple[str, str, str, int]]:
+    out: list[tuple[str, str, str, int]] = []
     for m in _CONTRAST_RE.finditer(text or ""):
         old = _old_value_of(m.group("head"))
         new = m.group("new").strip()
         if not old or not new or _is_single_hiragana(old):
             continue
-        out.append((old, new))
+        out.append((old, new, m.group("pred"), m.end()))
     return out
 
 

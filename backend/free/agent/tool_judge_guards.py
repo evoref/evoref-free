@@ -130,6 +130,14 @@ class GuardContext:
         return _dialogue_text(self.conversation)
 
     @cached_property
+    def user_dialogue_text(self) -> str:
+        """会話のうち user の発言だけの本文 (月の複利の期間の候補、docs/f_03 §3.4.1)。"""
+        return _dialogue_text([
+            m for m in self.conversation or ()
+            if isinstance(m, dict) and m.get("role") == "user"
+        ])
+
+    @cached_property
     def recent_dialogue_text(self) -> str:
         """直近 ``_CALCULATE_CONTEXT_TURNS`` ターンの本文。"""
         return _recent_dialogue_text(self.conversation)
@@ -165,6 +173,14 @@ class JudgeCall(GuardContext):
     #: 規則層が ``calculate`` を選んだが式が取れず降格した (「BMIを計算して」)。
     #: 層 5.95 の式合成が、クエリに数値が無くても会話の数値で式を組む手掛かり。
     calculate_requested: bool = False
+    #: 分類器の ``calculate`` を組み直した理由 (``percent_scale_slip`` /
+    #: ``recompute_ungrounded`` / ``ordinal_reference`` /
+    #: ``classifier_ignores_new_value``)。decision.jsonl の
+    #: reason に載せる (docs/f_03 §3.1)。
+    recompose_reason: str = ""
+    #: 分類器の ``calculate`` が門で落ち、組み直しも回数の置き換えも通らず no_tool に
+    #: した (``ToolJudgement.calculation_rejected``、docs/f_03 §3.1)。
+    calculation_rejected: bool = False
     #: ``_extract_file_path`` は fs stat を伴い、1 判定で最大 4 回同じ文字列に
     #: 対して呼ばれていた。引数文字列ごとに 1 度だけ引く。
     _file_paths: dict[str, str] = field(default_factory=dict, repr=False)
@@ -887,7 +903,9 @@ def _flag_suspicious_calculate(
     expression = str((result.tool_args or {}).get("expression") or "")
     if not expression:
         return result
-    issues = expression_sanity_issues(expression, ctx.query, ctx.dialogue_text)
+    issues = expression_sanity_issues(
+        expression, ctx.query, ctx.dialogue_text, user_text=ctx.user_dialogue_text,
+    )
     if not issues:
         return result
     logger.info(

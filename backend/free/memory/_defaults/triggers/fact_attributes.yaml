@@ -39,6 +39,47 @@
 # ユーザー上書き: ``<data_root>/g1/store/overrides/triggers/fact_attributes.yaml`` に同名ファイルを置くと
 # package 同梱 default に代えて読み込まれる (fact_triggers.yaml と同じ方針)。
 
+# スロットの意味 (2026-09-27 監査 F10)。Step 8.3 の分割プロンプト
+# (``sleep/personal_fact_curator.build_prompt``) が許可スロットごとに添える。
+# キーだけを並べていたため、「予算は2人で8万円です」の予算が作業方針
+# (personal.policy) に入った。トリガ語の照合には使わない (照合は下の chat 節)。
+# ここに無いスロットはキーだけが並ぶ。キーは chat 節に実在するスロットだけ
+# (``test_personal_fact_curator_20260927.py`` が検査する)。
+meanings:
+  personal_fact:
+    machine_spec: 本人が使っている機械の仕様 (GPU / CPU / メモリ / ストレージ)
+    age: 本人の年齢
+    birthday: 本人の誕生日
+    contact: 本人の連絡先 (メール / 電話 / 内線)
+    family: 本人の家族構成と家族の各人 (同行者として出ただけの人・旅行の日程は含めない)
+    health: 本人の体調・持病・アレルギー (家族や子どもの体調は含めない)
+    origin: 本人の出身地・生まれ育った土地
+    location: 本人の居住地 (通勤先・旅行先・趣味で行く場所は含めない)
+    work_location: 本人の勤務地・職場の所在地
+    employer: 本人の勤務先・所属部署・入社年
+    occupation: 本人の職種 (勤務先・所属・入社年は personal.employer)
+    schedule: 本人の予定・締切・会議・旅行の日程
+    policy: 本人が自分の作業に課している方針・規約 (コメント・命名などの書き方)。予算・金額・人数・日程は含めない
+    pet: 本人が飼っているペット (種類・名前・年齢)
+    name: 本人の氏名
+    color: 本人の好きな色
+    beverage: 本人がよく飲む / 好き・苦手な飲み物
+    food: 本人の好き・苦手な食べ物
+  preference:
+    language: 応答に使ってほしい言語
+    coding_style: コードの書き方の好み (コメント・命名・型ヒント・フォーマッタ)
+    communication_style: 応答の長さ・口調の好み
+    editor: 本人が使うエディタ
+    tooling: 本人が使う OS・シェル・端末
+    workflow: テスト・レビュー・ブランチなど作業の進め方の好み
+    hobby: 本人の趣味・休日の過ごし方
+    author: 本人の好きな作家・本
+    color: 本人の好きな色
+    beverage: 本人の好きな飲み物
+    food: 本人の好きな食べ物
+    music: 本人の好きな音楽・アーティスト
+    media: 本人の好きな映画・本・ゲーム
+
 chat:
   personal_fact:
     # 具体的・固有性の高いものを先に置く

@@ -183,27 +183,19 @@ _EXPLICIT_PATH_RE = EXPLICIT_WINDOWS_PATH_RE
 # 書き込みに成功しているのに「私はファイルを直接作成したり書き込んだりする権限を
 # 持っていないため、保存に失敗しました」と答えた)。理由はこちらが付けたコードなので、
 # 無関係なツール出力を露出させる心配なく添えられる。
-_WRITE_REJECTION_REASON_JA: dict[str, str] = {
-    "write_report_echo": "生成された本文が完了報告になっていたため",
-    "task_log_echo": "生成された本文が進捗ノートになっていたため",
-    "tool_call_syntax": "生成された本文がツールコール構文になっていたため",
-    "write_script": "生成された本文がファイルを書くスクリプトになっていたため",
-    "refusal_or_missing_info": "生成された本文が断り書きになっていたため",
-    "prompt_echo": "生成された本文が内部プロンプトの写しになっていたため",
-    "instruction_echo": "生成された本文が依頼文の写しになっていたため",
-    "literal_wrapped": "生成された本文が依頼文の引用で包まれていたため",
-    "path_only": "生成された本文がパスだけだったため",
-    "low_information": "生成された本文に中身がほとんど無かったため",
-    "csv_without_rows": "生成された CSV に行が無かったため",
-    "edit_without_change": "内容が変わらなかったため",
-    "task_restatement": "生成された本文が依頼の言い換えだったため",
-    "no_table_data": "保存する本文に表が無かったため",
-    # 既存ファイルを踏まえられない編集は書かない (docs/f_11 §5)
-    "existing_unreadable": "既存ファイルを文字化けなく読めず、内容を失うおそれがあったため",
-    "existing_too_large": "既存ファイルが大きすぎて、全体を踏まえた書き直しができないため",
-    # 書き手 (write_file) が既存ファイルの符号化で表せない文字を断った (docs/f_11 §5.5)
-    "unencodable": "既存ファイルの文字コードで表せない文字を含み、内容を壊すおそれがあったため",
-}
+#
+# 文面は i18n ``agent.write_rejection.<code>`` (不変則 #6。以前はここに日本語の辞書を
+# 持ち、en ロケールでも日本語の理由が混ざった — 2026-09-28 レビュー M2)。ここには
+# 説明を持つ理由コードだけを置く。``existing_unreadable`` / ``existing_too_large`` は
+# 既存ファイルを踏まえられない編集 (docs/f_11 §5)、``unencodable`` は書き手が既存
+# ファイルの符号化で表せない文字を断った (docs/f_11 §5.5)。
+_WRITE_REJECTION_CODES: frozenset[str] = frozenset({
+    "write_report_echo", "task_log_echo", "tool_call_syntax", "write_script",
+    "refusal_or_missing_info", "prompt_echo", "instruction_echo", "literal_wrapped",
+    "path_only", "low_information", "csv_without_rows", "edit_without_change",
+    "task_restatement", "no_table_data",
+    "existing_unreadable", "existing_too_large", "unencodable",
+})
 _WRITE_REJECTION_RE = re.compile(r"(?:invalid output|edit refused) \(([a-z_]+)\)")
 
 # 制作ステージが未完了のまま **書けた分は書いた** 結果 (``_execute_production_task``)。
@@ -214,6 +206,8 @@ _PARTIAL_WRITE_RE = re.compile(
 )
 _PARTIAL_WRITE_TASKS_FAILED_RE = re.compile(r"(\d+) task\(s\) failed")
 _PARTIAL_WRITE_VALIDATION_RE = re.compile(r"(\d+) validation error\(s\) remain")
+# 外へ書こうとして検査できなかった未完了 (``_production_incomplete_reason``、f_10 §12.4)。
+_PARTIAL_WRITE_CHECKS_NOT_RUN_RE = re.compile(r"(\d+) check\(s\) could not be run")
 # 一部だけ書けた配信の理由 (``_execute_production_task``、f_10 §7)。
 _PARTIAL_WRITE_FILES_FAILED_RE = re.compile(
     r"(?P<n>\d+) file\(s\) failed to write: (?P<paths>.+)$",

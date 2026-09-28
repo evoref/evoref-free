@@ -21,12 +21,14 @@ logger = get_logger("factory.served_model")
 
 
 def served_model_path(state: Any) -> str:
-    """接続中の llama-server の ``/props`` の ``model_path`` (無ければ ``model_id``)。"""
+    """接続中の llama-server の ``/props`` の ``model_path`` (無ければ ``model_id``)。
+
+    読み方は AuxClient の較正と共有する (:func:`served_model_of`)。
+    """
+    from backend.free.llm.model_metadata import served_model_of
+
     client = getattr(state, "local_client", None) if state is not None else None
-    metadata = getattr(client, "metadata", None)
-    return str(
-        getattr(metadata, "model_path", "") or getattr(metadata, "model_id", "") or "",
-    )
+    return served_model_of(client)
 
 
 def _same_model(served: str, expected: Path) -> bool:

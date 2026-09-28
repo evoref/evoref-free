@@ -921,7 +921,17 @@ class FeedbackCollector:
 
         config 未初期化などで解決できない場合は起動時に決めた既定
         (``_base_model_name``) へフォールバックし、記録自体は止めない。
+        llama-server が実際に載せているモデルが分かればその名前 (:meth:`_resolve_model_key`
+        と同じ根拠)。
         """
+        try:
+            from backend.config import get_path_resolver
+
+            served = get_path_resolver().served_model_path()
+        except Exception:  # noqa: BLE001 — resolver 未ロードなら宣言から引く
+            served = ""
+        if served:
+            return Path(served).name
         try:
             from backend.config import get_mode_generation_params
 
@@ -932,22 +942,20 @@ class FeedbackCollector:
 
     @staticmethod
     def _resolve_model_key(mode: str) -> str | None:
-        """記録時のモードで実際にロードされているモデルの ``model_key`` (c_05 §0.5.7)。
+        """その応答を生成したモデルの ``model_key`` (c_05 §0.5.7、f_04 §1.2.0)。
 
-        chat は学習パーティションの active key (ランタイムのモデル切替に追随する)、
-        create は ``model_paths.create_model`` の key (未指定なら active と同じ)。
-        Level 2 の経験の絞り込みはこの値で行う。解決できない (config 未ロード等)
-        ときは ``None`` で、その経験は Level 2 の絞り込みに載らない。
+        経験の置き場 (``learning/<model_key>/experience.jsonl``) と Level 2 の経験の
+        絞り込みはこの値で決まる。鍵は llama-server が実際に載せているモデル
+        (``/props``) から取り、取れなければそのモードが宣言するモデル (chat は
+        active、create は ``model_paths.create_model``。未指定なら active)
+        (:meth:`PathResolver.generating_model_key`)。解決できない (config 未ロード等)
+        ときは ``None`` で、その経験は束ねたファイルへ入り Level 2 の絞り込みに載らない。
         """
         try:
-            from backend.config import get_config, get_path_resolver
+            from backend.config import get_path_resolver
 
-            resolver = get_path_resolver()
-            if is_create_mode(mode):
-                create_model = (get_config().get("model_paths") or {}).get("create_model")
-                if create_model:
-                    return resolver.model_key_for(create_model)
-            return resolver.active_model_key
+            mode_key = "create" if is_create_mode(mode) else "chat"
+            return get_path_resolver().generating_model_key(mode_key)
         except Exception as exc:  # noqa: BLE001 — 記録自体は止めない
             logger.debug("model_key unavailable for the experience: %s", exc)
             return None
@@ -989,6 +997,7 @@ class FeedbackCollector:
         session_id: str = "",
         turn_id: str = "",
         gen_config: "GenerationConfigRef | None" = None,
+        unchecked_checks: list[str] | None = None,
     ) -> ExperienceEntry:
         """シグナル収集 → ExperienceBuffer に記録
 
@@ -1009,6 +1018,10 @@ class FeedbackCollector:
         (:func:`backend.free.core.response_dates.ignores_date_result`、
         2026-09-09 監査 G-06)。``calculate_result`` と同じく呼出側がプロンプト
         から読み戻して渡す。
+
+        ``unchecked_checks`` は create の制作ステージで未検査に終わった主要な検査
+        (``"contract:no_examples"`` の形、``core.check_outcome.unchecked_labels``)。
+        あればそのターンを **ラベル無し** にする (docs/f_04 §2.5)。
         """
         from backend.free.core.text_quality import detect_lang
 
@@ -1034,9 +1047,14 @@ class FeedbackCollector:
                 signals=FeedbackSignals(),
             )
         self._load_session_state(session_id)
+        # 根拠台帳 (ツール判定が同じリクエストで積んだ接地の疑義) は成否の導出より
+        # 先に読む — システムが検出済みの欠けを成否へ反映する (docs/f_04 §2.5)。
+        tool_uses = current_tool_uses()
+        unexplained_numbers, expression_issues, unexplained_date_math = current_grounding()
         turn_outcome, outcome_reason = self._derive_turn_outcome_with_reason(
             response, step_credits,
             query=query,
+            mode=mode,
             tool_routing_false_positive=tool_routing_false_positive,
             long_form_false_positive=long_form_false_positive,
             action_blocked=action_blocked,
@@ -1044,6 +1062,13 @@ class FeedbackCollector:
             calculate_result=calculate_result,
             tool_result_text=tool_result_text,
             stated_context=stated_context,
+            long_form_used=long_form_used,
+            long_form_success=long_form_success,
+            long_form_validation_errors=long_form_validation_errors,
+            unexplained_numbers=unexplained_numbers,
+            expression_issues=expression_issues,
+            unexplained_date_math=unexplained_date_math,
+            unchecked_checks=unchecked_checks,
         )
         if generation_failed:
             # 本文が届かなかった / error フレームで終わったターン。
@@ -1053,8 +1078,10 @@ class FeedbackCollector:
         # ここで決めた成否を持ち上げる。以前は経験にしか残らず、結末は
         # 「SSE を届けられたか」だけで success=true だった (F-11)。
         _publish_turn_outcome(turn_outcome, outcome_reason)
-        tool_uses = current_tool_uses()
-        unexplained_numbers, expression_issues, unexplained_date_math = current_grounding()
+        # ラベル無しは成否の列挙の値ではなく **理由付きの success** で持つ
+        # (``level0_instant.teaches_success`` が読む)。結末 JSONL には "unlabeled" が出る。
+        if turn_outcome == "unlabeled":
+            turn_outcome = "success"
         if turn_outcome == "failed":
             # 失敗ターンの成功シグナルは矛盾なので failed 側に倒す
             # (偽成功が learned_patterns の正例学習 / Level 1 fitness に
@@ -1357,7 +1384,11 @@ class FeedbackCollector:
         tool_result_text: str = "",
         stated_context: str = "",
     ) -> str:
-        """ターン成否だけを返す (:meth:`_derive_turn_outcome_with_reason` の薄い皮)。"""
+        """ターン成否だけを返す (:meth:`_derive_turn_outcome_with_reason` の薄い皮)。
+
+        値は ``"success"`` / ``"partial"`` / ``"failed"`` / ``"unlabeled"`` (ラベル無しは判定の
+        語彙で、経験には理由付きの ``success`` として刻む。docs/f_04 §2.5)。
+        """
         outcome, _ = FeedbackCollector._derive_turn_outcome_with_reason(
             response, step_credits,
             query=query,
@@ -1377,6 +1408,7 @@ class FeedbackCollector:
         step_credits: list[dict] | None,
         *,
         query: str = "",
+        mode: str = "chat",
         tool_routing_false_positive: bool = False,
         long_form_false_positive: bool = False,
         action_blocked: bool = False,
@@ -1384,8 +1416,26 @@ class FeedbackCollector:
         calculate_result: float | None = None,
         tool_result_text: str = "",
         stated_context: str = "",
+        long_form_used: bool = False,
+        long_form_success: bool = False,
+        long_form_validation_errors: int = 0,
+        unexplained_numbers: list[str] | None = None,
+        expression_issues: list[str] | None = None,
+        unexplained_date_math: bool | None = None,
+        unchecked_checks: list[str] | None = None,
     ) -> tuple[str, str | None]:
-        """ターン成否 ("success" | "partial" | "failed") と理由を決定論導出する。
+        """ターン成否 ("success" | "partial" | "failed" | "unlabeled") と理由を決定論導出する。
+
+        **検出済みの失敗 (2026-09-28、ライブ監査 2026-09-27 M5、docs/f_04 §2.5)**: 本文の
+        破綻に当たらなかったターンも、システムが同じターンで構造化して記録した判定を読む。
+        長文の検証落ち (``judge_long_form_success`` が偽) は ``failed``。応答の誤りとは
+        確定しない欠け — 未実行の変更操作 (``action_blocked``)・会話から辿れない数での
+        計算 (``unexplained_numbers``)・式の組み方の疑い (``expression_issues``)・ツールで
+        検証していない日付演算 (``unexplained_date_math``)・create の未検査
+        (``unchecked_checks``) — は ``unlabeled`` (成功とも失敗とも教えない)。失敗の証拠は
+        ラベル無しに勝つので、``unlabeled`` は最後に見る。新しい字句判定は足さない。
+        ``unlabeled`` は判定の語彙で、経験には **理由付きの** ``turn_outcome="success"``
+        として刻む (:meth:`record`、``level0_instant.teaches_success``)。
 
         SSE 完走 = 成功ではなく、応答本文の [failed] マーカー・step_credits
         全 0・ルーティング false_positive・ユーザー発話のオウム返し、および
@@ -1452,18 +1502,25 @@ class FeedbackCollector:
         # (2026-09-05 ライブ監査 F-03: 結果 17,305,634 が本文に 1 つも現れず、
         # 手数料を 10 倍に誤った結論が reward=1.0 で成功経験になっていた)。
         ignored = ignores_calculate_result(text, calculate_result)
+        if ignored is None:
+            # 5% の幅では「約27.8」(結果 27.7177) が「使った」扱いになる。丸め違いの
+            # 値は前ターンの暗算の複写で、成功として学習させない (2026-09-22)。
+            misrounded = misrounded_result_values(text, calculate_result)
+            if misrounded:
+                ignored = (
+                    f"{', '.join(misrounded)} does not round from {calculate_result:g}"
+                )
+        # 式が会話から辿れない / 組み方に疑いがある calculate は、結果そのものが
+        # 誤っている疑いがあり、無視した回答が正しいこともある (2026-09-26 C01#3:
+        # ``100000 - 26000`` の 100000 は会話に無く、結果を使わない「2万8千円」が
+        # 正答)。失敗の証拠にしない — 下のラベル無しに理由を添える (docs/f_04 §2.5)。
+        ignored_unverified: str | None = None
         if ignored is not None:
-            logger.info("Turn marked failed (%s)", ignored)
-            return "failed", f"tool result ignored: {ignored}"
-        # 5% の幅では「約27.8」(結果 27.7177) が「使った」扱いになる。丸め違いの
-        # 値は前ターンの暗算の複写で、成功として学習させない (2026-09-22)。
-        misrounded = misrounded_result_values(text, calculate_result)
-        if misrounded:
-            logger.info("Turn marked failed (calculate result misrounded: %s)", misrounded)
-            return "failed", (
-                f"tool result ignored: {', '.join(misrounded)} does not round "
-                f"from {calculate_result:g}"
-            )
+            if unexplained_numbers or expression_issues:
+                ignored_unverified = ignored
+            else:
+                logger.info("Turn marked failed (tool result ignored: %s)", ignored)
+                return "failed", f"tool result ignored: {ignored}"
         # date_intent が組んだツール結果 (``target:`` 行) を渡したのに本文が
         # 別の日付を述べている = calculate と同じ構造の矛盾。ツールが向きの
         # 補正 (逆算) を正しく踏んでも、モデルが結果を暗算で差し替える経路は
@@ -1482,7 +1539,9 @@ class FeedbackCollector:
         # 形式指定 (箇条書き / 項目数 / 数値だけ) も同じ扱い。数えるだけで
         # 決まるので推定を含まない。文字数だけ見て形式を見ないと、
         # 「3つ箇条書きで」に 1 行で答えたターンが success として学習に入る。
-        broken_form = violates_output_form(query, text)
+        # create の依頼の「箇条書き」は成果物の仕様で、応答の形式の指定ではない
+        # (2026-09-27 ライブ監査 M6: K05「見出し・箇条書き・太字…に対応」だけが failed)。
+        broken_form = None if is_create_mode(mode) else violates_output_form(query, text)
         if broken_form is not None:
             logger.info("Turn marked failed (%s)", broken_form)
             return "failed", f"output form: {broken_form}"
@@ -1494,7 +1553,58 @@ class FeedbackCollector:
         if fabricated is not None:
             logger.info("Turn marked failed (fabricated count: %s)", fabricated)
             return "failed", f"fabricated count: {fabricated}"
+        # 長文の成果物が検証で落ちた。結末 JSONL の success と同じ判定
+        # (``judge_long_form_success``) を呼出側から受け取る — 同じターンの成否を
+        # 2 か所で決めない (2026-09-27 監査 C07#2: 結末は失敗、経験は成功だった)。
+        if long_form_used and not long_form_success:
+            logger.info(
+                "Turn marked failed (long-form validation, %d error(s))",
+                long_form_validation_errors,
+            )
+            return "failed", (
+                f"long-form validation failed: {long_form_validation_errors} error(s)"
+            )
+        unlabeled = FeedbackCollector._unlabeled_reason(
+            action_blocked=action_blocked,
+            unexplained_numbers=unexplained_numbers,
+            expression_issues=expression_issues,
+            unexplained_date_math=unexplained_date_math,
+            unchecked_checks=unchecked_checks,
+        )
+        if unlabeled is not None:
+            if ignored_unverified is not None:
+                unlabeled = f"{unlabeled}; tool result ignored: {ignored_unverified}"
+            logger.info("Turn left unlabeled (%s)", unlabeled)
+            return "unlabeled", unlabeled
         return "success", None
+
+    @staticmethod
+    def _unlabeled_reason(
+        *,
+        action_blocked: bool,
+        unexplained_numbers: list[str] | None,
+        expression_issues: list[str] | None,
+        unexplained_date_math: bool | None,
+        unchecked_checks: list[str] | None,
+    ) -> str | None:
+        """成功とも失敗とも教えない検出済みの欠けの理由 (無ければ ``None``)。
+
+        どれも「依頼を満たせたか確かめられていない / 満たせなかったが応答の誤りでは
+        ない」印で、正答のこともある。``failed`` にすると環境 (削除ツールがどのモードにも
+        無い・構文検査器が無い) や正しい前提を罰し、``success`` にすると検証していない
+        答えを手本にする (docs/f_04 §2.5 の表)。
+        """
+        if action_blocked:
+            return "action not executed"
+        if unexplained_numbers:
+            return f"unexplained numbers: {', '.join(unexplained_numbers)}"
+        if expression_issues:
+            return f"suspicious expression: {'; '.join(expression_issues)}"
+        if unexplained_date_math:
+            return "unverified date math"
+        if unchecked_checks:
+            return f"unchecked: {', '.join(unchecked_checks)}"
+        return None
 
     @staticmethod
     def _find_broken_output_reason(text: str) -> str | None:
@@ -1605,6 +1715,8 @@ class FeedbackCollector:
         書き換え後の値が直列化される)。
 
         既に failed / partial のエントリは触らない (格上げも格下げもしない)。
+        ラベル無し (理由付きの success) は「検証できていない」だけなので、撤回を誤りの
+        証拠として failed へ落とす (docs/f_04 §2.5)。
         """
         if not detect_assistant_self_retraction(response):
             return

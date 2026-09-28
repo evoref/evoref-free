@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+from backend.free.core.numerals import kanji_number_value
 from backend.free.core.predicate import LexicalPredicate, Verdict
 from backend.utils import utc_now_dt
 
@@ -193,12 +194,6 @@ _SECTION_REF_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: 全角数字と漢数字 (1〜10) の読み替え。節番号の指定にしか使わない。
-_FULLWIDTH_DIGITS = {c: str(i) for i, c in enumerate("０１２３４５６７８９")}
-_KANJI_NUMERALS = {
-    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
-}
 
 
 def references_artifact(query: str) -> bool:
@@ -254,12 +249,8 @@ def requested_section(query: str) -> int | None:
     m = _SECTION_REF_RE.search(query or "")
     if not m:
         return None
-    raw = "".join(_FULLWIDTH_DIGITS.get(c, c) for c in m.group(1))
-    if raw.isdigit():
-        return int(raw) or None
-    if len(raw) == 1 and raw in _KANJI_NUMERALS:
-        return _KANJI_NUMERALS[raw]
-    return None
+    # 読み取りは core.numerals の 1 本 (不変則 #14(a)、2026-09-28 再レビュー 6)。
+    return kanji_number_value(m.group(1)) or None
 
 
 def render_artifact_block(

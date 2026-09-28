@@ -130,7 +130,44 @@ FACT_CURATOR_ATTR_FIELDS: frozenset[str] = frozenset({
     "score_count", "last_fetched_at",
     # assertion_curator / personal_fact_curator
     "source_note_id", "raw_utterance",
+    # 行が置き換える旧値の span (不変則 #13)。Step 6B と到着時の畳みが後から読む。
+    "value_update",
 })
+
+
+def fact_value_update(fact: object) -> str:
+    """ファクトが置き換える旧値の span (無ければ空文字、純粋関数)。
+
+    書いた直後は作業値 (``fact.value_update``)、読み直した後は永続形
+    (``attrs.value_update`` → ``SemanticFact._extra``) にある。
+    """
+    span = getattr(fact, "value_update", None)
+    if not span:
+        span = (getattr(fact, "_extra", None) or {}).get("value_update")
+    return str(span or "")
+
+
+def fact_carries_span(fact: object, needle: str) -> bool:
+    """ファクトの本文 (object / キュレーターが残した原文) が span を含むか (純粋関数)。
+
+    ``needle`` は :func:`~backend.free.core.correction_verdict.norm_span` 済みの値。
+    assertion (``mem.world.assertion.*``) の object は補助タスクが書き直した 1 文
+    なので、原文 (``raw_utterance``) も照合する。**属性スロットでは原文を見ない** —
+    Step 8.3 の分割は全ファクトにノート全文を原文として載せるので、「息子は小学3年、
+    娘は小学1年です。」を分割した「娘は小学1年」が「小学3年」の訂正で巻き添えに
+    畳まれる (不変則 #13、2026-09-27 独立レビュー H1)。
+    """
+    from backend.free.core.correction_verdict import norm_span
+
+    if not needle:
+        return False
+    raw = ""
+    if str(getattr(fact, "subject", "") or "").startswith("mem.world.assertion."):
+        raw = (getattr(fact, "_extra", None) or {}).get("raw_utterance") or ""
+    return any(
+        needle in norm_span(str(text))
+        for text in (getattr(fact, "object", "") or "", raw) if text
+    )
 
 #: ``SemanticFact`` のフィールド → ``Evidence`` の書き先 (c_05 §1.4 の対応表)。
 #:
@@ -613,6 +650,8 @@ __all__ = [
     "evidence_to_fact",
     "fact_namespace",
     "fact_patch",
+    "fact_carries_span",
     "fact_to_evidence",
+    "fact_value_update",
     "is_ignored_fact_record",
 ]

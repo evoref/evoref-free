@@ -65,7 +65,7 @@ from backend.free.core.response_arithmetic import (
 )
 from backend.free.llm.json_schemas import FewShotQualityJudgement
 from backend.free.memory.types import make_fact
-from backend.free.learning.level0_instant import used_corpus_evidence
+from backend.free.learning.level0_instant import teaches_success, used_corpus_evidence
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -1528,7 +1528,10 @@ class FewShotPool(VersionedJsonFile):
                 continue
             if signals.get("rephrased_query", False):
                 continue
-            if signals.get("turn_outcome") == "failed":
+            # 成功だけを手本にする。部分成功 (partial) とラベル無し (理由付きの success:
+            # 検証できていない計算・実行されなかった操作・未検査の制作、docs/f_04 §2.5)
+            # も成功の教師にしない。
+            if not teaches_success(signals):
                 continue
             if signals.get("user_negative") is True:
                 continue
@@ -2010,7 +2013,8 @@ class FewShotPool(VersionedJsonFile):
             outcome = signals.get("turn_outcome")
             if outcome == "failed":
                 verdict = "harmful" if self._is_attributable_failure(signals) else None
-            elif outcome == "success":
+            elif outcome == "success" and teaches_success(signals):
+                # ラベル無し (理由付きの success) は使用だけ数える (f_04 §2.5)
                 verdict = "helpful"
             else:
                 verdict = None

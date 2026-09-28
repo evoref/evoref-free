@@ -837,8 +837,8 @@ class SleepTimeWorker:
 
         # Step 8-9: 未要約セッションの要約生成 + 埋め込み。
         # Full の LLM 版の **先頭** に置く — 手前に corpus 再構築 (5.85) /
-        # ProjectMap 更新 (5.87) / 競合解決 (6) / ノート進化 (7) / 訂正検証
-        # (8.0) / 各 curator (8.3-8.6) / 知識取得 (8.7) を挟むと、チャット
+        # 競合解決 (6) / ノート進化 (7) / 訂正検証 (8.0) / 各 curator
+        # (8.3-8.6) / 知識取得 (8.7) を挟むと、チャット
         # 割り込みによる早期 return (``_check_cancelled``) がここまで届かない
         # ことが多かった (実測: 4 回中 3 回未達)。要約は light パスの
         # ``_step_e3_summarize_sessions`` (ノートを要約へ畳む) と Full の
@@ -865,24 +865,6 @@ class SleepTimeWorker:
         step_durations["step5_85_corpus_rebuild"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
-
-        # Step 5.87: ProjectMap (既存プロジェクトの code グラフ) の更新 (c_16 §4.4)。
-        # LLM を使わない決定論抽出 (tree-sitter) なので、記憶の整理 (Step 6〜9) より
-        # 前に置ける — Step 5.9 (疑似クエリ、1 件 20 秒級の LLM 生成) と違い GPU 予算を
-        # 食い合わない。記憶側のステップなので ``--no-learning`` でも走る。
-        ts = time.monotonic()
-        result["project_map_updated"] = await self._step5_87_update_project_map()
-        step_durations["step5_87_project_map"] = round(time.monotonic() - ts, 3)
-        if self._check_cancelled():
-            return result
-
-        # 5.88: corpus パッケージの非 active 旧版を直近 2 版まで刈る (c_16 §4.3 / §5.4)。
-        # 5.85 / 5.87 が版を積んだ直後に置く — ProjectMap は構造変更のたびに 50 MB 級の
-        # 版を積むので、ここで刈らないと Full ごとに増え続ける (2026-09-18 実機: GC の
-        # 呼出元がどこにも無く 3 版 153 MB が残った)。
-        ts = time.monotonic()
-        result["corpus_versions_gc"] = self._step5_88_gc_corpus_versions()
-        step_durations["step5_88_corpus_gc"] = round(time.monotonic() - ts, 3)
 
         # Step 5.89: staged クリエイトの run (run.json/events.jsonl + workspace)
         # を create.runs_keep 件まで刈る (f_10 §7 / c_05 §0.5.6)。記憶側のステップ
@@ -1104,6 +1086,27 @@ class SleepTimeWorker:
         ts = time.monotonic()
         result["tail_refreshed"] = await self.refresh_tail()
         step_durations["step_e6_tail_refresh"] = round(time.monotonic() - ts, 3)
+
+        # Step 5.87: ProjectMap (既存プロジェクトの code グラフ) の更新 (c_16 §4.4)。
+        # 記憶の整理 (Step 6〜9、特に 8.0 の訂正検証) の **後** に置く — 初回構築は
+        # 走査の規模次第で 10 分を超え (2026-09-28 R13: worktree を抱えたリポジトリで
+        # 94 万ノード・11.6 分)、その間 8.0 以降が止まって訂正が反映されなかった。
+        # corpus 側の別ストアなので記憶の版 (E5) と順序の依存は無い。記憶側の
+        # ステップなので ``--no-learning`` でも走る。
+        ts = time.monotonic()
+        result["project_map_updated"] = await self._step5_87_update_project_map()
+        step_durations["step5_87_project_map"] = round(time.monotonic() - ts, 3)
+        # ここでキャンセルを見て抜けない — 記憶の段は終わっているので、抜けると
+        # 死活監視が Full を未完走 (missed) と数える。5.88 は軽く、5.9 は
+        # ``is_cancelled`` / 静穏窓を自前で見て何もせずに返る。
+
+        # 5.88: corpus パッケージの非 active 旧版を直近 2 版まで刈る (c_16 §4.3 / §5.4)。
+        # 5.85 / 5.87 が版を積んだ後に置く — ProjectMap は構造変更のたびに 50 MB 級の
+        # 版を積むので、ここで刈らないと Full ごとに増え続ける (2026-09-18 実機: GC の
+        # 呼出元がどこにも無く 3 版 153 MB が残った)。
+        ts = time.monotonic()
+        result["corpus_versions_gc"] = self._step5_88_gc_corpus_versions()
+        step_durations["step5_88_corpus_gc"] = round(time.monotonic() - ts, 3)
 
         # 永続化 + 完了ログ
         # Step 5.9: corpus 疑似クエリ生成 (f_01 §6.4)。**Full の最後** に置く —
@@ -1368,6 +1371,7 @@ class SleepTimeWorker:
         に分離された。本メソッドは cancel 判定を渡す薄いラッパ。
         """
         from backend.free.memory.sleep.summarize import (
+            chat_summary_skip_modes,
             summarize_unsummarized_sessions,
         )
 
@@ -1378,6 +1382,8 @@ class SleepTimeWorker:
             batch_size=int(history_cfg.get("summary_batch_size", 20)),
             is_cancelled=self._check_cancelled,
             should_pause=self._chat_in_flight,
+            # 配信モデルが chat のモデルと違う間は chat の要約を作らない (M3)
+            skip_modes=chat_summary_skip_modes(),
         )
 
     # ── Step 7.5 (MDP トレース → episodic LTM) ─────────

@@ -44,6 +44,7 @@ from backend.free.memory.sleep._curator_common import (
 )
 from backend.free.core.session_mode import normalize_session_mode
 from backend.free.memory.note_facts import fact_from_note
+from backend.free.memory.sleep.extraction import write_sleep_facts
 from backend.free.memory.types import SemanticFact
 from backend.log_config import get_logger
 from backend.utils import epoch_to_utc
@@ -298,8 +299,7 @@ async def curate_executable_command_facts(
                     # ``_curator_common.INDEX_EMBED_IS_QUERY`` が SSOT。
                     **index_embed_fields(subject),
                 )
-                store.add_fact(fact)
-                written += 1
+                written += len(write_sleep_facts(store, [fact], label="command"))
             else:
                 # 既存 fact が無く success=False → 学習しない
                 logger.debug(

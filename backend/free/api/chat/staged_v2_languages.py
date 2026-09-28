@@ -120,6 +120,16 @@ def module_rules(path: str, *, siblings: list[str]) -> str:
             "- Import sibling modules of this deliverable by their bare module name\n"
             f"  (e.g. `from {example} import ...`) — they are placed in the same directory.\n"
             "- Standard library only unless the request says otherwise.\n"
+            # 置き場は定数 1 か所・呼び出し時に読む — 参考テストが setattr で差し替える先 (f_10 §11.1-1、R12)
+            "- Define the default location of each data file once, as a module-level constant built from this\n"
+            "  file's location, e.g.\n"
+            "  `DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), \"todos.json\")` — not an\n"
+            "  absolute path and not the current directory. Functions read the constant when they are called\n"
+            "  (a `None` default replaced by `DATA_FILE` inside the function is fine); never use it as a default\n"
+            "  argument value (`def load(path=DATA_FILE)`), so tests can replace the constant. Accept another\n"
+            "  location as an argument or environment variable.\n"
+            f"- Other files read such a constant through its module (`import {example}` then `{example}.DATA_FILE`), never\n"
+            f"  by name (`from {example} import DATA_FILE` keeps a copy that tests cannot replace).\n"
         )
     lang = fence_language(path)
     rules = [f"- This file is {lang}, not Python. Write idiomatic {lang}."]
@@ -156,7 +166,8 @@ def module_rules(path: str, *, siblings: list[str]) -> str:
         rules.append(
             "- Include sibling PHP files with `require_once __DIR__ . '/<path>';` using the design's paths. "
             "No frameworks or Composer packages unless the request asks for them. Functions do not see "
-            "script variables: read `$argv` / `$argc` at the top level and pass the values in.",
+            "script variables: read `$argv` / `$argc` at the top level and pass the values in. "
+            "Build paths of data files from `__DIR__`, never from an absolute path.",
         )
     if suffix == ".sql":
         rules.append(
@@ -451,6 +462,42 @@ def syntax_errors(code_map: dict[str, str]) -> list[str]:
     return errors
 
 
+#: 実行環境で構文を検査する拡張子 (:func:`runtime_errors` と同じ対応)。
+_RUNTIME_CHECKED = {".js": "node", ".mjs": "node", ".php": "php"}
+
+
+def syntax_unchecked(code_map: dict[str, str], *, cfg: dict | None = None) -> dict[str, str]:
+    """構文を検査できなかったファイル → 欠けている検査器 (Python 以外、§12.4)。
+
+    :func:`syntax_errors` は検査できなかったファイルを「誤りなし」と区別しないので、ここで拾う
+    (飛ばした検査を「合格」と書かない、2026-09-27 ライブ監査 S9)。実行環境 (``node --check`` /
+    ``php -l``) で検査できたファイルは検査済み。``.php`` は tree-sitter の構文検査の対象外なので、
+    ``php`` が無ければ未検査 (独立レビュー L2)。
+    """
+    from backend.free.core.code_syntax import syntax_checker_missing
+    from backend.free.core.runtimes import resolve_runtime
+
+    available: dict[str, bool] = {}
+    out: dict[str, str] = {}
+    for path in code_map:
+        if path.endswith(".py"):
+            continue
+        suffix = PurePosixPath(path).suffix.lower()
+        runtime = _RUNTIME_CHECKED.get(suffix)
+        if runtime is not None:
+            if runtime not in available:
+                available[runtime] = resolve_runtime(runtime, cfg)[0] is not None
+            if available[runtime]:
+                continue
+            if suffix == ".php":
+                out[path] = runtime
+                continue
+        missing = syntax_checker_missing(path)
+        if missing:
+            out[path] = missing
+    return out
+
+
 def _sqlite_errors(code_map: dict[str, str], order: list[str]) -> list[str]:
     """``.sql`` を依存順に 1 つのメモリ上の SQLite で流す (最初に失敗したファイルだけ返す)。"""
     conn = sqlite3.connect(":memory:")
@@ -594,5 +641,6 @@ __all__ = [
     "references",
     "runtime_errors",
     "syntax_errors",
+    "syntax_unchecked",
     "unsupported_request",
 ]

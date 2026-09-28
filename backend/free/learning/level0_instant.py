@@ -2,8 +2,9 @@
 
 import os
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -12,11 +13,11 @@ from backend.free.learning.fitness import DEFECT_WEIGHTS, signal_is_defect
 from backend.io import jsoncodec
 from backend.io.codec import CodecError, codec_for, persisted
 from backend.io.format_registry import FormatSpec, register_format
-from backend.io.id_registry import new_id
+from backend.io.id_registry import is_valid_id, new_id
 from backend.io.readonly import DataReadonlyError
 from backend.io.writer_thread import ChatWriter, default_writer
 from backend.log_config import get_logger
-from backend.utils import utc_now
+from backend.utils import parse_utc, utc_now
 
 logger = get_logger("learning.level0")
 
@@ -31,8 +32,40 @@ RESPONSE_SUMMARY_CAP = 200
 RESPONSE_FULL_CAP = 4000
 
 #: ターン成否の語彙 (``FeedbackSignals.turn_outcome``)。台帳では ``open`` の列挙。
+#: 「ラベル無し」は第 4 の値ではなく **理由付きの ``success``** で持つ —
+#: ``learning.level1_session`` の snapshot がこの列挙を閉じた型で持ち、値やフィールドを
+#: 足すと形式の版とデータ世代の更新が要る (docs/f_04 §2.5)。導出 (``FeedbackCollector``)
+#: は ``success`` に理由を付けないので、理由の有無がそのまま印になる。
 TurnOutcome = Literal["success", "partial", "failed"]
 TURN_OUTCOMES: frozenset[str] = frozenset(get_args(TurnOutcome))
+
+
+def is_unlabeled(signals: Mapping[str, Any]) -> bool:
+    """ラベル無し (理由付きの ``success``) か。"""
+    return (
+        signals.get("turn_outcome", "success") == "success"
+        and bool(signals.get("turn_outcome_reason"))
+    )
+
+
+def teaches_success(signals: Mapping[str, Any]) -> bool:
+    """成功の教師にしてよいターンか (``success`` かつラベル無しでない)。
+
+    few-shot の候補と curate の helpful はこれだけを見る。成否を持たない旧レコードは
+    成功として読む (:func:`unknown_enums` と同じ既定値)。
+    """
+    return signals.get("turn_outcome", "success") == "success" and not is_unlabeled(signals)
+
+
+def teaches_via_verified_correction(signals: Mapping[str, Any]) -> bool:
+    """検証済みの訂正ターンを「元の問い → 訂正後の回答」の手本にしてよいか。
+
+    :func:`teaches_success` の例外 (docs/f_04 §2.5)。手本の中身はユーザーの **検証済み**
+    の訂正 (``user_correction``、不変則 #12) であって元の回答ではないので、訂正ターンが
+    ラベル無しや ``partial`` でもよい。訂正ターン自身が ``failed`` (別の欠陥を持ち込んだ)
+    なら使わない。eval_core の期待値にするかは別 (ラベル無しは ``grounding_suspect``)。
+    """
+    return bool(signals.get("user_correction")) and signals.get("turn_outcome") != "failed"
 
 
 def _has_defect(signals: "FeedbackSignals") -> bool:
@@ -86,7 +119,7 @@ def truncate_at_boundary(text: str, cap: int) -> str:
 class FeedbackSignals:
     """暗黙的フィードバックシグナル"""
     conversation_ended: bool = False
-    # ターン成否の SSOT: "success" | "partial" | "failed"。
+    # ターン成否の SSOT: "success" | "partial" | "failed" (理由付きの success はラベル無し)。
     # response の [failed] マーカー / step_credits 全 0 / ルーティング
     # false_positive から FeedbackCollector が決定論導出する。
     # tool_routing_success / long_form_success と矛盾する場合は failed 側に
@@ -94,7 +127,9 @@ class FeedbackSignals:
     turn_outcome: TurnOutcome = "success"
     #: ``turn_outcome`` の導出理由 (``FeedbackCollector._derive_turn_outcome_with_reason``
     #: の文字列)。few-shot の curate が「手本に帰属できる失敗か」を理由で
-    #: 選別する (f_04 §3.2.2)。旧レコードは None。
+    #: 選別する (f_04 §3.2.2)。旧レコードは None。**理由付きの ``success`` は
+    #: ラベル無し** (失敗の証拠は無いが成功の教師にもしない、docs/f_04 §2.5。読み手は
+    #: :func:`teaches_success`)。
     turn_outcome_reason: str | None = None
     rephrased_query: bool = False
     rag_used: bool = False
@@ -124,7 +159,8 @@ class FeedbackSignals:
     correction_verdict: VerdictCode | None = None
     """検証結果 (語彙は :data:`~backend.free.core.correction_verdict.VerdictCode`)。``assistant`` / ``self`` / ``third_party`` / ``premise_change``
     / ``none`` (LLM の判定) と、コード側で付ける ``no_context`` (直前応答を
-    解決できない) / ``invalid_span`` (逐語検証に落ちた) / ``no_verdict``
+    解決できない) / ``invalid_span`` (逐語検証に落ちた。span の組が発話の
+    「X ではなく Y」と逆向きのものを含む) / ``no_verdict``
     (補助タスクが空を返した)。``assistant`` のみが昇格する。"""
     correction_wrong_claim: str | None = None
     """直前応答のうち誤っていた逐語 span (検証済み)。"""
@@ -577,6 +613,25 @@ def compacted_body(path: Path, max_entries: int) -> tuple[str, int]:
     return rows_text(kept), len(kept)
 
 
+_TIME_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _parsed_time_or_min(value: object) -> datetime:
+    """並べ替え用の時刻 (読めなければ最古。文字列の辞書順では比べない、c_05 §0.5.4)。"""
+    return parse_utc(value) or _TIME_MIN  # type: ignore[arg-type]
+
+
+@dataclass(slots=True)
+class _PartitionFile:
+    """束ねたファイル以外のパーティションのファイル (生成したモデルが違う経験の置き場)。"""
+
+    path: Path
+    #: 物理行数 (コンパクションの判定)。
+    lines: int = 0
+    #: 新しい版の行を見つけたら書かない (c_05 §0.4.5)。
+    newer: bool = False
+
+
 class ExperienceBuffer:
     """経験バッファ: 毎応答時にエントリを記録し、JSONL へ追記する (c_05 §5.3)。
 
@@ -595,6 +650,14 @@ class ExperienceBuffer:
     **耐久性はこのストア自身の責務** (2026-09-06 監査 F-04: 保存を sleep-time に
     預けていた間、ログ上は記録済みでも実体が無い窓が常時開いていた)。追記は
     ターンの終わりに fsync される (書き手スレッドの契約)。
+
+    **置き場はエントリごと** (f_04 §1.2.0、2026-09-27 監査 S8): :meth:`set_partition_path`
+    を渡すと、``record()`` は ``entry.model_key`` (その生成を返したモデル) の
+    パーティションのファイルへ追記する。読み込んだエントリの patch は読み込んだ
+    ファイルへ出す (混入した行を別のファイルへ動かさない)。:meth:`load_partition`
+    で束ねたファイル以外のパーティションをメモリへ足す (``entries`` はその和)。
+    件数上限はファイルごとに掛かる。Level 1 は :meth:`partition_entries` (束ねた
+    ファイルの分のうち、束ねたパーティションのモデルが生成したもの) だけを見る。
     """
 
     FORMAT = EXPERIENCE_FORMAT
@@ -623,6 +686,12 @@ class ExperienceBuffer:
         self._newer_on_disk = False
         #: 未知の列挙値を持つ記録 (原形の dict)。学習には使わず、書き直しで保つ。
         self._ignored: list[dict] = []
+        #: model_key → そのパーティションの経験ファイル (未設定なら全て束ねたファイルへ)。
+        self._partition_path: Callable[[str], Path] | None = None
+        #: 束ねたファイル以外のパーティションのファイル (正規化したパス → 状態)。
+        self._partitions: dict[str, _PartitionFile] = {}
+        #: entry id → 束ねたファイル以外の置き場 (正規化したパス)。無ければ束ねたファイル。
+        self._homes: dict[str, str] = {}
         # 差分の計算と enqueue を 1 つにする (sleep-time の executor とループの
         # 両方から来る。先に差分を取った方が後から enqueue すると古い値が勝つ)。
         self._persist_lock = threading.RLock()
@@ -654,6 +723,24 @@ class ExperienceBuffer:
         (patch 行・刈り込み待ち・印の付け直し) 起動時のコンパクションとして書き直す。
         """
         target = Path(path)
+        parsed, ignored, stats = self._read_file(target)
+        with self._persist_lock:
+            self.entries = parsed
+            self.bound_path = target
+            self._reset_tracking()
+            self._newer_on_disk = bool(stats["newer"])
+            self._ignored = ignored
+            marked = self._mark_loaded_conversations_ended(self.entries)
+            self._shadow = {e.id: entry_to_dict(e) for e in self.entries if e.id}
+            self._anonymous_written = {id(e) for e in self.entries if not e.id}
+            self._lines = stats["lines"]
+            if stats["lines"] and (marked or stats["lines"] > self._record_count):
+                self._rewrite(target)
+        if stats["lines"] or parsed:
+            logger.info("Loaded %d experience entries from %s", len(self.entries), target)
+
+    def _read_file(self, target: Path) -> tuple[list[ExperienceEntry], list[dict], dict[str, int]]:
+        """``target`` を畳んで ``(使うエントリ, 未知の列挙値の記録, 統計)`` を返す (件数上限を掛ける)。"""
         records, stats = fold_experience_file(target)
         parsed: list[ExperienceEntry] = []
         ignored: list[dict] = []
@@ -689,46 +776,112 @@ class ExperienceBuffer:
             )
         if len(parsed) > self.max_entries:
             parsed = parsed[-self.max_entries:]
+        return parsed, ignored, stats
+
+    # ── パーティション (生成したモデルの置き場、f_04 §1.2.0) ──
+
+    def set_partition_path(self, resolve: Callable[[str], Path] | None) -> None:
+        """``model_key`` → そのパーティションの経験ファイル、を渡す (``None`` で外す)。
+
+        以後の :meth:`record` は ``entry.model_key`` の置き場へ追記する。束ねたファイルと
+        同じ置き場になるエントリ・``model_key`` の無いエントリは束ねたファイルへ。
+        """
+        self._partition_path = resolve
+
+    def load_partition(self, path: str | Path) -> None:
+        """束ねたファイル以外のパーティション ``path`` を読んでメモリへ足す (書き直さない)。
+
+        読んだエントリの patch は ``path`` へ出る。既にメモリにある id は足さない。
+        束ねたファイルそのもの・未束縛のときは何もしない。
+        """
+        target = Path(path)
+        if self.bound_path is None or self._same(target, self.bound_path):
+            return
+        parsed, _ignored, stats = self._read_file(target)
         with self._persist_lock:
-            self.entries = parsed
-            self.bound_path = target
-            self._reset_tracking()
-            self._newer_on_disk = bool(stats["newer"])
-            self._ignored = ignored
-            marked = self._mark_loaded_conversations_ended()
-            self._shadow = {e.id: entry_to_dict(e) for e in self.entries if e.id}
-            self._anonymous_written = {id(e) for e in self.entries if not e.id}
-            self._lines = stats["lines"]
-            if stats["lines"] and (marked or stats["lines"] > self._record_count):
-                self._rewrite(target)
-        if stats["lines"] or parsed:
-            logger.info("Loaded %d experience entries from %s", len(self.entries), target)
+            key = self._norm(target)
+            self._partitions[key] = _PartitionFile(
+                target, lines=stats["lines"], newer=bool(stats["newer"]),
+            )
+            known = {e.id for e in self.entries if e.id}
+            added = [e for e in parsed if not (e.id and e.id in known)]
+            self._mark_loaded_conversations_ended(added)
+            for entry in added:
+                if entry.id:
+                    self._homes[entry.id] = key
+                    self._shadow[entry.id] = entry_to_dict(entry)
+                else:
+                    self._anonymous_written.add(id(entry))
+            self.entries = sorted(
+                [*self.entries, *added], key=lambda e: _parsed_time_or_min(e.timestamp),
+            )
+        if added:
+            logger.info("Loaded %d experience entries of another partition from %s", len(added), target)
+
+    def partition_entries(self) -> list[ExperienceEntry]:
+        """束ねたパーティションのモデルが生成したエントリだけ (Level 1 の入力)。
+
+        置き場が束ねたファイルでも、``model_key`` が束ねたパーティション
+        (``learning/<model_key>/``) と違う行は除く — 2026-09-26〜27 に base へ混入した
+        create_model の経験 (移送しない。doctor が数える) を base の Level 1・few-shot
+        の入力にしない (2026-09-28 レビュー M3)。``model_key`` の無い行は残す。
+        """
+        own = self._home_entries()
+        bound = self.bound_path.parent.name if self.bound_path is not None else ""
+        if not is_valid_id(bound, "mk_"):
+            return own
+        return [e for e in own if not e.model_key or e.model_key == bound]
+
+    def _home_entries(self) -> list[ExperienceEntry]:
+        """束ねたファイルに行があるエントリ (永続化の単位。混入した行も含む)。"""
+        homes = self._homes
+        return [e for e in self.entries if not (e.id and e.id in homes)]
+
+    def _route(self, entry: ExperienceEntry) -> str | None:
+        """新しいエントリの置き場 (束ねたファイル以外なら正規化したパス、同じなら ``None``)。"""
+        resolve = self._partition_path
+        if resolve is None or not entry.model_key or self.bound_path is None:
+            return None
+        target = Path(resolve(entry.model_key))
+        if self._same(target, self.bound_path):
+            return None
+        key = self._norm(target)
+        if key not in self._partitions:
+            self._partitions[key] = _PartitionFile(target)
+        return key
+
+    def _home_key(self, entry: ExperienceEntry) -> str | None:
+        return self._homes.get(entry.id) if entry.id else None
 
     def save(self, path: str | Path) -> None:
         """保存する。
 
         ``path`` が束縛先なら、変わったエントリを patch 行で出してから
         (sleep-time / shutdown の書き戻し)、行が記録数より多ければコンパクションを
-        書き手スレッドへ出す。別のパス (rebind の退避・移行先) なら今のエントリで
-        そのファイルを書き直す。
+        書き手スレッドへ出す。別のパス (rebind の退避・移行先) なら束ねたファイルの
+        エントリでそのファイルを書き直す (他のパーティションのエントリは混ぜない)。
         """
         target = Path(path)
         if self.bound_path is not None and self._same(target, self.bound_path):
             self.flush()
             if self._lines > self._record_count:
                 self._compact()
+            for key, part in list(self._partitions.items()):
+                if part.lines > self._partition_record_count(key):
+                    self._compact(key)
             return
         if self._newer_on_disk:
             return
+        own = self._home_entries()
         try:
             self.writer.replace(
-                target, rows_text([*self._ignored, *(entry_to_dict(e) for e in self.entries)]),
+                target, rows_text([*self._ignored, *(entry_to_dict(e) for e in own)]),
                 format_id=EXPERIENCE_FORMAT.format_id, fsync=True,
             )
         except DataReadonlyError:
             logger.debug("Experience buffer not saved to %s: data root is read-only", target)
             return
-        logger.info("Saved %d experience entries to %s", len(self.entries), target)
+        logger.info("Saved %d experience entries to %s", len(own), target)
 
     def rebind(self, path: str | Path, *, previous: str | Path | None = None) -> None:
         """base モデル切替で経験バッファを新パーティションへ向け直す。
@@ -740,6 +893,12 @@ class ExperienceBuffer:
         prev = Path(previous) if previous is not None else self.bound_path
         if prev is not None and self.entries:
             self.save(prev)
+        # 書き手スレッドに積まれた追記 (新しい束ね先のパーティションへの create の
+        # 経験を含む) を書き切ってから読む。読んだ内容で書き直す (``_rewrite``) と、
+        # 未実行の追記が書き直しに上書きされて消える (2026-09-28 レビュー M1)。
+        # rebind は /api/model/reload 等の経路でチャット経路ではないので待ってよい。
+        if self.autosave:
+            self.writer.drain()
         self.entries = []
         self.load(path)
         logger.info(
@@ -767,14 +926,20 @@ class ExperienceBuffer:
             return
 
         self.entries.append(entry)
+        home = self._route(entry)
+        if home is not None:
+            self._homes[entry.id] = home
 
-        # ローテーション (ファイルからの刈り込みはコンパクションで)
-        if len(self.entries) > self.max_entries:
-            overflow = len(self.entries) - self.max_entries
-            for old in self.entries[:overflow]:
+        # ローテーション (ファイルからの刈り込みはコンパクションで)。件数上限は置き場
+        # (ファイル) ごと — 別のパーティションの記録が束ねたファイルの分を押し出さない。
+        same_home = [e for e in self.entries if self._home_key(e) == home]
+        if len(same_home) > self.max_entries:
+            dropped = {id(e) for e in same_home[: len(same_home) - self.max_entries]}
+            for old in same_home[: len(same_home) - self.max_entries]:
                 self._shadow.pop(old.id, None)
-            self.entries = self.entries[overflow:]
-            logger.info("Rotated %d old entries", overflow)
+                self._homes.pop(old.id, None)
+            self.entries = [e for e in self.entries if id(e) not in dropped]
+            logger.info("Rotated %d old entries", len(dropped))
 
         self._persist(self.entries[-_RECENT_WINDOW:])
 
@@ -801,28 +966,39 @@ class ExperienceBuffer:
                 return
             touched = list(self._touched.values())
             self._touched.clear()
-            lines: list[str] = []
+            # 置き場 (None = 束ねたファイル) → 行。エントリは記録・読み込みしたファイルへ。
+            by_home: dict[str | None, list[str]] = {}
             seen: set[int] = set()
             for entry in (*touched, *candidates):
                 if id(entry) in seen:
                     continue
                 seen.add(id(entry))
+                home = self._home_key(entry)
+                if home is not None and self._partitions[home].newer:
+                    continue
                 line = self._line_for(entry)
                 if line is not None:
-                    lines.append(line)
-            if not lines:
-                return
-            try:
-                self.writer.append(path, lines, format_id=EXPERIENCE_FORMAT.format_id)
-            except DataReadonlyError:
-                # readonly は起動側で学習を止めている。ここは最後の砦で、ターンごとに
-                # WARNING を出さない (G1 設計 §16.2 #14)。
-                logger.debug("Experience not saved: data root is read-only")
-                return
-            self._lines += len(lines)
-            overfull = self._lines > 2 * self.max_entries
-        if overfull:
-            self._compact()
+                    by_home.setdefault(home, []).append(line)
+            overfull: list[str | None] = []
+            for home, lines in by_home.items():
+                target = path if home is None else self._partitions[home].path
+                try:
+                    self.writer.append(target, lines, format_id=EXPERIENCE_FORMAT.format_id)
+                except DataReadonlyError:
+                    # readonly は起動側で学習を止めている。ここは最後の砦で、ターンごとに
+                    # WARNING を出さない (G1 設計 §16.2 #14)。
+                    logger.debug("Experience not saved: data root is read-only")
+                    return
+                if home is None:
+                    self._lines += len(lines)
+                    total = self._lines
+                else:
+                    self._partitions[home].lines += len(lines)
+                    total = self._partitions[home].lines
+                if total > 2 * self.max_entries:
+                    overfull.append(home)
+        for home in overfull:
+            self._compact(home)
 
     def _line_for(self, entry: ExperienceEntry) -> str | None:
         """未出力なら記録の行、出力済みで変わっていれば patch 行、無変更なら ``None``。"""
@@ -845,20 +1021,34 @@ class ExperienceBuffer:
             return None
         return _patch_line(entry.id, changed)
 
-    def _compact(self) -> None:
-        """書き手スレッドでファイルを畳んで書き直す (完了を待たない)。"""
-        path = self.bound_path
-        if path is None or not self.autosave or self._newer_on_disk:
-            return
-        with self._persist_lock:
-            lines_at_enqueue = self._lines
+    def _compact(self, home: str | None = None) -> None:
+        """書き手スレッドでファイルを畳んで書き直す (完了を待たない)。
+
+        ``home`` は束ねたファイル以外のパーティション (正規化したパス)。``None`` は束ねたファイル。
+        """
+        if home is None:
+            path = self.bound_path
+            if path is None or not self.autosave or self._newer_on_disk:
+                return
+            with self._persist_lock:
+                lines_at_enqueue = self._lines
+        else:
+            part = self._partitions.get(home)
+            if part is None or not self.autosave or part.newer:
+                return
+            path = part.path
+            with self._persist_lock:
+                lines_at_enqueue = part.lines
 
         def build() -> str:
             body, kept = compacted_body(path, self.max_entries)
             with self._persist_lock:
-                if self.bound_path is not None and self._same(path, self.bound_path):
-                    # enqueue 後に追記された行はコンパクションの後ろに積まれる。
-                    self._lines = kept + max(0, self._lines - lines_at_enqueue)
+                # enqueue 後に追記された行はコンパクションの後ろに積まれる。
+                if home is None:
+                    if self.bound_path is not None and self._same(path, self.bound_path):
+                        self._lines = kept + max(0, self._lines - lines_at_enqueue)
+                elif (current := self._partitions.get(home)) is not None:
+                    current.lines = kept + max(0, current.lines - lines_at_enqueue)
             logger.info("Compacted experience log %s to %d entries", path, kept)
             return body
 
@@ -874,7 +1064,10 @@ class ExperienceBuffer:
         """
         if not self.autosave or self._newer_on_disk:
             return
-        rows = [*self._ignored, *(self._shadow.get(e.id) or entry_to_dict(e) for e in self.entries)]
+        rows = [
+            *self._ignored,
+            *(self._shadow.get(e.id) or entry_to_dict(e) for e in self._home_entries()),
+        ]
         try:
             self.writer.replace(
                 path, rows_text(rows), format_id=EXPERIENCE_FORMAT.format_id, fsync=True,
@@ -886,8 +1079,12 @@ class ExperienceBuffer:
 
     @property
     def _record_count(self) -> int:
-        """ファイルに残るべき記録の数 (使う記録 + 未知の列挙値の記録)。"""
-        return len(self.entries) + len(self._ignored)
+        """束ねたファイルに残るべき記録の数 (使う記録 + 未知の列挙値の記録)。"""
+        return len(self._home_entries()) + len(self._ignored)
+
+    def _partition_record_count(self, home: str) -> int:
+        """束ねたファイル以外のパーティション ``home`` のメモリ上の記録の数。"""
+        return sum(1 for e in self.entries if self._home_key(e) == home)
 
     @property
     def ignored_count(self) -> int:
@@ -901,10 +1098,16 @@ class ExperienceBuffer:
         self._lines = 0
         self._newer_on_disk = False
         self._ignored = []
+        self._partitions = {}
+        self._homes = {}
 
     @staticmethod
     def _same(a: str | Path, b: str | Path) -> bool:
         return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    @staticmethod
+    def _norm(path: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(path))
 
     def mark_user_feedback(
         self, session_id: str, *, negative: bool | None, note: str = "",
@@ -970,7 +1173,9 @@ class ExperienceBuffer:
         """全エントリを dict 化して返す (時系列順)。学習側の純粋関数の入力用。"""
         return [entry_to_dict(e) for e in self.entries]
 
-    def _mark_loaded_conversations_ended(self) -> int:
+    def _mark_loaded_conversations_ended(
+        self, entries: list[ExperienceEntry] | None = None,
+    ) -> int:
         """読み込んだエントリの ``conversation_ended`` を確定させる。
 
         ``FeedbackCollector.mark_conversation_ended`` は ``_session_entries``
@@ -988,7 +1193,7 @@ class ExperienceBuffer:
             新たに ended を立てた件数。
         """
         marked = 0
-        for entry in self.entries:
+        for entry in self.entries if entries is None else entries:
             if not entry.signals.conversation_ended:
                 entry.signals.conversation_ended = True
                 marked += 1

@@ -146,40 +146,59 @@ def _format_calc_result(result: object) -> str:
     return f"{rounded:.12g}"
 
 
+def _check_tree(tree: ast.AST) -> str | None:
+    """許可リスト (ノード・名前・呼び出し) とコスト上限を検査し、違反なら理由を返す。"""
+    for node in ast.walk(tree):
+        node_name = type(node).__name__
+        if type(node) not in _SAFE_NODES:
+            msg = f"Error: Unsafe expression (disallowed node: {node_name})"
+            hint = _DISALLOWED_NODE_HINTS.get(node_name)
+            if hint:
+                msg += f" -- {hint}"
+            return msg
+        if isinstance(node, ast.Name) and node.id not in _SAFE_NAMES:
+            return (
+                f"Error: Unsafe expression (unknown name: {node.id})"
+                f" -- {_DISALLOWED_NODE_HINTS['Name']}"
+            )
+        if isinstance(node, ast.Call):
+            # 呼び出し先は許可リストの素の名前のみ (Attribute は _SAFE_NODES に
+            # 無いのでここへ来る前に弾かれる)。キーワード引数と *args/**kwargs は
+            # 許可しない — 数学関数の用途では不要で、検証面を最小に保つ。
+            if not isinstance(node.func, ast.Name):
+                return (
+                    "Error: Unsafe expression (call target must be a plain "
+                    f"function name) -- {_DISALLOWED_NODE_HINTS['Call']}"
+                )
+            if node.keywords:
+                return (
+                    "Error: Unsafe expression (keyword arguments are not "
+                    "supported)"
+                )
+    return _reject_expensive(tree)
+
+
+def validate_expression(expression: str) -> str | None:
+    """``calculate`` が受け付ける式か (評価はしない)。受け付けないなら理由を返す。
+
+    式合成 (ツール判定の層 5.95) が合成直後に使う。合成器は SQL を「式」として
+    返すことがあり、実行時に初めて ``invalid syntax`` になっていた (2026-09-27
+    ライブ監査 C02#2、docs/f_03 §3.1)。規則は ``calculate`` と同じもの 1 つ。
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+        return _check_tree(tree)
+    except Exception as e:  # noqa: BLE001 - calculate と同じく理由の文字列で返す
+        return f"Error: {e}"
+
+
 def calculate(expression: str) -> str:
     """数式を安全に計算する"""
     try:
         tree = ast.parse(expression, mode="eval")
-        for node in ast.walk(tree):
-            node_name = type(node).__name__
-            if type(node) not in _SAFE_NODES:
-                msg = f"Error: Unsafe expression (disallowed node: {node_name})"
-                hint = _DISALLOWED_NODE_HINTS.get(node_name)
-                if hint:
-                    msg += f" -- {hint}"
-                return msg
-            if isinstance(node, ast.Name) and node.id not in _SAFE_NAMES:
-                return (
-                    f"Error: Unsafe expression (unknown name: {node.id})"
-                    f" -- {_DISALLOWED_NODE_HINTS['Name']}"
-                )
-            if isinstance(node, ast.Call):
-                # 呼び出し先は許可リストの素の名前のみ (Attribute は _SAFE_NODES に
-                # 無いのでここへ来る前に弾かれる)。キーワード引数と *args/**kwargs は
-                # 許可しない — 数学関数の用途では不要で、検証面を最小に保つ。
-                if not isinstance(node.func, ast.Name):
-                    return (
-                        "Error: Unsafe expression (call target must be a plain "
-                        f"function name) -- {_DISALLOWED_NODE_HINTS['Call']}"
-                    )
-                if node.keywords:
-                    return (
-                        "Error: Unsafe expression (keyword arguments are not "
-                        "supported)"
-                    )
-        cost_error = _reject_expensive(tree)
-        if cost_error:
-            return cost_error
+        violation = _check_tree(tree)
+        if violation:
+            return violation
         result = eval(  # noqa: S307 - AST を許可リストで検証済み、builtins も無効
             compile(tree, "<calc>", "eval"),
             {"__builtins__": {}}, dict(_SAFE_NAMES),

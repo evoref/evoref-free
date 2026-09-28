@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from backend.i18n_helper import template_line_patterns
 from backend.log_config import get_logger
 from backend.free.llm.model_metadata import DEFAULT_PARAMS_B
 from backend.free.memory.notes.note_evolver import compute_llm_call_interval
@@ -49,11 +51,78 @@ def _is_user_utterance(note: object) -> bool:
     return (getattr(note, "source", "user") or "user") == "user"
 
 
+def _mergeable_pair(a: object, b: object) -> bool:
+    """2 つのノートを統合してよいか (assistant 発話は同じターン内だけ)。
+
+    統合は ``note_a`` を生成文で上書きするので、マージ元の内容が相手の記録になる。
+    モデル自身の応答 (誤答を含みうる) を **別の会話のノート / 長期ノート** へ連結
+    すると、誤答が記憶として残り次の想起で強化される (2026-09-27 監査 M2: C10#5 の
+    「対面での対話は2人で8万円」が前日の別セッションのノートへ書き戻された)。
+
+    同じセッションでも **別のターン** の答えは統合しない。統合先の ``created_at`` /
+    ``turn_id`` / ``answers`` は元のターンのまま残るので、後のターンの内容が前の
+    ターンの記録になり、ノートの時刻で前後を決める読み手 (訂正の照合元
+    ``correction_curator.previous_turn_context``、問い ↔ 答えの ``answered_by``) が
+    取り違える (2026-09-28 再監査 R4: C03 の #1〜#3 の答えが #1 のノートへ統合され、
+    訂正より後の「金利 1.2%」が訂正の「直前の応答」になった)。ターンが分からない
+    ノートは同じターンだと示せないので統合しない。
+    """
+    if "assistant" not in (getattr(a, "source", None), getattr(b, "source", None)):
+        return True
+    if "long" in (getattr(a, "tier", "short"), getattr(b, "tier", "short")):
+        return False
+    if getattr(a, "session_id", "") != getattr(b, "session_id", ""):
+        return False
+    turn_a = getattr(a, "turn_id", "") or ""
+    return bool(turn_a) and turn_a == (getattr(b, "turn_id", "") or "")
+
+
 def _mark_dirty(short_term: object) -> None:
     """``EpisodicWorkspace.mark_dirty`` を呼ぶ (簡易スタブは持たないことがある)。"""
     mark = getattr(short_term, "mark_dirty", None)
     if callable(mark):
         mark()
+
+
+#: 書き込んだ内容の提示ブロックの見出し (``agent.written_content_header``、i18n が SSOT)。
+_WRITTEN_PREVIEW_HEADER_KEYS = (("agent.written_content_header", "path"),)
+#: 提示ブロックの囲みの開き (行頭の ``` 3 連以上 + 言語名)。
+_PREVIEW_OPENING_FENCE_RE = re.compile(r"^(`{3,})[^`]*$")
+
+
+def _without_written_previews(content: str) -> str:
+    """システムが実ファイルを読み戻して見せた提示ブロックを除いた本文 (純粋関数)。
+
+    提示ブロック (見出し + 囲み) の中身はディスクから読んだファイルそのもので、
+    生成ではない。その ``` の数はファイルの書き方で決まり、生成の途中切れの
+    印にならない (2026-09-27 監査 M8)。囲みの閉じ (開きと同じ長さの ``` だけの
+    行) が見つからないブロックは除かない — 区切れないものは従来どおり数える。
+    """
+    headers = template_line_patterns(_WRITTEN_PREVIEW_HEADER_KEYS, group="path")
+    if not headers:
+        return content
+    lines = content.split("\n")
+    kept: list[str] = []
+    i = 0
+    while i < len(lines):
+        is_header = any(pattern.match(lines[i]) for pattern in headers)
+        opening = (
+            _PREVIEW_OPENING_FENCE_RE.match(lines[i + 1].rstrip())
+            if is_header and i + 1 < len(lines) else None
+        )
+        if opening is not None:
+            # 囲みは行頭に置かれる (字下げした内側の ``` と取り違えない)。
+            fence = opening.group(1)
+            end = next(
+                (j for j in range(i + 2, len(lines)) if lines[j].rstrip() == fence),
+                None,
+            )
+            if end is not None:
+                i = end + 1
+                continue
+        kept.append(lines[i])
+        i += 1
+    return "\n".join(kept)
 
 
 class ConflictResolver:
@@ -125,7 +194,8 @@ class ConflictResolver:
 
         **ユーザー発話は対象外** (:func:`_is_user_utterance`)。統合は
         ``note_a.content`` を LLM 生成文で上書きするため、ユーザー自身の
-        言葉が失われる。
+        言葉が失われる。**assistant 発話は同じターン内でしか組にしない**
+        (:func:`_mergeable_pair`)。
 
         Returns:
             list of (note_id_a, note_id_b) pairs
@@ -157,6 +227,9 @@ class ConflictResolver:
 
         for i, j in zip(rows.tolist(), cols.tolist()):
             a, b = notes[i], notes[j]
+            # assistant 発話は別ターン・長期ノートと統合しない (M2 / R4)
+            if not _mergeable_pair(a, b):
+                continue
             # 失敗が続いて quarantine 中のペアはスキップ
             if self._in_cooldown(a, now) or self._in_cooldown(b, now):
                 cooldown_skipped += 1
@@ -180,6 +253,8 @@ class ConflictResolver:
 
         user 発話のノートは本人の書いたままなので触らない。統合 / 要約由来の
         ノートで奇数個の ``\`\`\``` は生成の切断の印 (2026-09-12 実機で 2 件)。
+        書き込んだ内容の提示ブロック (実ファイルの読み戻し) は数えない
+        (:func:`_without_written_previews`、2026-09-27 監査 M8)。
 
         Returns:
             外したノート数。
@@ -190,7 +265,9 @@ class ConflictResolver:
         doomed = [
             note_id for note_id, note in notes.items()
             if getattr(note, "source", "user") != "user"
-            and str(getattr(note, "content", "") or "").count("```") % 2 == 1
+            and _without_written_previews(
+                str(getattr(note, "content", "") or ""),
+            ).count("```") % 2 == 1
         ]
         for note_id in doomed:
             del notes[note_id]

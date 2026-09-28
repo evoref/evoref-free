@@ -790,19 +790,50 @@ class EvidenceStore:
         ``dictionary changed size during iteration`` になる。``in_place`` は
         読み手のいない起動時の replay 用 (事象数に比例したコピーを避ける)。
         """
-        if self._events_during_build is not None:
-            self._events_during_build.append(event)
-        folded = SnapshotWriter.fold(self._existing_for(event), [event])
+        self._apply_events([event], in_place=in_place)
+
+    def _apply_events(
+        self, events: Sequence[dict[str, Any]], *, in_place: bool = False,
+    ) -> None:
+        """事象を順にオーバーレイへ適用する (写しは 1 回だけ取る)。
+
+        事象ごとに写しを取ると、n 件の書込みでオーバーレイ全体を n 回写すので
+        O(n²) になる (2026-09-28 R13: ProjectMap の初回構築が 50 分を超えた)。
+        写しは適用し終えてから 1 回で差し替えるので、読み手が掴んでいる dict は
+        書き換えない (copy-on-write は :meth:`_apply_event` と同じ)。tail に足す id も
+        手元に集め、オーバーレイと同時に反映する — 途中で例外が出たときに、オーバーレイに
+        無い id が tail に残らないように。
+        """
         overlay = self._overlay if in_place else dict(self._overlay)
-        for record in folded:
-            known = self._snapshot is not None and self._snapshot.row_of(record.id) is not None
-            if not known and record.id not in overlay:
-                self._tail_ids.append(record.id)
-            overlay[record.id] = record
+        added: list[str] = []
+        try:
+            for event in events:
+                if self._events_during_build is not None:
+                    self._events_during_build.append(event)
+                folded = SnapshotWriter.fold(self._existing_for(event, overlay), [event])
+                for record in folded:
+                    known = (
+                        self._snapshot is not None
+                        and self._snapshot.row_of(record.id) is not None
+                    )
+                    if not known and record.id not in overlay:
+                        added.append(record.id)
+                    overlay[record.id] = record
+        except BaseException:
+            if in_place:
+                # その場で書き換えたオーバーレイに揃える (写しを持たない replay)
+                self._tail_ids.extend(added)
+            raise
+        self._tail_ids.extend(added)
         self._overlay = overlay
 
-    def _existing_for(self, event: dict[str, Any]) -> list[Evidence]:
-        """事象が参照するレコードの現在値だけを集める (全件展開しない)。"""
+    def _existing_for(
+        self, event: dict[str, Any], overlay: dict[str, Evidence],
+    ) -> list[Evidence]:
+        """事象が参照するレコードの現在値だけを集める (全件展開しない)。
+
+        ``overlay`` は適用中の写し (同じ一括の前の事象を反映した値を引く)。
+        """
         payload = event.get("payload") or {}
         ids = [str(event.get("id") or "")]
         if event.get("op") == "touch":
@@ -811,7 +842,9 @@ class EvidenceStore:
         for record_id in ids:
             if not record_id:
                 continue
-            current = self.get(record_id)
+            current = overlay.get(record_id)
+            if current is None and self._snapshot is not None:
+                current = self._snapshot.get(record_id)
             if current is not None:
                 records.append(current)
         return records
@@ -1233,6 +1266,39 @@ class EvidenceStore:
             self._apply_event(event)
             self.manifest.events_since_snapshot += 1
             return self._overlay.get(record.id, record)
+
+    def put_many(self, records: Iterable[Evidence], *, by: str | None = None) -> int:
+        """複数のレコードを順に ``put`` する (結果は :meth:`put` を順に呼んだのと同じ)。
+
+        事象は 1 レコード = 1 行で :meth:`put` と同じ形。違いは費用だけ —
+        月ファイルを開くのは 1 回、オーバーレイの写しも 1 回 (:meth:`_apply_events`)。
+        :meth:`put` を n 回呼ぶと写しが n 回になり O(n²) (2026-09-28 R13)。
+        書く前に全件を :func:`check_writable` に通し、1 件でも通らなければ何も書かない。
+
+        追記の途中の I/O 失敗 (ENOSPC 等) では、事象ログに一括の先頭の一部が残り、
+        オーバーレイには 1 件も適用されない (例外はそのまま上げる)。次の読み直し・版の
+        生成では事象ログが正になる。1 件ずつの :meth:`put` でも失敗した 1 行が残りうるのと
+        同じ性質で、ずれる幅が一括の件数まで広がるだけ。
+
+        Returns:
+            書いたレコード数。
+
+        Raises:
+            EvidenceStoreReadonlyError: ストアが readonly のとき (c_05 §0.5.1)。
+            RuntimeError: 別の書き手が同時に書いているとき。
+        """
+        records = list(records)
+        if not records:
+            return 0
+        operation = f"put_many({len(records)})"
+        self._refuse_write(operation)
+        for record in records:
+            check_writable(record)
+        with self._exclusive_write(operation):
+            events = self.events.append_puts([r.to_record() for r in records], by=by)
+            self._apply_events(events)
+            self.manifest.events_since_snapshot += len(events)
+            return len(events)
 
     def patch(
         self,
@@ -2178,8 +2244,7 @@ class EvidenceStore:
         # 戻す。捨てると次の版まで get / 検索から見えなくなる。事象ログから
         # 読み直すと月ファイルを先頭から数えることになる (50k 行で 0.24 秒
         # ループが止まる) ので、適用した事象をメモリに取っておく。
-        for event in late_events:
-            self._apply_event(event)
+        self._apply_events(late_events)
         self._prune_tail_vectors()
         self._vector_store = None
         self._vector_rows = None

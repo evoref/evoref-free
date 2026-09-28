@@ -17,6 +17,7 @@ dict マッパーは純粋関数として単体テスト可能。
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
@@ -114,6 +115,33 @@ def require_prompt_manager(state: AppState) -> SystemPromptManager:
     if mgr is None:
         raise prompt_manager_not_initialized_error()
     return mgr
+
+
+def manager_for_mode(mgr: SystemPromptManager, mode: str) -> SystemPromptManager:
+    """UI の表示・編集は、そのモードのターンが読むパーティションのマネージャで行う。
+
+    create_model が別モデルなら create のプロンプトはそのモデルのパーティションに
+    ある (f_04 §1.2.0)。active のものを編集しても create のターンには効かない。
+    """
+    from backend.free.agent.prompt_manager import SystemPromptManager
+
+    return mgr.for_mode(mode) if isinstance(mgr, SystemPromptManager) else mgr
+
+
+def prompt_partition_dict(mgr: SystemPromptManager, mode: str) -> dict[str, Any]:
+    """そのプロンプトがどのモデルのパーティションか (``model_key`` と表示名)。"""
+    from backend.free.agent.prompt_manager import SystemPromptManager
+
+    if not isinstance(mgr, SystemPromptManager):
+        return {}
+    label = ""
+    try:
+        from backend.config import get_config, mode_base_model_raw
+
+        label = Path(mode_base_model_raw(get_config().get("model_paths") or {}, mode)).stem
+    except Exception:  # noqa: BLE001 — 表示名が取れなくても本文は返す
+        label = ""
+    return {"model_key": Path(mgr.prompt_dir).parent.name, "model_label": label}
 
 
 # ── PromptMeta + content → dict マッピング ──────────────────────────

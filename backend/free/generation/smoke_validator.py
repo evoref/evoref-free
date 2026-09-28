@@ -25,8 +25,10 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.free.core import fs_sandbox
 from backend.free.generation.api_contract import (
     bind_local_instances,
     build_src_api,
@@ -63,6 +65,29 @@ def _stems(paths) -> set[str]:
 def _module_paths(paths) -> set[str]:
     """各ファイルパスを完全修飾ドット区切りモジュール名に変換する (import smoke 対象)。"""
     return {os.path.splitext(p.replace("\\", "/"))[0].replace("/", ".") for p in paths}
+
+
+def _run_sandboxed(
+    tmp: Path, py_files: dict[str, str], runner: str, args: list[str], exe: str, timeout_sec: float,
+    *, stdin=None,
+) -> subprocess.CompletedProcess:
+    """生成物を ``tmp/src`` に書き、``runner`` をスクリプトとして隔離下で実行する (f_10 §11.1-4)。
+
+    ``-c`` で起動すると audit hook を入れられない (入れると import が壊れる) ので、入口を
+    ``.sandbox/`` のファイルに書いてから起動する。書込みを許すのは ``src/`` と ``.sandbox`` の
+    home / tmp / cwd だけ (違反の記録は許す根の外)。モジュールは CWD (``src/``) から import する。
+    """
+    src = tmp / "src"
+    _write_py_files(str(src), py_files)
+    script = fs_sandbox.write_script(
+        tmp, "_evoref_runner.py", "import os, sys\nsys.path.insert(0, os.getcwd())\n" + runner,
+    )
+    # 出力は一時ファイルで受け、終わったら子孫ごと止める (孫が出力を掴むと時間上限が効かなかった)
+    return fs_sandbox.run_bounded(
+        [exe, str(script), *args],
+        cwd=str(src), timeout=timeout_sec, stdin=stdin,
+        env=fs_sandbox.sandbox_env(tmp, write_dirs=[src]),
+    )
 
 
 def _write_py_files(tmp: str, py_files: dict[str, str]) -> None:
@@ -734,6 +759,10 @@ class SmokeResult:
 
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: 作業フォルダの外への書込みを止めたため検査できなかったもの (止めた書込み先、
+    #: 記録が無ければモジュール名、f_10 §11.1-4)。不合格ではない (``errors`` に入れない)。
+    #: 説明の文は ``warnings`` にも入る。
+    unchecked: list[str] = field(default_factory=list)
 
 
 # サブプロセス内で各モジュールを import し、失敗を JSON で報告する runner。
@@ -883,15 +912,14 @@ def run_import_smoke(
     component_names = _top_level_component_names(py_files)
     exe = python_exe or sys.executable
 
+    violations: list[str] = []
     try:
         with tempfile.TemporaryDirectory(prefix="evoref_smoke_") as tmp:
-            _write_py_files(tmp, py_files)
-            proc = subprocess.run(
-                [exe, "-c", _SMOKE_RUNNER, json.dumps(sorted(module_paths))],
-                cwd=tmp,
-                capture_output=True,
-                timeout=timeout_sec,
+            # import 時の副作用で一時フォルダの外へ書かせない (f_10 §11.1-4)
+            proc = _run_sandboxed(
+                Path(tmp), py_files, _SMOKE_RUNNER, [json.dumps(sorted(module_paths))], exe, timeout_sec,
             )
+            violations = fs_sandbox.violation_paths(fs_sandbox.read_violations(Path(tmp)))
     except subprocess.TimeoutExpired:
         result.warnings.append(
             f"import スモークテストが {timeout_sec:.0f}s でタイムアウト "
@@ -912,10 +940,19 @@ def run_import_smoke(
         return result
 
     seen: set[str] = set()
+    for path in violations:
+        result.unchecked.append(path)
+        result.warnings.append(f"import スモーク: 未検査 — 作業フォルダの外への書込みを止めた ({path})")
     for failure in failures:
         if not isinstance(failure, dict):
             continue
         msg = str(failure.get("msg", ""))
+        if fs_sandbox.is_sandbox_error(msg):
+            # 止めた書込みで import が落ちたのはコードの誤りの証拠ではない (未検査)
+            if not violations:
+                result.unchecked.append(str(failure.get("module", "?")))
+                result.warnings.append(f"{failure.get('module', '?')}: import スモーク: 未検査 — {msg}")
+            continue
         missing = msg.split("'")[1].split(".")[0] if "'" in msg else ""
         imported = (
             _names_imported_from(py_files, missing) if missing else frozenset()
@@ -1107,11 +1144,7 @@ def run_entry_smoke(
     exe = python_exe or sys.executable
     try:
         with tempfile.TemporaryDirectory(prefix="evoref_entry_") as tmp:
-            _write_py_files(tmp, py_files)
-            proc = subprocess.run(
-                [exe, "-c", _ENTRY_SMOKE_RUNNER, ep_module],
-                cwd=tmp, capture_output=True, timeout=timeout_sec,
-            )
+            proc = _run_sandboxed(Path(tmp), py_files, _ENTRY_SMOKE_RUNNER, [ep_module], exe, timeout_sec)
     except subprocess.TimeoutExpired:
         result.warnings.append(
             f"エントリ実行スモークが {timeout_sec:.0f}s でタイムアウト (要確認)"
@@ -1131,6 +1164,70 @@ def run_entry_smoke(
         for issue in data.get("issues", []) or []:
             result.warnings.append(f"エントリ実行スモーク: {issue}")
     return result
+
+
+@dataclass
+class UsageRun:
+    """使い方を配信形で 1 回実行した結果 (f_10 §11.1-3)。判定は ``package_layout.usage_outcome``。"""
+
+    #: 終了コード (時間切れ・起動できなかったときは ``None``)。
+    returncode: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    #: 隔離が止めた書込み先 (あれば未検査)。
+    unchecked: list[str] = field(default_factory=list)
+    #: 起動できなかった理由。
+    error: str = ""
+    #: 時間上限 (秒、時間切れの文面に出す)。
+    timeout_sec: float = 0.0
+
+
+# ``python -m <module> <args>`` と同じ形で起こす入口。``-m`` で起動すると audit hook が入らない
+# (fs_sandbox_runtime) のでスクリプトとして起動し、runpy で ``__main__`` として走らせる
+# (``sys.argv[0]`` は ``__main__.py`` のパスになる)。
+_USAGE_RUNNER = (
+    "import json, runpy\n"
+    "module = sys.argv[1]\n"
+    "sys.argv = [module] + json.loads(sys.argv[2])\n"
+    "runpy.run_module(module, run_name='__main__', alter_sys=True)\n"
+)
+
+
+def run_usage(
+    files: dict[str, str], module: str, args: list[str], timeout_sec: float = 30.0,
+    python_exe: str | None = None,
+) -> UsageRun:
+    """配信形 (``units/__init__.py`` … と依頼されたデータファイル) を一時フォルダに置き、その親を CWD にして
+    ``python -m <module> <args>`` を隔離の下で 1 回実行する (f_10 §11.1-3 / §11.1-4)。
+
+    stdin は空。書込みを許すのは一時フォルダの中だけで、止めた書込みは ``unchecked`` に入る。
+    """
+    exe = python_exe or sys.executable
+    try:
+        with tempfile.TemporaryDirectory(prefix="evoref_usage_") as tmp:
+            try:
+                proc = _run_sandboxed(
+                    Path(tmp), files, _USAGE_RUNNER, [module, json.dumps(list(args))], exe, timeout_sec,
+                    stdin=subprocess.DEVNULL,
+                )
+            except subprocess.TimeoutExpired as expired:
+                return UsageRun(
+                    returncode=None, stdout=decode_process_output(expired.output),
+                    stderr=decode_process_output(expired.stderr), timed_out=True,
+                    unchecked=fs_sandbox.violation_paths(fs_sandbox.read_violations(Path(tmp))),
+                    timeout_sec=timeout_sec,
+                )
+            violations = fs_sandbox.violation_paths(fs_sandbox.read_violations(Path(tmp)))
+    except Exception as e:  # noqa: BLE001 - 起動できないのはコードの誤りの証拠ではない (未検査)
+        return UsageRun(returncode=None, stdout="", stderr="", error=str(e), timeout_sec=timeout_sec)
+    return UsageRun(
+        returncode=proc.returncode,
+        stdout=decode_process_output(proc.stdout),
+        stderr=decode_process_output(proc.stderr),
+        unchecked=violations,
+        timeout_sec=timeout_sec,
+    )
 
 
 def _signature_of(func: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:

@@ -22,6 +22,9 @@
   指すなら、それは訂正ではなく **確認 / 言い直し**。
 - :func:`response_already_states` — 相手の応答が既にその値を述べているなら、
   ユーザーは誤りを指摘していない。
+- :func:`reversed_restatement` — 検証器の span の組が、発話の「X ではなく Y」と
+  逆向き (ユーザーが退けた X を正しい値としている) なら判定ごと捨てる
+  (却下理由は ``invalid_span``。永続の語彙は増やさない)。
 - :func:`check_verdict` — 上の門を LLM 出力へ順に当て、通ったものだけ
   :class:`VerdictCheck` として返す。
 """
@@ -32,10 +35,15 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
+from backend.free.core.correction_target import restatement_pairs, split_sentences
+from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.script_ranges import (
     KANJI,
     KATAKANA_WORD,
 )
+from backend.log_config import get_logger
+
+logger = get_logger("core.correction_verdict")
 
 #: 引用として扱う開き / 閉じの対。内側は発話者本人の主張ではない。
 QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
@@ -237,9 +245,14 @@ def build_correction_verify_prompt(
         "- assistant: アシスタントの応答が誤っていると指摘している\n"
         "- self: ユーザー自身の過去の発言を訂正している "
         "(例: 「すみません、住んでいるのは盛岡市ではなく花巻市でした」— "
-        "アシスタントが言及していなくても self)\n"
+        "アシスタントが言及していなくても self)。"
+        "自分の前の値を「X ではなく Y」と言い直しているなら、"
+        "計算などのやり直しの依頼を伴っても self "
+        "(例: 「試験日は4月18日ではなく4月25日でした。計算し直してください」)\n"
         "- third_party: 第三者・世間・引用元の誤りに言及している\n"
-        "- premise_change: 前提や条件を変えてやり直しを頼んでいる (誤りの指摘ではない)\n"
+        "- premise_change: 前の値は誤っていないが、前提や条件 (計画) を変えて"
+        "やり直しを頼んでいる、または仮定の問いをしている (誤りの指摘ではない。"
+        "例: 「金利が1.5%ではなく2%だったら月々いくら？」)\n"
         "- none: 訂正ではない (質問・比較・依頼・伝聞・確認など)\n\n"
         "重要: アシスタントの応答が **既にユーザーの示す値と同じ** なら、それは"
         "誤りの指摘ではありません (is_correction=false, target=none)。\n"
@@ -317,6 +330,82 @@ def narrow_to_new_value(
     return strip_copula(wrong_claim[left:w_end]), strip_copula(correct_value[left:right])
 
 
+#: 前の値の言い直しではないと読める発話の標識 — 仮定 (仮に / もし / としたら /
+#: なら)・時間の対比 (以前は / 先月 / 今は / 今月は)・伝聞 (によると / と言って /
+#: と言われ / らしい)。「以前は1.5%ではなく1.2%でしたが、今は2%です」「部下に
+#: よると、試験日は18日ではなく25日でした。」を self に倒さない (独立レビュー M-c)。
+#: 門は LLM の判定を上げる方向なので、標識があれば倒さず LLM の答えに任せる。
+_NOT_OWN_RESTATEMENT_RE = re.compile(
+    r"仮に|もし|としたら|とすると|なら"
+    r"|以前は|先月|今は|今月は"
+    r"|によると|と言って|と言われ|らしい",
+)
+
+
+def restated_own_value(candidate: str, prev_user: str) -> tuple[str, str] | None:
+    """ユーザーが **自分の前の値** を言い直しているなら ``(旧値, 新値)`` (純粋関数)。
+
+    検証器は「自分の申告を言い直したうえでやり直しを頼む」発話 (「試験日は4月18日
+    ではなく4月25日でした。…計算し直してください」) を ``premise_change`` と答える
+    ことがあり、訂正が記憶に届かなかった (2026-09-27 監査 F8)。LLM の判定は単体では
+    閉じないので、コードで決められる範囲をここに持つ:
+
+    - 引用の内側は落とす (伝聞は本人の主張ではない)
+    - **平叙の文** だけを見る (問い・依頼の文の対比は仮定・条件)
+    - 対比は断定 (です / でした) で閉じるものだけ (:func:`restatement_pairs`)。
+      「だったら」の仮定・「に変更」の計画変更は対比にならない
+    - 旧値が **前のユーザー発話** に逐語で在る (アシスタントの値の訂正ではない)
+    - 述語の直後が文末 (「でしたが」「でしたっけ」「でした、と言われたら」は除く)
+    - 同じ発話に仮定・時間の対比・伝聞の標識が無い (:data:`_NOT_OWN_RESTATEMENT_RE`)
+    """
+    source = norm_span(prev_user)
+    if not source:
+        return None
+    masked = mask_quoted_speech(candidate or "")
+    if _NOT_OWN_RESTATEMENT_RE.search(masked):
+        return None
+    for sentence in split_sentences(masked):
+        if not is_plain_statement(sentence):
+            continue
+        for old, new in restatement_pairs(sentence, sentence_final=True):
+            if norm_span(old) in source:
+                return strip_copula(old), strip_copula(new)
+    return None
+
+
+def reversed_restatement(wrong_claim: str, correct_value: str, candidate: str) -> bool:
+    """span の組が訂正発話の「X ではなく Y」と **逆向き** か (純粋関数)。
+
+    逐語 span / 同値 / 既述の門は向きを見ない。「金利は1.5%ではなく1.2%でした」に
+    ``wrong_claim=1.2%`` / ``correct_value=1.5%`` が返ると、どちらも逐語で在るので
+    全部通っていた (2026-09-28 実機再監査 R4)。発話 (引用の内側は落とす) の文末で
+    断定に閉じた対比 (:func:`restatement_pairs`、:func:`restated_own_value` と同じ
+    分解) について、``correct_value`` が X と同値で Y とは同値でなく、``wrong_claim``
+    が Y と同値 (空なら不問) の組があれば真。
+
+    偽に倒すもの (向きが構造で決まらない):
+
+    - X と Y 自体が同値で両方の向きに当たる組
+    - 同じ発話に **順向き** の対比も在る (「1.5%ではなく1.2%でした。いえ、やはり
+      1.2%ではなく1.5%でした。」) — 言い直しの最終形を構造だけでは決めない
+    - 文末で閉じない対比 (「でしたが」「です、というのは誤りです」)
+    """
+    if not correct_value:
+        return False
+
+    def _wrong_is(value: str) -> bool:
+        return not wrong_claim or claims_equivalent(wrong_claim, value)
+
+    backward = forward = False
+    for sentence in split_sentences(mask_quoted_speech(candidate or "")):
+        for old, new in restatement_pairs(sentence, sentence_final=True):
+            if claims_equivalent(correct_value, new) and _wrong_is(old):
+                forward = True
+            elif claims_equivalent(correct_value, old) and _wrong_is(new):
+                backward = True
+    return backward and not forward
+
+
 @dataclass(frozen=True)
 class VerdictCheck:
     """LLM 出力にコード側の門を当てた結果。
@@ -330,6 +419,12 @@ class VerdictCheck:
     target: str
     wrong_claim: str
     correct_value: str
+    #: 門が LLM の帰属を上書きしたときの理由 (``"restated"`` = premise_change を
+    #: :func:`restated_own_value` で self に上げた)。LLM の答えのままなら ``None``。
+    overridden: str | None = None
+    #: 却下理由の内訳 (非永続。ログ / テスト用)。``"reversed"`` = span の組が発話の
+    #: 「X ではなく Y」と逆向き (:func:`reversed_restatement`) で ``invalid_span``。
+    detail: str | None = None
 
 
 def check_verdict(
@@ -342,11 +437,16 @@ def check_verdict(
     """LLM の判定に **コード側の門** を順に当てる (純粋関数)。
 
     1. 形 (dict / target が既知の値)
-    2. ``is_correction`` と帰属 — ``assistant`` / ``self`` 以外は訂正でない
+    2. ``is_correction`` と帰属 — ``assistant`` / ``self`` 以外は訂正でない。
+       ただし ``premise_change`` でも、自分の前の値の言い直し
+       (:func:`restated_own_value`) なら ``self`` に倒し、その span で以降の門を当てる
     3. 逐語 span — ``wrong_claim`` は帰属先の本文に、``correct_value`` は
        訂正発話に、空白を無視して含まれること
-    4. 同値 — ``wrong_claim`` と ``correct_value`` が同じ値なら訂正でない
-    5. 既述 — 帰属先の本文が ``correct_value`` を既に述べているなら訂正でない
+    4. 向き — 発話の「X ではなく Y」と逆向きの組 (:func:`reversed_restatement`)
+       は入れ替えずに ``invalid_span`` で却下する (帰属も誤っている見込みが高い。
+       ``detail="reversed"`` とログで区別する)
+    5. 同値 — ``wrong_claim`` と ``correct_value`` が同じ値なら訂正でない
+    6. 既述 — 帰属先の本文が ``correct_value`` を既に述べているなら訂正でない
 
     消費側は ``ok`` のものをさらに ``target`` で絞る (学習側は ``assistant`` のみ)。
     """
@@ -357,22 +457,48 @@ def check_verdict(
     correct_value = strip_copula(str(payload.get("correct_value") or ""))
     if target not in CORRECTION_TARGETS:
         return VerdictCheck(False, "invalid_target", target, wrong_claim, correct_value)
-    if not payload.get("is_correction") or target not in POINTING_TARGETS:
+    restated = (
+        restated_own_value(candidate, prev_user) if target == "premise_change" else None
+    )
+    overridden: str | None = None
+    if restated is not None:
+        # LLM の判定を字句の門で上げる唯一の経路なので、必ず記録する (#14(c))。
+        target, overridden = "self", "restated"
+        wrong_claim, correct_value = restated
+        logger.info(
+            "Correction verdict premise_change overridden to self (restated): "
+            "wrong_claim=%r correct_value=%r", wrong_claim[:40], correct_value[:40],
+        )
+    elif not payload.get("is_correction") or target not in POINTING_TARGETS:
         return VerdictCheck(False, "not_correction", target, wrong_claim, correct_value)
+
+    def _check(
+        ok: bool, reason: RejectReason | None, detail: str | None = None,
+    ) -> VerdictCheck:
+        return VerdictCheck(
+            ok, reason, target, wrong_claim, correct_value, overridden, detail,
+        )
 
     # self の古い値は前のユーザー発話にあるか、訂正文自身に同居している
     # (「盛岡市ではなく花巻市でした」)。既述の判定 (下) は前の発話だけで見る。
     source = prev_response if target == "assistant" else (prev_user or prev_response)
     span_source = source if target == "assistant" else f"{source}\n{candidate}"
     if wrong_claim and norm_span(wrong_claim) not in norm_span(span_source):
-        return VerdictCheck(False, "invalid_span", target, wrong_claim, correct_value)
+        return _check(False, "invalid_span")
     if correct_value and norm_span(correct_value) not in norm_span(candidate):
         narrowed = narrow_to_new_value(wrong_claim, correct_value, candidate)
         if narrowed is None:
-            return VerdictCheck(False, "invalid_span", target, wrong_claim, correct_value)
+            return _check(False, "invalid_span")
         wrong_claim, correct_value = narrowed
+    if reversed_restatement(wrong_claim, correct_value, candidate):
+        logger.info(
+            "Correction verdict rejected: invalid_span (reversed against the "
+            "utterance's contrast; target=%s, wrong_claim=%r, correct_value=%r)",
+            target, wrong_claim[:40], correct_value[:40],
+        )
+        return _check(False, "invalid_span", "reversed")
     if claims_equivalent(wrong_claim, correct_value):
-        return VerdictCheck(False, "same_value", target, wrong_claim, correct_value)
+        return _check(False, "same_value")
     if response_already_states(correct_value, source):
-        return VerdictCheck(False, "already_stated", target, wrong_claim, correct_value)
-    return VerdictCheck(True, None, target, wrong_claim, correct_value)
+        return _check(False, "already_stated")
+    return _check(True, None)

@@ -34,6 +34,8 @@ from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from backend.free.core.intent_vocab import PAST_FILE_OPERATION_PATTERN
+from backend.i18n_helper import template_line_patterns
 from backend.log_config import get_logger
 
 logger = get_logger("agent.file_ledger")
@@ -44,6 +46,7 @@ __all__ = [
     "forget_current_file",
     "forget_file",
     "last_file_path",
+    "last_written_path",
     "named_file_paths",
     "record_current_file",
     "record_file",
@@ -51,6 +54,10 @@ __all__ = [
     "resolve_against_recent_dir",
     "resolve_current_against_recent_dir",
     "reset",
+    "restore_from_conversation",
+    "starts_with_write_report",
+    "written_paths_in_conversation",
+    "written_paths_in_text",
 ]
 
 #: 1 セッションあたりの保持件数 (新しい方を残す)。
@@ -73,9 +80,16 @@ class _Entry:
 
     path: str
     named: bool = False
+    #: 最後に **書いた** 順番 (0 は書いていない = 読んだだけ)。「保存したファイル」の
+    #: 宛先は最後に書いたファイルで、最後に触れたファイルではない
+    #: (2026-09-28 レビュー H1: notes.md を書いた後に config.yaml を読むと、宛先が
+    #: config.yaml になっていた)。
+    written_seq: int = 0
 
 
 _ledger: "OrderedDict[str, deque[_Entry]]" = OrderedDict()
+#: ``written_seq`` の採番 (プロセス内で単調増加)。
+_write_counter = 0
 
 
 def _bucket(session_id: str) -> "deque[_Entry]":
@@ -90,28 +104,38 @@ def _bucket(session_id: str) -> "deque[_Entry]":
     return created
 
 
-def _remove(bucket: "deque[_Entry]", path: str) -> bool:
-    """``path`` の記録をすべて外す。外した記録のどれかが ``named`` なら True。"""
+def _remove(bucket: "deque[_Entry]", path: str) -> tuple[bool, int]:
+    """``path`` の記録をすべて外す。``(どれかが named か, 最後に書いた順番)``。"""
     named = False
+    written_seq = 0
     for entry in [e for e in bucket if e.path == path]:
         named = named or entry.named
+        written_seq = max(written_seq, entry.written_seq)
         bucket.remove(entry)
-    return named
+    return named, written_seq
 
 
-def record_file(session_id: str, path: str, *, named: bool = False) -> None:
+def record_file(
+    session_id: str, path: str, *, named: bool = False, written: bool = False,
+) -> None:
     """このセッションで触れたファイルのパスを記録する。
 
     同じパスを重ねて記録しない (最後に触れた順を保つため、既存を消して
     末尾へ積み直す)。一度 ``named`` で記録したパスは、後で名指し無しに触れても
     ``named`` のまま (「同じファイルに追記して」の次のターンも書ける)。
+    ``written`` (書き込んだ) の記録は最後に書いた順番を更新し、読んだだけの
+    記録はそれを保つ (:func:`last_written_path`)。
     """
+    global _write_counter
     cleaned = (path or "").strip().strip("\"'")
     if not session_id or not cleaned:
         return
     bucket = _bucket(session_id)
-    named = _remove(bucket, cleaned) or named
-    bucket.append(_Entry(cleaned, named))
+    was_named, written_seq = _remove(bucket, cleaned)
+    if written:
+        _write_counter += 1
+        written_seq = _write_counter
+    bucket.append(_Entry(cleaned, was_named or named, written_seq))
 
 
 #: 現在のリクエストの ``session_id``。``tool_ledger`` と同じ理由で contextvar
@@ -127,11 +151,11 @@ def file_ledger_scope(session_id: str):
     return _current_session.set(session_id or "")
 
 
-def record_current_file(path: str, *, named: bool = False) -> None:
+def record_current_file(path: str, *, named: bool = False, written: bool = False) -> None:
     """現在のリクエストの宛先へファイルパスを記録する。"""
     session_id = _current_session.get()
     if session_id:
-        record_file(session_id, path, named=named)
+        record_file(session_id, path, named=named, written=written)
 
 
 def named_file_paths(session_id: str) -> list[str]:
@@ -179,6 +203,20 @@ def last_file_path(session_id: str, *, named_only: bool = False) -> str:
         if entry.named or not named_only:
             return entry.path
     return ""
+
+
+def last_written_path(session_id: str) -> str:
+    """このセッションで最後に **書いた** ファイルのパス (無ければ空文字)。
+
+    「保存したファイルに追記して」「保存したファイルの場所」の宛先はこちら
+    (docs/f_03 §1.6)。読んだだけのファイルは対象にしない。会話の書込み報告からの
+    復元 (:func:`restore_from_conversation`) も書込みとして記録するので、再起動の
+    前後で同じファイルになる。
+    """
+    written = [e for e in _ledger.get(session_id) or () if e.written_seq]
+    if not written:
+        return ""
+    return max(written, key=lambda e: e.written_seq).path
 
 
 def resolve_against_recent_dir(session_id: str, path: str, *, named_only: bool = False) -> str:
@@ -243,9 +281,12 @@ def reset(session_id: str | None = None) -> None:
 #: 語彙でファイルの種類を数えない。見るのは指示詞という閉じた文法クラスと、
 #: 「保存した/書いた」という **過去の自分の操作** への参照だけ。
 #: 「何を指すか」は「直前にファイルを書いた」という観測事実が決める。
+#: 過去の操作の語形は説明節の SSOT (``intent_vocab.PAST_FILE_OPERATION_PATTERN``、
+#: docs/c_17 §3.5.1) を合成する — 「保存しておいた」「作成していただいた」
+#: 「保存済みの」がここにだけ無く、ルータ・参照解決と判定が割れていた。
 _IMPLICIT_FILE_REF_RE = re.compile(
     r"(?:その|それ|この|これ|さっきの|先ほどの|いまの|今の|上記の"
-    r"|保存した|書き込んだ|書いた|作った|作成した|出力した"
+    rf"|{PAST_FILE_OPERATION_PATTERN}"
     r"|that|the same)",
 )
 
@@ -270,3 +311,129 @@ def references_recent_file(query: str) -> bool:
     return bool(
         _IMPLICIT_FILE_REF_RE.search(query) and _FILE_OBJECT_RE.search(query),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 会話履歴の書込み報告からの復元
+# ─────────────────────────────────────────────────────────────────────
+#
+# 台帳はプロセス内の dict なので、再起動すると空になる。一方、書込みターンの
+# 応答はシステム自身が i18n の定型文 (``agent.files_written`` 「{paths} に
+# 書き込みました。」/ ``agent.written_content_header`` 「{path} に書き込んだ
+# 内容:」) で出しており、会話履歴に残る。**文面の SSOT は i18n** なので、正規
+# 表現はそこから組む (語彙を二重に持たない)。
+
+#: パスを運ぶ定型文のキーと、その中のパスの差込み名。
+_WRITE_REPORT_KEYS: tuple[tuple[str, str], ...] = (
+    ("agent.files_written", "paths"),
+    ("agent.files_written_with_failures", "paths"),
+    ("agent.written_content_header", "path"),
+)
+#: 複数のパスの区切り (``chat_stream_meta`` は「、」で連結する)。
+_PATHS_SEPARATOR_RE = re.compile(r"、|,\s+")
+
+
+def _write_report_patterns() -> tuple[re.Pattern[str], ...]:
+    """読み込み済みの全 locale の書込み報告の文面から 1 行分の正規表現を組む。"""
+    return template_line_patterns(_WRITE_REPORT_KEYS, group="paths")
+
+
+#: パスらしさ: 区切り文字を含むか、拡張子で終わる 1 語。報告の文面 (英語の
+#: 「Wrote {paths}.」) は普通の文にも当たる — 「Wrote a short poem about autumn.」
+#: を path "a short poem about autumn" と読んでいた (2026-09-27 レビュー M4)。
+_PATH_LIKE_RE = re.compile(r"[\\/]|^[^\s]+\.[A-Za-z0-9]{1,6}$")
+
+
+def _report_line_paths(line: str) -> list[str] | None:
+    """1 行が書込み報告ならその中のパス (報告でなければ ``None``)。
+
+    パスらしくない語 (「メモ帳」「a short poem about autumn」) しか無い行は
+    報告とみなさない。
+    """
+    for pattern in _write_report_patterns():
+        m = pattern.match(line)
+        if m:
+            paths = [
+                p.strip().strip("\"'`")
+                for p in _PATHS_SEPARATOR_RE.split(m.group("paths"))
+                if p.strip()
+            ]
+            paths = [p for p in paths if _PATH_LIKE_RE.search(p)]
+            if paths:
+                return paths
+    return None
+
+
+def written_paths_in_text(text: str) -> list[str]:
+    """応答本文中のシステム自身の書込み報告が挙げるパス (出現順、純粋関数に近い)。"""
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        paths = _report_line_paths(line)
+        if paths:
+            out.extend(paths)
+    return out
+
+
+def starts_with_write_report(text: str) -> bool:
+    """応答の最初の行がシステム自身の書込み報告か (「…に書き込みました。」/
+    「…に書き込んだ内容:」+ 本文)。
+
+    書込みターンの応答は、本文を添えていても **見出し行とフェンスが付いた報告** で、
+    そのまま別のファイルの本文にすると見出しとフェンスごと書かれる。素材探しは
+    これを候補にしない (docs/f_03 §1.2)。
+    """
+    for line in (text or "").splitlines():
+        if line.strip():
+            return _report_line_paths(line) is not None
+    return False
+
+
+def written_paths_in_conversation(
+    conversation: list[dict] | None, *, existing_only: bool = False,
+) -> list[str]:
+    """会話履歴の assistant 発話から、書き込んだパスを古い順に返す (重複は最後の位置)。
+
+    ``existing_only`` なら実在するファイルだけ。書込み報告の文面は LLM の応答にも
+    現れる (捏造の「E:\\tmp\\memo.txt に書き込みました。」) ので、事実として使う
+    読み手 (台帳の復元 / 所在の事実注記) は実在を確かめる。
+    """
+    ordered: list[str] = []
+    for msg in conversation or ():
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for path in written_paths_in_text(str(msg.get("content") or "")):
+            if existing_only and not _is_existing_file(path):
+                continue
+            if path in ordered:
+                ordered.remove(path)
+            ordered.append(path)
+    return ordered
+
+
+def _is_existing_file(path: str) -> bool:
+    try:
+        return os.path.isfile(path)
+    except (OSError, ValueError):
+        return False
+
+
+def restore_from_conversation(session_id: str, conversation: list[dict] | None) -> int:
+    """台帳が空のセッションを、会話履歴の書込み報告から復元する (復元した件数)。
+
+    台帳はプロセス内だけなので、再起動後の「保存したファイルの場所」「保存した
+    ファイルに追記」は台帳からは解けない。会話履歴に残っている書込み報告を
+    古い順に記録し直す。台帳に既に **書込みの** 記録があるセッションは触らない
+    (実行時の記録の方が新しい)。読んだだけの記録しか無いとき (再起動後にファイルを
+    読んでから「保存したファイルに追記して」) は、書込み報告から書込みを復元する。
+    """
+    if not session_id or last_written_path(session_id):
+        return 0
+    paths = written_paths_in_conversation(conversation, existing_only=True)
+    for path in paths:
+        record_file(session_id, path, written=True)
+    if paths:
+        logger.info(
+            "File ledger restored from the conversation's write reports "
+            "(session=%s, files=%d)", session_id[:12], len(paths),
+        )
+    return len(paths)

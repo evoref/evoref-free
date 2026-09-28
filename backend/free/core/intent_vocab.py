@@ -21,6 +21,9 @@ import できない) を越えずに済むよう、どの pillar にも属さな
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+
+from backend.free.core.numerals import kanji_number_value
 from backend.free.core.response_dates import YMD_JA_PATTERN, YMD_NUMERIC_PATTERN
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
@@ -195,6 +198,23 @@ _REQUEST_HEAD_EN_RE = re.compile(
 )
 
 
+def split_sentences(text: str) -> list[str]:
+    """発話を文に切る (空の文は落とす。純粋関数)。区切りは ``request_clauses`` と同じ。"""
+    return [s for s in _SENTENCE_SPLIT_RE.split(text or "") if s and s.strip()]
+
+
+def is_request_sentence(sentence: str) -> bool:
+    """1 文の文末が依頼・命令の形か (純粋関数)。
+
+    「〜してくれますか？」のような **依頼形の問い** も依頼に数える
+    (``_REQUEST_TAIL_RE`` の ``して(?:くれ|もらえ|いただけ)\\w*``)。
+    """
+    return bool(
+        _REQUEST_TAIL_RE.search((sentence or "").strip())
+        or _REQUEST_HEAD_EN_RE.search(sentence or ""),
+    )
+
+
 def request_clauses(text: str) -> str:
     """発話のうち **依頼している文** だけを連結して返す (純粋関数)。
 
@@ -202,13 +222,10 @@ def request_clauses(text: str) -> str:
     ものを絞ると既存の検出が落ちるため)。意図の判定はこの戻り値に対して行う。
     """
     raw = text or ""
-    sentences = [s for s in _SENTENCE_SPLIT_RE.split(raw) if s and s.strip()]
+    sentences = split_sentences(raw)
     if len(sentences) <= 1:
         return raw
-    picked = [
-        s for s in sentences
-        if _REQUEST_TAIL_RE.search(s.strip()) or _REQUEST_HEAD_EN_RE.search(s)
-    ]
+    picked = [s for s in sentences if is_request_sentence(s)]
     if not picked:
         return raw
     return " ".join(s.strip() for s in picked)
@@ -421,14 +438,47 @@ def has_long_range_recall_keyword(query: str) -> bool:
 
 
 
+#: 会話の中の位置を **数で** 指す序数 (「2つ目」「二番目」「3回目」)。数の値は
+#: :func:`backend.free.core.numerals.kanji_number_value` が読む (構造の抽出、c_17 §1.1)。
+_ORDINAL_NUMERAL = r"[0-9０-９一二三四五六七八九十]+"
+_ORDINAL_COUNTER = r"(?:番目|つ目|回目)"
+#: 再掲の依頼 (「もう一度」)。既報の値の再掲 (:data:`_RESTATE_PRIOR_REPORT_RE`) と
+#: N 番目の回答の再掲 (:func:`session_answer_ordinal_reason`) が共有する。
+_RESTATE_AGAIN = r"(?:もう一度|もう1度|もういちど|再掲)"
+
+#: アシスタントが伝えた / 出したことを指す動詞の語幹。既報の値の再掲
+#: (:data:`_RESTATE_PRIOR_REPORT_RE`) と過去の出力の再掲
+#: (:data:`_PRIOR_OUTPUT_ORDINAL_RE`) と同じ語彙を 1 か所に置く。
+_ASSISTANT_REPORT_STEMS = r"教え|言っ|言|答え|示し|出し|報告し"
+_ASSISTANT_OUTPUT_STEMS = r"書い|作っ|作成し|出力し|示し|挙げ"
+#: 語幹に続く「〜てくれた / 〜てもらった / 〜た」。
+_ASSISTANT_REPORT_PAST = r"(?:て\s*(?:くれた|もらった|いた|くださった|頂いた|いただいた)|た)"
+#: アシスタントを主語に立てる語 (「あなたが書いた」)。
+_ASSISTANT_SUBJECT = r"(?:あなたが|君が)"
+
+#: 「2つ目に教えてもらった」— アシスタントの N 番目の回答を数で指す **候補**。
+#: 「2つ目の方法」のような **直前の回答の中の項目** を巻き込まないよう、序数の
+#: 直後にアシスタントの発話を指す動詞を要求する (2026-09-27 監査 M9)。候補から
+#: 確定するまでの型 (節の頭・連体修飾・依頼) は :func:`session_answer_ordinal_reason`。
+_SESSION_ANSWER_ORDINAL_PATTERN = (
+    rf"(?P<answer_ordinal>{_ORDINAL_NUMERAL})\s*{_ORDINAL_COUNTER}\s*に?\s*"
+    rf"{_ASSISTANT_SUBJECT}?\s*(?:{_ASSISTANT_REPORT_STEMS}|{_ASSISTANT_OUTPUT_STEMS})"
+    rf"\s*{_ASSISTANT_REPORT_PAST}"
+)
+_SESSION_ANSWER_ORDINAL_RE = re.compile(_SESSION_ANSWER_ORDINAL_PATTERN)
+
 #: 会話の中の位置を指す言い回し。発火 (履歴検索を **撃つ** 根拠) には使わず、
 #: 撃つと決まった検索を **絞る** 側だけで使うので、単独の「最初に」を含めても
 #: 誤爆の余地は無い (「最初に私が聞いた営業日数は」は ``最初に聞`` に当たらない
 #: — 主語が割り込む形が実データの大半だった)。
 _SESSION_ORDINAL_CUE_RE = re.compile(
     r"一番最初|一番最後|最初に|最後に"
-    r"|(?:最初|最後|冒頭)の(?:質問|問い|発言|依頼|メッセージ|お願い|相談|話題)"
-    r"|[0-9０-９一二三四五六七八九十]+\s*(?:番目|つ目)の(?:質問|問い|発言|依頼|メッセージ)"
+    # 「最初の計算をやり直して」も会話内の位置を指す (計算の組み直し、
+    # tool_call_judge._beyond_window_reason、2026-09-27 監査 C03)。
+    r"|(?:最初|最後|冒頭)の(?:質問|問い|発言|依頼|メッセージ|お願い|相談|話題|計算|試算)"
+    rf"|{_ORDINAL_NUMERAL}\s*{_ORDINAL_COUNTER}の(?:質問|問い|発言|依頼|メッセージ|計算|試算)"
+    # 「2つ目に教えてもらったクエリ」(アシスタントの N 番目の回答、M9)
+    rf"|{_SESSION_ANSWER_ORDINAL_PATTERN}"
     r"|(?<![A-Za-z])(?:at first|in the beginning|the (?:first|last) (?:question|message|thing|request))(?![A-Za-z])",
     re.IGNORECASE,
 )
@@ -781,6 +831,142 @@ def resolve_session_position_message(
     return texts[0] if position == "first" else texts[-1]
 
 
+#: 序数の前に置けるもの: 会話そのものへのアンカー (「この会話で」)、進行中の会話を
+#: 指す近接の語 (「さっき」「先ほど」— 直後に「の」が続く「さっきの2つ目」は直前の
+#: 回答の中の項目なので除く)、アシスタントの主語 (「あなたが」)。
+_ANSWER_ORDINAL_HEAD_RE = re.compile(
+    rf"(?:(?:{SESSION_ANCHOR_JA}){SESSION_TOPIC_BREAK_LOOKAHEAD_JA}\s*(?:で|の|に|において)?"
+    rf"|(?:{_keyword_union(PROXIMAL_RECALL_KEYWORDS).pattern})(?!\s*の)"
+    rf"|{_ASSISTANT_SUBJECT}|\s)+",
+    re.IGNORECASE,
+)
+#: 節の区切り (序数が節の頭にあるかを見る範囲)。
+_CLAUSE_DELIMITERS = "。．！？!?\n、,"
+#: 文の区切り (依頼・問いの形を見る範囲)。
+_SENTENCE_DELIMITERS = "。．！？!?\n"
+_RESTATE_AGAIN_RE = re.compile(_RESTATE_AGAIN)
+
+
+def _ordinal_reference_shape(text: str, m: re.Match[str]) -> tuple[str, bool]:
+    """序数 + アシスタントの動詞の候補 ``m`` が、過去の回答 / コードを指す型か (純粋関数)。
+
+    N 番目の回答 (:func:`session_answer_ordinal_reason`) と N 番目のコード
+    (:func:`prior_code_block_request`) が同じ型を使う (2026-09-28 再レビュー 1)。
+
+    Returns:
+        ``(外れた根拠, 再掲・提示の依頼か)``。型に当たれば根拠は空文字列。
+    """
+    if _TRUE_LONG_RANGE_RECALL_KEYWORD_RE.search(text):
+        return "past_session", False
+    clause_start = max(text.rfind(c, 0, m.start()) for c in _CLAUSE_DELIMITERS) + 1
+    head = text[clause_start:m.start()].strip()
+    if head and not _ANSWER_ORDINAL_HEAD_RE.fullmatch(head):
+        return "not_clause_head", False
+    if not _NOUN_HEAD_RE.match(text, m.end()):
+        return "not_adnominal", False
+    sentence_start = max(text.rfind(c, 0, m.start()) for c in _SENTENCE_DELIMITERS) + 1
+    ends = [i for c in _SENTENCE_DELIMITERS if (i := text.find(c, m.end())) >= 0]
+    sentence_end = min(ends) + 1 if ends else len(text)
+    sentence = text[sentence_start:sentence_end]
+    phrase = _NOUN_PHRASE_RE.match(text, m.end())
+    after = text[phrase.end() if phrase else m.end():sentence_end]
+    restate = bool(
+        _RESTATE_AGAIN_RE.search(sentence)
+        or _SENTENCE_TAIL_ONLY_RE.match(after)
+        or _PRESENTATION_PREDICATE_RE.match(after)
+    )
+    if not (
+        restate
+        or is_request_sentence(sentence)
+        or QUESTION_END_RE.search(sentence.strip())
+    ):
+        return "not_a_request", False
+    return "", restate
+
+
+def session_answer_asks_restate(query: str) -> bool:
+    """N 番目の回答を **そのまま示せ** と求めているか (再掲・提示の依頼、純粋関数)。
+
+    「もう一度」「見せて」「教えて」「何でしたか」、体言止め。「修正して」「英語に
+    翻訳して」「使うとどうなる？」は回答を材料にした別の依頼で、逐語の再掲では
+    ない (2026-09-28 再レビュー 2)。
+    """
+    m = _SESSION_ANSWER_ORDINAL_RE.search(query or "")
+    if m is None:
+        return False
+    evidence, restate = _ordinal_reference_shape(query, m)
+    return not evidence and restate
+
+
+def session_answer_ordinal_reason(query: str) -> tuple[int | None, str]:
+    """アシスタントの **N 番目の回答** を数で指しているかと、その根拠 (純粋関数)。
+
+    候補 (:data:`_SESSION_ANSWER_ORDINAL_RE`、序数 + アシスタントの発話を指す動詞) の
+    うち、次の型をすべて満たすものだけを N 番目の回答とみなす (2026-09-28 レビュー H1)。
+    語形を足すのではなく、序数と動詞が **再掲・想起の依頼の目的語を修飾している** か
+    を格と位置で見る:
+
+    - 序数が節の頭にある (前に置けるのは「この会話で」「さっき / 先ほど」「あなたが」
+      だけ)。一人称の主語 (「私が2番目に言った」)・「から」(「最後から2番目」)・
+      「<名詞>の」(「手順の2つ目」「さっきの2つ目」)・時の語 (「昨日2つ目に」) が前に
+      あれば ``not_clause_head``
+    - 動詞の直後が名詞 (連体修飾。「〜のを」「〜やつを」も)。「言ったけど」「答えたのに」
+      は ``not_adnominal``
+    - 文が依頼・問い・再掲・提示 (「もう一度」「見せて」「何でしたか」)・体言止め
+      (「…教えてもらったクエリ」) の形。報告・苦情は ``not_a_request``
+    - 過去のセッションを指す語が無い (``past_session``)
+
+    型は :func:`_ordinal_reference_shape` (N 番目のコードと共有)。
+
+    Returns:
+        ``(N, 根拠)``。N は 1 始まり、該当しなければ ``None``。根拠は
+        ``ordinal_answer`` / ``no_match`` / ``past_session`` / ``not_clause_head`` /
+        ``not_adnominal`` / ``not_a_request`` / ``unreadable_number``。
+    """
+    text = query or ""
+    m = _SESSION_ANSWER_ORDINAL_RE.search(text)
+    if m is None:
+        return None, "no_match"
+    evidence, _ = _ordinal_reference_shape(text, m)
+    if evidence:
+        return None, evidence
+    n = kanji_number_value(m.group("answer_ordinal"))
+    if not n:
+        return None, "unreadable_number"
+    return n, "ordinal_answer"
+
+
+def session_answer_ordinal(query: str) -> int | None:
+    """アシスタントの **N 番目の回答** を数で指しているか (純粋関数)。
+
+    「2つ目に教えてもらったクエリをもう一度」「三番目に書いてくれたコードを見せて」。
+    「最初 / 最後」は数ではないので対象外 (:func:`session_position_kind` の経路)。
+    型は :func:`session_answer_ordinal_reason`。
+
+    Returns:
+        1 始まりの N。該当しなければ ``None``。
+    """
+    return session_answer_ordinal_reason(query)[0]
+
+
+def resolve_session_answer(conversation: list[dict] | None, n: int) -> str:
+    """会話履歴から N 番目 (1 始まり) の assistant の回答を取り出す (純粋関数)。
+
+    Returns:
+        回答本文。N 番目が無ければ空文字列。
+    """
+    texts = [
+        content.strip()
+        for msg in conversation or []
+        if msg.get("role") == "assistant"
+        and isinstance(content := msg.get("content"), str)
+        and content.strip()
+    ]
+    if n < 1 or n > len(texts):
+        return ""
+    return texts[n - 1]
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 挨拶
 # ─────────────────────────────────────────────────────────────────────
@@ -857,6 +1043,15 @@ QUESTION_TAIL_RE = re.compile(
     r"(?:教えて|おしえて|とは|って何|ですか|でしょうか|ありますか)",
 )
 
+#: 問いの文末 (``QUESTION_TAIL_RE`` + ``ますか`` / ``ませんか`` + 疑問符)。依頼形の問い
+#: (「〜してくれますか」) は :func:`is_request_sentence` が先に依頼として拾う。
+#: 直近ファイルへの参照 (``agent.file_reference_gate``) と N 番目の回答
+#: (:func:`session_answer_ordinal_reason`) が共有する。
+QUESTION_END_RE = re.compile(
+    rf"(?:{QUESTION_TAIL_RE.pattern}|ますか|ませんか|[?？])"
+    r"[。．.、,！!\s\"'」』）)]*$",
+)
+
 #: web リソースを対象にしていることを示す語。**web 意図の唯一の定義** —
 #: ツール要否シグナル (``tool_judge_signals._TOOL_PATTERNS`` / ``_EN``)、
 #: ``_infer_tool`` の fetch_url 分岐、``_query_targets_local_file_only``、
@@ -906,6 +1101,165 @@ CODE_SEARCH_PATTERNS: tuple["re.Pattern[str]", ...] = (
 
 
 # ─────────────────────────────────────────────────────────────────────
+# 直近ファイルへの参照 (説明節) — docs/c_17 §3.5.1
+# ─────────────────────────────────────────────────────────────────────
+#
+# 「保存した / 作った / 保存しておいた / 作成していただいた / 保存済みの … +
+# ファイル」は **過去の操作で対象を説明する連体修飾節** (説明節) で、書込み
+# 動詞ではなく直近に扱ったファイルへの参照である。2026-09-27 ライブ監査で、
+# 同じ語がルータ (説明節として消す)・tool_judge_referential (「保存」を書込み
+# 動詞とみなす)・file_ledger (参照とみなす)・REFERENTIAL_WRITE_TARGET_RE
+# (持っていない) の 4 実装で逆に扱われ、しかも「保存しておいた」「作成して
+# いただいた」「保存済みの」はどれにも当たらなかった (F5 / F7)。
+#
+# 語形は **助動詞の閉じた集合** で持つ (``ておいた`` / ``てあった`` /
+# ``てもらった`` / ``ていただいた`` / ``てくれた`` / 受身 / ``済みの``)。語を
+# 足して直す運用にしない (不変則 #14)。宛先にするかどうかは格と支配する動詞と
+# モダリティで決まるので、ここでは「説明節か」だけを答える
+# (判定は ``agent.file_reference_gate``、c_17 §3.11)。
+
+#: 動詞のテ形に付く「相手 / 自分が済ませた」助動詞の過去 (``ておいた`` /
+#: ``てもらった`` / ``ていただいた`` / ``てくれた``)。
+_DONE_AFTER_TE = r"(?:おい|もらっ|いただい|頂い|くれ)"
+
+#: 過去の操作の **動詞部**。4 か所 (router / tool_judge_referential /
+#: file_ledger / REFERENTIAL_WRITE_TARGET_RE) が合成する SSOT。
+#:
+#: ``てあった`` はサ変 (「保存してあった」) にだけ許す。「書いてあった」は
+#: 「メモに書いてあった内容」のような **状態の説明** で、直近に書いたファイルを
+#: 指さない (router は「書いてあ」を状態の説明として別に消す)。
+PAST_FILE_OPERATION_PATTERN = (
+    r"(?:"
+    # サ変: 保存した / 保存しておいた / 保存しといた / 作成していただいた / 保存された / 保存済みの
+    r"(?:保存|作成|生成|出力)"
+    rf"(?:し(?:て(?:{_DONE_AFTER_TE}|あっ)|とい)?た|され(?:てい)?た|済みの?)"
+    # 五段: 作った / 作っておいた / 作っといた / 作られた
+    rf"|作(?:っ(?:て{_DONE_AFTER_TE}|とい)?た|られた)"
+    # 五段: 書いた / 書いておいた / 書いといた / 書いてもらった
+    rf"|書い(?:て{_DONE_AFTER_TE}|とい)?た"
+    # 五段: 書き込んだ / 書き込んでおいた / 書き込んどいた / 書き込まれた
+    rf"|書き込(?:ん(?:だ|で{_DONE_AFTER_TE}た|どいた)|まれた)"
+    # 五段: 書き出した / 書き出しておいた / 書き出しといた / 書き出された
+    rf"|書き出(?:し(?:て{_DONE_AFTER_TE}|とい)?た|された)"
+    r")"
+    # 「保存したい」「作ったら」「書いたり」は過去の操作ではない (願望 / 仮定 / 列挙)
+    r"(?![いくらり])"
+)
+
+#: 説明節が説明している対象の名詞。目的語の出典 (「メモ帳の**内容**を」) の判定
+#: (``agent.file_reference_gate``) も同じ集合を使う。
+DESCRIBED_OBJECT_PATTERN = r"(?:ファイル|もの|やつ|データ|内容|中身)"
+_DESCRIBED_OBJECT_PATTERN = DESCRIBED_OBJECT_PATTERN
+
+# ── 序数 + アシスタントの動詞が修飾する名詞 (:func:`_ordinal_reference_shape`) ──
+# 説明節の対象の名詞 (もの / やつ …) を使うので、その定義の後に置く。
+
+#: 連体修飾を受ける名詞の頭 (「教えてもらった**ク**エリ」「…もらった**やつ**を」
+#: 「…もらった**の**を」)。語ではなく字種と、説明節の対象の名詞・準体の「の」で見る。
+_NOUN_HEAD_RE = re.compile(
+    rf"\s*(?:[{KANJI}{KATAKANA}A-Za-z0-9０-９]|{DESCRIBED_OBJECT_PATTERN}"
+    r"|の(?=\s*[をがは]))",
+)
+#: 修飾された名詞句 (字種の連なり、説明節の対象の名詞、準体の「の」)。
+_NOUN_PHRASE_RE = re.compile(
+    rf"\s*(?:[{KANJI}{KATAKANA_WORD}A-Za-z0-9０-９]+|{DESCRIBED_OBJECT_PATTERN}"
+    r"|の(?=\s*[をがは]))",
+)
+#: 名詞句で文が終わる (体言止め「二つ目に教えてもらったクエリ」)。
+_SENTENCE_TAIL_ONLY_RE = re.compile(r"[。．！？!?\s]*$")
+#: 名詞句に続く再掲・提示の述語 (「を見せて」「を教えて」「は何でしたか」「をもう一度」)。
+_PRESENTATION_PREDICATE_RE = re.compile(
+    rf"\s*(?:を|は|って|、)?\s*(?:{_RESTATE_AGAIN}\s*)?(?:見せ|表示|示し|教え|何)",
+)
+#: 動詞と対象の間に挟まる語 (「保存したばかりのその」)。
+_CLAUSE_LINK_PATTERN = (
+    r"\s*(?:ばかりの?|ところの?)?"
+    r"\s*(?:その|この|あの|先ほどの?|さっきの?)?\s*"
+)
+
+#: 説明節 (動詞部 + 対象の名詞) の SSOT。**捕獲グループを持たない** (合成先の
+#: 正規表現と混ぜられるように)。
+FILE_REFERENCE_CLAUSE_PATTERN = (
+    PAST_FILE_OPERATION_PATTERN + _CLAUSE_LINK_PATTERN + _DESCRIBED_OBJECT_PATTERN
+)
+
+#: 対象がファイル (書込み先になりうるもの) である説明節。
+FILE_REFERENCE_CLAUSE_FILE_PATTERN = (
+    PAST_FILE_OPERATION_PATTERN + _CLAUSE_LINK_PATTERN + r"ファイル"
+)
+
+_FILE_REFERENCE_CLAUSE_RE = re.compile(
+    rf"(?P<verb>{PAST_FILE_OPERATION_PATTERN}){_CLAUSE_LINK_PATTERN}"
+    rf"(?P<object>{_DESCRIBED_OBJECT_PATTERN})",
+)
+#: 操作の主体を示す語 (同じ文の **節より前** のどこにあってもよい)。台帳は
+#: アシスタントの書込みしか持たないので、主体が user の参照は台帳で解決しない
+#: (c_17 §3.11)。隣接だけを見ると「私が昨日の夜に保存したファイル」「私の PC に
+#: 保存したファイル」を取りこぼした (2026-09-27 レビュー)。
+_CLAUSE_SUBJECT_USER_RE = re.compile(
+    r"(?:私|わたし|僕|ぼく|俺|おれ|自分|こちら|当方|ユーザー)(?:が|で|の|は|も)",
+)
+_CLAUSE_SUBJECT_ASSISTANT_RE = re.compile(
+    r"(?:あなた|君|きみ|evoref|アシスタント)(?:が|の|は|に)",
+    re.IGNORECASE,
+)
+#: 主体を探す範囲の区切り (同じ文の中だけを見る)。
+_CLAUSE_SENTENCE_BOUNDARY_RE = re.compile(r"[。．！？!?\n]")
+#: 相手にしてもらった操作を表す助動詞 (主体は assistant)。
+_BENEFACTIVE_RE = re.compile(r"(?:もらっ|いただい|頂い|くれ)")
+
+
+@dataclass(frozen=True, slots=True)
+class FileReferenceClause:
+    """発話中の説明節 1 つ (純粋な値)。"""
+
+    #: 節の開始・終了位置 (``text[start:end]`` が節)。
+    start: int
+    end: int
+    #: 説明している対象の名詞 (``ファイル`` / ``内容`` …)。
+    object_noun: str
+    #: 操作の主体。``assistant`` / ``user`` / ``unknown``。
+    subject: str
+
+    @property
+    def names_file(self) -> bool:
+        """対象が書込み先になりうるもの (ファイル / もの / やつ) か。"""
+        return self.object_noun in ("ファイル", "もの", "やつ")
+
+
+def find_file_reference_clauses(text: str) -> list[FileReferenceClause]:
+    """発話中の説明節を出現順に返す (純粋関数)。"""
+    out: list[FileReferenceClause] = []
+    raw = text or ""
+    for m in _FILE_REFERENCE_CLAUSE_RE.finditer(raw):
+        head = raw[:m.start()]
+        boundaries = list(_CLAUSE_SENTENCE_BOUNDARY_RE.finditer(head))
+        before = head[boundaries[-1].end():] if boundaries else head
+        if _CLAUSE_SUBJECT_ASSISTANT_RE.search(before) or _BENEFACTIVE_RE.search(
+            m.group("verb"),
+        ):
+            subject = "assistant"
+        elif _CLAUSE_SUBJECT_USER_RE.search(before):
+            subject = "user"
+        else:
+            subject = "unknown"
+        out.append(FileReferenceClause(
+            start=m.start(), end=m.end(),
+            object_noun=m.group("object"), subject=subject,
+        ))
+    return out
+
+
+def strip_file_reference_clauses(text: str, repl: str = " ") -> str:
+    """説明節を ``repl`` に置き換えた本文を返す (純粋関数)。
+
+    説明節の「保存」「書い」は依頼された動作ではないので、書込み動詞の判定に
+    掛ける前に落とす (router ``write_intent_probe`` / tool_judge_referential)。
+    """
+    return _FILE_REFERENCE_CLAUSE_RE.sub(repl, text or "")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # 既存ファイルへの再保存 (参照表現)
 # ─────────────────────────────────────────────────────────────────────
 
@@ -916,16 +1270,104 @@ CODE_SEARCH_PATTERNS: tuple["re.Pattern[str]", ...] = (
 #:
 #: - ``agent.router``: 書込み意図の検出。掛からないと deliberative へ落ちて
 #:   read_file だけが走り、書込みが一度も起きないまま「保存し直した」体の
-#:   回答になる (実測 2026-07-27)。
+#:   回答になる (実測 2026-07-27)。ルータは説明節を ``write_intent_probe`` で
+#:   先に消すので、「保存したファイルに追記」を宛先にするかどうかはここではなく
+#:   判定点 ``recent_file_reference`` が決める (c_17 §3.11)。
 #: - ``agent.feedback``: 訂正判定の除外。「3 番目の項目を直して、同じファイルに
 #:   保存し直して」は **編集依頼** であってアシスタントの誤りへの訂正ではない。
 #:   これを訂正として数えると、成功した書込みターンが失敗として学習される。
+#:   「保存したファイルに追記して」も同じ編集依頼 (説明節の SSOT を合成する)。
+#: - ``agent.tool_judge_referential``: 保存先を会話から引く参照型の書込み / 読取。
+#:   以前は同じ語彙の別定義 (``_REFERENTIAL_TARGET_RE``) を持ち、説明節を持たず、
+#:   逆に ``さきほど`` / ``書き直して保存`` はそちらにしか無かった (2026-09-27
+#:   レビュー、#14(a))。
 REFERENTIAL_WRITE_TARGET_RE = re.compile(
-    r"(?:同じ|その|この|先ほどの?|さっきの?)\s*(?:ファイル|ところ|場所)"
-    r"|保存し直|上書き|同じ場所に"
+    r"(?:同じ|その|この|先ほどの?|さきほどの?|さっきの?)\s*(?:ファイル|ところ|場所)"
+    rf"|{FILE_REFERENCE_CLAUSE_FILE_PATTERN}"
+    r"|保存し直|書き直して保存|上書き|同じ場所に"
     r"|\b(?:same|that)\s+file\b|\boverwrite\b",
     re.IGNORECASE,
 )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 既出成果物の保存 (「その議事録を保存して」) — docs/c_17 §3.6 / f_03 §1.2
+# ─────────────────────────────────────────────────────────────────────
+#
+# 書くべき本文は直前の応答にあり、生成し直す対象が無い依頼。読み手は 2 つで、
+# **同じ 1 本** を見る (片方だけが「既出の保存」とみなすと、ルータが write-fast
+# へ回したのに素材探しが空振りして生成し直す、またはその逆になる):
+#
+# - ``agent.router._detect_long_form``: long_form (会話を持たない長文生成) から外す。
+#   2026-09-27 C07#2 で「その議事録をWord文書 … として保存」が long_form へ振られ、
+#   turn1 に無い議事録を捏造して保存した。
+# - ``agent.meta_cognitive_write_rescue.previous_answer_write_content``: 直前の
+#   応答をそのまま本文にする (以前はこのモジュールだけが語彙を持っていた)。
+
+#: 直前の成果物を指す **指示詞 + 成果物名詞** (「この案内文」「その議事録」)。
+#:
+#: 成果物の名詞は **散文以外も** 並べる。コード・スクリプト・定義・計算過程が
+#: 抜けていたため「そのテストコードを保存して」で決定論経路が発火せず、LLM の
+#: 再生成に回って `E:\tmp\test_mttr.py にテストコードを保存しました。` という
+#: 完了報告を本文として出し、2 回とも棄却されて書込み自体が失敗した
+#: (実インシデント 2026-08-10 ライブ監査)。直前の応答をそのまま書けばよい
+#: ケースを生成に回さないのが最も確実。
+PREVIOUS_ANSWER_REF_RE = re.compile(
+    r"(?:この|その|上記の?|先(?:ほど|程)の?|さっきの?|いまの|今の|先の|提示した)\s*"
+    r"(?:案内文?|文章|文面|本文|内容|議事録|メモ|原稿|下書き|回答|答え|結果"
+    r"|一覧|リスト|表"
+    r"|コード|スクリプト|プログラム|関数|クラス|テスト|クエリ|設定|定義"
+    r"|設計|手順|計算過程|計算|説明|要点)"
+)
+#: 直前の成果物に手を加える依頼 (そのまま書き写してはいけない)。
+PREVIOUS_ANSWER_TRANSFORM_RE = re.compile(
+    r"翻訳|英訳|和訳|要約|短く|長く|整えて|直して|修正|変えて|変更|書き換え"
+    r"|追記|付け加え|足して|加えて|敬語|丁寧に|箇条書きに|表にして|まとめ直"
+)
+#: 保存/書き出しの依頼であることのシグナル。
+PREVIOUS_ANSWER_SAVE_RE = re.compile(
+    r"保存|書き出|書き込|出力|ファイルに|セーブ|save|write", re.IGNORECASE,
+)
+
+
+#: 既出の内容を **素材** にして別の文書を作る語 (「その内容をもとに」「英語で」
+#: 「2000字で」「詳しく」)。そのまま保存ではないので、直前の応答を本文にしない。
+_PREVIOUS_ANSWER_AS_MATERIAL_RE = re.compile(
+    r"もとに|基に|元に|もとづ|基づ|踏まえ|参考に|参照して|使って"
+    r"|(?:英語|日本語|中国語|韓国語|英文|和文)で"
+    r"|\d+\s*(?:字|文字|語|行|ページ|枚)"
+    r"|詳しく|詳細に|簡潔に|わかりやすく|分かりやすく"
+)
+#: 新しく **生成** する動詞 (作成 / 生成 / 書いて / まとめ …)。「書き出」「書き込」
+#: 「書き直」は保存・加工の語なのでここでは数えない。
+_PREVIOUS_ANSWER_GENERATE_RE = re.compile(
+    r"作成|生成|作って|作る|作り|起こし|まとめ|書(?:い|く|け|こ|き(?!出|込|直|換))"
+)
+#: 指示詞 + 成果物名詞 が **目的語** である形 (「その議事録を」「その内容で」
+#: 「そのテストコードを」— 名詞の複合語は続きを許す)。
+_PREVIOUS_ANSWER_OBJECT_RE = re.compile(
+    rf"(?:{PREVIOUS_ANSWER_REF_RE.pattern})[^\sをでは、。「」]{{0,10}}?\s*(?:を|で|は)",
+)
+
+
+def saves_previous_answer(query: str) -> bool:
+    """既出の成果物を **そのまま** 保存・書き出す依頼か (純粋関数)。
+
+    指示詞 + 成果物名詞 (:data:`PREVIOUS_ANSWER_REF_RE`) が保存 / 書出しの動詞の
+    **目的語** で、加工の指示 (翻訳 / 要約 / 修正 …)・素材として使う語 (もとに /
+    踏まえ / 英語で / ○字で …)・生成の動詞 (作成 / 書いて / まとめ …) の **いずれも
+    無い** こと。広く取ると「その内容をもとに報告書を作成して report.docx に保存して」
+    まで直前の応答がそのまま書き込まれる (write-fast の本文解決は決定論、2026-09-27
+    レビュー H3)。
+    """
+    text = query or ""
+    return bool(
+        PREVIOUS_ANSWER_SAVE_RE.search(text)
+        and _PREVIOUS_ANSWER_OBJECT_RE.search(text)
+        and not PREVIOUS_ANSWER_TRANSFORM_RE.search(text)
+        and not _PREVIOUS_ANSWER_AS_MATERIAL_RE.search(text)
+        and not _PREVIOUS_ANSWER_GENERATE_RE.search(text),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1513,9 +1955,13 @@ def split_user_text_measurement(message: str) -> tuple[str, tuple[str, ...]]:
 #: 後置形 (``_USER_TEXT_MEASURE_RE``) だけを見ていたため、日本語で普通に多い
 #: この語順が素通りしてモデルの目分量に落ちていた。実測 (2026-08-31 ライブ監査
 #: T19#1): 52 文字の文章に **「58文字です」**。
+#: 後ろに続く本文を指す前方参照 (「次の」「以下の」)。直近ファイルへの追記の
+#: 「：」の後ろを中身とみなす条件 (``agent.file_reference_gate``) も同じ語を使う。
+FORWARD_REFERENCE_JA = r"(?:次|以下|下記|この後|後述)"
+
 _LEADING_MEASURE_QUESTION_RE = re.compile(
     r"^[^「『\"“\n]{0,40}?"
-    r"(?:次|以下|下記|この後|後述)の?(?:文章|文字列|文|テキスト|文言)"
+    rf"{FORWARD_REFERENCE_JA}の?(?:文章|文字列|文|テキスト|文言)"
     r"[^「『\"“\n]{0,24}?"
     r"(?:何|なん)(?:文字|行|単語|語)[^「『\"“\n]{0,14}",
 )
@@ -1601,11 +2047,16 @@ def self_output_measure_kinds(query: str) -> tuple[str, ...]:
 #: ``asks_verbatim_excerpt`` は「逐語で見せろ」を検出するがファイル抜粋とも
 #: 共通で、しかも **消費側が few-shot の除外にしか使っていない**。ここでは
 #: 「どれを」まで確定させて、決定論で会話窓から引いて渡すために使う。
+#:
+#: 数の序数は会話内の位置の序数 (:data:`_ORDINAL_NUMERAL` / :data:`_ORDINAL_COUNTER`) と
+#: 同じ部品。1〜3 と ASCII / 漢数字・素の「た」だけを列挙していた頃は「3番目に書いた
+#: コード」はコードブロック、「3つ目に書いたコード」「２番目に書いた関数」「2番目に
+#: 書いてくれた関数」は回答の経路と、綴りで振り分けが割れていた (2026-09-28 レビュー M1)。
 _PRIOR_OUTPUT_ORDINAL_RE = re.compile(
-    r"(?P<ord>最初|1\s*番目|一番目|最後|最新|直前|2\s*番目|二番目|3\s*番目|三番目)"
+    rf"(?:(?:一番)?(?P<ord>最初|最後|最新|直前)|(?P<num>{_ORDINAL_NUMERAL})\s*{_ORDINAL_COUNTER})"
     r"\s*(?:に|の)?\s*"
-    r"(?:あなたが|君が)?\s*"
-    r"(?:書い|作っ|作成し|出力し|示し|挙げ)た",
+    rf"{_ASSISTANT_SUBJECT}?\s*"
+    rf"(?:{_ASSISTANT_OUTPUT_STEMS})\s*{_ASSISTANT_REPORT_PAST}",
 )
 
 #: 再掲の対象がコードであることを示す語。コードブロックはフェンスで
@@ -1616,13 +2067,6 @@ _PRIOR_OUTPUT_CODE_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: 序数語 → 0 始まりのインデックス。負値は末尾からの参照。
-_ORDINAL_INDEX: dict[str, int] = {
-    "最初": 0, "1番目": 0, "1 番目": 0, "一番目": 0,
-    "2番目": 1, "2 番目": 1, "二番目": 1,
-    "3番目": 2, "3 番目": 2, "三番目": 2,
-    "最後": -1, "最新": -1, "直前": -1,
-}
 
 
 def prior_code_block_request(query: str) -> int | None:
@@ -1649,8 +2093,16 @@ def prior_code_block_request(query: str) -> int | None:
     m = _PRIOR_OUTPUT_ORDINAL_RE.search(query)
     if m is None:
         return None
-    key = m.group("ord").replace(" ", "")
-    return _ORDINAL_INDEX.get(key)
+    # 型は N 番目の回答と同じ (節の頭・過去のセッション・依頼の形、再レビュー 1)。
+    # 「最後から2番目に書いたコード」「前回2つ目に書いたコード」「私が2つ目に書いた
+    # コード」「3回目に書いたコードが動かない」を会話のコードブロックへ解かない。
+    evidence, _ = _ordinal_reference_shape(query, m)
+    if evidence:
+        return None
+    if m.group("ord"):
+        return 0 if m.group("ord") == "最初" else -1
+    n = kanji_number_value(m.group("num"))
+    return n - 1 if n else None
 
 
 #: フェンス付きコードブロック (``` で囲まれた本体)。
@@ -1686,15 +2138,15 @@ _RESTATE_PRIOR_REPORT_RE = re.compile(
     r"(?:あなたが|君が)?\s*"
     # 「教えてくれた」(て形 + 補助動詞) と「答えた」(過去形) の両方を受ける。
     # 片方だけだと「先ほど答えたCPU使用率をもう一度。」を取りこぼす。
-    r"(?:教え|言っ|言|答え|示し|出し|報告し)\s*"
-    r"(?:て\s*(?:くれた|もらった|いた|くださった|頂いた|いただいた)|た)"
+    rf"(?:{_ASSISTANT_REPORT_STEMS})\s*"
+    rf"{_ASSISTANT_REPORT_PAST}"
     # 「先ほどの 10 営業日後の日付をもう一度」「先ほど求めた 3 営業日後の日付を
     # もう一度」— 近接の参照 + 再掲の依頼。発話動詞 (教えてくれた) を伴わない形
     # を取りこぼし、日付抽出器が **演算し直して** 前日の起点 (注入された前
     # セッションの結果) で 9/24 と再計算した (2026-09-11 ライブ監査 (j) J-06)。
     # 再掲は会話にある値の読み上げで、演算し直す理由が無い。
     r"|(?:さっき|先(?:ほど|程)|最初)\s*(?:に|の)?[^。．!！?？\n]{0,30}?"
-    r"(?:もう一度|もう1度|もういちど|再掲)",
+    rf"{_RESTATE_AGAIN}",
 )
 
 #: 「いま測り直せ」と読める語。再掲要求と重なったらこちらを優先し、
