@@ -17,6 +17,10 @@ from backend.free.agent.tool_judge_args import (
 )
 from backend.free.agent.tool_judge_types import ToolJudgement
 from backend.free.agent.tools_registry import ToolsRegistry
+from backend.free.core.intent_vocab import (
+    REFERENTIAL_WRITE_TARGET_RE,
+    strip_file_reference_clauses,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -24,16 +28,12 @@ if TYPE_CHECKING:
 
 logger = get_logger("agent.tool_call_judge")
 
-#: 「同じファイルに」「そのファイルを」等、保存先を直前の文脈に委ねる表現。
-#: ``さきほど`` (ひらがな) は 2026-08-09 に追加。``先ほど`` / ``さっき`` しか
-#: 無く、「さきほど作った notes.txt に追記して」が参照表現として認識されず
-#: 書込みが 1 度も走らないまま完了を捏造していた。
-_REFERENTIAL_TARGET_RE = re.compile(
-    r"(?:同じ|その|この|先ほどの?|さきほどの?|さっきの?)\s*(?:ファイル|ところ|場所)"
-    r"|保存し直|上書き|書き直して保存|同じ場所に"
-    r"|\b(?:same|that)\s+file\b|\boverwrite\b",
-    re.IGNORECASE,
-)
+#: 「同じファイルに」「そのファイルを」「保存したファイルに」等、保存先を直前の
+#: 文脈に委ねる表現。ルータの宛先の証拠と同じ 1 本 (``intent_vocab`` が SSOT)。
+#: 以前はここに同じ語彙の別定義があり、説明節を持たず (「保存しておいたファイル」
+#: が参照にならない)、``さきほど`` / ``書き直して保存`` はこちらにしか無かった
+#: (2026-09-27 レビュー、#14(a))。
+_REFERENTIAL_TARGET_RE = REFERENTIAL_WRITE_TARGET_RE
 #: 保存/書き出しを求める動詞 (パス無しの参照依頼を拾うための最小集合)。
 #: ``追記`` / ``書き足`` / ``書[きい]て`` は 2026-08-09 に追加 (実インシデント:
 #: 「そのファイルの末尾に追記して書いて」が保存動詞として認識されなかった)。
@@ -137,7 +137,11 @@ def _referential_rewrite_judgement(
     """
     if not tools_registry.has("write_file"):
         return None
-    if not _REWRITE_VERB_RE.search(query):
+    # 説明節 (「保存したファイル」) の「保存」は対象の説明で、依頼された動作では
+    # ない。消さずに見ると「保存したファイルの場所を教えて」が write_file になり、
+    # chat で格下げされた後に list_directory('.') へ落ちた (2026-09-27 監査 C07#5)。
+    # 節の SSOT はルータの ``write_intent_probe`` と同じ (docs/c_17 §3.5.1)。
+    if not _REWRITE_VERB_RE.search(strip_file_reference_clauses(query)):
         return None
     if _path_is_written_in_query(query):
         return None  # ディレクトリ付きパスが本文にあるなら通常のルール層で足りる

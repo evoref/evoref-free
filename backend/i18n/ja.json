@@ -255,6 +255,9 @@
     "help_reset": "データ根を初期化する (記憶・履歴・学習・ログを削除。outputs / themes / profiles は残す)",
     "help_doctor": "データ根を検査する (版・件数・ID の一意性・参照のぶら下がり。読むだけで何も書かない)",
     "doctor_header": "evoref doctor: {data_root}",
+    "doctor_runtime": "Python: {python} / {deps}",
+    "doctor_dependency_installed": "あり",
+    "doctor_dependency_missing": "なし",
     "doctor_serve_running": "evoref が稼働中です。検査の間にも書き込まれるため、結果が変わることがあります。",
     "doctor_scanned": "{formats} 種類の形式・{files} ファイルを検査しました。",
     "doctor_evidence": "記憶 {store}: {total} 件 (有効 {live} / 取り消し {retracted} / 置き換え済み {superseded} / 未知の値 {ignored})",
@@ -293,6 +296,7 @@
       "history_duplicate_session": "履歴のセッション id が {count} 件重複しています",
       "experience_duplicate_id": "経験の id が {count} 件重複しています",
       "experience_ignored": "未知の値を持つ経験が {count} 件あります (保持したまま使っていません)",
+      "experience_foreign_model_key": "別のモデル ({detail}) が生成した経験が {count} 件、このパーティションに入っています (移送はしません。このパーティションの学習の入力になります)",
       "weak_reference_missing": "{format_id}: 共有データへの弱い参照 {count} 件の宛先がありません (動作には影響しません)",
       "location_unsafe": "データ根がネットワークドライブ / OneDrive の下にあります ({detail})",
       "location_weak_fs": "データ根のファイルシステム ({detail}) はジャーナルが無く、書き込みの順序保証が弱いです",
@@ -542,6 +546,31 @@
     "written_content_truncated": "（先頭 {lines} 行のみ表示 / 全 {total} 行）",
     "tasks_partially_done": "{done} 件のタスクを完了し、{failed} 件が失敗しました。",
     "tasks_all_failed": "タスクの実行に失敗しました。",
+    "write_rejection": {
+      "write_report_echo": "生成された本文が完了報告になっていたため",
+      "task_log_echo": "生成された本文が進捗ノートになっていたため",
+      "tool_call_syntax": "生成された本文がツールコール構文になっていたため",
+      "write_script": "生成された本文がファイルを書くスクリプトになっていたため",
+      "refusal_or_missing_info": "生成された本文が断り書きになっていたため",
+      "prompt_echo": "生成された本文が内部プロンプトの写しになっていたため",
+      "instruction_echo": "生成された本文が依頼文の写しになっていたため",
+      "literal_wrapped": "生成された本文が依頼文の引用で包まれていたため",
+      "path_only": "生成された本文がパスだけだったため",
+      "low_information": "生成された本文に中身がほとんど無かったため",
+      "csv_without_rows": "生成された CSV に行が無かったため",
+      "edit_without_change": "内容が変わらなかったため",
+      "task_restatement": "生成された本文が依頼の言い換えだったため",
+      "no_table_data": "保存する本文に表が無かったため",
+      "existing_unreadable": "既存ファイルを文字化けなく読めず、内容を失うおそれがあったため",
+      "existing_too_large": "既存ファイルが大きすぎて、全体を踏まえた書き直しができないため",
+      "unencodable": "既存ファイルの文字コードで表せない文字を含み、内容を壊すおそれがあったため"
+    },
+    "write_failed": {
+      "append": "{path} への追記ができませんでした{reason}。",
+      "write": "{path} への書き込みができませんでした{reason}。",
+      "no_target": "ファイルへの書き込みができませんでした{reason}。",
+      "unchanged": "ファイルは変更されていません。"
+    },
     "edit": {
       "unreadable": "{path} は文字化けなく読めない形式のため、内容を失わないよう追記を中止しました。",
       "mixed": "{path} への追記と書き換え (修正・削除など) を一度には行えないため、内容を失わないよう書き込みを中止しました。追記と書き換えは分けて依頼してください。",
@@ -571,6 +600,10 @@
         "good_night": "おやすみなさい。良い夜を！",
         "bye": "さようなら！またいつでもどうぞ。"
       }
+    },
+    "search_history": {
+      "display_other_sessions": "別の会話の記録",
+      "display_current_session": "この会話の記録"
     },
     "boundary_turns": {
       "first": "最初",
@@ -669,9 +702,70 @@
     "requested_tests_not_available": "依頼されたテスト ({names}) は作成していません (この構成ではテスト工程を実行しません)。",
     "requested_tests_not_generated": "依頼されたテスト ({names}) は生成できませんでした。",
     "requested_tests_failing": "依頼されたテスト {name} を付けましたが、一部が通っていません (参考として配信しています)。",
+    "requested_files_not_generated": "依頼にあった {names} は作成していません (実行時にプログラムが作るファイルなら不要です)。",
+    "reference_tests_failing": "確認用に自動で作った参考テストのうち {count} 件が通っていません (警告のみ。参考テストは配信していません)。",
+    "reference_tests_failing_some": "確認用に自動で作った参考テストの一部が通っていません (警告のみ。参考テストは配信していません)。",
     "missing_assets": "同梱していないファイルを読み込んでいます: {refs} (音や画像が出ない可能性があります)。",
     "not_generated": "未生成: {names}",
     "generating_data_files": "データファイルを生成中… ({names})",
-    "contract_repair_reverted": "契約テスト後の修正を取り消し (smoke 不合格): {paths}"
+    "fixing_check_errors": "検査のエラーを修正中… ({paths})",
+    "fixing_usage_errors": "使い方の実行のエラーを修正中… ({path})",
+    "contract_repair_reverted": "契約テスト後の修正を取り消し (smoke 不合格): {paths}",
+    "contract_repair_worse": "契約テスト後の修正を取り消し (失敗が {before} 件から {after} 件に増えた): {paths}",
+    "contract_repair_unchecked": "契約テスト後の修正を取り消し (修正版を検査できなかった): {paths}",
+    "checks_not_run": "作業フォルダの外へ書き込もうとしたため検査できませんでした: {lines}",
+    "incomplete": {
+      "written": "{paths} に書き込みましたが、制作は完了していません ({reasons})。",
+      "written_no_paths": "ファイルを書き込みましたが、制作は完了していません ({reasons})。",
+      "generated": "成果物は出力しましたが、制作は完了していません ({reasons})。",
+      "grouped": "成果物は上の制作でまとめて扱いましたが、制作は完了していません ({reasons})。",
+      "separator": "、",
+      "reason": {
+        "timed_out": "時間切れで打ち切りました",
+        "tasks_failed": "生成や検査で {count} 件の失敗がありました",
+        "validation_errors": "GENERATION_ISSUES.md に記した未解決のエラーが {count} 件残っています",
+        "checks_not_run": "{count} 件の検査を実行できませんでした",
+        "no_code_files": "コードのファイルが 1 本も生成されませんでした",
+        "files_failed": "{count} 件のファイルを書き込めませんでした: {paths}"
+      }
+    },
+    "check": {
+      "line": "{label}: {status}",
+      "passed": "合格",
+      "failed": "不合格",
+      "failed_errors": "不合格 (エラー {count} 件)",
+      "unchecked": "未検査 ({reason})",
+      "failures": "{label} の失敗: {items}",
+      "advisory_dropped": " (壊れやすい検査を {count} 件除外)",
+      "advisory_warning_only": " — 警告のみ",
+      "label": {
+        "static": "import / 静的検査",
+        "contract": "契約テスト",
+        "contract_examples": "契約テスト (入出力例 {count} 件)",
+        "advisory": "参考テスト",
+        "usage": "使い方の実行 (配信形)"
+      },
+      "reason": {
+        "sandbox_violation": "作業フォルダの外へ書き込もうとしたので止めた: {detail}",
+        "missing_dependency": "外部依存 {detail} が未インストール",
+        "no_examples": "入出力例なし",
+        "invalid_examples": "入出力例が不正",
+        "no_tests": "参考テストなし",
+        "lint_dropped": "生成したテストを lint が全件除外: {detail} 件",
+        "needs_input": "入力か画面が要る: {detail}",
+        "not_run": "実行できなかった"
+      },
+      "reason_by_check": {
+        "static": {
+          "missing_dependency": "構文検査器なし: {detail}"
+        },
+        "usage": {
+          "not_run": "実行できなかった: {detail}"
+        }
+      },
+      "detail": {
+        "timed_out": "{seconds} 秒以内に終わらなかった"
+      }
+    }
   }
 }

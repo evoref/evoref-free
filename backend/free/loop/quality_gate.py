@@ -27,6 +27,10 @@ class GateResult:
     stderr_tail: str
     error: str | None = None
     skip_reason: str | None = None
+    #: skipped の理由の種類 (``core.check_outcome.UncheckedReason`` の値)。表示は i18n で組む。
+    skip_kind: str | None = None
+    #: ``skip_kind`` の補足 (止めた書込み先・欠けた依存名)。
+    skip_detail: str | None = None
 
     def is_failure(self) -> bool:
         """ゲート実行が失敗とみなされる (= 後段のリトライ判定対象) か"""

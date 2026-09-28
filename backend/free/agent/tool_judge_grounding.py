@@ -7,9 +7,13 @@
 
 from __future__ import annotations
 
+import ast
+import math
 import re
 
 from backend.free.core.intent_vocab import NUMBER_LITERAL_RE
+from backend.free.core.numerals import kanji_number_value
+from backend.free.core.response_arithmetic import JaNumber, iter_ja_numbers
 
 #: 数値計算クエリの事前フィルタ。式が書かれていれば層1 (_extract_arithmetic_expression)
 #: が決定論的に処理するため、ここは「数値は複数あるが式は書かれていない」ものだけを
@@ -47,11 +51,106 @@ _UNIT_SYSTEM_CONSTANTS = frozenset({
     "1", "7", "10", "12", "24", "52", "60", "100", "365", "366",
     "1000", "1440", "3600", "86400",
     "0.1", "0.01", "0.001",
-    # SI 接頭辞 (10 の冪) — 1000 は上にある
+})
+
+#: 1e6 以上の SI 接頭辞と 2 進接頭辞 (KiB / MiB / GiB / TiB)。定義なので記憶違いの
+#: 余地は無いが、**どこに置かれたか** を見ずに説明済みにすると、会話に無い金額の
+#: 捏造 (「100 万」) まで定義として通る (実インシデント 2026-09-27 ライブ監査
+#: C08#3: 「広告費を20%削減した場合の合計」に ``1000000 * 0.8`` — 会話の広告費は
+#: 120 万 — が組まれ、1000000 が SI 接頭辞として無条件に説明済みだったため
+#: 561.4 万円 (正 683 万円) が「厳密な計算結果」になった)。換算の位置
+#: (:func:`_conversion_position_constants`) か単位の定義 (:func:`_unit_defined_constants`)
+#: のときだけ説明済みにする (docs/f_03 §3.4.1)。
+_LARGE_UNIT_CONSTANTS = frozenset({
     "1000000", "1000000000", "1000000000000",
-    # 2 進接頭辞 (2 の冪): KiB / MiB / GiB / TiB
     "1024", "1048576", "1073741824", "1099511627776",
 })
+
+#: 単位の記号がその換算率を **定義として** 名指しするもの。``ppm`` = 10^6 は
+#: 「0.02%は何ppm?」の ``0.0002 * 1000000`` のように、相手が百分率由来でも換算。
+#: バイトの接頭辞は SI (10^3n) と 2 進 (1024^k, k≤n) の両定義を受ける。
+_PARTS_PER_UNITS: dict[str, tuple[str, ...]] = {
+    "ppm": ("1000000",), "ppb": ("1000000000",), "ppt": ("1000000000000",),
+}
+_BYTE_PREFIX_POWER: dict[str, int] = {
+    "K": 1, "M": 2, "G": 3, "T": 4, "キロ": 1, "メガ": 2, "ギガ": 3, "テラ": 4,
+}
+#: 単位記号 (``ppm`` / ``KB`` / ``gb`` / ``MiB``) と日本語の接頭辞 (「3ギガバイト」
+#: 「1ギガは何メガ」)。日本語は長さ・重さ・電力などの単位が続く形を除く。
+_UNIT_SYMBOL_RE = re.compile(
+    r"(?<![A-Za-z])(?:(ppm|ppb|ppt)|([KMGT])i?B)(?![A-Za-z])"
+    r"|(キロ|メガ|ギガ|テラ)(?!メートル|グラム|ワット|カロリー|ヘルツ|トン)",
+    re.IGNORECASE,
+)
+
+
+def _unit_defined_constants(text: str) -> set[str]:
+    """対話が書いた単位記号が **定義として** 名指しする換算率 (純粋関数)。"""
+    found: set[str] = set()
+    for parts_per, prefix, ja_prefix in _UNIT_SYMBOL_RE.findall(text or ""):
+        if parts_per:
+            found.update(_PARTS_PER_UNITS[parts_per.lower()])
+            continue
+        power = _BYTE_PREFIX_POWER[ja_prefix or prefix.upper()]
+        found.add(str(1000 ** power))
+        found.update(str(1024 ** k) for k in range(1, power + 1))
+    return found & _LARGE_UNIT_CONSTANTS
+
+
+def _product_leaves(node: ast.AST) -> list[ast.AST]:
+    """乗除の連鎖を括弧の中まで平坦化した項 (``(a*b)/(c*d)`` → a, b, c, d)。"""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Div)):
+        return _product_leaves(node.left) + _product_leaves(node.right)
+    return [node]
+
+
+def _numeric_leaf_text(expression: str, node: ast.AST) -> str | None:
+    """項が数値リテラル (符号付きを含む) なら、その綴り (符号抜き) を返す。
+
+    底が数値リテラルの冪 (``1024 ** 3``) は底の綴りを返す — 「3ギガバイトは何
+    バイト」の ``3 * 1024 ** 3`` で 1024 は相手 3 と並ぶ換算定数 (独立レビュー)。
+    """
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        node = node.operand
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+        node = node.left
+    if not (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))):
+        return None
+    if isinstance(node.value, bool):
+        return None
+    return ast.get_source_segment(expression, node)
+
+
+def _conversion_position_constants(expression: str, partners: set[str]) -> set[str]:
+    """**換算の位置** にある大きな換算定数を返す (純粋関数)。
+
+    換算の位置 = 乗除の連鎖 (括弧の中まで平坦化した積の項) の相手に、
+    ``partners`` (百分率由来でない会話の数) の数値リテラルがある。
+    ``(1277500 * 240) / (1024 * 1024)`` の 1024 は相手が 1277500 / 240 なので
+    換算、``1000000 * 0.8`` の 1000000 は相手が 20% 由来の 0.8 だけなので換算では
+    ない。相手は数値リテラルの項だけを数える (冪・和の項の中は見ない)。
+    構文として読めない式は換算の位置を持たない。
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return set()
+    explained: set[str] = set()
+    roots = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Mult, ast.Div))
+    ]
+    for root in roots:
+        texts = [_numeric_leaf_text(expression, leaf) for leaf in _product_leaves(root)]
+        for i, text in enumerate(texts):
+            if text not in _LARGE_UNIT_CONSTANTS:
+                continue
+            if any(
+                other is not None and other in partners
+                for j, other in enumerate(texts) if j != i
+            ):
+                explained.add(text)
+    return explained
 
 
 def _ungrounded_numbers(
@@ -66,9 +165,21 @@ def _ungrounded_numbers(
     事実」であってモデルの想像ではないため。空タプルなら式は接地している。
     真偽ではなく **どの値が説明できないか** を返すのは、式を捨てずに実行する
     経路でその値を回答に開示させるため (``_suppress_ungrounded_calculate``)。
+
+    大きな換算定数 (:data:`_LARGE_UNIT_CONSTANTS`) は、対話に書かれているか、
+    換算の位置にあるか、対話の単位記号が定義として名指しするときだけ説明済み
+    (docs/f_03 §3.4.1)。
     """
     known = _known_numbers(query) | _known_numbers(context)
     known.update(_UNIT_SYSTEM_CONSTANTS)
+    text = f"{query or ''}\n{context or ''}"
+    known.update(_unit_defined_constants(text))
+    # 相手に数えるのは百分率由来でない会話の数。「20%」の 20 そのものも除く
+    # (``1000000*20/100`` を換算と読んでいた、独立レビュー)。
+    partners = _known_numbers(
+        _PERCENT_LITERAL_RE.sub(" ", query or ""), include_percent=False,
+    ) | _known_numbers(_PERCENT_LITERAL_RE.sub(" ", context or ""), include_percent=False)
+    known.update(_conversion_position_constants(expression, partners))
     seen: list[str] = []
     # 冪の指数 (``x ** 2``) は式の構造が要求する値で、対話の数値ではない
     # (BMI = 体重 / 身長 ** 2。2026-09-21 ライブ監査の再検証で棄却されていた)。
@@ -137,15 +248,8 @@ _INTERVAL_M_RE = re.compile(r"(\d+(?:\.\d+)?)\s*分\s*(?:刻み|単位|ごと|�
 #: 実インシデント 2026-09-05 ライブ監査 T03/1: 「残債が2,850万円」に対し
 #: ネイティブ層が正しく ``28500000`` を使ったのに ungrounded と判定され、
 #: 「この値の根拠を示せ」という無意味な注記がプロンプトに載った。
-_MYRIAD_UNITS: dict[str, int] = {
-    "兆": 10**12, "億": 10**8, "千万": 10**7, "百万": 10**6, "万": 10**4, "千": 10**3,
-}
-_MYRIAD_GROUP_RE = re.compile(
-    r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(兆|億|千万|百万|万|千)",
-)
-_MYRIAD_SEQUENCE_RE = re.compile(
-    r"(?:(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:兆|億|千万|百万|万|千)\s*)+",
-)
+#: 読みは ``response_arithmetic.iter_ja_numbers`` (:func:`_myriad_derived_numbers` /
+#: :func:`_myriad_pairs`)。
 
 _WEEKDAY_ORDER = "月火水木金土日"
 #: SI 接頭辞付きの長さ / 質量 (``172cm`` / ``500g`` / ``3km`` は対象外 — km は
@@ -153,44 +257,116 @@ _WEEKDAY_ORDER = "月火水木金土日"
 _METRIC_PREFIX_DIVISORS: dict[str, float] = {"cm": 100.0, "mm": 1000.0, "g": 1000.0}
 _METRIC_PREFIXED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(cm|mm|g)(?![a-zA-Z])", re.IGNORECASE)
 
-#: ``** 2`` のような冪の指数 (整数リテラル)。
-_POWER_EXPONENT_RE = re.compile(r"\*\*\s*\d+")
+#: ``** 2`` のような冪の指数 (整数リテラル)。符号付き (``**-10``) と括弧で囲んだ
+#: 1 つの数 (``**(-10)``) も剥がす — ``\*\*\s*\d+`` だけだった頃は ``**-10`` の 10 が
+#: 残り、定数表に 10 があったから通っていただけだった (2026-09-27)。式の指数
+#: (``**(-23*12)``) の中の数は剥がさない — 年数 23 は対話から辿れるべき被演算子。
+_POWER_EXPONENT_RE = re.compile(r"\*\*\s*(?:[-+]?\s*\d+|\(\s*[-+]?\s*\d+\s*\))")
 
 _WEEKDAY_RANGE_RE = re.compile(
     r"([月火水木金土日])\s*(?:曜日?)?\s*(?:〜|～|-|–|から)\s*([月火水木金土日])\s*(?:曜日?)?",
 )
 
 
-def _known_numbers(text: str) -> set[str]:
-    """``text`` に「書かれている」とみなせる数値リテラルを集める (純粋関数)。
+def percent_derived_values(text: str) -> list[float]:
+    """``text`` の百分率・割合の語から導ける値 (率 / 加算後の倍率 / 割引後の倍率、純粋関数)。
 
-    素の数字に加えて 2 種類を同一視する。どちらも **対話に現れた表記から決定論で
-    導ける**もので、モデルが知識から持ち出した定数ではない:
+    「10%」からは 0.1 (率) と 1.1 (加算後の倍率) と 0.9 (割引後の倍率) が
+    導ける。「15% 引き」の式は ``× 0.85`` になるのが普通で、0.85 を
+    「対話に無い数値」と記録していた (2026-09-10 ライブ監査 (h) H-07)。
 
-    - 桁区切り: ``2,660`` → ``2660``。数える側 (式) は区切りを打たないため、
-      正規化しないと自分が直前に提示した金額を「知らない数値」と判定してしまう
-    - パーセント: ``10%`` → ``0.1`` / ``1.1`` / ``1.10``。税率・割引率の計算で
-      式に現れる倍率は、クエリ中の百分率から一意に決まる
+    **百分率由来の値の分類はこの 1 関数** (docs/f_03 §3.4.1)。既知の数
+    (:func:`_known_numbers`)、換算定数の相手 (:func:`_ungrounded_numbers`)、
+    桁の取り違え (:func:`percent_scale_slips`)、組み直しの新値判定
+    (``tool_call_judge``) が共有する — 百分率の展開を複数書くと片方だけ直る。
     """
-    known = set(_NUMBER_LITERAL_RE.findall(text))
-    for grouped in _GROUPED_NUMBER_RE.findall(text):
-        known.add(grouped.replace(",", ""))
-    for pct in _PERCENT_LITERAL_RE.findall(text):
+    values: list[float] = []
+    for pct in _PERCENT_LITERAL_RE.findall(text or ""):
         try:
             rate = float(pct) / 100.0
         except ValueError:
             continue
-        # 「10%」からは 0.1 (率) と 1.1 (加算後の倍率) と 0.9 (割引後の倍率) が
-        # 導ける。「15% 引き」の式は ``× 0.85`` になるのが普通で、0.85 を
-        # 「対話に無い数値」と記録していた (2026-09-10 ライブ監査 (h) H-07)。
+        values.extend((rate, 1.0 + rate, 1.0 - rate))
+    # 割合の語 (「3割」「3割引」「半分」「半額」) も同じ種類の値。無いと
+    # ``100000000*0.03*0.3`` (売上 1 億の 3% の 3 割) の 0.3 や ``5000*0.95*0.5``
+    # (半額) の 0.5 が説明できない数になり、桁の取り違えと誤って読まれた
+    # (独立レビュー 2026-09-27)。
+    for token in _WARI_RE.findall(text or ""):
+        tenths = _wari_tenths(token)
+        if tenths is not None:
+            rate = tenths / 10.0
+            values.extend((rate, 1.0 + rate, 1.0 - rate))
+    if _HALF_RE.search(text or ""):
+        values.append(0.5)
+    return values
+
+
+#: 「3割」「3割引」「三割」 (割合の語)。
+_WARI_RE = re.compile(r"(\d+(?:\.\d+)?|[一二三四五六七八九十])\s*割")
+#: 「半分」「半額」「半値」「半減」。
+_HALF_RE = re.compile(r"半(?:分|額|値|減)")
+
+
+def _wari_tenths(token: str) -> float | None:
+    """「3」「三」「十」を割の数に (純粋関数)。"""
+    value = kanji_number_value(token)
+    if value is not None:
+        return float(value)
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def percent_derived_numbers(text: str) -> set[str]:
+    """:func:`percent_derived_values` を式の綴りで (``0.1`` / ``1.10`` の両表記)。"""
+    found: set[str] = set()
+    for value in percent_derived_values(text):
         # 式側の表記ゆれ (1.1 / 1.10) を吸収するため両方を登録する。
-        for value in (rate, 1.0 + rate, 1.0 - rate):
-            known.add(f"{value:g}")
-            known.add(f"{value:.2f}")
+        found.add(f"{value:g}")
+        found.add(f"{value:.2f}")
+    return found
+
+
+def _known_numbers(text: str, *, include_percent: bool = True) -> set[str]:
+    """``text`` に「書かれている」とみなせる数値リテラルを集める (純粋関数)。
+
+    素の数字に加えて次を同一視する。いずれも **対話に現れた表記から決定論で
+    導ける**もので、モデルが知識から持ち出した定数ではない:
+
+    - 桁区切り: ``2,660`` → ``2660``。数える側 (式) は区切りを打たないため、
+      正規化しないと自分が直前に提示した金額を「知らない数値」と判定してしまう
+    - パーセント: ``10%`` → ``0.1`` / ``1.1`` / ``1.10`` (:func:`percent_derived_numbers`)。
+      税率・割引率の計算で式に現れる倍率は、クエリ中の百分率から一意に決まる。
+      ``include_percent=False`` は百分率由来の値を除いた「会話の数」
+      (換算定数の相手の判定、docs/f_03 §3.4.1)
+    - 時間表現 / 万進表記 / 漢数字の量 / SI 接頭辞付きの長さ・質量
+    """
+    known = set(_NUMBER_LITERAL_RE.findall(text))
+    for grouped in _GROUPED_NUMBER_RE.findall(text):
+        known.add(grouped.replace(",", ""))
+    if include_percent:
+        known.update(percent_derived_numbers(text))
     known.update(_duration_derived_numbers(text))
     known.update(_myriad_derived_numbers(text))
+    known.update(_kanji_quantity_numbers(text))
     known.update(_metric_prefix_derived_numbers(text))
     return known
+
+
+#: 漢数字の量 (``百万`` / ``三千万`` / ``一億二千万`` / ``二十``)。万進表記
+#: (``iter_ja_numbers``) は係数に算用数字を要求するので、「百万円を年利3%で」の
+#: 1000000 を拾えなかった (2026-09-27、F1 の反例)。先頭は数字か 十百千 に限る
+#: (単独の「万」「億」は量ではない — 「万が一」)。
+_KANJI_QUANTITY_RE = re.compile(r"[〇一二三四五六七八九十百千][〇一二三四五六七八九十百千万億兆]*")
+def _kanji_quantity_numbers(text: str) -> set[str]:
+    """漢数字の量を算用数字の綴りで集める (``百万円`` → ``1000000``、純粋関数)。"""
+    found: set[str] = set()
+    for token in _KANJI_QUANTITY_RE.findall(text or ""):
+        value = kanji_number_value(token)
+        if value is not None:
+            found.add(str(value))
+    return found
 
 
 def _metric_prefix_derived_numbers(text: str) -> set[str]:
@@ -214,7 +390,12 @@ def _myriad_derived_numbers(text: str) -> set[str]:
 
     ``2,850万`` → ``28500000`` (展開値) と ``2850`` (万単位の係数)。モデルは
     万単位のまま式を組むこともある (``2850 * 0.0135``) ので両方を登録する。
-    ``1億2000万`` のような連結は各項の和 (``120000000``)。
+    ``1億2000万`` / ``9 万 1,855.33`` のような連結は 1 つの数 (``120000000`` /
+    ``91855.33``)。展開値の読みは応答の数の読みと同じ
+    ``response_arithmetic.iter_ja_numbers`` の 1 本 (不変則 #14(a)) — 別に持っていた
+    読みは万の後ろの端数を落とし、直前の回答「9 万 1,855.33 円」を使った式
+    ``30000000 + 91855.33 * 35 * 12`` を「会話に無い数」と判定した
+    (2026-09-28 再監査 C03#2)。
     """
     derived: set[str] = set()
 
@@ -222,19 +403,24 @@ def _myriad_derived_numbers(text: str) -> set[str]:
         if value == int(value):
             derived.add(str(int(value)))
         else:
-            derived.add(f"{value:g}")
+            derived.add(f"{value:.10f}".rstrip("0").rstrip("."))
 
-    for seq in _MYRIAD_SEQUENCE_RE.findall(text):
-        total = 0.0
-        for num, unit in _MYRIAD_GROUP_RE.findall(seq):
-            try:
-                coefficient = float(num.replace(",", ""))
-            except ValueError:
-                continue
+    for num in iter_ja_numbers(text):
+        if not num.has_unit:
+            continue
+        add(num.value)
+        for coefficient, _multiplier in _myriad_terms(num):
             add(coefficient)
-            total += coefficient * _MYRIAD_UNITS[unit]
-        add(total)
     return derived
+
+
+def _myriad_terms(num: JaNumber) -> list[tuple[float, float]]:
+    """万進の項 (係数, 倍率)。倍率が千以上の項だけ (「3百」の 3 は係数に数えない)。
+
+    係数の読みも ``iter_ja_numbers`` の 1 本 (以前は別の正規表現で読み、全角の桁区切り
+    や「2 万 6 千」の空白で読みが割れていた、独立レビュー L3)。
+    """
+    return [(c, m) for c, m in num.unit_terms if m >= 1000]
 
 
 def _duration_derived_numbers(text: str) -> set[str]:
@@ -315,16 +501,21 @@ def _rate_forms(pct: str) -> list[str]:
 
 
 def expression_sanity_issues(
-    expression: str, query: str, context: str = "",
+    expression: str, query: str, context: str = "", *, user_text: str | None = None,
 ) -> tuple[str, ...]:
     """式の組み方が対話の表記と食い違う疑いを返す (純粋関数)。
 
     返すのは **疑いの説明文** (回答側の注記にそのまま使う)。空タプルなら疑い無し。
-    検出するのは構造だけで決まる 3 種:
+    ``user_text`` は会話のうち user の発言だけの本文で、5 の期間の候補はここからだけ
+    取る (``None`` なら ``context`` 全体)。検出するのは構造だけで決まる 5 種:
 
     1. 年率を 12 倍 / 月率を 12 で割る (期間単位の取り違え)
     2. 百分率を 2 回割る (``1.35/100/100`` / ``0.0135/100``)
     3. 万円の係数と円の展開値の混在 (``2850 * 0.0135 + 627000``)
+    4. 月数 (年数×12) の冪に年率をそのまま使う (``1.012 ** 420``、
+       :func:`_compounding_period_issues`)
+    5. 月の複利の冪の指数が会話の期間と合わない (「35年」に ``** -360``、
+       :func:`period_exponent_mismatches`)
     """
     expr = expression or ""
     text = f"{query or ''}\n{context or ''}"
@@ -358,6 +549,16 @@ def expression_sanity_issues(
             except ValueError:
                 pass
 
+    issues.extend(_compounding_period_issues(expr, text))
+    for exponent, periods in _period_exponent_mismatch_pairs(
+        expr, text, _period_text(query, context, user_text),
+    ):
+        listed = "、".join(str(p) for p in periods)
+        issues.append(
+            f"月の複利の冪の指数 {exponent} が会話の期間の月数 ({listed}) と一致しない "
+            "(年数 × 12 か、会話に書かれた回数を使う)"
+        )
+
     pairs = _myriad_pairs(text)
     if len(pairs) >= 1:
         used_coefficient = any(
@@ -375,17 +576,332 @@ def expression_sanity_issues(
     return tuple(issues)
 
 
+#: 期間の年数 (「35年」「20 年間」)。「年利」「年率」「年齢」の年は数えない。
+_YEARS_RE = re.compile(r"(\d+)\s*年(?!利|率|齢|生|代|目|前|後)")
+#: 「月々 1%」「毎月 0.5% ずつ」— 月あたりの率 (``_MONTHLY_RATE_RE`` の「月利」表記以外)。
+_PER_MONTH_RATE_RE = re.compile(
+    r"(?:月々|毎月|月あたり|ひと月)[^。\n\d]{0,8}?(\d+(?:\.\d+)?)\s*(?:%|％|パーセント)",
+)
+#: 定数部分木の評価で許す指数の上限 (``calc`` の上限と同じ桁)。
+_MAX_CONSTANT_EXPONENT = 10_000
+
+
+def _constant_value(node: ast.AST) -> float | None:
+    """数値リテラルと四則・冪だけの部分木を評価する (純粋関数)。それ以外は ``None``。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return None if isinstance(node.value, bool) else float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        inner = _constant_value(node.operand)
+        if inner is None:
+            return None
+        return -inner if isinstance(node.op, ast.USub) else inner
+    if not isinstance(node, ast.BinOp):
+        return None
+    left = _constant_value(node.left)
+    right = _constant_value(node.right)
+    if left is None or right is None:
+        return None
+    try:
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Pow) and abs(right) <= _MAX_CONSTANT_EXPONENT:
+            return float(left ** right)
+    except (ZeroDivisionError, OverflowError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _power_operands(tree: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
+    """式の全ての冪 (``a ** b`` / ``pow(a, b)``) の (底, 指数)。"""
+    found: list[tuple[ast.AST, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            found.append((node.left, node.right))
+        elif (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "pow" and len(node.args) == 2
+        ):
+            found.append((node.args[0], node.args[1]))
+    return found
+
+
+def _annual_percents(text: str) -> list[str]:
+    """年率とみなす百分率 (出現順・重複なし、純粋関数)。
+
+    月率と明示された百分率 (``月利 0.5%``、「月々 1%」「毎月 0.5%」) を除くすべて。
+    「金利1.5%」は年率で書かれるのが普通で、「年」の接頭は付かない。
+    """
+    # 「月々 1%」「毎月 0.5%」も月率 (独立レビュー: ``1.01 ** 60`` に誤った案内)
+    monthly = set(_MONTHLY_RATE_RE.findall(text or "")) | set(
+        _PER_MONTH_RATE_RE.findall(text or ""),
+    )
+    annual: list[str] = []
+    for pct in _PERCENT_LITERAL_RE.findall(text or ""):
+        if pct not in monthly and pct not in annual:
+            annual.append(pct)
+    return annual
+
+
+#: 期間の年数の候補 (「35年」「10年後」「3年目」「20年間」)。:data:`_YEARS_RE` と違い
+#: 「年後」「年目」も数える — ここは指数の照合の **許す側** なので、候補を広げるほど
+#: 疑いは減る (「10年後の残債」の ``** 120`` を疑わない)。
+_PERIOD_YEARS_RE = re.compile(r"(\d+)\s*年(?!利|率|齢)")
+#: 月数の明示 (「24か月」「420 ヶ月」「300回払い」)。
+_PERIOD_MONTHS_RE = re.compile(r"(\d+)\s*(?:[かヶケヵカ]月|回払い)")
+
+
+def _period_months(text: str) -> set[int]:
+    """会話に書かれた期間の月数 (年数 × 12 と明示の月数、純粋関数)。"""
+    normalized = (text or "").translate(_FULLWIDTH_DIGITS)
+    months = {int(y) * 12 for y in _PERIOD_YEARS_RE.findall(normalized) if int(y) > 0}
+    months.update(int(m) for m in _PERIOD_MONTHS_RE.findall(normalized) if int(m) > 0)
+    return months
+
+
+def _period_text(query: str, context: str, user_text: str | None) -> str:
+    """期間の候補を取る本文 (純粋関数)。``user_text`` があればクエリ + user の発言だけ。
+
+    アシスタントの前の回答が誤って「360回払い」と書くと、それを根拠に ``** -360`` を
+    許してしまう (2026-09-28 独立レビュー L1)。
+    """
+    return f"{query or ''}\n{context if user_text is None else user_text or ''}"
+
+
+def _period_exponent_mismatch_pairs(
+    expression: str, text: str, period_text: str | None = None,
+) -> list[tuple[str, tuple[int, ...]]]:
+    """月の複利の冪で、指数が会話の期間と合わないもの (純粋関数)。
+
+    返すのは ``(指数の綴り (符号なし), 会話の期間の月数)`` の列。底が 1 + 年率/12
+    (元利均等・積立の形) の冪だけを見る。期間は ``period_text`` (無ければ ``text``)
+    から取る。12 (1 年ぶんの月の複利、実効年率) と **期間どうしの差** (残りの期間・
+    据置のあとの期間、「35年…5年後に繰上げ返済」の 360) は許す (独立レビュー M1)。
+    会話に期間も年率も無ければ空。
+    """
+    months, powers = _mismatched_period_powers(expression, text, period_text)
+    periods = tuple(sorted(months))
+    found: list[tuple[str, tuple[int, ...]]] = []
+    for _node, _sign, n in powers:
+        if not any(str(n) == seen for seen, _ in found):
+            found.append((str(n), periods))
+    return found
+
+
+def _mismatched_period_powers(
+    expression: str, text: str, period_text: str | None = None,
+) -> tuple[set[int], list[tuple[ast.AST, int, int]]]:
+    """会話の期間の月数と、指数が期間と合わない月の複利の冪 (純粋関数)。
+
+    返すのは ``(期間の月数, [(指数の節, 指数の符号 (±1), 指数の絶対値)])``。判定は
+    :func:`_period_exponent_mismatch_pairs` の docstring のとおり (同じ冪を 2 回
+    書いた式は節ごとに返す)。
+    """
+    months = _period_months(text if period_text is None else period_text)
+    if not months:
+        return set(), []
+    bases = [1.0 + float(pct) / 100.0 / 12.0 for pct in _annual_percents(text)]
+    if not bases:
+        return months, []
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return months, []
+    allowed = months | {12} | {a - b for a in months for b in months if a > b}
+    found: list[tuple[ast.AST, int, int]] = []
+    for base_node, exponent_node in _power_operands(tree):
+        base = _constant_value(base_node)
+        if base is None or not any(
+            math.isclose(base, b, rel_tol=0.0, abs_tol=1e-12) for b in bases
+        ):
+            continue
+        exponent = _constant_value(exponent_node)
+        if exponent is None or not float(abs(exponent)).is_integer():
+            continue
+        n = int(abs(exponent))
+        if n in allowed:
+            continue
+        found.append((exponent_node, -1 if exponent < 0 else 1, n))
+    return months, found
+
+
+def repair_period_exponents(
+    expression: str, query: str, context: str = "", *, user_text: str | None = None,
+) -> tuple[str, tuple[str, ...], int] | None:
+    """期間と合わない月の複利の冪の指数を、会話の期間の月数に置き換える (純粋関数)。
+
+    返すのは ``(置き換えた式, 置き換えた指数 (符号なし), 会話の期間の月数)``。
+    置き換えは式の構造 (AST の指数の節の位置) で行い、符号は保つ
+    (``** -360`` → ``** -420``)。式の他の部分は 1 文字も変えない。期間の候補
+    (:func:`_period_months`、:func:`period_exponent_mismatches` と同じ 1 関数) が
+    **1 つに決まらない**とき、合わない冪が無いとき、式が 1 行でないときは ``None``。
+    次の 2 つも ``None`` (2026-09-28 独立レビュー):
+
+    - 合わない指数が **ユーザーの発言に数として書かれている** — 指数そのものが接地
+      している。「返済回数420回…10年固定」は「420回」が期間の候補に読めず、無関係な
+      「10年」だけが候補になって正しい ``** -420`` を ``** -120`` に書き換えていた。
+    - 指数 × 12 が期間の月数 — 年数を指数にした構造の誤り (``(1 + r/12) ** -35 * 12``)。
+      回数だけ直すと ``** -420 * 12`` の負の値を実行する。
+
+    置き換えた式が接地・式の妥当性・値の符号を通るかは呼出側が確かめる (docs/f_03 §3.1、
+    2026-09-28 実機確認 R10)。
+    """
+    expr = expression or ""
+    period_text = _period_text(query, context, user_text)
+    months, powers = _mismatched_period_powers(
+        expr, f"{query or ''}\n{context or ''}", period_text,
+    )
+    if len(months) != 1 or not powers:
+        return None
+    user_numbers = _numeric_literals(period_text)
+    if any(str(n) in user_numbers or n * 12 in months for _node, _sign, n in powers):
+        return None
+    (term,) = months
+    raw = expr.encode("utf-8")
+    spans: list[tuple[int, int, str]] = []
+    for node, sign, _n in powers:
+        if node.lineno != 1 or node.end_lineno != 1 or node.end_col_offset is None:
+            return None
+        spans.append((node.col_offset, node.end_col_offset, f"{'-' if sign < 0 else ''}{term}"))
+    # 後ろから置き換える (前の節のバイト位置をずらさない)。入れ子の冪で節が重なれば諦める。
+    spans.sort(reverse=True)
+    if any(earlier[1] > later[0] for later, earlier in zip(spans, spans[1:], strict=False)):
+        return None
+    for start, end, replacement in spans:
+        raw = raw[:start] + replacement.encode("utf-8") + raw[end:]
+    replaced = tuple(dict.fromkeys(str(n) for _node, _sign, n in powers))
+    return raw.decode("utf-8"), replaced, term
+
+
+def period_exponent_mismatches(
+    expression: str, query: str, context: str = "", *, user_text: str | None = None,
+) -> tuple[str, ...]:
+    """月の複利の冪の指数のうち、会話の期間と合わないもの (純粋関数)。
+
+    実インシデント (2026-09-28 再監査 C03#3): 「35年」の住宅ローンの訂正の再計算に
+    ``10000000 * (0.012 / 12) / (1 - (1 + 0.012 / 12) ** -360)`` が組まれた。冪の
+    指数は接地 (:func:`_ungrounded_numbers`) の前に剥がすので 360 は見えず、
+    構造検査 (:func:`_compounding_period_issues`) も率が ÷12 されているので不発
+    だった。会話に「N年」(→ N×12) か月数の明示 (「24か月」「300回払い」) があり、
+    底が 1 + 年率/12 の冪の指数 (符号を除く) がそのどれとも合わなければ返す
+    (docs/f_03 §3.4.1 の 5 つ目)。期間の候補は ``user_text`` (user の発言だけ) から
+    取る (``None`` なら ``context`` 全体)。
+    """
+    text = f"{query or ''}\n{context or ''}"
+    return tuple(
+        exponent for exponent, _ in _period_exponent_mismatch_pairs(
+            expression or "", text, _period_text(query, context, user_text),
+        )
+    )
+
+
+def _compounding_period_issues(expression: str, text: str) -> list[str]:
+    """月数 (年数×12) の冪に **年率のまま** の率を使っている疑い (純粋関数)。
+
+    実インシデント (2026-09-27 ライブ監査 C03#3): 35 年・1.2% の元利均等返済で
+    ``30000000 * (1.012 ** 420) / ((1.012 ** 420) - 1) / 12`` が組まれ、月返済額
+    2,516,789 円 (正 87,510 円) が「厳密な計算結果」になった。月の複利は
+    1 + 年率/12 で、420 乗するなら底は 1.001。月率と明示された百分率 (``月利``)
+    だけを除き、他の百分率は年率とみなす (「金利1.5%」は年率で書かれる)。
+    """
+    months = {int(y) * 12 for y in _YEARS_RE.findall(text or "") if int(y) > 0}
+    if not months:
+        return []
+    annual = _annual_percents(text)
+    if not annual:
+        return []
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return []
+    issues: list[str] = []
+    for base_node, exponent_node in _power_operands(tree):
+        exponent = _constant_value(exponent_node)
+        if exponent is None or not float(abs(exponent)).is_integer():
+            continue
+        n = int(abs(exponent))
+        if n not in months:
+            continue
+        base = _constant_value(base_node)
+        if base is None:
+            continue
+        for pct in annual:
+            rate = float(pct) / 100.0
+            if math.isclose(base, 1.0 + rate, rel_tol=0.0, abs_tol=1e-12):
+                issue = (
+                    f"月数 {n} (= {n // 12} 年 × 12) の冪に年率 {pct}% をそのまま使っている "
+                    f"(月の複利の底は 1 + {pct}%/12 = {1.0 + rate / 12:.6g})"
+                )
+                if issue not in issues:
+                    issues.append(issue)
+    return issues
+
+
+#: 桁の取り違えとみなす倍率 (n×10 / n÷10 / n×100 / n÷100)。
+_SCALE_SLIP_FACTORS = (10.0, 0.1, 100.0, 0.01)
+#: 期間の単位 (倍率の 10 / 100 が期間の数のときは率 × 期間の正しい式でありうる)。
+_PERIOD_UNIT_PATTERN = r"(?:年|回|[かヶケヵカ]月|期|週)"
+
+
+def percent_scale_slips(
+    expression: str, query: str, context: str = "",
+) -> tuple[str, ...]:
+    """百分率の **桁の取り違え** とみなせる説明できない数を返す (純粋関数)。
+
+    説明できない数 n (:func:`_ungrounded_numbers`) のうち、n×10 / n÷10 /
+    n×100 / n÷100 が百分率由来の値 (:func:`percent_derived_values`) と一致する
+    もの。実インシデント (2026-09-27 ライブ監査 C03#3): 1.2% を ``0.12`` とした
+    ``30000000 * (0.12/12) / (1 - (1 + 0.12/12)**(-35*12))`` が「会話に無い値を
+    仮定した試算」として開示付きで実行され、304,665 円 (正 87,510 円) が答えに
+    なった。仮定ではなく読み違いなので、開示ではなく不合格にする (docs/f_03 §3.1)。
+
+    倍率の 10 / 100 そのものが **期間の数** (「10年」「10回」「10か月」) か式の中の
+    数なら取り違えとみなさない — 単利の ``1000000 * (1 + 0.12)`` (1.2% × 10 年) は
+    正しい式である。会話のどこかの 10 (「頭金は10万円」「返済開始は10月」) では
+    例外にしない (独立レビュー: C03 の 0.12 が見逃された)。
+    """
+    unexplained = _ungrounded_numbers(expression, query, context)
+    if not unexplained:
+        return ()
+    text = f"{query or ''}\n{context or ''}"
+    derived = percent_derived_values(text)
+    if not derived:
+        return ()
+    expression_numbers = set(_NUMBER_LITERAL_RE.findall(expression or ""))
+    slips: list[str] = []
+    for literal in unexplained:
+        try:
+            n = float(literal)
+        except ValueError:
+            continue
+        for factor in _SCALE_SLIP_FACTORS:
+            scale = f"{(factor if factor > 1 else 1.0 / factor):g}"
+            if scale in expression_numbers or re.search(
+                rf"(?<![\d.]){scale}\s*{_PERIOD_UNIT_PATTERN}", text,
+            ):
+                continue
+            if any(
+                math.isclose(n * factor, value, rel_tol=1e-9, abs_tol=1e-12)
+                for value in derived
+            ):
+                slips.append(literal)
+                break
+    return tuple(slips)
+
+
 def _myriad_pairs(text: str) -> list[tuple[str, str]]:
     """万進表記の (係数, 展開値) 対。``2,850万`` → ``("2850", "28500000")``。"""
     out: list[tuple[str, str]] = []
-    for num, unit in _MYRIAD_GROUP_RE.findall(text):
-        try:
-            coefficient = float(num.replace(",", ""))
-        except ValueError:
-            continue
-        expanded = coefficient * _MYRIAD_UNITS[unit]
-        if expanded == int(expanded) and coefficient == int(coefficient):
-            out.append((str(int(coefficient)), str(int(expanded))))
+    for num in iter_ja_numbers(text):
+        for coefficient, multiplier in _myriad_terms(num):
+            expanded = coefficient * multiplier
+            if expanded == int(expanded) and coefficient == int(coefficient):
+                out.append((str(int(coefficient)), str(int(expanded))))
     return out
 
 

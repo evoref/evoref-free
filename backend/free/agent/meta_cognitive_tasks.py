@@ -35,6 +35,10 @@ class TaskItem:
     # 取得データを決定論的に書く)。小型モデルが取得タスクの tool-loop 内で余計な
     # write_file を出し、プレースホルダ/重複ファイルを生む退行を防ぐ。
     fetch_only: bool = False
+    # 書込みを期待したタスクが失敗したときの利用者向けの注記 (i18n。どのファイルへの
+    # 何が失敗したか / ファイルが変わっていないか)。meta が失敗の確定後に刻み、
+    # 最終応答と chat_stream_meta の要約が読む (docs/f_03 §4.3)。
+    failure_note: str = ""
 
 
 @dataclass
@@ -71,6 +75,9 @@ class MetaCognitiveResponse:
     # 制作ステージの注記 (``ProductionResult.notes["notices"]``、UI の言語の文)。本文の後に
     # 添える (依頼されたテストを作っていない等、f_10 §11.1-1)。
     production_notices: list[str] = field(default_factory=list)
+    # 制作ステージの検査の 3 値 (``ProductionResult.notes["checks"]``、``CheckOutcome.to_dict``
+    # の列)。未検査の主要な検査は経験の成否をラベル無しにする (docs/f_04 §2.5)。
+    production_checks: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

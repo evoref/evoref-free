@@ -25,11 +25,14 @@ __all__ = [
     "YMD_JA_PATTERN",
     "YMD_NUMERIC_PATTERN",
     "WeekdayClaim",
+    "complete_years",
     "extract_tool_target_date",
+    "literal_dates",
     "fix_weekday_claims",
     "response_dates",
     "ignores_date_result",
     "mentions_literal_date",
+    "nearest_date",
     "weekday_claims",
 ]
 
@@ -83,6 +86,122 @@ def mentions_literal_date(text: str) -> bool:
         JP_DATE_RE.search(normalized) or _SLASH_DATE_RE.search(normalized)
         or _YMD_NUMERIC_RE.search(normalized)
     )
+
+
+def literal_date_count(text: str) -> int:
+    """具体日付 (:func:`mentions_literal_date` と同じ綴り) の個数 (重なりは 1 個、純粋関数)。
+
+    日数の問いの **構造** (「A から B は何日」= 日付 2 つ) を語彙ではなく日付の
+    個数で見るのに使う (``core.date_math_cue.asks_day_count``、2026-09-27)。
+    """
+    return len(literal_dates(text))
+
+
+def literal_dates(text: str) -> list[tuple[int | None, int, int]]:
+    """具体日付を ``(年 | None, 月, 日)`` で出現順に返す (重なりは 1 個、純粋関数)。
+
+    綴りは :func:`mentions_literal_date` と同じ (和文の月日 / 年月日 / ``10/15``)。
+    年を書いていない形は年を ``None`` にする (捏造しない)。
+    """
+    normalized = (text or "").translate(_ZENKAKU_DIGITS)
+    found: list[tuple[int, int, tuple[int | None, int, int]]] = []
+    for m in _YMD_NUMERIC_RE.finditer(normalized):
+        y, mo, d = re.split(r"[-/]", m.group(0))
+        found.append((m.start(), m.end(), (int(y), int(mo), int(d))))
+    for m in JP_DATE_RE.finditer(normalized):
+        year = int(m["y"]) if m["y"] else None
+        found.append((m.start(), m.end(), (year, int(m["m"]), int(m["d"]))))
+    for m in _SLASH_DATE_RE.finditer(normalized):
+        found.append((m.start(), m.end(), (None, int(m["m"]), int(m["d"]))))
+    found.sort(key=lambda t: (t[0], t[1]))
+    out: list[tuple[int | None, int, int]] = []
+    last_end = -1
+    for start, end, ymd in found:
+        if start < last_end:
+            continue
+        out.append(ymd)
+        last_end = end
+    return out
+
+
+def nearest_date(
+    month: int, day: int, anchor: date, *,
+    past_days: int | None = None, future_days: int | None = None,
+) -> date | None:
+    """年の無い月日を、``anchor`` に最も近い巡りの日付にする (純粋関数)。
+
+    「年なしの月日 → 近い年」の 1 実装 (曜日の照合・ツール判定の起点・記憶の
+    年の補完が使う)。候補は ``anchor`` の前後 1 年。``past_days`` /
+    ``future_days`` を渡すと ``anchor`` から前 N 日〜後 M 日の窓に入る候補だけに
+    絞る (窓外なら ``None``)。距離が同じなら早い方。
+    """
+    best: date | None = None
+    for delta_year in (-1, 0, 1):
+        candidate = _safe_date(anchor.year + delta_year, month, day)
+        if candidate is None:
+            continue
+        delta = (candidate - anchor).days
+        if past_days is not None and delta < -past_days:
+            continue
+        if future_days is not None and delta > future_days:
+            continue
+        if best is None or abs(delta) < abs((best - anchor).days):
+            best = candidate
+    return best
+
+
+#: 年を足さない文の区切り (:func:`_year_clue_before` の窓はこの後ろから)。
+_SENTENCE_ENDS = "。！？!?\n"
+#: 半角数字 → 全角 (全角の月日に足す年を揃える)。
+_HANKAKU_DIGITS = str.maketrans("0123456789", "０１２３４５６７８９")
+
+
+def _year_clue_before(normalized: str, start: int) -> bool:
+    """月日の前 (同じ文の中、他の日付を除く) に「年」があるか (純粋関数)。
+
+    年の手がかり (「来年度の」「2年後の」「2027年度の」「2027年、」「令和9年」) は
+    **語形を列挙せず** 構造で見る — 月日と同じ文の手前に「年」の字があれば、その
+    月日の年は西暦に解けない形で指定されている (2026-09-28 独立レビュー P3-3)。
+    手前の日付 (「2026年9月27日から10月15日」の前者) の「年」は数えない。
+    """
+    head = normalized[:start]
+    cut = max(head.rfind(ch) for ch in _SENTENCE_ENDS) + 1
+    return "年" in JP_DATE_RE.sub("", head[cut:])
+
+
+def complete_years(text: str, anchor: date | None) -> str:
+    """年の無い和文の月日 (``4月25日``) に、``anchor`` に最も近い年を足す (純粋関数)。
+
+    訂正は年を言い直さない (「4月18日ではなく4月25日でした」)。年は置き換える
+    旧値の日付 (``anchor``) に最も近い巡りから採る (:func:`nearest_date`)。
+    ``anchor`` が無い / 同じ文に年の手がかりがある月日は変えない。全角の月日には
+    全角で足す。
+    """
+    if anchor is None or not text:
+        return text
+    normalized = text.translate(_ZENKAKU_DIGITS)
+    pieces: list[str] = []
+    last = 0
+    for m in JP_DATE_RE.finditer(normalized):
+        year, unresolved = _year_of(normalized, m)
+        if year is not None or unresolved:
+            continue
+        resolved = nearest_date(int(m["m"]), int(m["d"]), anchor)
+        if resolved is None:
+            continue
+        stamp = str(resolved.year)
+        if text[m.start("m")] != normalized[m.start("m")]:
+            stamp = stamp.translate(_HANKAKU_DIGITS)
+        # 月日が数と単位の間に空白を置く書き方 (「4 月 25 日」) なら年も揃える
+        month_end = m.end("m")
+        gap = normalized[month_end:normalized.index("月", month_end)]
+        pieces.append(text[last:m.start()])
+        pieces.append(f"{stamp}{gap}年{gap}")
+        last = m.start()
+    if not pieces:
+        return text
+    pieces.append(text[last:])
+    return "".join(pieces)
 
 
 def extract_tool_target_date(text: str) -> date | None:
@@ -177,17 +296,15 @@ class WeekdayClaim:
     year_unresolved: bool = False
 
 
-#: 月日の直前が「…年」「…年の」で終わる = 年を指定している (西暦でなくても)。
-#: 和暦・相対年を解く SSOT は無いので **解かずに「手がかりあり」とだけ見る**
-#: (語彙を足さない。docs/f_08 §6.3)。
-_YEAR_CLUE_TAIL_RE = re.compile(r"年\s*の?\s*$")
-
-
 def _year_of(normalized: str, m: re.Match[str]) -> tuple[int | None, bool]:
-    """月日の一致の年と、「解けない年の手がかり」の有無を返す。"""
+    """月日の一致の年と、「解けない年の手がかり」の有無を返す。
+
+    和暦・相対年を解く SSOT は無いので **解かずに「手がかりあり」とだけ見る**
+    (語彙を足さない。docs/f_08 §6.3。手がかりの判定は :func:`_year_clue_before`)。
+    """
     if m["y"]:
         return int(m["y"]), False
-    return None, bool(_YEAR_CLUE_TAIL_RE.search(normalized[max(0, m.start() - 8):m.start()]))
+    return None, _year_clue_before(normalized, m.start())
 
 
 def weekday_claims(text: str) -> list[WeekdayClaim]:
@@ -232,18 +349,6 @@ def _grounded_years(grounded: str) -> dict[tuple[int, int], set[int | None]]:
     return out
 
 
-def _nearest_date(month: int, day: int, today: date) -> date | None:
-    """年の無い月日を、今日に最も近い年の日付にする (前後 1 年から選ぶ)。"""
-    candidates = [
-        d for d in (
-            _safe_date(today.year + delta, month, day) for delta in (-1, 0, 1)
-        ) if d is not None
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda d: abs((d - today).days))
-
-
 def fix_weekday_claims(text: str, *, today: date, grounded: str) -> str:
     """月日に添えた曜日が暦と食い違っていれば、暦の曜日へ書き換える (純粋関数)。
 
@@ -276,7 +381,7 @@ def fix_weekday_claims(text: str, *, today: date, grounded: str) -> str:
                 continue
             actual = (
                 _safe_date(next(iter(years)), claim.month, claim.day)
-                if years else _nearest_date(claim.month, claim.day, today)
+                if years else nearest_date(claim.month, claim.day, today)
             )
         if actual is None:
             continue

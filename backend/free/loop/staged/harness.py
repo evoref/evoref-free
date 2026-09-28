@@ -170,15 +170,19 @@ class StagedCodeHarness:
             )
 
         # v2 は依頼が名指したフォルダ (``todo_app/``) を出力先の接頭辞として返す
-        # (作業フォルダでは平置きで import が解決する)。
-        folder = str((result_payload.get("notes") or {}).get("output_folder") or "").strip("/")
+        # (作業フォルダでは平置きで import が解決する)。パッケージ形 (f_10 §11.1-1) は
+        # コードだけをパッケージのフォルダ (``units/``) の下へ置き、文書・テスト・データはその外。
+        notes = result_payload.get("notes") or {}
+        folder = str(notes.get("output_folder") or "").strip("/")
+        package = str(notes.get("package") or "").strip("/")
 
         def _out(name: str) -> str:
             return f"{folder}/{name}" if folder else name
 
         artifacts = [
             EditorArtifact(
-                content=content, language=_language_for_path(path), filename=_out(path),
+                content=content, language=_language_for_path(path),
+                filename=_out(f"{package}/{path}" if package else path),
             )
             for path, content in (result_payload.get("code_map") or {}).items()
         ]

@@ -197,7 +197,8 @@ def render_flowchart(
     for path in py:
         names = [s.signature.split("(")[0].replace("def ", "").replace("class ", "") for s in public_symbols(code_map[path])]
         shown = ", ".join(n.strip() for n in names[:4]) + (" …" if len(names) > 4 else "")
-        label = f"{PurePosixPath(path).name}" + (f"<br/>{shown}" if shown else "")
+        # パスのまま (パッケージ形は ``units/length.py``、平置きはファイル名と同じ)
+        label = path + (f"<br/>{shown}" if shown else "")
         lines.append(f'    {_node_id(path)}["{_label(label)}"]')
     entry = (skeleton.get("entry_module") or "").strip()
     nodes = py + others

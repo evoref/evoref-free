@@ -17,6 +17,7 @@ from backend.free.document_nouns import (
     DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
     DOCUMENT_NOUNS_STANDALONE,
     DOCUMENT_NOUNS_STANDALONE_EN,
+    WRITE_VERB_STEM_JA,
 )
 from backend.free.generation.models import ContentType
 
@@ -43,7 +44,8 @@ CODE_PATTERNS: list[str] = [
 TEXT_PATTERNS: list[str] = [
     # 動作動詞 (書/作成/生成) との共起が必要な文書名詞。router.py の
     # LONG_FORM_PATTERNS と backend/free/document_nouns.py で語彙を共有する。
-    rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX)}).*(書|作成|生成)",
+    # 「書」は動詞の活用形だけ (「Word文書」の「書」に当てない、WRITE_VERB_STEM_JA)。
+    rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX)}).*({WRITE_VERB_STEM_JA}|作成|生成)",
     r"(\d{3,})\s*[字文]",
     # 仕様書・設計書・要件定義書・手順書・議事録・送付状 等: 名詞単体でも TEXT
     # として扱う。「プログラムを作成するための仕様書を出力」のように、動作動詞が

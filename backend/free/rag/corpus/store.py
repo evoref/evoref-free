@@ -1580,8 +1580,7 @@ class CorpusStore:
         # (c_16 §5.1)。刻んでおかないと、規則を変えたあとに再構築が要る版を
         # 見分けられない。
         store.manifest.chunker_version = CHUNKER_VERSION
-        for record in records:
-            store.put(record, by="corpus_install")
+        store.put_many(records, by="corpus_install")
         await _emit(
             progress_cb,
             {
@@ -1959,8 +1958,7 @@ class CorpusStore:
             work = Path(tmp)
             store = self._make_store(work, meta.id)
             store.load()
-            for record in records:
-                store.put(record, by="corpus_prebuild")
+            store.put_many(records, by="corpus_prebuild")
             await store.create_snapshot()
             model_id = store.manifest.embedding_model_id or self.embedding_model_id
             dimension = int(store.manifest.embedding_dim)

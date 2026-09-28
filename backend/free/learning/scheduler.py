@@ -393,6 +393,8 @@ class LearningScheduler:
             if self._resolver is not None else None
         )
         self._model_change_warned = False
+        #: 載っているモデルが active と違う間の Level 1 延期を 1 回だけ記録する。
+        self._serving_other_warned = False
         # ランタイム切替を検知したときの自己修復 (新モデル GGUF 名 → rebind 結果)。
         # ``_learning_rebind.install_rebind_hook`` が注入。None なら従来どおり
         # Level 1 を止めるだけ。
@@ -1866,6 +1868,8 @@ class LearningScheduler:
             return {"skipped": True, "reason": "already_running"}
         if self._base_model_changed():
             return {"skipped": True, "reason": "base_model_changed"}
+        if self._serving_another_partition():
+            return {"skipped": True, "reason": "serving_another_partition"}
 
         # **走り出した印はここで立てる** (2026-09-16 監査)。以前は進化本体の
         # 直前でしか立てておらず、その手前にある訂正検証・選択圧の判定・
@@ -2106,6 +2110,39 @@ class LearningScheduler:
         self._save_state()
         return True
 
+    def _active_prompt_static(self, mode: str) -> str:
+        """Level 1 の評価に使う本文 (束ねた active パーティションのもの)。"""
+        get_active = getattr(self.prompt_manager, "get_active_prompt_static", None)
+        if callable(get_active):
+            return get_active(mode)
+        return self.prompt_manager.get_prompt_static(mode)
+
+    def _serving_another_partition(self) -> bool:
+        """載っているモデル (``/props``) が束ねた active パーティションのモデルと違うか。
+
+        Level 1 は active パーティションの経験で候補を作り、載っているモデルで評価する。
+        create_model が載っている間に走ると、active の候補を別モデルで評価して
+        active へ書き戻す (f_04 §1.2.0、2026-09-28 レビュー L4)。載っているモデルが
+        分からないときは止めない。
+        """
+        from backend.config import PathResolver
+
+        resolver = self._resolver
+        if not isinstance(resolver, PathResolver) or not resolver.served_model_path():
+            return False
+        serving = resolver.generating_model_key()
+        if serving == resolver.active_model_key:
+            self._serving_other_warned = False
+            return False
+        if not self._serving_other_warned:
+            self._serving_other_warned = True
+            logger.info(
+                "Level 1 deferred: the served model (%s) is not the bound learning "
+                "partition (%s); it runs again once that model is served",
+                serving, resolver.active_model_key,
+            )
+        return True
+
     def _base_model_changed(self) -> bool:
         """base モデルが学習コンポーネントの束ね先と食い違っていないかを検知する (L-A10)。
 
@@ -2207,8 +2244,13 @@ class LearningScheduler:
         使っていた ``ExperienceEntry.cartridge_ids`` は「そのとき **ロードされて
         いた** 一覧」で、実際に材料として見せたかどうかとは無関係だった。
         「何を見せたか」は ``gen_config.evidence_ids`` が持つ。
+
+        **Level 1 はパーティションごと** (f_04 §1.2.0): 束ねたファイルの経験だけを
+        見る。バッファが足した他のパーティション (create_model が生成した経験) は、
+        そのモデルを束ねたときの Level 1 が読む。
         """
-        entries = self.experience_buf.entries
+        buf = self.experience_buf
+        entries = buf.partition_entries() if isinstance(buf, ExperienceBuffer) else buf.entries
         key = (len(entries), entries[-1].timestamp if entries else None)
         if key == self._exp_cache_key:
             return list(self._exp_cache)
@@ -2759,7 +2801,7 @@ class LearningScheduler:
                     mode,
                     mode_exp,
                     base_params=_base_generation_params(mode),
-                    prompt_text=self.prompt_manager.get_prompt_static(mode),
+                    prompt_text=self._active_prompt_static(mode),
                     evaluator=self._prompt_eval,
                     cases=cases,
                     min_net_wins=self._min_net_wins(),

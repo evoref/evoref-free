@@ -34,14 +34,32 @@ from backend.free.agent.tools.builtin import (
     _check_path_traversal as check_builtin_path_traversal,
 )
 from backend.free.agent.write_gate import WriteDenial, normalize_write_path
-from backend.free.constants import READ_FILE_META_PREFIX
+from backend.free.constants import (
+    READ_FILE_META_PREFIX,
+    search_history_display_text,
+)
 from backend.free.core.date_math_cue import (
     conversation_has_date_math_cue,
     last_user_query,
 )
-from backend.free.core.session_mode import is_create_mode
+from backend.free.core.markdown_fence import outer_fence
+from backend.free.core.session_mode import is_chat_mode, is_create_mode
 from backend.free.core.verifier_events import record_grounding
 from backend.free.agent.issue_ledger import count_kind, format_issues
+from backend.free.agent.file_ledger import (
+    last_written_path,
+    restore_from_conversation,
+    written_paths_in_conversation,
+)
+from backend.free.agent.session_answer_gate import (
+    NO_CANDIDATE_EVIDENCE,
+    session_answer_rule,
+    session_answer_verdict,
+)
+from backend.free.agent.file_reference_gate import (
+    LOCATE_LABEL,
+    recent_file_reference_rule,
+)
 from backend.free.agent.tool_ledger import format_ledger, latest_use
 from backend.free.core.intent_vocab import (
     assistant_code_blocks,
@@ -56,8 +74,11 @@ from backend.free.core.intent_vocab import (
     self_assessment_question,
     PREMISE_CONFIRMATION_RE,
     persist_request,
+    resolve_session_answer,
     resolve_session_position_message,
     only_session_ordinal_recall,
+    session_answer_asks_restate,
+    session_answer_ordinal,
     session_position_kind,
     tool_inventory_question,
     unused_tool_question,
@@ -173,6 +194,30 @@ _UNMEASURED_FACT_GUIDANCES: dict[str, str] = {
     ),
 }
 
+#: 分類器の calculate が門で落ち、組み直しも回数の置き換えも通らず no_tool に
+#: なった回の注記 (``ToolJudgement.calculation_rejected``、docs/f_03 §3.1 / §3.5)。
+#: 注記が無いと暗算の値が検証済みの口調で出た (2026-09-28 実機確認 R10: 住宅ローンの
+#: 訂正の再計算で「毎月の返済額は約 8 万 7,300 円です。」、正 87,510 円)。§3.5 の
+#: 原則どおり「答えるな」ではなく「推測だと言え」にする。
+_CALCULATION_REJECTED_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: このターンの計算は計算ツールで検証できなかった "
+        "(組み立てた式が会話の条件と合わず、実行していない)。"
+        "数値を答えるなら「概算」「推測」であることを明示し、"
+        "使った式と前提 (元本・金利・期間などの条件) を併せて示すこと。"
+        "計算した / 検証した / 正確な値だと述べない。"
+    ),
+    "en": (
+        "\n\nConfirmed fact: the calculation for this turn could not be verified "
+        "with the calculator tool (the expression built did not match the "
+        "conditions in the conversation, so it was not run). If you give a "
+        "number, state clearly that it is an estimate or a guess, and show the "
+        "formula and the assumptions you used (conditions such as principal, "
+        "interest rate, and term). Do not say that you calculated or verified it, "
+        "or that it is an exact value."
+    ),
+}
+
 #: 過去の会話について訊かれたが、履歴検索を 1 度も実行しなかった場合の文言。
 #:
 #: 「実行していないツールについて実行したと述べない」は
@@ -233,6 +278,55 @@ _RECALL_IN_WINDOW_GUIDANCES: dict[str, str] = {
         "conversation, and the relevant message is in the conversation history "
         "above (there is no need to search other past conversations). Find that "
         "message in the history and answer by showing its content as it is."
+    ),
+}
+
+#: 尋ねた属性がすべて記憶に載っているので履歴検索を止めたターンの文言
+#: (``_append_answered_from_memory_note``)。「検索していない。無ければ確認できて
+#: いないと言え」は抑止の根拠 (記憶にある) と逆向きで、記憶の答えを否定させた
+#: (2026-09-27 監査 F9: 「確認できていません。」)。枠の見出し名を口にさせる指示
+#: (「[関連する記憶] と [参考情報] を突き合わせよ」) と確認を促す指示は入れない —
+#: 見出し名の漏出 (f_02 §8.4) と答えても何も起きない聞き返し (f_02 §5.3) を誘発する。
+_ANSWERED_FROM_MEMORY_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: 問われている事柄は、このターンに渡した記憶 "
+        "(過去の会話から保存した記録) に載っている。過去の会話を検索するツールは"
+        "実行していないが、それは記憶に答えがあるためである。記憶に載っている値で"
+        "答えること。今回の会話で本人が別の値を述べていれば、そちらを採る。"
+        "記録の枠の名前は書かない。過去の会話が行われた日付・時刻は述べない。"
+    ),
+    "en": (
+        "\n\nEstablished fact: what is being asked is in the memory supplied "
+        "this turn (records saved from past conversations). No tool that "
+        "searches past conversations was run, because the memory already holds "
+        "the answer. Answer with the values in that memory; if the user stated "
+        "a different value in this conversation, use that instead. Do not write "
+        "the names of the record blocks. Do not state the dates or times of past "
+        "conversations."
+    ),
+}
+
+#: 尋ねた属性の一部だけが記憶に載った状態で履歴検索を止めたターンの文言
+#: (``_append_partially_answered_from_memory_note``、独立レビュー H1)。載っていない
+#: 事柄には「確認できていない」を残す — 検索していないのは同じだから。
+_PARTIALLY_ANSWERED_FROM_MEMORY_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: 問われている事柄のうち一部だけが、このターンに渡した記憶 "
+        "(過去の会話から保存した記録) に載っている。過去の会話を検索するツールは"
+        "実行していない。記憶に載っている事柄はその値で答えること (今回の会話で"
+        "本人が別の値を述べていればそちらを採る)。記憶に載っていない事柄は、"
+        "推測で補わず「確認できていない」と伝えること。"
+        "記録の枠の名前は書かない。過去の会話が行われた日付・時刻は述べない。"
+    ),
+    "en": (
+        "\n\nEstablished fact: only part of what is being asked is in the memory "
+        "supplied this turn (records saved from past conversations). No tool "
+        "that searches past conversations was run. Answer the parts that are in "
+        "that memory with its values (if the user stated a different value in "
+        "this conversation, use that instead). For the parts that are not in the "
+        "memory, do not guess; say that they have not been confirmed. Do not "
+        "write the names of the record blocks. Do not state the dates or times "
+        "of past conversations."
     ),
 }
 
@@ -641,6 +735,43 @@ _SESSION_POSITION_FACTS: dict[str, str] = {
 }
 _SESSION_POSITION_LABEL_FIRST: dict[str, str] = {"ja": "最初", "en": "first"}
 _SESSION_POSITION_LABEL_LAST: dict[str, str] = {"ja": "直近", "en": "most recent"}
+#: アシスタントの N 番目の回答 (「2つ目に教えてもらったクエリ」、2026-09-27 M9)。
+_SESSION_ANSWER_POSITION_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でアシスタントが {n} 番目に返した回答は、次の区切り線の"
+        "間のとおりである。これは会話の並び順から機械的に確定したものなので、"
+        "ユーザーが指している「{n} 番目」はこの回答である。別の回答と取り違えず、"
+        "求められた内容をこの回答から一字一句そのまま示すこと。\n"
+        "-----\n{target}\n-----"
+    ),
+    "en": (
+        "\n\nEstablished fact: the assistant's answer number {n} in this "
+        "conversation is shown between the separator lines below. It was "
+        "determined mechanically from the order of the conversation, so this is "
+        "the answer the user means by \"number {n}\". Do not confuse it with "
+        "another answer; show what was asked for from this answer verbatim.\n"
+        "-----\n{target}\n-----"
+    ),
+}
+#: N 番目の回答を材料にした別の依頼 (「修正して」「英語に翻訳して」) の注記。逐語の
+#: 再掲を求めると依頼と逆の指示になる (2026-09-28 再レビュー 2)。
+_SESSION_ANSWER_REFERENCE_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でアシスタントが {n} 番目に返した回答は、次の区切り線の"
+        "間のとおりである。これは会話の並び順から機械的に確定したものなので、"
+        "ユーザーが指している「{n} 番目」はこの回答である。別の回答と取り違えず、"
+        "この回答を元にユーザーの依頼に答えること。\n"
+        "-----\n{target}\n-----"
+    ),
+    "en": (
+        "\n\nEstablished fact: the assistant's answer number {n} in this "
+        "conversation is shown between the separator lines below. It was "
+        "determined mechanically from the order of the conversation, so this is "
+        "the answer the user means by \"number {n}\". Do not confuse it with "
+        "another answer; answer the user's request based on this answer.\n"
+        "-----\n{target}\n-----"
+    ),
+}
 
 #: 「過去に書いたコードをそのまま見せろ」に実物を渡す注記 (末尾にコード)。
 _PRIOR_CODE_BLOCK_FACTS: dict[str, str] = {
@@ -696,6 +827,64 @@ _ISSUE_LEDGER_EMPTY_FACTS: dict[str, str] = {
         "content of answers themselves. If you assert this, qualify it with "
         "\"as far as the record shows\"."
     ),
+}
+
+#: 直近ファイルの所在の問いへ渡す確定事実 (``_append_saved_file_location_fact``)。
+#: ``{latest}`` は直近のファイル、``{listing}`` はこの会話で書き込んだファイルの一覧。
+_SAVED_FILE_LOCATION_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話でシステムが直近に扱った (保存した) ファイルは "
+        "{latest} である。これは実行時の記録なので、場所を訊かれたらこのパスを"
+        "そのまま答えること。別の場所を推測で述べず、ツールで調べ直す必要も無い。"
+        "{listing}"
+    ),
+    "en": (
+        "\n\nEstablished fact: the file the system most recently handled "
+        "(saved) in this conversation is {latest}. This is the execution "
+        "record, so when asked for the location, answer with this path as is. "
+        "Do not guess another location; there is no need to look it up with a "
+        "tool.{listing}"
+    ),
+}
+_SAVED_FILE_LISTING: dict[str, str] = {
+    "ja": "\nこの会話で書き込んだファイル (古い順):\n{paths}",
+    "en": "\nFiles written in this conversation (oldest first):\n{paths}",
+}
+#: 所在の問いで保存の記録が無いとき。
+_SAVED_FILE_LOCATION_EMPTY_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話にはファイルを保存した記録が無い (実行時の記録も"
+        "会話履歴の書込み報告も空)。場所を推測で述べず、保存の記録が無いので"
+        "分からないと正直に答えること。"
+    ),
+    "en": (
+        "\n\nEstablished fact: there is no record of any file being saved in "
+        "this conversation (both the execution record and the conversation's "
+        "write reports are empty). Do not guess a location; say honestly that "
+        "you do not know because there is no record of a save."
+    ),
+}
+#: 直近ファイルへの参照が決めきれないときの確認注記
+#: (``_append_file_reference_confirm_note``、判定点 recent_file_reference の棄権)。
+_FILE_REFERENCE_CONFIRM_NOTES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この依頼は、どのファイルに何をするか (直近のファイルへ"
+        "書き込むのか、別のファイルとして新しく保存するのか) が特定できない"
+        "ため、**まだ何も実行していない**。{latest}"
+        "ファイルを書き換えた・保存したと述べず、対象のファイルと操作を"
+        "確認する質問だけを短く返すこと。"
+    ),
+    "en": (
+        "\n\nEstablished fact: this request does not make clear which file to "
+        "act on or what to do (write into the recent file, or save a new "
+        "file), so **nothing has been executed yet**. {latest}"
+        "Do not say that any file was changed or saved; reply only with a "
+        "short question confirming the target file and the operation."
+    ),
+}
+_FILE_REFERENCE_CONFIRM_LATEST: dict[str, str] = {
+    "ja": "直近に扱ったファイルは {path} である。",
+    "en": "The most recently handled file is {path}. ",
 }
 
 #: 確認形で持ち込まれた「会話に無い数値」への注記。``listed``。
@@ -789,11 +978,20 @@ _REFOCUS_IGNORE_EARLIER: dict[str, str] = {
 }
 #: calculate の式がクエリに無い数値 (会話から取った被演算子) を使うときの範囲指定。
 #: 「前の話題は無関係」と言うと式の出所を説明できない (2026-09-26 監査 C03#3)。
+#: 訂正の再計算なので、前の回答の値 (訂正前の条件の値) を答えに使わせない
+#: (2026-09-28 再監査 C03#3: 計算結果を無視して 1 ターン前の「9 万 1,855.33 円」を答えた)。
 _REFOCUS_USES_CONVERSATION: dict[str, str] = {
-    "ja": "式は会話履歴の値を使っているので、どの計算をやり直したのかを会話履歴に沿って述べること。",
+    "ja": (
+        "式は会話履歴の値を使っているので、どの計算をやり直したのかを会話履歴に沿って述べること。"
+        "前の回答の数値のうち、訂正した値から出したものは訂正前の条件の値なので答えに使わず、"
+        "上の計算結果の値で答えること。"
+    ),
     "en": (
         "The expression uses values from the conversation history, so say which "
-        "calculation was redone, in line with the conversation."
+        "calculation was redone, in line with the conversation. Numbers in your "
+        "earlier answers that were derived from the corrected value reflect the "
+        "conditions before the correction; do not use them in the answer, answer "
+        "with the result above."
     ),
 }
 #: 引用文に一人称があるときの帰属注記 (``_REFOCUS_TEMPLATES`` に埋める)。
@@ -1088,7 +1286,7 @@ def verbatim_file_echo(
     body = strip_read_file_meta_line(tool_result)
     if not body.strip():
         return None
-    fence = "````" if "```" in body else "```"
+    fence = outer_fence(body)
     return f"{fence}\n{body.rstrip()}\n{fence}"
 
 
@@ -1224,9 +1422,15 @@ def _emit_tool_result_step(
         "Tool result step: tool=%s, failed=%s, result=%s",
         tool_name, failed, result_text[:120],
     )
+    # search_history の由来見出しはモデル向けの指示文。表示は短いラベルにする
+    # (2026-09-27 監査 F12: Agentic ステップに指示文だけが出ていた)。
+    shown = (
+        search_history_display_text(result_text)
+        if tool_name == "search_history" else result_text
+    )
     on_step({
         "type": "task_result",
-        "detail": f"{tool_name}: {_truncate_for_step(result_text)}",
+        "detail": f"{tool_name}: {_truncate_for_step(shown)}",
         "status": "failed" if failed else "done",
     })
 
@@ -1458,7 +1662,7 @@ _RUNTIME_EXTRA_FACT_RE = re.compile(
 )
 
 
-def query_short_circuits_tool_judge(query: str) -> bool:
+def query_short_circuits_tool_judge(query: str, mode: str = "chat") -> bool:
     """発話だけで「ツール判定を撃たずに決定論の事実で答える」と決まるか。
 
     :meth:`DeliberativeAgent._judge_and_execute_tool` 冒頭の短絡 (会話位置 /
@@ -1468,10 +1672,17 @@ def query_short_circuits_tool_judge(query: str) -> bool:
     2026-09-12 実測) を空撃ちしないよう起動前に見る。述語が真でも短絡側の
     追加条件 (履歴が無い等) で落ちた場合は、判定を **その場で直列に** 撃つ
     (``tool_judge_task=None`` の経路) ので挙動は変わらない。
+
+    直近ファイルへの参照 (所在の問い / 決めきれない参照) の短絡は chat モードだけ
+    (判定点 ``recent_file_reference`` は create では評価しない、f_03 §1.6)。
     """
     q = query or ""
+    file_reference = (
+        recent_file_reference_rule(q) if is_chat_mode(mode) else None
+    )
     return bool(
         session_position_kind(q) is not None
+        or session_answer_ordinal(q) is not None
         or is_today_scope_query(q)
         or tool_inventory_question(q)
         or memory_architecture_question(q)
@@ -1480,6 +1691,15 @@ def query_short_circuits_tool_judge(query: str) -> bool:
         or prior_code_block_request(q) is not None
         or own_process_question(q)
         or self_assessment_question(q)
+        # 所在の問い / 決めきれない参照 (_append_saved_file_location_fact /
+        # _append_file_reference_confirm_note)
+        or (
+            file_reference is not None
+            and (
+                (file_reference.fired and file_reference.value == LOCATE_LABEL)
+                or file_reference.band == "abstain"
+            )
+        )
     )
 
 
@@ -1509,6 +1729,7 @@ class DeliberativeAgent:
         #: このターンの [関連する記憶] に載った、クエリが尋ねている属性。
         #: ``process()`` の入口で毎ターン差し替える。
         self._answered_attributes: frozenset[str] = frozenset()
+        self._unanswered_attributes: frozenset[str] = frozenset()
         # _execute_tool の mode ゲートの既定値。process() 呼び出し毎の実際の mode は
         # _judge_and_execute_tool から明示的に渡される (こちらは直接 _execute_tool を
         # 呼ぶ既存テスト等のフォールバック用)。
@@ -1734,7 +1955,9 @@ class DeliberativeAgent:
         anchored = prior_user_turns >= 1 and only_session_ordinal_recall(query)
         position = session_position_kind(query, anchored=anchored)
         if position is None:
-            return None
+            return DeliberativeAgent._append_session_answer_fact(
+                messages, conversation, query, evicted_turns,
+            )
         if position == "first" and evicted_turns > 0:
             head = (session_head or "").strip()
             if head and head != query.strip():
@@ -1795,6 +2018,67 @@ class DeliberativeAgent:
             "Session position fact pinned (%s): %s", position, target[:60],
         )
         return position
+
+    @staticmethod
+    def _append_session_answer_fact(
+        messages: list[dict], conversation: list[dict] | None, query: str,
+        evicted_turns: int = 0,
+    ) -> str | None:
+        """「2つ目に教えてもらったクエリ」— アシスタントの N 番目の回答を確定して注記する。
+
+        実インシデント (2026-09-27 監査 M9): C02#5「2つ目に教えてもらったクエリを
+        もう一度見せてください。」に、会話の全文が載っていたのに 3 つ目のクエリを
+        返した。位置の注記が「最初 / 最後」しか扱わず、数で指された位置は base の
+        数え違いに任されていた。
+
+        数える単位は **アシスタントの回答** (フェンスの有無を問わない — C02 の
+        1 つ目と 3 つ目はフェンス無しの SQL だった)。「N 番目に書いたコード」は
+        従来どおりコードブロックを数える経路 (:meth:`_append_prior_code_block_fact`)
+        に任せる。窓から押し出しがあると窓の N 番目は会話の N 番目ではないので
+        注記しない。
+
+        Returns:
+            注記したら ``"nth"``。対象外なら ``None``。
+        """
+        # 候補 (序数 + アシスタントの動詞) が無いターンは判定点を記録しない。
+        # 「N 番目に書いたコード」はコードブロックの経路 (記録もそちらに任せる)。
+        if (
+            session_answer_rule(query).evidence == NO_CANDIDATE_EVIDENCE
+            or prior_code_block_request(query) is not None
+        ):
+            return None
+        if not session_answer_verdict(query).fired:
+            return None
+        n = session_answer_ordinal(query)
+        if n is None:
+            return None
+        if evicted_turns > 0:
+            logger.info(
+                "Session answer fact skipped: history truncated (%d messages "
+                "evicted); answer %d of the window is not answer %d of the "
+                "conversation", evicted_turns, n, n,
+            )
+            return None
+        target = resolve_session_answer(conversation, n)
+        if not target:
+            return None
+        if len(target) > _VERBATIM_ECHO_MAX_CHARS:
+            # 一字一句の再掲を求める注記なので、切り詰めて渡さない (L7)。
+            logger.info(
+                "Session answer fact skipped: answer %d is %d chars (> %d)",
+                n, len(target), _VERBATIM_ECHO_MAX_CHARS,
+            )
+            return None
+        append_to_last_user(
+            messages,
+            _localized(
+                _SESSION_ANSWER_POSITION_FACTS if session_answer_asks_restate(query)
+                else _SESSION_ANSWER_REFERENCE_FACTS,
+            ).format(n=n, target=target),
+            separator="",
+        )
+        logger.info("Session answer fact pinned (n=%d): %s", n, target[:60])
+        return "nth"
 
     def _append_prior_code_block_fact(
         self, messages: list[dict], query: str, conversation: list[dict] | None,
@@ -2152,6 +2436,106 @@ class DeliberativeAgent:
         return True
 
     @staticmethod
+    def _recent_file_facts(
+        session_id: str, conversation: list[dict] | None,
+    ) -> tuple[str, list[str]]:
+        """``(直近のファイル, この会話で書き込んだファイル (古い順))``。
+
+        file_ledger はプロセス内だけなので、空なら会話履歴の書込み報告から
+        復元してから読む (再起動後の「保存したファイルの場所」、f_03 §3.5)。
+        書込み報告の文面は LLM の応答にも現れる (捏造の「…に書き込みました。」)
+        ので、事実として渡すのは実在するパスだけ。
+        """
+        if session_id:
+            restore_from_conversation(session_id, conversation)
+        written = written_paths_in_conversation(conversation, existing_only=True)
+        # 「保存したファイル」は最後に書いたファイル (読んだだけのファイルではない。
+        # chat.py の宛先・判定の文脈と同じ、docs/f_03 §1.6)
+        latest = last_written_path(session_id) if session_id else ""
+        return latest, written
+
+    @classmethod
+    def _append_saved_file_location_fact(
+        cls, messages: list[dict], query: str, session_id: str,
+        conversation: list[dict] | None,
+    ) -> bool:
+        """「保存したファイルの場所」に file_ledger のパスを確定事実として渡す。
+
+        2026-09-27 ライブ監査 C07#5: 「保存したファイルの場所を教えてください。」
+        で、説明節の「保存」を書込み動詞とみなした write_file が格下げされ、
+        分類器の ``list_directory('.')`` がリポジトリ根を列挙し、「場所を
+        教えられない」と答えた。場所は実行時の記録 (台帳) にある — ツール目録
+        (``_append_tool_ledger_fact``) と同じく、数えるのはコード、モデルは
+        読み上げるだけにする。記録が無ければ「分からない」と答えさせる。
+
+        判定は判定点 ``recent_file_reference`` の字句段 (``locate``、c_17 §3.11)。
+
+        Returns:
+            注記したか。
+        """
+        verdict = recent_file_reference_rule(query)
+        if not (verdict.fired and verdict.value == LOCATE_LABEL):
+            return False
+        latest, written = cls._recent_file_facts(session_id, conversation)
+        if latest:
+            listing = (
+                _localized(_SAVED_FILE_LISTING).format(
+                    paths="\n".join(f"- {p}" for p in written),
+                )
+                if len(written) > 1 else ""
+            )
+            body = _localized(_SAVED_FILE_LOCATION_FACTS).format(
+                latest=latest, listing=listing,
+            )
+        else:
+            body = _localized(_SAVED_FILE_LOCATION_EMPTY_FACTS)
+        append_to_last_user(messages, body, separator="")
+        logger.info(
+            "Saved file location fact pinned (session=%s, known=%s, written=%d)",
+            session_id[:12], bool(latest), len(written),
+        )
+        return True
+
+    @classmethod
+    def _append_file_reference_confirm_note(
+        cls, messages: list[dict], query: str, session_id: str,
+        conversation: list[dict] | None,
+    ) -> bool:
+        """直近ファイルへの参照が決めきれない依頼は、実行せず確認させる。
+
+        「保存したファイルにある表を CSV に書き出して」(保存済みファイルを
+        上書きするのか、CSV を新しく作るのか) や「私が保存したファイルに追記して」
+        (台帳はアシスタントの書込みしか持たない) で、判定点
+        ``recent_file_reference`` は棄権する (c_17 §3.11)。棄権の縮退先は
+        「何もせず、対象のファイルと操作を尋ねる」— データは壊れず、ユーザーが
+        答えれば次のターンで書ける。
+
+        Returns:
+            注記したか。
+        """
+        latest, _written = cls._recent_file_facts(session_id, conversation)
+        # chat.py と同じ文脈 (直近のファイルの有無) で引く — 直近のファイルが無い
+        # 「前回保存したファイルに追記して」も棄権 (確認) になる。
+        if recent_file_reference_rule(
+            query, {"has_recent_file": bool(latest)},
+        ).band != "abstain":
+            return False
+        latest_line = (
+            _localized(_FILE_REFERENCE_CONFIRM_LATEST).format(path=latest)
+            if latest else ""
+        )
+        append_to_last_user(
+            messages,
+            _localized(_FILE_REFERENCE_CONFIRM_NOTES).format(latest=latest_line),
+            separator="",
+        )
+        logger.info(
+            "File reference unclear; asking to confirm the target "
+            "(session=%s, recent_known=%s)", session_id[:12], bool(latest),
+        )
+        return True
+
+    @staticmethod
     def _append_tool_ledger_fact(
         messages: list[dict], query: str, session_id: str,
         conversation: list[dict] | None = None,
@@ -2231,6 +2615,17 @@ class DeliberativeAgent:
         )
 
     @staticmethod
+    def _append_calculation_rejected_note(messages: list[dict]) -> None:
+        """最後の user メッセージへ「計算を検証できなかった」注記を追記する。"""
+        append_to_last_user(
+            messages, _localized(_CALCULATION_REJECTED_GUIDANCES), separator="",
+        )
+        logger.info(
+            "Calculation rejected without a passing expression; asked the model to "
+            "mark any number as an estimate and show the formula and assumptions",
+        )
+
+    @staticmethod
     def _append_history_not_searched_note(
         messages: list[dict], query: str,
     ) -> bool:
@@ -2277,12 +2672,42 @@ class DeliberativeAgent:
 
         窓内想起で検索を止めた (``recall_in_window``、窓がセッション全体を含む)
         ターンは「検索していない」ではなく「対象はこの会話の中」と伝える
-        (2026-09-26 監査 C05#5)。それ以外は「検索していない」の注記。
+        (2026-09-26 監査 C05#5)。記憶で答え済みとして止めた
+        (``answered_from_memory``) ターンは「記憶の値で答えよ」と伝える
+        (2026-09-27 監査 F9)。それ以外は「検索していない」の注記。
         """
         if judgement.recall_in_window:
             DeliberativeAgent._append_recall_in_window_note(messages)
+        elif judgement.answered_from_memory:
+            DeliberativeAgent._append_answered_from_memory_note(messages)
+        elif judgement.partially_answered_from_memory:
+            DeliberativeAgent._append_partially_answered_from_memory_note(messages)
         else:
             DeliberativeAgent._append_history_not_searched_note(messages, query)
+
+    @staticmethod
+    def _append_answered_from_memory_note(messages: list[dict]) -> None:
+        """記憶で答え済みとして履歴検索を止めたターンへ「記憶の値で答えよ」と注記する。
+
+        ``_append_history_not_searched_note`` (「確認できていないなら正直に」) を
+        ここで付けると、記憶に載っている答えを「確認できていません」と否定する
+        (2026-09-27 監査 F9)。
+        """
+        append_to_last_user(
+            messages, _localized(_ANSWERED_FROM_MEMORY_GUIDANCES), separator="",
+        )
+
+    @staticmethod
+    def _append_partially_answered_from_memory_note(messages: list[dict]) -> None:
+        """尋ねた属性の一部だけが記憶に載ったターンへ注記する (独立レビュー H1)。
+
+        全部載った前提の注記を付けると、載っていない属性まで記憶の値として
+        答えさせる (「勤務先と趣味」で勤務先だけ載っている → 趣味の捏造)。
+        """
+        append_to_last_user(
+            messages, _localized(_PARTIALLY_ANSWERED_FROM_MEMORY_GUIDANCES),
+            separator="",
+        )
 
     @staticmethod
     def _append_recall_in_window_note(messages: list[dict]) -> None:
@@ -2531,6 +2956,21 @@ class DeliberativeAgent:
                 tool_judge_task.cancel()
             return None, None, None, None, None
 
+        # 「保存したファイルの場所」も実行時の記録 (file_ledger) が答え。ツールを
+        # 撃つと list_directory('.') がリポジトリ根を列挙する (2026-09-27 C07#5)。
+        # 直近ファイルへの参照が決めきれない依頼は何も撃たずに確認させる。
+        # 判定点 recent_file_reference は chat モードでしか評価しない (f_03 §1.6)。
+        if is_chat_mode(mode) and (
+            self._append_saved_file_location_fact(
+                messages, query, session_id, conversation,
+            ) or self._append_file_reference_confirm_note(
+                messages, query, session_id, conversation,
+            )
+        ):
+            if tool_judge_task is not None and not tool_judge_task.done():
+                tool_judge_task.cancel()
+            return None, None, None, None, None
+
         if self._tool_judge is None or self._tools_registry is None:
             # 判定経路が無いなら precomputed タスクも使えない。残っていれば破棄。
             if tool_judge_task is not None and not tool_judge_task.done():
@@ -2557,9 +2997,13 @@ class DeliberativeAgent:
             )
         state.action_blocked = bool(judgement.action_blocked)
         if self._suppress_redundant_history_search(judgement, query):
+            # 尋ねた属性が全部載ったか一部だけかで注記を分ける (独立レビュー H1)。
+            partial = bool(self._unanswered_attributes)
             judgement = ToolJudgement(
                 tool_needed=False, tool_name="", tool_args={},
                 source=judgement.source,
+                answered_from_memory=not partial,
+                partially_answered_from_memory=partial,
             )
 
         if not (judgement.tool_needed and judgement.tool_name):
@@ -2598,6 +3042,10 @@ class DeliberativeAgent:
                 # 実測を試みたが撃てなかった。この状態で base に丸投げすると
                 # 測っていない値を断定する (_UNMEASURED_FACT_GUIDANCE 参照)。
                 self._append_unmeasured_fact_note(messages)
+            elif judgement.calculation_rejected:
+                # 分類器の式も組み直しも門で落ちた。丸投げすると暗算の値を検証済みの
+                # 口調で述べる (_CALCULATION_REJECTED_GUIDANCES 参照)。
+                self._append_calculation_rejected_note(messages)
             return None, None, None, None, None
 
         command = None
@@ -2841,6 +3289,7 @@ class DeliberativeAgent:
         answered_attributes: frozenset[str] = frozenset(),
         prompt_capture: list[dict] | None = None,
         private: bool = False,
+        unanswered_attributes: frozenset[str] = frozenset(),
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -2859,6 +3308,9 @@ class DeliberativeAgent:
             answered_attributes: このターンの [関連する記憶] に **実際に載った**
                 ファクトのうち、クエリが尋ねている属性のスロット名
                 (``_suppress_redundant_history_search`` 参照)。
+            unanswered_attributes: クエリが尋ねているのに [関連する記憶] に
+                載らなかった属性 (尋ねた − 注入済み)。空でなければ履歴検索を
+                止めたときの注記を「一部だけ載っている」側にする (独立レビュー H1)。
             prompt_capture: 渡すと、**実際に送信する** メッセージ配列を
                 ここへ書き戻す。呼出側は ``list(messages)`` の浅いコピーを
                 渡してくるため、``## ツール実行結果``・リマインダー・各種注記を
@@ -2881,6 +3333,7 @@ class DeliberativeAgent:
         # ターン固有の値なので process() の入口で差し替える (インスタンスは
         # セッションを跨いで再利用されない — chat() が毎リクエスト生成する)。
         self._answered_attributes = answered_attributes
+        self._unanswered_attributes = unanswered_attributes
 
         state = self._init_deliberative_state(mode)
         (

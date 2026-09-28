@@ -38,6 +38,14 @@ frozenset()``)、loop → gen 方向は許可されているが非対称にな�
 
 from __future__ import annotations
 
+#: 文書名詞に掛かる動作動詞のうち「書く」。**動詞の活用形** (書か / 書き / 書く /
+#: 書け / 書こ / 書い) に限る。裸の ``書`` は名詞の「文書」「手順書」の「書」にも
+#: 当たり、「その議事録をWord文書 … として保存して」が「議事録 … 文**書**」で
+#: 長文生成へ振られ、会話を持たない生成が議事録を捏造した (2026-09-27 ライブ監査
+#: C07#2)。router ``LONG_FORM_PATTERNS[0]`` / ``_LEARNED_LONG_FORM_OBJECT_RE`` と
+#: content_detector ``TEXT_PATTERNS[0]`` が共有する (f_03 §1.2)。
+WRITE_VERB_STEM_JA = r"書(?=[かきくけこいっ])"
+
 # 動作動詞 (書/作成/生成/まとめ/出力 等) との共起が必要な文書名詞。
 # 「計画書」「README」等、content_detector.py 側には過去実績が無い語彙は
 # 誤爆を避けるため標準単体マッチ (STANDALONE) へ安易に昇格させず、ここに留める。

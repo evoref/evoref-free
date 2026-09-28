@@ -200,6 +200,9 @@ class LearnFactView(FactViewBase):
             trace_id=trace_id,
             auto_evolved=auto_evolved,
             eval_metric=eval_metric,
+            # policy は学習が書く機械の記録 — ユーザーの言明 (origin=user) として
+            # 扱われない (2026-09-27 監査 M10、c_16 §3)。
+            origin="system",
         )
         return self._writeback_store.add_fact(fact)
 

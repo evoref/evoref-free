@@ -41,6 +41,27 @@ SEARCH_HISTORY_OTHER_SESSIONS_HEADER = (
 )
 SEARCH_HISTORY_CURRENT_SESSION_HEADER = "[以下は**今回の会話**の記録です]"
 
+#: 由来見出し → UI に出す短いラベルの i18n キー。見出しはモデルへの指示を含むので
+#: step 表示にはそのまま出さない (2026-09-27 監査 F12、docs/f_03 §3.2)。
+_SEARCH_HISTORY_DISPLAY_KEYS: dict[str, str] = {
+    SEARCH_HISTORY_OTHER_SESSIONS_HEADER: "agent.search_history.display_other_sessions",
+    SEARCH_HISTORY_CURRENT_SESSION_HEADER: "agent.search_history.display_current_session",
+}
+
+
+def search_history_display_text(result: str) -> str:
+    """search_history の結果を UI 表示用にする (先頭の由来見出しを短いラベルへ)。
+
+    モデルへ渡す文 (ツール結果の注入・会話履歴) には使わない。
+    """
+    from backend.i18n_helper import msg
+
+    for header, key in _SEARCH_HISTORY_DISPLAY_KEYS.items():
+        if result.startswith(header):
+            rest = result[len(header):].strip()
+            return f"{msg(key)} {rest}" if rest else msg(key)
+    return result
+
 # read_file が結果の先頭へ付けるメタ行の開始マーカー。行数・文字数をモデルに
 # 数えさせないための**モデル向け**の補助情報であり、ユーザーに見せる本文では
 # ない。emit 側 (tools/builtin.read_file) と除去側 (deliberative の逐語エコー)

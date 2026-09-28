@@ -243,7 +243,11 @@ class JSONLAppendStore(Generic[T]):
         terminate_torn_tail(self._path)
 
     def _append_line(self, text: str) -> None:
-        """1 行を追記する (ロックの下)。途中で失敗したら次の追記の前に末尾を検査し直す。
+        """1 行を追記する (ロックの下)。"""
+        self._append_lines([text])
+
+    def _append_lines(self, texts: list[str]) -> None:
+        """行を 1 回のオープンで追記する (ロックの下)。途中で失敗したら次の追記の前に末尾を検査し直す。
 
         ENOSPC や close 時の flush 失敗では行の前半だけが残りうる。検査済みのまま次の行を
         足すと断片に連結され、その行ごと読めなくなる。
@@ -251,7 +255,8 @@ class JSONLAppendStore(Generic[T]):
         self._terminate_torn_tail()
         try:
             with self._path.open("a", encoding="utf-8") as f:
-                f.write(text + "\n")
+                for text in texts:
+                    f.write(text + "\n")
         except BaseException:
             self._tail_checked = False
             raise
@@ -262,6 +267,28 @@ class JSONLAppendStore(Generic[T]):
         """1 件追記する。同じキーの既存 item は **後勝ち** で上書きされる
         (compaction まで物理的に古い行も残る)。
         """
+        self.append_many([item])
+
+    def append_many(self, items: list[T]) -> None:
+        """複数件を順に追記する (ファイルを開くのは 1 回)。
+
+        行の検査は :meth:`append` と同じで、1 件でも通らなければ 1 行も書かない。
+        Windows ではファイルのオープンが 1 回 1.5 ms 級なので、大量の行を 1 件ずつ
+        :meth:`append` すると書込みの大半がオープンになる。
+        """
+        if not items:
+            return
+        checked = [self._checked_line(item) for item in items]
+        guard_write(self._path)
+        with self._lock:
+            self._guard_newer()
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._append_lines([line for line, _ in checked])
+            self._total_lines += len(checked)
+            self._live_keys.update(key for _, key in checked)
+
+    def _checked_line(self, item: T) -> tuple[str, str]:
+        """item を 1 行へ直して検査し、``(行, キー)`` を返す。"""
         line = self._serialize(item)
         if "\n" in line or "\r" in line:
             raise ValueError("serialize() must not produce newline characters")
@@ -286,14 +313,7 @@ class JSONLAppendStore(Generic[T]):
                         f"serialize() output contains reserved tombstone field "
                         f"{reserved!r}",
                     )
-        key = self._key_of(item)
-        guard_write(self._path)
-        with self._lock:
-            self._guard_newer()
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._append_line(line)
-            self._total_lines += 1
-            self._live_keys.add(key)
+        return line, self._key_of(item)
 
     def tombstone(self, key: str, *, reason: str | None = None) -> None:
         """指定キーの削除マーカーを append する。

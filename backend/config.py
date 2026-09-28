@@ -1,6 +1,7 @@
 """設定管理とパス解決"""
 
 import yaml
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -165,6 +166,12 @@ class PathResolver:
         # 1 つを共有する。AppState.current_mode の初期値と揃え、active_mode の
         # 既定は "chat"。
         self._active_mode: str = "chat"
+        # llama-server が実際に載せているモデルのパス (``/props`` の ``model_path``) を
+        # 返す関数。学習データの置き場を「その生成を返したモデル」で決める
+        # (:meth:`generating_model_key`、f_04 §1.2.0)。未登録なら宣言へ倒す。
+        self._served_model_source: Callable[[], str] | None = None
+        #: ``/props`` の生の文字列 → model_key (``None`` = 宣言へ倒す)。束ね直しで捨てる。
+        self._served_key_cache: dict[str, str | None] = {}
         self._adapter_partition_mode: str = str(
             (config.get("learning", {}) or {}).get(
                 "level2_adapter_partition", "model_mode",
@@ -224,6 +231,7 @@ class PathResolver:
         Returns:
             束ねた ``model_key`` (外したときは ``None``)。
         """
+        self._served_key_cache.clear()
         name = Path(str(model_path or "")).name
         if not name:
             self._active_key = None
@@ -235,6 +243,7 @@ class PathResolver:
 
     def set_active_model_key(self, model_key: str, *, stem: str | None = None) -> None:
         """``model_key`` を直接束ねる (計算済みの key を持っている呼出元・テスト用)。"""
+        self._served_key_cache.clear()
         self._active_key = model_key
         self._active_stem = stem
 
@@ -385,6 +394,93 @@ class PathResolver:
         if not raw or Path(raw).stem == self._active_stem:
             return active
         return self.model_key_for(raw)
+
+    # ── 生成したモデルのパーティション (f_04 §1.2.0) ──
+
+    def declared_model_key(self, mode: str) -> str:
+        """``mode`` のターンを生成する **はずの** モデルの ``model_key``。
+
+        chat は束ねた active (``/api/model/reload`` の後も config の base_model では
+        なく束ねたモデル)。create は ``create_model`` を宣言していればそのモデル、
+        していなければ active。
+        """
+        if mode == "create" and self.models.get("create_model"):
+            return self._mode_model_key("create")
+        return self.active_model_key
+
+    def set_served_model_source(self, source: Callable[[], str] | None) -> None:
+        """llama-server が実際に載せているモデルのパスを返す関数を登録する (``None`` で外す)。
+
+        起動時の配線 (``_learning_rebind.wire_generating_partitions``) が
+        ``/props`` の ``model_path`` を読む関数を渡す。
+        """
+        self._served_model_source = source
+
+    def served_model_path(self) -> str:
+        """llama-server が実際に載せているモデルのパス (登録が無い・取れなければ空文字)。"""
+        source = self._served_model_source
+        if source is None:
+            return ""
+        try:
+            raw = source()
+        except Exception as exc:  # noqa: BLE001 — 置き場の解決は宣言へ倒して続ける
+            logger.debug("served model unavailable: %s", exc)
+            return ""
+        return raw if isinstance(raw, str) else ""
+
+    def generating_model_key(
+        self, mode: str | None = None, *, served_model: str | Path | None = None,
+    ) -> str:
+        """その生成を返したモデルの ``model_key`` (学習データの置き場の鍵)。
+
+        鍵は設定上の対応 (mode → model) ではなく、実際に載っているモデルから取る:
+        ``served_model`` (明示) → 登録された :meth:`set_served_model_source` →
+        ``mode`` が宣言するモデル (:meth:`declared_model_key`) → active の順。
+        ``/props`` の名前がファイルでも宣言済みでもない (alias だけ) ときも宣言へ倒す。
+        モード切替でパーティション全体を束ね直さず、書込み・読込みのたびに
+        これで置き場を決める。
+        """
+        raw = str(served_model or "") or self.served_model_path()
+        if raw:
+            key = self._served_model_key(raw)
+            if key is not None:
+                return key
+        if mode in ("chat", "create"):
+            return self.declared_model_key(mode)
+        return self.active_model_key
+
+    def _served_model_key(self, raw: str) -> str | None:
+        """``/props`` の ``model_path`` (または ``model_id``) を ``model_key`` にする。
+
+        読めるファイルならその重みから。読めない (名前だけ / 別の場所) ときは宣言した
+        モデル (base / create) の中から同じファイル名を探し、次に base_model の
+        ディレクトリの同名ファイル (モデル移行はその中で行う)。どれでもない名前
+        (alias だけ) は ``None`` — 仮 key の孤立パーティションを作らず、呼出側が
+        そのモードの宣言へ倒す。結果は生の文字列ごとにメモする (毎ターン 10 回前後
+        呼ばれ、models/ が NAS だと stat 1 回が重い)。束ね直しでメモを捨てる。
+        """
+        cached = self._served_key_cache.get(raw)
+        if cached is not None or raw in self._served_key_cache:
+            return cached
+        key = self._served_model_key_uncached(raw)
+        self._served_key_cache[raw] = key
+        return key
+
+    def _served_model_key_uncached(self, raw: str) -> str | None:
+        path = self._to_absolute(raw)
+        if path.is_file():
+            return self.model_key_for(path)
+        for declared in (self.models.get("base_model"), self.models.get("create_model")):
+            if declared and Path(str(declared)).name == path.name:
+                if Path(str(declared)).stem == self._active_stem:
+                    return self.active_model_key
+                return self.model_key_for(declared)
+        base_model = self.models.get("base_model")
+        if base_model:
+            sibling = self._to_absolute(str(base_model)).parent / path.name
+            if sibling.is_file():
+                return self.model_key_for(sibling)
+        return None
 
     def resolve_pro_created_dir(self) -> Path:
         """Pro が作る ``.evocart`` の置き場 (``<pro_dir>/created/``)。"""
@@ -937,7 +1033,11 @@ def get_mode_generation_params(mode: str) -> dict:
         from backend.free.learning.generation_delta_store import GenerationDeltaStore
         from backend.free.learning.generation_param_evolver import apply_deltas
         resolver = get_path_resolver()
-        delta_path = resolver.resolve_learning("generation_deltas_file")
+        # デルタはそれを学習したモデルのもの。いま生成するモデルのパーティションから読む
+        # (create_model に base の create デルタを当てない、f_04 §1.2.0)。
+        delta_path = resolver.learning_path_for(
+            "generation_deltas_file", resolver.generating_model_key(mode),
+        )
         mode_deltas = GenerationDeltaStore.load_mode(delta_path, mode)
         if mode_deltas:
             params = apply_deltas(params, mode_deltas)

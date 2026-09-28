@@ -168,6 +168,68 @@ def checks_syntax(path: str) -> bool:
     return lang is not None and lang not in _ERROR_TOLERANT_LANGUAGES and _parser(lang) is not None
 
 
+#: 構文検査器の任意依存 (pip の配布名)。無い環境では Python 以外の構文検査を飛ばす。
+SYNTAX_CHECKER_PACKAGE = "tree-sitter-language-pack"
+
+
+def syntax_checker_installed() -> bool:
+    """構文検査器 (``tree_sitter_language_pack``) が import できるか (読み込まずに見る)。"""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("tree_sitter_language_pack") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def syntax_checker_missing(path: str) -> str | None:
+    """このパスの構文を tree-sitter で検査できないとき、欠けているもの (検査できる・対象外なら ``None``)。
+
+    パッケージが無ければ :data:`SYNTAX_CHECKER_PACKAGE`、パッケージはあるのにその言語の文法が取れなければ
+    ``tree-sitter grammar <言語>`` (f_10 §12.4: 欠けているものを正しく名指す)。
+    Python (``compile``) と、表に無い拡張子 (PHP / SQL は実行環境で検査する) は対象外。
+    """
+    if is_python_path(path):
+        return None
+    suffix = Path(path).suffix.lower()
+    if suffix in _SFC_LANGUAGES:
+        lang: str | None = "javascript"
+    else:
+        lang = _TREE_SITTER_LANGUAGES.get(suffix)
+        if lang is None and suffix in _LANGUAGE_OVERLAY:
+            lang = _LANGUAGE_OVERLAY[suffix][0]
+    if lang is None or _parser(lang) is not None:
+        return None
+    return SYNTAX_CHECKER_PACKAGE if not syntax_checker_installed() else f"tree-sitter grammar {lang}"
+
+
+def syntax_check_unavailable(path: str) -> bool:
+    """このパスは tree-sitter で構文を検査する言語なのに、構文検査器が無くて検査できないか。
+
+    :func:`syntax_error_detail` の ``None`` (誤りなし) と「検査しなかった」を分けるため
+    (f_10 §12.4: 飛ばした検査を「合格」と書かない、2026-09-27 ライブ監査 S9)。
+    """
+    return syntax_checker_missing(path) is not None
+
+
+def runtime_environment() -> dict[str, Any]:
+    """起動した Python の実行ファイルと任意依存の有無 (起動ログと ``evoref doctor`` が出す)。"""
+    import sys
+
+    return {
+        "python": sys.executable,
+        "optional_dependencies": {SYNTAX_CHECKER_PACKAGE: syntax_checker_installed()},
+    }
+
+
+def runtime_environment_line() -> str:
+    """:func:`runtime_environment` の 1 行 (ログ用、英語固定)。"""
+    env = runtime_environment()
+    installed = env["optional_dependencies"][SYNTAX_CHECKER_PACKAGE]
+    state = "installed" if installed else "missing; non-Python syntax checks are reported as not checked"
+    return f"Python runtime: {env['python']} ({SYNTAX_CHECKER_PACKAGE}: {state})"
+
+
 def syntax_error_detail(code: str, path: str) -> str | None:
     """``path`` の言語で構文を検査し、誤りがあれば ``line N: 理由`` を返す (無ければ ``None``)。"""
     if is_python_path(path):

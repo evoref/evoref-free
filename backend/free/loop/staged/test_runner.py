@@ -25,12 +25,15 @@ test を収集するため、誤って system/e2e (PC フリーズ/強制再起�
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from backend.free.core import fs_sandbox
+from backend.free.core.check_outcome import UncheckedReason
 from backend.free.harness.action import RunCommandAction
 from backend.free.loop.action_runner import ActionRunner, ActionRunnerConfig
 from backend.free.loop.quality_gate import GateResult
@@ -60,7 +63,65 @@ from pathlib import Path
 _SRC = Path(__file__).parent / "src"
 if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
-"""
+
+""" + fs_sandbox.CONFTEST_GUARD
+
+_PYTEST_LAUNCHER = "run_pytest.py"
+#: 第 1 引数は作業フォルダの根。pytest の表示 (``tests/test_x.py::test_a``) を根からの相対に保つため
+#: 根で起動し、設定が済んだら (テストの収集・実行の前に) 実行ごとの空の CWD へ戻る。
+_PYTEST_LAUNCHER_BODY = (
+    "# evoref: pytest をスクリプトとして起動する (-m では audit hook を入れられない、f_10 §11.1-4)\n"
+    "import os\nimport sys\n\nimport pytest\n\n"
+    "_CWD = os.getcwd()\n\n\n"
+    "class _BackToScratchCwd:\n"
+    "    @staticmethod\n"
+    "    def pytest_configure(config):\n"
+    "        os.chdir(_CWD)\n\n\n"
+    "os.chdir(sys.argv[1])\n"
+    "sys.exit(pytest.main(sys.argv[2:], plugins=[_BackToScratchCwd()]))\n"
+)
+
+
+def _is_link(path: Path) -> bool:
+    """シンボリックリンクかジャンクションか (どちらも中へ入らない)。"""
+    return os.path.islink(path) or bool(getattr(os.path, "isjunction", lambda _p: False)(path))
+
+
+def _unlink_link(path: Path) -> None:
+    """リンクそのものを消す (ジャンクション・ディレクトリへのリンクは rmdir、先は触らない)。"""
+    try:
+        os.unlink(path)
+    except (IsADirectoryError, PermissionError):
+        os.rmdir(path)
+
+
+def _prune_untracked(directory: Path, src_real: Path, tracked: set[Path]) -> None:
+    """``directory`` の下の manifest に無いファイルと空のフォルダを消す (リンクは辿らない)。"""
+    try:
+        entries = list(os.scandir(directory))
+    except OSError as exc:
+        logger.debug("staged test state reset: could not list %s: %s", directory, exc)
+        return
+    for entry in entries:
+        path = Path(entry.path)
+        try:
+            if _is_link(path):
+                _unlink_link(path)
+                continue
+            if not path.resolve().is_relative_to(src_real):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                _prune_untracked(path, src_real, tracked)
+                if not any(path.iterdir()):
+                    path.rmdir()
+            elif path.resolve() not in tracked:
+                path.unlink()
+        except OSError as exc:
+            logger.debug("staged test state reset: could not remove %s: %s", path, exc)
+
+
+#: pytest の要約の失敗行 (``FAILED tests/test_x.py::test_a - AssertionError: …``)。
+_FAILED_LINE_RE = re.compile(r"^(FAILED|ERROR) (\S+?)(?: - (.*))?$", re.MULTILINE)
 
 _SUMMARY_RE = re.compile(
     r"(?:(\d+) failed)?(?:, )?(?:(\d+) passed)?(?:, )?(?:(\d+) error)?",
@@ -85,10 +146,39 @@ class StagedTestRunner:
     debug_logger: "DebugLogger | None" = None
 
     def _ensure_bootstrap(self) -> None:
+        # 既存の作業フォルダ (再接続・v1 の再開) の古い conftest にも隔離の備えを入れる
         conftest = self.workspace.path("conftest.py")
-        if not conftest.exists():
-            with AtomicWriter(conftest) as f:
-                f.write(_CONFTEST_BODY)
+        try:
+            if conftest.read_text(encoding="utf-8") == _CONFTEST_BODY:
+                return
+        except OSError:
+            pass
+        with AtomicWriter(conftest) as f:
+            f.write(_CONFTEST_BODY)
+
+    def _reset_run_state(self) -> None:
+        """前回の実行が残した状態を消す (実行ごとに同じ状態から始める、f_10 §11.1-4)。
+
+        ``src/`` の下で manifest に無いファイル (テストが作った保存ファイル等) と、
+        ``.sandbox/`` のホーム・一時フォルダ・CWD。K01 では修正前の版が壊した ``todos.json`` を
+        修正後の版が読み、4 件とも偽の不合格になった。manifest が読めなければ何も消さない。
+        シンボリックリンク・ジャンクションは中へ入らず、リンクそのものだけを消す
+        (``rglob`` はジャンクションを辿り、作業フォルダの外の中身を消した — 独立レビュー)。
+        """
+        fs_sandbox.reset_state(self.workspace.root)
+        src = self.workspace.root / "src"
+        if not src.is_dir() or _is_link(src):
+            return
+        try:
+            tracked = {
+                (self.workspace.root / f.workspace_path).resolve() for f in self.workspace.list_files()
+            }
+        except Exception as exc:  # noqa: BLE001 - 読めなければ消さない (安全側)
+            logger.debug("staged test state reset skipped: %s", exc)
+            return
+        if not tracked:
+            return
+        _prune_untracked(src, src.resolve(), tracked)
 
     def _build_runner(self) -> ActionRunner:
         cfg = ActionRunnerConfig(
@@ -106,8 +196,11 @@ class StagedTestRunner:
         は rootdir 算出を揃えるためで、conftest/ini 探索を止めるものではない
         (詳細はモジュール docstring 参照)。
         """
+        # pytest はスクリプトとして起動する: ``-m`` だと audit hook を入れた途端に
+        # import が壊れる (f_10 §11.1-4)。入口は ``.sandbox/run_pytest.py``。
+        launcher = fs_sandbox.sandbox_dir(self.workspace.root) / _PYTEST_LAUNCHER
         return (
-            self.python_exe, "-m", "pytest",
+            self.python_exe, str(launcher), str(self.workspace.root),
             "-p", "no:cacheprovider", "-q",
             # 失敗トレースを圧縮し、spec 見直しループの evidence 窓 (末尾 3000
             # chars) に複数の失敗が収まるようにする。
@@ -123,12 +216,20 @@ class StagedTestRunner:
         ``await asyncio.to_thread(runner.run, ...)`` で呼ぶこと。
         """
         self._ensure_bootstrap()
+        self._reset_run_state()
         ar = self._build_runner()
         test_ws_rel = f"tests/{_safe_rel(test_logical_path)}"
         target = self.workspace.root / test_ws_rel
         cmd = self._pytest_command(target)
-        action = RunCommandAction(command=cmd, cwd=str(self.workspace.root))
+        # 書込みを許すのは src/ と .sandbox の home / tmp / cwd だけ (孫プロセスにも継承、f_10 §11.1-4)。
+        # CWD は実行ごとの空フォルダ (CWD 相対の保存ファイルを次の実行へ持ち越さない)
+        fs_sandbox.write_script(self.workspace.root, _PYTEST_LAUNCHER, _PYTEST_LAUNCHER_BODY)
+        env = fs_sandbox.sandbox_env(self.workspace.root, write_dirs=[self.workspace.root / "src"])
+        action = RunCommandAction(
+            command=cmd, cwd=str(fs_sandbox.sandbox_cwd(self.workspace.root)), env=env,
+        )
         result = ar.run_one(action)
+        violations = fs_sandbox.violation_paths(fs_sandbox.read_violations(self.workspace.root))
 
         out = (result.output or "") + "\n" + (result.error or "")
         rc_raw = (result.metadata or {}).get("returncode", "")
@@ -141,6 +242,29 @@ class StagedTestRunner:
         no_tests = returncode == 5
         ok = bool(result.success) and not no_tests
         summary = _summarize(failed, passed, errors, no_tests, returncode)
+
+        if violations:
+            # 外への書込みを止めた結果の合否はコードの誤りの証拠にならない — 未検査
+            # (不合格にすると作り直し・偽の不合格を生む、2026-09-27 ライブ監査 K01)
+            logger.warning(
+                "staged test %s tried to write outside the workspace: %s",
+                test_logical_path, violations[:3],
+            )
+            gate = GateResult(
+                name="staged_pytest",
+                ok=False,
+                skipped=True,
+                returncode=returncode,
+                duration_ms=int(result.duration_ms),
+                stdout_tail=result.output or "",
+                stderr_tail=result.error or "",
+                error=summary,
+                skip_reason=f"sandbox violation: {', '.join(violations[:3])}",
+                skip_kind=UncheckedReason.SANDBOX_VIOLATION.value,
+                skip_detail=", ".join(violations[:3]),
+            )
+            self._log_gate_result(gate, test_logical_path)
+            return gate
 
         # collection error の原因が「非生成物・非 stdlib モジュールの
         # ModuleNotFoundError」なら環境要因 (外部依存未インストール) であり、
@@ -163,6 +287,8 @@ class StagedTestRunner:
                     stderr_tail=result.error or "",
                     error=summary,
                     skip_reason=f"外部依存 '{env_dep}' が未インストール (環境要因)",
+                    skip_kind=UncheckedReason.MISSING_DEPENDENCY.value,
+                    skip_detail=env_dep,
                 )
                 self._log_gate_result(gate, test_logical_path)
                 return gate
@@ -260,6 +386,30 @@ def _detect_env_missing_dependency(
             return None
         env_only.append(name)
     return env_only[0] if env_only else None
+
+
+def failure_lines(gate: GateResult, limit: int = 3) -> list[str]:
+    """失敗したテストの要約 (pytest の ``FAILED …`` / ``ERROR …`` 行、先頭 ``limit`` 件)。
+
+    ``FAILED tests/test_examples.py::test_example_3 - json.decoder.JSONDecodeError:...`` →
+    ``test_example_3 — json.decoder.JSONDecodeError:...``。
+    """
+    text = ((gate.stdout_tail or "") + "\n" + (gate.stderr_tail or "")).replace("\r", "")
+    out: list[str] = []
+    for m in _FAILED_LINE_RE.finditer(text):
+        name = m.group(2).rsplit("::", 1)[-1]
+        item = f"{name} — {m.group(3).strip()}" if m.group(3) else name
+        if item not in out:
+            out.append(item)
+    return out[:limit]
+
+
+def failed_count(gate: GateResult) -> int:
+    """不合格の件数 (failed + error)。合格・未検査は 0。"""
+    if gate.ok or gate.skipped:
+        return 0
+    failed, _passed, errors = _parse_pytest_summary(gate.error or "")
+    return failed + errors
 
 
 def _parse_pytest_summary(text: str) -> tuple[int, int, int]:

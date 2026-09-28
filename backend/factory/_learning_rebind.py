@@ -69,6 +69,71 @@ def bind_active_base_model(
     return raw.stem, key
 
 
+def load_mode_partitions(resolver: "PathResolver", buffer: Any) -> None:
+    """設定上のモードのモデルのうち active 以外のパーティションの経験をバッファへ足す。
+
+    create を別モデル (create_model) で回す構成で、その経験は create_model の
+    パーティションにある (f_04 §1.2.0)。Pro の Level 2 が mode 別に model_key で
+    絞るので、再起動後もメモリに載せる。Level 1 は束ねたファイルの分だけを見る。
+    """
+    load_partition = getattr(buffer, "load_partition", None)
+    # chat は active のモデルで回る。create が別モデルを宣言しているときだけ足す
+    # (未宣言の create は base で回るので active と同じパーティション)。
+    if load_partition is None:
+        return
+    key = resolver.declared_model_key("create")
+    if key != resolver.active_model_key:
+        load_partition(resolver.learning_path_for("experience_file", key))
+
+
+def wire_generating_partitions(state: "AppState", resolver: "PathResolver") -> None:
+    """学習データの置き場を「その生成を返したモデル」で決める配線 (f_04 §1.2.0)。
+
+    モード切替では全体を束ね直さない (チャットと create の並行、Level 1 実行中、
+    書き手スレッドに積まれた未書出しの経験を取り違えないため)。代わりに:
+
+    - resolver に llama-server が実際に載せているモデル (``/props``) の読み手を渡す
+      (:meth:`PathResolver.generating_model_key` の根拠)
+    - 経験バッファは ``entry.model_key`` のパーティションへ追記する
+    - プロンプトはターンの読み出しと規則の計数を、生成するモデルのパーティションへ
+    - aux 較正は AuxClient が自分のクライアントの ``/props`` から決める (配線不要)
+    """
+    from backend.factory._served_model import served_model_path
+
+    resolver.set_served_model_source(lambda: served_model_path(state))
+
+    fc = getattr(state, "feedback_collector", None)
+    buffer = getattr(fc, "buffer", None) if fc is not None else None
+    set_partition_path = getattr(buffer, "set_partition_path", None)
+    if set_partition_path is not None:
+        set_partition_path(lambda mk: resolver.learning_path_for("experience_file", mk))
+        load_mode_partitions(resolver, buffer)
+
+    prompt_mgr = getattr(state, "prompt_manager", None)
+    set_turn_prompt_dir = getattr(prompt_mgr, "set_turn_prompt_dir", None)
+    if set_turn_prompt_dir is not None:
+        set_turn_prompt_dir(
+            lambda mode: resolver.learning_path_for(
+                "prompts_dir", resolver.generating_model_key(mode),
+            ),
+        )
+        # UI の表示・編集はそのモードが宣言するモデルのパーティション (載っているモデル
+        # ではない。chat 中に create のプロンプトを直しても create に効くように)。
+        prompt_mgr.set_mode_prompt_dir(
+            lambda mode: resolver.learning_path_for(
+                "prompts_dir", resolver.declared_model_key(mode),
+            ),
+        )
+        prepare_mode_prompt_partitions(resolver, prompt_mgr)
+
+
+def prepare_mode_prompt_partitions(resolver: "PathResolver", prompt_mgr: Any) -> None:
+    """create_model のプロンプトの置き場を先に作る (チャット経路で既定の 6 ファイルを書かない)。"""
+    key = resolver.declared_model_key("create")
+    if key != resolver.active_model_key:
+        prompt_mgr.manager_for_dir(resolver.learning_path_for("prompts_dir", key))
+
+
 def rebind_base_learning(
     state: "AppState", *, new_model_filename: str,
 ) -> dict[str, Any]:
@@ -135,6 +200,8 @@ def rebind_base_learning(
     prompt_mgr = getattr(state, "prompt_manager", None)
     if prompt_mgr is not None:
         prompt_mgr.rebind_prompt_dir(prompt_dir)
+        if hasattr(prompt_mgr, "manager_for_dir"):
+            prepare_mode_prompt_partitions(resolver, prompt_mgr)
 
     aux_mgr = getattr(state, "aux_prompt_manager", None)
     if aux_mgr is not None:
@@ -149,6 +216,8 @@ def rebind_base_learning(
     fc = getattr(state, "feedback_collector", None)
     if fc is not None:
         fc.buffer.rebind(exp_file, previous=old_exp_file)
+        # rebind は束ねたファイルだけを読み直す。create_model の分を足し直す。
+        load_mode_partitions(resolver, fc.buffer)
         fc.rebind_base_model(new_name)
 
     fewshot_total = None

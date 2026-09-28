@@ -42,6 +42,7 @@ from backend.free.memory.sleep._curator_common import (
 )
 from backend.free.llm.json_schemas import UrlRelevanceJudgement
 from backend.free.memory.note_facts import fact_from_note
+from backend.free.memory.sleep.extraction import write_sleep_facts
 from backend.free.memory.sleep.curation_backoff import (
     clear_failure,
     in_cooldown,
@@ -462,8 +463,7 @@ async def curate_url_facts(
                         # _curator_common.INDEX_EMBED_IS_QUERY が SSOT。
                         **index_embed_fields(subject),
                     )
-                    store.add_fact(fact)
-                    written += 1
+                    written += len(write_sleep_facts(store, [fact], label="url"))
             except Exception as exc:
                 logger.warning("url_curator: persist failed for %s: %s", host, exc)
 

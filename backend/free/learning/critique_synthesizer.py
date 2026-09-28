@@ -16,7 +16,11 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from backend.free.learning.fitness import DEFECT_WEIGHTS, signal_is_defect
+from backend.free.learning.fitness import (
+    DEFECT_WEIGHTS,
+    OUTCOME_REASONS_COUNTED_ELSEWHERE,
+    signal_is_defect,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -148,6 +152,37 @@ def _analyze_correction_rate(
         "state your assumptions clearly before responding.'"
     )
     return pattern, hint, correction_count
+
+
+def failure_summary(failure: dict) -> str:
+    """批評 LLM へ渡す失敗経験 1 件の要約行。
+
+    検証器の理由はそのまま渡す。ただし別の欠陥キーが同じ事象を数える理由
+    (``OUTCOME_REASONS_COUNTED_ELSEWHERE`` = 長文の検証落ち) は ``verifier flagged`` に
+    出さない — 下の long-form の行と同じ事象が 2 回載る (docs/f_04 §2.5)。
+    """
+    signals = failure.get("signals", {})
+    entry =f"- query: \"{failure.get('query', '')[:100]}\""
+    if signals.get("user_correction"):
+        entry += f", correction: \"{signals['user_correction'][:100]}\""
+    if signals.get("agent_loops", 0) > 1:
+        entry += f", agent_loops: {signals['agent_loops']}"
+    if signals.get("turn_outcome") == "failed":
+        reason = str(signals.get("turn_outcome_reason") or "").strip()
+        if not reason.startswith(OUTCOME_REASONS_COUNTED_ELSEWHERE):
+            entry += (
+                f", verifier flagged: {reason[:160]}" if reason
+                else ", turn failed (no reason recorded)"
+            )
+    if (
+        signals.get("long_form_used")
+        and signals.get("long_form_success") is False
+    ):
+        errors = signals.get("long_form_validation_errors") or 0
+        entry += (
+            f", long-form document failed validation ({errors} error(s))"
+        )
+    return entry
 
 
 def failure_channels(failures: list[dict]) -> dict[str, int]:
@@ -376,29 +411,7 @@ class CritiqueSynthesizer:
         # なかった。``turn_outcome_reason`` には
         # "length constraint: asked for exactly 100 chars but the answer is 71"
         # のような具体が既に入っている。
-        failure_summaries = []
-        for f in failures[:10]:
-            signals = f.get("signals", {})
-            entry = f"- query: \"{f.get('query', '')[:100]}\""
-            if signals.get("user_correction"):
-                entry += f", correction: \"{signals['user_correction'][:100]}\""
-            if signals.get("agent_loops", 0) > 1:
-                entry += f", agent_loops: {signals['agent_loops']}"
-            if signals.get("turn_outcome") == "failed":
-                reason = str(signals.get("turn_outcome_reason") or "").strip()
-                entry += (
-                    f", verifier flagged: {reason[:160]}" if reason
-                    else ", turn failed (no reason recorded)"
-                )
-            if (
-                signals.get("long_form_used")
-                and signals.get("long_form_success") is False
-            ):
-                errors = signals.get("long_form_validation_errors") or 0
-                entry += (
-                    f", long-form document failed validation ({errors} error(s))"
-                )
-            failure_summaries.append(entry)
+        failure_summaries = [failure_summary(f) for f in failures[:10]]
 
         total = len(all_experiences)
         failure_count = len(failures)

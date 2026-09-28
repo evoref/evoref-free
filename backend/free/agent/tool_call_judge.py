@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -32,12 +33,19 @@ from backend.free.core.intent_vocab import (
     is_plain_statement,
     is_practice_advice_query,
     looks_like_numeric_question,
+    only_session_ordinal_recall,
 )
 from backend.free.core.date_math_cue import (
     conversation_has_date_math_cue,
+    day_count_is_the_only_cue,
     last_user_query,
 )
-from backend.free.core.correction_target import wrong_side_spans
+from backend.free.core.correction_target import (
+    contrast_pairs,
+    wrong_side_spans,
+)
+from backend.free.core.response_arithmetic import iter_ja_numbers
+from backend.free.agent.tools.calc import calculate, validate_expression
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -134,6 +142,11 @@ from backend.free.agent.tool_judge_grounding import (
     _known_numbers,
     _numeric_literals,
     _ungrounded_numbers,
+    expression_sanity_issues,
+    percent_derived_values,
+    percent_scale_slips,
+    period_exponent_mismatches,
+    repair_period_exponents,
 )
 from backend.free.agent.tool_judge_commands import (
     _DATE_ARITHMETIC_RE,
@@ -157,6 +170,8 @@ from backend.free.agent.tool_judge_commands import (
     command_lacks_date_arithmetic,
     business_day_offset_from_query,
     date_intent_command_from_params,
+    day_count_target_from_conversation,
+    without_corrected_dates,
     follow_up_excluded_weekdays_from_query,
     month_business_days_from_query,
     nth_weekday_of_month_from_query,
@@ -199,7 +214,6 @@ from backend.free.agent.tool_judge_args import (
     _is_numeric_expression,
     _normalize_path_separators,
     _normalize_path_text,
-    _trim_nonexistent_path_tail,
     asks_file_existence_only,
     extract_write_target_path,
     quoted_spans,
@@ -309,14 +323,38 @@ _DATE_INTENT_UNAVAILABLE = object()
 _DATE_INTENT_CONTEXT_CHARS = 300
 
 
-def _date_intent_context_messages(conversation: list[dict] | None) -> list[dict]:
-    """``date_intent`` へ渡す直近の会話 (末尾 N 件、各 M 文字に切る)。"""
+def _date_intent_context_messages(
+    conversation: list[dict] | None, *, query: str,
+) -> list[dict]:
+    """``date_intent`` へ渡す **今回の発話より前の** 直近の会話 (N 件、各 M 文字)。
+
+    今回の発話は位置ではなく **内容の一致** で除く。会話の末尾は今回の発話
+    (チャット API は今回の user ターンを積んでから履歴を取る) で、2 手目の判定は
+    さらに「(X を実行しました)」を足す。末尾 N 件を取ると [直前の応答, 今回] →
+    先頭の assistant を落として今回の発話だけになり、会話の日付 (「試験日は
+    2027年4月18日です」) が抽出器に届かなかった (2026-09-27 ライブ監査 C09#2)。
+    今回の発話は抽出器のプロンプトの末尾に別に載る。
+    """
+    turns = list(conversation or [])
+    current = " ".join((query or "").split())
+    for i in range(len(turns) - 1, -1, -1):
+        msg = turns[i]
+        if (
+            current
+            and str(msg.get("role") or "") == "user"
+            and " ".join(str(msg.get("content") or "").split()) == current
+        ):
+            turns = turns[:i]
+            break
     out: list[dict] = []
-    for msg in (conversation or [])[-_DATE_INTENT_CONTEXT_TURNS:]:
+    for msg in turns[-_DATE_INTENT_CONTEXT_TURNS:]:
         role = str(msg.get("role") or "")
         content = str(msg.get("content") or "").strip()
         if role not in ("user", "assistant") or not content:
             continue
+        if role == "user":
+            # 訂正の誤り側の日付は規則層と同じ判定 (corrected_value_spans) で落とす
+            content = without_corrected_dates(content)
         out.append({"role": role, "content": content[:_DATE_INTENT_CONTEXT_CHARS]})
     # 窓は user で始める (checkpoint 境界。tool_judge_dialogue.drop_leading_assistant)
     return drop_leading_assistant(out)
@@ -370,6 +408,166 @@ def _replaces_dialogue_value(query: str, dialogue: str) -> bool:
         for span in wrong_side_spans(query)
         for n in NUMBER_LITERAL_RE.findall(span)
     )
+
+
+def _corrected_new_value_forms(query: str) -> set[str]:
+    """訂正形 (「X ではなく Y <述語>」) の **新値** が式に現れうる綴り (純粋関数)。
+
+    新値は対比の SSOT (``contrast_pairs``) の Y から取り、百分率なら率・加算後・
+    割引後の倍率 (:func:`percent_derived_values`、百分率由来の値の 1 関数) まで
+    含める。「1.2%」→ ``1.2`` / ``0.012`` / ``1.012`` / ``0.988``。取れなければ空
+    (「正しくは 1.2% です」「1.2% に訂正します」は対比の形ではない)。
+    """
+    forms: set[str] = set()
+    for old, new in contrast_pairs(query or ""):
+        if not NUMBER_LITERAL_RE.search(old):
+            continue
+        forms.update(NUMBER_LITERAL_RE.findall(new))
+        forms.update(f"{v:g}" for v in percent_derived_values(new))
+    return forms
+
+
+def _beyond_window_reason(
+    expression: str, query: str, conversation: list[dict] | None,
+) -> str | None:
+    """分類器の式を判定窓の外の値の訂正として組み直す理由 (純粋関数)。無ければ ``None``。
+
+    前提: 会話が窓より長く、クエリの「誤りの側」の数値が **窓の外** の発言に
+    既出 (旧値が窓の中にしか無ければ分類器はそれを見ている、2026-09-26 レビュー)。
+    そのうえで次のどちらか (docs/f_03 §3.1、2026-09-27 監査 C03#3):
+
+    - ``ordinal_reference``: 序数での参照 (「最初の計算」)。語彙は既存の序数
+      (``only_session_ordinal_recall``) を使い、新しい語彙は作らない。
+    - ``classifier_ignores_new_value``: 訂正形で新値が取れ、分類器の式がそのどの
+      綴りも使っていない。新値が取れなければこの理由は **棄権** (分類器を保つ)。
+    """
+    outside = (conversation or [])[:-_CALCULATE_CONTEXT_TURNS]
+    if not outside:
+        return None
+    if not _replaces_dialogue_value(query, _dialogue_text(outside)):
+        return None
+    if only_session_ordinal_recall(query):
+        return "ordinal_reference"
+    forms = _corrected_new_value_forms(query)
+    if not forms:
+        return None
+    if forms & set(NUMBER_LITERAL_RE.findall(expression or "")):
+        return None
+    return "classifier_ignores_new_value"
+
+
+def _is_recompute_request(query: str, dialogue: str) -> bool:
+    """再計算の依頼か (純粋関数、docs/f_03 §3.1)。
+
+    既存の信号だけで決める (新しい語彙は作らない、不変則 #14(a)):
+
+    - 訂正形で会話の値を差し替える (:func:`_replaces_dialogue_value`、層 5.95 の門と同じ)
+    - 序数での参照 (``only_session_ordinal_recall``、「最初の計算をやり直して」) で、
+      **クエリに数が無い**。数があるときは訂正形の門に任せる — 「最初に頭金500万円を
+      払うとしたら毎月いくら？」は序数の語を含む新しい問いで、元本・金利は会話から
+      取るのが正しい (独立レビュー M2)。
+    """
+    if _replaces_dialogue_value(query, dialogue):
+        return True
+    return only_session_ordinal_recall(query) and not NUMBER_LITERAL_RE.search(query or "")
+
+
+def _recompute_ungrounded(
+    expression: str, query: str, dialogue: str, user_text: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """再計算の依頼で、分類器の式にある会話から辿れない数 (純粋関数)。
+
+    ``(説明できない数, 会話の期間と合わない月の複利の冪の指数)`` を返す。前者は
+    :func:`_ungrounded_numbers`、後者は :func:`period_exponent_mismatches` (冪の指数は
+    接地の前に剥がされる。期間の候補は ``user_text`` = user の発言だけ)。再計算の
+    依頼でなければ両方空 (従来どおり開示付きで残す、2026-09-28 再監査 C03#3)。
+    """
+    if not _is_recompute_request(query, dialogue):
+        return (), ()
+    return (
+        _ungrounded_numbers(expression, query, dialogue),
+        period_exponent_mismatches(expression, query, dialogue, user_text=user_text),
+    )
+
+
+#: 百分率の印 (数の直後)。
+_PERCENT_SUFFIX_RE = re.compile(r"\s*(?:%|％|パーセント)")
+#: 数の直後の単位 (次の数字の手前まで、数文字)。
+_UNIT_SUFFIX_RE = re.compile(r"[^\d０-９]{0,8}")
+
+
+def _non_positive_value(expression: str) -> str:
+    """式の値が正の有限値でなければその理由、そうなら空文字 (純粋関数)。
+
+    回数を置き換えた月の複利の式 (返済額・総額・残債) は正の値になる。負・ゼロ・
+    非有限は置き換えた構造が誤っている (2026-09-28 独立レビュー:
+    ``(1 + r/12) ** -420 * 12`` の -4,356.53)。
+    """
+    result = calculate(expression)
+    try:
+        value = float(result)
+    except ValueError:
+        return f"value {result!r} is not a positive finite value"
+    if not math.isfinite(value) or value <= 0:
+        return f"value {result} is not a positive finite value"
+    return ""
+
+
+def _int_digits(value: float) -> int:
+    """整数部の桁数 (1 未満は 0、純粋関数)。"""
+    return len(str(int(abs(value)))) if abs(value) >= 1 else 0
+
+
+def _replaced_operands(
+    expression: str, unexplained: tuple[str, ...], query: str, user_text: str,
+) -> tuple[str, ...]:
+    """説明できない数のうち、ユーザーの言った被演算子を **置き換えた** らしいもの (純粋関数)。
+
+    置き換えた = ユーザーの発言の数 (訂正の誤りの側と百分率を除く) のうち式が使って
+    いないものと整数部の桁数が同じで、ユーザーの発言の 2 つの数の和・差・積・商でも
+    ない (docs/f_03 §3.1)。C03#3 の 10000000 は、式が使っていない 3000 万円と同じ
+    8 桁で会話の数から導けない。知識の定数 (440000 / 3.14159 / 1.609344) や導出値
+    (3000 万 − 600 万 = 24000000、月利 1.001) は置き換えではない (独立レビュー H1)。
+    """
+    if not unexplained:
+        return ()
+    text = user_text if query in (user_text or "") else f"{user_text or ''}\n{query or ''}"
+    wrong = [
+        n.value for span in wrong_side_spans(query or "") for n in iter_ja_numbers(span)
+    ]
+    used = [float(x) for x in NUMBER_LITERAL_RE.findall(expression or "")]
+    values: list[float] = []
+    candidates: list[float] = []
+    for num in iter_ja_numbers(text):
+        values.append(num.value)
+        suffix = _UNIT_SUFFIX_RE.match(text, num.end).group(0)
+        if _PERCENT_SUFFIX_RE.match(suffix):
+            continue
+        if any(math.isclose(num.value, w, rel_tol=1e-9) for w in wrong):
+            continue
+        spellings = [
+            float(s) for s in _known_numbers(text[num.start:num.end] + suffix)
+        ] + [num.value]
+        if any(math.isclose(s, u, rel_tol=1e-9) for s in spellings for u in used):
+            continue
+        candidates.append(num.value)
+
+    def derivable(n: float) -> bool:
+        for a in values:
+            for b in values:
+                derived = [a + b, a - b, a * b]
+                if b:
+                    derived.append(a / b)
+                if any(math.isclose(n, d, rel_tol=1e-9) for d in derived):
+                    return True
+        return False
+
+    replaced: list[str] = []
+    for literal in unexplained:
+        n = float(literal)
+        if any(_int_digits(n) == _int_digits(c) for c in candidates) and not derivable(n):
+            replaced.append(literal)
+    return tuple(replaced)
 
 
 class ToolCallJudge:
@@ -634,6 +832,7 @@ class ToolCallJudge:
         # ``test_chat_path_audit_20260823`` が AST で固定している)。
         result.action_blocked = call.action_blocked
         result.measurement_blocked = call.measurement_blocked
+        result.calculation_rejected = call.calculation_rejected
         result.recall_in_window = call.recall_in_window
         return result
 
@@ -738,7 +937,7 @@ class ToolCallJudge:
                 call.tools_registry, call.mode,
                 select_locale_variant(DATE_INTENT_SYSTEM, DATE_INTENT_SYSTEM_EN),
             ),
-            *_date_intent_context_messages(call.conversation),
+            *_date_intent_context_messages(call.conversation, query=call.query or ""),
             {"role": "user", "content": f"[today: {today}]\n{call.query}"},
         ]
         try:
@@ -896,8 +1095,16 @@ class ToolCallJudge:
         code_offset = business_day_offset_from_query(query_text)
         nth_weekday = nth_weekday_of_month_from_query(query_text, today_local)
         month_count = month_business_days_from_query(query_text, today_local)
+        # 「今日から試験日まであと何日」の終点は会話の「試験日は…」にある
+        # (2026-09-27 ライブ監査 C09#2、docs/f_03 §3.1.2)。
+        conversation_target = day_count_target_from_conversation(
+            query_text, call.conversation, today_local,
+        )
         code_resolved = (
-            (code_offset is not None or nth_weekday is not None or month_count is not None)
+            (
+                code_offset is not None or nth_weekday is not None
+                or month_count is not None or conversation_target is not None
+            )
             and not mentions_literal_date(query_text)
         )
         payload: object = None
@@ -905,11 +1112,32 @@ class ToolCallJudge:
         if code_resolved:
             logger.info(
                 "date intent resolved by code rules; skipping the extractor "
-                "(offset=%s nth_weekday=%s month=%s)",
+                "(offset=%s nth_weekday=%s month=%s conversation_target=%s)",
                 code_offset is not None, nth_weekday is not None, month_count is not None,
+                conversation_target.end.isoformat()
+                if conversation_target is not None and conversation_target.end else None,
             )
-            params = code_offset
+            params = code_offset if code_offset is not None else conversation_target
         else:
+            # 終点が発話にも抽出器へ渡す会話にも無い日数の問い (「荷物はあと何日で
+            # 届きますか？」) は、抽出器 (1 往復 10〜24 秒) にも答えようがない。
+            # 日数の語彙を手掛かりに合成した (2026-09-27) ことで往復だけが増えて
+            # いた (独立レビュー)。撃たずに未検証の印 (``unexplained_date_math``) に任せる。
+            if (
+                day_count_is_the_only_cue(query_text)
+                and not mentions_literal_date(query_text)
+                and not any(
+                    mentions_literal_date(m["content"])
+                    for m in _date_intent_context_messages(
+                        call.conversation, query=query_text,
+                    )
+                )
+            ):
+                logger.info(
+                    "date intent skipped: day count with no endpoint in the query "
+                    "or the recent conversation: %s", query_text[:60],
+                )
+                return result
             params = await self._extract_date_intent_params(call)
             if params is _DATE_INTENT_UNAVAILABLE:
                 return result
@@ -1549,13 +1777,18 @@ class ToolCallJudge:
             if model_layers_allowed else None
         )
         if classified is not None:
-            # 窓の外の値を訂正する calculate は式合成で組み直す (docs/f_03 §3.1)
+            # 桁を取り違えた / 窓の外の値を訂正する calculate は式合成で 1 回だけ
+            # 組み直す。桁の取り違えで組み直しが通らなければ no_tool (docs/f_03 §3.1)。
             resynthesized = await self._resynthesize_beyond_window(
                 classified, query, tools_registry, mode, conversation, call,
             )
             if resynthesized is not None:
                 self._log_tool_decision(
-                    resynthesized, "expression_synthesis_beyond_window", call,
+                    resynthesized,
+                    f"expression_resynthesis_{call.recompose_reason}"
+                    if resynthesized.tool_needed
+                    else f"calculate_rejected_{call.recompose_reason}",
+                    call,
                 )
                 return resynthesized
             self._log_tool_decision(classified, "tool_classifier", call)
@@ -1672,26 +1905,138 @@ class ToolCallJudge:
         conversation: list[dict] | None,
         call: JudgeCall,
     ) -> "ToolJudgement | None":
-        """分類器の ``calculate`` が判定窓の外の値の訂正なら、式合成で組み直す。
+        """分類器の ``calculate`` を式合成で **1 回だけ** 組み直すか決め、組み直す。
 
-        分類器の対話窓は判定用の直近 ``_CALCULATE_CONTEXT_TURNS`` 件なので、
-        「年利は3%ではなく4%でした。最初の計算をやり直して」の 1 問目が窓の外に
-        あると、窓内の別の計算の式を新しい値で組む (2026-09-26 監査 C03#3)。
-        会話が窓より長く、クエリの「誤りの側」の数値が会話に既出のときだけ、
-        会話全体を見る層 5.95 に組み直させる。組めなければ ``None``
-        (分類器の結果を使う)。
+        組み直す理由は 3 つ (docs/f_03 §3.1、この順に 1 つだけ採る):
+
+        1. **百分率の桁の取り違え** (:func:`percent_scale_slips`、1.2% に対する
+           0.12)。分類器の式は採らない (開示で通さない)。組み直した式が通らなければ
+           **no_tool** を返す (calculate を使わず「厳密な計算結果」と言わせない)。
+        2. **再計算の依頼で会話に無い数** (:func:`_recompute_ungrounded`、2026-09-28
+           再監査 C03#3: 元本 1000 万・360 回)。組み直した式が通らなければ、会話の
+           期間と合わない冪か、置き換えた被演算子 (:func:`_replaced_operands`) が
+           あるときだけ **no_tool**。知識の定数・導出値だけなら ``None`` (分類器の式を
+           開示付きで残す、独立レビュー H1)。期間の食い違いだけなら、先に冪の回数を
+           会話の期間に置き換えた式を門に通し直す (:meth:`_repair_recompute_term`)。
+        3. **判定窓の外の値の訂正** (2026-09-26 監査 C03#3)。分類器の対話窓は
+           直近 ``_CALCULATE_CONTEXT_TURNS`` 件で、「年利は3%ではなく4%でした。
+           最初の計算をやり直して」の 1 問目が窓の外にあると窓内の別の計算を
+           新しい値で組む。旧値が窓の外にあることに加えて、序数での参照か、
+           訂正形で取れた新値を分類器の式が使っていないことを要求する
+           (:func:`_beyond_window_reason`)。組み直した式が通らなければ ``None``
+           (分類器の結果を使う)。
+
+        組み直した式は接地・式の妥当性 (構造検査を含む)・構文を通ったときだけ採る
+        (``_judge_with_expression_synthesis(recompose=True)``)。差し替えたら
+        backend.log に INFO を出し、理由を ``call.recompose_reason`` に残す
+        (decision.jsonl の reason)。
         """
         if classified.tool_name != "calculate":
             return None
-        outside = (conversation or [])[:-_CALCULATE_CONTEXT_TURNS]
-        if not outside:
+        expression = str((classified.tool_args or {}).get("expression") or "")
+        slips = percent_scale_slips(expression, query, call.dialogue_text)
+        unexplained, period_mismatch = ((), ()) if slips else _recompute_ungrounded(
+            expression, query, call.dialogue_text, call.user_dialogue_text,
+        )
+        if slips:
+            reason = "percent_scale_slip"
+        elif unexplained or period_mismatch:
+            reason = "recompute_ungrounded"
+        else:
+            reason = _beyond_window_reason(expression, query, conversation)
+        if reason is None:
             return None
-        # 旧値が判定窓の **外** に書かれているときだけ。窓の中にしか無ければ
-        # 分類器はそれを見て式を組んでいる (2026-09-26 レビュー)。
-        if not _replaces_dialogue_value(query, _dialogue_text(outside)):
+        call.recompose_reason = reason
+        synthesized = await self._judge_with_expression_synthesis(
+            query, tools_registry, mode, conversation, call=call, recompose=True,
+        )
+        if synthesized is not None and synthesized.tool_needed:
+            logger.info(
+                "Classifier calculate(%r) replaced by re-synthesized %r (reason=%s)",
+                expression[:120],
+                str((synthesized.tool_args or {}).get("expression") or "")[:120],
+                reason,
+            )
+            return synthesized
+        if slips:
+            rejected = f"percent scale slip {list(slips)}"
+        elif period_mismatch:
+            repaired = (
+                None if unexplained
+                else self._repair_recompute_term(expression, query, call, classified.source)
+            )
+            if repaired is not None:
+                return repaired
+            rejected = f"exponent {list(period_mismatch)} does not match the conversation's term"
+        else:
+            replaced = _replaced_operands(
+                expression, unexplained, query, call.user_dialogue_text,
+            )
+            rejected = f"replaced operand {list(replaced)}" if replaced else ""
+            if unexplained and not replaced:
+                # 知識の定数・導出値は再計算でも正当 (独立レビュー H1)。base と同じく
+                # 分類器の式を開示付きで残す (``unexplained_numbers`` は付いている)。
+                logger.info(
+                    "Classifier calculate(%r) kept with disclosure: recompute with "
+                    "unexplained numbers %s that do not replace a stated operand; the "
+                    "re-synthesized expression did not pass",
+                    expression[:120], list(unexplained),
+                )
+        if rejected:
+            logger.info(
+                "Classifier calculate(%r) rejected: %s; the re-synthesized "
+                "expression did not pass, answering without calculate",
+                expression[:120], rejected,
+            )
+            call.calculation_rejected = True
+            return ToolJudgement(
+                tool_needed=False, source=classified.source, calculation_rejected=True,
+            )
+        return None
+
+    def _repair_recompute_term(
+        self, expression: str, query: str, call: JudgeCall, source: str,
+    ) -> "ToolJudgement | None":
+        """冪の回数だけが会話の期間と合わない分類器の式を、回数を置き換えて通す。
+
+        呼ぶのは再計算の依頼で組み直しが通らず、分類器の式の不合格の理由が期間の
+        食い違いだけ (説明できない数が無い) のとき (docs/f_03 §3.1、2026-09-28 実機
+        確認 R10)。置き換え (:func:`repair_period_exponents`) は会話の期間が 1 つに
+        決まるときだけで、置き換えた式を構文・接地・式の妥当性にもう一度通す。
+        通らなければ ``None`` (呼出側が no_tool にする)。
+        """
+        repair = repair_period_exponents(
+            expression, query, call.dialogue_text, user_text=call.user_dialogue_text,
+        )
+        if repair is None:
             return None
-        return await self._judge_with_expression_synthesis(
-            query, tools_registry, mode, conversation, call=call,
+        repaired, exponents, term = repair
+        failed = (
+            validate_expression(repaired)
+            or ", ".join(_ungrounded_numbers(repaired, query, call.dialogue_text))
+            or "; ".join(expression_sanity_issues(
+                repaired, query, call.dialogue_text, user_text=call.user_dialogue_text,
+            ))
+            or _non_positive_value(repaired)
+        )
+        if failed:
+            logger.info(
+                "Classifier calculate(%r) term repair %r did not pass (%s)",
+                expression[:120], repaired[:120], failed[:200],
+            )
+            return None
+        logger.info(
+            "Classifier calculate(%r) repaired to %r: exponent %s replaced by the "
+            "conversation's term %d",
+            expression[:120], repaired[:120], list(exponents), term,
+        )
+        call.recompose_reason = "recompute_term_repair"
+        return self._finalize(
+            ToolJudgement(
+                tool_needed=True, tool_name="calculate",
+                tool_args={"expression": repaired}, source=source,
+            ),
+            call=call,
         )
 
     async def _judge_with_expression_synthesis(
@@ -1701,8 +2046,22 @@ class ToolCallJudge:
         mode: str,
         conversation: list[dict] | None,
         call: JudgeCall | None = None,
+        *,
+        recompose: bool = False,
     ) -> "ToolJudgement | None":
         """被演算子が会話にしかない差分クエリで、式だけを合成させて calculate を撃つ。
+
+        ``recompose=True`` は分類器の ``calculate`` の組み直し
+        (``_resynthesize_beyond_window``)。計算が要ることは分類器が決めているので
+        適用条件の門 (クエリの数値の数 / 照応語) は通さない。
+
+        合成した式はどちらの経路でも、構文 (calc と同じ規則 ``validate_expression``。
+        2026-09-27 監査 C02#2: SQL が「式」として返り、実行時に invalid syntax)・
+        接地・**式の妥当性** (:func:`expression_sanity_issues`、月数の冪と年率の
+        構造検査を含む) の 3 つを通ったときだけ採る (docs/f_03 §3.1)。妥当性は
+        当初組み直しの経路だけに掛けており、分類器が none を返した通常の 5.95 で
+        ``1.012 ** 420`` が注記付きで採られ、C03#3 が再現した (独立レビュー)。
+        分類器の式は従来どおり注記に留める (``_flag_suspicious_calculate``)。
 
         **判断させず合成だけ命じる**のが要点。層5.9 の分類器は「ツールが要るか」
         を判定するため、割り算のような難しい計算では ``calculate`` を選ぶが、
@@ -1748,16 +2107,18 @@ class ToolCallJudge:
         # 貯金可能額・総勉強時間をそれぞれ誤答した (2026-09-21 ライブ監査
         # C03/C07/C09 の訂正ターン)。
         query_numbers = NUMBER_LITERAL_RE.findall(query)
-        if len(query_numbers) >= 2 and not _replaces_dialogue_value(
-            query, call.dialogue_text,
+        if (
+            not recompose
+            and len(query_numbers) >= 2
+            and not _replaces_dialogue_value(query, call.dialogue_text)
         ):
             return None
         # 規則層が計算の依頼と判定したのに式が取れなかった問い (「BMIを計算して」)
         # は、数値も照応語も無いが被演算子はすべて会話にある。暗算で 26.34 と
         # 誤答した (2026-09-22 実機、正しくは 26.37)。会話に数値があるときだけ。
-        requested = call.calculate_requested and bool(
+        requested = recompose or (call.calculate_requested and bool(
             NUMBER_LITERAL_RE.search(call.recent_dialogue_text),
-        )
+        ))
         if not requested:
             if not query_numbers and not ANAPHORIC_OPERAND_RE.search(query):
                 return None
@@ -1796,11 +2157,27 @@ class ToolCallJudge:
         expression = parse_expression_response(content)
         if not expression:
             return None
+        syntax_error = validate_expression(expression)
+        if syntax_error:
+            logger.info(
+                "Expression synthesis rejected: %r is not a calculate expression (%s)",
+                expression[:120], syntax_error[:120],
+            )
+            return None
         unexplained = _ungrounded_numbers(expression, query, call.dialogue_text)
         if unexplained:
             logger.info(
                 "Expression synthesis rejected: %s uses numbers absent from "
                 "the conversation (%s)", expression, ", ".join(unexplained),
+            )
+            return None
+        issues = expression_sanity_issues(
+            expression, query, call.dialogue_text, user_text=call.user_dialogue_text,
+        )
+        if issues:
+            logger.info(
+                "Expression synthesis rejected: %s is structurally suspicious (%s)",
+                expression, "; ".join(issues),
             )
             return None
         result = ToolJudgement(

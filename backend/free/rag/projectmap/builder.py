@@ -76,6 +76,9 @@ UPDATE_INVALID = "invalid"
 
 _VERSION_RE = re.compile(r"^1\.0\.(\d+)$")
 
+#: 新しい版へノードを書く 1 回の ``put_many`` の件数。
+_PUT_BATCH = 10_000
+
 
 def _cfg(section: Any, key: str, default: Any) -> Any:
     if section is None:
@@ -548,9 +551,15 @@ class ProjectMapBuilder:
         store.load()
         fan_in, fan_out = self._fan_counts(graph)
         try:
-            for node in graph.nodes:
-                store.put(
-                    self._node_to_evidence(node, graph, fan_in, fan_out, version, now),
+            # 1 件ずつ put するとオーバーレイを毎回写して O(n²) になる (R13)。
+            # 区切るのは一括の中間物 (事象の dict) を全ノード分抱えないため。
+            nodes = graph.nodes
+            for start in range(0, len(nodes), _PUT_BATCH):
+                store.put_many(
+                    [
+                        self._node_to_evidence(node, graph, fan_in, fan_out, version, now)
+                        for node in nodes[start:start + _PUT_BATCH]
+                    ],
                     by="projectmap_builder",
                 )
             await store.create_snapshot()

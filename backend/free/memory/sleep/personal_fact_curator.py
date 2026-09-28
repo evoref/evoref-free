@@ -37,12 +37,16 @@ Step 8 (``ChatExtractor``) は ``fact_attributes.yaml`` のトリガ語で属性
 
 from __future__ import annotations
 
+import functools
 import re
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import yaml
+
+from backend.free.core.script_ranges import KANJI, KATAKANA_WORD
 from backend.free.llm.json_schemas import PersonalFactSplit
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.notes.note_builder import (
@@ -174,6 +178,66 @@ _BARE_PREDICATE_RE = re.compile(
 def is_bare_predicate(value: str) -> bool:
     """値が述語だけか (純粋関数)。"""
     return bool(_BARE_PREDICATE_RE.match((value or "").strip()))
+
+
+#: 量の値の数字と、数字に付いた助数詞・単位 (漢字・カタカナの連なり)。
+_DIGIT_RE = re.compile(r"[0-9０-９]")
+_UNIT_RUN_RE = re.compile(f"[{KANJI}{KATAKANA_WORD}]+")
+#: 値の直前 (同じ節の中) の主題「X は」。X は助詞・区切りを含まない連なり。
+_TOPIC_BEFORE_RE = re.compile(
+    r"(?P<topic>[^\s、。，,！!？?はがをにでとのへも]{1,12})は\s*$",
+)
+_CLAUSE_BREAK_CHARS = "、。，,！!？?\n"
+_SENTENCE_END_RE = re.compile(r"[。！!？?\n]")
+
+
+def is_quantity_value(value: str) -> bool:
+    """値が数と助数詞だけか (「2人で8万円」「1泊2日」「39歳」/ 純粋関数)。
+
+    値の中の漢字・カタカナの連なりがどれも数字の直後にある (= 助数詞・単位)
+    なら、値は何の量かを値の外の主題に預けている。
+    """
+    v = "".join((value or "").split())
+    if not _DIGIT_RE.search(v):
+        return False
+    return all(
+        m.start() > 0 and _DIGIT_RE.match(v[m.start() - 1])
+        for m in _UNIT_RUN_RE.finditer(v)
+    )
+
+
+def topic_widened_value(value: str, content: str, fact_type: str, slug: str) -> str:
+    """主題を落とした量の値を、主題を含む逐語 span に広げる (純粋関数に近い)。
+
+    「予算は2人で8万円です」から「2人で8万円」だけを残すと、何の量かが消えて
+    別の意味になる (2026-09-27 監査 F10: 「対面での対話は2人で8万円」)。値が
+    量だけで、発話の中でその直前が同じ節の主題「X は」のとき、主題から節の
+    終わりまでがこのスロットに解決しなければ、節の先頭から値の終わりまで
+    (「予算は2人で8万円」「今の会社は6年目」) を返す。主題がスロットの語
+    (「年齢は39歳です」) / 本人 (「私は39歳です」→ 節が age に解決) なら値のまま。
+
+    棄却しないのは、正しい予定 (「試験は4月25日です。」) やペットの年齢
+    (「柴犬は5歳です。」) まで落ちたため (独立レビュー M6)。
+    """
+    if not is_quantity_value(value):
+        return value
+    pos = content.find(value)
+    if pos < 0:
+        return value
+    clause_start = max(content.rfind(ch, 0, pos) for ch in _CLAUSE_BREAK_CHARS) + 1
+    topic = _TOPIC_BEFORE_RE.search(content[clause_start:pos])
+    if topic is None:
+        return value
+    end = _SENTENCE_END_RE.search(content, pos + len(value))
+    clause = content[clause_start + topic.start():end.start() if end else len(content)]
+
+    from backend.free.memory.notes.note_builder import resolve_fact_attribute_matches
+
+    if slug in {
+        s for s, _ in resolve_fact_attribute_matches(clause, fact_type, mode="chat")
+    }:
+        return value
+    return content[clause_start:pos + len(value)].strip()
 
 
 def is_verbatim_span(value: str, content: str) -> bool:
@@ -342,14 +406,48 @@ def is_untyped_statement(content: str) -> bool:
     return is_note_worthy(content)
 
 
+@functools.lru_cache(maxsize=8)
+def _load_slot_meanings(path: str) -> dict[tuple[str, str], str]:
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("personal_fact_curator: slot meanings not loaded (%s): %s", path, exc)
+        return {}
+    section = raw.get("meanings") if isinstance(raw, dict) else None
+    out: dict[tuple[str, str], str] = {}
+    for fact_type, per_slot in (section or {}).items():
+        if not isinstance(per_slot, dict):
+            continue
+        for slug, meaning in per_slot.items():
+            if isinstance(slug, str) and isinstance(meaning, str) and meaning.strip():
+                out[(str(fact_type), slug)] = meaning.strip()
+    return out
+
+
+def slot_meanings(triggers_dir: str | Path | None = None) -> dict[tuple[str, str], str]:
+    """``{(fact_type, slug): 意味}`` — ``fact_attributes.yaml`` の ``meanings:`` 節。
+
+    分割プロンプトにスロットの意味を渡す SSOT (2026-09-27 監査 F10)。節が無い
+    (user override が古い) ときは空で、プロンプトはキーだけを並べる。
+    """
+    return _load_slot_meanings(str(resolve_fact_attributes_path(triggers_dir)))
+
+
 def build_prompt(content: str, allowed: dict[str, tuple[str, str]]) -> str:
     """分割用 user プロンプトを組み立てる (純粋関数)。
 
     許可スロットを列挙するのは、``json_schema`` が型しか守らない
     (値域は守らない) ため。コード側でも検証するが、選択肢を見せた方が
-    有効な出力の率が上がる。
+    有効な出力の率が上がる。各スロットには ``fact_attributes.yaml`` の意味を
+    添える — キーだけでは予算が作業方針 (policy) に入った (2026-09-27 監査 F10)。
     """
-    slots = "\n".join(f"- {key}" for key in sorted(allowed))
+    meanings = slot_meanings()
+
+    def _line(key: str) -> str:
+        meaning = meanings.get(allowed[key])
+        return f"- {key}: {meaning}" if meaning else f"- {key}"
+
+    slots = "\n".join(_line(key) for key in sorted(allowed))
     return (
         "次の発話から、ユーザー自身の属性を **値ごとに 1 件ずつ** 取り出して"
         "ください。同じ slot の値が発話に複数あれば (嫌いな飲み物と普段飲む"
@@ -359,12 +457,13 @@ def build_prompt(content: str, allowed: dict[str, tuple[str, str]]) -> str:
         "(要約・言い換え・補完は禁止)。属性 1 つ分の **述語を含む最小の節** に"
         "すること (「コーヒーは苦手」「いつも緑茶を飲んでいます」)。名詞だけ"
         "(「コーヒー」) に切り詰めない — 好き/苦手・頻度の情報が落ちる。\n"
-        "ユーザー本人の属性でないもの (ペット・家族・同僚の値、依頼、質問、"
-        "挨拶) は返さないでください。該当が無ければ facts を空にしてください。\n"
-        "slot の意味: personal.location は **本人の居住地** (通勤先・旅行先・"
-        "趣味で行く場所は含めない)、personal.occupation は本人の **職種** (勤務先・所属・入社年は personal.employer)、"
-        "personal.name は本人の氏名。趣味の行き先は location にしないこと。\n"
-        f"\n許可された slot:\n{slots}\n"
+        "本人以外の人の属性 (家族や同僚の職業・体調など)、依頼、質問、挨拶は"
+        "返さないでください。本人の家族構成や飼っているペットは personal.family / "
+        "personal.pet の値として返してかまいません。該当が無ければ facts を空に"
+        "してください。\n"
+        "slot は下のリストの **意味に合うものだけ** を使うこと。意味に合う slot が"
+        "無い値 (予算・金額など) は返さないでください。\n"
+        f"\n許可された slot (slot: 意味):\n{slots}\n"
         f"\nUTTERANCE: {content}\n"
     )
 
@@ -409,6 +508,8 @@ def accept_items(
     - 表に無い slot (新スロットを生やさない)
     - 発話の逐語 span でない value (幻覚)
     - 文をまたぐ / 発話全体と同じ value (分割になっていない)
+    (主題を落とした量の value は落とさず、主題を含む逐語 span に広げる —
+    :func:`topic_widened_value`、「2人で8万円」→「予算は2人で8万円」)
     - 同じスロットの 2 件目 — ただし **単値スロットだけ** (先勝ち)。多値 /
       未宣言のスロットは値ごとに別件として受ける (「コーヒーは苦手で、いつも
       緑茶を飲んでいます」は beverage に 2 値。2026-09-14 監査 C: 1 件しか
@@ -446,6 +547,13 @@ def accept_items(
                 value,
             )
             continue
+        widened = topic_widened_value(value, content, fact_type, slug)
+        if widened != value:
+            logger.debug(
+                "personal_fact_curator: quantity value widened to keep its topic: "
+                "%r -> %r", value, widened,
+            )
+            value = widened
         single = is_single_valued_subject(make_mem_subject(kind, slug))
         key = (kind, slug, "" if single else _normalize_ws(value))
         if key in seen:
@@ -572,6 +680,15 @@ async def curate_personal_facts(
         note.personal_fact_curated_at = now_fn()
         clear_failure(note, _FAILURE_KEY)
         accepted = accept_items(items, content, allowed)
+        # 旧値を本人以外の人が持つ訂正は、Step 8 と同じ判定で本人のスロットに
+        # 書かない (独立レビュー M5: 分割が判定を迂回して health=小麦 を書いた)。
+        from backend.free.memory.extractors.chat import third_party_correction_slots
+
+        skip = third_party_correction_slots(
+            note, notes, getattr(builder, "triggers_dir", None),
+        )
+        if skip:
+            accepted = [a for a in accepted if (a[0], a[2]) not in skip]
         if not accepted:
             continue
         written += await _persist_split(

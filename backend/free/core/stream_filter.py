@@ -14,6 +14,12 @@ import re
 from datetime import date
 
 from backend.free.core.response_dates import fix_weekday_claims, response_dates
+from backend.free.core.text_quality import (
+    FRAME_HEADING_OPENERS,
+    FRAME_HEADING_RE,
+    INTERNAL_FRAME_HEADINGS,
+    rewrite_frame_headings,
+)
 from backend.free.core.verifier_events import record_verifier_hit
 from backend.log_config import get_logger
 
@@ -747,8 +753,13 @@ _INTERNAL_FRAME_CLAUSE_RE = re.compile(
 )
 
 
-def strip_internal_frame_mentions(text: str) -> str:
+def strip_internal_frame_mentions(
+    text: str, *, context: str = "", query: str = "",
+) -> str:
     """内部の根拠枠への言及を落とす (純粋関数)。
+
+    ``context`` は直前に出した本文 (見出しの言い換えの言語とコードの内側の判定)、
+    ``query`` はユーザーの発話 (そこに現れる枠名は書き換えない)。
 
     システムプロンプトは「[関連する記憶]・[参考情報]・ツール実行結果が
     『有ったか / 無かったか』自体を話題にしない」と規定し、動的ブロックの区切り文でも
@@ -761,7 +772,9 @@ def strip_internal_frame_mentions(text: str) -> str:
     """
     out = _INTERNAL_FRAME_PAREN_RE.sub("", text)
     out = _INTERNAL_FRAME_CLAUSE_RE.sub("", out)
-    return out
+    # 括弧でくくった見出し名 (「[関連する記憶]（…）は」) は消すと主語が抜けるので
+    # 普通の語へ言い換える (2026-09-27 監査 F11、docs/f_02 §8.4)。
+    return rewrite_frame_headings(out, context=context, query=query)
 
 
 #: 枠名の全接頭辞。ストリーミング中に「まだ枠名になりうるか」を 1 文字単位で
@@ -772,6 +785,9 @@ _FRAME_WORD_PREFIXES = frozenset(
     for w in ("参考情報", "関連する記憶", "ツール実行結果", "参照情報")
     for i in range(1, len(w) + 1)
 )
+
+#: 括弧でくくった見出し名の、名前の後ろ・閉じ括弧の前に来うるもの (番号と空白)。
+_HEADING_NUMBER_TAIL_RE = re.compile(r"\s*[0-9０-９]*\s*")
 
 
 class InternalFrameMentionFilter:
@@ -791,12 +807,28 @@ class InternalFrameMentionFilter:
 
     _OPEN_PARENS = ("（", "(")
 
-    def __init__(self) -> None:
+    def __init__(self, query: str = "") -> None:
         self._buffer = ""
+        # 出した本文 (コードの内側の判定と、言い換えの言語の判定に使う)。
+        self._emitted = ""
+        # ユーザーの発話にそのまま現れる枠名は書き換えない (ユーザーが持ち込んだ語)。
+        self._query = query or ""
 
     @classmethod
     def _could_still_match(cls, buf: str) -> bool:
         """バッファがまだ枠名への言及になりうるか。"""
+        if buf[:1] in FRAME_HEADING_OPENERS:
+            # 括弧でくくった見出し名 (「[関連する記憶]」「［参考情報 2］」)。閉じる
+            # 前は、見出し名の途中か、見出し名 + 番号までなら待つ。
+            inner = buf[1:].lstrip(" 　")
+            for name in INTERNAL_FRAME_HEADINGS:
+                if name.startswith(inner):
+                    return True
+                if inner.startswith(name) and _HEADING_NUMBER_TAIL_RE.fullmatch(
+                    inner[len(name):],
+                ):
+                    return True
+            return False
         body = buf.lstrip("（(")
         if not body:
             return True
@@ -808,45 +840,89 @@ class InternalFrameMentionFilter:
 
     def _trigger_index(self, text: str) -> int | None:
         for i, ch in enumerate(text):
-            if ch in self._OPEN_PARENS or ch in _FRAME_WORD_PREFIXES:
+            if (
+                ch in self._OPEN_PARENS
+                or ch in _FRAME_WORD_PREFIXES
+                or ch in FRAME_HEADING_OPENERS
+            ):
                 return i
         return None
+
+    @staticmethod
+    def _mention_end(buf: str, *, final: bool) -> int | None:
+        """``buf`` の先頭から始まる言及が閉じていればその終わり。
+
+        ``-1`` は「閉じたが次の 1 文字を見ないと決められない」(``]`` の直後が
+        ``(`` なら Markdown のリンクで言い換えない)。
+        """
+        for pattern in (_INTERNAL_FRAME_PAREN_RE, _INTERNAL_FRAME_CLAUSE_RE):
+            m = pattern.match(buf)
+            if m is not None and m.end() > 0:
+                return m.end()
+        m = FRAME_HEADING_RE.match(buf)
+        if m is None:
+            return None
+        if m.end() == len(buf) and not final and buf[-1:] == "]":
+            return -1
+        return m.end()
+
+    def _drain(self, pending: str, *, final: bool) -> str:
+        """``pending`` を起点ごとに走査して、出してよい本文を返す。
+
+        見出しにならないと分かったバッファは **先頭の 1 文字だけ** 吐き、残りを
+        次の起点から走査し直す — 全体を吐くと、同じ塊の後ろにある見出し
+        (「ご参加の[」+「関連する記憶]は」) を見落とす (独立レビュー M1)。
+        """
+        out: list[str] = []
+        while pending:
+            idx = self._trigger_index(pending)
+            if idx is None:
+                out.append(pending)
+                break
+            out.append(pending[:idx])
+            buf, pending = pending[idx:], ""
+            end = self._mention_end(buf, final=final)
+            if end == -1:
+                self._buffer = buf
+                break
+            if end is not None:
+                head = buf[:end]
+                cleaned = strip_internal_frame_mentions(
+                    head, context=self._emitted + "".join(out), query=self._query,
+                )
+                if cleaned != head:
+                    record_verifier_hit("internal_frame")
+                    logger.info(
+                        "InternalFrameMentionFilter: removed a mention of the "
+                        "internal evidence frame from the visible answer",
+                    )
+                out.append(cleaned)
+                pending = buf[end:]
+                continue
+            if (
+                not final
+                and self._could_still_match(buf)
+                and len(buf) < self._MAX_BUFFER_CHARS
+            ):
+                self._buffer = buf
+                break
+            out.append(buf[0])
+            pending = buf[1:]
+        text = "".join(out)
+        self._emitted += text
+        return text
 
     def process(self, text: str) -> str:
         if not text:
             return ""
-        if not self._buffer:
-            idx = self._trigger_index(text)
-            if idx is None:
-                return text
-            head, self._buffer = text[:idx], text[idx:]
-        else:
-            head = ""
-            self._buffer += text
-        cleaned = strip_internal_frame_mentions(self._buffer)
-        if cleaned != self._buffer:
-            # 表記が閉じた。除去後を出して、続きは素通しに戻す。
-            record_verifier_hit("internal_frame")
-            logger.info(
-                "InternalFrameMentionFilter: removed a mention of the internal "
-                "evidence frame from the visible answer",
-            )
-            self._buffer = ""
-            return head + cleaned
-        if (
-            not self._could_still_match(self._buffer)
-            or len(self._buffer) >= self._MAX_BUFFER_CHARS
-        ):
-            out, self._buffer = self._buffer, ""
-            return head + out
-        return head
+        pending, self._buffer = self._buffer + text, ""
+        return self._drain(pending, final=False)
 
     def flush(self) -> str:
         if not self._buffer:
             return ""
-        out = strip_internal_frame_mentions(self._buffer)
-        self._buffer = ""
-        return out
+        pending, self._buffer = self._buffer, ""
+        return self._drain(pending, final=True)
 
 
 class LengthDisclosureFilter:

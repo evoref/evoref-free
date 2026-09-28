@@ -194,7 +194,9 @@ def select_prompt_eval_cases(
                     kind=CASE_KIND_USER_NEGATIVE,
                     hint=str(signals.get("user_note") or "").strip(),
                 )
-            elif signals.get("turn_outcome") == "failed":
+            elif signals.get("turn_outcome") == "failed" and not signals.get("long_form_used"):
+                # 長文の失敗 (検証落ち等) は、system prompt だけで短く再生成するこの
+                # ゲートでは再現できず枠を無駄にする (docs/f_04 §2.5)。
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query, kind=CASE_KIND_FAILED,
                 )

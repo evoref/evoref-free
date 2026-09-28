@@ -594,6 +594,14 @@ class SleepTimeScheduler:
         全滅し、前倒し要求はそのまま消費された)。再要求は **1 回だけ** —
         空振りが続く間に繰り返すと会話中ずっと前倒しし続ける。1 件でも検証
         できたら (または待ちが無くなったら) 再要求の権利を戻す。
+
+        再要求を使い切った後でも、静穏窓で見送った候補が残ったら **前倒しでない
+        通常の** 待機を張り直す (待機は :meth:`_full_wait_seconds` が静穏窓の少し
+        後まで縮める)。前倒しの Full は前の応答の 30 秒後に起きるので静穏窓の内側で
+        見送りやすく、張り直さないと次の応答まで誰もタイマーを張らない
+        (2026-09-28 実機 R11: 再要求済みの Full が 3 回見送り、30 分の離席でも
+        Full が走らず検証 0 件)。通常の待機は次の入力で消え次の応答で張り直される
+        ので、会話中に割り込まない。
         """
         if not isinstance(result, dict):
             return
@@ -603,27 +611,36 @@ class SleepTimeScheduler:
             return
         # 静穏窓で見送った件数は死活監視の母数外なので別キーで来る。
         deferred = result.get("corrections_deferred")
-        if isinstance(deferred, int):
-            pending += deferred
+        if not isinstance(deferred, int):
+            deferred = 0
+        pending += deferred
         self._verification_waiting = pending > 0 and verified == 0
         if pending <= 0 or verified > 0:
             self._corrections_rerequested = False
             return
         if self._corrections_rerequested:
+            if deferred > 0:
+                self._arm_full_soon()
             return
         self._corrections_rerequested = True
         self.request_full_soon("unverified_corrections")
         # フラグだけだと次の応答が来るまで誰もタイマーを張らず、離席中は Full が
         # 走らない。この Full のタスクが終わった直後に待機タスクを張り直す
         # (``on_response_sent`` と同じ ``_schedule_full``)。
+        self._arm_full_soon()
+
+    def _arm_full_soon(self) -> None:
+        """いま走っている Full のタスクが終わった直後に待機タスクを張る。"""
         try:
-            asyncio.get_running_loop().call_soon(self._arm_requested_full)
+            asyncio.get_running_loop().call_soon(self._arm_pending_full)
         except RuntimeError:  # イベントループ外 (同期テスト等) では次の応答に任せる
             pass
 
-    def _arm_requested_full(self) -> None:
-        """前倒し要求済みの Full の待機タスクを張る (既に待機中なら何もしない)。"""
-        if self._worker is None or not self._full_requested:
+    def _arm_pending_full(self) -> None:
+        """前倒し要求 / 検証待ちの Full の待機タスクを張る (既に待機中なら何もしない)。"""
+        if self._worker is None:
+            return
+        if not (self._full_requested or self._verification_waiting):
             return
         if self._full_task is not None and not self._full_task.done():
             return

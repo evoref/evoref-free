@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +65,9 @@ DEFAULT_FAILURE_RATE_THRESHOLD = 0.3
 
 DEFAULT_SUCCESS_RATE_THRESHOLD = 0.7
 """``policy.runtime_observed`` を発火する success_rate の下限 (>=)。"""
+
+_POLICY_COALESCE_SEC = 1.0
+"""同じ subject の policy をこの秒数未満で書き直さない (同じ秒の連続置換をまとめる)。"""
 
 DEFAULT_DECAY_FACTOR = 0.5
 """flush 後に bucket カウンタを残す割合 (0.5 = 半減)。これにより同一パター
@@ -250,6 +254,7 @@ class PolicyAdjuster:
         success_rate_threshold: float = DEFAULT_SUCCESS_RATE_THRESHOLD,
         decay_factor: float = DEFAULT_DECAY_FACTOR,
         scope: str = "global",
+        now_provider: Callable[[], float] | None = None,
     ) -> None:
         if min_samples <= 0:
             raise ValueError(f"min_samples must be positive, got {min_samples}")
@@ -273,6 +278,7 @@ class PolicyAdjuster:
         self.success_rate_threshold = success_rate_threshold
         self.decay_factor = decay_factor
         self.scope = scope
+        self._now = now_provider or time.time
         # base 学習パーティションの active モデルスラグ。空 = レガシー subject。
         self._base_model_id: str = ""
 
@@ -283,6 +289,7 @@ class PolicyAdjuster:
             "consumed": 0,
             "orphans_seen": 0,
             "policy_emitted": 0,
+            "policy_coalesced": 0,
             "failure_pattern_emitted": 0,
             "skipped_no_decision_point": 0,
         }
@@ -373,14 +380,15 @@ class PolicyAdjuster:
         bucket を確実に書き出す」役割を果たす。
         """
         for bucket in list(self._buckets.values()):
-            await self._maybe_emit(bucket)
+            # 見送った観測を残さないため、同じ秒の置換のまとめは掛けない (M10)。
+            await self._maybe_emit(bucket, force=True)
 
     # ------------------------------------------------------------------
     # 内部実装
     # ------------------------------------------------------------------
 
-    async def _maybe_emit(self, bucket: _Bucket) -> None:
-        """閾値判定 + emit + decay の一連処理。"""
+    async def _maybe_emit(self, bucket: _Bucket, *, force: bool = False) -> None:
+        """閾値判定 + emit + decay の一連処理。``force`` は同じ秒のまとめを掛けない。"""
         if bucket.samples < self.min_samples:
             return
 
@@ -394,8 +402,9 @@ class PolicyAdjuster:
             await self._emit_failure_pattern(bucket)
             emitted = True
         elif bucket.success_rate >= self.success_rate_threshold:
-            await self._emit_policy(bucket)
-            emitted = True
+            # 同じ秒の連続置換はまとめる — 見送った回はバケットを減衰させず、
+            # 観測を次の書込み (または flush_all) に載せる (M10)。
+            emitted = await self._emit_policy(bucket, force=force)
 
         if emitted:
             self._decay_bucket(bucket)
@@ -439,7 +448,14 @@ class PolicyAdjuster:
                 )
         self._stats["failure_pattern_emitted"] += 1
 
-    async def _emit_policy(self, bucket: _Bucket) -> None:
+    async def _emit_policy(self, bucket: _Bucket, *, force: bool = False) -> bool:
+        """runtime_observed policy を書く。書いたら ``True``、同じ秒の置換を見送ったら ``False``。
+
+        同じ subject の live な policy が :data:`_POLICY_COALESCE_SEC` 未満前に
+        書かれていれば新しい世代を積まない。1 回のサイクルで同じ subject を 2〜3 世代
+        連続で supersede しており、作られたファクト 103 件のうち 44 件がこの policy
+        だった (2026-09-27 監査 M10)。書き込み失敗は従来どおり書いた扱い (減衰する)。
+        """
         subject = make_runtime_observed_subject(
             bucket.decision_point, bucket.chosen,
             base_model_id=self._base_model_id,
@@ -453,6 +469,14 @@ class PolicyAdjuster:
                 "find_active_policy_by_subject failed for %s: %s", subject, exc,
             )
             existing = None
+        now = float(self._now())
+        if (
+            not force
+            and existing is not None
+            and now - float(existing.created_at or 0.0) < _POLICY_COALESCE_SEC
+        ):
+            self._stats["policy_coalesced"] += 1
+            return False
         try:
             new_fact = self.learn_view.write_policy(
                 subject=subject,
@@ -463,10 +487,11 @@ class PolicyAdjuster:
                 mode_origin=normalize_session_mode(bucket.last_mode),  # type: ignore[arg-type]
                 auto_evolved=True,
                 trace_id=bucket.last_trace_id or None,
+                now=now,
             )
         except Exception as exc:
             logger.warning("write_policy failed for %s: %s", subject, exc)
-            return
+            return True
         if existing is not None:
             try:
                 self.learn_view.supersede_policy(
@@ -475,6 +500,7 @@ class PolicyAdjuster:
             except Exception as exc:
                 logger.warning("supersede_policy failed: %s", exc)
         self._stats["policy_emitted"] += 1
+        return True
 
     def _build_payload(self, bucket: _Bucket, *, kind: str) -> str:
         """SemanticFact.object に格納する JSON ペイロードを構築する。"""

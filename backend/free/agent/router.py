@@ -36,7 +36,15 @@ from backend.free.core.intent_vocab import (
     is_practice_advice_query,
     looks_like_numeric_question,
     PREMISE_CONFIRMATION_RE,
+    FILE_REFERENCE_CLAUSE_PATTERN,
+    saves_previous_answer,
 )
+from backend.free.agent.file_reference_gate import (
+    LOCATE_LABEL,
+    WRITE_LABEL,
+    recent_file_reference_rule,
+)
+from backend.free.core.predicate import NEGATIVE_LABEL, Verdict
 from backend.free.core.session_mode import is_chat_mode, is_create_mode
 from backend.free.core.text_quality import count_belongs_to_another_subject
 from backend.free.document_nouns import (
@@ -45,6 +53,7 @@ from backend.free.document_nouns import (
     DOCUMENT_NOUNS_NEEDS_SUFFIX_EN,
     DOCUMENT_NOUNS_STANDALONE,
     DOCUMENT_NOUNS_STANDALONE_EN,
+    WRITE_VERB_STEM_JA,
 )
 from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
@@ -59,6 +68,9 @@ if TYPE_CHECKING:
     from backend.free.core.policy_interpreter import PolicyInterpreter
 
 logger = get_logger("agent.router")
+
+#: 文書名詞の直後に名指しされたファイル名 (「設計書 DESIGN.md を」)。
+_NAMED_FILE_AFTER_NOUN = r"(?:\s*[\w.\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(?![A-Za-z0-9]))?\s*"
 
 # 長文生成リクエスト検出パターン（設計書 f_03 §1.2）
 # 名詞群・動詞群の語彙拡張時は f_03 §1.2 の表も同時更新すること。
@@ -99,9 +111,13 @@ LONG_FORM_PATTERNS = [
     # (i) I-04。前回の「見積書」は名詞リストに無く素通りしただけ)。
     # 「提案書を来週までにまとめて」(を 1 つ) / 「README を参考に手順書を
     # 作成して」(後ろの名詞で 1 つ) は従来どおり採る。
+    #
+    # 文書名詞の後にファイル名を挟む形 (「システム設計書 DESIGN.md を作成して」
+    # 「仕様書 SPEC.md を作成して」) も同じ依頼。「書」を活用形に限る前は名詞
+    # 「設計書」の「書」で偶然当たっていた (2026-09-27 レビュー L3)。
     re.compile(
         rf"({'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
-        r"(?:を)?[^を]*((?<!箇条)(?<!横)(?<!縦)書|作成|生成|出力)",
+        rf"{_NAMED_FILE_AFTER_NOUN}(?:を)?[^を]*((?<!箇条)(?<!横)(?<!縦){WRITE_VERB_STEM_JA}|作成|生成|出力)",
     ),
     re.compile(
         r"^(?!.*(?:要約|要点|読んで|整理))"
@@ -140,7 +156,7 @@ LONG_FORM_PATTERNS = [
 #: 同じ形。
 _LEARNED_LONG_FORM_OBJECT_RE = re.compile(
     rf"(?:{'|'.join(DOCUMENT_NOUN_LEARNABLE_JA)})"
-    r"(?:を)?[^を]*(?:(?<!箇条)(?<!横)(?<!縦)書|作成|生成|出力|まとめ)",
+    rf"{_NAMED_FILE_AFTER_NOUN}(?:を)?[^を]*(?:(?<!箇条)(?<!横)(?<!縦){WRITE_VERB_STEM_JA}|作成|生成|出力|まとめ)",
 )
 
 # LONG_FORM_PATTERNS の英語版。GUI locale に関わらず LONG_FORM_PATTERNS と
@@ -242,12 +258,18 @@ _WRITE_VERB_RE = re.compile(
 # 動作ではない。``書[きい]`` が ``書いてある`` の ``書い`` に一致するため、
 # 裸のファイル名を書込み先として認めるようにすると
 # 「notes.txt に書いてある内容を見せて」が書込み依頼に化ける。
+#
+# 過去の操作 + 対象の名詞 (説明節) は ``intent_vocab.FILE_REFERENCE_CLAUSE_PATTERN``
+# が SSOT (docs/c_17 §3.5.1)。file_ledger / tool_judge_referential /
+# REFERENTIAL_WRITE_TARGET_RE も同じ部品を合成する — 2026-09-27 に「保存して
+# おいた」「作成していただいた」「保存済みの」がここにだけ無く、読み手ごとに
+# 判定が割れていた。説明節を **宛先にするか** はここでは決めず、判定点
+# ``recent_file_reference`` が格と動詞で決める (「説明節 + に」を素朴に宛先に
+# すると「保存したファイルにある表を CSV に書き出して」で保存済みファイルを
+# 上書きする)。状態の説明 (書いてある) と英語はルータだけの上乗せ。
 _DESCRIPTIVE_WRITE_CLAUSE_RE = re.compile(
-    r"(?:書[きい]た|作成した|作った|生成した|保存した|出力した|書き込んだ)"
-    r"\s*(?:ばかりの?|ところの?)?"
-    r"\s*(?:その|この|あの|先ほどの?|さっきの?)?"
-    r"\s*(?:ファイル|もの|やつ|データ|内容|中身)"
-    r"|書いてあ|書かれて|書いてる"
+    FILE_REFERENCE_CLAUSE_PATTERN
+    + r"|書いてあ|書かれて|書いてる"
     r"|(?:you\s+(?:just\s+)?(?:wrote|created|saved|generated))",
     re.IGNORECASE,
 )
@@ -1070,6 +1092,13 @@ class _ClassifyContext:
     def is_long_form_candidate(self) -> bool:
         return self._memo("lf", lambda: self._c._detect_long_form(self.query))
 
+    @property
+    def file_reference_label(self) -> str | None:
+        """判定点 ``recent_file_reference`` の値 (``None`` は棄権、不発は ``NEGATIVE_LABEL``)。"""
+        return self._memo(
+            "fr", lambda: self._c._file_reference_label(self.query, self.mode),
+        )
+
 
 @dataclass(frozen=True)
 class _ClassifyRule:
@@ -1097,6 +1126,29 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
     _ClassifyRule(
         "url_write_intent", _META,
         lambda c, x: c._is_url_write_intent(x.query, x.mode),
+    ),
+    # 直近ファイルへの参照 (「保存したファイルに追記して」「保存したファイルの
+    # 場所を教えて」) は判定点 ``recent_file_reference`` が決める (docs/f_03 §1.6
+    # / c_17 §3.11)。説明節は ``write_intent_probe`` が宛先の証拠ごと消すので、
+    # 後段の local_write_intent には届かない (2026-09-27 監査 F5: C05#5 が
+    # deliberative に落ちて「追記するツールが利用できない」と答えた)。
+    _ClassifyRule(
+        "recent_file_write", _META,
+        lambda c, x: x.file_reference_label == WRITE_LABEL,
+    ),
+    # 決めきれない参照 (「保存したファイルにある表を CSV に書き出して」「私が
+    # 保存したファイルに追記して」) は **実行せず** 対象と操作を確認する
+    # (deliberative の確認注記)。長文生成・書込み経路へは回さない。
+    _ClassifyRule(
+        "recent_file_unclear", "deliberative",
+        lambda c, x: x.file_reference_label is None,
+    ),
+    # 所在の問いは台帳のパスを事実として注入する deliberative へ。短い問い
+    # (「そのファイルはどこ？」) を short_query → reactive に落とすと台帳も
+    # 記憶も見ない (F7)。
+    _ClassifyRule(
+        "recent_file_location", "deliberative",
+        lambda c, x: x.file_reference_label == LOCATE_LABEL,
     ),
     # 表形式データ出力先 (.csv/.tsv/.xlsx/.ods) はユニット分割の散文生成が
     # 構造を壊すため long_form を抑止して write-fast 経路へ落とす
@@ -1368,6 +1420,9 @@ class ComplexityClassifier:
     #: 持たせるのは、判定メソッドを ``__new__`` で組み立てた素のインスタンス
     #: から呼ぶテストがあるため (純粋関数に近い面を直接突く形)。
     _write_intent_hint: bool | None = None
+    #: 判定点 ``recent_file_reference`` の結果 (``classify`` の引数で受ける)。
+    #: ``None`` なら字句段を記録なしで引く。
+    _file_reference: Verdict | None = None
 
     def __init__(
         self,
@@ -1392,6 +1447,7 @@ class ComplexityClassifier:
         mode: str = "chat",
         context: str | Callable[[], str] = "",
         write_intent_hint: bool | None = None,
+        file_reference: Verdict | None = None,
     ) -> str:
         """クエリの複雑度を分類する
 
@@ -1410,6 +1466,10 @@ class ComplexityClassifier:
         ``context`` は文字列か、それを返す callable (遅延評価)。消費するのは
         numeric_question ルールだけなので、そこへ到達しない呼出では組み立てない。
 
+        ``file_reference`` は判定点 ``recent_file_reference`` の結果 (chat.py が
+        ターンに 1 回評価して記録し、``output_target`` と共有する)。渡されない
+        呼出では字句段を記録なしで引く (同じ規則なので結果は変わらない)。
+
         Returns:
             "reactive" | "deliberative" | "meta_cognitive"
         """
@@ -1417,6 +1477,7 @@ class ComplexityClassifier:
         self._classify_mode = mode
         self._last_classify_reason = "default"
         self._write_intent_hint = write_intent_hint
+        self._file_reference = file_reference
 
         ctx = _ClassifyContext(self, query, mode, context)
         for rule in _CLASSIFY_RULES:
@@ -1582,6 +1643,17 @@ class ComplexityClassifier:
         # プランを組むのに output_target は chat、あるいはその逆になる。
         return write_destination_evidence(probe)
 
+    def _file_reference_label(self, query: str, mode: str = "chat") -> str | None:
+        """判定点 ``recent_file_reference`` の値 (chat モードのみ。棄権は ``None``)。"""
+        if not is_chat_mode(mode):
+            return NEGATIVE_LABEL
+        verdict = self._file_reference
+        if verdict is None:
+            verdict = recent_file_reference_rule(query)
+        if verdict.band == "abstain":
+            return None
+        return str(verdict.value) if verdict.band == "fire" else NEGATIVE_LABEL
+
     def _is_tabular_write_intent(self, query: str, mode: str = "chat") -> bool:
         """表形式データ (.csv/.tsv/.xlsx/.ods) のローカル書出し意図を検出する。
 
@@ -1623,6 +1695,14 @@ class ComplexityClassifier:
             _PRIOR_ARTIFACT_REF_RE.search(query)
             and _WRITE_TO_FILE_VERB_RE.search(query)
         ):
+            return False
+        # 「その議事録を … として保存して」型 — 既出の成果物をそのまま保存・
+        # 書き出す依頼も、書くべき本文は直前の応答にある。長文生成は会話を
+        # 持たないので作り直すと捏造になる (2026-09-27 監査 C07#2: 153 字の
+        # 議事録を保存させたら turn1 に無い議事録が書かれた)。write-fast の
+        # 素材探し (previous_answer_write_content) と同じ 1 本で判定する
+        # (docs/f_03 §1.2 / c_17 §3.6)。
+        if saves_previous_answer(query):
             return False
         # 「見出しだけ並べて」型は既出成果物の抽出であって生成ではない。
         if _EXTRACTION_REQUEST_RE.search(query):

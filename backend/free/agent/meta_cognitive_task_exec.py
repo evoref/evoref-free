@@ -140,15 +140,17 @@ def explicit_query_dirs(query: str) -> list[tuple[Path, bool]]:
       区切れない表記 (``E:\\tmp\\newフォルダに``) は ASCII のセグメントだけを取る (``_DIR_PATH_RE``)
     - ファイルのパス → その親 (入力ファイルでありうるので出力先の候補にはしない)
 
+    - 英文の手前の空白で切った名前 (``Q:\\projects\\new app`` → ``new``) → 出力先の候補に加えて、
+      その親を出力先ではない根として足す (切らない読み方も配信先・書込みの門が覆う)
+
+    パスの末尾の境界 (文末の ``.`` / 空白の後の地の文 / 括られた空白入りの名前) は
+    ``iter_drive_dir_paths`` が決める (f_03 §4.x)。
+
     書込み先の確定 (``_resolve_write_path_from_query``) と配信先の根 (:func:`delivery_roots`) が
     共有する部品。以前は実在するディレクトリしか見ず、未作成の出力フォルダの名指しのファイルが
     ``outputs_dir`` へ落ちて配信で拒否された (独立レビュー 2026-09-26)。
     """
-    from backend.free.agent.tool_judge_args import (
-        _DIR_PATH_RE,
-        _normalize_path_separators,
-        _trim_nonexistent_path_tail,
-    )
+    from backend.free.agent.tool_judge_args import iter_drive_dir_paths
 
     found: list[tuple[int, Path, bool]] = []
     for m in EXPLICIT_WINDOWS_PATH_RE.finditer(query or ""):
@@ -160,12 +162,11 @@ def explicit_query_dirs(query: str) -> list[tuple[Path, bool]]:
                 found.append((m.start(), candidate.parent, False))
         except OSError:
             continue
-    for m in _DIR_PATH_RE.finditer(query or ""):
-        if m.end() < len(query) and query[m.end()] in "\\/":
+    for drive_path in iter_drive_dir_paths(query or ""):
+        start, end = drive_path.start, drive_path.end
+        if end < len(query) and query[end] in "\\/":
             continue  # 非 ASCII のセグメントの手前で切れた接頭辞
-        candidate = Path(_trim_nonexistent_path_tail(
-            _normalize_path_separators(m.group(1).rstrip()).rstrip("\\/"),
-        ))
+        candidate = Path(drive_path.path.rstrip("\\/"))
         if len(candidate.parts) <= 1:
             continue  # ドライブ直下だけ
         try:
@@ -173,9 +174,13 @@ def explicit_query_dirs(query: str) -> list[tuple[Path, bool]]:
         except OSError:
             is_dir = False
         if is_dir or not candidate.suffix:
-            found.append((m.start(), candidate, True))
+            found.append((start, candidate, True))
+            if drive_path.ambiguous and len(candidate.parent.parts) > 1:
+                # 英文の手前の空白で切った名前 (``new app`` → ``new``)。切らない読み方も
+                # ありうるので、親を出力先ではない根として足し、配信先・書込みの門が両方を覆う。
+                found.append((start, candidate.parent, False))
         else:
-            found.append((m.start(), candidate.parent, False))
+            found.append((start, candidate.parent, False))
     out: list[tuple[Path, bool]] = []
     for _pos, path, is_output in sorted(found, key=lambda item: item[0]):
         seen = next((i for i, (p, _) in enumerate(out) if p == path), None)

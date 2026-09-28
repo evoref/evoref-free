@@ -700,6 +700,12 @@ def _init_learning_core(
 
     aux_prompt_mgr = AuxPromptManager(aux_prompt_dir)
     state.aux_prompt_manager = aux_prompt_mgr
+
+    # 経験・プロンプトの置き場を「その生成を返したモデル」で決める (f_04 §1.2.0)。
+    # モード切替で束ね直さず、書込み・読込みのたびに解決する。
+    from backend.factory._learning_rebind import wire_generating_partitions
+
+    wire_generating_partitions(state, resolver)
     logger.info(
         "AuxPromptManager initialized: %d tasks loaded",
         len(aux_prompt_mgr.contents),
@@ -2441,10 +2447,25 @@ async def _build_learn_pillar(
 
     create_target_gate.bind_debug_logger(debug_logger)
 
+    # 直近ファイルへの参照の判定点 (c_17 §3.11) も字句段だけ。
+    from backend.free.agent import file_reference_gate
+
+    file_reference_gate.bind_debug_logger(debug_logger)
+
+    # 「2つ目に教えてもらった」が N 番目の回答を指すかの判定点 (c_17 §3.12) も字句段だけ。
+    from backend.free.agent import session_answer_gate
+
+    session_answer_gate.bind_debug_logger(debug_logger)
+
     # 文書テンプレートの選択判定 (c_16 §4.5.2 / c_17 §3.8) も字句段だけ。
     from backend.free.api.chat import _template_select
 
     _template_select.bind_debug_logger(debug_logger)
+
+    # create の名指しのデータファイルが用意の対象か (f_10 §11.1-1 / c_17 §3.10) も字句段だけ。
+    from backend.free.generation import requested_data_file
+
+    requested_data_file.bind_debug_logger(debug_logger)
 
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(

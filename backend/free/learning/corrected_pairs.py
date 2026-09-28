@@ -43,6 +43,7 @@ from backend.free.core.intent_vocab import (
     asks_quantity_without_operands,
     is_plain_statement,
 )
+from backend.free.learning.level0_instant import is_unlabeled, teaches_via_verified_correction
 
 #: 訂正後の回答の先頭に付く謝罪・受諾の前置き。1 文単位で繰り返し剥がす。
 _PREAMBLE_SENTENCE_RE = re.compile(
@@ -155,11 +156,17 @@ class CorrectedPair:
 
 
 def grounding_is_suspect(signals: dict) -> bool:
-    """根拠台帳 (``FeedbackSignals``) に接地の疑義があるか。未判定 (None) は疑わない。"""
+    """根拠台帳 (``FeedbackSignals``) に接地の疑義があるか。未判定 (None) は疑わない。
+
+    ラベル無し (理由付きの success、docs/f_04 §2.5 — 未実行の変更操作・create の
+    未検査を含む) も疑う: 訂正ペアとして手本にはしてよいが、eval_core の期待値には
+    しない。
+    """
     return bool(
         signals.get("unexplained_numbers")
         or signals.get("expression_issues")
         or signals.get("unexplained_date_math")
+        or is_unlabeled(signals)
     )
 
 
@@ -361,7 +368,8 @@ def build_corrected_pairs(
     (``turn_outcome == "failed"``: 算術矛盾 / 出力破損 / 制約違反) は手本にも
     評価ケースにもしない。訂正で 1 つ直しても別の欠陥を持ち込んだ回答を
     「正しい回答」として再生産すると、few-shot が壊れた形を増幅する
-    (2026-09-06 監査 F-05)。
+    (2026-09-06 監査 F-05)。ラベル無しの訂正ターンはペアにする (手本は検証済みの
+    訂正) が ``grounding_suspect`` にして eval_core へは渡さない (docs/f_04 §2.5)。
     """
     pairs: dict[str, CorrectedPair] = {}
     scoped = [
@@ -370,12 +378,11 @@ def build_corrected_pairs(
     ]
     for i, exp in enumerate(scoped):
         signals = exp.get("signals") or {}
+        # 検証済みの訂正で、訂正ターン自身が failed でない (ラベル無しは可、f_04 §2.5)
+        if not teaches_via_verified_correction(signals):
+            continue
         correction = signals.get("user_correction")
-        if not correction:
-            continue
         if signals.get("truncated", False):
-            continue
-        if signals.get("turn_outcome") == "failed":
             continue
         prev = resolve_corrected_turn(scoped, i)
         if prev is None:

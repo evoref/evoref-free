@@ -50,6 +50,21 @@ class ModelMetadata:
         return estimate_params_b(self.model_id)
 
 
+def served_model_of(client: object) -> str:
+    """クライアントの llama-server が載せているモデル (``/props``。無ければ空文字)。
+
+    ``model_path`` を優先し、空なら ``model_id`` (alias の場合もある)。学習データの
+    置き場 (``PathResolver.generating_model_key``) と served_model の照合がこの 1 本を
+    共有する — 経験と aux 較正が別々の根拠で別のパーティションへ分かれないように。
+    """
+    metadata = getattr(client, "metadata", None) if client is not None else None
+    for name in ("model_path", "model_id"):
+        value = getattr(metadata, name, "") if metadata is not None else ""
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def detect_template_family(chat_template: str) -> TemplateFamily:
     """chat_template 文字列からテンプレート系統を推定する
 

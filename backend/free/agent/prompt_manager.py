@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -438,7 +440,77 @@ class SystemPromptManager:
         #: ようにする (f_03 §7.1.3 #1)。採用は背景タスクから来るので鍵を掛ける。
         self._frozen: OrderedDict[tuple[str, str], tuple[str, int, str]] = OrderedDict()
         self._frozen_lock = threading.Lock()
+        #: mode → そのターンを生成するモデルのプロンプト置き場 (f_04 §1.2.0)。
+        #: 未設定なら常に自分 (``prompt_dir``)。
+        self._turn_dir: Callable[[str], Path | None] | None = None
+        #: mode → そのモードが宣言するモデルのプロンプト置き場 (UI の読み書き)。
+        self._mode_dir: Callable[[str], Path | None] | None = None
+        #: 自分以外のパーティションのマネージャ (正規化したパス → マネージャ)。
+        self._partition_managers: dict[str, SystemPromptManager] = {}
         self._load_all()
+
+    def set_turn_prompt_dir(self, resolve: Callable[[str], Path | None] | None) -> None:
+        """ターンの読み書きを、そのターンを生成するモデルのパーティションへ向ける。
+
+        ``resolve(mode)`` はそのモードのターンを生成するモデルのプロンプト置き場
+        (``learning/<model_key>/prompts``) を返す。自分の ``prompt_dir`` と違えば、
+        ターンの読み出し (:meth:`get_prompt_static` / :meth:`frozen_version` /
+        few-shot) と規則の計数 (:meth:`get_ledger` / :meth:`save_ledger_counts`) は
+        そのパーティションのマネージャへ回る。Level 1 と UI の読み書き
+        (``update_*`` / ``rollback`` / ``get_raw_prompt`` / ``get_meta``) は自分のまま。
+        """
+        self._turn_dir = resolve
+
+    def set_mode_prompt_dir(self, resolve: Callable[[str], Path | None] | None) -> None:
+        """UI の読み書き (:meth:`for_mode`) の置き場を、そのモードが宣言するモデルへ向ける。
+
+        ``resolve(mode)`` はそのモードのターンを生成する **はずの** モデル (chat は
+        base、create は create_model) のプロンプト置き場。いま載っているモデルでは
+        なく宣言で決める — chat 中に create のプロンプトを編集しても create の
+        ターンに効くように (2026-09-28 レビュー M4)。
+        """
+        self._mode_dir = resolve
+
+    def for_mode(self, mode: str) -> SystemPromptManager:
+        """``mode`` のターンが読むパーティションのマネージャ (UI の表示・編集用。同じなら自分)。"""
+        return self._resolve_manager(self._mode_dir, mode)
+
+    def _for_turn(self, mode: str) -> SystemPromptManager:
+        """``mode`` のターンを生成するモデルのパーティションのマネージャ (同じなら自分)。"""
+        return self._resolve_manager(self._turn_dir, mode)
+
+    def _resolve_manager(
+        self, resolve: Callable[[str], Path | None] | None, mode: str,
+    ) -> SystemPromptManager:
+        if resolve is None:
+            return self
+        try:
+            target = resolve(mode)
+        except Exception as exc:  # noqa: BLE001 — 解決できなければ自分の本文で続ける
+            logger.debug("prompt partition unavailable (mode=%s): %s", mode, exc)
+            return self
+        if target is None:
+            return self
+        return self.manager_for_dir(Path(target))
+
+    def manager_for_dir(self, prompt_dir: Path) -> SystemPromptManager:
+        """``prompt_dir`` のパーティションのマネージャ (自分の置き場なら自分)。
+
+        初回は既定プロンプトを書く (6 ファイル)。チャット経路で書かないよう、
+        宣言済みのモデルの分は配線時にここで作っておく (レビュー L3)。
+        few-shot の選択器は引き継がない — 手本はパーティションの学習データで、
+        プールは束ねたモデルの ``learn.fewshot.<model_key>`` にスコープされている
+        (f_04 §1.2.0、別モデルの手本を流用しない)。
+        """
+        key = os.path.normcase(os.path.abspath(prompt_dir))
+        if key == os.path.normcase(os.path.abspath(self.prompt_dir)):
+            return self
+        manager = self._partition_managers.get(key)
+        if manager is None:
+            manager = SystemPromptManager(Path(prompt_dir), instance_name=self.instance_name)
+            self._partition_managers[key] = manager
+            logger.info("Prompt partition of another model loaded: %s", prompt_dir)
+        return manager
 
     def set_fewshot_selector(
         self, selector: FewShotSelector | None, *, k: int = 3,
@@ -459,6 +531,8 @@ class SystemPromptManager:
         self.metas = {}
         # 旧パーティションの本文を新モデルのセッションへ持ち越さない
         self._drop_frozen()
+        # 旧 active のディレクトリを自分が書いていた間の写しを使わない (次に要るとき読み直す)
+        self._partition_managers.clear()
         self._load_all()
 
     def _current_locale(self) -> str:
@@ -539,6 +613,10 @@ class SystemPromptManager:
         return rendered
 
     def get_ledger(self, mode: str) -> Ledger:
+        """``mode`` の規則台帳 (ターンの計数に使う。生成するモデルのパーティションのもの)。"""
+        turn = self._for_turn(mode)
+        if turn is not self:
+            return turn.get_ledger(mode)
         if mode not in self.ledgers:
             raise ValueError(f"Unknown mode: {mode}")
         return self.ledgers[mode]
@@ -548,7 +626,12 @@ class SystemPromptManager:
 
         チャット経路 (毎ターンの規則の計数) から呼ばれるので、書き込みは書き手
         スレッドへ出す (c_05 §0.5.9)。台帳はその時点の複製を渡す。
+        置き場はそのターンを生成したモデルのパーティション (:meth:`get_ledger` と同じ)。
         """
+        turn = self._for_turn(mode)
+        if turn is not self:
+            turn.save_ledger_counts(mode)
+            return
         if mode not in self.ledgers:
             return
         from backend.io.writer_thread import default_writer
@@ -631,7 +714,13 @@ class SystemPromptManager:
 
         ``session_id`` を渡すと、そのセッションのそのモードで最初にレンダした
         本文を返し続ける (f_03 §7.1.3 #1)。進化の採用は次のセッションから効く。
+
+        本文はそのターンを生成するモデルのパーティションのもの (f_04 §1.2.0、
+        :meth:`set_turn_prompt_dir`)。
         """
+        turn = self._for_turn(mode)
+        if turn is not self:
+            return turn.get_prompt_static(mode, session_id)
         if mode not in self.contents:
             raise ValueError(f"Unknown mode: {mode}")
         if not session_id:
@@ -654,6 +743,17 @@ class SystemPromptManager:
                 self._frozen.popitem(last=False)
         return text
 
+    def get_active_prompt_static(self, mode: str) -> str:
+        """束ねた (active) パーティションの静的 system (Level 1 の評価用)。
+
+        :meth:`get_prompt_static` は載っているモデルのパーティションへ回るので、
+        Level 1 が active のデルタ・プロンプトを評価するときはこちらを使う
+        (2026-09-28 レビュー L4)。
+        """
+        if mode not in self.contents:
+            raise ValueError(f"Unknown mode: {mode}")
+        return self._render_static(mode)
+
     def frozen_version(self, mode: str, session_id: str) -> int | None:
         """そのセッションが凍結している本文の版 (凍結していなければ ``None``)。
 
@@ -661,6 +761,9 @@ class SystemPromptManager:
         刻むと、採用後も旧版で話し続けるセッションのターンが新しい版に帰属する
         (f_04 §4.5 の採用後監視が版で窓を切る)。
         """
+        turn = self._for_turn(mode)
+        if turn is not self:
+            return turn.frozen_version(mode, session_id)
         with self._frozen_lock:
             hit = self._frozen.get((session_id, mode))
         return hit[1] if hit is not None else None
@@ -744,7 +847,14 @@ class SystemPromptManager:
     def _resolve_fewshot(
         self, mode: str, query: str | None, query_vec=None,
     ) -> list[FewShotExample]:
-        """few-shot 例を解決する: 動的 selector 優先、無ければ凍結 candidates。"""
+        """few-shot 例を解決する: 動的 selector 優先、無ければ凍結 candidates。
+
+        手本はパーティションの学習データなので、そのターンを生成するモデルの
+        パーティションのマネージャから引く (選択器はそのマネージャに注入されたもの)。
+        """
+        turn = self._for_turn(mode)
+        if turn is not self:
+            return turn._resolve_fewshot(mode, query, query_vec)
         selector = self._fewshot_selector
         if query and selector is not None:
             try:

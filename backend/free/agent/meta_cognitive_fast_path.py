@@ -172,7 +172,14 @@ class _FastPathMixin:
         """書き込みタスクのファストパス実行"""
         # 出力先を確定 (ディレクトリ→output ファイル / bare 名→クエリ指定ディレクトリ配下)。
         # planner/judge が発明した CWD 相対の bare 名をユーザー指定の場所へ寄せる。
-        file_path = self._resolve_write_path(file_path, original_query)
+        # 直近ファイルの宛先 (判定点 recent_file_reference = write) は依頼が名指した
+        # ファイルとして扱い、名指しの無い既存ファイルの振り替えを掛けない
+        # (2026-09-28 レビュー H2: 「report.md にも」の名前へ振り替わった)。
+        recent_target = getattr(self, "_recent_file_target", "")
+        file_path = self._resolve_write_path(
+            file_path, original_query,
+            recent_target if recent_target and file_path == recent_target else "",
+        )
         logger.info("Write fast path: %s → %s", task.description[:60], file_path)
 
         async def _notify_generating() -> None:

@@ -8,8 +8,10 @@ from pydantic import BaseModel
 from backend.app_state import AppState, get_app_state
 from backend.free.api.model._prompt_helpers import (
     learning_running_error,
+    manager_for_mode,
     prompt_detail_dict,
     prompt_file_not_found_error,
+    prompt_partition_dict,
     prompt_summary_dict,
     require_prompt_manager,
     unknown_mode_error,
@@ -104,17 +106,21 @@ async def list_prompts(state: AppState = Depends(get_app_state)):
     """全モードのプロンプト一覧"""
     logger.debug("GET /api/prompts")
     mgr = require_prompt_manager(state)
-    return [
-        prompt_summary_dict(mode, mgr.get_meta(mode), mgr.get_raw_prompt(mode))
-        for mode in mgr.MODES
-    ]
+    rows = []
+    for mode in mgr.MODES:
+        sub = manager_for_mode(mgr, mode)
+        rows.append({
+            **prompt_summary_dict(mode, sub.get_meta(mode), sub.get_raw_prompt(mode)),
+            **prompt_partition_dict(sub, mode),
+        })
+    return rows
 
 
 @router.get("/{mode}")
 async def get_prompt(mode: str, state: AppState = Depends(get_app_state)):
-    """モード別プロンプト詳細"""
+    """モード別プロンプト詳細 (そのモードのターンが読むパーティションのもの)"""
     logger.debug("GET /api/prompts/%s", mode)
-    mgr = require_prompt_manager(state)
+    mgr = manager_for_mode(require_prompt_manager(state), mode)
 
     try:
         meta = mgr.get_meta(mode)
@@ -122,14 +128,14 @@ async def get_prompt(mode: str, state: AppState = Depends(get_app_state)):
     except ValueError:
         raise unknown_mode_error(mode)
 
-    return prompt_detail_dict(mode, meta, content)
+    return {**prompt_detail_dict(mode, meta, content), **prompt_partition_dict(mgr, mode)}
 
 
 @router.put("/{mode}")
 async def update_prompt(mode: str, body: PromptUpdateRequest, state: AppState = Depends(get_app_state)):
-    """プロンプト更新"""
+    """プロンプト更新 (そのモードのターンが読むパーティションへ、f_04 §1.2.0)"""
     logger.debug("PUT /api/prompts/%s: content_len=%d", mode, len(body.content))
-    mgr = require_prompt_manager(state)
+    mgr = manager_for_mode(require_prompt_manager(state), mode)
 
     try:
         mgr.update_manual(mode, body.content)
@@ -143,7 +149,7 @@ async def update_prompt(mode: str, body: PromptUpdateRequest, state: AppState = 
 async def reload_prompt(mode: str, state: AppState = Depends(get_app_state)):
     """ディスクから再読込み"""
     logger.debug("POST /api/prompts/%s/reload", mode)
-    mgr = require_prompt_manager(state)
+    mgr = manager_for_mode(require_prompt_manager(state), mode)
 
     try:
         mgr.reload(mode)
@@ -159,7 +165,7 @@ async def reload_prompt(mode: str, state: AppState = Depends(get_app_state)):
 async def get_history(mode: str, state: AppState = Depends(get_app_state)):
     """履歴一覧"""
     logger.debug("GET /api/prompts/%s/history", mode)
-    mgr = require_prompt_manager(state)
+    mgr = manager_for_mode(require_prompt_manager(state), mode)
 
     try:
         return mgr.get_history(mode)
@@ -171,7 +177,7 @@ async def get_history(mode: str, state: AppState = Depends(get_app_state)):
 async def rollback(mode: str, body: RollbackRequest, state: AppState = Depends(get_app_state)):
     """過去バージョンへのロールバック"""
     logger.debug("POST /api/prompts/%s/rollback: version=%d", mode, body.version)
-    mgr = require_prompt_manager(state)
+    mgr = manager_for_mode(require_prompt_manager(state), mode)
 
     try:
         mgr.rollback(mode, body.version)

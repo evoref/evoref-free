@@ -11,6 +11,7 @@ import ast
 import functools
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 from backend.log_config import get_logger
 
@@ -171,11 +172,121 @@ def _extract_search_pattern(query: str) -> str:
 #: ディレクトリとして ``"E:"`` を返していた — 実在しないパスであり、しかも
 #: ファイル要求がディレクトリ要求に化ける。ドライブ直下そのものを指す
 #: ``E:\`` は第 2 選択肢で拾う。
+#: セグメント内の空白は、直後が次のドライブレター (``X:``) なら取らない — 地の文を挟んだ
+#: 次のパス (``Copy Q:\in\data to Q:\out``) のドライブレターを飲み込み、2 つ目を失っていた。
+#: 最後のセグメントの空白と文末の ``.`` はここでは取りすぎてよく、境界は
+#: :func:`iter_drive_dir_paths` が決める。区切りの重複 (二重エスケープの ``E:\\\\xxx``) は
+#: 1 つの区切りとして受け、正規化は呼出側 (``_normalize_path_separators``) が行う。
+#: ドライブレターの左は英字でないこと — ``in Japanese:\\docs`` の ``e:\\docs`` を拾わない。
 _DIR_PATH_RE = re.compile(
-    r"([A-Za-z]:(?:[\\/][A-Za-z0-9_.][A-Za-z0-9_. -]*)+|[A-Za-z]:[\\/])",
+    r"(?<![A-Za-z])"
+    r"([A-Za-z]:(?:[\\/]+[A-Za-z0-9_.](?:[A-Za-z0-9_.-]| (?![A-Za-z]:))*)+|[A-Za-z]:[\\/])",
 )
 
-#: 括られた文字列がファイル名と言えるための拡張子 (末尾)。
+#: 丸ごと括られたドライブレター付きパス (``"…"`` / ``“…”`` / ``「…」`` / ``『…』`` / ``'…'``)。
+#: 中身は ``_DIR_PATH_RE`` と同じ ASCII に空白を足した文字に限る — 括りの中が和文
+#: (「E:\\tmp\\xに保存して」) なら発話の引用なので、括りを見ずに ``_DIR_PATH_RE`` の境界へ落とす。
+#: 開きの直後がドライブレターである形だけを見るので、英文の短縮形の ``'`` (``don't``) は括りにならない。
+_QUOTED_DRIVE_PATH_RE = re.compile("|".join(
+    f"{re.escape(open_q)}\\s*([A-Za-z]:(?:[\\\\/][A-Za-z0-9_. -]*)+){re.escape(close_q)}"
+    for open_q, close_q in (*_QUOTE_PAIRS, _SINGLE_QUOTE_PAIR)
+))
+
+#: 空白入りの名前の実在を確かめる語数の上限 (最後のセグメント)。長い英文が続いても
+#: ファイルシステムへの問い合わせを語数ぶん撃たない。
+_EXISTING_NAME_MAX_WORDS = 8
+
+
+class DrivePath(NamedTuple):
+    """依頼文のドライブレター付きパス 1 件 (:func:`iter_drive_dir_paths`)。"""
+
+    start: int
+    #: 括りなら閉じ記号の後、括り無しなら ``_DIR_PATH_RE`` の一致の終わり
+    #: (直後の文字で「非 ASCII のセグメントの手前で切れた」を見分ける呼出側がある)。
+    end: int
+    path: str
+    #: 最後のセグメントを英文の手前の空白で切った (``new app`` → ``new``)。切らない読み方も
+    #: ありうるので、配信先の根は親まで広げて両方を覆う (``explicit_query_dirs``)。
+    ambiguous: bool
+
+
+def _dir_path_boundary(raw: str, following: str) -> tuple[str, bool]:
+    """引用符の無いパス (``_DIR_PATH_RE`` の一致) の末尾の境界を構造で決める (f_03 §4.x)。
+
+    ``following`` は一致の直後の文字列。戻り値は ``(パス, 曖昧か)``。最後のセグメントに空白が
+    あるときだけ判断が要り、上から順に:
+
+    1. 直後 (空白を飛ばした次の文字) が非 ASCII (和文) → 空白入りのセグメントを丸ごと受ける
+       (``E:\\tmp\\my app フォルダに`` / ``E:\\tmp\\My Report.docx に保存して``)。
+    2. 空白入りの名前が **実在する** → 長い方から受ける (``C:\\Program Files`` 型、
+       最大 ``_EXISTING_NAME_MAX_WORDS`` 語)。
+    3. 最初の語の直後に空白 1 つで拡張子付きの語が続く → その 2 語でファイル名
+       (``Save it as Q:\\tmp\\My Report.docx``)。間に語があれば (``todo and name it main.py``) 続きにしない。
+    4. それ以外 (英文や文末が続く) → 最初の空白で切り、曖昧と印を付ける
+       (``in the E:\\tmp\\todo folder.`` → ``E:\\tmp\\todo``)。``new dir`` と ``todo folder`` は字面で
+       区別できないので、語形は列挙しない。空白入りの名前を確実に渡すには括る。
+
+    空白の後に区切りが続く (``C:\\Program Files\\MyApp``) なら、その空白はセグメントの内部。
+    末尾の ``.`` は文末の句読点で、Windows は名前の末尾の ``.`` を持てないので構造的にパスではない
+    (内部の ``.`` — ``v1.2`` / ``report.txt`` — は残す)。
+
+    以前は空白を取りすぎてから「実在する最長の接頭辞」へ切り詰めていたため、未作成の
+    フォルダでは地の文ごと残った (``...\\Desktop\\aa in Excel format`` への平文書込み、
+    2026-09-28 R16 の ``in the E:\\tmp\\todo folder.`` → ``E:\\tmp\\todo folder.``)。
+    """
+    path = _normalize_path_separators(raw.rstrip())
+    cut = max(path.rfind("\\"), path.rfind("/")) + 1
+    head, words = path[:cut], path[cut:].split(" ")
+    if len(words) == 1:
+        return head + words[0].rstrip("."), False
+    next_char = following.lstrip()[:1]
+    if next_char and not next_char.isascii():
+        return head + " ".join(words).rstrip(". "), False
+    for n in range(min(len(words), _EXISTING_NAME_MAX_WORDS), 1, -1):
+        candidate = head + " ".join(words[:n]).rstrip(". ")
+        try:
+            if Path(candidate).exists():
+                return candidate, False
+        except (OSError, ValueError):
+            break
+    first, second = words[0], words[1].rstrip(".")
+    if (
+        not first.endswith(".")
+        and not _QUOTED_FILENAME_EXT_RE.search(first)
+        and _QUOTED_FILENAME_EXT_RE.search(second)
+    ):
+        return f"{head}{first} {second}", False
+    return head + first.rstrip("."), True
+
+
+def iter_drive_dir_paths(query: str) -> list[DrivePath]:
+    """依頼文のドライブレター付きパスを出現順に返す (:class:`DrivePath`)。
+
+    ドライブパスの末尾の境界 (文末の句読点 / 空白の後の地の文 / 括られた空白入りの名前) を
+    決める実装 (f_03 §4.x)。明示フォルダの抽出 (``explicit_query_dirs``) とファイルパスの抽出
+    (``_extract_file_path_literal`` の Pattern 1b / 2 / 3) が共有する。括られたパスはそのまま
+    (空白入りの名前も) 受け、括りの内側の一致は二重に数えない。区切りの正規化はするが、
+    末尾の区切りは落とさない (ドライブ直下 ``E:\\`` を残すため)。
+
+    別の境界がまだ残っている (統合は残件): ``intent_vocab.EXPLICIT_WINDOWS_PATH_RE`` + 句読点の
+    rstrip (``explicit_query_dirs`` の実在パス / ``_explicit_path_named``)、Pattern 1a (非 ASCII を含む
+    フルパス)、``_extract_last_file_path`` の区切り。
+    """
+    text = query or ""
+    found: list[DrivePath] = []
+    quoted: list[tuple[int, int]] = []
+    for m in _QUOTED_DRIVE_PATH_RE.finditer(text):
+        span = next((g for g in m.groups() if g), "").strip()
+        found.append(DrivePath(m.start(), m.end(), _normalize_path_separators(span), False))
+        quoted.append((m.start(), m.end()))
+    for m in _DIR_PATH_RE.finditer(text):
+        if any(start <= m.start() < end for start, end in quoted):
+            continue
+        path, ambiguous = _dir_path_boundary(m.group(1), text[m.end():m.end() + 16])
+        found.append(DrivePath(m.start(), m.end(), path, ambiguous))
+    return sorted(found)
+
+#: 括られた文字列 / 空白を含みうるドライブパス (Pattern 1b) がファイル名と言えるための拡張子 (末尾)。
 _QUOTED_FILENAME_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,10}$")
 
 
@@ -332,9 +443,15 @@ def _extract_file_path_literal(query: str) -> str:
     # 1b. 空白を含む ASCII パス: C:\Program Files\app.exe
     #     空白を許容する代償として本体は ASCII 限定にし、地の文 (日本語) で
     #     停止させる。区切りは 1a と同様に \ と / の双方を受ける。
-    m = re.search(r"[A-Za-z]:[\\/][A-Za-z0-9_.\\/ -]+\.[A-Za-z0-9]{1,10}", query)
-    if m:
-        return _normalize_path_separators(m.group(0).rstrip(" "))
+    #     末尾の境界はディレクトリと同じ iter_drive_dir_paths で決める — 以前は
+    #     空白を無条件に受け、``in the E:\tmp\todo folder. Save a.py`` を
+    #     ``E:\tmp\todo folder. Save a.py`` と読んだ (2026-09-28 R16)。空白入りの
+    #     ファイル名は括られたとき・和文が続くとき・実在するとき・最初の語に空白 1 つで
+    #     隣り合うとき (``My Report.docx``) だけ。
+    dir_paths = iter_drive_dir_paths(query)
+    for found in dir_paths:
+        if _QUOTED_FILENAME_EXT_RE.search(found.path):
+            return found.path
 
     # 2. ドライブレター + 自然言語でのファイル名指定
     #    例: 「e:\直下にa.txtのファイル名で」→ e:\a.txt
@@ -343,7 +460,7 @@ def _extract_file_path_literal(query: str) -> str:
     #    サブ階層を保持する。深い階層が無い (ドライブ直下指定) 場合のみ
     #    従来どおりドライブ直下へフォールバックする。
     #    \w は日本語にもマッチするため ASCII 限定で検索
-    drive_match = re.search(r"([A-Za-z]):[\\/]", query)
+    drive_match = re.search(r"(?<![A-Za-z])([A-Za-z]):[\\/]", query)
     file_match = re.search(r"([A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10})(?=[^A-Za-z0-9_.]|$)", query)
     # ファイル名の語幹が非ASCII (日本語等) だと file_match はマッチしない
     # ("テスト.docx" 等)。その場合はクォートで明示されたファイル名を拾う。
@@ -362,18 +479,10 @@ def _extract_file_path_literal(query: str) -> str:
         if m:
             filename = m.group(1)
     if drive_match and filename:
-        dir_match = _DIR_PATH_RE.search(query)
-        if dir_match:
-            # セグメント内部は空白を許容するため ("Program Files" 等)、末尾に
-            # 地の文へ続く空白が巻き込まれることがある (例: "aa に保存して" の
-            # "aa " )。rstrip() で末尾空白 (全角含む) を落としてから区切りも除去。
-            # さらに英語の地の文が空白のみで続くケース ("aa in Excel format") は
-            # 実在チェックで切り落とす。
-            directory = _trim_nonexistent_path_tail(
-                _normalize_path_separators(
-                    dir_match.group(1).rstrip(),
-                ).rstrip("\\/"),
-            )
+        if dir_paths:
+            # 末尾の地の文 ("aa in Excel format" / "todo folder.") は
+            # iter_drive_dir_paths が境界で落とす。
+            directory = dir_paths[0].path.rstrip("\\/")
             return f"{directory}\\{filename}"
         return f"{drive_match.group(1)}:\\{filename}"
 
@@ -381,12 +490,8 @@ def _extract_file_path_literal(query: str) -> str:
     #    配下のファイルを参照する文脈では、ディレクトリパスを返す。
     #    全角スペース (U+3000) 等の Unicode 空白や文末で終端しても、
     #    セグメント単位で解析する _DIR_PATH_RE が自然に正しい境界で止まる。
-    if drive_match:
-        dir_match = _DIR_PATH_RE.search(query)
-        if dir_match:
-            return _trim_nonexistent_path_tail(
-                _normalize_path_separators(dir_match.group(1).rstrip()),
-            )
+    if dir_paths:
+        return dir_paths[0].path
 
     # 4. Unix パス: /home/user/file.txt
     m = re.search(r"(?:^|[\s　])((?:/[\w._-]+){2,})", query)
@@ -596,36 +701,3 @@ def _normalize_path_separators(path: str) -> str:
     """
     # 連続する2つ以上の \ を1つに置換
     return re.sub(r"\\{2,}", r"\\", path)
-
-
-def _trim_nonexistent_path_tail(path: str) -> str:
-    """実在チェックに基づき、パス末尾へ混入した自然文トークンを切り落とす。
-
-    ``_DIR_PATH_RE`` はセグメント内部の空白を許容する ("Program Files") ため、
-    LLM 生成のタスク記述がパス直後に空白 + 英語の修飾語を続けると
-    (実インシデント: ``...to C:\\...\\Desktop\\aa in Excel format``) 地の文が
-    末尾セグメントへ飲み込まれ、実在しない拡張子なしパスへの平文書込みに
-    化ける (リッチ文書経路・検証ゲートをすべてバイパス)。
-
-    捕捉パスが実在しない場合のみ、空白区切りトークンを右から 1 つずつ外し
-    ながら「実在する最長の空白境界プレフィックス」を探して返す。地の文の
-    混入は必ず空白境界で起きるため、バックスラッシュ境界では分割しない。
-    どのプレフィックスも実在しなければ原文のまま返す (新規パスの指定を
-    壊さない)。
-    """
-    try:
-        if not path or Path(path).exists():
-            return path
-    except (OSError, ValueError):
-        return path
-    candidate = path
-    while " " in candidate:
-        candidate = candidate.rsplit(" ", 1)[0].rstrip()
-        if not candidate or candidate.endswith(":"):
-            break
-        try:
-            if Path(candidate).exists():
-                return candidate
-        except (OSError, ValueError):
-            break
-    return path

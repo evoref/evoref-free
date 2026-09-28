@@ -47,8 +47,8 @@ class ExistingContentRefused(Exception):
     """既存内容を踏まえた書込みができないので書かない (docs/f_11 §5)。
 
     ``code`` は書込み棄却の理由コード (``existing_unreadable`` /
-    ``existing_too_large``)。``meta_cognitive_defs._WRITE_REJECTION_REASON_JA``
-    が利用者向けの説明を持つ。
+    ``existing_too_large``)。利用者向けの説明は i18n ``agent.write_rejection.<code>``
+    (``meta_cognitive_defs._WRITE_REJECTION_CODES``)。
     """
 
     def __init__(self, code: str) -> None:
@@ -146,7 +146,16 @@ class _ContentGenerationMixin:
         # 直させたら、draft-07 の別スキーマを作って書いた。同じ会話の次の
         # ターンではコード生成が正しい方のスキーマを使えており、素材が
         # 渡っていないことが原因だと確定した)。
-        if not existing_content or _PRIOR_CONTENT_REFERENCE_RE.search(user_prompt):
+        #
+        # 追記も同じ: 追記する中身は既存ファイルではなく依頼か会話にあり、既存内容は
+        # 末尾の抜粋しか見せない。「保存したファイルにこの内容を追記して」の
+        # 「この内容」は直前の応答で、会話を渡さないと中身を作り話する
+        # (2026-09-28、docs/f_03 §4.3)。
+        if (
+            not existing_content
+            or append
+            or _PRIOR_CONTENT_REFERENCE_RE.search(user_prompt)
+        ):
             user_prompt = self._inject_recent_conversation(
                 user_prompt, getattr(self, "_conversation", None), ctx_size,
             )

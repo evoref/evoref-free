@@ -283,53 +283,81 @@ class AuxClient:
     ):
         self.local = local
         self._debug_logger = debug_logger
-        self._model_filename = ""
+        self._config: dict = config or {}
+        #: 較正値の永続化キー (応答するモデルの ``model_key``)。空なら永続化しない。
+        self._model_key = ""
         self._calibration_path = ""
+        #: 較正を読んだ時点の ``/props`` の ``model_path`` (変われば読み直す)。
+        self._served_seen = ""
         self._calibrated: dict[str, float] = {}
         #: purpose → 直近の成功所要秒 (p95 較正の母集団)。
         self._samples: dict[str, deque[float]] = {}
         #: スロット ID → ロック (同一スロットへの同時要求を直列化)。
         self._slot_locks: dict[int, asyncio.Lock] = {}
-        self._load_calibration(config or {})
+        self._load_calibration(self._config)
 
     def _load_calibration(self, config: dict) -> None:
-        """config からモデル名 / 較正ファイルを解決し、較正値とサンプルを読み込む。"""
-        #: 較正値の永続化キー (ベースモデルの GGUF ファイル名)。空なら永続化しない。
-        self._model_filename = _resolve_base_model_filename(config)
+        """応答するモデルの較正ファイルを解決し、較正値とサンプルを読み込む。
+
+        置き場とキーは **このクライアントが乗る llama-server が実際に載せているモデル**
+        (``/props`` の ``model_path``) の ``model_key`` (f_04 §1.2.0)。create 中に
+        create_model で走った purpose の実測が base の較正を汚さない。``/props`` が
+        まだ無いときだけ ``model_paths.base_model`` に倒す。
+        """
+        served = _served_model_path(self.local)
+        self._served_seen = served
         self._calibration_path = ""
         self._calibrated = {}
         self._samples = {}
-        if not self._model_filename:
+        target = _calibration_target(config, served)
+        self._model_key = target[0] if target is not None else ""
+        if target is None:
             return
-        # 置き場はベースモデルの model_key パーティション (c_05 §0.7.1)。
-        self._calibration_path = str(_calibration_file_for(config))
+        self._calibration_path = str(target[1])
         from backend.free.llm.aux_calibration_store import AuxCalibrationStore
 
         self._calibrated = AuxCalibrationStore.load_timeouts(
-            self._calibration_path, self._model_filename,
+            self._calibration_path, self._model_key,
         )
         for purpose, values in AuxCalibrationStore.load_samples(
-            self._calibration_path, self._model_filename,
+            self._calibration_path, self._model_key,
         ).items():
             self._samples[purpose] = deque(values, maxlen=_CALIB_SAMPLE_WINDOW)
         if self._calibrated:
             logger.info(
-                "Loaded aux timeout calibration for model=%s (%d purposes)",
-                self._model_filename, len(self._calibrated),
+                "Loaded aux timeout calibration for model_key=%s (%d purposes)",
+                self._model_key, len(self._calibrated),
             )
+
+    def _sync_calibration_model(self) -> None:
+        """載っているモデルが較正を読んだ時と変わっていたら、そのモデルの較正へ切り替える。
+
+        書き込みの直前に呼ぶ (別のモデルの実測を今の較正に混ぜない)。クライアントの
+        差し替えは :meth:`rebind` が読み直すので、ここは同じクライアントの ``/props``
+        が後から埋まった / 変わった場合の保険。
+        """
+        served = _served_model_path(self.local)
+        if served == self._served_seen:
+            return
+        target = _calibration_target(self._config, served)
+        if target is not None and target[0] == self._model_key:
+            self._served_seen = served
+            return
+        self._load_calibration(self._config)
 
     def rebind(self, local: LocalClient, config: dict | None = None) -> None:
         """ベース差し替え (モード切替 / モデル移行) に追随する。
 
-        ``local`` を差し替えるだけでは、較正値が **旧モデルのファイル名** に
-        ぶら下がったままになる (27B の較正値を 4B に適用する / 逆)。config を
-        渡せばモデル名を再解決して較正を読み直す。スロットロックは新クライアント
-        のスロット配置に合わせて捨てる。
+        ``local`` を差し替えるだけでは、較正値が **旧モデル** にぶら下がったままに
+        なる (27B の較正値を 4B に適用する / 逆)。新しいクライアントの載せている
+        モデル (``/props``) で較正を読み直す。スロットロックは新クライアントの
+        スロット配置に合わせて捨てる。
         """
         self.local = local
         self._slot_locks = {}
         if config is not None:
-            self._load_calibration(config)
+            self._config = config
+        self._load_calibration(self._config)
 
     @property
     def metadata(self):
@@ -485,13 +513,13 @@ class AuxClient:
         return lock
 
     def _persist_calibration(self) -> None:
-        if not self._model_filename:
+        if not self._model_key:
             return
         try:
             from backend.free.llm.aux_calibration_store import AuxCalibrationStore
 
             AuxCalibrationStore.save_timeouts(
-                self._calibration_path, self._model_filename, self._calibrated,
+                self._calibration_path, self._model_key, self._calibrated,
                 samples={k: list(v) for k, v in self._samples.items()},
             )
         except OSError as e:
@@ -507,6 +535,7 @@ class AuxClient:
         """
         if not purpose or purpose in PURPOSE_TIMEOUT_CALIBRATION_EXEMPT:
             return
+        self._sync_calibration_model()
         base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, _DEFAULT_TIMEOUT)
         current = self._calibrated.get(purpose, base)
         bumped = min(current * _CALIB_BUMP_FACTOR, base * _CALIB_MAX_SCALE)
@@ -529,6 +558,7 @@ class AuxClient:
         """
         if not purpose or purpose in PURPOSE_TIMEOUT_CALIBRATION_EXEMPT:
             return
+        self._sync_calibration_model()
         samples = self._samples.setdefault(purpose, deque(maxlen=_CALIB_SAMPLE_WINDOW))
         samples.append(float(elapsed))
         if len(samples) < _CALIB_MIN_SAMPLES:
@@ -871,31 +901,34 @@ def _finish_reason_of(result: dict) -> str:
     return ""
 
 
-def _calibration_file_for(config: dict) -> Path:
-    """ベースモデルの model_key パーティションの ``aux_calibration.json``。
+def _served_model_path(local: Any) -> str:
+    """クライアントの llama-server が載せているモデル (経験の置き場と同じ根拠)。"""
+    from backend.free.llm.model_metadata import served_model_of
 
+    return served_model_of(local)
+
+
+def _calibration_target(config: dict, served: str) -> tuple[str, Path] | None:
+    """較正の ``(model_key, aux_calibration.json)``。解決できなければ ``None`` (永続化しない)。
+
+    ``served`` (``/props`` の ``model_path``) があればそのモデル、無ければ
+    ``model_paths.base_model``。置き場はその ``model_key`` のパーティション。
     config 未ロード (単体テスト等) でも、渡された config から同じ規則で解決する。
     """
     from backend.config import PathResolver, get_path_resolver, get_project_root
 
+    base_model = (config.get("model_paths") or {}).get("base_model", "")
+    if not served and not base_model:
+        return None
     try:
         resolver = get_path_resolver()
     except RuntimeError:
         resolver = PathResolver(config, get_project_root())
-    base_model = (config.get("model_paths") or {}).get("base_model", "")
-    return resolver.learning_path_for(
-        "aux_calibration_file", resolver.model_key_for(base_model),
-    )
-
-
-def _resolve_base_model_filename(config: dict) -> str:
-    """ベースモデルの GGUF ファイル名 (basename) を解決する。
-
-    較正値を model-scoped に保存 / ロードするためのキー。解決できない場合は
-    空文字列 (較正の永続化を無効化)。
-    """
-    raw = (config.get("model_paths") or {}).get("base_model", "")
-    return Path(str(raw)).name if raw else ""
+    if served:
+        key = resolver.generating_model_key(served_model=served)
+    else:
+        key = resolver.model_key_for(base_model)
+    return key, resolver.learning_path_for("aux_calibration_file", key)
 
 
 __all__ = [

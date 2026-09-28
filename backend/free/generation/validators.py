@@ -101,9 +101,10 @@ def is_degenerate_repetition(text: str) -> bool:
 #: コードではないファイルの拡張子 (データ / 文書 / 設定)。反復・情報量の判定から外し、staged v2 は
 #: 系統の判定に数えない (``staged_v2_languages.DATA_SUFFIXES`` はこれに拡張子なしを足しただけ)。
 #: データ / 文書は正当な反復構造や記号の多い本文を持つ。この 1 本が SSOT (不変則 #14 (a))。
+#: ``.log`` / ``.dat`` は 2026-09-27 (ライブ監査 K03: 骨組みの ``access.log`` が ``data_files`` から落ちた)。
 DATA_OR_DOCUMENT_SUFFIXES: tuple[str, ...] = (
     ".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".xml",
-    ".md", ".txt", ".svg",
+    ".md", ".txt", ".svg", ".log", ".dat",
     ".xlsx", ".xls", ".ods", ".docx", ".doc", ".odt", ".pptx", ".ppt", ".odp",
 )
 
@@ -135,13 +136,14 @@ def is_low_information(text: str, suffix: str = "") -> bool:
     扱いにするための判定。構造量 3 つのどれか: 空白以外の割合が低い / 非空行が極端に短い /
     非空行の大半がリスト記号で始まる。英数字の割合は使わない (数値配列・罫線の正当なコードを落とす)。
     長さに依存する :func:`is_degenerate_repetition` は短い出力で安定しないので使わない。
-    データ / 文書の拡張子 (``suffix``) は判定しない。
+    データ / 文書の拡張子 (``suffix``) は構造量では判定しないが、空白だけの本文は拡張子によらず中身が無い
+    (表に ``.log`` を足しても chat の書込みゲートが空の ``.log`` を通さない、f_10 §11.1-1)。
     """
-    if suffix.lower() in DATA_OR_DOCUMENT_SUFFIXES:
-        return False
     body = (text or "").strip()
     if not body:
         return True
+    if suffix.lower() in DATA_OR_DOCUMENT_SUFFIXES:
+        return False
     if sum(not c.isspace() for c in body) / len(body) < _MIN_NON_WHITESPACE_RATIO:
         return True
     lines = [line for line in body.splitlines() if line.strip()]

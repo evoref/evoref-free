@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from backend.app_state import AppState
+from backend.free.core.check_outcome import unchecked_labels
 from backend.free.core.turn_text import TOOL_RESULT_HEADER
 from backend.free.core.text_quality import strip_system_notes
 from backend.free.api.chat._artifact import remember_artifact
@@ -126,6 +127,8 @@ def judge_long_form_success(
         and validation_errors == 0
         and not is_content_type_mismatch(metrics, user_query)
     )
+
+
 
 
 @dataclass
@@ -795,14 +798,15 @@ def _calculate_result_in_prompt(messages: list[ChatMessage]) -> float | None:
     """最後の user メッセージへ注入済みの calculate 結果 (無ければ ``None``)。
 
     ``_turn_contradiction_inputs`` の実測値と同じく、注入したのはこのプロセス
-    なのでプロンプトから読み戻す。
+    なのでプロンプトから読み戻す。渡すのは **送信版** (``_record_turn`` の
+    ``sent``) — ツール結果は deliberative が送信直前に積むので組立て版には無い。
     """
     if not messages:
         return None
     return extract_calculate_result(str(messages[-1].get("content") or ""))
 
 
-def _stated_context(messages: list[ChatMessage]) -> str:
+def _stated_context(messages: list[ChatMessage], tool_result_text: str = "") -> str:
     """応答の「数え直し」判定に渡す **ユーザー側の本文** をまとめる (純粋関数)。
 
     プロンプトに載った user メッセージ (会話履歴 + ``[関連する記憶]`` /
@@ -811,12 +815,42 @@ def _stated_context(messages: list[ChatMessage]) -> str:
     (:func:`~backend.free.core.text_quality.fabricated_household_count`)。
     assistant メッセージは入れない — 自分の過去の数え直しを根拠にすると、
     一度補った数がそのまま正当化されて固定する。
+
+    ``messages`` は **組立て版** を渡し、送信版のツール結果は ``tool_result_text``
+    (``_tool_result_text_in_prompt`` の戻り) から **結果の本体だけ** を足す。送信版を
+    丸ごと入れると deliberative の接地文・再フォーカス注記まで入り、帰属注記の
+    「一人称」「二人称」を人数 1・2 と読んで「2人暮らし」の数え直しを見逃した
+    (独立レビュー M1)。
     """
-    return "\n".join(
+    parts = [
         str(m.get("content") or "")
         for m in (messages or [])
         if str(m.get("role") or "") == "user"
-    )
+    ]
+    parts.extend(_tool_result_bodies(tool_result_text))
+    return "\n".join(parts)
+
+
+def _tool_result_bodies(tool_result_text: str) -> list[str]:
+    """ツール結果ブロック列から結果の本体 (「ツール: X / 結果: …」) だけを取り出す。
+
+    本体の後ろには deliberative の再フォーカス注記と接地文が続く。境界は
+    再フォーカス注記の書き出し (``_REFOCUS_TEMPLATES`` の ``{query}`` より前) で、
+    語彙を複製しないようテンプレートそのものから導く (不変則 #14(a))。
+    """
+    from backend.free.agent.deliberative import _REFOCUS_TEMPLATES
+
+    markers = [t.split("{query}", 1)[0] for t in _REFOCUS_TEMPLATES.values()]
+    bodies: list[str] = []
+    for block in (tool_result_text or "").split(TOOL_RESULT_HEADER):
+        cut = min(
+            (idx for idx in (block.find(m) for m in markers) if idx >= 0),
+            default=len(block),
+        )
+        body = block[:cut].strip()
+        if body:
+            bodies.append(body)
+    return bodies
 
 
 def _turn_contradiction_inputs(
@@ -1158,7 +1192,9 @@ def record_response(
     リマインダーを積んだ後の姿は入っていない。--develop=evolve の
     ``requests`` JSONL は「プロンプト起因の不具合をログから追う」ためのもの
     なので、送信版がある場合はそちらを記録する (2026-08-30 ライブ監査:
-    ツール接地ターンの根拠ブロックがログから丸ごと欠けていた)。
+    ツール接地ターンの根拠ブロックがログから丸ごと欠けていた)。経験の成否の
+    突き合わせ (calculate / 日付の結果・実測値) も送信版から読む。数え直しの文脈は
+    組立て版の user 本文にツール結果の本体だけを足す (``_stated_context``)。
 
     ``tool_command`` / ``tool_command_name`` / ``tool_command_success`` は
     run_command 実行ターンの learning メタで、assistant note に載せて
@@ -1253,11 +1289,18 @@ def _record_turn(
             state, session_id, full_response, user_query, mode,
         )
 
+    # 実際に送ったプロンプト。deliberative はツール結果・注記を **最後の user を
+    # 新しい dict に置き換えて** 積む (``turn_text.edit_last_user``) ので、組立て時の
+    # ``messages`` には入っていない。ツール結果との突き合わせはこちらを読む —
+    # 組立て版を読んでいた間、calculate / 日付の結果の無視は本番で 1 件も発火して
+    # いなかった (2026-09-26〜27 の outcome ログで 0 件、PR #781 の独立レビュー)。
+    sent = sent_messages or messages
+
     # デバッグログ
     dl = state.debug_logger
     if dl:
         _log_request_debug(
-            dl, tokens_generated, sent_messages or messages, full_response,
+            dl, tokens_generated, sent, full_response,
             private=private,
         )
 
@@ -1275,8 +1318,9 @@ def _record_turn(
             body = _recorded_body(full_response)
             prompt_tokens, cached_tokens = read_llama_prompt_tokens(state)
             blocked, measured = _turn_contradiction_inputs(
-                state, messages, action_blocked,
+                state, sent, action_blocked,
             )
+            tool_result_text = _tool_result_text_in_prompt(sent)
             entry = fc.record(
                 query=user_query, response=body, mode=mode,
                 completion_tokens=tokens_generated,
@@ -1284,9 +1328,9 @@ def _record_turn(
                 cached_prompt_tokens=cached_tokens,
                 action_blocked=blocked,
                 measured_values=measured,
-                stated_context=_stated_context(messages),
-                calculate_result=_calculate_result_in_prompt(messages),
-                tool_result_text=_tool_result_text_in_prompt(messages),
+                stated_context=_stated_context(messages, tool_result_text),
+                calculate_result=_calculate_result_in_prompt(sent),
+                tool_result_text=tool_result_text,
                 truncated=truncated,
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,
@@ -1340,6 +1384,7 @@ def record_meta_cognitive_response(
     truncated: bool = False,
     generation_failed: bool = False,
     template: str = "",
+    production_checks: list[dict] | None = None,
 ) -> None:
     """Meta-Cognitive 層の応答をメモリ・経験バッファに記録（クレジット付き）
 
@@ -1359,6 +1404,9 @@ def record_meta_cognitive_response(
     ``MetaCognitiveResponse.production_metrics`` から呼出側が読んだ来歴鍵
     (長文の構成テンプレート seed。体裁の継承 / 帳票の穴埋めは write_file の
     contextvar 経由で ``_active_gen_config`` が拾うのでここでは渡さない)。
+
+    ``production_checks`` は制作ステージの検査の 3 値 (``notes["checks"]``)。
+    未検査の主要な検査があれば経験の成否をラベル無しにする (docs/f_04 §2.5)。
     """
     credits_dicts = [
         {"step_index": c.step_index, "action": c.action, "credit": c.credit}
@@ -1386,6 +1434,7 @@ def record_meta_cognitive_response(
             "tool_routing_success": tool_routing_success,
             "tool_routing_false_positive": tool_routing_false_positive,
             "step_credits": credits_dicts,
+            "unchecked_checks": unchecked_labels(production_checks),
         },
     )
 
@@ -1407,6 +1456,7 @@ def record_long_form_response(
     cancelled: bool = False,
     truncated: bool = False,
     generation_failed: bool = False,
+    long_form_success: bool | None = None,
 ) -> None:
     """長文生成の応答をメモリ・経験バッファに記録
 
@@ -1417,12 +1467,17 @@ def record_long_form_response(
     ``action_blocked`` は長文経路では導出できない (ツール判定層を通らず、
     状態を変える操作はユニット生成の外で write_file が担う) ため、呼出側は
     渡さない = 矛盾検出のこの入力は使わない。
+
+    ``long_form_success`` は呼出側が :func:`judge_long_form_success` で決めた
+    成否。結末 JSONL の ``success`` と経験の ``turn_outcome`` に同じ判定を読ませる
+    ために渡す (2026-09-27 監査 C07#2、docs/f_04 §2.5)。省略時はここで判定する。
     """
     units_completed = int(metrics.get("units_completed", 0) or 0)
     validation_errors = int(metrics.get("validation_errors", 0) or 0)
-    long_form_success = judge_long_form_success(
-        metrics, user_query, _recorded_body(full_response),
-    )
+    if long_form_success is None:
+        long_form_success = judge_long_form_success(
+            metrics, user_query, _recorded_body(full_response),
+        )
     _record_turn(
         state, full_response, messages, session_id, user_query, mode,
         tokens_generated,

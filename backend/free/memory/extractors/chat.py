@@ -39,7 +39,9 @@ from backend.free.core.text_quality import (
     attribute_belongs_to_another_person,
     strip_discourse_prefix,
     strip_first_person_topic,
+    names_self_as_owner,
     strip_interrogative_sentences,
+    value_modifies_another_person,
 )
 from backend.free.memory.extractors.base import (
     date_shift_days,
@@ -56,8 +58,10 @@ from backend.free.memory.notes.note_builder import (
     ChatNoteBuilder,
     _CONFIRMATION_SEEKING_RE,
     _normalize_trigger,
+    get_fact_attributes,
     resolve_fact_attribute_match,
     resolve_fact_attribute_matches,
+    resolve_fact_attributes_path,
 )
 from backend.free.memory.attribute_key import GENERIC_ATTRIBUTE as _GENERIC_ATTRIBUTE
 from backend.free.memory.episodic.note import MemoryNote
@@ -1553,6 +1557,76 @@ def resolve_value_anchored_matches(
     return resolved
 
 
+def third_party_correction_slots(
+    note: MemoryNote, notes: Iterable[MemoryNote], triggers_dir=None,
+) -> frozenset[tuple[str, str]]:
+    """旧値を本人以外の人が持つ訂正で、本人の属性として書かない ``(tag, slug)``。
+
+    「卵アレルギーの子ども（5歳）がいます。」の後の「アレルギーは卵ではなく
+    小麦でした」は主語を省いた訂正で、``アレルギー`` が health に解決するので
+    本人の health として書かれていた (2026-09-27 監査 F10)。旧値の持ち主は
+    **同じセッションの先行する利用者のノート** で決める。主語の判定は
+    text_quality の人名詞の SSOT (直近の主語 / 連体修飾「X…の<人>」)。
+
+    返すのは **訂正の文 (旧値を含む文) が解決したスロットだけ** (同じノートの
+    別の文の属性は書く、独立レビュー M3)。空集合 (判定しない) になるのは:
+    訂正の文に一人称が属性の持ち主として現れる / 旧値を含む先行の文のどれかが
+    本人の文 / 持ち主が見つからない (判定の根拠が無い — 従来どおり)。訂正が
+    解決したスロットのトリガ語の人 (family の「娘」) は第三者と数えない。
+    Step 8 (抽出) と Step 8.3 (分割) が同じこの関数を呼ぶ (M5)。
+    """
+    content = note.content or ""
+    update = value_update_spans(content)
+    if update is None:
+        return frozenset()
+    old = update[0]
+    # スロットは訂正の文 (旧値を含む文) だけで解く — 後続の依頼文の語
+    # (「大丈夫ですか」の「夫」) で family が立つと、子どもまで「本人の家族の値」になる。
+    correction = " ".join(s for s in _SENTENCE_SPLIT_RE.split(content) if old in s)
+    if names_self_as_owner(correction):
+        return frozenset()
+    holder = None
+    for other in notes:
+        if (
+            other is note
+            or getattr(other, "source", "user") != "user"
+            or other.session_id != note.session_id
+            or other.created_at >= note.created_at
+            or old not in (other.content or "")
+        ):
+            continue
+        if holder is None or other.created_at > holder.created_at:
+            holder = other
+    if holder is None:
+        return frozenset()
+    per_type = get_fact_attributes(resolve_fact_attributes_path(triggers_dir)).get("chat") or {}
+    slots: set[tuple[str, str]] = set()
+    own: list[str] = []
+    for tag in _USER_SUBJECT_TAGS_ORDERED:
+        slugs = {
+            slug for slug, _ in resolve_fact_attribute_matches(
+                correction, tag, mode="chat", triggers_dir=triggers_dir,
+            )
+        }
+        slots.update((tag, slug) for slug in slugs)
+        own.extend(
+            word for spec in per_type.get(tag) or () if spec.slug in slugs
+            for word in spec.triggers
+        )
+    if not slots:
+        return frozenset()
+    own_words = tuple(own)
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(holder.content or "") if old in s]
+    # 旧値を含む文の **すべて** が他者の文のときだけ第三者 (「同僚が建設会社で
+    # 働いています。私も建設会社勤務です。」の建設会社は本人の値でもある)。
+    third = bool(sentences) and all(
+        value_modifies_another_person(s, old, own_words)
+        or attribute_belongs_to_another_person(s, (old, *own_words))
+        for s in sentences
+    )
+    return frozenset(slots) if third else frozenset()
+
+
 def _better_hit(
     current: tuple[int, str, str] | None, length: int, attr: str,
 ) -> bool:
@@ -1784,6 +1858,21 @@ class ChatExtractor(BaseExtractor):
                 # 指標にならない (base.py の注記を参照)。
                 if is_plain_statement(content):
                     result.notes_without_tags_stating += 1
+            # 主語を省いた訂正の旧値を本人以外の人が持つなら、訂正の文が解決した
+            # 本人のスロットには書かない (2026-09-27 監査 F10: 子どもの卵アレルギーの
+            # 訂正が本人の health に。独立レビュー M3: 飛ばすのはそのスロットだけ)。
+            third_party_slots = (
+                third_party_correction_slots(
+                    note, note_list, self._builder.triggers_dir,
+                )
+                if any(t in _USER_SUBJECT_TAGS for t in tags) else frozenset()
+            )
+            if third_party_slots:
+                logger.info(
+                    "ChatExtractor: old value of the correction belongs to another "
+                    "person; not writing %s (note=%s)",
+                    sorted(third_party_slots), note.id,
+                )
             for tag in tags:
                 if tag not in self.SUPPORTED_TAGS:
                     continue
@@ -1898,6 +1987,11 @@ class ChatExtractor(BaseExtractor):
                             # 提案が無ければ従来どおり汎用スロットへ落ちる。
                             destination = ctx.attribute_hints.get(content) or None
                         matches = [(destination or "user", ())]
+                    if third_party_slots:
+                        kept = [m for m in matches if (tag, m[0]) not in third_party_slots]
+                        if not kept:
+                            continue
+                        matches = kept
                     # 「属性語を含まない文は直前の属性文に属する」判定に、
                     # この発話で解決した全属性のトリガ語を渡す
                     # (詳細は _attribute_evidence_text の docstring)。

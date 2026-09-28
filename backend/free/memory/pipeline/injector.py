@@ -39,6 +39,7 @@ EvorefMem 統合仕様 におけるモード別の意味記憶 / 短期記憶注
 
 from __future__ import annotations
 
+import functools
 import re
 import math
 import time
@@ -84,6 +85,7 @@ from backend.log_config import get_logger
 from backend.utils import estimate_tokens
 from backend.free.core.script_ranges import (
     KANJI,
+    KANJI_MARKS,
     KATAKANA_WORD,
 )
 
@@ -314,6 +316,103 @@ _USER_ATTRIBUTE_FACT_TYPES: tuple[str, ...] = (
     "emotion",
     "opinion",
 )
+
+
+@functools.lru_cache(maxsize=4096)
+def _attribute_slots_of(text: str) -> frozenset[tuple[str, str]]:
+    """本文が述べている属性スロット ``(fact_type, slug)`` (Step 8 と同じ辞書)。"""
+    if not text:
+        return frozenset()
+    from backend.free.memory.notes.note_builder import (
+        MAX_ASKED_ATTRIBUTES,
+        resolve_fact_attribute_matches,
+    )
+
+    return frozenset(
+        (fact_type, slug)
+        for fact_type in _USER_ATTRIBUTE_FACT_TYPES
+        for slug, _ in resolve_fact_attribute_matches(
+            text, fact_type, mode="chat", limit=MAX_ASKED_ATTRIBUTES,
+        )
+    )
+
+
+def _is_person_valued_slot(slug: str) -> bool:
+    """スロットが人を値に取るか (``fact_attributes.yaml`` の ``person_valued``)。"""
+    from backend.free.memory.notes.note_builder import (
+        get_fact_attributes,
+        resolve_fact_attributes_path,
+    )
+
+    per_type = get_fact_attributes(resolve_fact_attributes_path()).get("chat") or {}
+    return any(
+        spec.person_valued
+        for fact_type in _USER_ATTRIBUTE_FACT_TYPES
+        for spec in per_type.get(fact_type) or ()
+        if spec.slug == slug
+    )
+
+
+#: 値の連なり (数字・英字・漢字・カタカナの連続、``_VALUE_CHAR_CLASSES`` と同じ字種)。
+_VALUE_RUN_RE = re.compile(f"[0-9.,%A-Za-z{KANJI}{KANJI_MARKS}{KATAKANA_WORD}]+")
+_DIGITS_RE = re.compile(r"[0-9]+(?:[.,][0-9]+)*")
+#: 述語が否定で終わる文 (「ありません」「飼っていません」「無い」)。
+_NEGATED_STATEMENT_RE = re.compile(r"(?:ません|ない|無い|なし)(?:です|でした)?[。．.!！]?$")
+
+
+def _value_runs(text: str) -> list[str]:
+    runs: list[str] = []
+    for run in _VALUE_RUN_RE.findall("".join((text or "").split())):
+        run = run.strip(".,")
+        if run and run not in runs:
+            runs.append(run)
+    return runs
+
+
+def _shares_affix(a: str, b: str) -> bool:
+    """接頭辞か接尾辞の 1 文字を共有するか (数字は数えない — 「11月」と「1泊2日」)。"""
+    return any(
+        x == y and not x.isdigit()
+        for x, y in ((a[:1], b[:1]), (a[-1:], b[-1:]))
+    )
+
+
+def _previous_value_span(was: str, current: str) -> str | None:
+    """「以前は」に添える旧値の 1 語分 (docs/f_02 §5.3、2026-09-27 監査 F11)。
+
+    旧値 (世代の最古の object) は発話全文のことがあり、そのまま添えると別の事柄の
+    文が再注入される (C01#5: family「1泊2日」に旅行の文)。旧値を値の連なりに分け、
+    現在値と入れ替わった 1 つを選ぶ:
+
+    1. 旧値が 1 語ならそれ
+    2. 現在値の語に無い旧値の語が 1 つだけならそれ
+    3. 数字を伏せた形が現在値の語と同じ語 (「1泊2日」→「2泊3日」)
+    4. 現在値の語と接頭辞か接尾辞を共有する語 (「設備工事会社」→「建設会社」)
+
+    3・4 は候補が 1 つに決まるときだけ。決まらなければ ``None`` (旧値を出さない)。
+    """
+    old_runs = _value_runs(was)
+    if not old_runs or _NEGATED_STATEMENT_RE.search(was.strip()):
+        # 否定の文 (「アレルギーはありません」) の旧値は「無い」— 語を選ぶと
+        # 「以前は「アレルギー」」と反対の意味になる (独立レビュー L1)。
+        return None
+    if len(old_runs) == 1:
+        return old_runs[0]
+    cur_runs = _value_runs(current)
+    changed = [r for r in old_runs if r not in cur_runs]
+    if len(changed) == 1:
+        return changed[0]
+    new_runs = [r for r in cur_runs if r not in old_runs]
+    if not changed or not new_runs:
+        # 現在値の語がすべて旧値にある = 入れ替わった語が無い (旧値の文が
+        # 現在値を含む)。どの語を「以前は」とすべきか言えない。
+        return None
+    shapes = {_DIGITS_RE.sub("#", r) for r in new_runs if _DIGITS_RE.search(r)}
+    by_shape = [r for r in changed if _DIGITS_RE.sub("#", r) in shapes]
+    if by_shape:
+        return by_shape[0] if len(by_shape) == 1 else None
+    by_affix = [r for r in changed if any(_shares_affix(r, n) for n in new_runs)]
+    return by_affix[0] if len(by_affix) == 1 else None
 
 
 def provenance_header(fact: SemanticFact) -> str:
@@ -882,6 +981,31 @@ class MemoryInjector:
         """ファクトの属性名 (subject 末尾)。取り出せなければ ``None``。"""
         return _attribute_key(str(getattr(fact, "subject", "") or ""))
 
+    @staticmethod
+    def _value_fits_asked_slot(fact: SemanticFact) -> bool:
+        """属性一致で棒を免除してよい値か (docs/f_02 §8.4)。
+
+        - 本文か object が Step 8 と同じ辞書でそのスロットに解決する → 免除する
+        - どのスロットにも解決しない裸の値 (「埼玉県川口市」) → スロットが人を値に
+          取る (``person_valued``) ときだけ免除しない。家族の値は人を指すので、人の
+          語を含まない「1泊2日」は家族の値ではない (2026-09-27 監査 F11 / C01#5)
+        - 別のスロットに解決する値 → 免除しない
+        """
+        attr = MemoryInjector._fact_attribute(fact)
+        if not attr:
+            return False
+        slugs: set[str] = set()
+        for text in {
+            str(getattr(fact, "text", "") or ""),
+            str(getattr(fact, "object", "") or ""),
+        }:
+            slugs.update(slug for _ft, slug in _attribute_slots_of(text))
+        if attr in slugs:
+            return True
+        if slugs:
+            return False
+        return not _is_person_valued_slot(attr)
+
     # ── public API ────────────────────────────────────────────────────
 
     def inject(
@@ -1157,8 +1281,11 @@ class MemoryInjector:
             gate_reached += 1
             # 尋ねられている属性と subject の属性が一致するファクトは、
             # コサインの棒を免除する (:meth:`_asked_attributes` の実測を参照)。
+            # ただし値がそのスロットの値であるときだけ — 壊れた値 (family に入った
+            # 「1泊2日」) を無条件に載せる経路にしない (2026-09-27 監査 F11)。
             asked_this = profile_fact or bool(
                 asked_attrs and self._fact_attribute(fact) in asked_attrs
+                and self._value_fits_asked_slot(fact)
             )
             # 語彙アンカー: クエリの内容語がファクト本文にそのまま出ていれば、
             # 属性辞書に無い話題でも「その話をしている」ことが決定論で言える。
@@ -1868,8 +1995,11 @@ class MemoryInjector:
         age = self._fact_age_days(fact)
         corrected = bool(getattr(fact, "from_correction", False))
         labels = _render_labels()
-        # 旧値は 1 行 40 字までに切る (訂正前の値が発話全文のこともある)。
-        was = " ".join((was or "").split())[:40] or None
+        # 旧値は 1 語分に縮める (訂正前の値が発話全文のこともあり、そのままだと
+        # 別の事柄の文が再注入される、2026-09-27 監査 F11)。決まらなければ添えない。
+        if was:
+            was = _previous_value_span(was, str(getattr(fact, "text", "") or ""))
+        was = (was or "")[:40] or None
         # ``origin != user`` は 1 行ヘッダで出所と時点を示す (c_16 §7.4)。
         # ユーザー自身の言明と、ツール / 文書 / 世の中の情報を、読み手が行の
         # 上で区別できるようにするため。

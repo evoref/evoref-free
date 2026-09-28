@@ -271,6 +271,35 @@ def _check_experience(
     section["ignored"] += ignored
     if ignored:
         report.add("info", "experience_ignored", format_id=spec.format_id, path=rel, count=ignored)
+    _check_experience_partition(report, spec, path, rel, records, section)
+
+
+def _check_experience_partition(
+    report: _Report, spec: FormatSpec, path: Path, rel: str, records: list[dict[str, Any]],
+    section: dict[str, Any],
+) -> None:
+    """``model_key`` タグと置き場 (``learning/<mk>/``) が食い違う経験を数える (f_04 §1.2.0)。
+
+    経験は生成したモデルのパーティションに置く。2026-09-27 以前は create_model の
+    経験が base のパーティションへ混入していた (移送はしない)。混入した行はそのパーティ
+    ションの Level 1 の入力になるので、食い違う key ごとに件数を出す。``model_key`` の
+    無い行 (解決できなかった記録) は数えない。
+    """
+    from backend.io.id_registry import is_valid_id
+
+    partition = path.parent.name
+    if not is_valid_id(partition, "mk_"):
+        return
+    foreign: Counter[str] = Counter(
+        str(r["model_key"]) for r in records
+        if isinstance(r.get("model_key"), str) and r["model_key"] and r["model_key"] != partition
+    )
+    section["foreign_model_key"] = section.get("foreign_model_key", 0) + sum(foreign.values())
+    for key, count in sorted(foreign.items()):
+        report.add(
+            "warning", "experience_foreign_model_key", format_id=spec.format_id, path=rel,
+            detail=key, count=count,
+        )
 
 
 # ── Evidence ストア ──
@@ -531,6 +560,10 @@ def run_doctor(data_root: Path, *, edition: str | None = None) -> dict[str, Any]
     store_dir = store_root(data_root)
     report = _Report()
     report.sections.update(_app_section(edition))
+    # 起動した Python と任意依存の有無 (構文検査器が無いと create の構文検査が未検査になる、f_10 §12.4)
+    from backend.free.core.code_syntax import runtime_environment
+
+    report.sections["runtime"] = runtime_environment()
     report.sections["serve_running"] = lock_held(store_dir)
     collected: dict[str, Any] = {
         "evidence_manifests": {},
@@ -615,6 +648,10 @@ def write_bundle(
         "python": platform.python_version(),
         "platform": platform.platform(),
     }
+    # 実行ファイルの絶対パスは利用者名を含むので名前だけ (location 節もパスを持たない)
+    runtime = report.get("runtime")
+    if isinstance(runtime, dict) and runtime.get("python"):
+        report = {**report, "runtime": {**runtime, "python": Path(str(runtime["python"])).name}}
     target.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("report.json", redact_string(json.dumps(report, ensure_ascii=False, indent=2)))

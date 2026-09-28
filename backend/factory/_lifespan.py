@@ -460,6 +460,10 @@ async def lifespan(app: FastAPI):
         "evoref backend started: instance=%s, edition=%s",
         ctx.instance_name, current_edition().name,
     )
+    # 起動した Python と任意依存の有無 (無いと create の構文検査が「未検査」になる、f_10 §12.4)
+    from backend.free.core.code_syntax import runtime_environment_line
+
+    logger.info(runtime_environment_line())
 
     yield
 

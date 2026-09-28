@@ -343,8 +343,12 @@ def _staged_internal_names(ws) -> frozenset[str]:
 async def _staged_import_smoke(
     code_map: dict[str, str], timeout_sec: float,
     internal_names: frozenset[str] = frozenset(),
+    unchecked_out: list[str] | None = None,
 ) -> list[str]:
     """配信前の code_map を import スモークし error 文字列列を返す (失敗時は空)。
+
+    ``unchecked_out`` を渡すと、作業フォルダの外への書込みを止めたため検査できなかった
+    ものをそこへ足す (不合格ではなく未検査、f_10 §11.1-4)。
 
     静的検査 (check_coherence / check_entrypoint) では拾えない cross-file ImportError
     (``from game import GameConfig`` で GameConfig が実在しない等) を終端でも捕捉する。
@@ -364,6 +368,8 @@ async def _staged_import_smoke(
     except Exception as exc:
         logger.warning("staged finalize import smoke failed: %s", exc)
         return []
+    if unchecked_out is not None:
+        unchecked_out.extend(str(u) for u in (getattr(res, "unchecked", None) or []))
     return [str(e) for e in (getattr(res, "errors", None) or [])]
 
 

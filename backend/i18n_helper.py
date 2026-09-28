@@ -1,6 +1,8 @@
 """多言語対応ヘルパー（バックエンド + CLI 共用）"""
 
 import json
+import re
+from collections.abc import Sequence
 from pathlib import Path
 
 _BASE_DIR = Path(__file__).parent / "i18n"
@@ -104,3 +106,39 @@ def _resolve(keys: list[str], locale: str) -> str | None:
 def available_locales() -> list[str]:
     """利用可能なロケール一覧"""
     return sorted(_messages.keys())
+
+
+_template_line_cache: dict[tuple[str, ...], tuple[re.Pattern[str], ...]] = {}
+
+
+def template_line_patterns(
+    keys: Sequence[tuple[str, str]], *, group: str,
+) -> tuple[re.Pattern[str], ...]:
+    """読み込み済みの全 locale の定型文を、その文面だけの 1 行に当たる正規表現にする。
+
+    システム自身が出した定型文 (「{path} に書き込んだ内容:」) を会話履歴・記憶の
+    ノートから読み戻すときに使う。**文面の SSOT は i18n** なので正規表現はそこから
+    組む。``keys`` は ``(キー, 差込み名)`` の組で、差込み名の位置を名前付きグループ
+    ``group`` に、それ以外の差込みを ``.+?`` にする。読み手 (``agent.file_ledger`` の
+    書込み報告の復元 / ``memory`` の提示ブロックの除外) で読み方を 1 本にする
+    (2026-09-28 レビュー L2)。
+    """
+    templates: list[tuple[str, str]] = []
+    for locale in available_locales():
+        for key, slot in keys:
+            template = msg_for_locale(locale, key)
+            if template and template != key and f"{{{slot}}}" in template:
+                templates.append((template, slot))
+    cache_key = (group, *(t for t, _ in templates))
+    cached = _template_line_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    patterns: list[re.Pattern[str]] = []
+    for template, slot in templates:
+        body = re.escape(template)
+        body = body.replace(re.escape(f"{{{slot}}}"), rf"(?P<{group}>\S.*?)")
+        body = re.sub(r"\\\{[a-z_]+\\\}", r".+?", body)
+        patterns.append(re.compile(rf"^\s*{body}\s*$"))
+    compiled = tuple(patterns)
+    _template_line_cache[cache_key] = compiled
+    return compiled

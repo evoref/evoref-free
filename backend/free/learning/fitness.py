@@ -61,6 +61,12 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     ("routing false positive", "outcome_execution"),
 )
 
+#: 別の欠陥キーが同じ事象を数えている ``failed`` の理由 (前方一致)。チャネルにも
+#: 載せると二重計上になるので :func:`outcome_channel` は ``None`` を返す。
+#: 長文の検証落ちは ``long_form_failed`` (:data:`DERIVED_DEFECTS`) が数える
+#: (docs/f_04 §3.2.4)。
+OUTCOME_REASONS_COUNTED_ELSEWHERE: tuple[str, ...] = ("long-form validation failed",)
+
 #: 理由が :data:`OUTCOME_REASON_CHANNELS` のどれにも当たらない ``failed`` の
 #: 行き先。理由が空 (旧レコード / 外部から直接 ``failed`` を書いた経路) も
 #: ここへ落ちる。**失敗を取りこぼさない**ための受け皿で、ここが増えたら
@@ -87,6 +93,8 @@ def outcome_channel(signals: Mapping) -> str | None:
     if signals.get("turn_outcome") != "failed":
         return None
     reason = str(signals.get("turn_outcome_reason") or "")
+    if reason.startswith(OUTCOME_REASONS_COUNTED_ELSEWHERE):
+        return None
     for prefix, channel in OUTCOME_REASON_CHANNELS:
         if reason.startswith(prefix):
             return channel

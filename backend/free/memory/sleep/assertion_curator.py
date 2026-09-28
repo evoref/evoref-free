@@ -40,22 +40,28 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from datetime import date
 from typing import TYPE_CHECKING
 
 from backend.free.core.intent_vocab import NUMBER_LITERAL_RE
+from backend.free.core.response_dates import complete_years, literal_dates, nearest_date
 from backend.free.core.text_quality import (
     contradicts_asserted_value,
+    detect_lang,
     value_was_adopted,
 )
 from backend.free.llm.json_schemas import AssertionNaming
 from backend.free.memory.corrections import correction_target
+from backend.free.core.correction_verdict import strip_copula
 from backend.free.memory.extractors.base import (
     note_is_verified_correction,
     note_verification_rejected,
+    value_update_spans,
 )
 from backend.free.memory.notes.pin_detector import note_is_pinned
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.sleep._curator_common import public_notes
+from backend.free.memory.sleep.extraction import write_sleep_facts
 from backend.free.memory.sleep.curation_backoff import (
     clear_failure,
     in_cooldown,
@@ -244,8 +250,91 @@ def _is_curatable(note: "MemoryNote", builder) -> bool:
     if builder.candidate_fact_tags(content):
         return False
     # ノート分類器が「事実を述べている」と見たもの、またはユーザーが明示的に
-    # 覚えておけと言ったもの (pin) だけを対象にする。
-    return bool("fact" in (note.tags or []) or note_is_pinned(note))
+    # 覚えておけと言ったもの (pin) だけを対象にする。検証済みの自己訂正で旧値の
+    # span が取れるものも対象 — 「試験日は4月18日ではなく4月25日でした。…計算し
+    # 直してください」は分類器が task しか付けず、訂正がファクトにならないまま
+    # 旧値の assertion が残った (2026-09-27 監査 F8)。字句の候補だけでは通さない (#12)。
+    return bool(
+        "fact" in (note.tags or [])
+        or note_is_pinned(note)
+        or _is_verified_self_restatement(note, content)
+    )
+
+
+#: 検証が「訂正ではない」と答えたが、本人の値の更新として旧値を置き換えてよい帰属
+#: (「本社ではなく名古屋支社です」、J-03)。``third_party`` (他人の値) や門の却下
+#: (引用 / 同値 / 既述 …) は含めない。
+_OWN_VALUE_UPDATE_VERDICTS = frozenset({"premise_change", "none"})
+
+
+def _replaces_a_value(note: "MemoryNote") -> bool:
+    """訂正候補のノートが旧値を置き換える力 (slug の継承・旧値の span での畳み) を持つか。
+
+    検証済みの訂正 (assistant / self) と、本人の値更新 (:data:`_OWN_VALUE_UPDATE_VERDICTS`)
+    だけ。検証で他人の値と判った候補 (「取引先の創立記念日は6月1日ではなく6月2日だ
+    そうです」= ``third_party``) が本人の言明の slug を継いで「当社の創立記念日は
+    2001年6月1日です。」を畳んでいた (2026-09-28 独立レビュー、不変則 #12)。
+    """
+    return note_is_verified_correction(note) or (
+        str(getattr(note, "correction_verdict", "") or "") in _OWN_VALUE_UPDATE_VERDICTS
+    )
+
+
+def _is_verified_self_restatement(note: "MemoryNote", content: str) -> bool:
+    """検証済み ``self`` の訂正で、「X ではなく Y」の旧値 span が取れるノートか。"""
+    return (
+        str(getattr(note, "correction_verdict", "") or "") == "self"
+        and value_update_spans(content) is not None
+    )
+
+
+def _old_value_target(
+    note: "MemoryNote", notes: list, span: str,
+) -> "MemoryNote | None":
+    """旧値の span を逐語で述べ、**話題語も共有する** 同じセッションの前の命名済み
+    ユーザーノート (純粋関数)。
+
+    span の文字列一致だけでは話題を特定できない — 「18日」は試験日にも給料日にも
+    在り、給料日の slug を継いで給料日を畳んだ (2026-09-27 独立レビュー H2)。
+    訂正と keyword を 1 語以上共有する候補がちょうど 1 つのときだけ返し、0 件や
+    複数なら ``None`` (呼出側は語の重なり ``correction_target`` へ戻る)。
+    """
+    from backend.free.core.correction_verdict import norm_span
+
+    needle = norm_span(span)
+    if not needle:
+        return None
+    at = float(getattr(note, "created_at", 0.0) or 0.0)
+    session = getattr(note, "session_id", None)
+    topic = set(getattr(note, "keywords", None) or ())
+    found = []
+    for other in notes:
+        if other is note or getattr(other, "source", "user") != "user":
+            continue
+        if getattr(other, "session_id", None) != session:
+            continue
+        if not getattr(other, "assertion_slug", None):
+            continue
+        other_at = float(getattr(other, "created_at", 0.0) or 0.0)
+        if other_at >= at or needle not in norm_span(other.content or ""):
+            continue
+        if topic & set(getattr(other, "keywords", None) or ()):
+            found.append(other)
+    return found[0] if len(found) == 1 else None
+
+
+def _old_value_span(note: "MemoryNote", content: str) -> str:
+    """訂正 / 値更新のノートが置き換える旧値の span (無ければ空文字)。
+
+    検証済みの訂正なら検証器の ``wrong_claim`` (門を通った逐語 span)、無ければ
+    発話の「X ではなく Y」の X (本人の値更新、``value_update_spans`` と同じ分解)。
+    """
+    if note_is_verified_correction(note):
+        wrong = strip_copula(str(getattr(note, "correction_wrong_claim", "") or ""))
+        if wrong:
+            return wrong
+    pair = value_update_spans(content)
+    return pair[0] if pair else ""
 
 
 def _build_prompt(content: str) -> str:
@@ -255,10 +344,79 @@ def _build_prompt(content: str) -> str:
         "言明なら「何についての言明か」を表す短い英語の slug を付けてください。\n"
         "slug は ASCII 英小文字・数字・アンダースコアのみ (例: project_deadline, "
         "team_size, office_location)。\n"
-        "object には言明の内容を 1 文で簡潔に書き直してください (原文の言語のまま)。\n"
+        "object には言明の内容を 1 文で簡潔に書き直してください。object は "
+        "**UTTERANCE と同じ言語** で書くこと (日本語の発話なら日本語。英語にしない。"
+        "英語なのは slug だけ)。日付・数値は発話の表記のまま写し、年を省いたり"
+        "発話に無い年を足したりしないこと。言い直し・訂正なら新しい値を述べること。\n"
         "質問・依頼・相槌など、事実の言明でないものは is_assertion=false にしてください。\n"
         f"\nUTTERANCE: {content}\n"
     )
+
+
+def _object_departs(obj: str, body: str, anchor: date | None) -> str | None:
+    """補助タスクの object が発話から外れていればその理由を返す (純粋関数)。
+
+    object は補助タスクの書き直しで、発話の言語も日付も保証されない
+    (2026-09-28 再監査 R5: 日本語の訂正「試験日は4月18日ではなく4月25日でした」が
+    「The exam date is April 25, not April 18.」になり、年も落ちた)。コードで
+    確かめられる 2 点を確かめる:
+
+    - 言語: :func:`detect_lang` が発話と違う
+    - 日付: object の日付が発話に無い / 発話の年を落とした・変えた / 発話に無い年を
+      足した (``anchor`` から :func:`complete_years` が足す年と同じなら可) /
+      発話の日付を 1 つも残さない
+    """
+    body_lang = detect_lang(body)
+    if body_lang and detect_lang(obj) != body_lang:
+        return "language"
+    body_dates = literal_dates(body)
+    obj_dates = literal_dates(obj)
+    if body_dates and not obj_dates:
+        return "date_lost"
+    for year, month, day in obj_dates:
+        years = {y for y, m, d in body_dates if (m, d) == (month, day)}
+        if not years:
+            return "date_changed"
+        if year in years:
+            continue
+        if year is not None and None in years and anchor is not None:
+            resolved = nearest_date(month, day, anchor)
+            if resolved is not None and resolved.year == year:
+                continue
+        return "year_changed"
+    return None
+
+
+def _year_anchor(
+    note: "MemoryNote", target: "MemoryNote | None", content: str,
+) -> date | None:
+    """訂正が言い直さない年を解く基準 = **置き換える旧値の日付** (純粋関数)。
+
+    - 検証済みの訂正 (assistant / self) だけ。検証で退けられたノート (第三者の
+      日付・前提の変更) に宛先の年を足すと、他人の日付に自分の年が付く
+      (2026-09-28 独立レビュー P2-1)。
+    - 旧値の span (``_old_value_span``) の月日と一致する、宛先ノートの年つき日付が
+      **ちょうど 1 つ** のときだけ。宛先の年つき日付をすべて基準にすると、別の
+      日付 (2026-04-01) の年が混ざる (P3-2)。span 自体が年を持てばそれを使う。
+    """
+    if not note_is_verified_correction(note):
+        return None
+    old = literal_dates(_old_value_span(note, content))
+    if len(old) != 1:
+        return None
+    year, month, day = old[0]
+    if year is None:
+        years = {
+            y for y, m, d in literal_dates(getattr(target, "content", "") or "")
+            if y is not None and (m, d) == (month, day)
+        }
+        if len(years) != 1:
+            return None
+        year = years.pop()
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
 
 
 async def _name_assertion(aux_client, content: str) -> tuple[str, str] | None:
@@ -435,12 +593,18 @@ async def curate_assertion_facts(
         if named is None:
             continue
         slug, obj = named
+        target = None
         # 訂正は **対象と同じ slug** を継ぐ。訂正は話題語を落として言うため
         # 単独で命名させると別 slug になり (実測 2026-08-20:
         # ``asahi_project_deadline`` に対し訂正が ``deadline_change``)、
         # subject が分かれて競合検出が対にできず supersede できない。
-        if getattr(note, "is_correction", False):
-            target = correction_target(note, all_notes)
+        if getattr(note, "is_correction", False) and _replaces_a_value(note):
+            # 旧値を逐語で述べたノートが宛先 (語の重なりより確か)。無ければ従来の
+            # 語の重なり。語の重なりだけだと、同じ語を持つ後の問い (「試験日までの
+            # 総勉強時間は？」) が選ばれて slug を継げない (2026-09-27 監査 F8)。
+            target = _old_value_target(
+                note, all_notes, _old_value_span(note, content),
+            ) or correction_target(note, all_notes)
             inherited = getattr(target, "assertion_slug", None) if target else None
             if inherited:
                 logger.info(
@@ -449,6 +613,17 @@ async def curate_assertion_facts(
                 )
                 slug = inherited
         note.assertion_slug = slug
+        # 本文は発話の言語と日付を保つ。外れた書き直しは採らず発話の言明文へ戻し、
+        # 訂正が言い直さない年は宛先の日付から足す (2026-09-28 再監査 R5)。
+        anchor = _year_anchor(note, target, content)
+        departure = _object_departs(obj, body, anchor)
+        if departure is not None:
+            logger.info(
+                "assertion_curator: named object for note %s departs from the "
+                "utterance (%s); keeping the utterance", note.id, departure,
+            )
+            obj = body
+        obj = complete_years(obj, anchor)
         subject = f"mem.world.{_SUBJECT_PREFIX}.{slug}"
         # 同じ命題が既に live なら積まない。命名は補助タスクが「何についての
         # 言明か」を答えるので、言い直し・別セッションの再言明が同じ
@@ -491,16 +666,23 @@ async def curate_assertion_facts(
                 profile_id=profile_id,
                 embedding=vec,
                 veracity=veracity,
+                # 訂正の力 (時刻を跨いだ supersede) は検証済みの訂正だけ (#12)。
+                from_correction=note_is_verified_correction(note),
                 _extra={"source_note_id": note.id, "raw_utterance": content},
             )
-            store.add_fact(fact)
+            # 畳む範囲は旧値の span で絞る (#13)。assertion は多値が既定なので、
+            # span の無い訂正は兄弟を畳まない (共通入口 write_sleep_facts が畳む)。
+            if (
+                getattr(note, "is_correction", False) or _has_correction_form(content)
+            ) and _replaces_a_value(note):
+                fact.value_update = _old_value_span(note, content)  # type: ignore[attr-defined]
+            if not write_sleep_facts(store, [fact], label="assertion"):
+                continue
             written += 1
             logger.info(
                 "assertion_curator: wrote mem.world.%s.%s from note %s",
                 _SUBJECT_PREFIX, slug, note.id,
             )
-            if getattr(note, "is_correction", False):
-                _supersede_same_slug(store, fact)
         except Exception as exc:
             logger.warning(
                 "assertion_curator: persist failed for slug=%s: %s", slug, exc,
@@ -547,56 +729,3 @@ def _same_claim_is_live(store: "SemanticFactStore", subject: str, obj: str) -> b
         and getattr(f, "predicate", "is") == "is"
         for f in siblings
     )
-
-
-def _supersede_same_slug(store: "SemanticFactStore", correction: object) -> int:
-    """訂正が書かれたスロットの **古い値** を畳む。
-
-    このモジュールが slug に内容ハッシュを付けないのは「同じ話題の言い直しが
-    同じ subject に並ぶ方が正しい。並べば競合検出が対にでき、**訂正が
-    supersede できる**」ためだが (モジュール docstring)、書き込みは
-    ``store.add_fact`` で終わっており **畳む処理がどこにも無かった**。
-    ``sleep.extraction._supersede_corrected_slots`` は ``ChatExtractor`` が
-    作ったファクトだけを見るので、curator の書き込みは対象外。
-
-    実データ (2026-08-31 ライブ監査): 「コードネームは「ハヤブサ」ではなく
-    「ツバメ」に変わりました。」で slug 継承は成功し
-    ``mem.world.assertion.project_codename`` に両方が並んだが、**4 件すべて
-    live** のままで、訂正前の「ハヤブサ」が注入され続ける状態だった。
-
-    畳むのは **訂正ターンのみ**。独立した 2 つの言明がたまたま同じ slug を
-    もらうことがあり、無条件に畳むと片方が消える。訂正なら「同じ属性の
-    言い直し」であることが ``is_correction`` で確定している。
-    """
-    folded = 0
-    try:
-        siblings = store.search_by_subject(
-            correction.subject, include_superseded=False,
-        )
-    except Exception as exc:
-        logger.warning(
-            "assertion_curator: failed to list slot %s: %s",
-            correction.subject, exc,
-        )
-        return 0
-    for old in siblings:
-        if old.id == correction.id or old.predicate != correction.predicate:
-            continue
-        if old.superseded_by:
-            continue
-        try:
-            store.supersede(old.id, correction.id)
-        except (KeyError, ValueError) as exc:
-            # 閉路ガード等で弾かれた場合は残しておく (競合解決 / TTL に委ねる)。
-            logger.warning(
-                "assertion_curator: failed to supersede %s -> %s: %s",
-                old.id, correction.id, exc,
-            )
-            continue
-        folded += 1
-    if folded:
-        logger.info(
-            "assertion_curator: superseded %d stale value(s) in %s",
-            folded, correction.subject,
-        )
-    return folded

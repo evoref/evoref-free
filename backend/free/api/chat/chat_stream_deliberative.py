@@ -162,7 +162,7 @@ def _build_output_pipeline(
         # 内部の根拠枠 (「（参考情報1に基づく）」) の名指しを最後に落とす。
         # system プロンプトと動的ブロックの区切り文の両方で禁じているのに
         # 実機では破られた (2026-08-16 ライブ監査 ターン25)。
-        InternalFrameMentionFilter(),
+        InternalFrameMentionFilter(query),
         # 月日に添えた曜日を暦で照合する (ユーザーが述べた月日だけ。f_08 §6.3)。
         WeekdayFilter(grounded),
     ]
@@ -517,6 +517,7 @@ async def stream_deliberative(
     evicted_turns: int = 0,
     session_head: str = "",
     answered_attributes: frozenset[str] = frozenset(),
+    unanswered_attributes: frozenset[str] = frozenset(),
 ):
     """Deliberative 層の SSE ストリーミング
 
@@ -574,6 +575,7 @@ async def stream_deliberative(
                 session_head=session_head,
                 private=private,
                 answered_attributes=answered_attributes,
+                unanswered_attributes=unanswered_attributes,
                 prompt_capture=sent_messages,
             ))
             # process() はトークンを返す前にツール判定と実行を完了させる。
@@ -619,15 +621,19 @@ async def stream_deliberative(
             ):
                 yield frame
 
+            # 修復と 0 トークンの再試行は **実際に送ったプロンプト** で作り直す。
+            # 組立て版にはツール結果・注記が無く、作り直した回答が結果を知らないまま
+            # 経験では「tool result ignored」として失敗に数えられていた (独立レビュー M3)。
+            regen_messages = sent_messages or messages
             if verify_output:
                 async for frame in _emit_verified_output(
-                    stream_state, query, messages, client,
+                    stream_state, query, regen_messages, client,
                     max_tokens, generation_params, session_id,
                 ):
                     yield frame
 
             async for frame in _retry_zero_tokens_deliberative(
-                stream_state, messages, client, max_tokens, session_id, query,
+                stream_state, regen_messages, client, max_tokens, session_id, query,
                 generation_params=generation_params,
             ):
                 yield frame

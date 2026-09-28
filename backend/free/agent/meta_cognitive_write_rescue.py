@@ -11,8 +11,15 @@ import re
 
 from pathlib import Path
 
+from backend.free.agent.file_ledger import starts_with_write_report
 from backend.free.agent.output_format import is_table_output
 from backend.free.agent.tools.filesystem import _EXPORT_DOC_EXTS
+from backend.free.core.intent_vocab import (
+    PREVIOUS_ANSWER_REF_RE,
+    PREVIOUS_ANSWER_SAVE_RE,
+    PREVIOUS_ANSWER_TRANSFORM_RE,
+    saves_previous_answer,
+)
 from backend.free.agent.meta_cognitive_text import (
     _LITERAL_WRITE_EXTENSIONS,
     _LITERAL_WRITE_REJECT_RE,
@@ -204,28 +211,11 @@ def rescue_quoted_write_literal(instruction: str, file_path: str) -> str:
     return literals[0]
 
 
-#: 「この案内文を保存して」のように直前の成果物を指す参照表現。
-#:
-#: 成果物の名詞は **散文以外も** 並べる。コード・スクリプト・定義・計算過程が
-#: 抜けていたため「そのテストコードを保存して」で決定論経路が発火せず、LLM の
-#: 再生成に回って `E:\tmp\test_mttr.py にテストコードを保存しました。` という
-#: 完了報告を本文として出し、2 回とも棄却されて書込み自体が失敗した
-#: (実インシデント 2026-08-10 ライブ監査)。直前の応答をそのまま書けばよい
-#: ケースを生成に回さないのが最も確実。
-_PREVIOUS_ANSWER_REF_RE = re.compile(
-    r"(?:この|その|上記の?|先(?:ほど|程)の?|さっきの?|いまの|今の|先の|提示した)\s*"
-    r"(?:案内文?|文章|文面|本文|内容|議事録|メモ|原稿|下書き|回答|答え|結果"
-    r"|一覧|リスト|表"
-    r"|コード|スクリプト|プログラム|関数|クラス|テスト|クエリ|設定|定義"
-    r"|設計|手順|計算過程|計算|説明|要点)"
-)
-#: 直前の成果物に手を加える依頼 (そのまま書き写してはいけない)。
-_TRANSFORM_VERB_RE = re.compile(
-    r"翻訳|英訳|和訳|要約|短く|長く|整えて|直して|修正|変えて|変更|書き換え"
-    r"|追記|付け加え|足して|加えて|敬語|丁寧に|箇条書きに|表にして|まとめ直"
-)
-#: 保存/書き出しの依頼であることのシグナル。
-_WRITE_REQUEST_RE = re.compile(r"保存|書き出|書き込|出力|ファイルに|セーブ|save|write", re.IGNORECASE)
+#: 「この案内文を保存して」型の語彙は ``core.intent_vocab`` が SSOT (ルータの
+#: long_form 除外と同じ 1 本を見る、docs/c_17 §3.6)。旧名は再エクスポート用。
+_PREVIOUS_ANSWER_REF_RE = PREVIOUS_ANSWER_REF_RE
+_TRANSFORM_VERB_RE = PREVIOUS_ANSWER_TRANSFORM_RE
+_WRITE_REQUEST_RE = PREVIOUS_ANSWER_SAVE_RE
 
 #: そのまま書き写す対象として採用する直前応答の最小文字数。
 _PREVIOUS_ANSWER_MIN_CHARS = 40
@@ -316,14 +306,16 @@ def previous_answer_write_content(
     出力先 ``file_path`` が表形式 (xlsx / csv 等) なら表の見た目を持つ候補に
     限る。表の無い応答を採ると Writer が ``no_table_data`` で必ず落ち、再試行も
     同じ素材を採り直す (2026-09-26 監査 C15#3、docs/f_11 §5.3)。
+
+    依頼の判定はルータの long_form 除外と同じ ``saves_previous_answer`` の 1 本
+    (docs/c_17 §3.6)。システム自身の書込み報告で始まる応答 (「…に書き込み
+    ました。」/「…に書き込んだ内容:」+ フェンス付きの本文) は候補にしない —
+    外さないと報告文、または見出し行とフェンスごとの本文が「直前の応答」として
+    採られる (2026-09-27 監査の反証: C07#3 以降の「その議事録を保存」)。
     """
     if not conversation:
         return ""
-    if not _WRITE_REQUEST_RE.search(query):
-        return ""
-    if not _PREVIOUS_ANSWER_REF_RE.search(query):
-        return ""
-    if _TRANSFORM_VERB_RE.search(query):
+    if not saves_previous_answer(query):
         return ""
     candidates: list[str] = []
     for msg in reversed(conversation):
@@ -331,6 +323,8 @@ def previous_answer_write_content(
             continue
         content = msg.get("content")
         if not isinstance(content, str):
+            continue
+        if starts_with_write_report(content):
             continue
         text = unwrap_sole_code_fence(_strip_lead_in(content.strip()))
         if len(text) >= _PREVIOUS_ANSWER_MIN_CHARS:

@@ -45,6 +45,7 @@ from backend.free.core.correction_verdict import (
     check_verdict,
     claims_equivalent,
     response_already_states,
+    reversed_restatement,
 )
 from backend.free.llm.json_schemas import CorrectionVerdict
 from backend.log_config import get_logger
@@ -146,7 +147,7 @@ def _apply_verdict(
 def recheck_promoted(entries: list["ExperienceEntry"]) -> int:
     """既に昇格済みのエントリへ **コード側の門だけ** を掛け直す (LLM を呼ばない)。
 
-    門は後から増える (2026-09-09 に同値 / 既述を追加)。過去に昇格した
+    門は後から増える (2026-09-09 に同値 / 既述、2026-09-28 に向きを追加)。過去に昇格した
     エントリは冪等マーカーで二度と問い合わせないため、門を足しても既存の
     偽陽性 (100 → 100 m) は few-shot / 採用ゲート / eval_core に残り続ける。
     記録済みの span と直前応答だけで決定論に判定できる門なので、毎回掛け直して
@@ -166,7 +167,12 @@ def recheck_promoted(entries: list["ExperienceEntry"]) -> int:
         correct = getattr(signals, "correction_correct_value", None) or ""
         prev_response, _prev_query = _resolve_previous_context(entries, index)
         reason = None
-        if claims_equivalent(wrong, correct):
+        detail = ""
+        candidate = getattr(signals, "correction_candidate", None) or ""
+        if reversed_restatement(wrong, correct, candidate):
+            # 永続の語彙は増やさない (check_verdict と同じく invalid_span)。
+            reason, detail = "invalid_span", " (reversed)"
+        elif claims_equivalent(wrong, correct):
             reason = "same_value"
         elif response_already_states(correct, prev_response):
             reason = "already_stated"
@@ -176,9 +182,9 @@ def recheck_promoted(entries: list["ExperienceEntry"]) -> int:
         signals.correction_verdict = reason
         demoted += 1
         logger.info(
-            "Correction verifier: demoted a promoted entry on re-check: %s "
+            "Correction verifier: demoted a promoted entry on re-check: %s%s "
             "(entry=%s, wrong_claim=%r, correct_value=%r)",
-            reason, entry.id, wrong[:40], correct[:40],
+            reason, detail, entry.id, wrong[:40], correct[:40],
         )
     return demoted
 
