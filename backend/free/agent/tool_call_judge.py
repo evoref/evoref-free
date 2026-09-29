@@ -33,6 +33,7 @@ from backend.free.core.intent_vocab import (
     is_plain_statement,
     is_practice_advice_query,
     looks_like_numeric_question,
+    mentions_filesystem,
     only_session_ordinal_recall,
 )
 from backend.free.core.date_math_cue import (
@@ -53,8 +54,16 @@ from backend.free.agent.safety_patterns import (
     strip_command_literals,
 )
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
+from backend.free.agent.tool_judge_annuity import (
+    annuity_request_rule,
+    annuity_request_verdict,
+    annuity_slots,
+    build_annuity_expression,
+)
 from backend.free.agent.grammar_tool_classifier import (
     CLASSIFY_MAX_TOKENS,
+    EXPRESSION_RETRY,
+    EXPRESSION_RETRY_EN,
     EXPRESSION_SCHEMA,
     EXPRESSION_SYSTEM,
     EXPRESSION_SYSTEM_EN,
@@ -470,6 +479,22 @@ def _is_recompute_request(query: str, dialogue: str) -> bool:
     if _replaces_dialogue_value(query, dialogue):
         return True
     return only_session_ordinal_recall(query) and not NUMBER_LITERAL_RE.search(query or "")
+
+
+def _reads_file_for_a_quantity_question(
+    classified: "ToolJudgement", query: str, dialogue: str,
+) -> bool:
+    """分類器の ``read_file`` が、ファイルに触れない数量の問いに対するものか (純粋関数)。
+
+    ファイル系の語彙もファイル名も無い問い (:func:`mentions_filesystem` が偽) で、
+    数量を尋ねている (:func:`looks_like_numeric_question`) なら、読むべきファイルは
+    問いから決まらず、被演算子は会話にある (2026-09-29 回帰確認 R27_budget_cut #3)。
+    """
+    return (
+        classified.tool_name == "read_file"
+        and not mentions_filesystem(query)
+        and looks_like_numeric_question(query, dialogue)
+    )
 
 
 def _recompute_ungrounded(
@@ -1761,6 +1786,14 @@ class ToolCallJudge:
                 )
                 return cmd_recall_result
 
+        # 5.8. 元利均等の毎月返済額を決定論で組む (docs/f_03 §3.1、c_17 §3.13)。
+        # 9B は理由を添えて作り直させても正しい式を組めなかった (2026-09-29
+        # 回帰確認 R27_loan_correction)。推論往復の前に置く (前の層は正規表現だけ)。
+        annuity_result = self._judge_with_annuity_rule(query, tools_registry, call)
+        if annuity_result is not None:
+            self._log_tool_decision(annuity_result, "annuity_payment_rule", call)
+            return annuity_result
+
         # 5.9. ベースモデルの文法制約ツール分類 (docs/c_14 §1.3)。
         # 「ツールが要るのに撃たれない」穴を埋める最後の層。決定論層が
         # すべて外れてから実行する (決定論のシグナルの方がモデル判断より
@@ -1776,6 +1809,19 @@ class ToolCallJudge:
             )
             if model_layers_allowed else None
         )
+        if classified is not None and _reads_file_for_a_quantity_question(
+            classified, query, call.recent_dialogue_text,
+        ):
+            # 問いはファイルに触れず、被演算子は会話にある。読み直しても会話の値が
+            # 返るだけで計算の機会を失う (2026-09-29 回帰確認 R27_budget_cut #3:
+            # 保存した xlsx を読み、暗算で 6,456,000 円と誤答)。分類器の no_tool と
+            # 同じく層 5.95 の式合成へ回す (docs/f_03 §3.1)。
+            logger.info(
+                "Classifier read_file(%r) dropped for a quantity question that names "
+                "no file; falling through to expression synthesis",
+                str((classified.tool_args or {}).get("file_path") or "")[:120],
+            )
+            classified = None
         if classified is not None:
             # 桁を取り違えた / 窓の外の値を訂正する calculate は式合成で 1 回だけ
             # 組み直す。桁の取り違えで組み直しが通らなければ no_tool (docs/f_03 §3.1)。
@@ -1994,6 +2040,56 @@ class ToolCallJudge:
             )
         return None
 
+    def _judge_with_annuity_rule(
+        self, query: str, tools_registry: ToolsRegistry, call: JudgeCall,
+    ) -> "ToolJudgement | None":
+        """層 5.8: 元利均等の毎月返済額の問いに、user の発言から式を組んで返す。
+
+        判定点 ``annuity_payment_request`` が発火し、元本・年率・年数が 1 つに決まる
+        ときだけ。組んだ式も構文・接地・式の妥当性・値の正を通す (``_repair_recompute_term``
+        と同じ門、§3.4.1)。どれかが欠ければ ``None`` (分類器以降へ落とす)。
+        """
+        if not tools_registry.has("calculate"):
+            return None
+        # 候補 (月の返済額を問う形) が無いターンは記録しない (decision.jsonl のノイズにしない)
+        if annuity_request_rule(query, call.user_dialogue_text).evidence == "not_monthly_payment":
+            return None
+        verdict = annuity_request_verdict(query, call.user_dialogue_text)
+        if verdict.band != "fire":
+            return None
+        users = [
+            str(m.get("content") or "") for m in call.conversation or ()
+            if isinstance(m, dict) and m.get("role") == "user"
+        ]
+        if not users or users[-1].strip() != query.strip():
+            users.append(query)
+        slots = annuity_slots(users)
+        if slots is None:
+            logger.info("Annuity rule: principal / rate / term not unique; left to the classifier")
+            return None
+        expression = build_annuity_expression(*slots)
+        failed = (
+            validate_expression(expression)
+            or ", ".join(_ungrounded_numbers(expression, query, call.dialogue_text))
+            or "; ".join(expression_sanity_issues(
+                expression, query, call.dialogue_text, user_text=call.user_dialogue_text,
+            ))
+            or _non_positive_value(expression)
+        )
+        if failed:
+            logger.info("Annuity rule expression %r did not pass (%s)", expression, failed[:200])
+            return None
+        logger.info(
+            "Annuity rule: principal=%s rate=%s%% months=%d -> %s", *slots, expression,
+        )
+        return self._finalize(
+            ToolJudgement(
+                tool_needed=True, tool_name="calculate",
+                tool_args={"expression": expression}, source="rule",
+            ),
+            call=call,
+        )
+
     def _repair_recompute_term(
         self, expression: str, query: str, call: JudgeCall, source: str,
     ) -> "ToolJudgement | None":
@@ -2154,31 +2250,37 @@ class ToolCallJudge:
             logger.info("expression synthesis failed: %s", exc)
             return None
 
-        expression = parse_expression_response(content)
-        if not expression:
-            return None
-        syntax_error = validate_expression(expression)
-        if syntax_error:
-            logger.info(
-                "Expression synthesis rejected: %r is not a calculate expression (%s)",
-                expression[:120], syntax_error[:120],
-            )
-            return None
-        unexplained = _ungrounded_numbers(expression, query, call.dialogue_text)
-        if unexplained:
-            logger.info(
-                "Expression synthesis rejected: %s uses numbers absent from "
-                "the conversation (%s)", expression, ", ".join(unexplained),
-            )
-            return None
-        issues = expression_sanity_issues(
-            expression, query, call.dialogue_text, user_text=call.user_dialogue_text,
-        )
+        expression, issues = self._checked_synthesis(content, query, call)
         if issues:
-            logger.info(
-                "Expression synthesis rejected: %s is structurally suspicious (%s)",
-                expression, "; ".join(issues),
-            )
+            # 構造の疑いの文面は正しい組み方を述べている (「月の複利なら底は
+            # 1 + 年率/12 …」)。1 回目の続きとして返し、1 回だけ組み直させる
+            # (2026-09-29 回帰確認 R27_loan_correction: 9B は同じ誤った構造を
+            # 毎回出した)。接地・構文の不合格では作り直させない (docs/f_03 §3.1)。
+            messages = [
+                *messages,
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": select_locale_variant(
+                    EXPRESSION_RETRY, EXPRESSION_RETRY_EN,
+                ).format(issues="\n".join(f"- {i}" for i in issues))},
+            ]
+            try:
+                content = await client.generate_constrained(
+                    messages,
+                    response_format=EXPRESSION_SCHEMA,
+                    max_tokens=CLASSIFY_MAX_TOKENS,
+                    id_slot=getattr(
+                        client, "classifier_slot",
+                        getattr(client, "background_slot", -1),
+                    ),
+                    timeout=self._tool_classifier_timeout_sec,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info("expression synthesis retry failed: %s", exc)
+                return None
+            expression, issues = self._checked_synthesis(content, query, call)
+            if expression and not issues:
+                logger.info("Expression synthesis passed on the retry: %s", expression)
+        if not expression or issues:
             return None
         result = ToolJudgement(
             tool_needed=True,
@@ -2187,6 +2289,42 @@ class ToolCallJudge:
             source="classifier",
         )
         return self._finalize(result, call=call)
+
+    @staticmethod
+    def _checked_synthesis(
+        content: str, query: str, call: JudgeCall,
+    ) -> tuple[str, tuple[str, ...]]:
+        """合成器の応答から式を取り、構文・接地・式の妥当性を掛ける。
+
+        返すのは ``(式, 構造の疑い)``。構文・接地で落ちたら式は空 (作り直させない)。
+        構造の疑いがあるときだけ式と疑いの両方を返す (呼出側が理由を添えて作り直させる)。
+        """
+        expression = parse_expression_response(content)
+        if not expression:
+            return "", ()
+        syntax_error = validate_expression(expression)
+        if syntax_error:
+            logger.info(
+                "Expression synthesis rejected: %r is not a calculate expression (%s)",
+                expression[:120], syntax_error[:120],
+            )
+            return "", ()
+        unexplained = _ungrounded_numbers(expression, query, call.dialogue_text)
+        if unexplained:
+            logger.info(
+                "Expression synthesis rejected: %s uses numbers absent from "
+                "the conversation (%s)", expression, ", ".join(unexplained),
+            )
+            return "", ()
+        issues = tuple(expression_sanity_issues(
+            expression, query, call.dialogue_text, user_text=call.user_dialogue_text,
+        ))
+        if issues:
+            logger.info(
+                "Expression synthesis rejected: %s is structurally suspicious (%s)",
+                expression, "; ".join(issues),
+            )
+        return expression, issues
 
     _NATIVE_JUDGE_SYSTEM = (
         "あなたはツール選択器です。ユーザーの発言に答えるのに必要なツールを"

@@ -18,7 +18,13 @@ import re
 from collections.abc import Callable, Iterable, Sequence
 from functools import cache
 from backend.free.core.numerals import kanji_number_value
-from backend.free.core.response_arithmetic import iter_ja_numbers, normalize_numerals
+from backend.free.core.response_arithmetic import (
+    find_arithmetic_contradictions,
+    find_conclusion_contradiction,
+    iter_ja_numbers,
+    normalize_numerals,
+)
+from backend.free.core.session_mode import is_create_mode
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
     HIRAGANA,
@@ -2989,7 +2995,9 @@ def classify_constraint_verifier(detail: str) -> str:
 
 # ── 応答の決定論的な欠陥計数 (採用ゲート、2026-09-14 監査 A) ──────────────
 
-def count_response_defects(response: str, query: str = "") -> dict[str, int]:
+def count_response_defects(
+    response: str, query: str = "", *, mode: str = "chat",
+) -> dict[str, int]:
     """応答に含まれる **検証可能な欠陥** を種類別に数える (純粋関数)。
 
     base prompt 採用ゲート (f_04 §4.5) の勝敗判定に使う。LLM judge は
@@ -3003,6 +3011,12 @@ def count_response_defects(response: str, query: str = "") -> dict[str, int]:
     参考情報の有無を話題にしない / 内部ラベルを出さない …) と一対一で対応する
     **形の欠陥** で、本文が多少分岐しても判定が動きにくい。加点 (「良さ」) は
     測らない — 測れるのは欠陥の有無だけで、それで十分に選択圧になる。
+
+    失敗ラベル (``FeedbackCollector._derive_turn_outcome_with_reason``) のうち問いと応答
+    だけで決まる判定も同じ関数で数える (f_04 §4.5、2026-09-29)。数えないと「文字数指定を
+    破った」事例で候補がそれを直しても引き分けになる。形式指定は create では数えない
+    (ラベル側と同じ除外)。コード主体の回答 (``is_payload_dump``) は記憶側の判定で、
+    応答の欠陥ではないので数えない (正しい SQL の回答を欠陥にしていた)。
     """
     text = response or ""
     return {
@@ -3014,9 +3028,17 @@ def count_response_defects(response: str, query: str = "") -> dict[str, int]:
         "chinese_leak": int(has_chinese_token_leak(text)),
         "self_retraction": int(retracts_own_conclusion(text)),
         "task_log_residue": int(looks_like_task_log_residue(text)),
-        "payload_dump": int(is_payload_dump(text)),
         "internal_label": int(bool(_INTERNAL_LABEL_RE.search(text))),
         "empty": int(not text.strip()),
+        "length_constraint": int(
+            bool(query) and violates_length_constraint(query, text) is not None,
+        ),
+        "output_form": int(
+            bool(query) and not is_create_mode(mode)
+            and violates_output_form(query, text) is not None,
+        ),
+        "arithmetic_contradiction": int(bool(find_arithmetic_contradictions(text))),
+        "conclusion_contradiction": int(find_conclusion_contradiction(text) is not None),
     }
 
 
@@ -3027,6 +3049,6 @@ _INTERNAL_LABEL_RE = re.compile(
 )
 
 
-def response_defect_total(response: str, query: str = "") -> int:
+def response_defect_total(response: str, query: str = "", *, mode: str = "chat") -> int:
     """:func:`count_response_defects` の合計 (欠陥の件数)。"""
-    return sum(count_response_defects(response, query).values())
+    return sum(count_response_defects(response, query, mode=mode).values())

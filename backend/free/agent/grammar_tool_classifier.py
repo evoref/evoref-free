@@ -225,6 +225,20 @@ EXPRESSION_SYSTEM_EN = (
 )
 
 
+#: 構造の疑いで落ちた式を 1 回だけ組み直させるときの追記 (docs/f_03 §3.1)。
+#: ``{issues}`` は ``expression_sanity_issues`` の文面 (正しい組み方を述べている)。
+EXPRESSION_RETRY = (
+    "その式は次の点で誤っている疑いがあります:\n{issues}\n"
+    "指摘に従って式を 1 つだけ組み直し、JSON だけを返してください。"
+    "会話中に現れた数値だけを使うこと。"
+)
+EXPRESSION_RETRY_EN = (
+    "That expression looks wrong for these reasons:\n{issues}\n"
+    "Rebuild exactly one expression following the notes and return JSON only. "
+    "Use only numbers that appear in the conversation."
+)
+
+
 def parse_expression_response(content: str) -> str:
     """式合成の応答から ``expression`` を取り出す。取れなければ空文字。"""
     try:

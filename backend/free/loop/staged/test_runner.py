@@ -25,6 +25,7 @@ test を収集するため、誤って system/e2e (PC フリーズ/強制再起�
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
@@ -275,6 +276,7 @@ class StagedTestRunner:
         if not ok:
             env_dep = _detect_env_missing_dependency(
                 out, self._src_stems(), self._internal_names(),
+                src_imports=self._src_imports(),
             )
             if env_dep:
                 gate = GateResult(
@@ -345,6 +347,29 @@ class StagedTestRunner:
         except Exception:  # noqa: BLE001 - 判定不能時は空集合 (env-skip しない側へ)
             return set()
 
+    def _src_imports(self) -> frozenset[str] | None:
+        """生成 src が import するモジュールの先頭名 (読めなければ ``None`` = 判定しない)。
+
+        import スモークは外部依存の欠落を警告で通すので、本物の外部依存なら src 側にも
+        同じ import がある。テストだけが import する名前をコードの欠陥にする判定用 (f_10)。
+        """
+        try:
+            names: set[str] = set()
+            for f in self.workspace.list_files(kind="src"):
+                if not f.logical_path.endswith(".py"):
+                    continue
+                code = self.workspace.read_file(f.logical_path, kind="src")
+                if code is None:
+                    return None
+                for node in ast.walk(ast.parse(code)):
+                    if isinstance(node, ast.Import):
+                        names.update(a.name.split(".")[0] for a in node.names)
+                    elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                        names.add(node.module.split(".")[0])
+            return frozenset(names)
+        except Exception:  # noqa: BLE001 - 判定不能時は従来どおり (env-skip しうる側)
+            return None
+
     def _internal_names(self) -> frozenset[str]:
         """spec が宣言する内部契約名 (幻覚内部 import を env-skip させない判定用)。"""
         try:
@@ -357,6 +382,8 @@ class StagedTestRunner:
 def _detect_env_missing_dependency(
     out: str, src_stems: set[str],
     internal_names: frozenset[str] = frozenset(),
+    *,
+    src_imports: frozenset[str] | None = None,
 ) -> str | None:
     """collection error の原因が環境要因の外部依存欠落なら、そのモジュール名を返す。
 
@@ -366,6 +393,9 @@ def _detect_env_missing_dependency(
     (c) spec の内部契約名 (Component 名 / 正準モジュール stem、case-insensitive)
     でない (幻覚内部 import はコード欠陥。2026-07-07 live: `from game import
     Game` が env-skip され偽 success で配信された) こと。
+    ``src_imports`` を渡したときは (d) 生成 src のどれかが import している名前で
+    あること (テストだけが import する名前は生成されなかった兄弟か幻覚、2026-09-26
+    trace 74893037692b の ``import storage``)。
     1 つでもコード欠陥側の欠落が混ざる場合は None (通常の失敗扱い)。
     """
     if "ERROR collecting" not in out:
@@ -383,6 +413,8 @@ def _detect_env_missing_dependency(
         if name in _STDLIB_MODULES or name.lstrip("_") in _STDLIB_MODULES:
             return None
         if name.lower() in lowered_internal:
+            return None
+        if src_imports is not None and name not in src_imports:
             return None
         env_only.append(name)
     return env_only[0] if env_only else None

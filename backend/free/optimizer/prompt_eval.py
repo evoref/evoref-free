@@ -60,6 +60,8 @@ class PromptEvalCase:
     #: 振る舞い」を訂正文の言い回しからでなく実際の正答から判定できる。
     #: 訂正ターンの回答が受諾だけ / 訂正を受け入れていない場合は空。
     reference: str = ""
+    #: 事例のモード。欠陥計数の形式指定を create で数えない (失敗ラベルと同じ除外)。
+    mode: str = "chat"
 
 
 @runtime_checkable
@@ -181,7 +183,7 @@ def select_prompt_eval_cases(
                 picked[_case_id(pq)] = PromptEvalCase(
                     case_id=_case_id(pq), query=pq,
                     kind=CASE_KIND_CORRECTION, hint=str(correction).strip(),
-                    reference=fixed or correct_value,
+                    reference=fixed or correct_value, mode=mode,
                 )
             continue
         if query:
@@ -192,17 +194,17 @@ def select_prompt_eval_cases(
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query,
                     kind=CASE_KIND_USER_NEGATIVE,
-                    hint=str(signals.get("user_note") or "").strip(),
+                    hint=str(signals.get("user_note") or "").strip(), mode=mode,
                 )
             elif signals.get("turn_outcome") == "failed" and not signals.get("long_form_used"):
                 # 長文の失敗 (検証落ち等) は、system prompt だけで短く再生成するこの
                 # ゲートでは再現できず枠を無駄にする (docs/f_04 §2.5)。
                 picked[_case_id(query)] = PromptEvalCase(
-                    case_id=_case_id(query), query=query, kind=CASE_KIND_FAILED,
+                    case_id=_case_id(query), query=query, kind=CASE_KIND_FAILED, mode=mode,
                 )
             elif signals.get("rephrased_query"):
                 picked[_case_id(query)] = PromptEvalCase(
-                    case_id=_case_id(query), query=query, kind=CASE_KIND_REPHRASE,
+                    case_id=_case_id(query), query=query, kind=CASE_KIND_REPHRASE, mode=mode,
                 )
     # 文脈 (直前ターン / 記憶 / ツール結果) を前提にした問いは、system prompt
     # だけで再生成するゲートでは **どの候補でも同じ点** になり、何も測れない。
@@ -231,7 +233,7 @@ def select_prompt_eval_cases(
                 continue
             taken.add(_case_id(query))
             samples.append(PromptEvalCase(
-                case_id=_case_id(query), query=query, kind=CASE_KIND_SAMPLE,
+                case_id=_case_id(query), query=query, kind=CASE_KIND_SAMPLE, mode=mode,
             ))
         # 標本は古い側に置く (limit で切るとき失敗の証拠がある側を残す)
         cases = list(reversed(samples)) + cases

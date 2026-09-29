@@ -2457,6 +2457,11 @@ async def _build_learn_pillar(
 
     session_answer_gate.bind_debug_logger(debug_logger)
 
+    # 元利均等の毎月返済額の問いの判定点 (c_17 §3.13、層 5.8) も字句段だけ。
+    from backend.free.agent import tool_judge_annuity
+
+    tool_judge_annuity.bind_debug_logger(debug_logger)
+
     # 文書テンプレートの選択判定 (c_16 §4.5.2 / c_17 §3.8) も字句段だけ。
     from backend.free.api.chat import _template_select
 
