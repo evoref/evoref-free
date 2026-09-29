@@ -558,6 +558,12 @@ def expression_sanity_issues(
             f"月の複利の冪の指数 {exponent} が会話の期間の月数 ({listed}) と一致しない "
             "(年数 × 12 か、会話に書かれた回数を使う)"
         )
+    issues.extend(_annuity_without_monthly_rate(expr, text))
+    for exponent in _annual_period_mismatches(expr, text, _period_text(query, context, user_text)):
+        issues.append(
+            f"年率の複利の冪の指数 {exponent} が会話の期間 (年数) と一致しない "
+            "(月の複利なら底は 1 + 年率/12 で指数は年数 × 12、年の複利なら指数は年数)"
+        )
 
     pairs = _myriad_pairs(text)
     if len(pairs) >= 1:
@@ -730,6 +736,106 @@ def _mismatched_period_powers(
     return months, found
 
 
+def _annuity_without_monthly_rate(expression: str, text: str) -> list[str]:
+    """元利均等の係数を使うのに月利を掛けていない疑い (純粋関数)。
+
+    2026-09-29 実機確認 (R27_loan_correction #3): 理由付きの作り直しで底と回数は直ったが
+    ``30000000 * (1 + 0.012/12) ** 420 / ((1 + 0.012/12) ** 420 - 1) / 12`` (72,926 円、
+    正しくは 87,510 円) が通った。毎月の返済額は 元本 × 月利 × g^n / (g^n - 1)
+    (g = 1 + 年率/12) で、月利を ÷12 にしている。月の複利の冪が 2 回以上現れるか、
+    ``1 - g ** -n`` の形 (元利均等の係数) なのに、式のどこにも月利 (年率/12) も年率も
+    冪の底の外で現れなければ返す。一括の複利 (``P * g ** n``) は係数ではないので見ない。
+    """
+    rates = [(pct, float(pct) / 100.0 / 12.0) for pct in _annual_percents(text)]
+    if not rates:
+        return []
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return []
+    monthly_powers = []
+    used: list[tuple[str, float]] = []
+    base_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            base = _constant_value(node.left)
+            matched = [
+                (pct, r) for pct, r in rates
+                if base is not None and math.isclose(base, 1.0 + r, abs_tol=1e-12)
+            ]
+            if matched:
+                monthly_powers.append(node)
+                used.extend(m for m in matched if m not in used)
+                base_ids.update(id(n) for n in ast.walk(node.left))
+    if not monthly_powers:
+        return []
+    negative = any(
+        (_constant_value(p.right) or 0) < 0 for p in monthly_powers
+    )
+    if len(monthly_powers) < 2 and not negative:
+        return []
+    for node in ast.walk(tree):
+        if id(node) in base_ids:
+            continue
+        value = _constant_value(node)
+        # 月利そのもの、または年率 (``P * 0.0135 / 12 / (...)`` は左結合で
+        # 0.0135/12 が部分木にならない) が底の外にあれば掛けている
+        if value is not None and any(
+            math.isclose(value, r, abs_tol=1e-12) or math.isclose(value, r * 12.0, abs_tol=1e-12)
+            for _p, r in rates
+        ):
+            return []
+    # 名指すのは底に使われた率 (訂正前の率が会話の先に出ていても取り違えない)
+    pct, rate = used[0]
+    return [
+        f"元利均等の係数 g^n / (g^n - 1) (g = 1 + 年率/12) を使っているのに月利 {pct}%/12 = "
+        f"{rate:.6g} を掛けていない (毎月の返済額 = 元本 × 月利 × 係数)"
+    ]
+
+
+def _annual_period_mismatches(
+    expression: str, text: str, period_text: str | None = None,
+) -> tuple[str, ...]:
+    """年の複利の冪 (底が 1 + 年率) で、指数が会話の年数と合わないもの (純粋関数)。
+
+    2026-09-29 回帰確認 (R27_loan_correction #3): 35 年・1.2% の訂正の組み直しで
+    ``30000000 * (1.012 ** 360) / ((1.012 ** 360) - 1) / 12`` が通った。4 つ目の検査
+    (:func:`_compounding_period_issues`) は指数が会話の月数のときだけ、5 つ目
+    (:func:`_mismatched_period_powers`) は底が 1 + 年率/12 のときだけ見るので、底も
+    回数も違う式はどちらにも掛からなかった。年の複利の指数は会話の年数か年数どうしの
+    差 (残りの期間) のはずなので、そのどれとも合わなければ返す。指数が会話の月数なら
+    4 つ目が「年率のまま」と言うので、ここでは返さない (二重に出さない)。会話に年数が
+    無ければ空。回数の置き換え (:func:`repair_period_exponents`) には使わない — 底が
+    年率のままなので、回数だけ直しても誤りのまま。
+    """
+    months = _period_months(text if period_text is None else period_text)
+    years = {m // 12 for m in months if m % 12 == 0}
+    if not years:
+        return ()
+    bases = [1.0 + float(pct) / 100.0 for pct in _annual_percents(text)]
+    if not bases:
+        return ()
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return ()
+    allowed = years | months | {a - b for a in years for b in years if a > b}
+    found: list[str] = []
+    for base_node, exponent_node in _power_operands(tree):
+        base = _constant_value(base_node)
+        if base is None or not any(
+            math.isclose(base, b, rel_tol=0.0, abs_tol=1e-12) for b in bases
+        ):
+            continue
+        exponent = _constant_value(exponent_node)
+        if exponent is None or not float(abs(exponent)).is_integer():
+            continue
+        n = int(abs(exponent))
+        if n not in allowed and str(n) not in found:
+            found.append(str(n))
+    return tuple(found)
+
+
 def repair_period_exponents(
     expression: str, query: str, context: str = "", *, user_text: str | None = None,
 ) -> tuple[str, tuple[str, ...], int] | None:
@@ -793,11 +899,14 @@ def period_exponent_mismatches(
     取る (``None`` なら ``context`` 全体)。
     """
     text = f"{query or ''}\n{context or ''}"
-    return tuple(
+    period_text = _period_text(query, context, user_text)
+    monthly = tuple(
         exponent for exponent, _ in _period_exponent_mismatch_pairs(
-            expression or "", text, _period_text(query, context, user_text),
+            expression or "", text, period_text,
         )
     )
+    annual = _annual_period_mismatches(expression or "", text, period_text)
+    return monthly + tuple(n for n in annual if n not in monthly)
 
 
 def _compounding_period_issues(expression: str, text: str) -> list[str]:

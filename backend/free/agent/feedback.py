@@ -1069,6 +1069,7 @@ class FeedbackCollector:
             expression_issues=expression_issues,
             unexplained_date_math=unexplained_date_math,
             unchecked_checks=unchecked_checks,
+            tool_uses=tool_uses,
         )
         if generation_failed:
             # 本文が届かなかった / error フレームで終わったターン。
@@ -1423,6 +1424,7 @@ class FeedbackCollector:
         expression_issues: list[str] | None = None,
         unexplained_date_math: bool | None = None,
         unchecked_checks: list[str] | None = None,
+        tool_uses: list[dict] | None = None,
     ) -> tuple[str, str | None]:
         """ターン成否 ("success" | "partial" | "failed" | "unlabeled") と理由を決定論導出する。
 
@@ -1468,9 +1470,16 @@ class FeedbackCollector:
             if _DONE_MARKER_RE.search(text):
                 return "partial", "some tasks failed"
             return "failed", "all tasks failed"
-        if step_credits and all(
-            not (c.get("credit") or 0) for c in step_credits
-        ):
+        # 書込みゲートが断っただけ (根拠台帳の全件が write_denied) なら失敗にしない —
+        # 断ったこと自体は安全側の正しい振る舞い。ゲートの誤判定もありうるので成功の
+        # 教師にもせず、後段の失敗の証拠が無ければラベル無しにする (docs/f_04 §2.5)。
+        guard_denied = bool(tool_uses) and all(
+            u.get("reason") == "write_denied" for u in tool_uses or ()
+        )
+        zero_credit = bool(step_credits) and all(
+            not (c.get("credit") or 0) for c in step_credits or ()
+        )
+        if zero_credit and not guard_denied:
             return "failed", "no step credit"
         if tool_routing_false_positive or long_form_false_positive:
             return "failed", "routing false positive"
@@ -1571,6 +1580,8 @@ class FeedbackCollector:
             unexplained_date_math=unexplained_date_math,
             unchecked_checks=unchecked_checks,
         )
+        if unlabeled is None and zero_credit and guard_denied:
+            unlabeled = "write denied by guard"
         if unlabeled is not None:
             if ignored_unverified is not None:
                 unlabeled = f"{unlabeled}; tool result ignored: {ignored_unverified}"

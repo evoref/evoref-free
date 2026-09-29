@@ -237,8 +237,9 @@ class PromptCandidateEval:
             if a.strip() == b.strip():
                 verdicts[case.case_id] = 0
                 continue
-            da = response_defect_total(a, case.query)
-            db = response_defect_total(b, case.query)
+            mode = getattr(case, "mode", "chat")
+            da = response_defect_total(a, case.query, mode=mode)
+            db = response_defect_total(b, case.query, mode=mode)
             verdicts[case.case_id] = 1 if db < da else (-1 if db > da else 0)
         return verdicts
 

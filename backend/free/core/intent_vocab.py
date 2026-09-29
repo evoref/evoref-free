@@ -1718,7 +1718,7 @@ def persist_request(query: str) -> bool:
 #: 絶対パスを要求する (「メモ」のような裸の語では発火しない)。
 _NAMES_FILE_TARGET_RE = re.compile(
     r"[A-Za-z]:[\\/][^\s\"']+"
-    r"|[\w\-.]+\.(?:txt|md|json|csv|log|yaml|yml|py|ts|js|html|xml|ini|toml)"
+    r"|[\w\-.]+\.(?:txt|md|json|csv|log|yaml|yml|py|ts|js|html|xml|ini|toml|docx|xlsx|pptx|pdf)"
     r"(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
