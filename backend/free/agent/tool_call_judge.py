@@ -76,8 +76,13 @@ from backend.free.llm.aux_client import PURPOSE_TIMEOUT_DEFAULTS
 from backend.free.llm.json_extract import extract_json_object
 from backend.free.llm.json_schemas import resolve_response_format_for_purpose
 from backend.free.llm.slot_prefix import shared_prefix_messages
+from backend.free.llm.tps_calibration import (
+    chat_path_timeout,
+    is_explicit_agent_timeout,
+    measured_tps_of,
+)
 from backend.log_config import get_logger
-from backend.utils import utc_now_dt, utc_to_epoch
+from backend.utils import estimate_tokens, utc_now_dt, utc_to_epoch
 
 # --- 責務別モジュール ---------------------------------------------------------
 # 判定に使う正規表現・純粋関数は責務ごとに分割してある。本モジュールは判定フロー
@@ -671,6 +676,10 @@ class ToolCallJudge:
         )
         self._tool_classifier_timeout_sec: float = float(
             agent_cfg.get("tool_classifier_timeout_sec", 60.0),
+        )
+        #: 利用者が既定から変えた値なら生成速度の実測 (c_16 §7.2.3) で延ばさない。
+        self._tool_classifier_timeout_explicit: bool = is_explicit_agent_timeout(
+            agent_cfg, "tool_classifier_timeout_sec",
         )
         # 分類器を撃つかどうかの門。正規表現 ``_query_has_tool_signal`` は
         # 実クエリ 137 件のベンチで recall 66.2% しかなく、ツールが要る
@@ -1923,6 +1932,26 @@ class ToolCallJudge:
         )
         return replace(params, holidays=merged)
 
+    def _classifier_timeout(self, client: Any, messages: list[dict], max_tokens: int) -> float:
+        """分類器スロットの判定 1 往復の上限 (``agent.tool_classifier_timeout_sec``)。
+
+        既定のままなら、生成速度の実測が遅いマシンでだけ「出力トークン ÷ decode tps +
+        prompt ÷ prefill tps」まで延ばす (天井は現行の 1.5 倍、c_16 §7.2.3)。利用者が値を
+        変えていればその値を尊重する。未測定なら現行値。
+        """
+        current = self._tool_classifier_timeout_sec
+        # ``__new__`` で組んだ判定器 (テスト) は既定扱い
+        if getattr(self, "_tool_classifier_timeout_explicit", False):
+            return current
+        prompt_tokens = sum(
+            estimate_tokens(str(m.get("content") or ""))
+            for m in messages if isinstance(m, dict)
+        )
+        return chat_path_timeout(
+            current, measured_tps_of(client),
+            prompt_tokens=prompt_tokens, max_tokens=max_tokens,
+        )
+
     def _slot_shared_messages(
         self, tools_registry: ToolsRegistry | None, mode: str, task_system: str,
     ) -> list[dict]:
@@ -2244,7 +2273,7 @@ class ToolCallJudge:
                     client, "classifier_slot",
                     getattr(client, "background_slot", -1),
                 ),
-                timeout=self._tool_classifier_timeout_sec,
+                timeout=self._classifier_timeout(client, messages, CLASSIFY_MAX_TOKENS),
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("expression synthesis failed: %s", exc)
@@ -2272,7 +2301,7 @@ class ToolCallJudge:
                         client, "classifier_slot",
                         getattr(client, "background_slot", -1),
                     ),
-                    timeout=self._tool_classifier_timeout_sec,
+                    timeout=self._classifier_timeout(client, messages, CLASSIFY_MAX_TOKENS),
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.info("expression synthesis retry failed: %s", exc)
@@ -2513,7 +2542,9 @@ class ToolCallJudge:
                     client, "classifier_slot",
                     getattr(client, "background_slot", -1),
                 ),
-                timeout=self._tool_classifier_timeout_sec,
+                timeout=self._classifier_timeout(
+                    client, messages, self._tool_classifier_max_tokens,
+                ),
             )
         except httpx.HTTPStatusError as exc:
             # ``response_format`` 非対応の build。リトライしても回復しないので

@@ -112,6 +112,10 @@ export interface RerankStatusInfo {
 	tested_at: string | null;
 	/** 自己テストの後にリランカーのモデルが変わった (再テストはしない) */
 	model_changed_since_selftest: boolean;
+	/** 実行時の遮断器が開いている (冷却中は HTTP を送らず cosine 順のまま) */
+	breaker_open: boolean;
+	/** 冷却の残り秒。遮断していなければ null */
+	breaker_remaining_s: number | null;
 }
 
 /** 埋め込みサーバの配置 GPU / CPU (c_16 §7.2.2)。setting は auto / explicit / default、reason は判別の理由の識別子 */
@@ -126,6 +130,18 @@ export interface EmbedPlacementInfo {
 	gpu_p50_ms: number | null;
 	/** 同じ文の CPU と GPU のベクトルの cosine の最小 */
 	cosine_min: number | null;
+}
+
+/** 環境調整 (auto-tune) の状態 (c_16 §7.2.3)。state は fresh / ok / pending / declined / accepted / unchanged / unknown */
+export interface AutoTuneInfo {
+	state: string;
+	reason: string;
+	/** 変わった PC の軸 (hostname / cpu / logical_cores / memory_gb。GPU 名は比べない) */
+	changed_axes: string[];
+	/** 項目の件数 (total / applied / manual / failed) */
+	items_summary: Record<string, number>;
+	/** 最後に項目を測った時刻 (ISO 8601 UTC)。未測定なら null */
+	measured_at: string | null;
 }
 
 export interface StatusResponse {
@@ -152,6 +168,8 @@ export interface StatusResponse {
 	rerank?: RerankStatusInfo;
 	/** 埋め込みサーバの配置 */
 	embed_placement?: EmbedPlacementInfo;
+	/** 環境調整 (auto-tune) の状態 */
+	auto_tune?: AutoTuneInfo;
 }
 
 /** ステータス取得 */

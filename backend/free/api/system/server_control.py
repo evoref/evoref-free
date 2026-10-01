@@ -98,6 +98,28 @@ def _build_cmd(
     *,
     model_override: str | None = None,
     adapters: LaunchAdapters | None = None,
+    allow_decide: bool = False,
+) -> tuple[list[str], str, int] | None:
+    """サーバー名から起動コマンドと (host, port) を構築 (ブロッキング。async からは executor で呼ぶ)
+
+    環境調整の ``auto`` の項目 (c_16 §7.2.3) は既定では保存値を読むだけ (``--list-devices`` も
+    見積りも走らせない)。``allow_decide`` は base を止めた後の組み直しだけ真にする — 予約の再計算や
+    その場の見積りをし、輪郭は 1 回だけ読んで項目の間で共有する (本番の base が載った空きで
+    見積もって保存しない)。
+    """
+    from backend.free.core.tuning.resolve import launch_scope
+
+    with launch_scope(allow_decide):
+        return _compose_cmd(name, cfg, project_root, model_override=model_override, adapters=adapters)
+
+
+def _compose_cmd(
+    name: ServerName,
+    cfg: dict,
+    project_root: Path,
+    *,
+    model_override: str | None = None,
+    adapters: LaunchAdapters | None = None,
 ) -> tuple[list[str], str, int] | None:
     """サーバー名から起動コマンドと (host, port) を構築
 
@@ -109,6 +131,11 @@ def _build_cmd(
         (cmd, host, port) or None（設定なし / モデル未指定）
     """
     from scripts.launch_llama import build_embed_cmd, build_llama_cmd
+
+    # 起動スクリプトは解決結果 (slots / -ngl / 環境調整の値) を config の ``__*`` キーに覚える。
+    # backend の config は長く生きるので、そのままだと画面の再起動が前の解決を使い回し、
+    # 予約した環境調整の再計算 (c_16 §7.2.3) が効かない。起動ごとに覚え直させる。
+    cfg = {k: v for k, v in cfg.items() if not (isinstance(k, str) and k.startswith("__"))}
 
     if name == "base":
         llama_cfg = cfg.get("llama", {})
@@ -195,11 +222,14 @@ def _rotate_if_large(path: Path) -> None:
 
 
 def _spawn_server(
-    name: ServerName, cfg: dict, *, cmd_override: list[str] | None = None,
+    name: ServerName, cfg: dict, *, cmd_override: list[str] | None = None, allow_decide: bool = False,
 ) -> ManagedProcess | None:
-    """llama-server プロセスを起動 (``cmd_override`` は埋め込みの CPU 再起動用)"""
+    """llama-server プロセスを起動 (``cmd_override`` は埋め込みの CPU 再起動用)
+
+    ``allow_decide`` は環境調整の見積りを許すか (base を止めた後だけ。:func:`_build_cmd`)。
+    """
     project_root = _find_project_root()
-    result = _build_cmd(name, cfg, project_root)
+    result = _build_cmd(name, cfg, project_root, allow_decide=allow_decide)
     if result is None:
         logger.warning("server_control: no config for %s", name)
         return None
@@ -234,12 +264,13 @@ def _spawn_server_with_override(
     *,
     model_override: str | None = None,
     adapters: LaunchAdapters | None = None,
+    allow_decide: bool = False,
 ) -> ManagedProcess | None:
-    """model_override / adapters 対応版の llama-server プロセス起動"""
+    """model_override / adapters 対応版の llama-server プロセス起動 (``allow_decide`` は :func:`_build_cmd`)"""
     project_root = _find_project_root()
     result = _build_cmd(
         name, cfg, project_root, model_override=model_override,
-        adapters=adapters,
+        adapters=adapters, allow_decide=allow_decide,
     )
     if result is None:
         logger.warning("server_control: no config for %s", name)
@@ -451,8 +482,13 @@ async def start_server(
 
     # 既にポートで起動中かチェック
     import asyncio
+    from functools import partial
 
-    result = _build_cmd(name, cfg, _find_project_root())
+    from backend.trace_context import run_in_executor_with_context
+
+    loop = asyncio.get_running_loop()
+    # kill より前の組み立ては保存値を読むだけ (イベントループを止めず、稼働中の base の空きで見積もらない)
+    result = await run_in_executor_with_context(loop, None, partial(_build_cmd, name, cfg, _find_project_root()))
     cmd = None
     if result is not None:
         cmd, host, port = result
@@ -481,7 +517,10 @@ async def start_server(
     # で外部起動済みプロセスが無い場合も no-op で安全。
     await asyncio.to_thread(wait_port_released, name, cfg, 10.0)
 
-    managed = _spawn_server(name, cfg)
+    # base はここで止まっている (起動していない / 上で kill した) ので、組み直しで予約の再計算・
+    # その場の見積りを許す。埋め込み / リランカーは base が載ったままなので保存値を読むだけ
+    spawn = partial(_spawn_server, name, cfg, allow_decide=True) if name == "base" else partial(_spawn_server, name, cfg)
+    managed = await run_in_executor_with_context(loop, None, spawn)
     if managed is None:
         return ServerActionResponse(
             name=name, action="start", success=False,
@@ -492,23 +531,46 @@ async def start_server(
     # 検証し、旧プロセス残響の誤 ready 判定を防ぐ。
     from scripts.launch_llama import (
         EMBED_GPU_START_TIMEOUT_SEC,
+        RERANK_GPU_START_TIMEOUT_SEC,
         _extract_model_basename,
         embed_cpu_fallback_cmd,
+        rerank_cpu_fallback_cmd,
         wait_for_health,
     )
-    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+    from backend.free.llm._base_client import (
+        health_wait_for_cfg,
+        model_path_from_cmd,
+        resolve_health_wait,
+    )
+
+    # 整数は明示値、auto / 無しは起動するモデルの GGUF サイズ連動 (c_16 §7.2.3)
+    model_path = model_path_from_cmd(cmd)
+    health_timeout = health_wait_for_cfg(
+        cfg, model_path, project_root=_find_project_root(), label=name,
+    )
     expected = _extract_model_basename(cmd) if cmd else None
-    # 埋め込みが保存済みの GPU 配置 (auto) なら、起動しなければ CPU で 1 回だけ起こし直す
-    # (埋め込みは必須機能。保存結果は書き換えない、c_16 §7.2.2)
-    fallback = embed_cpu_fallback_cmd(cfg, cmd) if name == "embed" and cmd else None
-    first_timeout = min(health_timeout, EMBED_GPU_START_TIMEOUT_SEC) if fallback else health_timeout
+    # 埋め込み / rerank が保存済みの GPU 配置 (auto) なら、起動しなければ CPU で 1 回だけ起こし直す
+    # (保存結果は書き換えない、c_16 §7.2.1 / §7.2.2)
+    if name == "embed" and cmd:
+        fallback = embed_cpu_fallback_cmd(cfg, cmd)
+        gpu_start_timeout = resolve_health_wait(
+            "auto", model_path, floor=EMBED_GPU_START_TIMEOUT_SEC, label="embed GPU start",
+        )
+    elif name == "rerank" and cmd:
+        fallback = rerank_cpu_fallback_cmd(cfg, _find_project_root(), cmd)
+        gpu_start_timeout = resolve_health_wait(
+            "auto", model_path, floor=RERANK_GPU_START_TIMEOUT_SEC, label="rerank GPU start",
+        )
+    else:
+        fallback, gpu_start_timeout = None, health_timeout
+    first_timeout = min(health_timeout, gpu_start_timeout) if fallback else health_timeout
     healthy = await asyncio.to_thread(
         wait_for_health, managed.host, managed.port, first_timeout, expected,
     )
     if not healthy and fallback is not None:
         logger.warning(
-            "server_control: embed on GPU did not become healthy within %ds; restarting it on CPU",
-            first_timeout,
+            "server_control: %s on GPU did not become healthy within %ds; restarting it on CPU",
+            name, first_timeout,
         )
         _stop_server(name)
         managed = _spawn_server(name, cfg, cmd_override=fallback)

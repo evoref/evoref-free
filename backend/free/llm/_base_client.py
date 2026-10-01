@@ -440,3 +440,61 @@ def resolve_startup_probe_timeout(
             "%s startup probe budget %.0fs (model %.1f GB)", label, budget, size_gb,
         )
     return budget
+
+
+#: 起動の health 待ち (本番起動・モード切替・auto-serve) の下限。現行の既定 (c_16 §7.2.3)。
+HEALTH_WAIT_FLOOR_SEC = 120
+#: 30 秒の下限 (``evoref serve`` の全サーバー待ち)。GPU 起動待ち (60) と配置判別プローブ (30) の下限は
+#: 起動スクリプトの ``*_GPU_START_TIMEOUT_SEC`` / ``EMBED_PROBE_HEALTH_TIMEOUT_SEC`` が持つ。
+PROBE_WAIT_FLOOR_SEC = 30
+
+
+def resolve_health_wait(
+    configured: object,
+    model_path: "str | Path | None",
+    *,
+    floor: float = HEALTH_WAIT_FLOOR_SEC,
+    label: str = "llama-server",
+) -> int:
+    """起動の health 待ちの秒数 (全経路の 1 実装、c_16 §7.2.3)。
+
+    ``configured`` が正の整数 (config の明示値) ならそのまま返す — 利用者の選択は不変で、
+    サイズ連動は適用しない。``"auto"`` / ``None`` / 不正値は
+    ``max(floor, resolve_startup_probe_timeout(model_path))`` (15 秒/GB、上限 600)。
+    サイズが読めなければ ``floor`` (現行の値)。大型モデルだけが ``floor`` を超えて延びる。
+    """
+    if isinstance(configured, (int, float, str)) and not isinstance(configured, bool):
+        try:
+            explicit = int(configured)
+        except ValueError:
+            explicit = 0
+        if explicit > 0:
+            return explicit
+    return int(max(floor, resolve_startup_probe_timeout(model_path, label=label)))
+
+
+def health_wait_for_cfg(
+    cfg: dict,
+    model_path: "str | Path | None",
+    *,
+    project_root: "Path | None" = None,
+    section: str = "process_manager",
+    key: str = "health_timeout",
+    floor: float = HEALTH_WAIT_FLOOR_SEC,
+    label: str = "llama-server",
+) -> int:
+    """config の ``<section>.<key>`` (``int`` / ``auto`` / 無し) から :func:`resolve_health_wait`。
+
+    相対の ``model_path`` は ``project_root`` 基準で解く (CWD に依らない)。
+    """
+    configured = ((cfg.get(section) or {}) if isinstance(cfg, dict) else {}).get(key, "auto")
+    if model_path and project_root is not None and not Path(model_path).is_absolute():
+        model_path = Path(project_root) / model_path
+    return resolve_health_wait(configured, model_path, floor=floor, label=label)
+
+
+def model_path_from_cmd(cmd: "list[str] | None") -> str | None:
+    """llama-server の起動コマンドの ``-m`` の値 (無ければ ``None``)。"""
+    if cmd and "-m" in cmd and cmd.index("-m") + 1 < len(cmd):
+        return str(cmd[cmd.index("-m") + 1])
+    return None

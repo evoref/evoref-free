@@ -180,8 +180,9 @@ class LearningConfig(BaseModel):
     # (実 llama-server ロード検証後)。
     # 'spsa-real-eval': CandidateEvalHarness を
     # base 用に配線し、候補 LoRA を ephemeral llama-server (base モデル + scratch port) に
-    # 実ロードして eval_core.json ケースで実推論評価する。CPU 推論 (-ngl 0 相当) のため
-    # base モデルサイズ次第で 1 サイクルが長時間化しうる。
+    # 実ロードして eval_core.json ケースで実推論評価する。-ngl は本番と同じだが、起動前に
+    # 空き VRAM / RAM を見て、収まらなければ CPU 推論 (-ngl 0) かスキップへ倒す
+    # (c_16 §7.2.3)。CPU 配置では base モデルサイズ次第で 1 サイクルが長時間化しうる。
     level2_base_method: Literal["lora", "cvector", "spsa-real-eval"] = "lora"
     # base=spsa-real-eval 実推論 eval 有効時の SPSA 反復数
     # (1 反復で候補サーバを複数回起動するためコスト天井として低く設定)。

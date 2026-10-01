@@ -511,10 +511,11 @@ def collect_configured_ports(config: dict) -> list[int]:
     if embed_cfg.get("backend") == "llama-cpp" and embed_cfg.get("llama_port"):
         ports.append(embed_cfg["llama_port"])
 
-    # リランカー (rag.rerank.mode が off 以外のときだけ。起動時のポート競合検査の対象、c_16 §7.2.1)
+    # リランカー (rag.rerank.mode が off 以外でモデル設定済みのときだけ。既定 on でもモデル未設定なら
+    # 起動しないので見ない。起動時のポート競合検査の対象、c_16 §7.2.1)
     from backend.schemas.rag import rerank_mode_of
 
-    if rerank_mode_of(config) != "off":
+    if rerank_mode_of(config) != "off" and (config.get("model_paths") or {}).get("rerank_model"):
         ports.append(_rerank_port(config))
 
     return ports

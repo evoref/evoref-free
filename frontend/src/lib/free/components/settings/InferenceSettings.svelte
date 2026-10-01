@@ -8,6 +8,7 @@
 	import ToggleField from './fields/ToggleField.svelte';
 	import SelectField from './fields/SelectField.svelte';
 	import TagListField from './fields/TagListField.svelte';
+	import { autoNumber } from '$lib/free/utils/autotune_view';
 
 	let llama = $derived(configSection($configData, 'llama'));
 	let mtp = $derived((llama.mtp ?? {}) as Record<string, unknown>);
@@ -32,13 +33,13 @@
 	</FieldGroup>
 
 	<FieldGroup label="settings.group_llama_performance">
-		<NumberField label="settings.llama.context_size" value={Number(llama.context_size ?? 4096)} min={512} onchange={fieldUpdater('llama', 'context_size')} />
-		<NumberField label="settings.llama.gpu_layers" value={Number(llama.gpu_layers ?? 999)} min={-1} onchange={fieldUpdater('llama', 'gpu_layers')} />
+		<NumberField label="settings.llama.context_size" value={autoNumber(llama.context_size, true, 4096)} min={512} onchange={fieldUpdater('llama', 'context_size')} />
+		<NumberField label="settings.llama.gpu_layers" value={autoNumber(llama.gpu_layers, false, 999)} min={-1} onchange={fieldUpdater('llama', 'gpu_layers')} />
 		<NumberField label="settings.llama.threads" value={Number(llama.threads ?? 0)} min={0} description="settings.llama.threads_desc" onchange={fieldUpdater('llama', 'threads')} />
-		<NumberField label="settings.llama.batch_size" value={Number(llama.batch_size ?? 512)} min={1} onchange={fieldUpdater('llama', 'batch_size')} />
+		<NumberField label="settings.llama.batch_size" value={autoNumber(llama.batch_size, true, 512)} min={1} onchange={fieldUpdater('llama', 'batch_size')} />
 		<ToggleField label="settings.llama.flash_attn" value={Boolean(llama.flash_attn ?? true)} onchange={fieldUpdater('llama', 'flash_attn')} />
 		<ToggleField label="settings.llama.mlock" value={Boolean(llama.mlock ?? false)} onchange={fieldUpdater('llama', 'mlock')} />
-		<NumberField label="settings.llama.slots" value={Number(llama.slots ?? 2)} min={1} max={16} onchange={fieldUpdater('llama', 'slots')} />
+		<NumberField label="settings.llama.slots" value={autoNumber(llama.slots, true, 2)} min={1} max={16} onchange={fieldUpdater('llama', 'slots')} />
 	</FieldGroup>
 
 	<FieldGroup label="settings.group_llama_generation">

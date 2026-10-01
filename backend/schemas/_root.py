@@ -119,8 +119,11 @@ class EvorefConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_rerank_port_is_unique(self) -> "EvorefConfig":
-        """rerank (off 以外) のポートが他のサーバのポートと重ならない (c_16 §7.2.1)"""
-        if self.rag.rerank.mode == "off":
+        """rerank (off 以外・モデル設定済み) のポートが他のサーバのポートと重ならない (c_16 §7.2.1)
+
+        モデル未設定なら起動しないので見ない (既定 on でモデルを置いていない既存の config を拒否しない)。
+        """
+        if self.rag.rerank.mode == "off" or not self.model_paths.rerank_model:
             return self
         others = {
             "llama.port": self.llama.port,
@@ -153,7 +156,9 @@ class EvorefConfig(BaseModel):
         """
         from backend.log_config import get_logger
 
-        context = int(getattr(self.llama, "context_size", 0) or 0)
+        raw_context = getattr(self.llama, "context_size", 0)
+        # ``auto`` / null は起動時に決まる (c_16 §7.2.3) ので、ここでは比べない
+        context = raw_context if isinstance(raw_context, int) else 0
         window = int(self.memory.working_max_tokens)
         if context <= 0:
             return self

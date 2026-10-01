@@ -41,6 +41,7 @@
 	import { reattachCreateRun } from '$lib/free/services/createReattach';
 	import { addToast } from '$lib/free/stores/toast';
 	import { refreshServerStatus, serverState } from '$lib/free/stores/server';
+	import AutoTuneBanner from './AutoTuneBanner.svelte';
 	import FileUpload from './FileUpload.svelte';
 	import FilePreview from './FilePreview.svelte';
 
@@ -466,6 +467,7 @@
 			</button>
 		</div>
 	{/if}
+	<AutoTuneBanner />
 	<div class="input-row">
 		<FileUpload />
 		<textarea

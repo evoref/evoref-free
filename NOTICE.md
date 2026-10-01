@@ -86,6 +86,25 @@ Pro 拡張 (`backend/pro/` / `frontend/src/lib/pro/`) はプロプライエタ�
 
 ---
 
+## japanese-bge-reranker-v2-m3-v1 (リランカー — 既定、任意)
+
+- **提供元**: hotchpotch
+- **リポジトリ**: https://huggingface.co/hotchpotch/japanese-bge-reranker-v2-m3-v1
+- **ライセンス**: MIT License
+- **ベースモデル**: BAAI/bge-reranker-v2-m3 (BAAI、https://huggingface.co/BAAI/bge-reranker-v2-m3 、Apache License 2.0)
+- **用途**: cross-encoder の日本語 reranker。RAG の再順位段 (`rag.rerank`、既定 on) で、
+  `model_paths.rerank_model` にファイルがあるときだけ使用する。GGUF は利用者が `models/` に
+  配置する (本リポジトリは配布しない)。
+
+### Attribution / 帰属表示
+
+> japanese-bge-reranker-v2-m3-v1 is developed and provided by [hotchpotch](https://huggingface.co/hotchpotch).
+> Licensed under the [MIT License](https://opensource.org/licenses/MIT).
+> It is based on [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) by [BAAI](https://huggingface.co/BAAI),
+> licensed under [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
+---
+
 ## 過去に使用していたモデル (現在は不使用)
 
 ### ruri-v3-130m

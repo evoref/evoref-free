@@ -15,6 +15,7 @@
 	import EditorSettings from '$lib/free/components/settings/EditorSettings.svelte';
 	import ModeGenerationSettings from '$lib/free/components/settings/ModeGenerationSettings.svelte';
 	import PromptSettings from '$lib/free/components/settings/PromptSettings.svelte';
+	import SystemSettings from '$lib/free/components/settings/SystemSettings.svelte';
 	import DeveloperSettings from '$lib/free/components/settings/DeveloperSettings.svelte';
 	import { loadConfig, activeTab, configLoaded, configLoadError } from '$lib/free/stores/settings';
 
@@ -33,6 +34,7 @@
 		generation: ModeGenerationSettings,
 		editor: EditorSettings,
 		prompts: PromptSettings,
+		system: SystemSettings,
 		develop: DeveloperSettings
 	};
 

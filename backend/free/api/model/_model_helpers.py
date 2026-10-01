@@ -31,6 +31,19 @@ from backend.free.api.schemas import (
 # ── ModelDetailResponse ビルダー ──────────────────────────────────────
 
 
+def _tuned_gpu_layers(llama_cfg: dict[str, Any]) -> int:
+    """``llama.gpu_layers: auto`` の表示値。保存済みの調整結果 (この PC) を読み、無ければ全層 (999)。"""
+    from backend.config import get_config, get_project_root
+    from backend.free.core.tuning.resolve import resolve_tuned
+
+    try:
+        cfg = {**get_config(), "llama": llama_cfg}
+    except RuntimeError:  # config 未ロード (単体テスト等)
+        cfg = {"llama": llama_cfg}
+    value = resolve_tuned(cfg, "ngl", project_root=get_project_root(), allow_decide=False).value
+    return value if isinstance(value, int) else 999
+
+
 def build_model_detail_response(
     client: object | None,
     llama_cfg: dict[str, Any],
@@ -45,8 +58,11 @@ def build_model_detail_response(
     渡す。未指定時は後方互換で `llama_cfg` から読む (None なら 4096)。
     """
     if context_size is None:
-        context_size = int(llama_cfg.get("context_size") or 4096)
-    gpu_layers = int(llama_cfg.get("gpu_layers", 0))
+        raw_ctx = llama_cfg.get("context_size")
+        context_size = raw_ctx if isinstance(raw_ctx, int) else 4096
+    raw_ngl = llama_cfg.get("gpu_layers", 0)
+    # ``auto`` は起動スクリプトが環境調整で決めた値 (c_16 §7.2.3)。backend は測らずに保存値を読む
+    gpu_layers = raw_ngl if isinstance(raw_ngl, int) else _tuned_gpu_layers(llama_cfg)
     flash_attn = bool(llama_cfg.get("flash_attn", False))
 
     metadata = getattr(client, "metadata", None) if client else None

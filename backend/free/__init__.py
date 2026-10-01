@@ -46,6 +46,7 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.system.server_control import router as server_control_router
     from backend.free.api.config.mode import router as mode_router
     from backend.free.api.system.system import router as system_router
+    from backend.free.api.system.auto_tune import router as auto_tune_router
 
     app.include_router(status_router)
     app.include_router(chat_router)
@@ -71,6 +72,7 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(server_control_router)
     app.include_router(mode_router)
     app.include_router(system_router)
+    app.include_router(auto_tune_router)
 
     # テキスト抽出 Extractor の登録（Free 11種）
     import backend.free.extraction
@@ -79,4 +81,4 @@ def setup_free(app: FastAPI) -> None:
     import backend.free.export  # noqa: F401
 
     register_free()
-    logger.info("Free edition initialized: 24 routers registered")
+    logger.info("Free edition initialized: 25 routers registered")

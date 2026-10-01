@@ -61,7 +61,7 @@ logger = get_logger("cli.main")
 # - "create": 対話モード (Pro はクリエイト、Free は警告 + chat フォールバック)
 _SUBCOMMANDS = {
     "serve", "chat", "create", "gui", "export", "import", "reindex", "projectmap", "theme",
-    "config", "reset", "doctor",
+    "config", "reset", "doctor", "tune",
 }
 
 #: 旧サブコマンド名 → 現行名。``code`` はクリエイトモードへの改名に追随して
@@ -437,6 +437,9 @@ def _get_subcommand_handler(name: str):
     if name == "doctor":
         from backend.free.cli.doctor_command import run_doctor_command
         return run_doctor_command
+    if name == "tune":
+        from backend.free.cli.tune_command import run_tune
+        return run_tune
     return None
 
 

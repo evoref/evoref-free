@@ -25,6 +25,7 @@ from pathlib import Path
 
 import httpx
 
+from backend.free.llm._base_client import model_path_from_cmd, resolve_health_wait
 from backend.log_config import get_logger
 
 logger = get_logger("core.llama_process_manager")
@@ -86,7 +87,19 @@ def _load_launch_module(project_root: Path):
 
 
 def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | None:
-    """`scripts/launch_llama.py` の build_*_cmd を流用"""
+    """`scripts/launch_llama.py` の build_*_cmd を流用
+
+    環境調整の ``auto`` の項目 (c_16 §7.2.3) の見積りを許すのは base だけ (この管理が base を起こすのは
+    base が止まっているとき)。埋め込み / リランカーは base が載ったままなので保存値を読むだけにする。
+    """
+    from backend.free.core.tuning.resolve import launch_scope
+
+    with launch_scope(component == "base"):
+        return _compose_cmd(component, cfg, project_root)
+
+
+def _compose_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | None:
+    """:func:`_build_cmd` の本体。"""
     mod = _load_launch_module(project_root)
 
     if component == "base":
@@ -138,10 +151,11 @@ class LlamaProcessManager:
         self,
         project_root: Path,
         *,
-        health_timeout: int = 60,
+        health_timeout: int | str | None = "auto",
         stop_timeout: int = 10,
     ):
         self.project_root = project_root
+        #: 整数は明示値 (そのまま)、``auto`` / ``None`` は起動するモデルの GGUF サイズ連動 (c_16 §7.2.3)
         self.health_timeout = health_timeout
         self.stop_timeout = stop_timeout
         self._procs: dict[str, ProcessEntry] = {}
@@ -172,17 +186,32 @@ class LlamaProcessManager:
                 f"{component} is not configured (build_cmd returned None)",
             )
         host, port = _resolve_endpoint(component, cfg)
+        model_path = model_path_from_cmd(cmd)
+        if model_path and not Path(model_path).is_absolute():
+            model_path = str(self.project_root / model_path)
+        health_timeout = resolve_health_wait(self.health_timeout, model_path, label=component)
 
-        # 埋め込みが保存済みの GPU 配置 (auto) なら、起動しなければ CPU で 1 回だけ起こし直す
-        # (埋め込みは必須機能。保存結果は書き換えない、c_16 §7.2.2)
-        if component == "embedding":
+        # 埋め込み / rerank が保存済みの GPU 配置 (auto) なら、起動しなければ CPU で 1 回だけ起こし直す
+        # (保存結果は書き換えない、c_16 §7.2.1 / §7.2.2)
+        if component in ("embedding", "rerank"):
             try:
                 mod = _load_launch_module(self.project_root)
             except ProcessManagerError:
                 mod = None  # launch_llama.py が読めない: CPU への起こし直しを諦めるだけ
-            fallback = mod.embed_cpu_fallback_cmd(cfg, cmd) if mod is not None else None
+            fallback = None
+            if mod is not None:
+                fallback = (
+                    mod.embed_cpu_fallback_cmd(cfg, cmd, self.project_root) if component == "embedding"
+                    else mod.rerank_cpu_fallback_cmd(cfg, self.project_root, cmd)
+                )
             if fallback is not None:
-                first = min(self.health_timeout, int(mod.EMBED_GPU_START_TIMEOUT_SEC))
+                first = min(health_timeout, resolve_health_wait(
+                    "auto", model_path, label=f"{component} GPU start",
+                    floor=int(
+                        mod.EMBED_GPU_START_TIMEOUT_SEC if component == "embedding"
+                        else mod.RERANK_GPU_START_TIMEOUT_SEC,
+                    ),
+                ))
                 if self._spawn_and_wait(component, cmd, host, port, first):
                     logger.info("%s is ready at %s:%s", component, host, port)
                     return self._procs[component]
@@ -192,14 +221,14 @@ class LlamaProcessManager:
                 self.stop(component)
                 cmd = fallback
 
-        if not self._spawn_and_wait(component, cmd, host, port, self.health_timeout):
+        if not self._spawn_and_wait(component, cmd, host, port, health_timeout):
             logger.error(
                 "%s health check timed out at %s:%s", component, host, port,
             )
             self.stop(component)
             raise ProcessManagerError(
                 f"{component} failed to become healthy within "
-                f"{self.health_timeout}s",
+                f"{health_timeout}s",
             )
         logger.info("%s is ready at %s:%s", component, host, port)
         return self._procs[component]

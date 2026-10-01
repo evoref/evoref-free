@@ -2,7 +2,19 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+
+
+def _int_or_auto(v: object, name: str, minimum: int) -> int | str | None:
+    """環境調整 (c_16 §7.2.3) が決めるキーの値: ``"auto"`` / ``None`` (どちらも自動) か ``minimum`` 以上の整数。"""
+    if v is None or v == "auto":
+        return v  # type: ignore[return-value]
+    if isinstance(v, str) or isinstance(v, bool):
+        raise ValueError(f"{name} must be an int (>={minimum}), 'auto' or null, got {v!r}")
+    iv = int(v)  # type: ignore[call-overload]
+    if iv < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {iv}")
+    return iv
 
 
 class MtpConfig(BaseModel):
@@ -96,18 +108,32 @@ class LlamaConfig(BaseModel):
 
     host: str = "localhost"
     port: int = Field(default=8080, ge=1024, le=65535)
-    # ``-c`` / コンテキスト長。``None`` (既定) は arch プロファイル
-    # (``models/profiles/<arch>.yaml`` の ``context_size``) を参照し、それも
-    # 未宣言なら 8192 にフォールバックする。明示 int を設定するとプロファイル
-    # より優先される (解決順: config 明示 > profile > 8192)。
-    context_size: int | None = Field(default=None, ge=512)
+    # ``-c`` / コンテキスト長。``"auto"`` / ``None`` (既定) は環境調整 (c_16 §7.2.3) が
+    # 空き VRAM / RAM に収まる最大 (4096〜、上限は arch プロファイルの ``context_size``、
+    # 無ければ 8192) を決める。明示 int はそのまま使う (調整結果は提案値として残るだけ)。
+    context_size: int | Literal["auto"] | None = Field(default=None)
     # 整数 (-1 / 0 / 999 等) または ``"auto"`` 文字列。
-    # ``"auto"`` 指定時は scripts/launch_llama.py の resolve 関数が
-    # GPU 物理容量 + GGUF layer 数 + Vulkan host buffer headroom から
-    # 段階的に縮小した値 (100% / 80% / 60% / 40% / 0%) を算出する。
+    # ``"auto"`` 指定時は環境調整 (c_16 §7.2.3) が GPU の **空き** から
+    # ヘッドルーム (iGPU: Vulkan host buffer、単体 GPU: 数百 MiB) を引いた予算に
+    # 収まるよう段階的に縮小した値 (100% / 80% / 60% / 40% / 0%) を決める。
     # iGPU 環境で base の GPU メモリ占有を抑え、embed の
     # Vulkan host buffer 確保失敗 (ErrorOutOfDeviceMemory) を回避する用途。
     gpu_layers: int | Literal["auto"] = Field(default=999)
+
+    @field_validator("context_size", mode="before")
+    @classmethod
+    def _validate_context_size(cls, v: object) -> int | str | None:
+        """整数は ``>= 512``、文字列は ``"auto"`` のみ、``None`` は auto と同じ。"""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            if v == "auto":
+                return v
+            raise ValueError(f"context_size must be an int (>=512), 'auto' or null, got string {v!r}")
+        iv = int(v)  # type: ignore[call-overload]
+        if iv < 512:
+            raise ValueError(f"context_size must be >= 512, got {iv}")
+        return iv
 
     @field_validator("gpu_layers", mode="before")
     @classmethod
@@ -123,8 +149,20 @@ class LlamaConfig(BaseModel):
         if iv < -1:
             raise ValueError(f"gpu_layers must be >= -1, got {iv}")
         return iv
+    # ``-t``。0 (既定) は環境調整 (c_16 §7.2.3 の項目 threads) が物理コア数を base / 埋め込み /
+    # リランカーへ配分した値 (と ``-tb`` = 物理コア数)。正の整数は明示 (``-tb`` は付けない)。
     threads: int = Field(default=0, ge=0)
-    batch_size: int = Field(default=512, ge=1)
+    # ``-b`` / ``-ub``。``"auto"`` / ``None`` (既定) は環境調整 (項目 batch) が GPU 種別と空きから選ぶ
+    # (単体 GPU は大きく、iGPU は ub を既定 512 のまま、CPU は 512 / 512)。明示 int はそのまま使う。
+    batch_size: int | Literal["auto"] | None = Field(default=None)
+    ubatch_size: int | Literal["auto"] | None = Field(default=None)
+
+    @field_validator("batch_size", "ubatch_size", mode="before")
+    @classmethod
+    def _validate_batch(cls, v: object, info: ValidationInfo) -> int | str | None:
+        """整数は ``>= 1``、``"auto"`` / ``None`` は自動。"""
+        return _int_or_auto(v, str(info.field_name), 1)
+
     flash_attn: bool = True
     mlock: bool = False
     cache_prompt: bool = True
@@ -186,7 +224,9 @@ class LlamaConfig(BaseModel):
     # 256 なら user ターンごとに 1 つ置かれ、分岐のコストは最後に一致した
     # ターン以降の窓だけになる。メモリは checkpoint 1 つにつき recurrent 状態の
     # スナップショット 1 つで、ctx_checkpoints が slot ごとの上限。
-    ctx_checkpoints: int = Field(default=8, ge=0)
+    # ``"auto"`` / ``None`` (既定) は環境調整 (c_16 §7.2.3 の項目 ram_params) が空き RAM から決める
+    # (決められないときは従来の 8)。明示 int (0 = 無効) はそのまま使う。
+    ctx_checkpoints: int | Literal["auto"] | None = Field(default=None)
     checkpoint_min_step: int = Field(default=256, ge=1)
     # 0 = 上限を config で決めない。ただし **無制限では投げない** —
     # ``LocalClient._build_payload`` が context_size からプロンプト推定を引いた
@@ -203,7 +243,17 @@ class LlamaConfig(BaseModel):
     # idle slot offload
     # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限。上流既定 8192 を
     # 黙従しないよう launch_llama.py から常に明示付与する。
-    cache_ram_mib: int = Field(default=0, ge=-1)
+    # ``"auto"`` / ``None`` (既定) は環境調整 (項目 ram_params) が空き RAM の余裕から決める。決められない
+    # ときの値は 0 (RAM を食わない側) で、その 1 か所は ``tuners/ram_params.py`` の FALLBACK (以前は
+    # 起動スクリプトのキー無しの既定 4096 と schema・雛形の 0 が食い違っていた)。
+    cache_ram_mib: int | Literal["auto"] | None = Field(default=None)
+
+    @field_validator("ctx_checkpoints", "cache_ram_mib", mode="before")
+    @classmethod
+    def _validate_ram_params(cls, v: object, info: ValidationInfo) -> int | str | None:
+        """``ctx_checkpoints`` は ``>= 0``、``cache_ram_mib`` は ``>= -1``。``"auto"`` / ``None`` は自動。"""
+        return _int_or_auto(v, str(info.field_name), -1 if info.field_name == "cache_ram_mib" else 0)
+
     # 上流既定 true (idle slot を退避対象にする)。false で機構自体を OFF。
     #
     # **本プロジェクトの既定は False**。true にしても cache_ram_mib=0 では

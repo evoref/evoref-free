@@ -32,7 +32,9 @@ const BASE_TAB_SECTIONS: Readonly<Record<string, readonly string[]>> = {
 	storage: ['local_paths', 'history'],
 	integration: ['tools'],
 	generation: ['modes', 'long_form'],
-	editor: ['editor']
+	editor: ['editor'],
+	// config を編集しないタブ (環境調整の実行・確認だけ)。セクション無し
+	system: []
 } as const;
 
 /** エディションに応じたタブセクションマッピングを生成 */

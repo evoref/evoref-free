@@ -90,6 +90,24 @@ def _base_model_path_or_none(cfg: dict[str, Any]) -> "Path | None":
     return path if path.exists() else None
 
 
+def _configure_tps_tracker(cfg: dict[str, Any]) -> None:
+    """生成速度の実測の台帳 (``cache/tps_calibration.json``、c_16 §7.2.3) を用意する。
+
+    失敗しても起動は続ける (締切は現行の定数のまま)。
+    """
+    try:
+        from backend.config import PathResolver, get_path_resolver
+        from backend.free.llm.tps_calibration import configure_tps_tracker
+
+        try:
+            resolver = get_path_resolver()
+        except RuntimeError:
+            resolver = PathResolver(cfg)
+        configure_tps_tracker(resolver.resolve_local("tps_calibration_file"))
+    except Exception as e:  # noqa: BLE001 - 実測は任意機能
+        logger.warning("tps calibration unavailable (deadlines stay at the defaults): %s", e)
+
+
 async def _init_llama_server(
     state: AppState, cfg: dict[str, Any], debug_logger: "DebugLogger",
 ) -> "LocalClient | None":
@@ -105,6 +123,10 @@ async def _init_llama_server(
     llama_host = llama_cfg.get("host", "127.0.0.1")
     llama_port = llama_cfg.get("port", 8080)
     llama_url = f"http://{llama_host}:{llama_port}"
+    # 生成速度の台帳は接続の成否と独立に用意する。初回接続が base のロードに負けて遅延接続
+    # (``status._try_lazy_connect``) になると LocalClient は後から作られるが、台帳が未設定のまま
+    # 残って締切の延長・件数の伸縮が黙って OFF になっていた (遅い PC ほど起きる)。
+    _configure_tps_tracker(cfg)
 
     try:
         # 起動レース対策: llama-server プロセスが listen するまで /health を
@@ -172,6 +194,7 @@ def _start_capability_probe(
         probe_model_capabilities,
         probe_timeout_sec,
     )
+    from backend.free.llm.tps_calibration import measured_tps_of
 
     chat_template = getattr(metadata, "chat_template", None)
     params_b = float(getattr(metadata, "params_b", 0.0) or 0.0)
@@ -181,7 +204,11 @@ def _start_capability_probe(
             declared = resolve_reasoning_mode(cfg, "base", chat_template=chat_template)
             # モデルサイズに追随したタイムアウト (固定 120 秒は 27B+ の iGPU で
             # 足りず、観測が恒久的に None になっていた)
-            probe_timeout = probe_timeout_sec(params_b, PROBE_REASONING_MAX_TOKENS)
+            measured = measured_tps_of(client)
+            probe_timeout = probe_timeout_sec(
+                params_b, PROBE_REASONING_MAX_TOKENS,
+                decode_tps=measured.decode_tps if measured is not None else None,
+            )
             snapshot = await probe_model_capabilities(
                 model_id=getattr(metadata, "model_id", ""),
                 template_family=getattr(metadata, "template_family", "unknown"),
@@ -473,7 +500,13 @@ def _start_quality_probes(
                     )
                     # モデルサイズに追随 (固定 90 秒だと 27B+ の iGPU で 200 トークン
                     # の decode が収まらない)
-                    quality_timeout = probe_timeout_sec(params_b, _PROBE_MAX_TOKENS)
+                    from backend.free.llm.tps_calibration import measured_tps_of
+
+                    measured = measured_tps_of(client)
+                    quality_timeout = probe_timeout_sec(
+                        params_b, _PROBE_MAX_TOKENS,
+                        decode_tps=measured.decode_tps if measured is not None else None,
+                    )
                     result = await probe_text_quality(
                         role=role,
                         model=model_name,
@@ -800,6 +833,33 @@ def _init_embed_placement_status(cfg: dict[str, Any], resolver: Any) -> Any:
     return status
 
 
+def _init_auto_tune_status(cfg: dict[str, Any], project_root: Path, resolver: Any) -> Any:
+    """7e''. 環境調整 (auto-tune) の確認状態と結果の要約を読む (c_16 §7.2.3)。
+
+    測るのは起動スクリプトで、ここは ``cache/auto_tune.json`` と保存済みの指紋を読むだけ (起動の経路と
+    同じ ``gate`` の 1 実装)。GPU 名は subprocess (--list-devices) が要るので比べない。読めなければ
+    ``unknown`` (起動は止めない)。
+    """
+    from backend.free.core.tuning.gate import load_auto_tune_status
+    from backend.free.core.tuning.store import resolve_tune_paths
+
+    try:
+        paths = resolve_tune_paths(cfg, project_root, resolver)
+    except Exception as e:  # noqa: BLE001 - 置き場が決まらなければ unknown (起動は続ける)
+        logger.warning("Auto-tune paths unresolvable: %s", e)
+        paths = None
+    status = load_auto_tune_status(cfg, project_root, paths=paths)
+    if status.state in ("pending", "declined"):
+        logger.warning(
+            "Auto-tune: the PC changed (%s) and re-measuring is %s; the embedding server stays on CPU and "
+            "the reranker is off until it is confirmed (evoref tune)",
+            ", ".join(status.changed_axes) or "unknown axes", status.state,
+        )
+    else:
+        logger.info("Auto-tune: state=%s reason=%s", status.state, status.reason or "-")
+    return status
+
+
 async def _init_reranker(
     cfg: dict[str, Any],
     resolver: Any,
@@ -807,21 +867,35 @@ async def _init_reranker(
 ) -> tuple[Any, Any]:
     """7e. 再順位 (リランカー) クライアント (c_16 §7.2.1)。
 
-    自己テストの結果ファイルを読むだけ (測るのは起動スクリプト)。mode off / 未テスト /
-    無効 / 保存時と PC が違う (``stale_fingerprint``) / サーバ不達なら ``(None, status)``。
+    自己テストの結果ファイルを読むだけ (測るのは起動スクリプト)。mode off / モデル未設定
+    (``no_model``) / モデルのファイルが無い (``model_missing``) / 未テスト / 無効 / 保存時と
+    PC が違う (``stale_fingerprint``) / サーバ不達なら ``(None, status)``。モデルが無いのは
+    既定 on でモデルを置いていない環境の正常な状態なので、結果ファイルも読まず WARNING も出さない。
     候補数は保存済みの ms/件と現在の締切・候補数の設定で引き直す。モデルが自己テスト後に
     変わっていても再テストはせず WARNING だけ出す。失敗は起動を止めない。
     """
     from backend.free.rag.rerank_llamacpp import RerankClient
     from backend.free.rag.rerank_selftest import (
+        RerankStatus,
         collect_pc_info,
         load_selftest_result,
+        rerank_model_unavailable_reason,
         resolve_rerank_status,
     )
     from backend.schemas.rag import rerank_mode_of
 
     rr = (cfg.get("rag") or {}).get("rerank") or {}
     mode = rerank_mode_of(cfg)
+    if mode != "off":
+        model_rel = (cfg.get("model_paths") or {}).get("rerank_model")
+        exists = bool(model_rel) and resolver.resolve_model("rerank_model").is_file()
+        absent = rerank_model_unavailable_reason(model_rel, exists)
+        if absent == "no_model":
+            logger.debug("Reranker not used: model_paths.rerank_model is not set")
+            return None, RerankStatus(mode=mode, reason=absent)
+        if absent:
+            logger.info("Reranker not used: rerank model file not found (%s)", model_rel)
+            return None, RerankStatus(mode=mode, reason=absent)
     saved = None
     current_pc = None
     current_model_key = None
@@ -2216,7 +2290,8 @@ def _log_gpu_cpu_placement(cfg: dict[str, Any], project_root: Path) -> None:
                 logger.warning(
                     "  total estimated VRAM %d MB exceeds runtime.total_vram_budget_mb "
                     "(%d MB). Run `python scripts/launch_llama.py --all` to re-check, "
-                    "or set embedding.gpu_layers to 0 (CPU fallback).",
+                    "or set embedding.gpu_layers to 0 (CPU fallback); when the reranker is in "
+                    "the breakdown, rag.rerank.gpu_layers: 0 also frees its share.",
                     total_vram_mb, int(budget_mb),
                 )
             else:
@@ -2264,7 +2339,7 @@ async def _build_base_context(
         pm_cfg = (cfg.get("process_manager") or {})
         state.llama_manager = LlamaProcessManager(
             project_root,
-            health_timeout=int(pm_cfg.get("health_timeout", 120)),
+            health_timeout=pm_cfg.get("health_timeout", "auto"),
             stop_timeout=int(pm_cfg.get("stop_timeout", 10)),
         )
 
@@ -2337,6 +2412,9 @@ async def _build_gen_pillar(
     with _timed(timings, "embed_placement"):
         embed_placement = _init_embed_placement_status(cfg, resolver)
 
+    with _timed(timings, "auto_tune"):
+        auto_tune = _init_auto_tune_status(cfg, project_root, resolver)
+
     with _timed(timings, "llm_client"):
         _init_llm_client(state, client)
 
@@ -2357,6 +2435,7 @@ async def _build_gen_pillar(
         reranker=reranker,
         rerank_status=rerank_status,
         embed_placement=embed_placement,
+        auto_tune=auto_tune,
     )
     return gen, pro_shutdown, develop_shutdown
 

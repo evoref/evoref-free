@@ -117,6 +117,32 @@
 		"documents_off": "使わない",
 		"documents_hint": "インストール済みの文書 (corpus) をこの会話の応答に使うか。自動 = 問いと関連度で決める"
 	},
+	"autotune": {
+		"banner": {
+			"message": "PC の環境が変わりました。自動調整を実行しますか",
+			"changed_axes": "(変わった項目: {axes})",
+			"accept": "実行する",
+			"decline": "今はしない",
+			"unchanged": "変更なし",
+			"running": "自動調整を実行しています..."
+		},
+		"axis": {
+			"hostname": "ホスト名",
+			"cpu": "CPU",
+			"logical_cores": "コア数",
+			"memory_gb": "メモリ"
+		},
+		"decision": {
+			"auto": "自動",
+			"accepted": "実行を承認",
+			"declined": "実行しない",
+			"pending": "確認待ち",
+			"unchanged": "変更なし"
+		},
+		"load_failed": "環境調整の状態を取得できませんでした。",
+		"run_failed": "自動調整を始められませんでした。",
+		"decision_failed": "確認の送信に失敗しました。"
+	},
 	"vram": {
 		"placement_cpu": "CPU"
 	},
@@ -273,6 +299,60 @@
 		"tab_prompts": "プロンプト",
 		"tab_generation": "生成パラメータ",
 		"tab_develop": "開発",
+		"tab_system": "システム",
+		"system": {
+			"title": "環境調整",
+			"description": "この PC のスペック (RAM / VRAM / GPU / コア数) に依存する値を測って提案します。config.yaml で値を明示している項目は書き換えません。",
+			"pc_title": "現在の PC",
+			"pc_hostname": "ホスト名",
+			"pc_cpu": "CPU",
+			"pc_cores": "論理コア数",
+			"pc_memory": "メモリ",
+			"pc_gpu": "GPU",
+			"pc_gpu_none": "なし",
+			"run_title": "自動調整",
+			"run": "自動調整を実行",
+			"running": "実行中...",
+			"decision_label": "確認状態",
+			"done": "調整が完了しました (反映 {applied} 件 / 未適用 {manual} 件)。",
+			"failed": "自動調整に失敗しました",
+			"restart_required": "反映には再起動が必要です。モデルタブのサーバ制御から llama-server を再起動してください。",
+			"open_model_tab": "モデルタブを開く",
+			"items_title": "調整項目",
+			"items_empty": "まだ調整結果がありません。",
+			"col_item": "項目",
+			"col_value": "提案値",
+			"col_status": "状態",
+			"item": {
+				"ctx": "コンテキスト長",
+				"ngl": "GPU に載せる層数",
+				"vram_budget": "VRAM 予算",
+				"threads": "スレッド配分",
+				"ram_params": "RAM 系 (チェックポイント・キャッシュ)",
+				"batch": "バッチサイズ",
+				"embed_params": "埋め込みのバッチ・タイムアウト",
+				"embed_placement": "埋め込みの配置 (GPU/CPU)",
+				"rerank": "リランカー",
+				"startup_timeouts": "起動待ち時間",
+				"tps": "生成速度の実測",
+				"background_budget": "裏処理の件数"
+			},
+			"status_applied": "反映",
+			"status_restart": "要再起動",
+			"status_requires_stop": "要停止 (停止中に CLI で実行)",
+			"status_requires_explicit": "稼働中の一括実行では測らない (項目を指定して実行)",
+			"status_scheduled": "再起動時に再計算して反映 (予約済み)",
+			"status_manual": "手動設定のため未適用 (提案値 {value})",
+			"status_manual_rows": "手動設定のため未適用 (提案値は左の値欄を参照)",
+			"status_not_auto": "自動指定ではないため未適用",
+			"manual_keys": "手動設定: {keys}",
+			"status_no_samples": "実測がまだ無いため現行値で動作",
+			"status_failed": "失敗: {reason}",
+			"source_measured": "実測",
+			"source_estimated": "見積り",
+			"source_skipped": "対象外",
+			"source_failed": "失敗"
+		},
 		"develop": {
 			"title": "Danger Zone",
 			"description": "開発者向けのメンテナンス操作です。破壊的な操作で、Develop エディションでのみ利用できます。",
@@ -825,6 +905,8 @@
 		"copy_failed": "コピーに失敗しました"
 	},
 	"api": {
+		"auto_tune_restamp_refused": "この PC の結果として残せませんでした。ホスト名以外 (CPU・メモリ・GPU 等) が変わっているときは「変更なし」は選べません。「実行する」で測り直してください。",
+		"auto_tune_unknown_item": "環境調整の項目が不明です。",
 		"learning_invalid_level": "level は 'level1' または 'full' のいずれかを指定してください",
 		"learning_scheduler_not_initialized": "学習スケジューラーが初期化されていません",
 		"learning_cycle_running": "学習サイクルが既に実行中です",

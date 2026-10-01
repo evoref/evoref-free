@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from backend.config import (
+    note_served_context_size,
     resolve_client_reasoning,
     resolve_context_size,
     resolve_enable_thinking,
@@ -42,6 +43,12 @@ def build_local_client(
     from backend.free.llm.local_client import DEFAULT_SLOTS, LocalClient
 
     llama_cfg = cfg.get("llama", {})
+    # 実際に起動している llama-server の n_ctx (``/props``) を記録する。以降の
+    # ``resolve_context_size*`` (チャット経路の WM 窓・プロンプト予算) はこれを超えない。
+    # 起動側が保守側へ倒れた回 (GPU 名だけ変わって環境移行の確認待ち → ``-c 8192``) に、
+    # backend だけが保存値 (32768) で予算を組んで HTTP 400 になっていた。/props に n_ctx が
+    # 無ければ「不明」へ戻し、従来どおり config 由来の値を使う。
+    note_served_context_size(getattr(metadata, "n_ctx", None))
     base_enable_thinking = resolve_enable_thinking(
         cfg, "base",
         explicit=llama_cfg.get("enable_thinking"),
@@ -84,6 +91,6 @@ def build_local_client(
         # --kv-unified を自動付与するため per-slot でも full n_ctx)。
         # ``llama.context_size`` の既定は None (プロファイル委譲) なので
         # ``.get(..., 4096)`` では None が入ってガードが無効化されていた。
-        # 起動フラグ ``-c`` と同じ優先順位で解決する。
+        # 起動フラグ ``-c`` と同じ優先順位で解決し、実際の n_ctx (/props) を超えない。
         context_size=resolve_context_size(cfg, "base"),
     )

@@ -21,6 +21,7 @@ from backend.free.llm._base_client import (
     async_retry_http_call,
     make_retry_logger,
 )
+from backend.free.core.tuning.tuners.embed_params import FALLBACK as _TUNE_FALLBACK
 from backend.free.rag.embedding_backend import (
     DEFAULT_MODE,
     QueryCacheMixin,
@@ -31,11 +32,12 @@ from backend.utils import estimate_tokens
 
 logger = get_logger("rag.embedding_llamacpp")
 
-# 1 HTTP リクエストあたりの最大テキスト数。フル reindex 等の大バッチ
-# (例 492 チャンクを 1 回で送る) を分割し、単一リクエストが embedding.timeout を
-# 超過する (低速 iGPU で顕著、httpx.ReadTimeout) のを防ぐ。各サブバッチは
-# embed() の単一リクエスト経路 (clamp / prefix / 5xx per-text フォールバック) を通る。
-_MAX_HTTP_BATCH = 64
+# 1 HTTP リクエストあたりのテキスト数の既定 (環境調整の保守側の値、c_16 §7.2.3 の項目
+# ``embed_params``)。フル reindex 等の大バッチ (例 492 チャンクを 1 回で送る) を分割し、
+# 単一リクエストが embedding.timeout を超過する (低速 iGPU で顕著、httpx.ReadTimeout) のを
+# 防ぐ。各サブバッチは embed() の単一リクエスト経路 (clamp / prefix / 5xx per-text
+# フォールバック) を通る。実際の件数はファクトリが解決値 (``http_batch``) を渡す。
+DEFAULT_HTTP_BATCH: int = int(_TUNE_FALLBACK["http_batch"])
 
 
 class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
@@ -55,8 +57,11 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         doc_template: str = "",
         debug_logger=None,
         model_key: str = "",
+        http_batch: int = DEFAULT_HTTP_BATCH,
     ):
         super().__init__(timeout=timeout)
+        #: 1 HTTP リクエストあたりのテキスト数 (``embed_params`` の解決値)。
+        self._http_batch = max(1, int(http_batch))
         #: 埋め込みモデルの GGUF の model_key (ストアのディレクトリ名、c_05 §0.5.7)。
         #: ``model_name_str`` は llama-server へ送る名前で、識別子には使わない。
         self.model_key = model_key
@@ -146,11 +151,12 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         # 大バッチは HTTP リクエストを分割する (timeout / メモリ過大防止)。各サブバッチは
         # 下の単一リクエスト経路を再帰で通る。フル reindex (全チャンクを 1 embed() で送る)
         # が低速 iGPU で 30s timeout を超えて落ちるのを防ぐ。
-        if len(texts) > _MAX_HTTP_BATCH:
+        step = self._http_batch
+        if len(texts) > step:
             parts: list[np.ndarray] = []
-            for i in range(0, len(texts), _MAX_HTTP_BATCH):
+            for i in range(0, len(texts), step):
                 sub = await self.embed(
-                    texts[i:i + _MAX_HTTP_BATCH], is_query=is_query, mode=mode,
+                    texts[i:i + step], is_query=is_query, mode=mode,
                 )
                 parts.append(sub)
             return np.vstack(parts)
@@ -312,6 +318,10 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
     def dim(self) -> int:
         """出力ベクトル次元数"""
         return self._dim
+
+    def http_batch_size(self) -> int:
+        """1 HTTP リクエストあたりのテキスト数 (呼び手が 1 回の ``embed()`` に渡す件数の目安)。"""
+        return self._http_batch
 
     def model_name(self) -> str:
         """モデル識別名"""

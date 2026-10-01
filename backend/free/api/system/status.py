@@ -12,6 +12,7 @@ from backend.free.api.system._status_collectors import (
     extract_learning_brief,
 )
 from backend.free.api.schemas import (
+    AutoTuneInfo,
     CapabilityInfo,
     ComponentStatus,
     DataHealthInfo,
@@ -304,6 +305,7 @@ async def get_status(state: AppState = Depends(get_app_state)):
         data_health=_data_health(state),
         rerank=_rerank_status(state),
         embed_placement=_embed_placement(state),
+        auto_tune=_auto_tune(state),
     )
 
 
@@ -313,7 +315,11 @@ def _rerank_status(state: AppState) -> RerankStatusInfo:
     status = getattr(gen, "rerank_status", None) if gen is not None else None
     if status is None:
         return RerankStatusInfo()
+    reranker = getattr(gen, "reranker", None)
+    remaining = getattr(reranker, "breaker_remaining_s", None)
     return RerankStatusInfo(
+        breaker_open=remaining is not None,
+        breaker_remaining_s=round(remaining, 1) if remaining is not None else None,
         mode=status.mode,
         enabled=status.enabled,
         placement=status.placement,
@@ -340,6 +346,21 @@ def _embed_placement(state: AppState) -> EmbedPlacementInfo:
         cpu_p50_ms=status.cpu_p50_ms,
         gpu_p50_ms=status.gpu_p50_ms,
         cosine_min=status.cosine_min,
+    )
+
+
+def _auto_tune(state: AppState) -> AutoTuneInfo:
+    """起動時に決めた環境調整の状態を返す (I/O なし、c_16 §7.2.3)。"""
+    gen = getattr(state, "gen", None)
+    status = getattr(gen, "auto_tune", None) if gen is not None else None
+    if status is None:
+        return AutoTuneInfo()
+    return AutoTuneInfo(
+        state=status.state,
+        reason=status.reason,
+        changed_axes=list(status.changed_axes),
+        items_summary=dict(status.items_summary),
+        measured_at=status.measured_at,
     )
 
 

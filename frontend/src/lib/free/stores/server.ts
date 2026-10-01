@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import { isPro } from '$lib/edition';
 import type {
+	AutoTuneInfo,
 	ComponentStatus,
 	DataHealthInfo,
 	DebugStatusInfo,
@@ -42,6 +43,9 @@ let editionMismatchNotified = false;
 
 export const serverState = writable<ServerState>(initial);
 
+/** /api/status の auto_tune (環境調整の確認待ちバナー用)。未取得・到達不能なら null */
+export const autoTuneStatus = writable<AutoTuneInfo | null>(null);
+
 /**
  * バックエンドが報告するエディション (/api/status の edition)。未取得なら null。
  * ビルド時の isPro が Pro でもバックエンドが free なら Pro の導線を出さない。
@@ -74,6 +78,7 @@ export async function refreshServerStatus(): Promise<void> {
 			dataHealth: status.data_health ?? null
 		});
 		backendEdition.set(status.edition ?? null);
+		autoTuneStatus.set(status.auto_tune ?? null);
 		if (status.data_health?.readonly && !readonlyNotified) {
 			readonlyNotified = true;
 			addToast({ type: 'error', i18nKey: 'chat.data_readonly_toast', duration: 0 });
@@ -93,6 +98,7 @@ export async function refreshServerStatus(): Promise<void> {
 			addToast({ type: 'warning', i18nKey: 'chat.edition_build_mismatch', duration: 0 });
 		}
 	} else {
+		autoTuneStatus.set(null);
 		serverState.set({
 			backendOnline: false,
 			components: [],

@@ -72,6 +72,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.embed_priority import P1_FRESHNESS, embed_priority
+from backend.free.core.tuning.tuners.embed_params import HTTP_BATCH_MAX, http_batch_of
 from backend.free.rag.evidence.columns import active_mask as columns_active_mask
 from backend.free.rag.evidence.columns import build_columns
 from backend.free.rag.evidence.events import EventPosition, EvidenceEventLog
@@ -152,8 +153,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("rag.evidence.store")
 
-#: 埋め込みを 1 回の ``embed()`` に渡す件数。
-EMBED_BATCH_SIZE = 64
+#: 埋め込みを 1 回の ``embed()`` に渡す件数の上限 (環境調整の項目 ``embed_params`` の HTTP バッチの
+#: 上限と同じ値)。バックエンドが解決値 (``http_batch_size()``) を持てばそれを使う (``http_batch_of``)。
+EMBED_BATCH_SIZE = HTTP_BATCH_MAX
 
 #: 埋め込みモデル名が取れないときのディレクトリ名。
 _UNKNOWN_MODEL = "unknown"
@@ -1726,20 +1728,22 @@ class EvidenceStore:
         """``(本文, is_query, mode)`` を **側ごとに** バッチで埋め込む。
 
         ``embed()`` は 1 回の呼び出しで 1 つの側しか扱えない (instruction は
-        バッチ単位で決まる) ので、側で分けてから :data:`EMBED_BATCH_SIZE` ずつ
-        投げる。返す配列は **入力と同じ行順** — 呼出側は snapshot の行位置で
-        書き戻すので、側でまとめた並びをそのまま返すと行が入れ替わる。
+        バッチ単位で決まる) ので、側で分けてから HTTP バッチ件数 (``http_batch_of``、
+        上限 :data:`EMBED_BATCH_SIZE`) ずつ投げる。返す配列は **入力と同じ行順** —
+        呼出側は snapshot の行位置で書き戻すので、側でまとめた並びをそのまま返すと
+        行が入れ替わる。
         """
         backend = self.embedding_backend
         assert backend is not None
+        step = http_batch_of(backend, EMBED_BATCH_SIZE)
         groups: dict[tuple[bool, str], list[int]] = {}
         for position, (_text, is_query, mode) in enumerate(items):
             groups.setdefault((is_query, mode), []).append(position)
 
         out: np.ndarray | None = None
         for (is_query, mode), positions in groups.items():
-            for start in range(0, len(positions), EMBED_BATCH_SIZE):
-                window = positions[start:start + EMBED_BATCH_SIZE]
+            for start in range(0, len(positions), step):
+                window = positions[start:start + step]
                 vectors = np.asarray(
                     await backend.embed(
                         [items[p][0] for p in window],

@@ -18,10 +18,15 @@ EXPECTED_MODELS = {
     "embed": "models/Qwen3-Embedding-0.6B-Q8_0.gguf",
 }
 
+# 任意のモデル (無くても動く。未配置でも missing に数えない)
+OPTIONAL_MODELS = {
+    "rerank": "models/japanese-bge-reranker-v2-m3-v1-q8_0.gguf",
+}
 
-def main() -> int:
+
+def main(project_root: Path | None = None) -> int:
     """想定モデルの配置状況を表示する（ダウンロードはしない）"""
-    project_root = Path(__file__).parent.parent
+    project_root = project_root or Path(__file__).parent.parent
 
     print("Automatic model download is disabled. Place GGUF files under models/ manually.")
     print("Expected models (filenames must match config.yaml model_paths):")
@@ -35,6 +40,12 @@ def main() -> int:
             missing += 1
         status = "found  " if exists else "MISSING"
         print(f"  [{status}] {role:6s} - {rel}")
+    for role, rel in OPTIONAL_MODELS.items():
+        exists = (project_root / rel).exists()
+        status = "found  " if exists else "absent "
+        print(f"  [{status}] {role:6s} - {rel} [optional]")
+        if not exists:
+            print(f"           not required: evoref works without it (no {role} step; search results stay in cosine order)")
 
     print()
     if missing:

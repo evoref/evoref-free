@@ -54,7 +54,13 @@ from backend.free.agent.meta_cognitive_utils import (
 )
 from backend.free.agent.step_compactor import StepCompactor
 from backend.free.llm.editor_filename import derive_editor_filename_stem
+from backend.free.llm.tps_calibration import (
+    chat_path_timeout,
+    is_explicit_agent_timeout,
+    measured_tps_of,
+)
 from backend.log_config import get_logger
+from backend.utils import estimate_tokens
 
 # 責務ごとのメソッド群は mixin へ、プロンプト / 定数は共有モジュールへ分割した。
 # mixin 側から本体を import すると循環するため、共有物は meta_cognitive_defs に置く。
@@ -110,6 +116,9 @@ if TYPE_CHECKING:
     from backend.free.memory.views.loop import LoopFactView
 
 logger = get_logger("agent.meta_cognitive")
+
+#: 計画生成 (``meta_cognitive_plan``) の出力上限。外側の上限の見積りにも使う。
+_PLAN_MAX_TOKENS = 256
 
 # 公開シンボル（後方互換）
 __all__ = [
@@ -295,6 +304,8 @@ class MetaCognitiveAgent(
         )
         self._content_gen_idle_timeout = agent_cfg.get("content_gen_idle_timeout", 30)
         self._llm_call_timeout = agent_cfg.get("llm_call_timeout", 90)
+        #: 利用者が既定から変えた値なら生成速度の実測 (c_16 §7.2.3) で延ばさない。
+        self._llm_call_timeout_explicit = is_explicit_agent_timeout(agent_cfg, "llm_call_timeout")
         # ターン予算は mode 別 (f_03 §4.4、Phase 3a): create は
         # ``create.turn_timeout_sec`` (既定 3600s)、chat は ``agent.total_timeout``
         # (既定 1800s)。以前は mode 非依存で、create の内側予算 (staged
@@ -755,20 +766,22 @@ class MetaCognitiveAgent(
             # 二重 timeout の意図: 内側は AuxClient が purpose 別の実効
             # タイムアウト (較正込み) を HTTP 層へ渡す。外側 wait_for
             # (=_llm_call_timeout, 既定 90s) は、内側がリトライで伸びた場合でも
-            # 計画生成の総時間を保証する保険。
+            # 計画生成の総時間を保証する保険。既定のままなら生成速度の実測が
+            # 遅いマシンでだけ延ばす (内側の meta_cognitive_plan と同じ規則)。
+            plan_timeout = self._plan_call_timeout(prompt)
             data = await asyncio.wait_for(
                 self._aux_client.generate_json(
                     prompt,
-                    max_tokens=256,
+                    max_tokens=_PLAN_MAX_TOKENS,
                     temperature=0.3,
                     purpose="meta_cognitive_plan",
                     list_key="tasks",
                 ),
-                timeout=self._llm_call_timeout,
+                timeout=plan_timeout,
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "Plan generation timed out after %ds", self._llm_call_timeout,
+                "Plan generation timed out after %ds", plan_timeout,
             )
             return []
         except Exception as e:
@@ -1011,6 +1024,22 @@ class MetaCognitiveAgent(
                 t.description = f"{t.description} and save it to {user_path}"
                 break
         return tasks
+
+    def _plan_call_timeout(self, prompt: str) -> float:
+        """計画生成の外側の上限 (``agent.llm_call_timeout``)。
+
+        既定のままなら、生成速度の実測が遅いマシンでだけ「出力 256 トークン ÷ decode tps +
+        prompt ÷ prefill tps」まで延ばす (天井は現行の 1.5 倍、c_16 §7.2.3)。未測定・利用者の
+        明示値はそのまま。
+        """
+        current = float(self._llm_call_timeout)
+        if getattr(self, "_llm_call_timeout_explicit", False):
+            return current
+        local = getattr(getattr(self, "_aux_client", None), "local", None)
+        return chat_path_timeout(
+            current, measured_tps_of(local),
+            prompt_tokens=estimate_tokens(prompt), max_tokens=_PLAN_MAX_TOKENS,
+        )
 
     @staticmethod
     def _build_plan_user_content(
