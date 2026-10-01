@@ -33,7 +33,7 @@ kNN k=5 の LOO recall 98.5%) がこの形を採る根拠になっている。
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -128,6 +128,9 @@ class Verdict:
     predicate: str = ""
     #: どの段が返したか (``lexical`` / ``exemplar`` / ``aux``)。
     stage: str = ""
+    #: 1 語に収まらない数値の根拠 (特徴量・スコア列など)。``decision.jsonl`` の
+    #: ``context.detail`` に載る。ユーザー入力は入れない (数値と内部 id だけ)。
+    detail: Mapping[str, Any] | None = None
 
     @property
     def fired(self) -> bool:
@@ -148,6 +151,7 @@ class Verdict:
             "score": round(float(self.score), 4),
             "evidence": self.evidence,
             "value": self.value if isinstance(self.value, (bool, str)) else None,
+            **({"detail": dict(self.detail)} if self.detail is not None else {}),
         }
 
 
@@ -855,9 +859,13 @@ class CascadePredicate:
         debug_logger: Any = None,
         candidates: Sequence[str] = (),
         scope: str = "request",
+        liveness_exempt: Collection[str] = (),
     ) -> None:
         self.name = name
         self.policy: CascadePolicy = policy
+        #: 死活監視に数えない棄権の ``evidence`` (判定の材料がまだ無いと分かっている棄権。
+        #: c_17 §2.1)。``decision.jsonl`` には書く。既定は空 (すべて数える)。
+        self._liveness_exempt = frozenset(liveness_exempt)
         self._lexical = lexical
         self._exemplar = exemplar
         self._aux = aux
@@ -974,7 +982,7 @@ class CascadePredicate:
         return Verdict(
             value=verdict.value, score=verdict.score, band=verdict.band,
             evidence=verdict.evidence, predicate=self.name,
-            stage=verdict.stage or stage,
+            stage=verdict.stage or stage, detail=verdict.detail,
         )
 
     def _log(
@@ -986,9 +994,10 @@ class CascadePredicate:
     ) -> None:
         # 死活監視は debug logger の有無と無関係に数える (c_07 §7.1)。通常起動
         # (debug logger 無効) の利用者環境こそ、恒真・恒偽に気づく手段が無い。
-        liveness_ledger().record_decision(
-            f"gate.{self.name}", band=verdict.band, label=_chosen_label(verdict),
-        )
+        if not (verdict.band == "abstain" and verdict.evidence in self._liveness_exempt):
+            liveness_ledger().record_decision(
+                f"gate.{self.name}", band=verdict.band, label=_chosen_label(verdict),
+            )
         if self._debug_logger is None:
             return
         context = verdict.as_context()

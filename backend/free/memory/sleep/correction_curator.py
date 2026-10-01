@@ -89,10 +89,27 @@ def verification_pending(note: object, now: float) -> bool:
     """
     if getattr(note, "correction_verified_at", None) is not None:
         return False
-    content = getattr(note, "content", "") or ""
-    if not (getattr(note, "is_correction", False) or _has_correction_form(content)):
+    if not is_correction_candidate(note):
         return False
     return not in_cooldown(note, VERIFY_FAILURE_KEY, now)
+
+
+def is_correction_candidate(note: object) -> bool:
+    """訂正候補か (Step 8.0 の検証対象と Step 8 の据え置き対象の SSOT)。
+
+    ``is_correction`` か訂正の形を持つ **ユーザー発話** で、未検証のもの。
+    据え置きだけ形を見て候補選びが ``is_correction`` だけを見ていたため、
+    ``is_correction=False`` で形を持つノートが永久に検証も抽出もされなかった
+    (2026-10-01、不変則 #14(a))。
+    """
+    if str(getattr(note, "source", "user") or "user") != "user":
+        return False
+    if getattr(note, "correction_verified_at", None) is not None:
+        return False
+    content = str(getattr(note, "content", "") or "")
+    if not content.strip():
+        return False
+    return bool(getattr(note, "is_correction", False)) or _has_correction_form(content)
 
 
 def _has_correction_form(text: str) -> bool:
@@ -201,11 +218,11 @@ def pending_notes(notes: list["MemoryNote"]) -> list["MemoryNote"]:
     """検証待ちの訂正候補を発話時刻順で返す (純粋関数)。"""
     return sorted(
         (
+            # 抽出済みは Step 8 が already_extracted で飛ばすので検証しても効果が
+            # 無く、1 サイクルの枠 (``_MAX_PER_CYCLE``) を占めるだけ。据え置き側
+            # (``verification_pending``) は already_extracted が先に判定される。
             n for n in notes
-            if str(getattr(n, "source", "user") or "user") == "user"
-            and getattr(n, "is_correction", False)
-            and getattr(n, "correction_verified_at", None) is None
-            and str(getattr(n, "content", "") or "").strip()
+            if is_correction_candidate(n) and not getattr(n, "extracted_fact_ids", None)
         ),
         key=lambda n: float(getattr(n, "created_at", 0.0) or 0.0),
     )
@@ -236,7 +253,14 @@ async def curate_corrections(
         public_notes(list(notes)),
         key=lambda n: float(getattr(n, "created_at", 0.0) or 0.0),
     )
-    candidates = pending_notes(ordered)
+    now_fn = now_provider or time.time
+    # cooldown 中は据え置きも外れている (``verification_pending``)。毎サイクル
+    # aux へ出して 60 秒のタイムアウトを払い続けない。
+    cooldown_now = now_fn()
+    candidates = [
+        n for n in pending_notes(ordered)
+        if not in_cooldown(n, VERIFY_FAILURE_KEY, cooldown_now)
+    ]
     if not candidates:
         return 0
     if aux_client is None:
@@ -252,7 +276,6 @@ async def curate_corrections(
         )
         candidates = candidates[:max_per_cycle]
 
-    now_fn = now_provider or time.time
     marked = 0
     for note in candidates:
         if should_pause is not None and should_pause():
@@ -295,6 +318,16 @@ async def curate_corrections(
                 # 横取りされたなら次の候補もまた横取りされる。残りは次の
                 # サイクルへ回す (2026-09-26 監査 #12: 11 回とも全滅)。
                 break
+            continue
+        if not isinstance(parsed, dict) or not parsed:
+            # 出力の切断・パース不能で答えが取れなかった。判定ではないので刻まず、
+            # 例外と同じ一過性失敗として数える (2026-09-26 監査: 崩れた出力の空の
+            # 結果が invalid_target として刻まれ、二度と検証されなかった)。
+            logger.warning(
+                "correction_curator: no usable verdict (note=%s); will retry",
+                getattr(note, "id", "?"),
+            )
+            record_transient_failure(note, VERIFY_FAILURE_KEY, now_fn())
             continue
         clear_failure(note, VERIFY_FAILURE_KEY)
         check = check_verdict(

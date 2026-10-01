@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -46,6 +47,7 @@ from backend.config import resolve_data_path
 from backend.error_handlers import E6003
 from backend.i18n_helper import init_i18n, msg
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 logger = get_logger("cli.service_manager")
 
@@ -347,6 +349,49 @@ def _spawn_and_wait_llama(
     return all_servers
 
 
+def _spawn_rerank_server(
+    project_root: Path,
+    config: dict,
+    args: argparse.Namespace,
+    procs: list[subprocess.Popen],
+    optional_procs: list[subprocess.Popen],
+    stderr_files: list,
+    console,
+) -> tuple[str, int] | None:
+    """rerank 用 llama-server を起動する (``rag.rerank.mode`` が off 以外のときだけ、c_16 §7.2.1)。
+
+    base / embed の health 待ちの後、backend を起こす前に呼ぶ — 自己テスト (PC の指紋が
+    変わったときだけ) の結果を backend が起動時に読むため。起動・自己テストの失敗は
+    serve を止めない (rerank を無効にして続ける)。起動した proc は ``optional_procs`` にも
+    積み、死んでも他のプロセスを巻き添えにしない。
+    """
+    if args.no_llama:
+        return None
+    from scripts.launch_llama import (
+        RERANK_HOST,
+        rerank_launchable,
+        rerank_port,
+        start_rerank_server,
+    )
+
+    launchable, _why = rerank_launchable(config, project_root)
+    if not launchable:
+        return None
+    render_info(console, "Starting rerank server (self-test runs only when the PC changed)...")
+    stderr_f = _open_stderr_log(project_root, "llama-rerank")
+    stderr_files.append(stderr_f)
+    launched = start_rerank_server(
+        config, project_root,
+        popen_kwargs={"stdout": subprocess.DEVNULL, "stderr": stderr_f},
+    )
+    if launched.proc is None:
+        render_info(console, f"rerank disabled: {launched.message}")
+        return None
+    procs.append(launched.proc)
+    optional_procs.append(launched.proc)
+    return RERANK_HOST, rerank_port(config)
+
+
 def _build_backend_env(args: argparse.Namespace) -> dict | None:
     """FastAPI バックエンドプロセスの環境変数を構築（変更不要なら ``None``、
     ``EVOREF_DEVELOP_LEVEL`` / ``EVOREF_LEARNING_DISABLED`` 環境変数経由）。"""
@@ -410,12 +455,22 @@ def _monitor_serve_processes(
     project_root: Path,
     console,
     cleanup,
+    optional_procs: list[subprocess.Popen] | None = None,
 ) -> int:
-    """全プロセスを監視。子プロセス異常終了 → 1、Ctrl+C → 0。"""
+    """全プロセスを監視。子プロセス異常終了 → 1、Ctrl+C → 0。
+
+    ``optional_procs`` (rerank) の終了は 1 回だけ知らせて監視から外す (serve は続ける)。
+    """
+    optional = list(optional_procs or [])
     try:
         while True:
-            for p in procs:
+            for p in list(procs):
                 ret = p.poll()
+                if ret is not None and p in optional:
+                    render_error(console, f"rerank server exited (code={ret}); continuing without it")
+                    optional.remove(p)
+                    procs.remove(p)
+                    continue
                 if ret is not None:
                     render_error(
                         console,
@@ -446,6 +501,7 @@ def _run_serve(args: argparse.Namespace) -> int:
         4. `_validate_edition_arg` (--edition + --develop 整合性)
         5. `acquire_pid` + `_make_serve_cleanup` + signal ハンドラ登録
         6. `_spawn_and_wait_llama` (llama-server 群起動 + ヘルスチェック)
+           + `_spawn_rerank_server` (rerank、off 以外のときだけ。自己テストは PC が変わったときだけ)
         7. `_spawn_backend` (FastAPI 起動)
         8. `_print_serve_running_banner` + `_monitor_serve_processes` (監視ループ)
     """
@@ -491,13 +547,22 @@ def _run_serve(args: argparse.Namespace) -> int:
         cleanup()
         return 1
 
+    optional_procs: list[subprocess.Popen] = []
+    rerank = _spawn_rerank_server(
+        project_root, config, args, procs, optional_procs, stderr_files, console,
+    )
+    if rerank is not None:
+        all_servers["rerank"] = rerank
+
     backend_port = _spawn_backend(project_root, config, args, procs, console)
     if backend_port is None:
         cleanup()
         return 1
 
     _print_serve_running_banner(console, backend_port, args.no_llama, all_servers)
-    return _monitor_serve_processes(procs, project_root, console, cleanup)
+    return _monitor_serve_processes(
+        procs, project_root, console, cleanup, optional_procs=optional_procs,
+    )
 
 
 # ────────────────────────────────────────────
@@ -568,33 +633,45 @@ def _build_llama_cmd(project_root: Path, cfg: dict | None = None) -> list[str]:
     )
 
 
-def _build_embed_cmd(project_root: Path, cfg: dict | None = None) -> list[str] | None:
-    """config.yaml から埋め込み用 llama-server コマンドを構築（設定時のみ）"""
-    from scripts.launch_llama import build_embed_cmd
-
-    if cfg is None:
-        cfg = _load_config(project_root)
-    return build_embed_cmd(cfg, project_root)
-
-
 # ────────────────────────────────────────────
-# 追加サーバー起動（補助タスク・埋め込み）
+# 追加サーバー起動（埋め込み）
 # ────────────────────────────────────────────
 
-# (name, config_key, port_key, default_port, build_cmd_func) の定義
-_EXTRA_SERVERS: list[tuple[str, str, str, int]] = [
-    # (表示名, config セクションキー, ポートキー, デフォルトポート)
-    ("embed", "embedding", "llama_port", 8082),
-]
 
-def _get_nested_config(cfg: dict, dotted_key: str) -> dict:
-    """ドット区切りキーで config のネストした辞書を取得"""
-    result = cfg
-    for key in dotted_key.split("."):
-        result = result.get(key, {})
-        if not isinstance(result, dict):
-            return {}
-    return result
+def _embed_endpoint(cfg: dict) -> tuple[str, int]:
+    """埋め込みサーバの (host, port)。"""
+    section = cfg.get("embedding", {}) or {}
+    return section.get("host", "127.0.0.1"), int(section.get("llama_port", 8082))
+
+
+def _start_embed(
+    project_root: Path,
+    cfg: dict,
+    stderr_files: list,
+    *,
+    wait_base_sec: float,
+):
+    """埋め込みサーバを本番のポートで起動する (``scripts.launch_llama.start_embed_server``)。
+
+    serve / auto-serve は埋め込みサーバの持ち主なので、``embedding.gpu_layers: auto`` で PC か
+    埋め込みモデルが変わったときはここで配置を判別する (判別する回は base が載り終わるのを
+    ``wait_base_sec`` まで待つ、c_16 §7.2.2)。GPU で起動しなければ CPU で 1 回だけ起こし直す。
+    llama-cpp でなければ ``None``。ブロックするので、イベントループからは executor で呼ぶ。
+    """
+    from scripts.launch_llama import start_embed_server
+
+    stderr_f = _open_stderr_log(project_root, "llama-embed")
+    stderr_files.append(stderr_f)
+    return start_embed_server(
+        cfg, project_root,
+        popen_kwargs={"stdout": subprocess.DEVNULL, "stderr": stderr_f},
+        wait_base_sec=wait_base_sec,
+    )
+
+
+def _base_wait_sec(cfg: dict) -> float:
+    """判別する回に base の読み込みを待つ上限 (``process_manager.health_timeout``)。"""
+    return float((cfg.get("process_manager") or {}).get("health_timeout", 120))
 
 
 def _spawn_extra_servers(
@@ -604,42 +681,28 @@ def _spawn_extra_servers(
     stderr_files: list,
     console,
 ) -> dict[str, tuple[str, int]]:
-    """補助サーバー（embed）を一括スポーン（ヘルスチェックなし）
+    """補助サーバー（embed）を起動する (base は起動済み、health は呼び出し元の _wait_for_health_all())。
 
-    Popen はノンブロッキングなので全サーバーを即座にスポーンし、
-    ヘルスチェックは呼び出し元の _wait_for_health_all() に委譲する。
+    埋め込みは起動して health まで待つ (GPU で起動しなければ CPU へ起こし直すため)。その間も
+    base は並行して読み込みを続ける。
 
     Returns:
-        {name: (host, port)} — スポーンしたサーバーのみ
+        {name: (host, port)} — 起動したサーバーのみ
     """
-    builders = {
-        "embed": _build_embed_cmd,
-    }
     servers: dict[str, tuple[str, int]] = {}
-
-    for name, config_key, port_key, default_port in _EXTRA_SERVERS:
-        build_fn = builders[name]
-        try:
-            cmd = build_fn(project_root, config)
-            if cmd is None:
-                continue
-            section = _get_nested_config(config, config_key)
-            port = section.get(port_key, default_port)
-            host = section.get("host", "127.0.0.1")
-            render_info(console, f"Starting {name} server on :{port}...")
-            stderr_f = _open_stderr_log(project_root, f"llama-{name}")
-            stderr_files.append(stderr_f)
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(project_root),
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_f,
-            )
-            procs.append(proc)
-            servers[name] = (host, port)
-        except (FileNotFoundError, ValueError, OSError) as e:
-            render_error(console, f"Failed to start {name} server: {e}")
-
+    host, port = _embed_endpoint(config)
+    try:
+        render_info(console, f"Starting embed server on :{port}...")
+        launched = _start_embed(project_root, config, stderr_files, wait_base_sec=_base_wait_sec(config))
+    except (FileNotFoundError, ValueError, OSError) as e:
+        render_error(console, f"Failed to start embed server: {e}")
+        return servers
+    if launched is None or launched.proc is None:
+        return servers
+    if launched.fell_back:
+        render_info(console, "embed server restarted on CPU after the GPU start failed")
+    procs.append(launched.proc)
+    servers["embed"] = (host, port)
     return servers
 
 
@@ -726,40 +789,38 @@ async def ensure_extra_servers(
     evoref create を実行した場合に補助サーバーを補完する。
     """
     cfg = _load_config(project_root)
-    builders = {
-        "embed": _build_embed_cmd,
-    }
+    host, port = _embed_endpoint(cfg)
 
-    for name, config_key, port_key, default_port in _EXTRA_SERVERS:
-        build_fn = builders[name]
-        try:
-            cmd = build_fn(project_root, cfg)
-            if cmd is None:
-                continue
-            section = _get_nested_config(cfg, config_key)
-            port = section.get(port_key, default_port)
-            host = section.get("host", "127.0.0.1")
+    # 既に起動中ならスキップ (配置の判別より先に見る)
+    if await _check_llama_health(f"http://{host}:{port}"):
+        logger.debug("ensure_extra_servers: embed already healthy on :%d", port)
+        return
+    try:
+        # 判別と health 待ちはブロックするので executor へ (イベントループを止めない)
+        loop = asyncio.get_running_loop()
+        launched = await run_in_executor_with_context(
+            loop, None, partial(
+                _start_embed, project_root, cfg, auto_serve_state.stderr_files,
+                wait_base_sec=_base_wait_sec(cfg),
+            ),
+        )
+    except (FileNotFoundError, ValueError, OSError) as e:
+        logger.warning("ensure_extra_servers: embed start failed: %s", e)
+        return
+    if launched is None or launched.proc is None:
+        return
+    _track_embed_proc(auto_serve_state, launched.proc, port)
+    logger.info(
+        "ensure_extra_servers: spawned embed on :%d (pid=%d, %s%s)", port, launched.proc.pid,
+        launched.placement.kind, ", CPU fallback" if launched.fell_back else "",
+    )
 
-            # 既に起動中ならスキップ
-            if await _check_llama_health(f"http://{host}:{port}"):
-                logger.debug("ensure_extra_servers: %s already healthy on :%d", name, port)
-                continue
 
-            # スポーン
-            stderr_f = _open_stderr_log(project_root, f"llama-{name}")
-            auto_serve_state.stderr_files.append(stderr_f)
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(project_root),
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_f,
-            )
-            auto_serve_state.procs.append(proc)
-            auto_serve_state.proc_names.append(f"llama-{name}")
-            auto_serve_state.managed_ports.append(port)
-            logger.info("ensure_extra_servers: spawned %s on :%d (pid=%d)", name, port, proc.pid)
-        except (FileNotFoundError, ValueError, OSError) as e:
-            logger.warning("ensure_extra_servers: %s start failed: %s", name, e)
+def _track_embed_proc(state: "AutoServeState", proc: subprocess.Popen, port: int) -> None:
+    """auto-serve の後始末の対象に埋め込みサーバを積む。"""
+    state.procs.append(proc)
+    state.proc_names.append("llama-embed")
+    state.managed_ports.append(port)
 
 
 def _spawn_all_servers(
@@ -769,10 +830,11 @@ def _spawn_all_servers(
     *,
     skip_base: bool = False,
 ) -> dict[str, tuple[str, int]]:
-    """全 llama-server を一括スポーン（並列起動、ヘルスチェックなし）
+    """全 llama-server を起動する (base はスポーンのみ、embed は health まで)
 
-    base + embed を同時に起動し、
-    ヘルスチェックは呼び出し元の _health_check_loop に委譲する。
+    base をスポーンした後、embed を起動して health まで待つ (その間 base は並行して読み込む。
+    GPU で起動しなければ CPU へ起こし直すため)。base のヘルスチェックは呼び出し元の
+    _health_check_loop に委譲する。ブロックするので、イベントループからは executor で呼ぶ。
 
     Args:
         skip_base: True の場合、ベース llama-server のスポーンをスキップ（既に起動中）
@@ -781,9 +843,6 @@ def _spawn_all_servers(
         {name: (host, port)} — スポーンまたは既存検出されたサーバー
     """
     servers: dict[str, tuple[str, int]] = {}
-    builders = {
-        "embed": _build_embed_cmd,
-    }
 
     # ── base llama-server ──
     llama_cfg = cfg.get("llama", {})
@@ -809,31 +868,20 @@ def _spawn_all_servers(
         except (FileNotFoundError, ValueError, OSError) as e:
             logger.warning("auto-serve: base llama-server start failed: %s", e)
 
-    # ── extra servers (embed) ──
-    for name, config_key, port_key, default_port in _EXTRA_SERVERS:
-        build_fn = builders[name]
-        try:
-            cmd = build_fn(project_root, cfg)
-            if cmd is None:
-                continue
-            section = _get_nested_config(cfg, config_key)
-            port = section.get(port_key, default_port)
-            host = section.get("host", "127.0.0.1")
-            stderr_f = _open_stderr_log(project_root, f"llama-{name}")
-            state.stderr_files.append(stderr_f)
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(project_root),
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_f,
-            )
-            state.procs.append(proc)
-            state.proc_names.append(f"llama-{name}")
-            state.managed_ports.append(port)
-            servers[name] = (host, port)
-            logger.debug("auto-serve: spawned %s server on :%d (pid=%d)", name, port, proc.pid)
-        except (FileNotFoundError, ValueError, OSError) as e:
-            logger.warning("auto-serve: %s server start failed: %s", name, e)
+    # ── embed (起動して health まで待つ。GPU で起動しなければ CPU へ起こし直す) ──
+    host, port = _embed_endpoint(cfg)
+    try:
+        launched = _start_embed(project_root, cfg, state.stderr_files, wait_base_sec=_base_wait_sec(cfg))
+    except (FileNotFoundError, ValueError, OSError) as e:
+        logger.warning("auto-serve: embed server start failed: %s", e)
+        return servers
+    if launched is not None and launched.proc is not None:
+        _track_embed_proc(state, launched.proc, port)
+        servers["embed"] = (host, port)
+        logger.debug(
+            "auto-serve: spawned embed server on :%d (pid=%d, %s%s)", port, launched.proc.pid,
+            launched.placement.kind, ", CPU fallback" if launched.fell_back else "",
+        )
 
     return servers
 
@@ -1219,10 +1267,11 @@ async def _maybe_spawn_auto_serve_llama(
         )
         render_info(console, msg("cli.auto_serve_llama_exists"))
         state.llama_port = llama_port_val
-    # ベースが既存でも、embed は未起動の可能性があるため常にスポーン
-    return _spawn_all_servers(
-        project_root, cfg, state,
-        skip_base=llama_already_running,
+    # ベースが既存でも、embed は未起動の可能性があるため常にスポーン。
+    # embed の配置の判別と health 待ちはブロックするので executor へ (イベントループを止めない)
+    return await run_in_executor_with_context(
+        asyncio.get_running_loop(), None,
+        partial(_spawn_all_servers, project_root, cfg, state, skip_base=llama_already_running),
     )
 
 

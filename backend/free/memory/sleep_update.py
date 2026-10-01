@@ -20,7 +20,7 @@ from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now
-from backend.free.memory.episodic.ingest import ingest_new_turns
+from backend.free.memory.episodic.ingest import IngestReport, ingest_pending
 from backend.free.memory.episodic.store import EpisodicStore
 from backend.free.memory.episodic.turn_source import (
     DEFAULT_SESSION_LIMIT,
@@ -152,6 +152,7 @@ class SleepTimeWorker:
         triggers_dir: Path | str | None = None,
         private_trace_ids_provider: Callable[[], set[str]] | None = None,
         learning_disabled: bool = False,
+        reranker=None,
     ):
         self.episodic = episodic
         self.embedder = embedder
@@ -211,6 +212,14 @@ class SleepTimeWorker:
         #: (c_16 §2.1: 3 ストアの書き手は sleep-time だけ — ここを止めると
         #: 記憶が一切書かれなくなる)。
         self.learning_disabled = bool(learning_disabled)
+        #: 再順位のクライアント (``GenPillar.reranker``、無効なら ``None``)。Step 5.9 の
+        #: 疑似クエリの品質検査に使う (c_16 §7.2.1 の第 5 段階 B)。記憶・検索側なので
+        #: ``--no-learning`` でも使う。
+        self.reranker = reranker
+        #: Step 5.9 の品質検査の件数 (Full の結果辞書へ写す。取消された回の分は次の Full へ持ち越す)。
+        self._pq_rerank_stats: dict[str, int] = {}
+        #: 取消された Step 5.9 の件数の持ち越し (次に Step 5.9 を終えた Full の結果辞書に足す)。
+        self._pq_rerank_carry: dict[str, int] = {}
 
     def set_fewshot_pool(self, pool) -> None:
         """FewShotPool を設定 (手本の埋め込み backfill に使用)。"""
@@ -310,8 +319,9 @@ class SleepTimeWorker:
                 "Sleep-time Light skipped: another sleep-time cycle is in progress",
             )
             return {
-                "notes_created": 0, "touched": 0,
-                "knowledge_claims": 0, "skipped": "cycle_in_progress",
+                "notes_created": 0, "notes_pending_sessions": 0,
+                "notes_pending_turns": 0, "notes_unreadable_sessions": 0,
+                "touched": 0, "knowledge_claims": 0, "skipped": "cycle_in_progress",
             }
         async with self._cycle_lock:
             self._cancelled = False
@@ -421,7 +431,9 @@ class SleepTimeWorker:
         t0 = time.monotonic()
         step_durations: dict[str, float] = {}
         result: dict = {
-            "notes_created": 0, "touched": 0, "knowledge_claims": 0,
+            "notes_created": 0, "notes_pending_sessions": 0,
+            "notes_pending_turns": 0, "notes_unreadable_sessions": 0,
+            "touched": 0, "knowledge_claims": 0,
         }
 
         logger.info(
@@ -431,7 +443,11 @@ class SleepTimeWorker:
         # 重なるので、ループ上に置くとその間トークンが流れない、f_02 §4.3)。
         try:
             ts = time.monotonic()
-            result["notes_created"] = await self._off_loop(self._step_e1_build_notes)
+            e1 = await self._off_loop(self._step_e1_build_notes)
+            result["notes_created"] = e1.created
+            result["notes_pending_sessions"] = e1.pending_sessions
+            result["notes_pending_turns"] = e1.pending_turns
+            result["notes_unreadable_sessions"] = e1.unreadable_sessions
             step_durations["step_e1_note_build"] = round(time.monotonic() - ts, 3)
             if self._check_cancelled():
                 return result
@@ -500,7 +516,7 @@ class SleepTimeWorker:
 
     # ── エピソード記憶のライフサイクル (c_16 §4.1) ──────────
 
-    def _step_e1_build_notes(self) -> int:
+    def _step_e1_build_notes(self) -> IngestReport:
         """会話履歴のうち、まだノートにしていないターンをノート化する。
 
         応答パスは ``WorkingMemory`` に積むだけになったので (c_16 §2.1: 書き手
@@ -508,7 +524,7 @@ class SleepTimeWorker:
         どこまでノート化したかは ``episodic/progress.json`` が持つ。
         """
         try:
-            created = ingest_new_turns(
+            report = ingest_pending(
                 self.episodic,
                 self._turn_source,
                 session_limit=DEFAULT_SESSION_LIMIT,
@@ -517,10 +533,13 @@ class SleepTimeWorker:
             )
         except Exception as e:  # noqa: BLE001 — 1 セッションの失敗で止めない
             logger.warning("Note build from conversation turns failed: %s", e)
-            return 0
-        if created:
-            logger.info("Sleep-time: built %d episodic note(s)", created)
-        return created
+            return IngestReport()
+        if report.created or report.pending_sessions:
+            logger.info(
+                "Sleep-time: built %d episodic note(s), %d session(s) / %d turn(s) still pending",
+                report.created, report.pending_sessions, report.pending_turns,
+            )
+        return report
 
     def _retention_value(self, key: str, default: float) -> float:
         """``memory.evidence.retention.<key>`` (無ければ manifest の宣言値)。"""
@@ -1114,7 +1133,22 @@ class SleepTimeWorker:
         # 要約) を 10〜20 分待たせていた (2026-09-12 実測: Full 時間の 77%)。
         # 索引は corpus 側の別ストアなので、記憶の版 (E5) と順序の依存は無い。
         ts = time.monotonic()
+        from backend.free.memory.sleep.pseudo_query import CARRIED_OVER_KEY, empty_rerank_stats
+
+        # 前の Full が Step 5.9 の途中で取消されていれば、その回の件数 (結果辞書ごと捨てられた)
+        # を結果辞書にだけ足す (memory JSONL は取消の回にその場で書いたので二重に数えない)。
+        # 完走した回は下で空に戻すので持ち越さない (c_16 §7.2.1)。
+        for key, value in self._pq_rerank_stats.items():
+            self._pq_rerank_carry[key] = self._pq_rerank_carry.get(key, 0) + value
+        self._pq_rerank_stats = empty_rerank_stats()
         result["pseudo_queries"] = await self._step5_9_pseudo_queries(llm_client)
+        # 品質検査の件数 (c_16 §7.2.1 の第 5 段階 B)。再順位段が無い回も 0 で必ず載せる。
+        result.update(self._pq_rerank_stats)
+        for key, value in self._pq_rerank_carry.items():
+            result[key] = result.get(key, 0) + value
+        result.setdefault(CARRIED_OVER_KEY, 0)
+        self._pq_rerank_stats = {}
+        self._pq_rerank_carry = {}
         step_durations["step5_9_pseudo_query"] = round(time.monotonic() - ts, 3)
 
         await self._save_state_async()
@@ -1362,6 +1396,9 @@ class SleepTimeWorker:
             # 「今生成中か」ではなく静穏窓 (f_01 §6.4)。ターンの合間に割り込むと
             # 次のターンに横取りされ、その往復で TTFT を壊す。
             should_pause=lambda: self._chat_recent(quiet),
+            reranker=self.reranker,
+            stats=self._pq_rerank_stats,
+            debug_logger=self._debug_logger,
         )
 
     async def _step8_9_summarize_sessions(self, llm_client) -> int:

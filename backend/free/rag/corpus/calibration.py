@@ -18,9 +18,10 @@
    (実測 0.628、golden の p05 0.62 と一致)、null 側 = 同梱の中立カナリア発話の
    top1 の p95 (実測 0.59)。棒はその中点 (null 側が上回れば null 側)。
 
-較正値は ``CartridgeManager`` が保持し、疑似クエリの充足率が
-``rag.pseudo_query.gate_min_coverage`` 以上のときだけ有効になる。それまでは
-記憶側の較正 (従来動作、混入ゼロだが厳しい) に倒す。
+較正値は ``CartridgeManager`` が保持する。棒は較正済みなら充足率に関わらず使い、
+``pq_gate`` だけで corpus ごと拒否するのは充足率が ``rag.pseudo_query.gate_min_coverage``
+以上で、分布が重ならず、問いが :data:`MIN_PQ_FOR_TOPIC_GATE` 件以上のときだけ
+(:func:`thresholds_for_search`)。
 """
 
 from __future__ import annotations
@@ -54,6 +55,12 @@ CORPUS_CALIBRATION_FORMAT = register_format(FormatSpec(
     path_key="store/corpus/calibration.json",
     retention="one per data root; recomputed when the signature changes",
 ))
+
+#: 関連性ゲートの拒否と ``on_topic_threshold`` を較正から採る最低の問いの数 (f_01 §6.6)。
+#: p25 の下に 12 件 (20 件では 5 件)。2026-09-30 実測: 同じ corpus を 19〜20 件の
+#: 問いで 4 回較正すると ``on_topic`` が 0.515〜0.576 と揺れ、0.576 の回は golden
+#: 80 問中 9 問を corpus ごと引かなかった。分位の揺れは 1/√n なので 50 件で約 0.63 倍。
+MIN_PQ_FOR_TOPIC_GATE = 50
 
 #: 正側 (leave-one-out top1) から採る分位。5% の正当な問いを落とす側に倒す。
 POSITIVE_QUANTILE = 0.05
@@ -158,17 +165,42 @@ def compute_corpus_calibration(
     on_topic = distribution.get("match_top1_p25")
     if isinstance(on_topic, (int, float)):
         thresholds["on_topic_threshold"] = round(float(on_topic), 4)
-    logger.info(
-        "Corpus calibration: chunks=%d pq=%d canaries=%d dist=%s thresholds=%s",
-        base["n_notes"], base["n_queries"], canary.shape[0], distribution, thresholds,
-    )
-    return {
+    result = {
         "ok": True,
         "n_chunks": base["n_notes"],
         "n_pq": base["n_queries"],
         "distribution": distribution,
         "thresholds": thresholds,
     }
+    view = thresholds_for_search(result)
+    # 拒否の可否は余白なしで反転しうるので、較正のたびに出して追えるようにする。
+    logger.info(
+        "Corpus calibration: chunks=%d pq=%d canaries=%d dist=%s thresholds=%s "
+        "pq_veto_allowed=%s on_topic_calibrated=%s",
+        base["n_notes"], base["n_queries"], canary.shape[0], distribution, thresholds,
+        view["pq_veto_allowed"], view["on_topic_calibrated"],
+    )
+    return result
+
+
+def thresholds_for_search(payload: dict[str, Any]) -> dict[str, Any]:
+    """保存した較正結果から検索側 (``unified_search`` Step 3d) が読む値を組む (f_01 §6.6)。
+
+    ``thresholds`` に 2 つの判定を足して返す (キャッシュの形は変えない — 既存の
+    ``calibration.json`` にもそのまま効く):
+
+    - ``pq_veto_allowed``: 充足率が高いとき ``pq_gate`` だけで corpus ごと拒否して
+      よいか。正側と null 側が重なった (``pq_overlap``) 較正と、問いが
+      :data:`MIN_PQ_FOR_TOPIC_GATE` 未満の較正では拒否しない — 重なった分布の
+      null 側の棒は答えのある問いを落とす (2026-09-30: golden 80 問の 28 問)。
+    - ``on_topic_calibrated``: ``on_topic_threshold`` を信じてよいか (同じ最低件数)。
+    """
+    thresholds: dict[str, Any] = dict(payload.get("thresholds") or {})
+    distribution = payload.get("distribution") or {}
+    sampled = int(payload.get("n_pq") or 0) >= MIN_PQ_FOR_TOPIC_GATE
+    thresholds["pq_veto_allowed"] = sampled and not bool(distribution.get("pq_overlap", False))
+    thresholds["on_topic_calibrated"] = sampled
+    return thresholds
 
 
 def calibration_signature(fingerprint: str, n_chunks: int, n_pq: int) -> str:
@@ -227,9 +259,11 @@ __all__ = [
     "CANARY_UTTERANCES",
     "CORPUS_CALIBRATION_FORMAT",
     "MIN_NOTES",
+    "MIN_PQ_FOR_TOPIC_GATE",
     "MIN_QUERIES",
     "calibration_signature",
     "compute_corpus_calibration",
     "load_corpus_calibration",
     "save_corpus_calibration",
+    "thresholds_for_search",
 ]

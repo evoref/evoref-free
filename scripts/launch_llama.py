@@ -7,13 +7,17 @@ config.yaml の llama / embedding セクションから起動コマンドを組�
   (なし)     ベースモデル llama-server のみ起動
   --all      ベース + エンベッドを一括起動
   --embed    エンベッド用 llama-server のみ起動
+  --rerank-selftest  リランカーの自己テストを手動で測り直す (c_16 §7.2.1)
+  --embed-placement  埋め込みサーバの配置 (GPU / CPU) を手動で判別し直す (c_16 §7.2.2)
+
+  --all では ``rag.rerank.mode`` が off 以外なら rerank 用 llama-server (既定 :8083) も
+  起動する。自己テストは PC の指紋が保存結果と違うときだけ走らせる。
 
   --all 起動時に ``runtime.total_vram_budget_mb`` (config.yaml) を参照し、
   GPU オフロード対象モデルの VRAM 使用量推定合計が予算を超過する場合は
   警告してアボートする。``--force`` で強制起動可能。
-  埋め込みの ``-ngl`` 既定値は 0 (CPU フォールバック) とし、
-  GPU 割り当ては ``embedding.gpu_layers`` による
-  明示 opt-in でのみ有効化される。
+  埋め込みの ``-ngl`` は ``embedding.gpu_layers`` で、``null`` は 0 (CPU)、整数はそのまま、
+  ``auto`` は PC の指紋が変わったときだけ一時ポートで CPU と GPU を測って決める (c_16 §7.2.2)。
 
   起動時に ``llama-server --version`` を実行し build 番号をログに出力する。
   ``runtime.min_llamacpp_build`` 未満を検出すると stderr に警告を出し、
@@ -61,24 +65,21 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 import yaml
 
 
-def _resolve_embed_gpu_layers(cfg: dict) -> int:
-    """埋め込み用 ``-ngl`` の解決
+def _resolve_embed_gpu_layers(cfg: dict, project_root: Path | None = None) -> int:
+    """埋め込み用 ``-ngl`` の解決 (判別はしない。保存結果を読むだけ、c_16 §7.2.2)。
 
-    ``embedding.gpu_layers`` が明示されていればそれを、未指定の場合は CPU
-    フォールバックとして 0 を返す。ベースモデル ``llama.gpu_layers`` には
-    追従しない (GPU 割り当ては opt-in)。
+    ``embedding.gpu_layers`` が整数ならそれを、``null`` (未指定) なら CPU の 0 を返す。
+    ``auto`` は保存済みの判別結果 (:func:`saved_embed_placement`) の配置で、無い・PC が違えば 0。
+    ベースモデル ``llama.gpu_layers`` には追従しない。
     """
-    emb_cfg = cfg.get("embedding", {}) or {}
-    gpu_layers = emb_cfg.get("gpu_layers")
-    if gpu_layers is None:
-        return 0
-    return int(gpu_layers)
+    return saved_embed_placement(cfg, project_root).gpu_layers
 
 
 def _resolve_base_gpu_layers(cfg: dict, project_root: Path | None = None) -> int:
@@ -956,11 +957,24 @@ def build_llama_cmd(
     return cmd
 
 
+def _embed_model_path(cfg: dict, project_root: Path) -> Path:
+    """埋め込みモデルの絶対パス (``model_paths.embed_model`` or 既定、存在は見ない)。"""
+    embed_model = (cfg.get("model_paths", {}) or {}).get(
+        "embed_model", "models/Qwen3-Embedding-0.6B-Q8_0.gguf",
+    )
+    embed_model_path = Path(embed_model)
+    if not embed_model_path.is_absolute():
+        embed_model_path = project_root / embed_model_path
+    return embed_model_path
+
+
 def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | None:
     """config.yaml の embedding セクションから埋め込み用 llama-server コマンドを生成
 
     embedding.backend は llama-cpp のみサポート。未知の値は None を返す。
-    ``-ngl`` 既定値は 0
+    ``-ngl`` は ``embedding.gpu_layers`` (``null`` → 0 / 整数 / ``auto`` は保存済みの判別結果、
+    c_16 §7.2.2)。判別はしない — 判別して起動するのは持ち主のプロセスの :func:`start_embed_server`。
+    GPU で起動できなかったときの CPU の再試行は :func:`embed_cpu_fallback_cmd`。
     """
     emb_cfg = cfg.get("embedding", {})
     if emb_cfg.get("backend", "llama-cpp") != "llama-cpp":
@@ -969,22 +983,23 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     if project_root is None:
         project_root = Path.cwd()
 
-    sp = cfg.get("model_paths", {})
+    gpu_layers = _resolve_embed_gpu_layers(cfg, project_root)
+    return _embed_cmd(
+        cfg, project_root, port=int(emb_cfg.get("llama_port", 8082)), gpu_layers=gpu_layers,
+    )
 
-    # エンベッドモデルパス（model_paths.embed_model or デフォルト）
-    embed_model = sp.get("embed_model", "models/Qwen3-Embedding-0.6B-Q8_0.gguf")
-    embed_model_path = Path(embed_model)
-    if not embed_model_path.is_absolute():
-        embed_model_path = project_root / embed_model_path
 
-    port = emb_cfg.get("llama_port", 8082)
+def _embed_cmd(cfg: dict, project_root: Path, *, port: int, gpu_layers: int) -> list[str]:
+    """埋め込み用 llama-server のコマンド (ポートと ``-ngl`` 以外は設定から。判別の一時サーバも同じ引数)。"""
+    emb_cfg = cfg.get("embedding", {})
+    embed_model_path = _embed_model_path(cfg, project_root)
 
     cmd = [
         "llama-server",
         "-m", str(embed_model_path),
         "--port", str(port),
         "--embedding",
-        "-ngl", str(_resolve_embed_gpu_layers(cfg)),
+        "-ngl", str(gpu_layers),
     ]
 
     # Pooling 方式。embedding.pooling が明示されている場合のみ --pooling を
@@ -1053,6 +1068,155 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     # 黙って分割される (base と同じ footgun、_resolve_kv_unified 参照)。
     _append_kv_unified_args(cmd, emb_cfg, slots=slots)
 
+    return cmd
+
+
+# ── rerank (リランカー、c_16 §7.2.1) ───────────────────────
+# 実測 (japanese-bge-reranker-v2-m3 q8_0、890M iGPU): -ngl 999 -fa on -c 8192 -b 8192
+# -ub 2048 -np 1 -t 2 --cache-ram 0 が最適。-ub は 1 組 (query + doc) の最大長以上が
+# 必須 (512 では 500 エラー)。
+
+RERANK_DEFAULT_PORT = 8083
+#: GPU 配置の判定で、モデルサイズに足す計算バッファの見積り (MiB)。
+RERANK_COMPUTE_MARGIN_MIB = 1024
+#: GPU 配置で threads=0 (自動) のときの -t (GPU が計算するので少なくてよい、実測最適)。
+RERANK_GPU_DEFAULT_THREADS = 2
+
+
+@dataclass(frozen=True)
+class RerankPlacement:
+    """rerank サーバの配置。``kind`` は ``gpu`` / ``cpu``、``reason`` は判定の根拠 (英語)。"""
+
+    kind: str
+    gpu_layers: int
+    reason: str = ""
+
+
+def _rerank_cfg(cfg: dict) -> dict:
+    return ((cfg.get("rag") or {}).get("rerank") or {})
+
+
+def rerank_mode(cfg: dict) -> str:
+    """``rag.rerank.mode`` (正規化は ``backend.schemas.rag.rerank_mode_of`` の 1 実装)。"""
+    from backend.schemas.rag import rerank_mode_of
+
+    return rerank_mode_of(cfg)
+
+
+def rerank_port(cfg: dict) -> int:
+    return int(_rerank_cfg(cfg).get("port", RERANK_DEFAULT_PORT))
+
+
+def resolve_rerank_model_path(cfg: dict, project_root: Path) -> Path | None:
+    """``model_paths.rerank_model`` の絶対パス。未設定なら ``None`` (存在は見ない)。"""
+    raw = (cfg.get("model_paths") or {}).get("rerank_model")
+    if not raw:
+        return None
+    path = Path(str(raw))
+    return path if path.is_absolute() else project_root / path
+
+
+def rerank_launchable(cfg: dict, project_root: Path) -> tuple[bool, str]:
+    """rerank サーバを起動する条件 (mode != off・モデル設定済み・ファイルあり) と、起動しない理由。"""
+    if rerank_mode(cfg) == "off":
+        return False, "rag.rerank.mode is off"
+    model = resolve_rerank_model_path(cfg, project_root)
+    if model is None:
+        return False, "model_paths.rerank_model is not set"
+    if not model.is_file():
+        return False, f"rerank model not found: {model}"
+    return True, ""
+
+
+@dataclass(frozen=True)
+class GpuFit:
+    """GPU に載るかの判定 (リランカーと埋め込みで共有する 1 実装)。
+
+    ``status`` は ``no_gpu`` / ``unknown_size`` / ``fits`` / ``short``。
+    """
+
+    status: str
+    device: str = ""
+    free_mib: int = 0
+    need_mib: int = 0
+
+
+def gpu_fit(
+    device_memory: dict[str, tuple[int, int]], model_mb: int | None, *, margin_mib: int, reserve_mib: int = 0,
+) -> GpuFit:
+    """GPU デバイス (``host`` 以外) の空きの最大が ``model_mb + margin_mib + reserve_mib`` 以上か (純関数)。"""
+    gpus = {k: v for k, v in device_memory.items() if k.lower() != "host"}
+    if not gpus:
+        return GpuFit("no_gpu")
+    if model_mb is None:
+        return GpuFit("unknown_size")
+    name, (_total, free) = max(gpus.items(), key=lambda kv: kv[1][1])
+    need = model_mb + margin_mib + max(0, reserve_mib)
+    return GpuFit("fits" if free >= need else "short", name, free, need)
+
+
+def decide_rerank_placement(
+    gpu_layers_cfg: object,
+    device_memory: dict[str, tuple[int, int]],
+    model_mb: int | None,
+    *,
+    compute_margin_mib: int = RERANK_COMPUTE_MARGIN_MIB,
+) -> RerankPlacement:
+    """配置を決める (純関数)。
+
+    明示の整数ならそれに従う (0 = CPU)。``auto`` は GPU デバイス (``host`` 以外) の空きの
+    最大がモデルサイズ + ``compute_margin_mib`` 以上なら GPU (``-ngl 999``)、でなければ CPU。
+    """
+    if not (isinstance(gpu_layers_cfg, str) and gpu_layers_cfg == "auto"):
+        ngl = int(gpu_layers_cfg)  # type: ignore[call-overload]
+        if ngl > 0:
+            return RerankPlacement("gpu", ngl, "explicit gpu_layers")
+        return RerankPlacement("cpu", 0, "explicit gpu_layers=0")
+    fit = gpu_fit(device_memory, model_mb, margin_mib=compute_margin_mib)
+    if fit.status == "no_gpu":
+        return RerankPlacement("cpu", 0, "no GPU device")
+    if fit.status == "unknown_size":
+        return RerankPlacement("cpu", 0, "model size unknown")
+    if fit.status == "fits":
+        return RerankPlacement("gpu", 999, f"{fit.device} free {fit.free_mib} MiB >= need {fit.need_mib} MiB")
+    return RerankPlacement("cpu", 0, f"{fit.device} free {fit.free_mib} MiB < need {fit.need_mib} MiB")
+
+
+def build_rerank_cmd(
+    cfg: dict, project_root: Path | None, placement: RerankPlacement,
+) -> list[str] | None:
+    """rerank 用 llama-server (``--reranking``) の起動コマンド。
+
+    ``rag.rerank.mode`` が off / ``model_paths.rerank_model`` 未設定 / ファイル無しなら
+    ``None`` (起動しない)。モデルパスは空白・括弧を含んでも argv の 1 要素のまま渡す。
+    """
+    if project_root is None:
+        project_root = Path.cwd()
+    ok, why = rerank_launchable(cfg, project_root)
+    if not ok:
+        print(f"[launch] rerank server not started: {why}")
+        return None
+    model = resolve_rerank_model_path(cfg, project_root)
+    assert model is not None
+    rr = _rerank_cfg(cfg)
+    cmd = [
+        "llama-server",
+        "-m", str(model),
+        "--port", str(rerank_port(cfg)),
+        "--reranking",
+        "-c", "8192",
+        "-b", "8192",
+        # 1 組 (query + doc) の最大長以上が必須 (512 では 500 エラー)
+        "-ub", "2048",
+        "-np", "1",
+        "--cache-ram", "0",
+        "-ngl", str(placement.gpu_layers),
+    ]
+    threads = int(rr.get("threads", 0) or 0)
+    if placement.kind == "gpu":
+        cmd += ["-fa", "on", "-t", str(threads or RERANK_GPU_DEFAULT_THREADS)]
+    elif threads > 0:
+        cmd += ["-t", str(threads)]
     return cmd
 
 
@@ -1816,7 +1980,7 @@ def _estimate_via_gguf_size(
     emb_cfg = cfg.get("embedding", {}) or {}
     if emb_cfg.get("backend", "llama-cpp") == "llama-cpp":
         embed_path = _resolve_model_path(cfg, "embed_model", "", project_root)
-        embed_ngl = _resolve_embed_gpu_layers(cfg)
+        embed_ngl = _resolve_embed_gpu_layers(cfg, project_root)
         embed_size = _file_size_mb(embed_path)
         result["embed"] = {
             "model_mb": embed_size,
@@ -1939,6 +2103,38 @@ def _parse_device_memory(text: str) -> dict[str, tuple[int, int]]:
             free = int(m.group(2))
             result[m.group(1)] = (free, free)
     return result
+
+
+_DEVICE_NAME_RE = re.compile(
+    # "Vulkan0: AMD Radeon(TM) 890M Graphics (48923 MiB, 46477 MiB free)" (--list-devices)
+    r"^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.+?)\s*\(\d+\s*MiB,\s*\d+\s*MiB\s*free\)\s*$"
+)
+
+
+def _parse_device_names(text: str) -> list[str]:
+    """device 列挙行 (フォーマット A) から ``"<device>: <製品名>"`` の一覧を返す。
+
+    容量 (空きは刻々と変わる) は含めない — PC の指紋 (リランカー自己テスト) に使うため。
+    """
+    names: list[str] = []
+    for raw in (text or "").splitlines():
+        m = _DEVICE_NAME_RE.match(raw.strip())
+        if m and m.group(1).lower() != "host":
+            names.append(f"{m.group(1)}: {m.group(2)}")
+    return names
+
+
+def _list_llama_devices(binary: str = "llama-server", timeout: float = 30.0) -> str:
+    """``llama-server --list-devices`` の出力 (stdout + stderr)。失敗は空文字列。"""
+    try:
+        result = subprocess.run(
+            [binary, "--list-devices"],
+            capture_output=True, timeout=timeout, check=False,
+            encoding="utf-8", errors="replace",
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+    return (result.stdout or "") + "\n" + (result.stderr or "")
 
 
 # config 明示も arch プロファイル宣言も無い場合の context_size slot 別既定。
@@ -2570,15 +2766,8 @@ def _parse_build_requirement(value: str | int | None) -> int | None:
     return int(text)
 
 
-def _probe_llamacpp_build(
-    binary: str = "llama-server", timeout: float = 2.0,
-) -> int | None:
-    """``llama-server --version`` を実行し build 番号を抽出する
-
-    タイムアウト / バイナリ不存在 / 抽出失敗のいずれもサイレントに None を返す。
-    バイナリが build 番号を露出しないカスタムビルドにも対応するため、抽出
-    失敗を「要件未満」とは扱わない (呼び出し側で警告のみで継続)。
-    """
+def _llama_version_text(binary: str = "llama-server", timeout: float = 2.0) -> str | None:
+    """``llama-server --version`` の出力 (stdout + stderr)。起動できなければ ``None``。"""
     try:
         result = subprocess.run(
             [binary, "--version"],
@@ -2589,8 +2778,30 @@ def _probe_llamacpp_build(
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
-    combined = (result.stdout or "") + "\n" + (result.stderr or "")
+    return (result.stdout or "") + "\n" + (result.stderr or "")
+
+
+def _probe_llamacpp_build(
+    binary: str = "llama-server", timeout: float = 2.0,
+) -> int | None:
+    """``llama-server --version`` を実行し build 番号を抽出する
+
+    タイムアウト / バイナリ不存在 / 抽出失敗のいずれもサイレントに None を返す。
+    バイナリが build 番号を露出しないカスタムビルドにも対応するため、抽出
+    失敗を「要件未満」とは扱わない (呼び出し側で警告のみで継続)。
+    """
+    combined = _llama_version_text(binary, timeout)
+    if combined is None:
+        return None
     return _parse_build_number(combined)
+
+
+def _llama_server_version(binary: str = "llama-server", timeout: float = 5.0) -> str:
+    """``llama-server --version`` の ``version:`` 行の値 (リランカー自己テストの記録用、無ければ空)。"""
+    for line in (_llama_version_text(binary, timeout) or "").splitlines():
+        if line.strip().startswith("version:"):
+            return line.strip()[len("version:"):].strip()
+    return ""
 
 
 def check_llamacpp_build(
@@ -2772,6 +2983,754 @@ def _start_and_wait(
     return proc
 
 
+# ── rerank の起動と自己テスト (c_16 §7.2.1) ─────────────────
+# 自己テストは rerank サーバを所有するプロセス (この起動スクリプト / evoref serve) で
+# 走らせる: GPU で退化したら CPU で起動し直す必要があり、プロセスの持ち主でないと
+# 止めて起こし直せない。backend はその結果ファイルを読むだけ。
+
+RERANK_HOST = "127.0.0.1"
+
+
+@dataclass
+class RerankLaunch:
+    """:func:`start_rerank_server` の結果。``proc`` は起動したまま残した rerank サーバ。"""
+
+    proc: subprocess.Popen | None
+    #: 使った / 書いた自己テストの結果 (``RerankSelftestResult``)。起動しなかった前段の理由では ``None``。
+    result: object | None
+    #: この呼出で自己テストを走らせたか。
+    tested: bool
+    #: 起動しなかった / 無効にした理由 (英語)。
+    message: str = ""
+
+
+def _stop_proc(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    """``proc`` を止めて待つ (止まらなければ kill)。"""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _port_answers(host: str, port: int) -> bool:
+    """``host:port`` の ``/health`` が何か答えるか (既に別のサーバが居る)。"""
+    try:
+        httpx.get(f"http://{host}:{port}/health", timeout=1.0)
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return False
+    except httpx.HTTPError:
+        return True
+    return True
+
+
+def rerank_selftest_path(cfg: dict, project_root: Path) -> Path | None:
+    """自己テスト結果の置き場 (``PathResolver.LAYOUT["rerank_selftest_file"]``)。"""
+    return _data_path(cfg, project_root, "rerank_selftest_file")
+
+
+def _explicit_gpu_layers(rr: dict) -> int | None:
+    """``rag.rerank.gpu_layers`` が明示の整数ならその値、``auto`` なら ``None``。"""
+    raw = rr.get("gpu_layers", "auto")
+    if isinstance(raw, str) and raw == "auto":
+        return None
+    return int(raw)
+
+
+def _usable_saved(st, saved, rr: dict) -> tuple[bool, int, str]:
+    """保存済みの結果を **現在の** 締切・候補数で読み直す (再テストしない)。"""
+    return st.effective_candidates(
+        saved,
+        deadline_ms=int(rr.get("deadline_ms", 1000)),
+        max_candidates=int(rr.get("max_candidates", 20)),
+        min_candidates=int(rr.get("min_candidates", 3)),
+    )
+
+
+def saved_rerank_placement(cfg: dict, project_root: Path) -> RerankPlacement | None:
+    """保存済みの自己テストが (現在の設定で) 有効なら、その配置 (再起動の経路用。測り直さない)。
+
+    明示の ``gpu_layers`` (整数) が保存済みの配置と食い違うときは ``None`` — その配置は
+    未テストなので起こさない (測り直すのは起動スクリプト、理由 ``placement_setting_changed``)。
+    """
+    path = rerank_selftest_path(cfg, project_root)
+    if path is None:
+        return None
+    try:
+        from backend.free.rag import rerank_selftest as st
+    except ImportError:
+        return None
+    saved, _status = st.load_selftest_result(path)
+    if saved is None or saved.placement not in ("gpu", "cpu"):
+        return None
+    rr = _rerank_cfg(cfg)
+    explicit = _explicit_gpu_layers(rr)
+    if explicit is not None and explicit != saved.gpu_layers:
+        print(
+            f"[launch] rerank not started: gpu_layers={explicit} differs from the self-tested "
+            f"placement ({saved.gpu_layers}); re-run the launcher to test it",
+        )
+        return None
+    enabled, _candidates, _reason = _usable_saved(st, saved, rr)
+    if not enabled:
+        return None
+    return RerankPlacement(saved.placement, saved.gpu_layers, "saved self-test")
+
+
+def _rerank_health_once(host: str, port: int, expected_model_id: str | None) -> bool:
+    """``/health`` が 200 で、``/props`` のモデルが一致するか (1 回だけ見る)。"""
+    try:
+        resp = httpx.get(f"http://{host}:{port}/health", timeout=2.0)
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return False
+    if resp.status_code != 200:
+        return False
+    return expected_model_id is None or _props_model_matches(host, port, expected_model_id)
+
+
+def _wait_healthy_or_dead(
+    proc: subprocess.Popen,
+    host: str,
+    port: int,
+    timeout: float,
+    expected_model_id: str | None,
+    *,
+    probe: Callable[[str, int, str | None], bool] = _rerank_health_once,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """health を待つ。プロセスが死んだら **その場で** ``False`` (timeout 全部は待たない)。"""
+    deadline = clock() + timeout
+    while True:
+        if proc.poll() is not None:
+            return False
+        if probe(host, port, expected_model_id):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(1.0)
+
+
+def start_rerank_server(
+    cfg: dict,
+    project_root: Path,
+    *,
+    force_selftest: bool = False,
+    popen_kwargs: dict | None = None,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    list_devices: Callable[[], str] = _list_llama_devices,
+    health: Callable[..., bool] = _wait_healthy_or_dead,
+    measure: Callable[..., object] | None = None,
+    port_busy: Callable[[str, int], bool] = _port_answers,
+    server_version: Callable[[], str] = _llama_server_version,
+    health_timeout: int | None = None,
+) -> RerankLaunch:
+    """rerank サーバを起動する。PC の指紋が保存結果と違うときだけ自己テストを走らせる。
+
+    - mode off / モデル未設定 / ファイル無し → 起動しない (INFO)。
+    - 指紋が一致 → 保存値の配置で起動。候補数は保存済みの ms/件と **現在の** 締切・候補数で
+      引き直す (再テストしない)。無効なら起動しない。モデルが変わっていても再テストせず WARNING。
+    - 一致しない / 結果が無い / 読めない / ``force_selftest`` / 明示の ``gpu_layers`` が
+      保存済みの配置と違う (``placement_setting_changed``、唯一の例外) → 配置を決めて起動して
+      測る。GPU で退化・起動失敗したら CPU で 1 回だけ起動し直す (``gpu_layers: auto`` の
+      ときだけ。遅すぎは再試行しない)。
+    - 結果は ``cache/rerank_selftest.json`` へ書く。ただし環境起因の失敗 (``server_unhealthy`` /
+      ``http_error:*``) が混じった回は保存しない (次の起動でまた試す)。
+
+    起動・health・自己テストの失敗はチャットを止めない (rerank を無効にして続ける)。
+    """
+    ok, why = rerank_launchable(cfg, project_root)
+    if not ok:
+        print(f"[launch] rerank server not started: {why}")
+        return RerankLaunch(None, None, False, why)
+    try:
+        from backend.free.rag import rerank_selftest as st
+        from backend.model_key import model_key_for
+        from backend.utils import utc_now
+    except ImportError as e:
+        msg = f"backend is not importable ({e}); the rerank self-test cannot run"
+        print(f"[launch] WARNING: rerank server not started: {msg}", file=sys.stderr)
+        return RerankLaunch(None, None, False, msg)
+    path = rerank_selftest_path(cfg, project_root)
+    if path is None:
+        msg = "data root is not resolvable"
+        print(f"[launch] WARNING: rerank server not started: {msg}", file=sys.stderr)
+        return RerankLaunch(None, None, False, msg)
+
+    port = rerank_port(cfg)
+    if port_busy(RERANK_HOST, port):
+        msg = f"port {port} is already in use; stop the old rerank server first (evoref-ctl stop)"
+        print(f"[launch] WARNING: rerank server not started: {msg}", file=sys.stderr)
+        return RerankLaunch(None, None, False, msg)
+
+    rr = _rerank_cfg(cfg)
+    explicit = _explicit_gpu_layers(rr)
+    deadline_ms = int(rr.get("deadline_ms", 1000))
+    max_candidates = int(rr.get("max_candidates", 20))
+    min_candidates = int(rr.get("min_candidates", 3))
+    model = resolve_rerank_model_path(cfg, project_root)
+    assert model is not None
+    model_key = model_key_for(model)
+    timeout = health_timeout or int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+    kwargs = {"cwd": project_root, **(popen_kwargs or {})}
+
+    devices_text = list_devices()
+    pc = st.collect_pc_info(_parse_device_names(devices_text))
+    fingerprint = pc.digest
+    saved, status = st.load_selftest_result(path)
+    needed, why_test = st.selftest_needed(
+        saved, fingerprint, force=force_selftest, explicit_gpu_layers=explicit,
+    )
+
+    def spawn(placement: RerankPlacement) -> subprocess.Popen | None:
+        cmd = build_rerank_cmd(cfg, project_root, placement)
+        if cmd is None:
+            return None
+        print(f"[launch] rerank ({placement.kind}): {' '.join(cmd)}")
+        try:
+            proc = popen(cmd, **kwargs)
+        except (FileNotFoundError, OSError) as e:
+            print(f"[launch] WARNING: failed to spawn rerank server: {e}", file=sys.stderr)
+            return None
+        if health(proc, RERANK_HOST, port, timeout, model.name):
+            return proc
+        print(f"[launch] WARNING: rerank server ({placement.kind}) did not become healthy", file=sys.stderr)
+        if placement.kind == "gpu" and saved_embed_placement(cfg, project_root).kind == "gpu":
+            print(
+                "[launch] WARNING: the embedding server is also on GPU (cache/embed_placement.json); "
+                "GPU memory may be short for both. The reranker is disabled for this run (retrieval "
+                "falls back to cosine order); set embedding.gpu_layers: 0 to keep the GPU for the reranker",
+                file=sys.stderr,
+            )
+        _stop_proc(proc)
+        return None
+
+    if not needed and saved is not None:
+        if saved.model_key and saved.model_key != model_key:
+            print(
+                f"[launch] WARNING: model_paths.rerank_model changed since the self-test "
+                f"({saved.model_file} -> {model.name}); not re-testing (only a PC change re-tests). "
+                "Run --rerank-selftest to measure the new model",
+                file=sys.stderr,
+            )
+        enabled, candidates, reason = _usable_saved(st, saved, rr)
+        if not enabled:
+            print(f"[launch] rerank disabled by the saved self-test ({reason}); not started")
+            return RerankLaunch(None, saved, False, reason)
+        placement = RerankPlacement(saved.placement, saved.gpu_layers, "saved self-test")
+        proc = spawn(placement)
+        if proc is None:
+            return RerankLaunch(None, saved, False, "server_unhealthy")
+        print(
+            f"[launch] rerank ready on :{port} ({saved.placement}, "
+            f"{saved.ms_per_doc or 0:.0f} ms/doc, {candidates} candidates; saved self-test)",
+        )
+        return RerankLaunch(proc, saved, False, "")
+
+    print(f"[launch] rerank self-test: {why_test} (saved result: {status})")
+    measure_fn = measure or st.measure_rerank_server
+    budget = st.warm_budget_ms(deadline_ms, min_candidates)
+    first = decide_rerank_placement(
+        rr.get("gpu_layers", "auto"), _parse_device_memory(devices_text), _file_size_mb(model),
+    )
+    print(f"[launch] rerank placement: {first.kind} ({first.reason})")
+    attempts = [first]
+    if first.kind == "gpu" and explicit is None:
+        attempts.append(RerankPlacement("cpu", 0, "retry on CPU after the GPU attempt failed"))
+
+    common = {
+        "fingerprint": fingerprint,
+        "model_key": model_key,
+        "model_file": model.name,
+        "llama_server_version": server_version(),
+        "pc": pc,
+    }
+    threads = int(rr.get("threads", 0) or 0)
+    last = None
+    environmental = False
+    for placement in attempts:
+        proc = spawn(placement)
+        if proc is None:
+            environmental = True
+            last = st.RerankSelftestResult(
+                enabled=False, reason="server_unhealthy", placement=placement.kind,
+                gpu_layers=placement.gpu_layers, threads=threads, tested_at=utc_now(), **common,
+            )
+            continue
+        measurement = measure_fn(f"http://{RERANK_HOST}:{port}", warm_budget=budget)
+        verdict = st.evaluate_measurement(
+            measurement, deadline_ms=deadline_ms,
+            max_candidates=max_candidates, min_candidates=min_candidates,
+        )
+        last = st.RerankSelftestResult(
+            enabled=verdict.enabled, reason=verdict.reason, placement=placement.kind,
+            gpu_layers=placement.gpu_layers, threads=threads,
+            ms_per_doc=verdict.ms_per_doc, candidates=verdict.candidates, margin=verdict.margin,
+            scores=list(getattr(measurement, "scores", [])),
+            prompt_tokens=getattr(measurement, "prompt_tokens", None),
+            tested_at=utc_now(), **common,
+        )
+        if verdict.enabled:
+            if not st.save_selftest_result(path, last):
+                print(f"[launch] WARNING: failed to save the rerank self-test to {path}", file=sys.stderr)
+            print(
+                f"[launch] rerank self-test passed on {placement.kind}: "
+                f"{verdict.ms_per_doc or 0:.0f} ms/doc, {verdict.candidates} candidates, "
+                f"margin {verdict.margin or 0:.2f}",
+            )
+            return RerankLaunch(proc, last, True, "")
+        print(
+            f"[launch] WARNING: rerank self-test failed on {placement.kind}: {verdict.reason}",
+            file=sys.stderr,
+        )
+        environmental = environmental or st.is_environmental_failure(verdict.reason)
+        _stop_proc(proc)
+        if not verdict.retry_on_cpu:
+            break
+
+    assert last is not None
+    if environmental:
+        print(f"[launch] rerank disabled for this run: {last.reason} (not saved; will retry next start)")
+    else:
+        if not st.save_selftest_result(path, last):
+            print(f"[launch] WARNING: failed to save the rerank self-test to {path}", file=sys.stderr)
+        print(f"[launch] rerank disabled: {last.reason}")
+    return RerankLaunch(None, last, True, last.reason)
+
+
+def wait_rerank_ready(
+    cfg: dict, project_root: Path, timeout_sec: float,
+    *, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+    list_devices: Callable[[], str] = _list_llama_devices,
+) -> str:
+    """別プロセスの起動スクリプトが rerank の自己テストを終えるまで待つ (evoref-ctl 用)。
+
+    保存結果の指紋がこの PC と一致し、有効なら ``/health`` が 200 になるまで。mode off /
+    モデル無しは即座に返る。戻り値は状態 (``off`` / ``ready`` / ``disabled`` / ``timeout``)。
+    """
+    ok, _why = rerank_launchable(cfg, project_root)
+    path = rerank_selftest_path(cfg, project_root)
+    if not ok or path is None:
+        return "off"
+    try:
+        from backend.free.rag import rerank_selftest as st
+    except ImportError:
+        return "off"
+    fingerprint = st.collect_pc_info(_parse_device_names(list_devices())).digest
+    rr = _rerank_cfg(cfg)
+    explicit = _explicit_gpu_layers(rr)
+    port = rerank_port(cfg)
+    deadline = clock() + timeout_sec
+    while True:
+        saved, _status = st.load_selftest_result(path)
+        needed, _why = st.selftest_needed(saved, fingerprint, explicit_gpu_layers=explicit)
+        if saved is not None and not needed:
+            if not _usable_saved(st, saved, rr)[0]:
+                return "disabled"
+            try:
+                if httpx.get(f"http://{RERANK_HOST}:{port}/health", timeout=1.0).status_code == 200:
+                    return "ready"
+            except (httpx.ConnectError, httpx.TimeoutException):
+                pass
+        if clock() >= deadline:
+            return "timeout"
+        sleep(1.0)
+
+
+# ── 埋め込みサーバの配置 (GPU / CPU) の判別と起動 (c_16 §7.2.2) ─────
+# 判別は埋め込みサーバを起こす持ち主のプロセス (この起動スクリプト / evoref serve / auto-serve) だけが
+# :func:`start_embed_server` から走らせる。一時ポートで CPU と GPU を起こして測り、本番のポートは
+# 触らない。再起動の経路と backend は保存結果を読むだけ。GPU 配置の本番サーバが起動しなければ、
+# どの経路も :func:`embed_cpu_fallback_cmd` で CPU に 1 回だけ起こし直す (埋め込みは必須機能)。
+
+EMBED_PROBE_HOST = "127.0.0.1"
+#: GPU 候補の判定で、埋め込みモデルのサイズに足す計算バッファの見積り (MiB)。
+EMBED_COMPUTE_MARGIN_MIB = 1024
+#: 判別の一時サーバの health 待ち (秒)。ハングした GPU で起動時間を膨らませない。
+EMBED_PROBE_HEALTH_TIMEOUT_SEC = 30
+#: GPU 配置の本番サーバの health 待ち (秒)。超えたら CPU で起こし直す。
+EMBED_GPU_START_TIMEOUT_SEC = 60
+
+
+@dataclass(frozen=True)
+class EmbedPlacement:
+    """埋め込みサーバの配置。``kind`` は ``gpu`` / ``cpu``、``reason`` は根拠 (英語の識別子)。"""
+
+    kind: str
+    gpu_layers: int
+    reason: str = ""
+
+
+def embed_placement_path(cfg: dict, project_root: Path) -> Path | None:
+    """判別結果の置き場 (``PathResolver.LAYOUT["embed_placement_file"]``)。"""
+    return _data_path(cfg, project_root, "embed_placement_file")
+
+
+def _embed_setting_is_auto(cfg: dict) -> bool:
+    return (cfg.get("embedding") or {}).get("gpu_layers") == "auto"
+
+
+def _embed_model_key(cfg: dict, project_root: Path) -> str | None:
+    """埋め込みモデルの ``model_key`` (ファイルが無い / backend が無ければ ``None``)。"""
+    model = _embed_model_path(cfg, project_root)
+    if not model.is_file():
+        return None
+    try:
+        from backend.model_key import model_key_for
+    except ImportError:
+        return None
+    return model_key_for(model)
+
+
+def _placement_from_status(status) -> EmbedPlacement:
+    return EmbedPlacement(status.placement, int(status.gpu_layers), status.reason)
+
+
+def saved_embed_placement(cfg: dict, project_root: Path | None) -> EmbedPlacement:
+    """設定と保存結果から配置を決める (判別しない。再起動の経路・VRAM 見積り・``build_embed_cmd`` 用)。
+
+    backend と同じ純関数 ``embed_placement.resolve_embed_placement_status`` を使う。``auto`` で
+    結果が無い / 読めない / PC が違う (GPU 名は比べない) / 埋め込みモデルが違うなら CPU。
+    """
+    raw = (cfg.get("embedding") or {}).get("gpu_layers")
+    try:
+        from backend.free.rag import embed_placement as ep
+        from backend.free.rag.rerank_selftest import collect_pc_info
+    except ImportError:
+        ngl = 0 if raw is None or raw == "auto" else int(raw)
+        return EmbedPlacement("gpu" if ngl != 0 else "cpu", ngl, "backend not importable")
+    if ep.gpu_layers_setting(raw) != "auto":
+        return _placement_from_status(ep.resolve_embed_placement_status(raw, None))
+    path = embed_placement_path(cfg, project_root) if project_root is not None else None
+    saved = ep.load_placement_result(path)[0] if path is not None else None
+    model_key = _embed_model_key(cfg, project_root) if saved is not None and project_root is not None else None
+    return _placement_from_status(ep.resolve_embed_placement_status(
+        raw, saved, current_pc=collect_pc_info([]), current_model_key=model_key,
+    ))
+
+
+def embed_cpu_fallback_cmd(cfg: dict, cmd: list[str]) -> list[str] | None:
+    """GPU 配置の埋め込みサーバが起動しなかったときに起こし直す CPU (``-ngl 0``) のコマンド。
+
+    ``embedding.gpu_layers: auto`` で ``-ngl`` が 0 以外のときだけ (明示の整数は利用者の選択なので
+    そのまま。リランカーの CPU 再試行と同じ)。それ以外は ``None``。保存結果は書き換えない
+    (起動の失敗は環境起因)。全部の本番起動経路 (--all / --embed / serve / auto-serve /
+    server_control / LlamaProcessManager) がこの 1 実装を使う。
+    """
+    if not _embed_setting_is_auto(cfg) or "-ngl" not in cmd:
+        return None
+    i = cmd.index("-ngl") + 1
+    if i >= len(cmd) or cmd[i] == "0":
+        return None
+    return [*cmd[:i], "0", *cmd[i + 1:]]
+
+
+def decide_embed_gpu_candidate(
+    device_memory: dict[str, tuple[int, int]],
+    model_mb: int | None,
+    *,
+    reserve_mib: int = 0,
+    compute_margin_mib: int = EMBED_COMPUTE_MARGIN_MIB,
+) -> tuple[bool, str]:
+    """GPU で測る価値があるか (純関数)。GPU の空きの最大 ≥ モデル + 計算バッファ + ``reserve_mib``。
+
+    ``reserve_mib`` はまだ載っていない base の見積り (先に埋め込みが VRAM を取って base が OOM
+    しないように)。理由: ``no_gpu_device`` / ``model_size_unknown`` / ``gpu_memory_short: ...``。
+    判定の式はリランカーと共有する (:func:`gpu_fit`)。
+    """
+    fit = gpu_fit(device_memory, model_mb, margin_mib=compute_margin_mib, reserve_mib=reserve_mib)
+    if fit.status == "no_gpu":
+        return False, "no_gpu_device"
+    if fit.status == "unknown_size":
+        return False, "model_size_unknown"
+    detail = (
+        f"{fit.device} free {fit.free_mib} MiB, need {fit.need_mib} MiB "
+        f"(reserve {max(0, reserve_mib)} MiB for base)"
+    )
+    if fit.status == "fits":
+        return True, detail
+    return False, f"gpu_memory_short: {detail}"
+
+
+def embed_gpu_within_budget(cfg: dict, project_root: Path, embed_model_mb: int | None) -> tuple[bool, str]:
+    """埋め込みを GPU に見積もっても ``runtime.total_vram_budget_mb`` に収まるか (未設定なら常に可)。
+
+    ``--all`` の予算検査 (:func:`check_vram_budget`) は判別の前に走り、未判別の埋め込みを CPU と
+    見積もるので、判別する回はここで GPU 側に見積もり直す。理由: ``vram_budget_exceeded: ...``。
+    """
+    budget = (cfg.get("runtime") or {}).get("total_vram_budget_mb")
+    if budget is None:
+        return True, ""
+    try:
+        estimates = _estimate_via_gguf_size(cfg, project_root)
+    except (OSError, ValueError, KeyError):
+        return True, ""
+    others = sum(int(e.get("vram_mb") or 0) for name, e in estimates.items() if name != "embed")
+    total = others + int(embed_model_mb or 0)
+    if total > int(budget):
+        return False, f"vram_budget_exceeded: {total} MB with the embed on GPU > budget {int(budget)} MB"
+    return True, ""
+
+
+def _base_ready(cfg: dict) -> bool:
+    """base の llama-server が ``/health`` 200 を返すか (載り終わっていれば空きに反映済み)。"""
+    lc = cfg.get("llama", {}) or {}
+    url = f"http://{lc.get('host', '127.0.0.1')}:{lc.get('port', 8080)}/health"
+    try:
+        return httpx.get(url, timeout=1.0).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _wait_base_ready(
+    cfg: dict, timeout_sec: float, base_ready: Callable[[dict], bool],
+    *, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """base が載り終わるまで待つ (判別する回だけ。空きと p50 を base の読み込みと競合させない)。"""
+    deadline = clock() + max(0.0, timeout_sec)
+    while True:
+        if base_ready(cfg):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(1.0)
+
+
+def _base_reserve_mib(cfg: dict, project_root: Path, base_ready: Callable[[dict], bool]) -> int:
+    """まだ載っていない base の VRAM 見積り (Tier 2)。載り終わっていれば 0。"""
+    if base_ready(cfg):
+        return 0
+    try:
+        return int(_estimate_via_gguf_size(cfg, project_root)["base"]["vram_mb"] or 0)
+    except (OSError, ValueError, KeyError):
+        return 0
+
+
+def _free_port() -> int:
+    """OS に空きポートを 1 つ選ばせる (判別の一時サーバ用)。"""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((EMBED_PROBE_HOST, 0))
+        return int(sock.getsockname()[1])
+
+
+def ensure_embed_placement(
+    cfg: dict,
+    project_root: Path,
+    *,
+    force: bool = False,
+    wait_base_sec: float = 0.0,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    list_devices: Callable[[], str] = _list_llama_devices,
+    health: Callable[..., bool] = _wait_healthy_or_dead,
+    measure: Callable[..., object] | None = None,
+    server_version: Callable[[], str] = _llama_server_version,
+    free_port: Callable[[], int] = _free_port,
+    base_ready: Callable[[dict], bool] = _base_ready,
+    probe_timeout: int = EMBED_PROBE_HEALTH_TIMEOUT_SEC,
+) -> EmbedPlacement:
+    """``embedding.gpu_layers: auto`` の配置を返す。PC か埋め込みモデルが変わったときだけ判別する (c_16 §7.2.2)。
+
+    - ``null`` / 整数 → 設定どおり (判別しない・保存結果も見ない)。
+    - 指紋とモデルが保存結果と一致 (GPU の起動失敗を数えている途中でない) → 保存結果の配置。
+    - それ以外 / ``force`` → GPU デバイスが無ければ測らずに CPU (保存)。あれば base が載り終わるのを
+      ``wait_base_sec`` まで待ち、空き・予算で GPU 候補か決め、候補なら一時ポートで CPU (``-ngl 0``) と
+      GPU (``-ngl 999``) を起こして測る。空きの不足・予算超過は状態なので保存しない (測らないので
+      次の起動の費用は ``--list-devices`` だけ)。GPU の一時サーバが起動しないのは
+      ``GPU_UNHEALTHY_LIMIT`` 回続くまで数えるだけ。どの失敗もチャットを止めない (CPU で返す)。
+    """
+    raw = (cfg.get("embedding") or {}).get("gpu_layers")
+    try:
+        from backend.free.rag import embed_placement as ep
+        from backend.free.rag import rerank_selftest as st
+        from backend.utils import utc_now
+    except ImportError as e:
+        print(f"[launch] WARNING: embed placement not decided (backend is not importable: {e})", file=sys.stderr)
+        return saved_embed_placement(cfg, project_root)
+    if ep.gpu_layers_setting(raw) != "auto":
+        return saved_embed_placement(cfg, project_root)
+    path = embed_placement_path(cfg, project_root)
+    if path is None:
+        print("[launch] WARNING: embed placement not decided (data root is not resolvable); using CPU", file=sys.stderr)
+        return EmbedPlacement("cpu", 0, "data_root_unresolvable")
+    model = _embed_model_path(cfg, project_root)
+    model_key = _embed_model_key(cfg, project_root)
+    if model_key is None:
+        print(f"[launch] WARNING: embed model not found ({model}); embed placement not decided", file=sys.stderr)
+        return EmbedPlacement("cpu", 0, "model_not_found")
+
+    devices_text = list_devices()
+    pc = st.collect_pc_info(_parse_device_names(devices_text))
+    fingerprint = pc.digest
+    saved, status = ep.load_placement_result(path)
+    needed, why = ep.placement_needed(saved, fingerprint, force=force, model_key=model_key)
+    if not needed and saved is not None:
+        print(f"[launch] embed placement: {saved.placement} (saved: {saved.reason})")
+        return EmbedPlacement(saved.placement, saved.gpu_layers, saved.reason)
+
+    print(f"[launch] embed placement: deciding ({why}; saved result: {status})")
+    emb_cfg = cfg.get("embedding", {}) or {}
+    dim = int(emb_cfg.get("dim", 1024))
+    model_mb = _file_size_mb(model)
+    device_memory = _parse_device_memory(devices_text)
+    has_gpu = gpu_fit(device_memory, model_mb, margin_mib=0).status != "no_gpu"
+    if has_gpu and wait_base_sec > 0 and not base_ready(cfg):
+        print(f"[launch] embed placement: waiting for the base model to load (up to {wait_base_sec:.0f}s)")
+        _wait_base_ready(cfg, wait_base_sec, base_ready)
+        device_memory = _parse_device_memory(list_devices())
+    reserve = _base_reserve_mib(cfg, project_root, base_ready) if has_gpu else 0
+    gpu_ok, candidate_reason = decide_embed_gpu_candidate(device_memory, model_mb, reserve_mib=reserve)
+    if gpu_ok:
+        gpu_ok, budget_reason = embed_gpu_within_budget(cfg, project_root, model_mb)
+        candidate_reason = budget_reason or candidate_reason
+    print(f"[launch] embed placement: GPU candidate={gpu_ok} ({candidate_reason})")
+    measure_fn = measure or ep.measure_embed_server
+
+    def run_probe(gpu_layers: int):
+        port = free_port()
+        cmd = _embed_cmd(cfg, project_root, port=port, gpu_layers=gpu_layers)
+        print(f"[launch] embed probe (-ngl {gpu_layers}) on :{port}")
+        try:
+            proc = popen(cmd, cwd=project_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (FileNotFoundError, OSError) as e:
+            print(f"[launch] WARNING: failed to spawn the embed probe server: {e}", file=sys.stderr)
+            return ep.EmbedProbe(error=ep.SERVER_UNHEALTHY)
+        try:
+            if not health(proc, EMBED_PROBE_HOST, port, probe_timeout, model.name):
+                return ep.EmbedProbe(error=ep.SERVER_UNHEALTHY)
+            return measure_fn(f"http://{EMBED_PROBE_HOST}:{port}")
+        finally:
+            _stop_proc(proc)
+
+    cpu = run_probe(0) if gpu_ok else None
+    gpu = run_probe(999) if gpu_ok else None
+    decision = ep.decide_embed_placement(
+        cpu, gpu, gpu_candidate_reason=candidate_reason, expected_dim=dim,
+        prior_unhealthy_streak=ep.prior_unhealthy_streak(saved, fingerprint, model_key),
+    )
+    placement = EmbedPlacement(decision.placement, decision.gpu_layers, decision.reason)
+    cos = f"{decision.cosine_min:.6f}" if decision.cosine_min is not None else "-"
+    streak = f", GPU start failures {decision.gpu_unhealthy_streak}" if decision.gpu_unhealthy_streak else ""
+    print(
+        f"[launch] embed placement: {decision.placement} ({decision.reason}; p50 cpu "
+        f"{decision.cpu_p50_ms or 0:.0f} ms / gpu {decision.gpu_p50_ms or 0:.0f} ms, cosine min {cos}{streak})",
+    )
+    if not decision.save:
+        print("[launch] embed placement not saved (a state, not a PC property); will decide again next start")
+        return placement
+    result = ep.EmbedPlacementResult(
+        fingerprint=fingerprint, placement=decision.placement, gpu_layers=decision.gpu_layers,
+        reason=decision.reason, cpu_p50_ms=decision.cpu_p50_ms, gpu_p50_ms=decision.gpu_p50_ms,
+        cosine_min=decision.cosine_min, dim=dim, decided_at=utc_now(),
+        gpu_unhealthy_streak=decision.gpu_unhealthy_streak,
+        model_key=model_key, model_file=model.name,
+        llama_server_version=server_version(), pc=pc,
+    )
+    if not ep.save_placement_result(path, result):
+        print(f"[launch] WARNING: failed to save the embed placement to {path}", file=sys.stderr)
+    return placement
+
+
+@dataclass
+class EmbedLaunch:
+    """:func:`start_embed_server` の結果。``proc`` は起動したまま残した本番の埋め込みサーバ。"""
+
+    proc: subprocess.Popen | None
+    placement: EmbedPlacement
+    healthy: bool
+    #: GPU で起動できず CPU に起こし直した。
+    fell_back: bool = False
+
+
+def start_embed_server(
+    cfg: dict,
+    project_root: Path,
+    *,
+    popen_kwargs: dict | None = None,
+    wait_base_sec: float = 0.0,
+    health_timeout: int | None = None,
+    popen: Callable[..., subprocess.Popen] = subprocess.Popen,
+    health: Callable[..., bool] = _wait_healthy_or_dead,
+    placement_fn: Callable[..., EmbedPlacement] | None = None,
+) -> EmbedLaunch | None:
+    """埋め込みサーバを本番のポートで起動する (持ち主のプロセスの入口。``embedding.backend`` が
+    llama-cpp でなければ ``None``)。
+
+    ``auto`` なら先に配置を判別し (:func:`ensure_embed_placement`、PC かモデルが変わったときだけ)、
+    GPU 配置のサーバが即死 / ``EMBED_GPU_START_TIMEOUT_SEC`` 以内に health を通らなければ止めて
+    CPU (``-ngl 0``) で 1 回だけ起こし直す (:func:`embed_cpu_fallback_cmd`)。保存結果は書き換えない。
+    最後の試行は health を通らなくてもプロセスを残す (従来どおり、呼び手の health 待ちに任せる)。
+    """
+    emb_cfg = cfg.get("embedding", {}) or {}
+    if emb_cfg.get("backend", "llama-cpp") != "llama-cpp":
+        return None
+    placement = (placement_fn or ensure_embed_placement)(cfg, project_root, wait_base_sec=wait_base_sec)
+    port = int(emb_cfg.get("llama_port", 8082))
+    host = emb_cfg.get("llama_host", "localhost")
+    model_name = _embed_model_path(cfg, project_root).name
+    timeout = health_timeout or int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+    kwargs = {"cwd": project_root, **(popen_kwargs or {})}
+
+    cmd = _embed_cmd(cfg, project_root, port=port, gpu_layers=placement.gpu_layers)
+    fallback = embed_cpu_fallback_cmd(cfg, cmd)
+    attempts = [(cmd, placement)]
+    if fallback is not None:
+        attempts.append((fallback, EmbedPlacement("cpu", 0, "cpu_fallback_after_gpu_start_failed")))
+    proc = None
+    for i, (attempt_cmd, attempt) in enumerate(attempts):
+        last = i == len(attempts) - 1
+        print(f"[launch] embedding ({attempt.kind}): {' '.join(attempt_cmd)}")
+        try:
+            proc = popen(attempt_cmd, **kwargs)
+        except (FileNotFoundError, OSError) as e:
+            print(f"[launch] WARNING: failed to spawn the embedding server: {e}", file=sys.stderr)
+            proc = None
+            continue
+        wait = timeout if last else min(timeout, EMBED_GPU_START_TIMEOUT_SEC)
+        if health(proc, host, port, wait, model_name):
+            print(f"[launch] embedding is ready on :{port} ({attempt.kind})")
+            return EmbedLaunch(proc, attempt, True, fell_back=i > 0)
+        if not last:
+            print(
+                f"[launch] WARNING: embedding server on GPU did not become healthy within {wait}s; "
+                "restarting it on CPU (-ngl 0). The saved placement is kept (a start failure is environmental)",
+                file=sys.stderr,
+            )
+            _stop_proc(proc)
+            continue
+        print(f"[launch] WARNING: embedding server ({attempt.kind}) health check timed out", file=sys.stderr)
+        return EmbedLaunch(proc, attempt, False, fell_back=i > 0)
+    return EmbedLaunch(proc, attempts[-1][1], False, fell_back=len(attempts) > 1)
+
+
+def wait_embed_ready(
+    cfg: dict, timeout_sec: float,
+    *, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+) -> str:
+    """埋め込みサーバの ``/health`` が 200 になるまで待つ (evoref-ctl 用。初回の判別と CPU の再起動を含めて待つ)。
+
+    戻り値は ``off`` (llama-cpp でない) / ``ready`` / ``timeout``。
+    """
+    emb = cfg.get("embedding", {}) or {}
+    if emb.get("backend", "llama-cpp") != "llama-cpp":
+        return "off"
+    url = f"http://{emb.get('llama_host', 'localhost')}:{int(emb.get('llama_port', 8082))}/health"
+    deadline = clock() + timeout_sec
+    while True:
+        try:
+            if httpx.get(url, timeout=1.0).status_code == 200:
+                return "ready"
+        except httpx.HTTPError:
+            pass
+        if clock() >= deadline:
+            return "timeout"
+        sleep(1.0)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -2820,6 +3779,43 @@ if __name__ == "__main__":
             "端末でない呼出元からは 'Input redirection is not supported' で落ちた)"
         ),
     )
+    parser.add_argument(
+        "--rerank-selftest",
+        action="store_true",
+        help=(
+            "リランカーの自己テストを手動で測り直す (c_16 §7.2.1)。rerank サーバを起動して測り、"
+            "結果を cache/rerank_selftest.json に書いて止める。rerank のポートが使用中なら拒否する "
+            "(先に evoref-ctl stop)"
+        ),
+    )
+    parser.add_argument(
+        "--embed-placement",
+        action="store_true",
+        help=(
+            "埋め込みサーバの配置 (GPU / CPU) を手動で判別し直す (c_16 §7.2.2、embedding.gpu_layers: auto の"
+            "ときだけ)。一時ポートで CPU と GPU を起こして測り、cache/embed_placement.json に書いて終わる"
+        ),
+    )
+    parser.add_argument(
+        "--wait-embed",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "起動せず、別プロセスの --all が立てる埋め込みサーバの /health が 200 になるまで待って終了する "
+            "(evoref-ctl 用。初回の配置の判別と GPU 失敗時の CPU 再起動を含めて待つ)"
+        ),
+    )
+    parser.add_argument(
+        "--wait-rerank",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "起動せず、別プロセスの --all が rerank の自己テストを終えて (有効なら /health 200 まで) "
+            "準備できるまで待って終了する (evoref-ctl 用。rerank が off なら即終了)"
+        ),
+    )
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -2842,6 +3838,33 @@ if __name__ == "__main__":
     if args.wait_health is not None:
         _wait_health(health_ports, float(args.wait_health))
         sys.exit(0)
+
+    if args.wait_rerank is not None:
+        state = wait_rerank_ready(cfg, project_root, float(args.wait_rerank))
+        if state == "timeout":
+            print("[launch] WARNING: rerank self-test / health did not finish in time, proceeding anyway")
+        elif state != "off":
+            print(f"[launch] rerank: {state}")
+        sys.exit(0)
+
+    if args.wait_embed is not None:
+        state = wait_embed_ready(cfg, float(args.wait_embed))
+        if state == "timeout":
+            print("[launch] WARNING: embedding server did not become healthy in time, proceeding anyway")
+        elif state != "off":
+            print(f"[launch] embedding: {state}")
+        sys.exit(0)
+
+    if args.embed_placement:
+        decided = ensure_embed_placement(cfg, project_root, force=True)
+        print(f"[launch] embed placement: {decided.kind} (-ngl {decided.gpu_layers}, {decided.reason})")
+        sys.exit(0)
+
+    if args.rerank_selftest:
+        launched = start_rerank_server(cfg, project_root, force_selftest=True)
+        if launched.proc is not None:
+            _stop_proc(launched.proc)
+        sys.exit(0 if launched.result is not None else 1)
 
     procs: list[subprocess.Popen] = []
 
@@ -2893,22 +3916,24 @@ if __name__ == "__main__":
 
         # エンベッド
         if launch_embed:
-            embed_cmd = build_embed_cmd(cfg, project_root)
-            if embed_cmd:
-                emb_cfg = cfg.get("embedding", {})
-                host = emb_cfg.get("llama_host", "localhost")
-                port = emb_cfg.get("llama_port", 8082)
-                # 注意: -ngl 0 (CPU モード) でも llama.cpp は Vulkan バックエンドを
-                # 初期化し model loading 時に host (pinned) buffer を要求する。
-                # buffer size が Vulkan device->max_buffer_size を超えると warning
-                # (ggml_vulkan: Failed to allocate pinned memory) が出るが CPU buffer に
-                # 自動フォールバックするため機能影響は無い (ggml-vulkan.cpp:14079 / :2671)。
-                procs.append(_start_and_wait(
-                    embed_cmd, "embedding", host, port, cwd=project_root,
-                    expected_model_id=_extract_model_basename(embed_cmd), timeout=health_timeout,
-                ))
-            else:
+            # 注意: -ngl 0 (CPU モード) でも llama.cpp は Vulkan バックエンドを
+            # 初期化し model loading 時に host (pinned) buffer を要求する。
+            # buffer size が Vulkan device->max_buffer_size を超えると warning
+            # (ggml_vulkan: Failed to allocate pinned memory) が出るが CPU buffer に
+            # 自動フォールバックするため機能影響は無い (ggml-vulkan.cpp:14079 / :2671)。
+            # auto なら配置を判別し (base は上で health 済み)、GPU で起動しなければ CPU で起こし直す。
+            embed = start_embed_server(cfg, project_root, health_timeout=health_timeout)
+            if embed is None:
                 print("[launch] Embedding backend is not llama-cpp, skipping")
+            elif embed.proc is not None:
+                procs.append(embed.proc)
+
+        # リランカー (rag.rerank.mode が off 以外のときだけ)。自己テストは PC が変わったときだけ。
+        # 起動・自己テストの失敗は他のサーバを止めない (rerank を無効にして続ける)。
+        if args.all:
+            rerank = start_rerank_server(cfg, project_root, health_timeout=health_timeout)
+            if rerank.proc is not None:
+                procs.append(rerank.proc)
 
         if procs:
             for proc in procs:

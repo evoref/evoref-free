@@ -26,14 +26,17 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.free.core.correction_target import contrast_pairs
+from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
 from backend.free.memory.notes.note_builder import (
     is_multi_valued_subject,
     is_single_valued_subject,
+    is_span_only_fold_subject,
 )
 from backend.free.memory.semantic.fact import fact_carries_span, fact_value_update
 from backend.log_config import get_logger
@@ -106,7 +109,9 @@ def write_sleep_facts(
     2. mem が所有しない型 (``FACT_OWNERSHIP``) は書かない (loop / learn の型は
        各 Fact View を通す)
     3. 行が置き換える旧値の span (``value_update``) を ``attrs.value_update`` へ
-       載せ、Step 6B と到着時の畳みが後から読めるようにする
+       載せ、Step 6B と到着時の畳みが後から読めるようにする。検証済みの訂正は、
+       その span を持つ古い live ファクトのスロットが 1 つに定まればそこを継ぐ
+       (:func:`_inherit_corrected_slot`)
     4. 書いた後に #13 の畳みを掛ける — ``mem.*`` の属性スロットと
        ``mem.world.assertion.*`` だけ (セッション要約・``idx.*`` には掛けない)
 
@@ -118,6 +123,8 @@ def write_sleep_facts(
     from backend.free.memory.ownership import can_write
 
     persisted: list = []
+    #: このバッチで継いだ (宛先, 旧値) — 同じ訂正を宛先へ 2 重に書かない
+    inherited: set[tuple[str, str]] = set()
     for fact in facts:
         if getattr(fact, "private", False):
             logger.warning(
@@ -137,6 +144,7 @@ def write_sleep_facts(
         span = getattr(fact, "value_update", None)
         if span:
             fact._extra = {**(getattr(fact, "_extra", None) or {}), "value_update": str(span)}
+            _inherit_corrected_slot(store, fact, label, inherited)
         try:
             store.add_fact(fact)
         except Exception as exc:
@@ -150,6 +158,160 @@ def write_sleep_facts(
         _supersede_corrected_slots(store, foldable, label)
         _retire_assertions_contradicted_by_change(store, foldable, label)
     return persisted
+
+
+def _inherit_corrected_slot(
+    store: "SemanticFactStore",
+    fact: object,
+    label: str,
+    inherited: set[tuple[str, str]],
+) -> None:
+    """検証済みの訂正の宛先スロットを旧値の span で決める (不変則 #13、2026-09-30 C01)。
+
+    Step 8 の宛先は発話の属性語で決まるので、話題語を落とした訂正は別のスロットへ
+    落ちる — 「ポチではなくハチです。」(前の発話は「うちの犬の名前はポチです。」) が
+    「名前を」で ``mem.personal.name`` に解決され、``pet`` = ポチ は live のまま、
+    到着時の畳みが本人の氏名を畳んだ。
+
+    継ぐのは次をすべて満たすときだけ (満たさなければ Step 8 の解決のまま — 語の網目は
+    足さない、#12):
+
+    - 検証の verdict が ``self`` (``value_update_owner``、ChatExtractor の作業値)。
+      ``assistant`` の旧値はアシスタントの言い誤りで、利用者が記憶させた値ではない
+    - 旧値の span (正規化して 2 文字以上) を値として含む (:func:`value_names_span`、
+      値アンカーと同じ照合)、同じ型・同じ predicate の **自分より古い** live の
+      属性ファクトが **ちょうど 1 件**。汎用スロット ``mem.<kind>.user`` と
+      assertion は宛先にしない (値アンカーの F-12 より保守的に候補から除く)。
+      訂正と同じノートから出た行も候補にしない (自分の発話の言い直しになる)
+    - 宛先の本文に旧値が **ちょうど 1 回、語として** 現れる (:func:`_names_value_once`)。
+      置き換え (``restate_with_correction``) は最初の 1 か所を素の部分文字列で
+      置き換えるので、選んだ照合と置き換える位置がずれると誤った言明で宛先を畳む
+    - このバッチで同じ (宛先, 旧値) へまだ継いでいない
+    - その 1 件の本文の旧値を新値へ置き換えた言明が組める
+      (:func:`restate_with_correction`)。訂正の本文をその言明にする — 本体の畳みは
+      旧値を含む行を丸ごと supersede するので、「妻と娘と犬のポチの4人家族」へ
+      裸の「ハチ」で継ぐと妻と娘が消える (#13 / F-02 の型)。本文が旧値そのもの
+      なら置き換えは要らない
+    """
+    from backend.free.core.correction_verdict import norm_span
+    from backend.free.memory.attribute_key import is_generic_slot
+    from backend.free.memory.extractors.chat import (
+        restate_with_correction,
+        value_names_span,
+    )
+
+    if getattr(fact, "value_update_owner", None) != "self":
+        return
+    if not getattr(fact, "from_correction", False) or not _is_foldable(fact):
+        return
+    subject = str(getattr(fact, "subject", "") or "")
+    if subject.startswith(_ASSERTION_SUBJECT_PREFIX):
+        return
+    span = fact_value_update(fact)
+    needle = norm_span(span)
+    if len(needle) < 2:
+        return
+    try:
+        pool = store.search_by_type(fact.type, include_superseded=False)
+    except Exception as exc:  # noqa: BLE001 - 読めなければ宛先を動かさない
+        logger.warning("Step 8 [%s]: failed to list %s facts: %s", label, fact.type, exc)
+        return
+    own_notes = _note_ids(fact)
+    holders = [
+        other
+        for other in pool
+        if other.id != fact.id
+        and not (own_notes & _note_ids(other))
+        and other.predicate == fact.predicate
+        and not other.superseded_by
+        and _is_foldable(other)
+        and not str(other.subject).startswith(_ASSERTION_SUBJECT_PREFIX)
+        and not is_generic_slot(str(other.subject))
+        and getattr(other, "created_at", 0.0) <= getattr(fact, "created_at", 0.0)
+        and value_names_span(str(other.object or ""), span)
+    ]
+    if len(holders) != 1:
+        return
+    (holder,) = holders
+    target = str(holder.subject)
+    if target == subject:
+        return
+    if (target, needle) in inherited:
+        logger.info(
+            "Step 8 [%s]: correction %s kept in %s — %s already inherited %r in this batch",
+            label, fact.id, subject, target, span,
+        )
+        return
+    body = str(holder.object or "")
+    restated = ""
+    if norm_span(body) != needle:
+        if not _names_value_once(norm_span(body), needle):
+            logger.info(
+                "Step 8 [%s]: correction %s kept in %s — the old value is not a single "
+                "word in %s of %s",
+                label, fact.id, subject, holder.id, target,
+            )
+            return
+        restated = restate_with_correction(
+            (body,), span, str(getattr(fact, "value_update_new", "") or ""),
+        )
+        if not restated:
+            logger.info(
+                "Step 8 [%s]: correction %s kept in %s — could not restate %s of %s",
+                label, fact.id, subject, holder.id, target,
+            )
+            return
+    logger.info(
+        "Step 8 [%s]: correction %s inherits slot %s from its old value %s "
+        "(resolved as %s)",
+        label, fact.id, target, holder.id, subject,
+    )
+    inherited.add((target, needle))
+    fact.subject = target
+    # 元のスロットの言い回し (name の「〜といいます」) を宛先に残さない
+    fact.statement = None
+    if restated:
+        fact.object = restated
+
+
+def _note_ids(fact: object) -> set[str]:
+    """ファクトの元ノートの ID (provenance から、純粋関数)。"""
+    return {
+        str(prov.note_id)
+        for prov in getattr(fact, "provenances", None) or ()
+        if getattr(prov, "note_id", None)
+    }
+
+
+#: 旧値の端と「同じ語の続き」とみなす文字種 (ひらがなは助詞が隣接するので含めない)。
+_WORD_SCRIPT_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"[0-9]"),
+    re.compile(r"[a-z]"),
+    re.compile(f"[{KATAKANA_WORD}]"),
+    re.compile(f"[{KANJI}{KANJI_MARKS}]"),
+)
+
+
+def _names_value_once(body: str, needle: str) -> bool:
+    """正規化済みの ``body`` に ``needle`` が **ちょうど 1 回、語として** 現れるか (純粋関数)。
+
+    語として = 直前の文字が ``needle`` の先頭と、直後の文字が末尾と、同じ文字種
+    (数字 / 英字 / カタカナ / 漢字) の続きでない。「302」の中の「30」、
+    「ポチョムキン」の中の「ポチ」を宛先の値と読まない。
+    """
+    if not needle or body.count(needle) != 1:
+        return False
+    start = body.index(needle)
+    end = start + len(needle)
+
+    def _continues(a: str, b: str) -> bool:
+        return any(r.fullmatch(a) and r.fullmatch(b) for r in _WORD_SCRIPT_RES)
+
+    if start > 0 and _continues(body[start - 1], needle[0]):
+        return False
+    if end < len(body) and _continues(body[end], needle[-1]):
+        return False
+    return True
 
 
 def _is_foldable(fact: object) -> bool:
@@ -169,8 +331,14 @@ def _folds_as_multi_valued(subject: str) -> bool:
     ``multi_valued: true`` の宣言済みスロットと汎用スロットに加え、宣言を持たない
     ``mem.world.assertion.*`` も多値を既定にする — 同じ slug に並ぶ値 (試験が 2 つ:
     応用情報 4/25 と基本情報 10/12) を訂正 1 件で全部畳まない (2026-09-27 監査 F8)。
+    ``span_only_fold: true`` (name / birthday) も畳む範囲だけは多値と同じ
+    (他者の値が落ちうる、2026-10-01)。
     """
-    return is_multi_valued_subject(subject) or subject.startswith(_ASSERTION_SUBJECT_PREFIX)
+    return (
+        is_multi_valued_subject(subject)
+        or is_span_only_fold_subject(subject)
+        or subject.startswith(_ASSERTION_SUBJECT_PREFIX)
+    )
 
 
 def _old_value_spans(fact: object) -> list[str]:
@@ -460,10 +628,17 @@ def _retire_stale_arrivals_into_corrected_slots(
     span を持つなら、その span を本文に含む到着だけを畳む (試験が 2 つあるとき、
     訂正済みの応用情報の slot へ後から届いた基本情報の日付を消さない)。span の無い
     訂正は、宣言済みの多値スロットでは従来どおり畳み (span を永続化する前に書かれた
-    訂正で F-14 を失わないため)、``mem.world.assertion.*`` では畳まない。span の無い
+    訂正で F-14 を失わないため)、``mem.world.assertion.*`` と ``span_only_fold: true``
+    (name / birthday — 同じ会話で誤解決した訂正が本人の値を畳まないため) では畳まない。span の無い
     畳みは **訂正と会話 (session) か元ノートを共有する到着に限る** — 別セッションの
     「息子は中学1年です。」が、value_update の無い「夫と小学 4 年の娘の3人」の訂正で
     畳まれた (2026-09-27 独立レビュー M-b、M1 と同じ実害の別経路)。
+
+    **宣言の無いスロットも、勝者が span を持つなら span で絞る** (2026-09-30 C01)。
+    ``name`` へ取り違えた訂正 (``value_update=ポチ``) が、ポチを含まない本人の氏名を
+    畳んでいた。``single_valued: true`` だけは span に依らず畳む — 別のバッチで
+    届いた古い値は ``_supersede_corrected_slots`` の本体が span に依らず畳むので、
+    ここだけ絞ると同じバッチか否かで結果が変わる。
     """
     from backend.free.core.correction_verdict import norm_span
 
@@ -483,6 +658,7 @@ def _retire_stale_arrivals_into_corrected_slots(
             )
             continue
         multi = _folds_as_multi_valued(fact.subject)
+        single = is_single_valued_subject(fact.subject)
         winner = None
         for other in siblings:
             if other.id == fact.id or other.predicate != fact.predicate:
@@ -491,12 +667,13 @@ def _retire_stale_arrivals_into_corrected_slots(
                 continue
             if getattr(other, "created_at", 0.0) <= getattr(fact, "created_at", 0.0):
                 continue
-            if multi:
+            if not single:
                 needle = norm_span(fact_value_update(other))
                 if needle and not fact_carries_span(fact, needle):
                     continue
-                if not needle and (
+                if multi and not needle and (
                     fact.subject.startswith(_ASSERTION_SUBJECT_PREFIX)
+                    or is_span_only_fold_subject(fact.subject)
                     or not _shares_origin(fact, other)
                 ):
                     continue

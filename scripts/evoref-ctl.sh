@@ -22,10 +22,18 @@ start_all() {
     # (config.yaml.g0-<stamp> へ退避)。別の evoref がロックを持っていれば拒否。
     python -m backend.free.cli.main config normalize --if-needed || exit 1
 
-    echo "[start] Starting llama-server (base + embedding)..."
+    echo "[start] Starting llama-server (base + embedding + rerank if enabled)..."
     python scripts/launch_llama.py config.yaml --all &
     PIDS+=($!)
     sleep 3
+
+    # 埋め込みサーバを待つ。embedding.gpu_layers: auto で PC か埋め込みモデルが変わった回は
+    # 配置 (GPU / CPU) の判別が先に走り、GPU で起動しなければ CPU で起こし直すので長めに待つ。
+    python scripts/launch_llama.py config.yaml --wait-embed 240
+
+    # リランカー (rag.rerank、既定 off) の自己テスト (PC が変わったときだけ) を待つ。
+    # backend は起動時に結果を 1 回読むだけなので先に終わらせる。off なら即終了。
+    python scripts/launch_llama.py config.yaml --wait-rerank 120
 
     echo "[start] Starting FastAPI backend on :8000..."
     uvicorn backend.main:app --host 127.0.0.1 --port 8000 &
@@ -43,6 +51,7 @@ start_all() {
     echo "  API:      http://localhost:8000"
     echo "  llama:    http://localhost:8080 (base)"
     echo "  embed:    http://localhost:8082 (embedding, if llama-cpp)"
+    echo "  rerank:   http://localhost:8083 (reranker, if rag.rerank.mode is not off)"
     echo ""
     echo "Press Ctrl+C to stop all services"
 
@@ -52,6 +61,10 @@ start_all() {
 # ── サービス停止 ──
 stop_all() {
     echo "[stop] Stopping evoref services..."
+
+    # 起動スクリプトを先に止める (配置の判別中に llama-server だけ止めると、起動スクリプトが
+    # 判別を諦めて本番の埋め込みサーバを起こしてしまう)
+    pkill -f "scripts/launch_llama.py" 2>/dev/null || true
 
     pkill -f "llama-server" 2>/dev/null \
         && echo "  llama-server stopped" \

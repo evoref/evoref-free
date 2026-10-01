@@ -294,6 +294,15 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         explicit_only = guard == "explicit"
         single_valued = bool(raw.get("single_valued", False))
         multi_valued = bool(raw.get("multi_valued", False))
+        span_only_fold = bool(raw.get("span_only_fold", False))
+        if span_only_fold and (single_valued or multi_valued):
+            # 畳み方の宣言は排他。単値 / 多値の宣言が既に畳み方を決めているので、
+            # span_only_fold の方を落とす。
+            logger.warning(
+                "fact_attributes: slot %s declares span_only_fold together with "
+                "single_valued/multi_valued; span_only_fold is ignored", slug,
+            )
+            span_only_fold = False
         person_valued = bool(raw.get("person_valued", False))
         patterns = _coerce_patterns(slug, raw.get("patterns"))
     else:
@@ -302,6 +311,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         explicit_only = False
         single_valued = False
         multi_valued = False
+        span_only_fold = False
         person_valued = False
     if not words and not patterns:
         return None
@@ -312,6 +322,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         possessor_explicit_only=explicit_only,
         single_valued=single_valued,
         multi_valued=multi_valued,
+        span_only_fold=span_only_fold,
         person_valued=person_valued,
         patterns=patterns,
     )
@@ -746,8 +757,8 @@ class AttributeSpec:
     #: 名前はミルクです。」が ``name`` へ解決され、単値化していると
     #: ペットの名前が **本人の名前を supersede** する。所有者ガード
     #: (``requires_self_possessor``) は trigger 直前の「<非一人称>の」しか
-    #: 見ないため、文をまたいだ暗黙の所有者は落とせない。重複 live のままなら
-    #: injector の collapse が選ぶだけで、正しい値が消えることはない。
+    #: 見ないため、文をまたいだ暗黙の所有者は落とせない。宣言の無いままでは
+    #: Step 6B が後勝ちで畳むので、``span_only_fold`` を宣言する (下記)。
     #:
     #: 現在の宣言は ``location`` / ``origin`` / ``occupation`` /
     #: ``preference.editor`` の 4 つだけ
@@ -761,6 +772,14 @@ class AttributeSpec:
     #: (2026-09-10 (i) I-19: 提案書の送付日 9/21 が締切 11/15 に畳まれて
     #: 注入されず、few-shot 手本の日付で偶然正答していた)。
     multi_valued: bool = False
+    #: **旧値の span を持つ行でしか畳まない** スロット (name / birthday)。
+    #: 他者の値が落ちうるので ``single_valued`` にしない (span 無しで畳むと本人の値が
+    #: 消える) が、宣言が無いと Step 6B が類似度の塊ごと後勝ちで畳むので、
+    #: 誤解決 1 件で本人の値が superseded になる。畳む範囲 (Step 6B / Step 8 の
+    #: 訂正の畳み / 到着時の畳み) だけを多値と同じく span で絞る。注入側の
+    #: 1 スロット 1 値の畳み込みは ``multi_valued`` と違って外さない
+    #: (docs/f_02 §5.3、2026-10-01)。
+    span_only_fold: bool = False
     #: trigger 語が **人** を指すスロット (family)。trigger を含む文がすべて
     #: 「人の語が斜格にしか現れず、存在述語も願望・評価の文末も無い」形なら
     #: 当たらなかったことにする (棄権、:func:`person_trigger_abstains`)。
@@ -1099,17 +1118,16 @@ _ATTR_FACT_TYPE_BY_KIND: dict[str, str] = {
 }
 
 
-def is_single_valued_subject(
+def _spec_flag(
     subject: str,
+    attr: str,
     *,
-    mode: str = "chat",
-    triggers_dir: str | Path | None = None,
+    mode: str,
+    triggers_dir: str | Path | None,
 ) -> bool:
-    """``subject`` が **単値スロット** として宣言されているか (純粋関数)。
+    """``mem.<kind>.<attr>`` の属性スロットの宣言 ``attr`` を引く (純粋関数)。
 
-    ``mem.personal.location`` のように ``mem.<kind>.<attr>`` の形をした subject
-    だけを見る。辞書に無い / 形が違う / 宣言が無い場合は ``False`` — つまり
-    **既定は従来どおり多値扱い**で、宣言したスロット以外の挙動は変わらない。
+    辞書に無い / 形が違う / 宣言が無い場合は ``False``。
     """
     if not subject:
         return False
@@ -1124,8 +1142,23 @@ def is_single_valued_subject(
     attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
     for spec in (attrs.get(mode) or {}).get(fact_type) or ():
         if spec.slug == parts[2]:
-            return spec.single_valued
+            return bool(getattr(spec, attr))
     return False
+
+
+def is_single_valued_subject(
+    subject: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> bool:
+    """``subject`` が **単値スロット** として宣言されているか (純粋関数)。
+
+    ``mem.personal.location`` のように ``mem.<kind>.<attr>`` の形をした subject
+    だけを見る。辞書に無い / 形が違う / 宣言が無い場合は ``False`` — つまり
+    **既定は従来どおり多値扱い**で、宣言したスロット以外の挙動は変わらない。
+    """
+    return _spec_flag(subject, "single_valued", mode=mode, triggers_dir=triggers_dir)
 
 
 def is_multi_valued_subject(
@@ -1144,25 +1177,27 @@ def is_multi_valued_subject(
     無い = ``from_correction`` の訂正が来ると **全兄弟を畳む** 経路に入り、
     無関係な値が巻き添えで消える (2026-09-14 監査 F-12、F-02 と同型)。
     """
-    if not subject:
-        return False
-    parts = subject.split(".")
-    if len(parts) != 3 or parts[0] != "mem":
-        return False
-    fact_type = _ATTR_FACT_TYPE_BY_KIND.get(parts[1])
-    if fact_type is None:
+    parts = (subject or "").split(".")
+    if len(parts) != 3 or parts[0] != "mem" or parts[1] not in _ATTR_FACT_TYPE_BY_KIND:
         return False
     from backend.free.memory.attribute_key import is_generic_slot
 
     if is_generic_slot(subject):
         return True
-    if triggers_dir is None:
-        triggers_dir = _DEFAULT_TRIGGERS_DIR
-    attrs = get_fact_attributes(resolve_fact_attributes_path(triggers_dir))
-    for spec in (attrs.get(mode) or {}).get(fact_type) or ():
-        if spec.slug == parts[2]:
-            return spec.multi_valued
-    return False
+    return _spec_flag(subject, "multi_valued", mode=mode, triggers_dir=triggers_dir)
+
+
+def is_span_only_fold_subject(
+    subject: str,
+    *,
+    mode: str = "chat",
+    triggers_dir: str | Path | None = None,
+) -> bool:
+    """``subject`` が **旧値の span でしか畳まない** スロット (``span_only_fold: true``) か。
+
+    :func:`is_single_valued_subject` と同じ解決 (純粋関数)。宣言が無ければ ``False``。
+    """
+    return _spec_flag(subject, "span_only_fold", mode=mode, triggers_dir=triggers_dir)
 
 
 #: 本文から属性スロットを解く fact_type (``fact_attributes.yaml`` の節)。

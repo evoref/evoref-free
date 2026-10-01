@@ -16,10 +16,12 @@ from backend.free.api.schemas import (
     ComponentStatus,
     DataHealthInfo,
     DebugStatusInfo,
+    EmbedPlacementInfo,
     LivenessAlertModel,
     LlamaServerInfo,
     MemoryStats,
     ModelInfo,
+    RerankStatusInfo,
     StatusResponse,
 )
 from backend.config import get_config, resolve_context_size
@@ -300,6 +302,44 @@ async def get_status(state: AppState = Depends(get_app_state)):
             for alert in liveness_ledger().alerts()
         ],
         data_health=_data_health(state),
+        rerank=_rerank_status(state),
+        embed_placement=_embed_placement(state),
+    )
+
+
+def _rerank_status(state: AppState) -> RerankStatusInfo:
+    """起動時に決めた rerank の状態を返す (I/O なし、c_16 §7.2.1)。"""
+    gen = getattr(state, "gen", None)
+    status = getattr(gen, "rerank_status", None) if gen is not None else None
+    if status is None:
+        return RerankStatusInfo()
+    return RerankStatusInfo(
+        mode=status.mode,
+        enabled=status.enabled,
+        placement=status.placement,
+        ms_per_doc=status.ms_per_doc,
+        candidates=status.candidates,
+        reason=status.reason,
+        tested_at=status.tested_at,
+        model_changed_since_selftest=status.model_changed_since_selftest,
+    )
+
+
+def _embed_placement(state: AppState) -> EmbedPlacementInfo:
+    """起動時に決めた埋め込みサーバの配置を返す (I/O なし、c_16 §7.2.2)。"""
+    gen = getattr(state, "gen", None)
+    status = getattr(gen, "embed_placement", None) if gen is not None else None
+    if status is None:
+        return EmbedPlacementInfo()
+    return EmbedPlacementInfo(
+        setting=status.setting,
+        placement=status.placement,
+        gpu_layers=status.gpu_layers,
+        reason=status.reason,
+        decided_at=status.decided_at,
+        cpu_p50_ms=status.cpu_p50_ms,
+        gpu_p50_ms=status.gpu_p50_ms,
+        cosine_min=status.cosine_min,
     )
 
 

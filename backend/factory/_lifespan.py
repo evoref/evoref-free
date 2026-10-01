@@ -266,6 +266,18 @@ async def _shutdown_embedder(state: AppState) -> None:
         logger.warning("Embedder close failed: %s", e)
 
 
+async def _shutdown_reranker(state: AppState) -> None:
+    """再順位クライアントの HTTP クライアントを閉じる (c_16 §7.2.1)"""
+    gen = getattr(state, "gen", None)
+    reranker = getattr(gen, "reranker", None) if gen is not None else None
+    if reranker is None:
+        return
+    try:
+        await reranker.aclose()
+    except Exception as e:
+        logger.warning("Reranker close failed: %s", e)
+
+
 async def _shutdown_pro(pro_shutdown: ProShutdownHook, state: AppState) -> None:
     """Pro ライフサイクル シャットダウン（WidgetProxyManager 含む）"""
     if pro_shutdown is None:
@@ -415,6 +427,7 @@ async def _run_lifespan_shutdown(
         await _shutdown_llm_client(state)
     with _timed(shutdown_timings, "embedder_close"):
         await _shutdown_embedder(state)
+        await _shutdown_reranker(state)
     with _timed(shutdown_timings, "snapshot_worker_stop"):
         from backend.free.rag.evidence.snapshot_build import (
             set_busy_probe,

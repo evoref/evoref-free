@@ -83,6 +83,7 @@ from backend.free.rag.corpus.calibration import (
     compute_corpus_calibration,
     load_corpus_calibration,
     save_corpus_calibration,
+    thresholds_for_search,
 )
 from backend.free.rag.corpus.language import (
     BUNDLED_EXTENSIONS,
@@ -2485,7 +2486,10 @@ class CorpusStore:
     # ── corpus 較正 (f_01 §6.6) ──
 
     def pq_coverage(self) -> float:
-        """ロード済みパッケージ全体の疑似クエリ充足率 (問いを持つチャンク / 全チャンク)。"""
+        """ロード済みパッケージ全体の疑似クエリ充足率 (検索に出る問いを持つチャンク / 全チャンク)。
+
+        未 commit の問いは数えない — 検索に出ない問いで関連性ゲートの拒否 (f_01 §6.6) を早めない。
+        """
         total = 0
         covered = 0
         for package_id in self.loaded_ids:
@@ -2494,14 +2498,18 @@ class CorpusStore:
                 continue
             total += package.chunk_count
             if package.pseudo_queries is not None:
-                covered += len(package.pseudo_queries.covered_target_ids())
+                covered += len(package.pseudo_queries.searchable_target_ids())
         return (covered / total) if total else 0.0
 
     def calibration(self) -> dict[str, Any] | None:
-        """較正済み閾値 (``relevance_threshold`` … ``pq_gate``)。未較正なら ``None``。"""
+        """較正済み閾値 (``relevance_threshold`` … ``pq_gate``) と関連性ゲートの可否。
+
+        未較正なら ``None``。可否 (``pq_veto_allowed`` / ``on_topic_calibrated``) は
+        :func:`~backend.free.rag.corpus.calibration.thresholds_for_search` を参照。
+        """
         if self._calibration is None:
             return None
-        return dict(self._calibration.get("thresholds") or {})
+        return thresholds_for_search(self._calibration)
 
     def _pooled_vectors(self) -> tuple[np.ndarray, np.ndarray, list[int]] | None:
         """ロード済みパッケージのチャンク本体 / 疑似クエリのベクトルを 1 つに束ねる。"""
@@ -2567,7 +2575,11 @@ class CorpusStore:
         )
         if cached:
             self._calibration = cached
-            logger.info("Corpus calibration loaded from cache: %s", cached.get("thresholds"))
+            view = thresholds_for_search(cached)
+            logger.info(
+                "Corpus calibration loaded from cache: %s pq_veto_allowed=%s on_topic_calibrated=%s",
+                cached.get("thresholds"), view["pq_veto_allowed"], view["on_topic_calibrated"],
+            )
 
     async def recalibrate(self, *, force: bool = False) -> dict[str, Any] | None:
         """疑似クエリとカナリア発話から corpus の棒を導き直す (sleep-time / 起動時)。

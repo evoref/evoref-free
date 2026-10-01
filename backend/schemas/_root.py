@@ -118,6 +118,23 @@ class EvorefConfig(BaseModel):
         return data
 
     @model_validator(mode="after")
+    def validate_rerank_port_is_unique(self) -> "EvorefConfig":
+        """rerank (off 以外) のポートが他のサーバのポートと重ならない (c_16 §7.2.1)"""
+        if self.rag.rerank.mode == "off":
+            return self
+        others = {
+            "llama.port": self.llama.port,
+            "embedding.llama_port": self.embedding.llama_port,
+            "server.port": self.server.port,
+        }
+        clash = [key for key, port in others.items() if port == self.rag.rerank.port]
+        if clash:
+            raise ValueError(
+                f"rag.rerank.port ({self.rag.rerank.port}) は {', '.join(clash)} と重複しています",
+            )
+        return self
+
+    @model_validator(mode="after")
     def warn_working_memory_vs_context(self) -> "EvorefConfig":
         """会話窓 (memory) とコンテキスト窓 (llama) の食い違いを warning で通知する。
 

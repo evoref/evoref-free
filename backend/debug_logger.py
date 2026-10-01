@@ -526,6 +526,100 @@ class DebugLogger:
             "elapsed_sec": round(elapsed_sec, 4),
         })
 
+    def log_rerank(
+        self,
+        *,
+        n_in: int,
+        elapsed_ms: float,
+        ok: bool,
+        reason: str,
+        prompt_tokens: int | None,
+        deadline_ms: int,
+        ids_before: list[str] | None = None,
+        ids_after: list[str] | None = None,
+        top_scores: list[float] | None = None,
+    ) -> None:
+        """rerank (``/v1/rerank``) 1 回の結果を ``rag.jsonl`` に記録 (docs/e_03 §4.4)。
+
+        ``reason`` は縮退の理由 (``deadline`` / ``http_<status>`` / ``degenerate_flat`` 等、成功なら空)。
+        ``ids_before`` / ``ids_after`` は並べ替えの前 (現順位) と後の id 順、``top_scores`` は
+        後の順の上位スコア (検索経路の Step 6.8 から呼ばれたときだけ、c_16 §7.2.1)。
+        """
+        if not self.enabled or not self.log_rag:
+            return
+        self._emit("rag", {
+            "timestamp": _now(),
+            "op": "rerank",
+            "n_in": n_in,
+            "elapsed_ms": round(elapsed_ms, 1),
+            "ok": ok,
+            "reason": reason,
+            "prompt_tokens": prompt_tokens,
+            "deadline_ms": deadline_ms,
+            "ids_before": ids_before,
+            "ids_after": ids_after,
+            "top_scores": top_scores,
+        })
+
+    def log_history_rerank(
+        self,
+        *,
+        n_candidates: int,
+        limit: int,
+        ids: list[str],
+        lexical_scores: list[float],
+        rerank_scores: list[float] | None,
+        ids_after: list[str] | None,
+        elapsed_ms: float,
+        reason: str,
+    ) -> None:
+        """``search_history`` の再順位 1 回を ``rag.jsonl`` に記録 (``op="history_rerank"``、c_16 §7.2.1)。
+
+        ``ids`` / ``lexical_scores`` / ``rerank_scores`` はプールの入力順 (字句の順) の
+        セッション id・字句スコア・再順位のスコア (縮退なら ``None``)。``ids_after`` は
+        並べ替えた後のプールの順。本文は受け取らない (較正の材料は id とスコアで足りる)。
+        """
+        if not self.enabled or not self.log_rag:
+            return
+        self._emit("rag", {
+            "timestamp": _now(),
+            "op": "history_rerank",
+            "n_candidates": int(n_candidates),
+            "limit": int(limit),
+            "ids": list(ids),
+            "lexical_scores": list(lexical_scores),
+            "rerank_scores": None if rerank_scores is None else list(rerank_scores),
+            "ids_after": None if ids_after is None else list(ids_after),
+            "elapsed_ms": round(elapsed_ms, 1),
+            "reason": reason,
+        })
+
+    def log_rerank_applied(
+        self,
+        *,
+        by_store: dict[str, dict[str, list[str]]],
+        correction_swaps: int,
+        swapped_pairs: list[tuple[str, str]] | None = None,
+    ) -> None:
+        """検索経路が再順位のスコアを当てた結果を ``rag.jsonl`` に記録 (``op="rerank_apply"``、c_16 §7.2.1)。
+
+        ``by_store`` はストアごとの ``{"before": 現順位のプール id, "after": 再順位の降順の id}``、
+        ``correction_swaps`` は訂正の正順のために入れ替えた組の数、``swapped_pairs`` はその
+        ``(訂正前, 訂正後)`` の id。本文は受け取らない (private を含むノートの本文をログへ出さない)。
+        """
+        if not self.enabled or not self.log_rag:
+            return
+        self._emit("rag", {
+            "timestamp": _now(),
+            "op": "rerank_apply",
+            "by_store": {
+                store: {"before": list(ids.get("before", [])), "after": list(ids.get("after", []))}
+                for store, ids in by_store.items()
+            },
+            "correction_swaps": int(correction_swaps),
+            "swapped_pairs": [list(pair) for pair in (swapped_pairs or [])],
+        })
+
     def log_content_gate(
         self,
         *,

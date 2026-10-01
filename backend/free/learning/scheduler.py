@@ -385,6 +385,8 @@ class LearningScheduler:
         # ロード済みカートリッジ集合が変わらない限り再変換しない、L-D1)
         self._exp_cache_key: tuple | None = None
         self._exp_cache: list[dict] = []
+        # 訂正候補の検証で答えが取れなかった回数 (エントリ id → 回数、プロセス内だけ)
+        self._correction_unanswered: dict[str, int] = {}
         # 学習コンポーネントが束ねられている base モデル stem (起動時 = resolver の
         # active stem、rebind_learning_partition で更新)。ModelState と食い違えば
         # ランタイム切替が起きている (L-A10、_base_model_changed)。
@@ -967,6 +969,8 @@ class LearningScheduler:
             self.experience_buf,
             self.resolve_idle_task_client(llm_client),
             learning_disabled=self._disabled,
+            unanswered=self._correction_unanswered,
+            should_pause=self.should_yield,
         )
         # 検証は signals を **その場で** 書き換える (件数も末尾 timestamp も
         # 変わらない) ので、``_get_filtered_experiences`` のメモ化キーでは
