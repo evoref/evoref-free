@@ -45,7 +45,7 @@ from backend.free.rag.evidence import (
 from backend.free.rag.evidence.types import KIND_IDS, TIER_IDS, UNKNOWN_I16
 from backend.free.rag.vector_store import dequantize_int8
 from backend.log_config import get_logger
-from backend.utils import parse_utc, utc_now_dt
+from backend.utils import utc_now_dt
 
 if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend

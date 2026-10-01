@@ -307,11 +307,3 @@ class EvorefApp(App):
 
         with suppress_widget_error("_refresh_status"):
             self.query_one("#status-bar", Static).update(status)
-
-    def apply_theme(self, theme: CLITheme) -> None:
-        """テーマを動的に再適用（/theme activate 時に使用）"""
-        self._cli_theme = theme
-        self.stylesheet.set(build_textual_css(theme))
-        with suppress_widget_error("apply_theme"):
-            self.query_one("#prompt-label", Static).update(theme.prompt_marker)
-        self.refresh(layout=True)

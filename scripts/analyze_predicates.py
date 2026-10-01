@@ -35,7 +35,6 @@ import importlib
 import inspect
 import json
 import sys
-import typing
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 

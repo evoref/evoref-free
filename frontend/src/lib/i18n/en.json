@@ -71,15 +71,15 @@
 		"feedback_sent_bad": "Feedback recorded (bad)",
 		"feedback_sent_good": "Feedback recorded (good)",
 		"feedback_failed": "Could not record feedback",
-			"template_label": "Template",
-			"template_none": "None",
-			"template_part_base": "Style",
-			"template_part_outline": "Outline",
-			"template_part_fields": "Form fields",
-			"template_hint_single": "Template “{doc_type}” is available",
-			"template_hint_multiple": "Templates are available:",
-			"template_hint_use": "Use",
-			"template_hint_dismiss": "Dismiss"
+		"template_label": "Template",
+		"template_none": "None",
+		"template_part_base": "Style",
+		"template_part_outline": "Outline",
+		"template_part_fields": "Form fields",
+		"template_hint_single": "Template “{doc_type}” is available",
+		"template_hint_multiple": "Templates are available:",
+		"template_hint_use": "Use",
+		"template_hint_dismiss": "Dismiss"
 	},
 	"sidebar": {
 		"chat": "Chat",
@@ -158,21 +158,11 @@
 		"sources": "Sources",
 		"chunking_strategy": "Chunking strategy",
 		"embedding_dim": "Embedding dim",
-		"enabled": "Enabled",
-		"disabled": "Disabled",
 		"embedding_model": "Embedding model",
 		"embedding_backend": "Backend",
 		"created_at": "Created",
 		"last_reindex_at": "Last reindex",
 		"embedding_dim_mismatch": "⚠ Embedding dimension mismatch (stored={stored} / current={current}). Run 'evoref reindex'.",
-		"scheduler": "Scheduler",
-		"scheduler_state": "State",
-		"running": "Running",
-		"idle": "Idle",
-		"experience_buffer": "Experience buffer",
-		"level1_conditions": "Level 1 conditions",
-		"met": "Met",
-		"not_met": "Not met",
 		"last_level1": "Level 1 last run",
 		"last_level2": "Level 2 last run",
 		"rollback_confirm": "Roll back {target} to version {version}?",
@@ -184,23 +174,13 @@
 		"no_adapter": "No adapter",
 		"eval_cases": "Eval cases",
 		"no_data": "No data available",
-		"level0_title": "Level 0",
-		"level0_last_record": "Last record",
 		"experience_by_mode": "By mode",
 		"mode_chat": "chat",
 		"mode_create": "create",
 		"correction_rate": "Correction rate",
 		"rag_usage_rate": "RAG usage",
-		"level1_title": "Level 1",
-		"level1_2_title": "Level 1 / 2",
 		"level1_run_count": "Run count",
 		"level1_run_count_value": "{count} times",
-		"level1_last_result": "Last result",
-		"level1_improved": "Improved",
-		"level1_no_change": "No change",
-		"level1_phases": "Executed phases",
-		"level1_no_runs": "Not yet run",
-		"level2_title": "Level 2",
 		"level2_section": "Level 2 (LoRA) status",
 		"level2_base": "Base",
 		"level2_running": "training",
@@ -219,17 +199,10 @@
 		"level2_gate_overdue": "{hours}h since last",
 		"level2_gate_backoff": "{targets} backing off to {hours}h after {streak} runs with no gain",
 		"level2_gate_interval": "{sec}s interval",
-		"exploration_title": "Explore / Exploit",
 		"phase_explore": "Exploring",
 		"phase_exploit": "Exploiting",
 		"phase_transition": "Transition",
 		"phase_explore_reset": "Explore reset",
-		"sigma_label": "σ",
-		"decline_count": "Decline count",
-		"overall_progress": "Learning Pipeline",
-		"pipeline_experience": "Experience",
-		"pipeline_level1": "Level 1",
-		"pipeline_result": "Improvements",
 		"lora_eval_title": "LoRA / Eval",
 		"fetch_error": "Failed to fetch data",
 		"next_learning": "Next Learning",
@@ -245,16 +218,12 @@
 		"last_run_ago": "{time} ago",
 		"learning_running": "Evolution running...",
 		"learning_impact": "Learning Impact",
-		"cumulative_change": "Cumulative change",
-		"initial_label": "Initial",
-		"current_label": "Current",
 		"stable": "Stable",
 		"stable_hint": "Will change as new experiences are incorporated",
 		"no_history": "No learning history yet",
 		"changed_phases": "Changed phases",
 		"experience_quality": "Experience Quality",
-		"optimization_status": "Parameter Optimization",
-		"exploration_degree": "Exploration"
+		"optimization_status": "Parameter Optimization"
 	},
 	"settings": {
 		"model_migrate": {
@@ -372,7 +341,6 @@
 		"group_theme": "Theme",
 		"group_i18n": "Language Settings",
 		"group_rag": "RAG Search",
-		"group_embedding": "Embedding Model",
 		"group_working_memory": "Working Memory",
 		"group_short_term": "Short-Term Memory",
 		"group_conflict": "Conflict Resolution",
@@ -397,7 +365,6 @@
 			"version_unknown": "version unavailable",
 			"not_found": "Not found (syntax checks are skipped)"
 		},
-		"group_model_paths": "Model Paths",
 		"group_local_paths": "Local Paths",
 		"group_history": "Conversation History",
 		"group_tools": "Tools",
@@ -413,9 +380,6 @@
 		"group_editor_display": "Display",
 		"group_editor_file": "File",
 		"group_editor_highlight": "Syntax Highlight",
-		"group_auto_run": "Auto Run",
-		"group_system_prompts": "System Prompts",
-		"group_aux_prompts": "Aux Task Prompts",
 		"group_prompt_history": "Version History",
 		"group_mode_chat": "Chat Mode",
 		"group_mode_create": "Create Mode",
@@ -444,15 +408,9 @@
 			"auto": "Auto",
 			"split": "Split",
 			"sequential": "Sequential",
-			"on": "ON",
-			"off": "OFF",
-			"local": "Local",
-			"external": "External",
-			"hybrid": "Hybrid",
 			"semantic": "Semantic",
 			"fixed": "Fixed",
-			"none": "None",
-			"pro_label": "Pro"
+			"none": "None"
 		},
 		"llama": {
 			"host": "Host",
@@ -510,12 +468,7 @@
 			"cart_failed": "Cartridge rebuild failed: {ids}. Re-run required"
 		},
 		"reembed": {
-			"preview": "Reembed facts (preview)",
-			"checking": "Checking…",
 			"targets": "Targets: {n} SemMem facts (URL/command recall)",
-			"run": "Run reembed",
-			"running": "Reembedding…",
-			"cancel": "Cancel",
 			"done": "Reembed complete: {n} facts ({sec}s)",
 			"restart_note": "Embedding model changed: the manifest was swapped and facts reembedded. Restart the backend so live recall uses the new vectors."
 		},
@@ -586,11 +539,7 @@
 			"meta_cognitive_min_budget": "Meta-Cognitive Min Budget"
 		},
 		"model_paths": {
-			"base_model": "Base Model",
-			"create_model": "Create Model",
-			"create_model_desc": "Uses base model when empty",
-			"embed_model": "Embedding Model (GGUF)",
-			"embed_model_desc": "GGUF file path for embeddings (llama-cpp backend)"
+			"base_model": "Base Model"
 		},
 		"long_form": {
 			"max_units": "Max Units",
@@ -721,22 +670,9 @@
 		"no_preview": "No preview"
 	},
 	"widget_proxy": {
-		"title": "Widget Proxy",
 		"enabled": "Enabled",
 		"disabled": "Disabled",
-		"api_name": "API Name",
-		"base_url": "Base URL",
-		"rate_limit": "Rate Limit",
-		"allowed_paths": "Allowed Paths",
-		"api_key_status": "API Key Status",
-		"configured": "Configured",
-		"not_configured": "Not Configured",
-		"stats_title": "Usage Statistics",
-		"total_requests": "Total Requests",
-		"total_errors": "Total Errors",
-		"avg_latency": "Avg Latency",
-		"rate_limit_hits": "Rate Limit Hits",
-		"last_request": "Last Request"
+		"rate_limit": "Rate Limit"
 	},
 	"toast": {
 		"dismiss": "Dismiss"
@@ -863,17 +799,6 @@
 		"encoding": "Encoding",
 		"line_ending": "Line Ending"
 	},
-	"export_file": {
-		"title": "File Export",
-		"download": "Download",
-		"select_format": "Select export format",
-		"exporting": "Exporting...",
-		"success": "Exported: {filename}",
-		"failed": "Export failed",
-		"unsupported_format": "Unsupported export format: {format}",
-		"missing_library": "Required library for export is not installed",
-		"no_content": "No content to export"
-	},
 	"history_page": {
 		"title": "Conversation History",
 		"no_sessions": "No conversation history yet",
@@ -972,26 +897,6 @@
 		"prompt_locale_unsupported": "Unsupported prompt locale: {locale}",
 		"prompt_locale_learning_running": "Cannot switch locale while learning is running"
 	},
-	"debug_overlay": {
-		"title": "Debug",
-		"components": "Components",
-		"memory": "Memory",
-		"performance": "Performance",
-		"learning": "Learning",
-		"wm_turns": "WM Turns",
-		"ttft": "TTFT",
-		"tok_per_sec": "tok/s",
-		"cache_hit_rate": "Cache Hit Rate",
-		"connected": "Connected",
-		"disconnected": "Disconnected",
-		"running": "Running",
-		"idle": "Idle",
-		"experiences": "Experiences",
-		"conditions_met": "Conditions",
-		"met": "Met",
-		"not_met": "Not met",
-		"no_data": "No data"
-	},
 	"sources": {
 		"title": "Sources",
 		"corpus": "Document",
@@ -1000,11 +905,7 @@
 	},
 	"rag_debug": {
 		"title": "RAG Chunks",
-		"search_time": "Search: {ms}ms",
-		"source": "Source",
-		"score": "Score",
-		"preview": "Preview",
-		"no_chunks": "No chunks retrieved"
+		"search_time": "Search: {ms}ms"
 	},
 	"cli": {
 		"mode_create_pro_only_warning": "Create mode is available only in the Pro edition. Falling back to chat mode."

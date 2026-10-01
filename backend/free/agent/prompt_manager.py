@@ -557,14 +557,6 @@ class SystemPromptManager:
 
     # ── 規則台帳 (f_03 §7.1.1) ──
 
-    def _default_ledger(self, mode: str, locale: str | None = None) -> Ledger:
-        """現行コードの DEFAULT_PROMPTS を台帳として読む (protected の SSOT)。"""
-        loc = locale or self._get_prompt_locale(mode)
-        body = DEFAULT_PROMPTS.get(loc, DEFAULT_PROMPTS["ja"]).get(mode, "")
-        ledger = parse_markdown(body, mode=mode, locale=loc)
-        apply_default_verifiers(ledger)
-        return ledger
-
     def _load_ledger_for(self, mode: str, body: str) -> None:
         """ロード時: 台帳ファイルがあればそれを、無ければ本文から移行して持つ。
 

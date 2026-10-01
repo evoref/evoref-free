@@ -25,7 +25,7 @@ WidgetProxyManager 等) を集約する。Free 版では ``None``。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from backend.free.agent.aux_prompt_manager import AuxPromptManager

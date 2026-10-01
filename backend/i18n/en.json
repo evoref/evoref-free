@@ -2,15 +2,8 @@
   "api": {
     "health_ok": "OK",
     "not_found": "Resource not found: {resource}",
-    "validation_error": "Invalid input: {detail}",
     "server_error": "Internal server error",
-    "model_not_loaded": "Model is not loaded",
     "cartridge_not_found": "Cartridge not found: {id}",
-    "cartridge_installed": "Cartridge installed: {id}",
-    "cartridge_uninstalled": "Cartridge uninstalled: {id}",
-    "theme_installed": "Theme installed: {name}",
-    "theme_activated": "Theme activated: {name}",
-    "generation_cancelled": "Generation cancelled",
     "learning_invalid_level": "level must be 'level1' or 'full'",
     "learning_scheduler_not_initialized": "Learning scheduler not initialized",
     "fewshot_delegated_to_semmem": "Few-shot pool is delegated to SemMem (evolve_writeback=semmem)",
@@ -122,7 +115,6 @@
     "generation_interrupted": "[Generation interrupted]",
     "backend_not_running": "Backend is not running. Please run 'evoref serve' first.",
     "already_running": "evoref is already running (PID: {pid})",
-    "port_in_use": "Port {port} is in use. Change server.port in config.yaml.",
     "file_not_found": "File not found: {path}",
     "file_not_file": "Not a file: {path}",
     "file_binary_unsupported": "Unsupported binary format: {path}",
@@ -177,7 +169,6 @@
     "help_help": "Show command list",
     "web_no_url": "Please specify a URL: /web <url>",
     "web_fetching": "Fetching: {url}",
-    "web_missing_library": "Required library not installed: {library}",
     "web_connect_error": "Cannot connect: {url}",
     "web_http_error": "HTTP error: {status}",
     "web_empty": "Content is empty",
@@ -202,8 +193,6 @@
     "startup_vector_empty": "Vector index not found. Will be created on first use.",
     "startup_vector_dim_ok": "Vector dimension — OK ({dim})",
     "startup_vector_dim_mismatch": "Vector dimension mismatch: stored={stored}, current={current}. Run 'evoref reindex'.",
-    "vector_dim_mismatch_error": "Embedding model dimension has changed. Run 'evoref reindex' to rebuild vector data.",
-    "reindex_header": "evoref reindex — embedding model: {model} ({dim}-dim)",
     "reindex_targets": "Targets: facts {rag_chunks} / corpus {cart_chunks} chunks ({cart_count} packages) / notes {mem_notes}",
     "reindex_no_data": "No vector data to reindex.",
     "reindex_dry_run": "Dry run: no changes will be made.",
@@ -371,11 +360,9 @@
     "reset_kept_cache": "Kept expensive caches ({count} file(s): aux timeout calibration, history summary embeddings). Pass --include-cache to delete them too.",
     "data_root_conflicts_isolate": "--data-root and --isolate-data cannot be used together (--isolate-data uses its own data root).",
     "mode_create_pro_only_warning": "--mode create is Pro-only. Falling back to chat mode in Free.",
-    "mode_default_resolved": "Mode: {mode} (edition default)",
     "develop_banner": "DEVELOP MODE ON [{level}] — develop logging enabled",
     "learning_disabled_banner": "Self-learning disabled (--no-learning) — Level 0/1/2 and Pro learn injection are no-op; SemMem reads continue.",
     "develop_level_develop_only": "--develop={level} requires Develop edition. Use --develop=debug or --develop=investigate instead.",
-    "develop_mode_active": "Develop mode is active",
     "history_empty": "No conversation history",
     "history_total": "Showing {showing} of {total} sessions",
     "history_col_date": "Date",
@@ -516,7 +503,6 @@
     "diff_editor_failed": "Failed to launch editor. Check $EDITOR or OS default editor configuration.",
     "diff_edit_empty": "Skipped: edited diff is empty",
     "diff_enter_path": "Enter target file path (empty to skip): ",
-    "shell_out_request": "Shell-out requested for interactive command: {cmd}",
     "shell_out_confirm": "Execute this command via shell-out? [y/n] ",
     "shell_out_running": "Running shell-out: {cmd}",
     "shell_out_done": "Shell-out completed (exit code: {code})",
@@ -539,7 +525,6 @@
     "page_hint": "Output was truncated. Use /page to view full output",
     "session_duplicate": "Session ID already in use: {session_id}",
     "auto_serve_starting": "Starting servers...",
-    "auto_serve_waiting": "Waiting for backend to start...",
     "auto_serve_ready": "All servers are ready",
     "auto_serve_failed": "Failed to auto-start servers",
     "auto_serve_stopping": "Stopping servers...",
@@ -695,15 +680,9 @@
       "plan_failed": "Failed to generate long-form plan. Try simplifying your instructions.",
       "unit_failed": "Failed to generate long-form unit."
     },
-    "migration": {
-      "invalid_model": "Failed to load new model file: {path}",
-      "archive_failed": "LoRA archive failed. Check available disk space.",
-      "rollback_failed": "Migration rollback failed. Starting with old model without LoRA."
-    },
     "cli": {
       "backend_not_running": "Backend server is not running. Run 'evoref serve' first.",
       "encoding_failed": "Character encoding error. Check UTF-8 settings.",
-      "already_running": "Another evoref process is already running.",
       "stream_interrupted": "Response stream was interrupted.",
       "stream_timeout": "Response timed out. The operation may be taking longer than expected."
     },
@@ -713,7 +692,6 @@
       "rate_limited": "External API rate limit exceeded. Please try again later.",
       "timeout": "External API request timed out.",
       "invalid_response": "Received invalid response from external API.",
-      "api_key_missing": "API key not set. Set environment variable {env_var}.",
       "disabled": "Widget proxy is disabled. Set widget_proxy.enabled to true in config.yaml."
     },
     "chat": {
@@ -729,18 +707,6 @@
     }
   },
   "warning": {
-    "import": {
-      "embedding_dim_mismatch": "Embedding dimensions differ from export source. Re-embedding required."
-    },
-    "llama": {
-      "lora_not_found": "LoRA adapter not found. Starting without LoRA."
-    },
-    "fs": {
-      "path_not_found": "Configured path does not exist: {path}"
-    },
-    "rag": {
-      "vector_unavailable": "Vector search unavailable. Using text search only."
-    },
     "edition": {
       "downgrade": "⚠ Edition downgraded ({old} -> {new}). Features exclusive to the previous edition are now disabled, but all saved data is preserved.",
       "lora_unavailable": "⚠ LoRA adapter and Level 2 learning are unavailable in Free edition. LoRA data is preserved locally, but recovery may be difficult if the base model is changed."

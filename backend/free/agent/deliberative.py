@@ -24,7 +24,6 @@ from backend.free.agent.tool_call_judge import (
 )
 from backend.free.agent.tool_judge_commands import (
     command_lacks_date_arithmetic,
-    query_has_date_math_cue,
 )
 from backend.free.agent.tool_judge_grounding import conversation_operands
 from backend.free.agent.tool_judge_guards import _STATE_CHANGING_TOOL_NAMES

@@ -962,11 +962,6 @@ def note_served_context_size(n_ctx: object) -> None:
     _served_context_size = n_ctx if valid else None
 
 
-def served_context_size() -> int | None:
-    """接続中の llama-server の実際の n_ctx (不明なら ``None``)。"""
-    return _served_context_size
-
-
 def _clamp_to_served(value: int) -> int:
     """config 由来の context_size を、実際に起動している llama-server の n_ctx 以下へ丸める。"""
     served = _served_context_size
@@ -986,7 +981,7 @@ def resolve_context_size_for_mode(cfg: dict, mode: str) -> int:
     依らず手動 pin として優先する。``auto`` / ``null`` は base と同じモデルなら環境調整の
     値 (:func:`resolve_context_size`)、別モデルの create はそのモデルの arch プロファイル > 既定
     (調整は ``base_model`` について決めるため。起動フラグ側の ``model_override`` と同じ)。
-    いずれも接続中の llama-server の実際の n_ctx (:func:`served_context_size`) を超えない。
+    いずれも接続中の llama-server の実際の n_ctx を超えない。
     """
     explicit = (cfg.get("llama") or {}).get("context_size")
     if explicit is not None and explicit != "auto":
@@ -1024,7 +1019,7 @@ def resolve_context_size(cfg: dict, slot: str) -> int:  # noqa: ARG001 - slot �
     (c_16 §7.2.3) で、起動スクリプト (scripts/launch_llama.py::resolve_context_size_for) が
     決めて保存した値を読み、llama-server 起動値とランタイム値 (token budget 表示等) を一致させる。
     起動側が保守側へ倒れて食い違ったときに備え、接続中の llama-server の実際の n_ctx
-    (:func:`served_context_size`) を超えない。
+    を超えない。
     """
     explicit = (cfg.get("llama") or {}).get("context_size")
     if explicit is not None and explicit != "auto":

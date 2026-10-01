@@ -28,7 +28,6 @@ from backend.free.agent.tool_judge_args import (
 )
 from backend.free.agent.tool_judge_commands import (
     command_lacks_date_arithmetic,
-    query_has_date_math_cue,
 )
 from backend.free.agent.tool_judge_dialogue import (
     _dialogue_text,
