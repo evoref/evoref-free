@@ -2,15 +2,8 @@
   "api": {
     "health_ok": "正常",
     "not_found": "リソースが見つかりません: {resource}",
-    "validation_error": "入力が不正です: {detail}",
     "server_error": "内部エラーが発生しました",
-    "model_not_loaded": "モデルが読み込まれていません",
     "cartridge_not_found": "カートリッジが見つかりません: {id}",
-    "cartridge_installed": "カートリッジをインストールしました: {id}",
-    "cartridge_uninstalled": "カートリッジをアンインストールしました: {id}",
-    "theme_installed": "テーマをインストールしました: {name}",
-    "theme_activated": "テーマを適用しました: {name}",
-    "generation_cancelled": "生成を中断しました",
     "learning_invalid_level": "level は 'level1' または 'full' のいずれかを指定してください",
     "learning_scheduler_not_initialized": "学習スケジューラーが初期化されていません",
     "fewshot_delegated_to_semmem": "few-shot プールは SemMem に委譲されています (evolve_writeback=semmem)",
@@ -122,7 +115,6 @@
     "generation_interrupted": "[生成を中断しました]",
     "backend_not_running": "バックエンドが起動していません。evoref serve を先に実行してください。",
     "already_running": "evoref は既に起動中です (PID: {pid})",
-    "port_in_use": "ポート {port} は使用中です。config.yaml の server.port を変更してください。",
     "file_not_found": "ファイルが見つかりません: {path}",
     "file_not_file": "ファイルではありません: {path}",
     "file_binary_unsupported": "非対応のバイナリ形式です: {path}",
@@ -177,7 +169,6 @@
     "help_help": "コマンド一覧を表示",
     "web_no_url": "URL を指定してください: /web <url>",
     "web_fetching": "取得中: {url}",
-    "web_missing_library": "必要なライブラリがインストールされていません: {library}",
     "web_connect_error": "接続できません: {url}",
     "web_http_error": "HTTP エラー: {status}",
     "web_empty": "コンテンツが空です",
@@ -202,8 +193,6 @@
     "startup_vector_empty": "ベクトルインデックスが未作成です。初回使用時に生成されます。",
     "startup_vector_dim_ok": "ベクトル次元 — OK ({dim} 次元)",
     "startup_vector_dim_mismatch": "ベクトル次元不一致: 保存済み={stored}, 現在の設定={current}。evoref reindex を実行してください。",
-    "vector_dim_mismatch_error": "埋め込みモデルの次元数が変更されています。evoref reindex を実行してベクトルデータを再構築してください。",
-    "reindex_header": "evoref reindex — 埋め込みモデル: {model} ({dim} 次元)",
     "reindex_targets": "再構築対象: ファクト {rag_chunks} 件 / コーパス {cart_chunks} チャンク ({cart_count} パッケージ) / ノート {mem_notes} 件",
     "reindex_no_data": "再構築対象のベクトルデータがありません。",
     "reindex_dry_run": "ドライランモード: 実際の再構築は行いません。",
@@ -371,11 +360,9 @@
     "reset_kept_cache": "作り直しが高価なキャッシュ ({count} ファイル: 補助タスクの timeout 較正・履歴要約の埋め込み) は残しました。これも消すには --include-cache を付けてください。",
     "data_root_conflicts_isolate": "--data-root と --isolate-data は同時に指定できません (--isolate-data は専用のデータ根を使います)。",
     "mode_create_pro_only_warning": "--mode create は Pro 専用です。Free 環境では chat モードにフォールバックします。",
-    "mode_default_resolved": "Mode: {mode} (edition default)",
     "develop_banner": "DEVELOP MODE ON [{level}] — develop ログ有効",
     "learning_disabled_banner": "自己学習は無効化されています (--no-learning) — Level 0/1/2 / Pro 学習コンポーネント注入は no-op、SemMem 読み込みは継続。",
     "develop_level_develop_only": "--develop={level} は Develop エディションが必要です。--develop=debug または --develop=investigate を使用してください。",
-    "develop_mode_active": "developモードがアクティブです",
     "history_empty": "会話履歴はありません",
     "history_total": "全 {total} 件中 {showing} 件を表示",
     "history_col_date": "日時",
@@ -516,7 +503,6 @@
     "diff_editor_failed": "エディタの起動に失敗しました。$EDITOR の設定または OS 既定エディタを確認してください。",
     "diff_edit_empty": "編集後の diff が空のためスキップしました",
     "diff_enter_path": "対象ファイルのパスを入力してください（空欄でスキップ）: ",
-    "shell_out_request": "対話的コマンドのシェルアウトが要求されました: {cmd}",
     "shell_out_confirm": "このコマンドをシェルアウト実行しますか？ [y/n] ",
     "shell_out_running": "シェルアウト実行中: {cmd}",
     "shell_out_done": "シェルアウト完了 (終了コード: {code})",
@@ -539,7 +525,6 @@
     "page_hint": "出力が省略されました。/page で全文を表示できます",
     "session_duplicate": "同一セッション ID が既に使用されています: {session_id}",
     "auto_serve_starting": "サーバーを起動しています...",
-    "auto_serve_waiting": "バックエンドの起動を待機中...",
     "auto_serve_ready": "全サーバーの起動が完了しました",
     "auto_serve_failed": "サーバーの自動起動に失敗しました",
     "auto_serve_stopping": "サーバーを停止しています...",
@@ -695,15 +680,9 @@
       "plan_failed": "長文生成の計画生成に失敗しました。指示を簡潔にして再試行してください。",
       "unit_failed": "長文生成のユニット生成に失敗しました。"
     },
-    "migration": {
-      "invalid_model": "新しいモデルファイルを読み込めません: {path}",
-      "archive_failed": "LoRAアーカイブに失敗しました。ディスク空き容量を確認してください。",
-      "rollback_failed": "移行のロールバックに失敗しました。LoRAなしで旧モデルを起動します。"
-    },
     "cli": {
       "backend_not_running": "バックエンドサーバーが起動していません。evoref serve を実行してください。",
       "encoding_failed": "文字エンコードエラーが発生しました。UTF-8設定を確認してください。",
-      "already_running": "evoref は既に別のプロセスで起動中です。",
       "stream_interrupted": "応答の受信が中断されました。",
       "stream_timeout": "応答がタイムアウトしました。処理に時間がかかっている可能性があります。"
     },
@@ -713,7 +692,6 @@
       "rate_limited": "外部APIのレート制限を超過しました。しばらくしてからお試しください。",
       "timeout": "外部APIへのリクエストがタイムアウトしました。",
       "invalid_response": "外部APIから不正なレスポンスを受信しました。",
-      "api_key_missing": "APIキーが設定されていません。環境変数 {env_var} を設定してください。",
       "disabled": "ウィジェットプロキシが無効になっています。config.yaml で widget_proxy.enabled を true に設定してください。"
     },
     "chat": {
@@ -729,18 +707,6 @@
     }
   },
   "warning": {
-    "import": {
-      "embedding_dim_mismatch": "エクスポート元と埋め込み次元が異なります。再埋め込みが必要です。"
-    },
-    "llama": {
-      "lora_not_found": "LoRAアダプタが見つかりません。LoRAなしで起動します。"
-    },
-    "fs": {
-      "path_not_found": "設定されたパスが存在しません: {path}"
-    },
-    "rag": {
-      "vector_unavailable": "ベクトル検索が利用できません。テキスト検索のみで動作しています。"
-    },
     "edition": {
       "downgrade": "⚠ エディションがダウングレードされました ({old} → {new})。上位エディション専用機能は無効になりますが、保存データは保持されます。",
       "lora_unavailable": "⚠ LoRA アダプタおよび Level 2 学習機能は Free エディションでは使用できません。LoRA データはローカルに保持されますが、ベースモデルを変更すると復帰が困難になります。"

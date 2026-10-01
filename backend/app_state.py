@@ -24,7 +24,6 @@ logger = get_logger("app_state")
 
 if TYPE_CHECKING:
     import asyncio
-    from collections.abc import Callable
 
     from backend.debug_logger import DebugLogger
     from backend.free.agent.aux_prompt_manager import AuxPromptManager

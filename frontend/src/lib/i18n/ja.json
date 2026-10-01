@@ -71,15 +71,15 @@
 		"feedback_sent_bad": "評価を記録しました (良くなかった)",
 		"feedback_sent_good": "評価を記録しました (良かった)",
 		"feedback_failed": "評価を記録できませんでした",
-			"template_label": "様式",
-			"template_none": "なし",
-			"template_part_base": "体裁",
-			"template_part_outline": "構成",
-			"template_part_fields": "帳票",
-			"template_hint_single": "様式『{doc_type}』が使えます",
-			"template_hint_multiple": "使える様式があります:",
-			"template_hint_use": "使う",
-			"template_hint_dismiss": "閉じる"
+		"template_label": "様式",
+		"template_none": "なし",
+		"template_part_base": "体裁",
+		"template_part_outline": "構成",
+		"template_part_fields": "帳票",
+		"template_hint_single": "様式『{doc_type}』が使えます",
+		"template_hint_multiple": "使える様式があります:",
+		"template_hint_use": "使う",
+		"template_hint_dismiss": "閉じる"
 	},
 	"sidebar": {
 		"chat": "チャット",
@@ -158,21 +158,11 @@
 		"sources": "ソース数",
 		"chunking_strategy": "分割戦略",
 		"embedding_dim": "埋め込み次元",
-		"enabled": "有効",
-		"disabled": "無効",
 		"embedding_model": "埋め込みモデル",
 		"embedding_backend": "バックエンド",
 		"created_at": "作成日時",
 		"last_reindex_at": "最終再構築",
 		"embedding_dim_mismatch": "⚠ 埋め込み次元が一致しません（保存={stored} / 現在={current}）。evoref reindex を実行してください。",
-		"scheduler": "スケジューラ",
-		"scheduler_state": "状態",
-		"running": "実行中",
-		"idle": "待機中",
-		"experience_buffer": "経験バッファ",
-		"level1_conditions": "Level 1 条件",
-		"met": "充足",
-		"not_met": "未充足",
 		"last_level1": "Level 1 最終実行",
 		"last_level2": "Level 2 最終実行",
 		"rollback_confirm": "{target} をバージョン {version} にロールバックしますか？",
@@ -184,23 +174,13 @@
 		"no_adapter": "アダプターなし",
 		"eval_cases": "評価ケース",
 		"no_data": "データがありません",
-		"level0_title": "Level 0",
-		"level0_last_record": "最終記録",
 		"experience_by_mode": "モード別",
 		"mode_chat": "chat",
 		"mode_create": "create",
 		"correction_rate": "修正検出率",
 		"rag_usage_rate": "RAG利用率",
-		"level1_title": "Level 1",
-		"level1_2_title": "Level 1 / 2",
 		"level1_run_count": "実行回数",
 		"level1_run_count_value": "{count}回",
-		"level1_last_result": "最終結果",
-		"level1_improved": "改善",
-		"level1_no_change": "維持",
-		"level1_phases": "実行フェーズ",
-		"level1_no_runs": "未実行",
-		"level2_title": "Level 2",
 		"level2_section": "Level 2 (LoRA) 学習状態",
 		"level2_base": "Base",
 		"level2_running": "学習中",
@@ -219,17 +199,10 @@
 		"level2_gate_overdue": "前回から {hours}h 経過",
 		"level2_gate_backoff": "無改善 {streak} 回で {targets} は {hours}h 待機中",
 		"level2_gate_interval": "{sec}s 間隔",
-		"exploration_title": "探索/活用フェーズ",
 		"phase_explore": "探索中",
 		"phase_exploit": "活用中",
 		"phase_transition": "遷移中",
 		"phase_explore_reset": "探索再開",
-		"sigma_label": "σ",
-		"decline_count": "低下回数",
-		"overall_progress": "学習パイプライン",
-		"pipeline_experience": "経験蓄積",
-		"pipeline_level1": "Level 1",
-		"pipeline_result": "改善状況",
 		"lora_eval_title": "LoRA / Eval",
 		"fetch_error": "データの取得に失敗しました",
 		"next_learning": "次の学習",
@@ -245,16 +218,12 @@
 		"last_run_ago": "{time}前",
 		"learning_running": "進化実行中...",
 		"learning_impact": "学習効果",
-		"cumulative_change": "累積変化",
-		"initial_label": "初回",
-		"current_label": "現在",
 		"stable": "安定",
 		"stable_hint": "新しい経験が反映されると変化します",
 		"no_history": "まだ学習履歴がありません",
 		"changed_phases": "変化のあったフェーズ",
 		"experience_quality": "経験の質",
-		"optimization_status": "パラメータ最適化",
-		"exploration_degree": "探索度"
+		"optimization_status": "パラメータ最適化"
 	},
 	"settings": {
 		"model_migrate": {
@@ -372,7 +341,6 @@
 		"group_theme": "テーマ",
 		"group_i18n": "言語設定",
 		"group_rag": "RAG検索",
-		"group_embedding": "埋め込みモデル",
 		"group_working_memory": "ワーキングメモリ",
 		"group_short_term": "短期メモリ",
 		"group_conflict": "競合解決",
@@ -397,7 +365,6 @@
 			"version_unknown": "版を取得できません",
 			"not_found": "見つかりません (構文検査は飛ばします)"
 		},
-		"group_model_paths": "モデルパス",
 		"group_local_paths": "ローカルパス",
 		"group_history": "チャット履歴",
 		"group_tools": "ツール",
@@ -413,9 +380,6 @@
 		"group_editor_display": "表示",
 		"group_editor_file": "ファイル",
 		"group_editor_highlight": "シンタックスハイライト",
-		"group_auto_run": "自動実行",
-		"group_system_prompts": "システムプロンプト",
-		"group_aux_prompts": "補助タスクプロンプト",
 		"group_prompt_history": "バージョン履歴",
 		"group_mode_chat": "チャットモード",
 		"group_mode_create": "クリエイトモード",
@@ -444,15 +408,9 @@
 			"auto": "自動",
 			"split": "分割",
 			"sequential": "連続",
-			"on": "ON",
-			"off": "OFF",
-			"local": "ローカル",
-			"external": "外部",
-			"hybrid": "ハイブリッド",
 			"semantic": "セマンティック",
 			"fixed": "固定",
-			"none": "なし",
-			"pro_label": "Pro"
+			"none": "なし"
 		},
 		"llama": {
 			"host": "ホスト",
@@ -510,12 +468,7 @@
 			"cart_failed": "カートリッジの再構築に失敗しました: {ids}。再実行が必要です"
 		},
 		"reembed": {
-			"preview": "fact 再embed（プレビュー）",
-			"checking": "確認中…",
 			"targets": "対象: SemMem fact {n} 件（URL/コマンドリコール）",
-			"run": "再embed を実行",
-			"running": "再embed 中…",
-			"cancel": "キャンセル",
 			"done": "fact 再embed 完了: {n} 件（{sec}秒）",
 			"restart_note": "埋め込みモデルが変わったため manifest を切替え fact を再embedしました。live リコールに新ベクトルを反映するには backend を再起動してください。"
 		},
@@ -586,11 +539,7 @@
 			"meta_cognitive_min_budget": "メタ認知最小バジェット"
 		},
 		"model_paths": {
-			"base_model": "ベースモデル",
-			"create_model": "クリエイト用モデル",
-			"create_model_desc": "空欄の場合はベースモデルを使用",
-			"embed_model": "埋め込みモデル (GGUF)",
-			"embed_model_desc": "埋め込み用 GGUF ファイルパス (llama-cpp バックエンド)"
+			"base_model": "ベースモデル"
 		},
 		"long_form": {
 			"max_units": "最大ユニット数",
@@ -721,22 +670,9 @@
 		"no_preview": "プレビューなし"
 	},
 	"widget_proxy": {
-		"title": "ウィジェットプロキシ",
 		"enabled": "有効",
 		"disabled": "無効",
-		"api_name": "API名",
-		"base_url": "ベースURL",
-		"rate_limit": "レート制限",
-		"allowed_paths": "許可パス",
-		"api_key_status": "APIキー状態",
-		"configured": "設定済み",
-		"not_configured": "未設定",
-		"stats_title": "使用統計",
-		"total_requests": "総リクエスト数",
-		"total_errors": "総エラー数",
-		"avg_latency": "平均レイテンシ",
-		"rate_limit_hits": "レート制限超過",
-		"last_request": "最終リクエスト"
+		"rate_limit": "レート制限"
 	},
 	"toast": {
 		"dismiss": "閉じる"
@@ -863,17 +799,6 @@
 		"encoding": "文字コード",
 		"line_ending": "改行コード"
 	},
-	"export_file": {
-		"title": "ファイル書出し",
-		"download": "ダウンロード",
-		"select_format": "書出し形式を選択",
-		"exporting": "書出し中...",
-		"success": "書出し完了: {filename}",
-		"failed": "書出しに失敗しました",
-		"unsupported_format": "非対応の書出し形式です: {format}",
-		"missing_library": "書出しに必要なライブラリがインストールされていません",
-		"no_content": "書出し対象のコンテンツがありません"
-	},
 	"history_page": {
 		"title": "チャット履歴",
 		"no_sessions": "チャット履歴はまだありません",
@@ -972,26 +897,6 @@
 		"prompt_locale_unsupported": "非対応のプロンプトロケールです: {locale}",
 		"prompt_locale_learning_running": "学習実行中はプロンプト言語を切り替えられません"
 	},
-	"debug_overlay": {
-		"title": "Debug",
-		"components": "コンポーネント",
-		"memory": "メモリ",
-		"performance": "パフォーマンス",
-		"learning": "学習",
-		"wm_turns": "WM ターン",
-		"ttft": "TTFT",
-		"tok_per_sec": "tok/s",
-		"cache_hit_rate": "キャッシュヒット率",
-		"connected": "接続",
-		"disconnected": "未接続",
-		"running": "実行中",
-		"idle": "待機中",
-		"experiences": "経験数",
-		"conditions_met": "実行条件",
-		"met": "充足",
-		"not_met": "未充足",
-		"no_data": "データなし"
-	},
 	"sources": {
 		"title": "参考にした資料",
 		"corpus": "資料",
@@ -1000,11 +905,7 @@
 	},
 	"rag_debug": {
 		"title": "RAG チャンク",
-		"search_time": "検索: {ms}ms",
-		"source": "ソース",
-		"score": "スコア",
-		"preview": "プレビュー",
-		"no_chunks": "チャンク取得なし"
+		"search_time": "検索: {ms}ms"
 	},
 	"cli": {
 		"mode_create_pro_only_warning": "クリエイトモードは Pro エディション専用です。チャットモードで起動します。"

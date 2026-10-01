@@ -71,7 +71,7 @@ from backend.free.memory.attribute_key import (
 from backend.free.memory.notes.note_builder import is_multi_valued_subject
 from backend.free.memory.notes.pin_detector import note_is_pinned
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
-from backend.free.memory.semantic.namespaces import is_injectable, namespace_of
+from backend.free.memory.semantic.namespaces import is_injectable
 from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.types import MemoryMode, SemanticFact
 from backend.i18n_helper import prompt_locale

@@ -35,7 +35,7 @@ import typing
 from pathlib import Path
 from typing import Any, Literal
 
-from backend.io.codec import EXTRA_FIELD, codec_for
+from backend.io.codec import codec_for
 from backend.io.format_registry import FORMATS, FormatRegistry, FormatSpec
 
 LOCK_PATH = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "formats" / "lock.json"

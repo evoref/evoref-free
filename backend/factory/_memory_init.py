@@ -21,7 +21,6 @@ from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.free.memory.episodic.store import EpisodicStore
-    from backend.free.memory.semantic.store import SemanticStore
     from backend.free.memory.stores.working import WorkingMemoryRegistry
 
 logger = get_logger("factory.memory_init")
