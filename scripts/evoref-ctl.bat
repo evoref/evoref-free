@@ -124,6 +124,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem If the PC changed since the saved tune results, ask once before llama-server starts.
+rem Runs after the stale llama-server sweep so the estimates see the memory it held as free
+rem (estimating with an old server still loaded would save a too-small value).
+rem Not a console / any failure is ignored (it stays pending and the GUI asks).
+"%VENV_PYTHON%" -m backend.free.cli.main tune --startup-check
+
 echo [start] Starting llama-server (base + embedding + rerank if enabled)...
 rem The launcher adds the trained adapters (--lora / --control-vector, Pro only)
 rem and runs scripts\launch_llama.py, which never resolves adapters itself.
@@ -133,13 +139,17 @@ rem wait targets come from launch_llama.py --print-health-ports
 rem The embedding server may first decide its GPU / CPU placement (embedding.gpu_layers: auto,
 rem only when the PC or the embedding model changed) and falls back to CPU when the GPU start
 rem fails, so it gets a longer wait (240s) than the others (60s).
+rem Probe 127.0.0.1 first: on Windows "localhost" can resolve to ::1 first and a 1s timeout then fails
+rem every probe against a server bound to 127.0.0.1, so the wait always ran to its full limit.
 echo [start] Waiting for llama-server to be ready (up to 60s, embedding up to 240s)...
-powershell -NoProfile -Command "$pairs=& '%VENV_PYTHON%' scripts\launch_llama.py config.yaml --print-health-ports; foreach ($p in $pairs) { if ($p -notmatch '^(\w+)=(\d+)$') { continue }; $name=$Matches[1]; $port=$Matches[2]; $limit=60; if ($name -eq 'embed') { $limit=240 }; $elapsed=0; do { Start-Sleep 2; $elapsed+=2; try { $r=(Invoke-WebRequest \"http://localhost:$port/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 } } while ($r -ne 200 -and $elapsed -lt $limit); if ($r -ne 200) { Write-Host \"[start] WARNING: $name (port $port) health check timed out, proceeding anyway\" } }"
+powershell -NoProfile -Command "$pairs=& '%VENV_PYTHON%' scripts\launch_llama.py config.yaml --print-health-ports; foreach ($p in $pairs) { if ($p -notmatch '^(\w+)=(\d+)$') { continue }; $name=$Matches[1]; $port=$Matches[2]; $limit=60; if ($name -eq 'embed') { $limit=240 }; $elapsed=0; do { Start-Sleep 2; $elapsed+=2; $r=0; foreach ($h in '127.0.0.1','localhost') { try { $r=(Invoke-WebRequest \"http://${h}:$port/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 }; if ($r -eq 200) { break } } } while ($r -ne 200 -and $elapsed -lt $limit); if ($r -ne 200) { Write-Host \"[start] WARNING: $name (port $port) health check timed out, proceeding anyway\" } }"
 
 rem The reranker (rag.rerank, off by default) runs its self-test only when the PC
 rem fingerprint changed; the backend reads that result once at startup, so wait for
-rem it here. Returns at once when rag.rerank.mode is off.
-"%VENV_PYTHON%" scripts\launch_llama.py config.yaml --wait-rerank 120
+rem it here. Returns at once when rag.rerank.mode is off. The worst case is the GPU start
+rem wait (60s) plus the CPU restart wait (process_manager.health_timeout, 120s) plus the
+rem self-test itself, so the wait is 240s.
+"%VENV_PYTHON%" scripts\launch_llama.py config.yaml --wait-rerank 240
 
 echo [start] Starting FastAPI backend on :8000...
 start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 127.0.0.1 --port 8000"

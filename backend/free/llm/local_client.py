@@ -24,6 +24,12 @@ from backend.free.llm._base_client import (
 from backend.free.core.turn_text import split_last_user
 from backend.free.llm.generation_gate import chat_generation, gate_stream
 from backend.free.llm.model_metadata import ModelMetadata
+from backend.free.llm.tps_calibration import (
+    TIMEOUT_HEADROOM,
+    TpsEstimate,
+    extend_only,
+    get_tps_tracker,
+)
 from backend.free.llm.utils import extract_content
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
@@ -167,10 +173,58 @@ STREAM_TOTAL_DEADLINE_MARGIN = 30.0
 #: ``context_size`` も不明で残量へクランプできなかった) ときに総壁時計の計算へ
 #: 使う仮の上限トークン数。
 STREAM_DEADLINE_FALLBACK_MAX_TOKENS = 4096
+#: 実測 tps (``tps_calibration``、c_16 §7.2.3) から締め切りを組むときの余裕係数。
+#:
+#: 上の定数は「どの PC でも健全な要求を切らない」ための固定値で、prefill 40 tok/s は
+#: 70〜80 tok/s の環境の実測から取った。iGPU + 27B では prefill が約 16 tok/s
+#: (2026-08-25 実測、``classifier_slot`` の説明) しか出ず、4,500 トークンの冷えた
+#: prefill が 281 秒かかる — 定数の締め切り (60 + 4500/40 = 172 秒) では切れる。
+#: 実測が溜まったら ``係数 × トークン ÷ 実測 tps + 下駄`` まで **延ばす**。係数は
+#: ``tps_calibration.TIMEOUT_HEADROOM`` (1.3) と同じ: 併走の減速は EWMA の実測が既に含むので
+#: 二重に掛けない。延びるのは実測が前提 (prefill 40 / decode 1 tok/s) の 1.3 倍 (52 / 1.3 tok/s) を
+#: 下回る PC だけで、定数を取った 70〜80 tok/s の環境は現行の締切のまま。
+STREAM_MEASURED_HEADROOM = TIMEOUT_HEADROOM
+#: 実測で延ばす天井 (現行の締め切りの倍率)。測定の事故で締め切りが際限なく伸びて
+#: 51.9 分のハング (2026-08-31 t06#10) を取り逃さないようにする。
+STREAM_MEASURED_MAX_SCALE = 3.0
+
+
+def stream_first_token_deadline(
+    prompt_tokens: int, *, base: float, tps: TpsEstimate | None = None,
+) -> float:
+    """最初のトークンまでの締め切り (秒)。
+
+    現行は ``base + prompt_tokens / STREAM_PREFILL_TOKENS_PER_SEC``。prefill の実測が
+    あれば ``base + STREAM_MEASURED_HEADROOM × prompt_tokens / 実測`` まで延ばす
+    (現行未満には縮めない、天井は現行の ``STREAM_MEASURED_MAX_SCALE`` 倍)。
+    """
+    current = base + prompt_tokens / STREAM_PREFILL_TOKENS_PER_SEC
+    if tps is None or tps.prefill_tps is None:
+        return current
+    measured = base + STREAM_MEASURED_HEADROOM * prompt_tokens / tps.prefill_tps
+    return extend_only(current, measured, current * STREAM_MEASURED_MAX_SCALE)
+
+
+def stream_total_deadline(
+    max_tokens: int | None, *, tps: TpsEstimate | None = None,
+) -> float:
+    """最初のデータ後の総壁時計締め切り (秒)。
+
+    現行は ``max_tokens / STREAM_MIN_DECODE_TPS + STREAM_TOTAL_DEADLINE_MARGIN``。decode の
+    実測があれば ``STREAM_MEASURED_HEADROOM × max_tokens / 実測 + マージン`` まで延ばす
+    (縮めない、天井は現行の ``STREAM_MEASURED_MAX_SCALE`` 倍)。
+    """
+    tokens = int(max_tokens or 0) or STREAM_DEADLINE_FALLBACK_MAX_TOKENS
+    current = tokens / STREAM_MIN_DECODE_TPS + STREAM_TOTAL_DEADLINE_MARGIN
+    if tps is None or tps.decode_tps is None:
+        return current
+    measured = STREAM_MEASURED_HEADROOM * tokens / tps.decode_tps + STREAM_TOTAL_DEADLINE_MARGIN
+    return extend_only(current, measured, current * STREAM_MEASURED_MAX_SCALE)
 
 
 def sync_request_timeout(
     max_tokens: int | None, prompt_tokens: int | None = None, *, floor: float = 120.0,
+    tps: TpsEstimate | None = None,
 ) -> float:
     """非ストリーミング呼び出しの per-request 壁時計締め切り (秒)。
 
@@ -180,12 +234,11 @@ def sync_request_timeout(
     (120 秒) で切れており、実機 (2026-09-03、Qwen3.8-27B) では 400 文字の回答が
     120.8 秒 / 121.3 秒で 503 になった。健全な低速生成は切らず、ハングだけを
     捕まえる上限であって所要時間の見積もりではない。``floor`` (既定 120 秒) を
-    下回らない。
+    下回らない。``tps`` (実測) があれば各項をストリームと同じ規則で延ばす。
     """
-    tokens = int(max_tokens or 0) or STREAM_DEADLINE_FALLBACK_MAX_TOKENS
-    budget = tokens / STREAM_MIN_DECODE_TPS + STREAM_TOTAL_DEADLINE_MARGIN
+    budget = stream_total_deadline(max_tokens, tps=tps)
     if prompt_tokens:
-        budget += prompt_tokens / STREAM_PREFILL_TOKENS_PER_SEC
+        budget += stream_first_token_deadline(prompt_tokens, base=0.0, tps=tps)
     return max(float(floor), budget)
 
 
@@ -582,6 +635,9 @@ class LocalClient(BaseHTTPClient):
         #: ツール分類器が公開し、同じスロットへ送る AuxClient が system を
         #: byte 一致させるために読む。未公開なら None。
         self._classifier_slot_prefix: str | None = None
+        #: 生成速度の実測の鍵のメモ (``/props`` の ``model_path`` → ``model_key``)。
+        self._tps_key_served: str | None = None
+        self._tps_key = ""
 
     @property
     def classifier_slot_prefix(self) -> str | None:
@@ -677,6 +733,7 @@ class LocalClient(BaseHTTPClient):
         if not isinstance(data, dict):
             return None
         timings = data.get("timings")
+        self._observe_tps(timings)
         cache_n: int | None = None
         prompt_total: int | None = None
         if isinstance(timings, dict) and "cache_n" in timings:
@@ -702,6 +759,51 @@ class LocalClient(BaseHTTPClient):
                 tokens_prompt=prompt_total, tokens_cached=cache_n, slot=slot,
             )
         return record
+
+    def _tps_model_key(self) -> str:
+        """実測の鍵 (載っているモデルの ``model_key``)。解決できなければ空文字。
+
+        ``/props`` の ``model_path`` ごとにメモする (resolver を毎回引かない)。``/props`` から
+        載っているモデルが取れない (served が空) ときはメモを使わず毎回引き直す — 鍵は「そのモードが
+        宣言するモデル」になり、モード切替で変わるのにメモが古いまま残るため。
+        """
+        from backend.free.llm.model_metadata import served_model_of
+
+        served = served_model_of(self)
+        # ``__new__`` で組んだクライアント (テスト) はメモを持たない
+        if served and getattr(self, "_tps_key_served", None) == served and getattr(self, "_tps_key", ""):
+            return self._tps_key
+        try:
+            from backend.config import get_path_resolver
+
+            key = get_path_resolver().generating_model_key(served_model=served or None)
+        except Exception as e:  # noqa: BLE001 - 実測の鍵が引けないだけで生成は止めない
+            logger.debug("tps calibration: model_key unresolved (%s)", e)
+            return ""
+        self._tps_key_served, self._tps_key = served, key
+        return key
+
+    def _observe_tps(self, timings: object) -> None:
+        """応答の ``timings`` を生成速度の実測へ畳む (台帳が未設定なら何もしない)。"""
+        tracker = get_tps_tracker()
+        if tracker is None or not isinstance(timings, dict):
+            return
+        try:
+            tracker.observe(self._tps_model_key(), timings)
+        except Exception as e:  # noqa: BLE001 - 計測の事故で応答を落とさない
+            logger.debug("tps calibration observe failed: %s", e)
+
+    @property
+    def context_size(self) -> int | None:
+        """送信前ガードに使う n_ctx (``build_local_client`` が設定値と /props の実 n_ctx の小さい方で渡す)。None は未設定。"""
+        return self._context_size
+
+    def measured_tps(self) -> TpsEstimate | None:
+        """このクライアントのモデルの実測 tps (未測定 / 台帳が未設定なら ``None``)。"""
+        tracker = get_tps_tracker()
+        if tracker is None:
+            return None
+        return tracker.estimate(self._tps_model_key())
 
     def _owns_last_timings(self, id_slot: int | None) -> bool:
         """この要求が ``_last_timings`` (ユーザーのターンの値) を書いてよいか。
@@ -770,7 +872,7 @@ class LocalClient(BaseHTTPClient):
             tokens = self._estimate_prompt_tokens(messages)
         except Exception:
             return base
-        return base + tokens / STREAM_PREFILL_TOKENS_PER_SEC
+        return stream_first_token_deadline(tokens, base=base, tps=self.measured_tps())
 
     def _enforce_context_budget(
         self, messages: list[dict], max_tokens: int | None = None,
@@ -1110,6 +1212,7 @@ class LocalClient(BaseHTTPClient):
             )
             request_timeout = sync_request_timeout(
                 payload.get("max_tokens"), prompt_tokens, floor=self._http_timeout,
+                tps=self.measured_tps(),
             )
         if self._is_chat_slot(id_slot):
             async with chat_generation():
@@ -1399,10 +1502,8 @@ class LocalClient(BaseHTTPClient):
                     # content が 1 つ出た時点で止まる)。組み直しは **最初のデータを
                     # 観測した行で即座に** 行う — 次の行が届いてからでは、その行が
                     # 遅い場合に最初のトークン用の短い締め切りが先に発火する。
-                    total_budget = (
-                        (payload.get("max_tokens") or STREAM_DEADLINE_FALLBACK_MAX_TOKENS)
-                        / STREAM_MIN_DECODE_TPS
-                        + STREAM_TOTAL_DEADLINE_MARGIN
+                    total_budget = stream_total_deadline(
+                        payload.get("max_tokens"), tps=self.measured_tps(),
                     )
                     loop = asyncio.get_running_loop()
                     async with asyncio.timeout(

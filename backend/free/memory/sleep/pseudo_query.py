@@ -197,7 +197,9 @@ async def _screen_questions(
         question = questions[position]
         stats[RERANK_SCORED_INPUT_KEY] = stats.get(RERANK_SCORED_INPUT_KEY, 0) + 1
         try:
-            scores = await reranker.rerank(question, [text], ids=[f"{package_id}:{evidence_id}"])
+            scores = await reranker.rerank(
+                question, [text], ids=[f"{package_id}:{evidence_id}"], breaker=False,
+            )
         except Exception as e:  # noqa: BLE001 — 採点の失敗で生成した問いを失わない
             logger.warning("Step 5.9: pseudo-query scoring failed: %s: %s", type(e).__name__, e)
             scores = None

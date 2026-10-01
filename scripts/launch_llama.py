@@ -64,6 +64,7 @@ import struct
 import subprocess
 import sys
 import time
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,6 +81,71 @@ def _resolve_embed_gpu_layers(cfg: dict, project_root: Path | None = None) -> in
     ベースモデル ``llama.gpu_layers`` には追従しない。
     """
     return saved_embed_placement(cfg, project_root).gpu_layers
+
+
+def _tuned(cfg: dict, project_root: Path, key: str):
+    """環境調整の項目 ``key`` の起動時の値 (``resolve_tuned``、c_16 §7.2.3)。backend が無ければ ``None``。
+
+    明示値はそのまま、``auto`` は保存済みの調整結果 (この PC) → その場の見積り (保存する) → 保守側の値。
+    環境移行の確認待ちの間の ctx / ngl / VRAM 予算は、保存しない一時の見積り
+    (``base_model.resolve_or_provisional``。起動スクリプトは ``--list-devices`` を読めるので)。
+    """
+    # ``python scripts/launch_llama.py`` で起動されたとき (``__main__``) や backend が
+    # ファイルから読み込んだ複製では ``scripts.launch_llama`` を import できない。環境調整は
+    # その名前で GGUF / ``--list-devices`` の実装を引くので、自分自身を登録しておく。
+    if "scripts.launch_llama" not in sys.modules:
+        me = sys.modules.get(__name__)
+        if me is None:  # spec_from_file_location で読んで sys.modules に載せていない複製
+            me = types.ModuleType("scripts.launch_llama")
+            me.__dict__.update(globals())
+        sys.modules["scripts.launch_llama"] = me
+    try:
+        from backend.free.core.tuning.base_model import resolve_or_provisional
+    except ImportError:
+        return None
+    # 予約 (稼働中の画面の実行) の再計算は base が止まっているときだけ (載っている間は空きが過小)
+    return resolve_or_provisional(cfg, key, project_root=project_root, can_recompute=lambda: not _base_ready(cfg))
+
+
+def _tuned_effective(cfg: dict, project_root: Path, name: str):
+    """キーごとに反映する環境調整の項目 (``threads`` / ``ram_params`` / ``batch``) の実効値。
+
+    項目モジュールの ``effective_*`` が明示値と調整値を合わせる (明示値はそのまま)。全キーが明示なら
+    調整しない。backend が無ければ ``None`` (呼び手は config の値と従来の既定で起動する)。
+    """
+    from importlib import import_module
+
+    try:
+        mod = import_module(f"backend.free.core.tuning.tuners.{name}")
+    except ImportError:
+        return None
+    effective = {"threads": "effective_threads", "ram_params": "effective_ram_params", "batch": "effective_batch"}[name]
+    tuned = None
+    if len(mod.manual_fields(cfg)) < len(mod.CONFIG_KEYS):
+        tuned = _tuned(cfg, project_root, mod.KEY)
+    return getattr(mod, effective)(cfg, tuned)
+
+
+#: backend が無い配布形態で ``llama.cache_ram_mib`` が ``auto`` / 無しのときの値。正本は
+#: ``backend/free/core/tuning/tuners/ram_params.py`` の ``FALLBACK`` (0 = RAM を食わない側。テストが一致を見る)。
+_UNTUNED_CACHE_RAM_MIB = 0
+
+
+def _explicit_int(value: object) -> int | None:
+    """config の値が明示の整数ならその値 (``auto`` / ``null`` / bool は ``None``)。"""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _aux_threads(cfg: dict, project_root: Path, part: str, *, gpu: bool) -> int:
+    """埋め込み (``embed``) / リランカー (``rerank``) を ``gpu`` 配置で起こすときの ``-t`` (0 は付けない)。
+
+    明示の正の整数はそのまま。``0`` は環境調整の項目 threads の配分 (c_16 §7.2.3)。
+    """
+    section = (cfg.get("embedding") or {}) if part == "embed" else _rerank_cfg(cfg)
+    plan = _tuned_effective(cfg, project_root, "threads")
+    if plan is None:
+        return max(0, _explicit_int(section.get("threads")) or 0)
+    return plan.aux(part, "gpu" if gpu else "cpu")
 
 
 def _resolve_base_gpu_layers(cfg: dict, project_root: Path | None = None) -> int:
@@ -153,17 +219,16 @@ def _resolve_kv_unified(section_cfg: dict, slots: int) -> bool:
 
 
 def _append_cache_ram_args(
-    cmd: list[str], section_cfg: dict, *, default_mib: int,
+    cmd: list[str], section_cfg: dict, *, cache_ram_mib: int,
 ) -> None:
     """``--cache-ram`` / ``--no-cache-idle-slots`` を ``cmd`` に追加する
     (chat slots を持つ base 用)。
 
-    ``cache_ram_mib`` は常に明示付与し、上流デフォルト 8192 の黙従を
+    ``cache_ram_mib`` (解決済み) は常に明示付与し、上流デフォルト 8192 の黙従を
     回避する。``cache_idle_slots: false`` のときのみ ``--no-cache-idle-slots``
     を付与する (上流デフォルト true は何も付けない)。
     """
-    cache_ram_mib = _resolve_cache_ram_mib(section_cfg, default=default_mib)
-    cmd += ["--cache-ram", str(cache_ram_mib)]
+    cmd += ["--cache-ram", str(int(cache_ram_mib))]
     if not _resolve_cache_idle_slots(section_cfg, default=True):
         cmd += ["--no-cache-idle-slots"]
 
@@ -778,6 +843,16 @@ def build_llama_cmd(
 
     port = port_override if port_override is not None else lc.get("port", 8080)
 
+    # 環境調整の値 (ngl / b・ub / threads / RAM 系) は ``model_paths.base_model`` について決めたもの。
+    # 別モデルの ``model_override`` (create_model 等) には持ち込まず、config の明示値と従来の既定で組む
+    # (ctx は resolve_context_size_for がそのモデルの profile を引く)
+    tuned_ok = _is_base_model(cfg, project_root, model_override)
+    if tuned_ok:
+        ngl = _resolve_base_gpu_layers(cfg, project_root)
+    else:
+        ngl = _explicit_int(lc.get("gpu_layers"))
+        ngl = 999 if ngl is None else ngl  # auto / 無しは従来の既定 (全層)
+
     cmd = [
         "llama-server",
         "-m", str(base_model_path),
@@ -785,9 +860,16 @@ def build_llama_cmd(
         "-c", str(context_override or resolve_context_size_for(
             cfg, "base", project_root, model_override=model_override,
         )),
-        "-ngl", str(_resolve_base_gpu_layers(cfg, project_root)),
-        "-b", str(lc.get("batch_size", 512)),
+        "-ngl", str(ngl),
     ]
+    # -b / -ub: 明示値はそのまま、auto / 無しは環境調整の項目 batch (c_16 §7.2.3)
+    batch = _tuned_effective(cfg, project_root, "batch") if tuned_ok else None
+    if batch is not None:
+        cmd += ["-b", str(batch.batch_size), "-ub", str(batch.ubatch_size)]
+    else:
+        cmd += ["-b", str(_explicit_int(lc.get("batch_size")) or 512)]
+        if _explicit_int(lc.get("ubatch_size")):
+            cmd += ["-ub", str(lc["ubatch_size"])]
 
     # LoRA アダプタ。呼出元が解決・検証済み (Level 2 候補評価の GGUF は harness が
     # 起動直前に書き出すため exists チェックしない)。
@@ -831,9 +913,13 @@ def build_llama_cmd(
                 cmd += ["--control-vector-layer-range", parts[0], parts[1]]
 
     # オプション
-    threads = lc.get("threads", 0)
+    # -t / -tb: 明示の正の整数はそのまま (-tb は付けない)、0 は環境調整の項目 threads の配分 (c_16 §7.2.3)
+    plan = _tuned_effective(cfg, project_root, "threads") if tuned_ok else None
+    threads = plan.base if plan is not None else max(0, _explicit_int(lc.get("threads")) or 0)
     if threads > 0:
         cmd += ["-t", str(threads)]
+    if plan is not None and plan.batch > 0:
+        cmd += ["-tb", str(plan.batch)]
     flash_attn = lc.get("flash_attn", True)
     if flash_attn is not False:
         fa_value = flash_attn if isinstance(flash_attn, str) else "on"
@@ -888,15 +974,18 @@ def build_llama_cmd(
     # 上流既定 min-step 8192 だと n_ctx=8192 で中間 checkpoint が生まれず、
     # 前回の最終 user 位置より手前で prompt が分岐すると system prompt ごと
     # 全量 re-prefill になる。-np と同様に常に明示する (上流既定へ黙従しない)。
-    cmd += ["--ctx-checkpoints", str(int(lc.get("ctx_checkpoints", 8)))]
+    # checkpoint 数と cache-ram は明示値はそのまま、auto / 無しは環境調整の項目 ram_params (空き RAM から)。
+    ram = _tuned_effective(cfg, project_root, "ram_params") if tuned_ok else None
+    checkpoints = ram.ctx_checkpoints if ram is not None else _explicit_int(lc.get("ctx_checkpoints"))
+    cmd += ["--ctx-checkpoints", str(8 if checkpoints is None else checkpoints)]
     cmd += [
         "--checkpoint-min-step", str(int(lc.get("checkpoint_min_step", 256))),
     ]
 
-    # idle slot offload。base は agentic ワークロード前提で
-    # 既定 4096 MiB の RAM 退避バッファを確保する。slots>1 のときは
+    # idle slot offload / prompt cache の RAM 上限。slots>1 のときは
     # ``--cache-ram`` が動作するよう ``--kv-unified`` を自動付与する。
-    _append_cache_ram_args(cmd, lc, default_mib=4096)
+    cache_ram = ram.cache_ram_mib if ram is not None else _explicit_int(lc.get("cache_ram_mib"))
+    _append_cache_ram_args(cmd, lc, cache_ram_mib=_UNTUNED_CACHE_RAM_MIB if cache_ram is None else cache_ram)
     _append_kv_unified_args(cmd, lc, slots=int(slots))
 
     # MTP (Multi-Token Prediction) self-speculative。Free/Pro 共通。MTP ヘッド
@@ -942,7 +1031,7 @@ def build_llama_cmd(
         cfg,
         base_model_path,
         fixed_flags={
-            "-m", "--port", "-c", "-ngl", "-b", "-t", "-fa", "--mlock",
+            "-m", "--port", "-c", "-ngl", "-b", "-ub", "-t", "-tb", "-fa", "--mlock",
             "-np", "--cache-type-k", "--cache-type-v", "--cache-reuse", "--cache-ram",
             "--kv-unified", "--lora", "--reasoning-budget", "--reasoning-budget-message",
             "--control-vector", "--control-vector-scaled", "--control-vector-layer-range",
@@ -987,6 +1076,51 @@ def build_embed_cmd(cfg: dict, project_root: Path | None = None) -> list[str] | 
     return _embed_cmd(
         cfg, project_root, port=int(emb_cfg.get("llama_port", 8082)), gpu_layers=gpu_layers,
     )
+
+
+def _embed_batch_sizes(cfg: dict, project_root: Path, *, cpu: bool = False) -> tuple[int, int]:
+    """埋め込みの ``(-b, -ub)``。backend と同じ解決 (環境調整の項目 ``embed_params`` + 明示値、c_16 §7.2.3)。
+
+    明示値が ``ubatch < max_length`` 等を破っていれば警告だけ出す。backend が無ければ明示値、
+    ``auto`` / 未設定は ``max_length`` (不変条件の下限)。``cpu`` (CPU で起こす) のとき、GPU 配置を前提に
+    VRAM の空きで広げた調整値は不変条件の下限 (``max_length``) に戻す (計算バッファを RAM に積まない)。
+    調整値の理由が ``warn`` (計算バッファが空きに収まらない) なら、その提案を警告に出す。
+    """
+    emb_cfg = cfg.get("embedding", {}) or {}
+    resolved = _tuned(cfg, project_root, "embed_params")
+    if resolved is None:
+        floor = max(int(emb_cfg.get("max_length", 8192)), 512)
+
+        def pick(key: str) -> int:
+            raw = emb_cfg.get(key)
+            return floor if raw is None or raw == "auto" else int(raw)
+
+        return pick("batch_size"), pick("ubatch_size")
+    from backend.free.core.tuning.tuners.embed_params import effective_embed_params, ubatch_floor
+
+    params = effective_embed_params(emb_cfg, resolved.value)
+    for warning in params.warnings:
+        print(f"[launch] WARNING: {warning}", file=sys.stderr)
+    if "warn:" in (resolved.reason or ""):
+        print(f"[launch] WARNING: embedding ubatch: {resolved.reason}", file=sys.stderr)
+    batch, ubatch = params.batch_size, params.ubatch_size
+    if cpu and isinstance(resolved.value, dict) and resolved.value.get("placement") == "gpu":
+        if params.sources.get("ubatch_size") == "tuned":
+            ubatch = min(ubatch, ubatch_floor(int(emb_cfg.get("max_length") or 8192)))
+        if params.sources.get("batch_size") == "tuned":
+            batch = ubatch
+    return batch, ubatch
+
+
+def _forget_tuned(cfg: dict, key: str) -> None:
+    """1 回の起動の中で覚えた ``key`` の解決 (``resolve_tuned`` のメモ) を捨てる (前提が変わったとき)。"""
+    try:
+        from backend.free.core.tuning.resolve import CACHE_KEY
+    except ImportError:
+        return
+    memo = cfg.get(CACHE_KEY)
+    if isinstance(memo, dict):
+        memo.pop(key, None)
 
 
 def _embed_cmd(cfg: dict, project_root: Path, *, port: int, gpu_layers: int) -> list[str]:
@@ -1038,14 +1172,10 @@ def _embed_cmd(cfg: dict, project_root: Path, *, port: int, gpu_layers: int) -> 
         )
 
     # 物理バッチサイズ。長い STM ノート (>512 tok) の埋め込みリクエストが
-    # llama-server デフォルト batch=512 のままだと 500 エラーで落ちるため、
-    # config.yaml の embedding.batch_size / ubatch_size を明示的に渡す。
-    batch_size = emb_cfg.get("batch_size")
-    if batch_size is not None:
-        cmd += ["-b", str(batch_size)]
-    ubatch_size = emb_cfg.get("ubatch_size")
-    if ubatch_size is not None:
-        cmd += ["-ub", str(ubatch_size)]
+    # llama-server デフォルト batch=512 のままだと 500 エラーで落ちるため、常に明示する
+    # (auto は環境調整の値で ubatch >= max_length を保証、明示値はそのまま。c_16 §7.2.3)。
+    batch_size, ubatch_size = _embed_batch_sizes(cfg, project_root, cpu=int(gpu_layers) == 0)
+    cmd += ["-b", str(batch_size), "-ub", str(ubatch_size)]
 
     # idle slot offload は埋め込みでは無意味 (chat slots 不使用) なので
     # 既定 0 で明示 disable する。``cache_ram_mib`` を 0 以外に
@@ -1053,10 +1183,10 @@ def _embed_cmd(cfg: dict, project_root: Path, *, port: int, gpu_layers: int) -> 
     cache_ram_mib = _resolve_cache_ram_mib(emb_cfg, default=0)
     cmd += ["--cache-ram", str(cache_ram_mib)]
 
-    # スレッド数。0 (既定) は省略して llama.cpp 自動検出 (全物理コア)。CPU 埋め込み時に
-    # base と CPU を分け合うため、明示値でヘッドルームを残せる。
-    threads = emb_cfg.get("threads", 0)
-    if threads and threads > 0:
+    # スレッド数。明示の正の整数はそのまま。0 (既定) は環境調整の項目 threads が物理コア数を
+    # base と分け合った値 (GPU 配置は 2。決められなければ省略して llama.cpp の既定)。
+    threads = _aux_threads(cfg, project_root, "embed", gpu=int(gpu_layers) != 0)
+    if threads > 0:
         cmd += ["-t", str(threads)]
 
     # 並列スロットは常に -np で明示する (未指定だと n_parallel=auto=4 になり
@@ -1078,9 +1208,15 @@ def _embed_cmd(cfg: dict, project_root: Path, *, port: int, gpu_layers: int) -> 
 
 RERANK_DEFAULT_PORT = 8083
 #: GPU 配置の判定で、モデルサイズに足す計算バッファの見積り (MiB)。
+#: 実測ではなく見積り (埋め込みと同じ値)。RAM 余裕の判定 (:func:`decide_rerank_memory`) と
+#: VRAM の合算 (:func:`estimate_rerank_vram`) で共有する。
 RERANK_COMPUTE_MARGIN_MIB = 1024
 #: GPU 配置で threads=0 (自動) のときの -t (GPU が計算するので少なくてよい、実測最適)。
 RERANK_GPU_DEFAULT_THREADS = 2
+#: GPU 配置の本番サーバの health 待ち (秒)。超えたら CPU で起こし直す (埋め込みと同じ値)。
+RERANK_GPU_START_TIMEOUT_SEC = 60
+#: evoref-ctl が rerank の準備を待つとき、起動の待ちに足す自己テスト本体の余裕 (秒)。
+RERANK_SELFTEST_ALLOWANCE_SEC = 60
 
 
 @dataclass(frozen=True)
@@ -1198,7 +1334,6 @@ def build_rerank_cmd(
         return None
     model = resolve_rerank_model_path(cfg, project_root)
     assert model is not None
-    rr = _rerank_cfg(cfg)
     cmd = [
         "llama-server",
         "-m", str(model),
@@ -1212,12 +1347,44 @@ def build_rerank_cmd(
         "--cache-ram", "0",
         "-ngl", str(placement.gpu_layers),
     ]
-    threads = int(rr.get("threads", 0) or 0)
+    # 明示の正の整数はそのまま。0 は環境調整の項目 threads の配分 (決められなければ GPU は 2、CPU は省略)
+    threads = _aux_threads(cfg, project_root, "rerank", gpu=placement.kind == "gpu")
     if placement.kind == "gpu":
         cmd += ["-fa", "on", "-t", str(threads or RERANK_GPU_DEFAULT_THREADS)]
     elif threads > 0:
         cmd += ["-t", str(threads)]
     return cmd
+
+
+def rerank_cpu_fallback_cmd(cfg: dict, project_root: Path | None, cmd: list[str] | None) -> list[str] | None:
+    """GPU 配置の rerank サーバが起動しなかったときに起こし直す CPU (``-ngl 0``) のコマンド。
+
+    ``rag.rerank.gpu_layers: auto`` で ``-ngl`` が 0 以外のときだけ (明示の整数は利用者の選択なので
+    そのまま)。それ以外は ``None``。保存結果は書き換えない (起動の失敗は環境起因)。全部の本番起動経路
+    (--all / serve / ctl / server_control / LlamaProcessManager) がこの 1 実装を使う。
+    """
+    if not cmd or "-ngl" not in cmd or _explicit_gpu_layers(_rerank_cfg(cfg)) is not None:
+        return None
+    i = cmd.index("-ngl") + 1
+    if i >= len(cmd) or cmd[i] == "0":
+        return None
+    return build_rerank_cmd(cfg, project_root, RerankPlacement("cpu", 0, "cpu_fallback_after_gpu_start_failed"))
+
+
+def decide_rerank_memory(
+    available_mb: int, model_mb: int | None, *, compute_margin_mib: int = RERANK_COMPUTE_MARGIN_MIB,
+) -> tuple[bool, str]:
+    """自己テストの前の RAM 余裕 (純関数)。利用可能な物理メモリ ≥ モデル + 計算バッファの見積り か。
+
+    ``available_mb`` が 0 (取れなかった) / ``model_mb`` が不明なら判定せず可。iGPU は VRAM が共有 RAM
+    なので GPU 配置でも見る。不足の理由は ``low_memory: ...``。
+    """
+    if available_mb <= 0 or model_mb is None:
+        return True, ""
+    need = model_mb + compute_margin_mib
+    if available_mb >= need:
+        return True, ""
+    return False, f"low_memory: available {available_mb} MiB < need {need} MiB (model {model_mb} + buffer {compute_margin_mib})"
 
 
 def _resolve_model_path(
@@ -1776,7 +1943,7 @@ def resolve_auto_model_flags(
     # context 乖離は警告のみ (-c は config 優先で自動上書きしない)。
     ctx_train = meta.get("context_length")
     cfg_ctx = lc.get("context_size")
-    if warn and ctx_train and cfg_ctx and int(cfg_ctx) > int(ctx_train):
+    if warn and ctx_train and isinstance(cfg_ctx, int) and cfg_ctx > int(ctx_train):
         warn(
             f"[launch] WARNING: llama.context_size={cfg_ctx} exceeds model "
             f"n_ctx_train={ctx_train}; consider lowering context_size"
@@ -1918,6 +2085,12 @@ def _estimate_via_gguf_size(
     base_ngl = _resolve_base_gpu_layers(cfg, project_root)
     base_size = _file_size_mb(base_path)
     base_vram = (base_size or 0) if base_ngl > 0 else 0
+    if base_size and 0 < base_ngl < 999:
+        # 層の一部だけを載せる (``gpu_layers: auto`` が空きに合わせて縮めた) ときは重みも層の割合で
+        # 見積もる。全量で数えると、空きから導いた予算 (c_16 §7.2.3) の検査で必ず超過になる。
+        layers = _read_gguf_layer_count(base_path)
+        if layers and base_ngl < layers:
+            base_vram = int(round(base_size * base_ngl / layers))
 
     # Pro かつ ``llama.speculative.mode == "draft-model"`` の
     # ときは draft GGUF のサイズも base の VRAM 推定に加算する。
@@ -2182,6 +2355,11 @@ def resolve_context_size_for(
     引く。これにより ``-m`` で渡すモデルと ``-c`` が一致する (旧実装は常に
     base_model profile から ``-c`` を引いていた)。``llama.context_size`` の明示は
     手動 pin として override より優先する。
+
+    ``auto`` / ``null`` (c_16 §7.2.3) は環境調整の項目 ctx — 保存済みの調整結果 (この PC・この
+    base モデル) → その場の見積り (空き VRAM / RAM に収まる最大、上限は profile) → 保守側 8192。
+    調整は ``model_paths.base_model`` について決めるので、別モデルの ``model_override`` は従来どおり
+    そのモデルの profile を引く。backend が無い配布物も従来どおり profile。
     """
     default = _CONTEXT_SIZE_DEFAULTS.get(name, 8192)
     if name == "base":
@@ -2192,18 +2370,46 @@ def resolve_context_size_for(
     else:
         return default
 
-    if explicit is not None:
+    if explicit is not None and explicit != "auto":
         return int(explicit)
     if project_root is not None:
-        model_rel = model_override or (cfg.get("model_paths") or {}).get(model_key, "")
+        base_rel = (cfg.get("model_paths") or {}).get(model_key, "")
+        model_rel = model_override or base_rel
         if model_rel:
             model_path = Path(model_rel)
             if not model_path.is_absolute():
                 model_path = project_root / model_path
+            same_as_base = not model_override or (
+                bool(base_rel) and _same_path(model_path, project_root / Path(base_rel))
+            )
+            if same_as_base:
+                tuned = _tuned(cfg, project_root, "ctx")
+                if tuned is not None and isinstance(tuned.value, int):
+                    return int(tuned.value)
             profile_ctx = _profile_context_size_for_model(model_path, project_root)
             if profile_ctx is not None:
                 return profile_ctx
     return default
+
+
+def _is_base_model(cfg: dict, project_root: Path, model_override: str | None) -> bool:
+    """``model_override`` が無いか、``model_paths.base_model`` と同じファイルか (環境調整の値を使ってよいか)。"""
+    if not model_override:
+        return True
+    base_rel = (cfg.get("model_paths") or {}).get("base_model", "")
+    if not base_rel:
+        return False
+
+    def absolute(rel: str) -> Path:
+        path = Path(rel)
+        return path if path.is_absolute() else project_root / path
+
+    return _same_path(absolute(model_override), absolute(base_rel))
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    """2 つのパスが同じファイルを指すか (存在しなくても表記を正規化して比べる)。"""
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def _run_fit_params(
@@ -2243,130 +2449,22 @@ def _run_fit_params(
     return _parse_fit_params_output(result.stdout or "")
 
 
-def _run_fit_params_with_meta(
-    binary: str,
-    model_path: str,
-    context_size: int,
-    gpu_layers: int,
-    timeout: float,
-) -> tuple[dict | None, dict[str, tuple[int, int]]]:
-    """``_run_fit_params`` の拡張版: device memory 情報も併せて返す。
-
-    返値: ``(vram_estimate, device_memory)`` のタプル。
-      - vram_estimate: ``_parse_fit_params_output`` と同じ dict (失敗時 None)
-      - device_memory: ``{device_name: (total_mib, free_mib)}`` (空 dict 可)
-
-    device 列挙行は実装によって stdout / stderr のどちらに出るか不定なので
-    両 stream を結合して走査する。``-v`` (verbose) を追加して device 行
-    (``using device <name> (...) - NNN MiB free``) を確実に出力させる
-    (verbose なしでは device 行が省略されるバージョンがあるため)。
-    Tier 1 推定 (``_run_fit_params``) には影響しないよう本関数を分離。
-    """
-    cmd = [
-        binary,
-        "-m", str(model_path),
-        "-c", str(int(context_size)),
-        "--fit-print", "on",
-        "-ngl", str(int(gpu_layers)),
-        "-v",  # verbose: device 列挙行を確実に出力させる
-    ]
-    try:
-        # encoding を utf-8 + errors=replace で明示。Windows の cp932 デフォルト
-        # では verbose 出力中の非 ASCII バイト (GGUF メタなど) で UnicodeDecodeError
-        # が発生する。
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None, {}
-    combined = (result.stdout or "") + "\n" + (result.stderr or "")
-    device_mem = _parse_device_memory(combined)
-    if result.returncode != 0:
-        return None, device_mem
-    return _parse_fit_params_output(result.stdout or ""), device_mem
-
-
-# ── 自動段階縮小ロジック ──────────────────────────────
-# rationale: 予算内に収まる最大の ratio を採る。ratio を落とすほど CPU 側へ
-# 逃げるので応答速度は落ちるが、OOM で起動できないよりは良い。
-_AUTO_NGL_RATIOS: tuple[float, ...] = (1.0, 0.8, 0.6, 0.4, 0.0)
-
-
-def _scaled_vram_mb(full_estimate: dict, ratio: float) -> int:
-    """ngl 縮小後の VRAM 推定 MiB を返す。
-
-    rationale: ``model_mb`` のみ ratio に線形比例で縮小、``context_mb`` /
-    ``compute_mb`` は安全側で据置 (= 多めに見積もる)。実際は ngl=0 で
-    ctx/compute も大幅減るが、上振れさせて「縮小不足で起動後 OOM」を回避。
-    ratio=0 のときだけ全成分 0 (= CPU 配置)。
-    """
-    if ratio <= 0.0:
-        return 0
-    model_mb = int(full_estimate.get("model_mb", 0) or 0)
-    ctx_mb = int(full_estimate.get("context_mb", 0) or 0)
-    compute_mb = int(full_estimate.get("compute_mb", 0) or 0)
-    return int(round(model_mb * ratio)) + ctx_mb + compute_mb
-
-
-def _calc_auto_gpu_layers(
-    *,
-    base_layers_total: int,
-    base_full_estimate: dict,
-    gpu_total_mib: int,
-    headroom_mib: int,
-) -> tuple[int, str]:
-    """base の ``-ngl`` を段階縮小し、最初に予算内へ収まる値を返す。
-
-    Args:
-        base_layers_total: base モデルの全 layer 数 (GGUF block_count)
-        base_full_estimate: ngl=999 (全 offload) 時の Tier 1 推定
-            ``{"model_mb", "context_mb", "compute_mb"}``
-        gpu_total_mib: GPU 物理容量 (MiB)
-        headroom_mib: Vulkan host buffer 予約 (MiB)
-
-    Returns:
-        ``(base_ngl, reason_str)`` のタプル。ratio=1.0 採用時は ``(999, ...)``、
-        CPU フォールバック時は ``(0, ...)`` を返す。
-    """
-    budget = max(gpu_total_mib - headroom_mib, 0)
-    for ratio in _AUTO_NGL_RATIOS:
-        base_ngl = 999 if ratio >= 1.0 else int(round(base_layers_total * ratio))
-        base_vram = _scaled_vram_mb(base_full_estimate, ratio)
-        if base_vram <= budget:
-            reason = (
-                f"ratio={ratio:.0%} base={base_ngl}/{base_layers_total} "
-                f"est={base_vram}MiB budget={budget}MiB "
-                f"(gpu_total={gpu_total_mib}MiB - headroom={headroom_mib}MiB)"
-            )
-            return base_ngl, reason
-    # ratio=0.0 でも収まらない (異常状態) → CPU フォールバック
-    reason = (
-        f"all-CPU fallback: estimate exceeds budget even at ratio=0 "
-        f"(budget={budget}MiB gpu_total={gpu_total_mib}MiB "
-        f"headroom={headroom_mib}MiB)"
-    )
-    return 0, reason
-
-
-# ── auto エントリ: GGUF parse + fit-params + 段階縮小 + キャッシュ ──
+# ── auto エントリ: 環境調整の項目 ngl (c_16 §7.2.3) + キャッシュ ──
 _AUTO_NGL_CACHE_KEY = "__auto_ngl_cache__"
 
 
 def _resolve_auto_gpu_layers(
     cfg: dict, project_root: Path,
 ) -> dict[str, int] | None:
-    """``gpu_layers="auto"`` 指定時の base 自動段階縮小を実行。
+    """``gpu_layers="auto"`` 指定時の base の ``-ngl`` (環境調整の項目 ngl)。
+
+    保存済みの調整結果 (この PC・このモデル) → その場の見積り (GPU の **空き** から段階縮小、
+    ``backend.free.core.tuning.tuners.ngl``。保存する) の順に決める (``resolve_tuned``)。
+    環境移行の確認待ちの間は保存しない一時の見積り (取れなければ全層の 40%、``tuners.ngl.conservative_ngl``)。
+    決められない (モデルが読めない / backend が無い) ときは None を返し、
+    呼び出し側は既定 999 にフォールバックする。``runtime.gpu_auto_tune_enabled: false`` も None。
 
     1 度だけ計算し ``cfg[_AUTO_NGL_CACHE_KEY]`` に dict をキャッシュする。
-
-    ``runtime.gpu_auto_tune_enabled: false`` のときは即座に None を返し、
-    呼び出し側は既定 999 にフォールバックする。GGUF / fit-params のいずれかが
-    失敗した場合も None を返し WARNING を 1 行出して同様にフォールバック。
 
     Returns:
         ``{"base_ngl": int, "reason": str}`` または None。
@@ -2384,64 +2482,25 @@ def _resolve_auto_gpu_layers(
         )
         return None
 
-    binary = runtime_cfg.get("fit_params_binary", "llama-fit-params")
-    timeout = float(runtime_cfg.get("fit_params_timeout_sec", 10.0))
-    headroom = int(runtime_cfg.get("vulkan_host_buffer_headroom_mib", 4096))
-
-    base_model_path = _resolve_model_path(cfg, "base_model", "", project_root)
-    if not base_model_path.exists():
+    resolved = _tuned(cfg, project_root, "ngl")
+    if resolved is None or resolved.source == "fallback" or not isinstance(resolved.value, int):
         cfg[_AUTO_NGL_CACHE_KEY] = {}
+        why = "auto-tune unavailable" if resolved is None else resolved.reason
         print(
-            "[launch] WARNING: gpu_layers='auto' but the base model file is "
-            "missing; falling back to -ngl 999"
-        )
-        return None
-
-    base_layers = _read_gguf_layer_count(base_model_path)
-    if base_layers is None:
-        cfg[_AUTO_NGL_CACHE_KEY] = {}
-        print(
-            "[launch] WARNING: gpu_layers='auto' but failed to read "
-            "block_count; falling back to -ngl 999"
-        )
-        return None
-
-    base_ctx = resolve_context_size_for(cfg, "base", project_root)
-    base_full, base_devmem = _run_fit_params_with_meta(
-        binary, str(base_model_path), base_ctx, 999, timeout,
-    )
-    if base_full is None:
-        cfg[_AUTO_NGL_CACHE_KEY] = {}
-        print(
-            "[launch] WARNING: gpu_layers='auto' but llama-fit-params failed; "
+            f"[launch] WARNING: gpu_layers='auto' could not be tuned ({why}); "
             "falling back to -ngl 999"
         )
         return None
 
-    # ``host`` 行は CPU 側システム RAM のためスキップ
-    gpu_devices = {k: v for k, v in base_devmem.items() if k.lower() != "host"}
-    if not gpu_devices:
-        cfg[_AUTO_NGL_CACHE_KEY] = {}
+    reason = f"{resolved.source}: {resolved.reason}"
+    if resolved.source == "provisional":
         print(
-            "[launch] WARNING: gpu_layers='auto' but no GPU device detected "
-            "from fit-params output; falling back to -ngl 999"
+            f"[launch] WARNING: gpu_layers='auto' uses an unsaved estimate (base={resolved.value}) until the "
+            "re-tune after the PC change is confirmed. Run `evoref tune --startup-check` or `evoref tune run`"
         )
-        return None
-    # 最大 total を持つ device を採用 (multi-GPU の場合は最大 1 枚に基づく
-    # 保守的判定。共有 iGPU 環境では 1 枚しかないため影響なし)
-    gpu_total_mib = max(total for total, _free in gpu_devices.values())
-
-    base_ngl, reason = _calc_auto_gpu_layers(
-        base_layers_total=base_layers,
-        base_full_estimate=base_full,
-        gpu_total_mib=gpu_total_mib,
-        headroom_mib=headroom,
-    )
-
-    print(f"[launch] auto-tuned gpu_layers: base={base_ngl}/{base_layers}")
+    print(f"[launch] auto-tuned gpu_layers: base={resolved.value}")
     print(f"[launch]   reason: {reason}")
-
-    result = {"base_ngl": base_ngl, "reason": reason}
+    result = {"base_ngl": int(resolved.value), "reason": reason}
     cfg[_AUTO_NGL_CACHE_KEY] = result
     return result
 
@@ -2494,6 +2553,64 @@ def _try_estimate_via_fit_params(
     return enriched
 
 
+def _saved_rerank_known_invalid(cfg: dict, project_root: Path, rr: dict, explicit: int) -> bool:
+    """明示の ``gpu_layers`` と同じ配置の保存結果が無効で、起動しないと分かっているか (VRAM を足さない)。
+
+    保存結果が無い / 配置が違う (測り直す) / 環境起因の失敗を数えている途中 (また試す) は ``False``。
+    """
+    path = rerank_selftest_path(cfg, project_root)
+    if path is None:
+        return False
+    try:
+        from backend.free.rag import rerank_selftest as st
+    except ImportError:
+        return False
+    saved, _status = st.load_selftest_result(path)
+    if saved is None or saved.gpu_layers != explicit:
+        return False
+    if not saved.enabled and st.is_environmental_failure(saved.reason) and (
+        saved.environmental_streak < st.ENVIRONMENTAL_FAILURE_LIMIT
+    ):
+        return False
+    enabled, _candidates, _reason = _usable_saved(st, saved, rr)
+    return not enabled
+
+
+def estimate_rerank_vram(cfg: dict, project_root: Path) -> dict:
+    """rerank の VRAM 見積り (Tier 2)。GPU 配置のときだけ ``present`` True で合算に入る。
+
+    起動対象 (:func:`rerank_launchable`) で、明示の ``gpu_layers > 0`` (保存結果が同じ配置で無効と
+    分かっていれば除く) か、``auto`` で保存済みの自己テストが GPU 配置のとき。mode off / モデル無し / CPU 配置 / 未テストの ``auto`` は 0 MB・
+    ``present`` False (埋め込みの未判別 = CPU と同じ扱い)。``vram_mb`` はモデル + 計算バッファの見積り。
+    """
+    model = resolve_rerank_model_path(cfg, project_root)
+    entry = {
+        "model_mb": None, "gpu_layers": 0, "vram_mb": 0, "present": False,
+        "path": str(model) if model is not None else "",
+        "context_mb": None, "compute_mb": None, "device": None,
+        "estimated_via": "gguf-size",
+    }
+    if not rerank_launchable(cfg, project_root)[0] or model is None:
+        return entry
+    rr = _rerank_cfg(cfg)
+    explicit = _explicit_gpu_layers(rr)
+    if explicit is not None:
+        ngl = explicit
+        if ngl > 0 and _saved_rerank_known_invalid(cfg, project_root, rr, explicit):
+            ngl = 0
+    else:
+        saved = saved_rerank_placement(cfg, project_root)
+        ngl = saved.gpu_layers if saved is not None and saved.kind == "gpu" else 0
+    size = _file_size_mb(model)
+    entry["model_mb"] = size
+    entry["gpu_layers"] = ngl
+    if ngl > 0 and size is not None:
+        entry["compute_mb"] = RERANK_COMPUTE_MARGIN_MIB
+        entry["vram_mb"] = size + RERANK_COMPUTE_MARGIN_MIB
+        entry["present"] = True
+    return entry
+
+
 def estimate_vram_usage_mb(
     cfg: dict,
     project_root: Path | None = None,
@@ -2536,13 +2653,14 @@ def estimate_vram_usage_mb(
 
     base_result = _estimate_via_gguf_size(cfg, project_root)
 
-    if not prefer_fit_params:
-        return base_result
     runtime_cfg = cfg.get("runtime", {}) or {}
-    if not runtime_cfg.get("fit_params_enabled", True):
-        return base_result
-
-    return _try_estimate_via_fit_params(cfg, base_result, project_root)
+    if prefer_fit_params and runtime_cfg.get("fit_params_enabled", True):
+        result = _try_estimate_via_fit_params(cfg, base_result, project_root)
+    else:
+        result = base_result
+    # rerank は常に Tier 2 (サイズ + 計算バッファの見積り)。GPU 配置のときだけ present
+    result["rerank"] = estimate_rerank_vram(cfg, project_root)
+    return result
 
 
 def suggest_total_vram_budget_mb(
@@ -2617,7 +2735,34 @@ def format_placement_summary(estimates: dict[str, dict]) -> list[str]:
                 f"  {'':<9s}   + draft: "
                 f"model_size={draft_mb}MB  path={draft_path}"
             )
+    rerank = estimates.get("rerank") or {}
+    if rerank.get("present"):
+        lines.append(
+            f"  {'rerank':<9s} : GPU ngl={rerank.get('gpu_layers', 0):<4d} "
+            f"model_size={rerank.get('model_mb')}MB + buffer={rerank.get('compute_mb')}MB "
+            f"est_vram={rerank.get('vram_mb', 0)}MB"
+        )
     return lines
+
+
+def _vram_budget_mb(cfg: dict, project_root: Path | None) -> tuple[int | None, str]:
+    """VRAM 予算と表示の注記。``runtime.total_vram_budget_mb`` が ``null`` なら環境調整の項目
+    vram_budget (GPU の空き × 安全率、c_16 §7.2.3)。GPU が無い・決められなければ ``None`` (検査しない)。
+    """
+    raw = (cfg.get("runtime") or {}).get("total_vram_budget_mb")
+    if raw is not None:
+        return int(raw), ""
+    if project_root is None:
+        return None, ""
+    tuned = _tuned(cfg, project_root, "vram_budget")
+    if tuned is None or tuned.value is None:
+        return None, ""
+    return int(tuned.value), f" (auto-tuned: {tuned.reason})"
+
+
+def _vram_budget_is_explicit(cfg: dict) -> bool:
+    """``runtime.total_vram_budget_mb`` を利用者が数値で明示したか (``null`` は自動で導いた目安)。"""
+    return (cfg.get("runtime") or {}).get("total_vram_budget_mb") is not None
 
 
 def check_vram_budget(
@@ -2628,16 +2773,16 @@ def check_vram_budget(
     Returns:
         (ok, total_vram_mb, budget_mb, estimates, message)
 
-        - ``ok``: True なら起動継続可。False なら超過中 (force=True でも True にはならない)
-        - ``total_vram_mb``: 判定に使った VRAM 合計 (base + embed)
+        - ``ok``: True なら起動継続可。False は **明示の予算** を超過中 (``force`` なら True)。
+          自動で導いた予算 (``null``) の超過は警告だけで True
+        - ``total_vram_mb``: 判定に使った VRAM 合計 (base + embed + GPU 配置の rerank)
         - ``budget_mb``: ``runtime.total_vram_budget_mb`` (未設定なら None)
         - ``estimates``: モデル別内訳 (``estimate_vram_usage_mb`` の返り値)
         - ``message``: 人間可読なログ用メッセージ
     """
     estimates = estimate_vram_usage_mb(cfg, project_root)
     total_vram_mb = sum(e.get("vram_mb", 0) for e in estimates.values())
-    runtime_cfg = cfg.get("runtime", {}) or {}
-    budget_mb = runtime_cfg.get("total_vram_budget_mb")
+    budget_mb, budget_note = _vram_budget_mb(cfg, project_root)
 
     # Tier 1 (llama-fit-params) を 1 つでも採用できたかをサマリ末尾に表示する。
     has_tier1 = any(
@@ -2656,7 +2801,7 @@ def check_vram_budget(
             "  runtime.total_vram_budget_mb: (not set — skipping VRAM budget check)"
         )
     else:
-        lines.append(f"  runtime.total_vram_budget_mb: {budget_mb} MB")
+        lines.append(f"  runtime.total_vram_budget_mb: {budget_mb} MB{budget_note}")
 
     # Tier 1 結果から 10% headroom 付き推奨値を提示する
     if budget_mb is None:
@@ -2668,12 +2813,18 @@ def check_vram_budget(
             )
         return True, total_vram_mb, None, estimates, "\n".join(lines)
 
+    # 自動で導いた予算 (``null`` → 項目 vram_budget = 空き × 0.9) は目安: 超えても警告だけで止めない。
+    # ctx・b・ub の見積りは「空き - ヘッドルーム」まで詰めるので、空き × 0.9 の予算とは食い違いうる
+    # (12 GB の単体 GPU で 8B・ctx 32768・ub 1024 なら必要 ≈ 11.2 GB > 予算 10.8 GB)。中断と slots の降格は
+    # 利用者が明示した予算のときだけ (``null`` は以前「検査しない」だったので、既存の --all を止めない)。
+    explicit_budget = _vram_budget_is_explicit(cfg)
+
     # ``llama.slots: auto`` が 4 本目 (long_form 専用) を選んだせいで予算を
     # 超えるなら、そのぶん (hybrid arch の再帰状態 1 シーケンス分) を諦めて 3 に
     # 降格する。明示 ``slots: 4`` は降格しない (超過は従来どおり警告 / アボート)。
     resolved = (cfg.get(_RESOLVED_SLOTS_KEY) or {}).get("")
     if (
-        resolved is not None and resolved.get("auto")
+        explicit_budget and resolved is not None and resolved.get("auto")
         and int(resolved.get("slots", 0)) == SLOTS_WITH_LONG_FORM
         and total_vram_mb > int(budget_mb)
         and total_vram_mb - int(resolved.get("per_seq_mb", 0)) <= int(budget_mb)
@@ -2694,6 +2845,12 @@ def check_vram_budget(
             f"[launch] WARNING: estimated VRAM {total_vram_mb} MB exceeds budget "
             f"{budget_mb} MB (over by {over} MB)"
         )
+        if not explicit_budget:
+            lines.append(
+                "[launch] WARNING: auto-derived budget exceeded; continuing. "
+                "Set runtime.total_vram_budget_mb to enforce"
+            )
+            return True, total_vram_mb, int(budget_mb), estimates, "\n".join(lines)
         if force:
             lines.append(
                 "[launch] --force specified: continuing despite VRAM budget overrun"
@@ -2702,6 +2859,7 @@ def check_vram_budget(
         lines.append(
             "[launch] Aborting. Re-run with --force to override, or set "
             "embedding.gpu_layers to 0 (CPU fallback) "
+            "(or rag.rerank.gpu_layers: 0 when rerank is in the breakdown) "
             "or raise runtime.total_vram_budget_mb to continue."
         )
         return False, total_vram_mb, int(budget_mb), estimates, "\n".join(lines)
@@ -2932,6 +3090,48 @@ def _wait_health(ports: dict[str, int], timeout_sec: float) -> None:
             print(f"[launch] WARNING: {name} (port {port}) health check timed out, proceeding anyway")
 
 
+#: 起動の health 待ちの下限 (``backend.free.llm._base_client.HEALTH_WAIT_FLOOR_SEC`` と同じ値。
+#: backend を import できない配布形態のときだけの保険で、通常は backend の 1 実装が決める)。
+_HEALTH_WAIT_FALLBACK_SEC = 120
+
+
+def _health_wait(
+    cfg: dict, model_path: "str | Path | None", project_root: Path | None = None,
+    *, floor: float = _HEALTH_WAIT_FALLBACK_SEC, label: str = "llama-server",
+) -> int:
+    """起動の health 待ちの秒数 (全経路の 1 実装 ``resolve_health_wait`` を呼ぶ、c_16 §7.2.3)。
+
+    config の ``process_manager.health_timeout`` が整数ならそのまま、``auto`` / 無しなら
+    GGUF サイズ連動 (``floor`` 以上、上限 600)。
+    """
+    try:
+        from backend.free.llm._base_client import health_wait_for_cfg
+    except ImportError:
+        configured = (cfg.get("process_manager") or {}).get("health_timeout", "auto")
+        return int(configured) if isinstance(configured, int) and configured > 0 else int(floor)
+    return health_wait_for_cfg(cfg, model_path, project_root=project_root, floor=floor, label=label)
+
+
+def _sized_wait(model_path: "str | Path | None", floor: float, *, label: str) -> int:
+    """GPU 起動待ち / 判別プローブの待ち (``floor`` 以上でモデルサイズ連動。config の明示値は見ない)。
+
+    ``floor`` は現行の値 (60 / 30) で、「GPU で起動しない PC」を速く検知する意図のため下げない。
+    延びるのは大型モデルだけ。呼び出し側は本番の待ちとの ``min`` を取る。
+    """
+    try:
+        from backend.free.llm._base_client import resolve_health_wait
+    except ImportError:
+        return int(floor)
+    return resolve_health_wait("auto", model_path, floor=floor, label=label)
+
+
+def _model_path_of_cmd(cmd: list[str] | None) -> str | None:
+    """``cmd`` 中の ``-m`` の値 (起動するモデルのパス。無ければ ``None``)。"""
+    if cmd and "-m" in cmd and cmd.index("-m") + 1 < len(cmd):
+        return str(cmd[cmd.index("-m") + 1])
+    return None
+
+
 def _extract_model_basename(cmd: list[str]) -> str | None:
     """``cmd`` 中の ``-m`` 引数の basename を返す
 
@@ -3080,6 +3280,28 @@ def saved_rerank_placement(cfg: dict, project_root: Path) -> RerankPlacement | N
     return RerankPlacement(saved.placement, saved.gpu_layers, "saved self-test")
 
 
+def _tune_gate(cfg: dict, project_root: Path, pc, why: str, *, force: bool = False) -> tuple[bool, str]:
+    """環境移行の確認 (c_16 §7.2.3) — 測り直す直前に見る。(測ってよいか, 理由)。
+
+    判定は backend の 1 実装 (``backend.free.core.tuning.gate.should_measure``) に任せる。``force``
+    (手動の --embed-placement / --rerank-selftest) は常に測り、現在の PC に ``accepted`` を記録する。
+    確認を挟むのは PC が変わった / 結果が無い回だけ (新規インストールは ``fresh`` で従来どおり測る)。
+    backend を import できなければ従来どおり測る。
+    """
+    try:
+        from backend.free.core.tuning import gate as tg
+        from backend.free.core.tuning.store import resolve_tune_paths
+    except ImportError:
+        return True, "gate_unavailable"
+    paths = resolve_tune_paths(cfg, project_root)
+    if force:
+        tg.record_decision(paths.auto_tune, "accepted", pc)
+        return True, "forced"
+    if why not in tg.GATED_REASONS:
+        return True, why
+    return tg.should_measure(tg.load_gate(cfg, project_root, pc, paths=paths))
+
+
 def _rerank_health_once(host: str, port: int, expected_model_id: str | None) -> bool:
     """``/health`` が 200 で、``/props`` のモデルが一致するか (1 回だけ見る)。"""
     try:
@@ -3127,6 +3349,7 @@ def start_rerank_server(
     port_busy: Callable[[str, int], bool] = _port_answers,
     server_version: Callable[[], str] = _llama_server_version,
     health_timeout: int | None = None,
+    available_memory: Callable[[], int] | None = None,
 ) -> RerankLaunch:
     """rerank サーバを起動する。PC の指紋が保存結果と違うときだけ自己テストを走らせる。
 
@@ -3137,8 +3360,13 @@ def start_rerank_server(
       保存済みの配置と違う (``placement_setting_changed``、唯一の例外) → 配置を決めて起動して
       測る。GPU で退化・起動失敗したら CPU で 1 回だけ起動し直す (``gpu_layers: auto`` の
       ときだけ。遅すぎは再試行しない)。
-    - 結果は ``cache/rerank_selftest.json`` へ書く。ただし環境起因の失敗 (``server_unhealthy`` /
-      ``http_error:*``) が混じった回は保存しない (次の起動でまた試す)。
+    - 自己テストの前に利用可能な物理メモリがモデル + 計算バッファ未満なら起動せず ``low_memory``
+      (保存も数えもしない。次の起動でまた試す)。
+    - 結果は ``cache/rerank_selftest.json`` へ書く。環境起因の失敗 (``server_unhealthy`` /
+      ``http_error:*``) が混じった回は、連続回数を ``environmental_streak`` に数えて保存し、
+      ``ENVIRONMENTAL_FAILURE_LIMIT`` 回に届くまで次の起動でまた試す (届いたら無効が確定)。
+    - 保存済みの配置が GPU (``gpu_layers: auto``) で起動しなければ CPU で 1 回だけ起こし直す
+      (:func:`rerank_cpu_fallback_cmd`)。保存結果は書き換えない。
 
     起動・health・自己テストの失敗はチャットを止めない (rerank を無効にして続ける)。
     """
@@ -3174,7 +3402,7 @@ def start_rerank_server(
     model = resolve_rerank_model_path(cfg, project_root)
     assert model is not None
     model_key = model_key_for(model)
-    timeout = health_timeout or int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+    timeout = health_timeout or _health_wait(cfg, model, project_root, label="rerank")
     kwargs = {"cwd": project_root, **(popen_kwargs or {})}
 
     devices_text = list_devices()
@@ -3185,8 +3413,10 @@ def start_rerank_server(
         saved, fingerprint, force=force_selftest, explicit_gpu_layers=explicit,
     )
 
-    def spawn(placement: RerankPlacement) -> subprocess.Popen | None:
-        cmd = build_rerank_cmd(cfg, project_root, placement)
+    def spawn(
+        placement: RerankPlacement, cmd: list[str] | None = None, wait: float = timeout,
+    ) -> subprocess.Popen | None:
+        cmd = cmd or build_rerank_cmd(cfg, project_root, placement)
         if cmd is None:
             return None
         print(f"[launch] rerank ({placement.kind}): {' '.join(cmd)}")
@@ -3195,7 +3425,7 @@ def start_rerank_server(
         except (FileNotFoundError, OSError) as e:
             print(f"[launch] WARNING: failed to spawn rerank server: {e}", file=sys.stderr)
             return None
-        if health(proc, RERANK_HOST, port, timeout, model.name):
+        if health(proc, RERANK_HOST, port, wait, model.name):
             return proc
         print(f"[launch] WARNING: rerank server ({placement.kind}) did not become healthy", file=sys.stderr)
         if placement.kind == "gpu" and saved_embed_placement(cfg, project_root).kind == "gpu":
@@ -3221,16 +3451,41 @@ def start_rerank_server(
             print(f"[launch] rerank disabled by the saved self-test ({reason}); not started")
             return RerankLaunch(None, saved, False, reason)
         placement = RerankPlacement(saved.placement, saved.gpu_layers, "saved self-test")
-        proc = spawn(placement)
+        gpu_cmd = build_rerank_cmd(cfg, project_root, placement)
+        fallback = rerank_cpu_fallback_cmd(cfg, project_root, gpu_cmd)
+        gpu_wait = _sized_wait(model, RERANK_GPU_START_TIMEOUT_SEC, label="rerank GPU start")
+        proc = spawn(placement, gpu_cmd, min(timeout, gpu_wait) if fallback else timeout)
+        if proc is None and fallback is not None:
+            print(
+                "[launch] WARNING: rerank server on GPU did not start; restarting it on CPU (-ngl 0). "
+                "The saved self-test is kept (a start failure is environmental); candidates were "
+                "sized for the GPU, so the deadline may cut some queries to cosine order",
+                file=sys.stderr,
+            )
+            placement = RerankPlacement("cpu", 0, "cpu_fallback_after_gpu_start_failed")
+            proc = spawn(placement, fallback)
         if proc is None:
             return RerankLaunch(None, saved, False, "server_unhealthy")
         print(
-            f"[launch] rerank ready on :{port} ({saved.placement}, "
+            f"[launch] rerank ready on :{port} ({placement.kind}, "
             f"{saved.ms_per_doc or 0:.0f} ms/doc, {candidates} candidates; saved self-test)",
         )
         return RerankLaunch(proc, saved, False, "")
 
+    tune_ok, tune_why = _tune_gate(cfg, project_root, pc, why_test, force=force_selftest)
+    if not tune_ok:
+        print(
+            f"[launch] rerank not started: {tune_why} (the PC changed since the saved self-test and "
+            "the re-measure is not confirmed; run `evoref tune --startup-check` or `evoref tune run`)",
+        )
+        return RerankLaunch(None, None, False, tune_why)
     print(f"[launch] rerank self-test: {why_test} (saved result: {status})")
+    mem_ok, mem_detail = decide_rerank_memory(
+        (available_memory or st.available_physical_memory_mb)(), _file_size_mb(model),
+    )
+    if not mem_ok:
+        print(f"[launch] WARNING: rerank self-test skipped, {mem_detail}; will retry next start", file=sys.stderr)
+        return RerankLaunch(None, None, False, st.LOW_MEMORY)
     measure_fn = measure or st.measure_rerank_server
     budget = st.warm_budget_ms(deadline_ms, min_candidates)
     first = decide_rerank_placement(
@@ -3250,11 +3505,9 @@ def start_rerank_server(
     }
     threads = int(rr.get("threads", 0) or 0)
     last = None
-    environmental = False
     for placement in attempts:
         proc = spawn(placement)
         if proc is None:
-            environmental = True
             last = st.RerankSelftestResult(
                 enabled=False, reason="server_unhealthy", placement=placement.kind,
                 gpu_layers=placement.gpu_layers, threads=threads, tested_at=utc_now(), **common,
@@ -3286,14 +3539,32 @@ def start_rerank_server(
             f"[launch] WARNING: rerank self-test failed on {placement.kind}: {verdict.reason}",
             file=sys.stderr,
         )
-        environmental = environmental or st.is_environmental_failure(verdict.reason)
         _stop_proc(proc)
         if not verdict.retry_on_cpu:
             break
 
     assert last is not None
-    if environmental:
-        print(f"[launch] rerank disabled for this run: {last.reason} (not saved; will retry next start)")
+    # 環境起因かは最後の試行の結果で決める (GPU が環境起因でも CPU が too_slow なら PC の性質として保存する)
+    if st.is_environmental_failure(last.reason) and saved is not None and saved.fingerprint == fingerprint and saved.enabled:
+        print(
+            f"[launch] rerank disabled for this run: {last.reason} (environmental; kept the previous result "
+            "of this PC, not overwritten)",
+        )
+    elif st.is_environmental_failure(last.reason):
+        last.environmental_streak = st.next_environmental_streak(saved, fingerprint)
+        if not st.save_selftest_result(path, last):
+            print(f"[launch] WARNING: failed to save the rerank self-test to {path}", file=sys.stderr)
+        if last.environmental_streak >= st.ENVIRONMENTAL_FAILURE_LIMIT:
+            print(
+                f"[launch] rerank disabled: {last.reason} ({last.environmental_streak} environmental failures "
+                "in a row; not re-testing until the PC changes or --rerank-selftest)",
+            )
+        else:
+            print(
+                f"[launch] rerank disabled for this run: {last.reason} "
+                f"(environmental failure {last.environmental_streak}/{st.ENVIRONMENTAL_FAILURE_LIMIT}; "
+                "will retry next start)",
+            )
     else:
         if not st.save_selftest_result(path, last):
             print(f"[launch] WARNING: failed to save the rerank self-test to {path}", file=sys.stderr)
@@ -3309,7 +3580,8 @@ def wait_rerank_ready(
     """別プロセスの起動スクリプトが rerank の自己テストを終えるまで待つ (evoref-ctl 用)。
 
     保存結果の指紋がこの PC と一致し、有効なら ``/health`` が 200 になるまで。mode off /
-    モデル無しは即座に返る。戻り値は状態 (``off`` / ``ready`` / ``disabled`` / ``timeout``)。
+    モデル無しは即座に返る。環境移行の確認待ち (``pending`` / ``declined``、c_16 §7.2.3) で起動スクリプトが
+    測らない回も待たずに ``disabled``。戻り値は状態 (``off`` / ``ready`` / ``disabled`` / ``timeout``)。
     """
     ok, _why = rerank_launchable(cfg, project_root)
     path = rerank_selftest_path(cfg, project_root)
@@ -3319,14 +3591,21 @@ def wait_rerank_ready(
         from backend.free.rag import rerank_selftest as st
     except ImportError:
         return "off"
-    fingerprint = st.collect_pc_info(_parse_device_names(list_devices())).digest
+    pc = st.collect_pc_info(_parse_device_names(list_devices()))
+    fingerprint = pc.digest
     rr = _rerank_cfg(cfg)
     explicit = _explicit_gpu_layers(rr)
     port = rerank_port(cfg)
     deadline = clock() + timeout_sec
+    gate_checked = False
     while True:
         saved, _status = st.load_selftest_result(path)
-        needed, _why = st.selftest_needed(saved, fingerprint, explicit_gpu_layers=explicit)
+        needed, why = st.selftest_needed(saved, fingerprint, explicit_gpu_layers=explicit)
+        if needed and not gate_checked:
+            # 確認待ち (pending / declined) の間は起動スクリプトが測らないので待たない (c_16 §7.2.3)
+            gate_checked = True
+            if not _tune_gate(cfg, project_root, pc, why)[0]:
+                return "disabled"
         if saved is not None and not needed:
             if not _usable_saved(st, saved, rr)[0]:
                 return "disabled"
@@ -3412,20 +3691,36 @@ def saved_embed_placement(cfg: dict, project_root: Path | None) -> EmbedPlacemen
     ))
 
 
-def embed_cpu_fallback_cmd(cfg: dict, cmd: list[str]) -> list[str] | None:
+def embed_cpu_fallback_cmd(
+    cfg: dict, cmd: list[str], project_root: Path | None = None,
+) -> list[str] | None:
     """GPU 配置の埋め込みサーバが起動しなかったときに起こし直す CPU (``-ngl 0``) のコマンド。
 
     ``embedding.gpu_layers: auto`` で ``-ngl`` が 0 以外のときだけ (明示の整数は利用者の選択なので
     そのまま。リランカーの CPU 再試行と同じ)。それ以外は ``None``。保存結果は書き換えない
     (起動の失敗は環境起因)。全部の本番起動経路 (--all / --embed / serve / auto-serve /
     server_control / LlamaProcessManager) がこの 1 実装を使う。
+
+    コマンドは ``-ngl`` だけを差し替えず、CPU 配置として **組み直す** (:func:`_embed_cmd` の ``gpu_layers=0``。
+    リランカーの :func:`rerank_cpu_fallback_cmd` と同じ): GPU 配置の ``-t 2`` (GPU_AUX_THREADS) と VRAM で
+    広げた ``-ub`` を CPU に持ち込むと、CPU の埋め込みが 2 スレッドで詰まりクエリが timeout する。
+    ポートは ``cmd`` の ``--port``。``project_root`` が無ければ backend のプロジェクト根 (無ければ CWD)。
     """
     if not _embed_setting_is_auto(cfg) or "-ngl" not in cmd:
         return None
     i = cmd.index("-ngl") + 1
     if i >= len(cmd) or cmd[i] == "0":
         return None
-    return [*cmd[:i], "0", *cmd[i + 1:]]
+    if project_root is None:
+        try:
+            from backend.config import get_project_root
+
+            project_root = Path(get_project_root())
+        except Exception:  # noqa: BLE001 - backend が無い / 読めない配布物は CWD (build_embed_cmd と同じ)
+            project_root = Path.cwd()
+    port_at = cmd.index("--port") + 1 if "--port" in cmd else -1
+    port = int(cmd[port_at]) if 0 < port_at < len(cmd) else int((cfg.get("embedding") or {}).get("llama_port", 8082))
+    return _embed_cmd(cfg, project_root, port=port, gpu_layers=0)
 
 
 def decide_embed_gpu_candidate(
@@ -3461,7 +3756,7 @@ def embed_gpu_within_budget(cfg: dict, project_root: Path, embed_model_mb: int |
     ``--all`` の予算検査 (:func:`check_vram_budget`) は判別の前に走り、未判別の埋め込みを CPU と
     見積もるので、判別する回はここで GPU 側に見積もり直す。理由: ``vram_budget_exceeded: ...``。
     """
-    budget = (cfg.get("runtime") or {}).get("total_vram_budget_mb")
+    budget, _note = _vram_budget_mb(cfg, project_root)
     if budget is None:
         return True, ""
     try:
@@ -3531,7 +3826,7 @@ def ensure_embed_placement(
     server_version: Callable[[], str] = _llama_server_version,
     free_port: Callable[[], int] = _free_port,
     base_ready: Callable[[dict], bool] = _base_ready,
-    probe_timeout: int = EMBED_PROBE_HEALTH_TIMEOUT_SEC,
+    probe_timeout: int | None = None,
 ) -> EmbedPlacement:
     """``embedding.gpu_layers: auto`` の配置を返す。PC か埋め込みモデルが変わったときだけ判別する (c_16 §7.2.2)。
 
@@ -3542,6 +3837,9 @@ def ensure_embed_placement(
       GPU (``-ngl 999``) を起こして測る。空きの不足・予算超過は状態なので保存しない (測らないので
       次の起動の費用は ``--list-devices`` だけ)。GPU の一時サーバが起動しないのは
       ``GPU_UNHEALTHY_LIMIT`` 回続くまで数えるだけ。どの失敗もチャットを止めない (CPU で返す)。
+    - PC が変わった / 結果が無い回は判別の前に環境移行の確認 (:func:`_tune_gate`、c_16 §7.2.3) を見て、
+      確認待ち (``pending`` / ``declined``) なら測らずに CPU (理由 ``tune_pending`` / ``tune_declined``)。
+      ``force`` は常に測り、``accepted`` を記録する。
     """
     raw = (cfg.get("embedding") or {}).get("gpu_layers")
     try:
@@ -3572,10 +3870,19 @@ def ensure_embed_placement(
         print(f"[launch] embed placement: {saved.placement} (saved: {saved.reason})")
         return EmbedPlacement(saved.placement, saved.gpu_layers, saved.reason)
 
+    tune_ok, tune_why = _tune_gate(cfg, project_root, pc, why, force=force)
+    if not tune_ok:
+        print(
+            f"[launch] embed placement not measured: {tune_why} (the PC changed and the re-measure is not "
+            "confirmed); the embedding server runs on CPU. Run `evoref tune --startup-check` or `evoref tune run`",
+        )
+        return EmbedPlacement("cpu", 0, tune_why)
     print(f"[launch] embed placement: deciding ({why}; saved result: {status})")
     emb_cfg = cfg.get("embedding", {}) or {}
     dim = int(emb_cfg.get("dim", 1024))
     model_mb = _file_size_mb(model)
+    if probe_timeout is None:
+        probe_timeout = _sized_wait(model, EMBED_PROBE_HEALTH_TIMEOUT_SEC, label="embed probe")
     device_memory = _parse_device_memory(devices_text)
     has_gpu = gpu_fit(device_memory, model_mb, margin_mib=0).status != "no_gpu"
     if has_gpu and wait_base_sec > 0 and not base_ready(cfg):
@@ -3632,6 +3939,8 @@ def ensure_embed_placement(
     )
     if not ep.save_placement_result(path, result):
         print(f"[launch] WARNING: failed to save the embed placement to {path}", file=sys.stderr)
+    # 一時サーバの引数を決めたときの埋め込みの調整値は判別前の材料なので、本番の起動で見積り直す
+    _forget_tuned(cfg, "embed_params")
     return placement
 
 
@@ -3672,11 +3981,13 @@ def start_embed_server(
     port = int(emb_cfg.get("llama_port", 8082))
     host = emb_cfg.get("llama_host", "localhost")
     model_name = _embed_model_path(cfg, project_root).name
-    timeout = health_timeout or int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+    embed_model = _embed_model_path(cfg, project_root)
+    timeout = health_timeout or _health_wait(cfg, embed_model, project_root, label="embedding")
+    gpu_wait = _sized_wait(embed_model, EMBED_GPU_START_TIMEOUT_SEC, label="embedding GPU start")
     kwargs = {"cwd": project_root, **(popen_kwargs or {})}
 
     cmd = _embed_cmd(cfg, project_root, port=port, gpu_layers=placement.gpu_layers)
-    fallback = embed_cpu_fallback_cmd(cfg, cmd)
+    fallback = embed_cpu_fallback_cmd(cfg, cmd, project_root)
     attempts = [(cmd, placement)]
     if fallback is not None:
         attempts.append((fallback, EmbedPlacement("cpu", 0, "cpu_fallback_after_gpu_start_failed")))
@@ -3690,7 +4001,7 @@ def start_embed_server(
             print(f"[launch] WARNING: failed to spawn the embedding server: {e}", file=sys.stderr)
             proc = None
             continue
-        wait = timeout if last else min(timeout, EMBED_GPU_START_TIMEOUT_SEC)
+        wait = timeout if last else min(timeout, gpu_wait)
         if health(proc, host, port, wait, model_name):
             print(f"[launch] embedding is ready on :{port} ({attempt.kind})")
             return EmbedLaunch(proc, attempt, True, fell_back=i > 0)
@@ -3707,17 +4018,72 @@ def start_embed_server(
     return EmbedLaunch(proc, attempts[-1][1], False, fell_back=len(attempts) > 1)
 
 
+#: 環境移行の確認待ちで配置を判別しない回の埋め込みの health 待ち (秒)。判別の分 (240 秒) は待たず、
+#: 他のサーバと同じ 60 秒にする (CPU の本番サーバは起こすので、backend より先に待つ意味は残る)。
+EMBED_UNTUNED_WAIT_SEC = 60.0
+
+
+def _embed_tune_blocked(cfg: dict, project_root: Path, list_devices: Callable[[], str]) -> bool:
+    """埋め込みの配置を確認待ち (``pending`` / ``declined``) のため判別しない回か (c_16 §7.2.3)。"""
+    if not _embed_setting_is_auto(cfg):
+        return False
+    path = embed_placement_path(cfg, project_root)
+    try:
+        from backend.free.rag import embed_placement as ep
+        from backend.free.rag import rerank_selftest as st
+    except ImportError:
+        return False
+    if path is None:
+        return False
+    pc = st.collect_pc_info(_parse_device_names(list_devices()))
+    saved, _status = ep.load_placement_result(path)
+    needed, why = ep.placement_needed(saved, pc.digest, model_key=_embed_model_key(cfg, project_root))
+    return needed and not _tune_gate(cfg, project_root, pc, why)[0]
+
+
+def _embed_total_wait(cfg: dict, project_root: Path) -> int:
+    """evoref-ctl が埋め込みの準備を待つ最長 = 判別プローブ 2 回 + GPU 起動待ち + CPU 起こし直しの待ち。
+
+    各項は :func:`start_embed_server` と同じ関数で導く (下限どうしの和は従来の 240 秒)。
+    """
+    model = _embed_model_path(cfg, project_root)
+    return (
+        2 * _sized_wait(model, EMBED_PROBE_HEALTH_TIMEOUT_SEC, label="embed probe")
+        + _sized_wait(model, EMBED_GPU_START_TIMEOUT_SEC, label="embedding GPU start")
+        + _health_wait(cfg, model, project_root, label="embedding")
+    )
+
+
+def _rerank_total_wait(cfg: dict, project_root: Path) -> int:
+    """evoref-ctl が rerank の準備を待つ最長 = GPU 起動待ち + CPU 起こし直しの待ち + 自己テスト本体の余裕。
+
+    下限どうしの和は従来の 240 秒。
+    """
+    model = resolve_rerank_model_path(cfg, project_root)
+    return (
+        _sized_wait(model, RERANK_GPU_START_TIMEOUT_SEC, label="rerank GPU start")
+        + _health_wait(cfg, model, project_root, label="rerank")
+        + RERANK_SELFTEST_ALLOWANCE_SEC
+    )
+
+
 def wait_embed_ready(
     cfg: dict, timeout_sec: float,
     *, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+    project_root: Path | None = None, list_devices: Callable[[], str] = _list_llama_devices,
 ) -> str:
     """埋め込みサーバの ``/health`` が 200 になるまで待つ (evoref-ctl 用。初回の判別と CPU の再起動を含めて待つ)。
 
+    ``project_root`` を渡すと、環境移行の確認待ち (``pending`` / ``declined``、c_16 §7.2.3) で判別しない回は
+    待ちを :data:`EMBED_UNTUNED_WAIT_SEC` までに縮める (判別の分の 240 秒を空費しない)。
     戻り値は ``off`` (llama-cpp でない) / ``ready`` / ``timeout``。
     """
     emb = cfg.get("embedding", {}) or {}
     if emb.get("backend", "llama-cpp") != "llama-cpp":
         return "off"
+    if project_root is not None and _embed_tune_blocked(cfg, project_root, list_devices):
+        print("[launch] embedding: the auto-tune is not confirmed, so no placement probe runs; waiting for the CPU server only")
+        timeout_sec = min(timeout_sec, EMBED_UNTUNED_WAIT_SEC)
     url = f"http://{emb.get('llama_host', 'localhost')}:{int(emb.get('llama_port', 8082))}/health"
     deadline = clock() + timeout_sec
     while True:
@@ -3840,7 +4206,10 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.wait_rerank is not None:
-        state = wait_rerank_ready(cfg, project_root, float(args.wait_rerank))
+        # 引数は下限。大型モデルでは起動の待ちの導出値 (GGUF サイズ連動) まで延ばす
+        state = wait_rerank_ready(
+            cfg, project_root, max(float(args.wait_rerank), _rerank_total_wait(cfg, project_root)),
+        )
         if state == "timeout":
             print("[launch] WARNING: rerank self-test / health did not finish in time, proceeding anyway")
         elif state != "off":
@@ -3848,7 +4217,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.wait_embed is not None:
-        state = wait_embed_ready(cfg, float(args.wait_embed))
+        state = wait_embed_ready(
+            cfg, max(float(args.wait_embed), _embed_total_wait(cfg, project_root)), project_root=project_root,
+        )
         if state == "timeout":
             print("[launch] WARNING: embedding server did not become healthy in time, proceeding anyway")
         elif state != "off":
@@ -3895,10 +4266,6 @@ if __name__ == "__main__":
         if not ok:
             sys.exit(2)
 
-    # モデルロードに時間がかかる大型 GGUF を考慮し、health タイムアウトは
-    # process_manager.health_timeout (mode.py の base 切替と同じ既定値) を使う。
-    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
-
     try:
         # ベースモデル
         if launch_base:
@@ -3909,9 +4276,11 @@ if __name__ == "__main__":
             )
             host = cfg["llama"].get("host", "localhost")
             port = cfg["llama"].get("port", 8080)
+            # health 待ちは process_manager.health_timeout (整数は明示値、auto / 無しは GGUF サイズ連動)
             procs.append(_start_and_wait(
                 cmd, "base-model", host, port, cwd=project_root,
-                expected_model_id=_extract_model_basename(cmd), timeout=health_timeout,
+                expected_model_id=_extract_model_basename(cmd),
+                timeout=_health_wait(cfg, _model_path_of_cmd(cmd), project_root, label="base"),
             ))
 
         # エンベッド
@@ -3922,7 +4291,7 @@ if __name__ == "__main__":
             # (ggml_vulkan: Failed to allocate pinned memory) が出るが CPU buffer に
             # 自動フォールバックするため機能影響は無い (ggml-vulkan.cpp:14079 / :2671)。
             # auto なら配置を判別し (base は上で health 済み)、GPU で起動しなければ CPU で起こし直す。
-            embed = start_embed_server(cfg, project_root, health_timeout=health_timeout)
+            embed = start_embed_server(cfg, project_root)
             if embed is None:
                 print("[launch] Embedding backend is not llama-cpp, skipping")
             elif embed.proc is not None:
@@ -3931,7 +4300,7 @@ if __name__ == "__main__":
         # リランカー (rag.rerank.mode が off 以外のときだけ)。自己テストは PC が変わったときだけ。
         # 起動・自己テストの失敗は他のサーバを止めない (rerank を無効にして続ける)。
         if args.all:
-            rerank = start_rerank_server(cfg, project_root, health_timeout=health_timeout)
+            rerank = start_rerank_server(cfg, project_root)
             if rerank.proc is not None:
                 procs.append(rerank.proc)
 

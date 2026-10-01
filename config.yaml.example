@@ -33,7 +33,8 @@ server:
 # `--force` オプションで強制起動可能。main.py lifespan でも起動時に
 # GPU/CPU 配置サマリを INFO ログに出力する。
 runtime:
-  # VRAM のソフト上限 (MB)。null なら検査を行わない (従来挙動と同一)。
+  # VRAM のソフト上限 (MB)。null なら環境調整 (`evoref tune`、c_16 §7.2.3) が GPU の空き × 0.9 から
+  # 導いた値で検査する (GPU が無ければ検査しない)。明示の整数はそのまま使う。
   # 例: RTX 3060 (12GB) → 11000 程度、RTX 4060 Ti (8GB) → 7000 程度が目安。
   total_vram_budget_mb: null
 
@@ -75,16 +76,16 @@ runtime:
   # 詳細 docs/c_15_model_capability_adaptation.md。
   capability_probe: true
 
-  # llama.gpu_layers が "auto" の場合に
-  # GPU 物理容量から差し引く Vulkan host buffer 予約量 (MiB)。
+  # llama.gpu_layers / context_size が "auto" の場合に
+  # iGPU の空きから差し引く Vulkan host buffer 予約量 (MiB)。
   # iGPU 環境で embed (CPU モード) が起動時に確保する pinned buffer 用
   # の余裕。既定 4 GiB は AMD Radeon 890M + 既定の embed モデル構成での
-  # 実測 ceiling。dedicated GPU でメモリに余裕があれば 0 にしても良い。
+  # 実測 ceiling。単体 GPU には使わない (数百 MiB の固定ヘッドルーム、c_16 §7.2.3)。
   vulkan_host_buffer_headroom_mib: 4096
 
   # gpu_layers="auto" 時に実際に自動段階縮小を行う kill switch。
   # false にすると "auto" 指定があっても従来挙動 (-ngl 999) にフォールバックし
-  # WARNING ログを 1 行出す。GGUF parse や llama-fit-params に異常が出た場合の
+  # WARNING ログを 1 行出す。GGUF parse や見積りに異常が出た場合の
   # 緊急回避用。
   gpu_auto_tune_enabled: true
 
@@ -117,20 +118,33 @@ runtime:
 llama:
   host: localhost
   port: 8080                      # llama-server のポート
-  context_size: 8192              # -c / コンテキストサイズ
-                                  # 推奨: 4096〜8192（VRAM に応じて調整）
+  context_size: auto              # -c / コンテキストサイズ
+                                  # auto (null も同じ): 環境調整 (`evoref tune`、c_16 §7.2.3) が
+                                  #   空き VRAM / RAM に「モデル + KV + 計算バッファ」が収まる最大
+                                  #   (4096 / 8192 / 16384 / 32768 …) を決める。上限は arch プロファイル
+                                  #   (models/profiles/<arch>.yaml の context_size、無ければ 8192) と
+                                  #   モデルの学習時コンテキスト長。PC が変わったときだけ決め直す
+                                  # 明示 int (例: 8192) はそのまま使う (調整結果は提案値として
+                                  #   `evoref tune status` に出るだけ)
                                   # 4096 だと fetch_url の長い結果 (Yahoo / news 等) で
-                                  # ツール結果 + RAG + system prompt が context を超過するため、
-                                  # 既定を 8192 に引き上げ。VRAM 余裕があれば 16384 以上も可。
+                                  # ツール結果 + RAG + system prompt が context を超過しやすい。
                                   # 16384以上は cache_type の見直し + RoPE スケーリングを検討
                                   # モデルの学習時コンテキスト長は GET /props の n_ctx_train で確認可能
-                                  # null にすると arch プロファイル (models/profiles/<arch>.yaml の
-                                  # context_size) を使用。明示 int は常にプロファイルより優先される
-                                  # (解決順: ここの明示値 > profile > 8192)
-  gpu_layers: 999                 # -ngl / GPU にオフロードするレイヤー数（999=全層、CPU only なら 0）
-  threads: 0                      # -t / スレッド数（0=自動検出）
-  batch_size: 512                 # -b / バッチサイズ
-  flash_attn: true                # -fa / Flash Attention の有効化
+  gpu_layers: auto                # -ngl / GPU にオフロードするレイヤー数
+                                  # auto: 環境調整が GPU の空き (iGPU は Vulkan host buffer、単体 GPU は
+                                  #   数百 MiB のヘッドルームを引く) に収まるよう全層 / 80% / 60% / 40% /
+                                  #   CPU から選ぶ。整数は明示 (999=全層、CPU only なら 0)
+  threads: 0                      # -t / スレッド数
+                                  # 0: 従来どおり (base は -t / -tb を付けず llama.cpp の既定)。環境調整 (`evoref tune`、
+                                  #   c_16 §7.2.3) が配分するのは補助 (埋め込み / リランカー) の -t だけ
+                                  # 正の整数は明示 (そのまま -t、-tb は付けない)
+  batch_size: auto                # -b / 論理バッチサイズ
+  ubatch_size: auto               # -ub / 物理バッチサイズ
+                                  # auto: 環境調整が GPU 種別と空きから選ぶ。単体 GPU は -b 2048 と、モデル + KV +
+                                  #   計算バッファが空きに収まる最大の -ub (2048 / 1024 / 512)。iGPU は計算バッファが
+                                  #   共有 RAM を食うので -b 1024 / -ub 512、CPU のみは 512 / 512
+                                  # 整数は明示 (以前の既定は -b 512、-ub は llama-server の既定 512)
+  flash_attn: true               # -fa / Flash Attention の有効化
   mlock: false                    # --mlock / モデルを RAM に固定
   cache_prompt: true              # KVキャッシュ再利用（共通プレフィックスの再計算をスキップ）
   slots: auto                     # -np / 並列スロット数（auto | 1=単一, 2=チャット+背景, 3=+ツール分類器, 4=+長文）
@@ -140,7 +154,7 @@ llama:
                                   #    同じ n_ctx セルを分け合うので、context_size >= 16384 のときだけ 4
                                   #    (8192 では llama-server がセル不足で slot0 から purge し効かない)。
                                   #    VRAM 増分は hybrid arch の再帰状態 1 本分 (27B で ~150 MiB、純
-                                  #    attention なら 0)。runtime.total_vram_budget_mb を超えるなら 3。
+                                  #    attention なら 0)。runtime.total_vram_budget_mb を明示していて超えるなら 3。
                                   # 3: slot0=チャット / slot1=背景 (sleep-time・学習) /
                                   #    slot2=ツール分類器 (層 5.9)。分類器のプロンプトは
                                   #    「ツールメニュー(385tok、毎回同一)+直近会話+クエリ」で、
@@ -166,8 +180,10 @@ llama:
                                   # ⚠ hybrid recurrent (Qwen3.5/3.8) と SWA (gemma-4) では上流が機構ごと無効化するため、
                                   #   launch_llama.py は recurrent メタデータを検出するとフラグを付けず warning だけ出す。
                                   #   ⚠️ SWA モデル（gemma-4 等）では llama.cpp が自動無効化し no-op（毎ターン full re-prefill）。非 SWA base のみ有効
-  ctx_checkpoints: 8              # --ctx-checkpoints / slot ごとのコンテキスト checkpoint 上限（0=無効）。
+  ctx_checkpoints: auto           # --ctx-checkpoints / slot ごとのコンテキスト checkpoint 上限（0=無効）。
                                   #   hybrid recurrent モデル（Qwen3.5/3.8 等）は KV を部分巻き戻しできず checkpoint 単位でしか戻れない
+                                  #   auto: 環境調整が空き RAM の余裕から 8 / 4 / 2 を選ぶ (上限は従来の 8、空きが少ないときだけ
+                                  #   下げる。checkpoint は RAM に slots × 数 × 約 150 MiB 載る見積り)。決められないときは 8。整数は明示
   checkpoint_min_step: 256        # --checkpoint-min-step / checkpoint 間の最小トークン間隔。上流既定 8192 だと context_size=8192 で
                                   #   中間 checkpoint が生まれず、prompt が前回の最終 user 位置より手前で分岐すると system prompt ごと全量 re-prefill。
                                   #   256 なら user ターンごとに 1 つ置かれ、分岐コストは最後に一致したターン以降の窓だけになる
@@ -184,8 +200,9 @@ llama:
   # --- idle slot offload ---
   # cache_ram_mib: -1=無制限 / 0=disable / >0=MiB 上限 (host RAM 退避量。VRAM 非依存)
   #   上流デフォルト 8192 を黙従しないよう launch_llama.py が常に明示付与する。
-  #   既定は 0 (無効) で host RAM 予約を省く。slots >= 2 でも per-seq context は
-  #   kv_unified (下記) が守るので、cache_ram_mib は RAM 退避が欲しい時のみ >0 にすればよい。
+  #   auto (既定): 環境調整は常に 0 (無効)。2026-09-11 の A/B (kv_cache_audit) で 2048 は wall 305 → 326 秒に
+  #   悪化し効果が無かったため、空き RAM から値を出さない。決められないときも 0。整数は明示。
+  #   slots >= 2 でも per-seq context は kv_unified (下記) が守るので、RAM 退避が要らなければ 0 を明示してよい。
   # cache_idle_slots: 上流既定 true (idle slot を退避対象にする)。
   #   false で機構自体を OFF（``--no-cache-idle-slots`` 付与）。
   #   **既定は false**。true にしても cache_ram_mib=0 では退避先が無く、
@@ -203,7 +220,7 @@ llama:
   # kv_unified: null=auto (slots>1 で ``--kv-unified`` 自動付与) / true|false で明示上書き。
   #   非 unified だと per-seq context が n_ctx/slots に半減する (-c 8192 -np 2 で 4096)。
   #   unified は VRAM 増なしに各 seq へ full n_ctx を与える。cache_ram_mib とは独立。
-  cache_ram_mib: 0
+  cache_ram_mib: auto
   cache_idle_slots: false
   kv_unified: null
   # --- self-speculative decoding ---
@@ -313,7 +330,8 @@ model_paths:
   create_model: null                                 # クリエイトモード用 GGUF（null/空欄 = base_model にフォールバック）
                                                       # 設定すると /api/mode/switch が chat⇄create 切替時に
                                                       # 補助タスクサーバも非破壊的 (config.yaml 非変更) に差し替える
-  rerank_model: null                                 # リランカー用 GGUF（例: models/japanese-bge-reranker-v2-m3-v1-q8_0.gguf。null = 使わない。rag.rerank.mode も参照）
+  rerank_model: models/japanese-bge-reranker-v2-m3-v1-q8_0.gguf  # リランカー用 GGUF（rag.rerank.mode も参照）。
+                                                      # ファイルが無ければ何も起動しない (自動ダウンロードは無い)。使わないなら null
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
 model_migration:
@@ -339,14 +357,14 @@ process_manager:
   #   変わらない)。llama-server の起動は launch_llama / evoref-ctl と、
   #   補助タスクのオンデマンド常駐 (AuxResidencyManager) が担当する。
   enabled: false           # 未実装（予約）
-  health_timeout: 120      # 起動後ヘルスチェック待機時間 (秒)。大きい create GGUF の load を待てる値。モード切替・サーバ起動 API と共用
+  health_timeout: auto     # 起動後ヘルスチェック待機時間 (秒)。auto = 起動する GGUF のサイズ連動 (15 秒/GB、下限 120・上限 600)。整数は明示値でそのまま使う。モード切替・サーバ起動 API・起動スクリプトと共用
   stop_timeout: 10         # SIGTERM 後のグレースフル終了待機時間 (秒)
 
 # ===== CLI の自動起動 (evoref chat --auto-serve) =====
 # --auto-serve でサーバ群を CLI から起こす際の起動待ち上限。
 auto_serve:
   timeout_backend: 30      # FastAPI が /api/health を返すまでの待機上限 (秒)
-  timeout_llama: 120       # llama-server 群が /health を返すまでの待機上限 (秒)。大きい GGUF のロードを待てる値
+  timeout_llama: auto      # llama-server 群が /health を返すまでの待機上限 (秒)。auto = base の GGUF のサイズ連動 (下限 120・上限 600)。整数は明示値でそのまま使う
 
 # ===== データの置き場 =====
 # データ・状態は全てデータ根 (--data-root → 環境変数 EVOREF_DATA_ROOT → 既定
@@ -565,18 +583,22 @@ rag:
   # --- 再順位段 (リランカー、c_16 §7.2.1) ---
   # mode: on で、関連度の床を通った文書 (corpus) の候補を上位 N 件だけ並べ替える
   # (記憶 (episodic) は並べ替えない。ゲートは cosine のまま)。モデルは model_paths.rerank_model (例:
-  # japanese-bge-reranker-v2-m3-v1-q8_0.gguf)。既定は off (rerank 用 llama-server を起動しない)。
+  # japanese-bge-reranker-v2-m3-v1-q8_0.gguf)。既定は on。ただし model_paths.rerank_model のファイルが
+  # 無ければ起動しない (並べ替えず cosine 順のまま。モデルは利用者が models/ に置く)。
   # 自己テストは PC が変わったとき (指紋: ホスト名・CPU・コア数・メモリ・GPU 名) だけ
   # 起動スクリプトが走らせ、結果を <data_root>/g1/cache/rerank_selftest.json に残す。
   # 手動で測り直す: python scripts/launch_llama.py config.yaml --rerank-selftest
+  # 起動の失敗 (環境起因) は 3 回まで次の起動で測り直し、空き RAM が足りない回は起動せず (low_memory)、
+  # GPU 配置で起動しなければ auto のときだけ CPU で 1 回起こし直す。実行時に締切超過が続くと 600 秒は
+  # 並べ替えを止める (遮断器、/api/status の rerank.breaker_open)。詳細は docs/c_16 §7.2.1。
   rerank:
-    mode: "off"                   # off: 起動しない・並べ替えない / on: 起動して文書の候補を並べ替える
+    mode: "on"                    # off: 起動しない・並べ替えない / on: モデルがあれば起動して文書の候補を並べ替える
     port: 8083                    # rerank 用 llama-server のポート
     gpu_layers: auto              # auto: GPU の空きがモデル + 約 1GB あれば GPU (-ngl 999 -fa on)、無ければ CPU (-ngl 0)。整数なら -ngl
     deadline_ms: 1000             # 1 回の rerank 呼出の締切 (ミリ秒)。超えたら cosine 順のまま
     max_candidates: 20            # 1 回に並べ替える候補数の上限 (実際の候補数は自己テストの速度で決める)
     min_candidates: 3             # 締切に収まる候補数がこれ未満なら無効 (too_slow)
-    threads: 0                    # -t (0 = 自動: GPU 配置は 2、CPU 配置は llama.cpp の既定)
+    threads: 0                    # -t (0 = 自動: GPU 配置は 2、CPU 配置は環境調整が決めた物理コアの 1/4 (下限 1)。物理コア数が推定値なら付けない)
 
 # ===== 埋め込みモデル設定 =====
 embedding:
@@ -584,14 +606,18 @@ embedding:
   llama_host: localhost            # llama-server ホスト（backend: llama-cpp 時）
   llama_port: 8082                 # llama-server ポート（backend: llama-cpp 時）
   dim: 1024                        # 埋め込みベクトルの次元数（Qwen3-Embedding-0.6B: 1024）
-  timeout: 30.0                    # 埋め込みリクエストのタイムアウト（秒）
+  # 埋め込みリクエストのタイムアウト（秒）。auto: 環境調整 (evoref tune、c_16 §7.2.3 の項目 embed_params) が
+  # 埋め込みの配置の測定 (embed_placement.json の p50) から決める。下限 30、遅い CPU では延びる (上限 120)。
+  # 1 回の HTTP に載せる件数 (上限 64) も同じ測定から timeout の半分に収まるよう決まる。数値を書けば固定
+  timeout: auto
   # チャット応答パスの単一クエリ埋め込みだけに掛かるデッドライン（秒、0 で無効）。
-  # バッチ／ドキュメント側には掛からない（sleep-time の 64 件バッチは本来長い）。
+  # バッチ／ドキュメント側には掛からない（sleep-time のバッチは本来長い）。
   # 超過時はそのターンだけ記憶なしで応答を続ける（カートリッジ検索と同じ縮退）。
   # 実測 2026-08-18 の実往復 262 件: 中央値 217ms / p90 1292ms / p95 3122ms /
   # 最大 8057ms。1.0s 超は 16.0% だが 2.0s 超は 6.1% と二峰で、3.0s 超の 5.7% が
-  # 「埋め込みサーバが詰まっている」区間。既定はその裾だけを切る位置に置く。
-  query_timeout: 3.0
+  # 「埋め込みサーバが詰まっている」区間。auto は 3.0 を下限に、測定の p50 から見積った
+  # p95 × 2 (上限 10) へ延ばす (遅い PC だけ延びる)。数値を書けば固定
+  query_timeout: auto
   model_name: Qwen/Qwen3-Embedding-0.6B       # HuggingFace モデル名
   max_length: 8192                # 入力最大トークン長
   # 文脈長 (-c)。必ず max_length 以上にすること (下回ると長入力で 500)。
@@ -610,21 +636,20 @@ embedding:
   gpu_layers: auto
   # 物理バッチサイズ。llama-server デフォルト 512 のままだと長文ノート (>512 tok)
   # の単一埋め込みリクエストで 500 エラーになり、EvorefMem sleep-time update が連鎖失敗する。
-  # 4096 は rag.chunk_size (既定 512) + STM ノート (通常 <2048 tok) を十分カバーし、
-  # メモリも 8192 と比べて省ける妥当値。長文ファイル (>4096 tok の単一リクエスト) を
-  # 扱う場合のみ 8192 に上げる選択肢が残る。
+  # auto: ubatch_size >= max_length を保証し (単一入力が ubatch を超えない)、context_size が
+  # max_length より大きければ空き RAM / VRAM に収まる範囲で広げる (c_16 §7.2.3 の項目 embed_params)。
+  # 数値を書けばそのまま渡す (max_length 未満なら起動時に WARNING だけ出す)。
   # 注意: ggml-vulkan の pinned memory warning は batch_size とは独立に出る
   # (model loading 時の host buffer 確保で発生、ggml-vulkan.cpp:14079)。batch_size
   # を下げても警告は消えない。CPU buffer フォールバックで動作上は問題なし。
-  batch_size: 4096                # -b: 論理バッチサイズ
-  ubatch_size: 4096               # -ub: 物理バッチサイズ
+  batch_size: auto                # -b: 論理バッチサイズ
+  ubatch_size: auto               # -ub: 物理バッチサイズ
   # 並列スロット数 (-np)。未指定だと llama.cpp が n_parallel=auto(=4) を選び
   # slots × context_size 分の KV を無駄に確保する。埋め込みは概ね逐次アクセスの
   # ため 2 (前景クエリ + 背景ノート埋め込みの最小並列) で十分。
   slots: 2
-  # スレッド数 (-t)。0=自動検出 (全物理コア)。CPU 埋め込み (gpu_layers: null/0、auto で CPU と判別された場合) 時は
-  # base と CPU を分け合うため、物理コア数より小さい値を指定して
-  # ヘッドルームを残すとチャット応答との競合を抑えられる。
+  # スレッド数 (-t)。0=自動: 環境調整 (c_16 §7.2.3) が決める (GPU 配置は 2、CPU 配置は物理コアの 1/4 (下限 1)、
+  # 補助の合計は物理コアを超えない。物理コア数が推定値のときは -t を付けない)。正の整数は明示 (そのまま -t)。
   threads: 0
   # --- 永続埋め込みキャッシュ ---
   # チャンクテキストのハッシュをキーに埋め込みベクトルをディスクにキャッシュ。

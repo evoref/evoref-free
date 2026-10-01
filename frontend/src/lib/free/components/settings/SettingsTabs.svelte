@@ -15,6 +15,7 @@
 		integration: 'settings.tab_integration',
 		generation: 'settings.tab_generation',
 		editor: 'settings.tab_editor',
+		system: 'settings.tab_system',
 		prompts: 'settings.tab_prompts',
 		develop: 'settings.tab_develop'
 	};

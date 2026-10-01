@@ -210,6 +210,16 @@ def _shutdown_history_fold() -> None:
         logger.warning("History fold on shutdown failed: %s", e)
 
 
+def _shutdown_tps_flush() -> None:
+    """生成速度の実測 (間引いて保存している分) を書き手スレッドへ積む (止める前に)。"""
+    try:
+        from backend.free.llm.tps_calibration import flush_tps_tracker
+
+        flush_tps_tracker()
+    except Exception as e:
+        logger.warning("tps calibration flush on shutdown failed: %s", e)
+
+
 def _shutdown_chat_writer() -> None:
     """書き手スレッドを drain して止める (未同期の追記を fsync、索引を書く)。"""
     from backend.io.writer_thread import default_writer
@@ -335,6 +345,25 @@ async def _shutdown_evolve_pipeline(
 # ──────────────────────────────────────────────────────────────────────────
 
 
+async def _prime_auto_tune_pc(state: AppState) -> None:
+    """環境調整 (c_16 §7.2.3) の照合に使う GPU 名を起動時に 1 回だけ読み、AppState に持つ。
+
+    ``--list-devices`` は subprocess なので executor で読む (タイムアウト付き。失敗・空は GPU なしで、
+    起動スクリプトと同じ扱い)。以後の ``/api/status.auto_tune``・保存値の照合・API の確認状態は
+    この GPU 名込みの完全な指紋で起動スクリプトと同じ判定をする。
+    """
+    import asyncio
+
+    from backend.free.core.tuning.resolve import backend_pc, prime_backend_gpus
+    from backend.trace_context import run_in_executor_with_context
+
+    gpus = await run_in_executor_with_context(asyncio.get_running_loop(), None, prime_backend_gpus)
+    service = getattr(state, "auto_tune_runner", None)
+    if service is not None:
+        service.pc = backend_pc()
+    logger.info("Auto-tune: backend PC has %d GPU(s): %s", len(gpus), ", ".join(gpus) or "-")
+
+
 async def _run_lifespan_startup(
     state: AppState, project_root: Path,
 ) -> tuple[_LifespanContext, dict[str, float]]:
@@ -355,6 +384,7 @@ async def _run_lifespan_startup(
     # コンパクション・履歴の取り残しの畳み込み) からこのスレッドで書く。
     default_writer().start()
     enable_process_pool()
+    await _prime_auto_tune_pc(state)
     ctx, timings = await wire_pillars(state, project_root)
     report_data_gate(state)
     if state.data_readonly_reason is not None and ctx.sleep_scheduler is not None:
@@ -421,6 +451,8 @@ async def _run_lifespan_shutdown(
                 logger.warning("AgentTracer close failed: %s", e)
     with _timed(shutdown_timings, "history_fold"):
         _shutdown_history_fold()
+    with _timed(shutdown_timings, "tps_flush"):
+        _shutdown_tps_flush()
     with _timed(shutdown_timings, "chat_writer_stop"):
         _shutdown_chat_writer()
     with _timed(shutdown_timings, "llm_client_close"):

@@ -88,6 +88,12 @@ class SessionInfo:
     registered_at: float = field(default_factory=time.time)
 
 
+def _new_auto_tune_service() -> Any:
+    from backend.free.core.tuning.service import AutoTuneService
+
+    return AutoTuneService()
+
+
 @dataclass
 class AppState:
     """アプリケーション状態コンテナ
@@ -226,6 +232,10 @@ class AppState:
     #: データ根が readonly の理由 (``None`` = 書ける)。readonly の間は学習を止め
     #: (``learning_disabled`` を立てる)、sleep-time をスケジュールしない。
     data_readonly_reason: str | None = None
+
+    #: 環境調整 (c_16 §7.2.3) の実行状態。``/api/system/auto-tune`` が使う
+    #: (``AutoTuneService``。型は循環を避けて遅延構築の ``Any``)。
+    auto_tune_runner: Any = field(default_factory=lambda: _new_auto_tune_service())
 
     # ── メトリクス ──
     last_request_metrics: LastRequestMetrics = field(

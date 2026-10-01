@@ -581,6 +581,7 @@ async def curate_personal_facts(
     profile_id: str = "default",
     now_provider: Callable[[], float] | None = None,
     should_pause: Callable[[], bool] | None = None,
+    max_per_cycle: int = _MAX_PER_CYCLE,
 ) -> int:
     """自己開示発話を属性ごとの逐語 span に分けて SemMem へ書く。
 
@@ -595,6 +596,7 @@ async def curate_personal_facts(
         should_pause: ``True`` を返したらノート境界でループを打ち切る協調
             yield。残りのノートは ``personal_fact_curated_at`` が立たない
             ままなので次サイクルが拾う。
+        max_per_cycle: 1 サイクルの上限 (sleep-time が実測 tps で伸縮する、c_16 §7.2.3)。
 
     Returns:
         新規に書き込まれた fact 件数。
@@ -638,12 +640,12 @@ async def curate_personal_facts(
         not builder.candidate_fact_tags((n.content or "").strip()),
         float(getattr(n, "created_at", 0.0) or 0.0),
     ))
-    if len(candidates) > _MAX_PER_CYCLE:
+    if len(candidates) > max_per_cycle:
         logger.info(
             "personal_fact_curator: %d candidate(s), splitting the oldest %d "
-            "this cycle (the rest carry over)", len(candidates), _MAX_PER_CYCLE,
+            "this cycle (the rest carry over)", len(candidates), max_per_cycle,
         )
-        candidates = candidates[:_MAX_PER_CYCLE]
+        candidates = candidates[:max_per_cycle]
 
     allowed = _allowed_slots(getattr(builder, "triggers_dir", None))
     written = 0

@@ -11,6 +11,7 @@
 	import NumberField from './fields/NumberField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
 	import SelectField from './fields/SelectField.svelte';
+	import { autoNumber } from '$lib/free/utils/autotune_view';
 
 	let models = $derived(configSection($configData, 'model_paths'));
 	let embedding = $derived(configSection($configData, 'embedding'));
@@ -42,7 +43,7 @@
 		<TextField label="settings.embedding.llama_host" value={String(embedding.llama_host ?? 'localhost')} onchange={fieldUpdater('embedding', 'llama_host')} />
 		<NumberField label="settings.embedding.llama_port" value={Number(embedding.llama_port ?? 8082)} min={1024} max={65535} onchange={fieldUpdater('embedding', 'llama_port')} />
 		<NumberField label="settings.embedding.dim" value={Number(embedding.dim ?? 1024)} min={1} onchange={fieldUpdater('embedding', 'dim')} />
-		<NumberField label="settings.embedding.timeout" value={Number(embedding.timeout ?? 30)} min={0.1} step={0.5} onchange={fieldUpdater('embedding', 'timeout')} />
+		<NumberField label="settings.embedding.timeout" value={autoNumber(embedding.timeout, true, 30)} min={0.1} step={0.5} onchange={fieldUpdater('embedding', 'timeout')} />
 		<NumberField label="settings.embedding.max_length" value={Number(embedding.max_length ?? 8192)} min={1} onchange={fieldUpdater('embedding', 'max_length')} />
 		<TextField label="settings.embedding.model_name" value={String(embedding.model_name ?? '')} onchange={fieldUpdater('embedding', 'model_name')} />
 		<ToggleField label="settings.embedding.cache_enabled" value={Boolean(embedding.cache_enabled ?? true)} onchange={fieldUpdater('embedding', 'cache_enabled')} />

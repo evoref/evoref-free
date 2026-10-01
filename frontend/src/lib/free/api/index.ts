@@ -6,6 +6,7 @@
 
 export * from './_client';
 export * from './status';
+export * from './autotune';
 export * from './system';
 export * from './server';
 export * from './config';

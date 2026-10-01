@@ -1,6 +1,6 @@
 """RAG / 埋め込み関連スキーマ"""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -220,7 +220,8 @@ RerankMode = Literal["off", "on"]
 def normalize_rerank_mode(value: object) -> str:
     """``rag.rerank.mode`` の生の値を正規化する (起動スクリプト・backend・スキーマの SSOT)。
 
-    YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す。未指定は ``off``。
+    YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す。明示の ``null`` /
+    ``false`` は ``off`` (キー自体が無いときの既定 ``on`` は :func:`rerank_mode_of` が決める)。
     """
     if value is False or value is None:
         return "off"
@@ -230,9 +231,13 @@ def normalize_rerank_mode(value: object) -> str:
 
 
 def rerank_mode_of(cfg: dict) -> str:
-    """素の config dict から ``rag.rerank.mode`` を読む (検証前の dict でも使える)。"""
+    """素の config dict から ``rag.rerank.mode`` を読む (検証前の dict でも使える)。
+
+    キーが無ければ既定の ``on`` (:class:`RerankConfig` と同じ)。モデル
+    (``model_paths.rerank_model``) が無ければ ``on`` でも何も起動しない。
+    """
     rerank = (cfg.get("rag") or {}).get("rerank") or {}
-    return normalize_rerank_mode(rerank.get("mode", "off"))
+    return normalize_rerank_mode(rerank.get("mode", "on"))
 
 
 class RerankConfig(BaseModel):
@@ -240,14 +245,19 @@ class RerankConfig(BaseModel):
 
     ``mode: on`` で検索経路 (``unified_search`` の Step 6.8) が floor を通った corpus の
     候補を並べ替える。``off`` なら rerank 用 llama-server は起動せず、並べ替えもしない。
+    既定は ``on`` だが、``model_paths.rerank_model`` が未設定かファイルが無ければ起動せず
+    並べ替えもしない (cosine 順のまま)。モデルは利用者が ``models/`` に置く (自動ダウンロードは無い)。
     自己テストは PC の指紋が変わったときだけ起動スクリプトが走らせる。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     mode: RerankMode = Field(
-        default="off",
-        description="off: 起動しない・並べ替えない / on: 起動して corpus の候補を並べ替える",
+        default="on",
+        description=(
+            "off: 起動しない・並べ替えない / on (既定): model_paths.rerank_model のファイルがあれば"
+            "起動して corpus の候補を並べ替える (無ければ起動しない)"
+        ),
     )
     port: int = Field(default=8083, ge=1024, le=65535, description="rerank 用 llama-server のポート")
     gpu_layers: Literal["auto"] | int = Field(
@@ -260,7 +270,9 @@ class RerankConfig(BaseModel):
         default=3, ge=1,
         description="締切に収まる候補数がこれ未満なら自己テストで無効にする (too_slow)",
     )
-    threads: int = Field(default=0, ge=0, description="-t (0 = 自動: GPU 配置なら 2、CPU 配置なら llama.cpp の既定)")
+    threads: int = Field(default=0, ge=0, description=(
+        "-t (0 = 自動: GPU 配置なら 2、CPU 配置なら環境調整 (c_16 §7.2.3 の項目 threads) が物理コア数から配分した値)"
+    ))
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -394,10 +406,13 @@ class EmbeddingConfig(BaseModel):
     llama_host: str = "localhost"
     llama_port: int = Field(default=8082, ge=1024, le=65535)
     dim: int = Field(default=1024, ge=1)
-    timeout: float = Field(default=30.0, ge=0.1)
+    # 1 要求の HTTP timeout (秒)。``auto`` / ``null`` は環境調整の値 (c_16 §7.2.3 の項目
+    # ``embed_params``: 配置の判別の ms/トークンから。下限 30、遅い CPU では延びる)。
+    timeout: Annotated[float, Field(ge=0.1)] | Literal["auto"] | None = None
     # チャット応答パスの **単一クエリ** 埋め込みだけに掛かるデッドライン (秒)。
     # 0 で無効 (``timeout`` のみ)。バッチ / ドキュメント側には掛からない
-    # (sleep-time の 64 件バッチは本来長い)。
+    # (sleep-time のバッチは本来長い)。``auto`` / ``null`` は環境調整の値 (下限 3.0、
+    # 判別の p50 から見積る p95 × 係数)。
     #
     # 実測 (2026-08-18、chat 136 ターン / 実往復 262 件): 中央値 216.7ms /
     # p90 1292.1ms / p95 3122ms / p99 5977ms / 最大 8057ms。分布は二峰で、
@@ -406,7 +421,7 @@ class EmbeddingConfig(BaseModel):
     # される (TTFT 中央値 17s に対し最大 8s = +47%)。
     # 既定 3.0 は ``rag.cartridge_search_timeout_ms`` (3000) と同じ水準に揃え、
     # p95 までは通しつつ病的な裾だけを切る。
-    query_timeout: float = Field(default=3.0, ge=0.0)
+    query_timeout: Annotated[float, Field(ge=0.0)] | Literal["auto"] | None = None
     max_length: int = Field(default=8192, ge=1)
     # 文脈長 (llama-server ``-c``)。埋め込みは max_length トークンまでの入力を
     # 扱うため、必ず max_length 以上にすること (下回ると長い入力で 500)。モデル
@@ -456,12 +471,13 @@ class EmbeddingConfig(BaseModel):
 
     # 物理バッチサイズ。max_length トークン分の単一入力を 1 回で処理できる値に揃える。
     # llama-server デフォルト 512 のままだと、長い STM ノート (例: 933 tok) の埋め込み
-    # リクエストが 500 エラーになり EvorefMem sleep-time update が連鎖失敗する
-    batch_size: int | None = Field(default=None, ge=1)
-    ubatch_size: int | None = Field(default=None, ge=1)
-    # スレッド数 (llama-server ``-t``)。0 = 省略し llama.cpp 自動検出 (全物理コア)。
-    # CPU 埋め込み (gpu_layers=null/0) 時に base と CPU を分け合うため、
-    # 物理コア数より小さい値を明示してヘッドルームを残せる。
+    # リクエストが 500 エラーになり EvorefMem sleep-time update が連鎖失敗する。
+    # ``auto`` / ``null`` は環境調整の値 (``ubatch >= max_length`` を保証、c_16 §7.2.3)。
+    # 明示値は保証せず、破っていれば起動時に WARNING だけ出す。
+    batch_size: Annotated[int, Field(ge=1)] | Literal["auto"] | None = None
+    ubatch_size: Annotated[int, Field(ge=1)] | Literal["auto"] | None = None
+    # スレッド数 (llama-server ``-t``)。0 = 環境調整 (c_16 §7.2.3 の項目 threads) が物理コア数を
+    # base / 埋め込み / リランカーへ配分した値 (GPU 配置は 2)。正の整数は明示 (そのまま使う)。
     threads: int = Field(default=0, ge=0)
     # 並列スロット数 (llama-server ``-np``)。明示しないと n_parallel=auto (=4) が
     # 選ばれ slots × context_size 分の KV を無駄に確保する。埋め込みは概ね逐次

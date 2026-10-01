@@ -307,16 +307,31 @@ PROBE_MIN_DECODE_TPS = 1.5
 PROBE_REASONING_MAX_TOKENS = 128
 
 
-def probe_timeout_sec(params_b: float, max_tokens: int) -> float:
+def probe_timeout_sec(
+    params_b: float, max_tokens: int, *, decode_tps: float | None = None,
+    max_scale: float | None = None,
+) -> float:
     """プローブ 1 本のタイムアウト秒をモデルサイズに追随させる。
 
     ``PROBE_BASE_SEC + max_tokens / decode_tps(params_b)``。固定 120 秒 / 90 秒
     だと、小型モデルでは長すぎて起動直後の失敗検知が遅れ、大型モデル (27B+) の
     iGPU では 128 トークンの decode だけで足りない (観測が恒久的に ``None`` に
     なり、``enable_thinking`` の自動再解決が宣言値のまま固定される)。
+
+    ``decode_tps`` (生成速度の実測、c_16 §7.2.3) があれば、その速度で見た所要秒
+    (余裕込み) まで **延ばす**。比例則より速いマシンでも縮めない。天井 ``max_scale`` は
+    既定で ``CHAT_PATH_MAX_SCALE`` (1.5 倍、プローブはチャットの初回応答と同じ base を使う)。
+    背景 purpose の下限 (``AuxClient._background_timeout_floor``) は ``MEASURED_MAX_SCALE`` を渡す。
     """
+    from backend.free.llm.tps_calibration import CHAT_PATH_MAX_SCALE, TIMEOUT_HEADROOM, extend_only
+
+    scale = CHAT_PATH_MAX_SCALE if max_scale is None else float(max_scale)
     tps = max(PROBE_MIN_DECODE_TPS, PROBE_DECODE_TPS_NUMERATOR / max(1.0, float(params_b or 1.0)))
-    return PROBE_BASE_SEC + float(max_tokens) / tps
+    current = PROBE_BASE_SEC + float(max_tokens) / tps
+    if not decode_tps or decode_tps <= 0:
+        return current
+    measured = PROBE_BASE_SEC + TIMEOUT_HEADROOM * float(max_tokens) / decode_tps
+    return extend_only(current, measured, current * scale)
 
 
 def make_llama_chat_fn(

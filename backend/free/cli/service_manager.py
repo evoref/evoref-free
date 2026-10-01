@@ -343,7 +343,7 @@ def _spawn_and_wait_llama(
 
     render_info(console, f"Waiting for {len(all_servers)} server(s)...")
     if not _wait_for_health_all(
-        all_servers, procs, console, project_root, timeout=30,
+        all_servers, procs, console, project_root, timeout=_serve_health_wait(config, project_root),
     ):
         return None
     return all_servers
@@ -523,6 +523,12 @@ def _run_serve(args: argparse.Namespace) -> int:
     if (rc := normalize_before_start(project_root, console)) is not None:
         return rc
 
+    # PC の環境が変わっていれば llama-server を起こす前に 1 回だけ確認する (c_16 §7.2.3)。
+    # 失敗しても起動は止めない。
+    from backend.free.cli.tune_command import run_startup_check
+
+    run_startup_check(project_root, console)
+
     config = _resolve_startup_config(project_root, args, console, force)
     if config is None:
         return 1
@@ -669,9 +675,28 @@ def _start_embed(
     )
 
 
-def _base_wait_sec(cfg: dict) -> float:
-    """判別する回に base の読み込みを待つ上限 (``process_manager.health_timeout``)。"""
-    return float((cfg.get("process_manager") or {}).get("health_timeout", 120))
+def _base_wait_sec(cfg: dict, project_root: Path) -> float:
+    """判別する回に base の読み込みを待つ上限 (``process_manager.health_timeout``、auto は GGUF サイズ連動)。"""
+    from backend.free.core.tuning.base_model import base_model_path
+    from backend.free.llm._base_client import health_wait_for_cfg
+
+    return float(health_wait_for_cfg(
+        cfg, base_model_path(cfg, project_root), project_root=project_root, label="base",
+    ))
+
+
+def _serve_health_wait(cfg: dict, project_root: Path) -> int:
+    """``evoref serve`` の全サーバー health 待ち。従来の 30 秒を下限に base の GGUF サイズへ連動させる。
+
+    ``process_manager.health_timeout`` は見ない (serve の待ちには従来から効いていないため、
+    明示値で短くも長くもしない)。
+    """
+    from backend.free.core.tuning.base_model import base_model_path
+    from backend.free.llm._base_client import PROBE_WAIT_FLOOR_SEC, resolve_health_wait
+
+    return resolve_health_wait(
+        "auto", base_model_path(cfg, project_root), floor=PROBE_WAIT_FLOOR_SEC, label="base",
+    )
 
 
 def _spawn_extra_servers(
@@ -693,7 +718,7 @@ def _spawn_extra_servers(
     host, port = _embed_endpoint(config)
     try:
         render_info(console, f"Starting embed server on :{port}...")
-        launched = _start_embed(project_root, config, stderr_files, wait_base_sec=_base_wait_sec(config))
+        launched = _start_embed(project_root, config, stderr_files, wait_base_sec=_base_wait_sec(config, project_root))
     except (FileNotFoundError, ValueError, OSError) as e:
         render_error(console, f"Failed to start embed server: {e}")
         return servers
@@ -801,7 +826,7 @@ async def ensure_extra_servers(
         launched = await run_in_executor_with_context(
             loop, None, partial(
                 _start_embed, project_root, cfg, auto_serve_state.stderr_files,
-                wait_base_sec=_base_wait_sec(cfg),
+                wait_base_sec=_base_wait_sec(cfg, project_root),
             ),
         )
     except (FileNotFoundError, ValueError, OSError) as e:
@@ -871,7 +896,7 @@ def _spawn_all_servers(
     # ── embed (起動して health まで待つ。GPU で起動しなければ CPU へ起こし直す) ──
     host, port = _embed_endpoint(cfg)
     try:
-        launched = _start_embed(project_root, cfg, state.stderr_files, wait_base_sec=_base_wait_sec(cfg))
+        launched = _start_embed(project_root, cfg, state.stderr_files, wait_base_sec=_base_wait_sec(cfg, project_root))
     except (FileNotFoundError, ValueError, OSError) as e:
         logger.warning("auto-serve: embed server start failed: %s", e)
         return servers
@@ -1347,7 +1372,14 @@ async def _auto_serve_start(
     cfg = _load_config(project_root)
     auto_serve_cfg = cfg.get("auto_serve", {})
     timeout_backend = auto_serve_cfg.get("timeout_backend", 30)
-    timeout_llama = auto_serve_cfg.get("timeout_llama", 120)
+    # 整数は明示値、auto / 無しは base の GGUF サイズ連動 (下限 120、c_16 §7.2.3)
+    from backend.free.core.tuning.base_model import base_model_path
+    from backend.free.llm._base_client import health_wait_for_cfg
+
+    timeout_llama = health_wait_for_cfg(
+        cfg, base_model_path(cfg, project_root), project_root=project_root,
+        section="auto_serve", key="timeout_llama", label="base",
+    )
 
     # develop モード時は config のオフセット適用済みポートを使用
     backend_port = cfg.get("server", {}).get("port", port)

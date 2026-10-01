@@ -113,7 +113,8 @@ def snapshot_due(evidence) -> bool:
 # 日本語は 1 文字 ≒ 1 トークン強なので、最小構成 (2048) でも収まる値に取る。
 # ノートの先頭側に主題が来るため単純な前方切り出しで足りる。
 _EMBED_MAX_CHARS = 1500
-# 1 リクエストあたりのノート数。失敗時の巻き添えを小さくする。
+# 1 リクエストあたりのノート数の上限。失敗時の巻き添えを小さくする。埋め込みの
+# HTTP バッチ件数 (環境調整の項目 ``embed_params``) がこれより小さければそちらに従う。
 _EMBED_BATCH_SIZE = 16
 # 同一ノートの埋め込み連続失敗をこの回数まで許容し、超えたら以降スキップする
 # (毎サイクル同じノートで失敗し続けて Step 1 が前進しなくなるのを防ぐ)。
@@ -166,6 +167,9 @@ class SleepTimeWorker:
         self._aux_prompt_manager = aux_prompt_manager
         self._fewshot_pool = None
         self._cancelled = False
+        #: このサイクルの件数の倍率 (実測 tps から、Full の開始時に引き直す。c_16 §7.2.3)。
+        #: 未測定の間は 1.0 で件数は既定のまま。
+        self._background_scale = 1.0
         #: サイクル (Light / Full) の排他。3 ストアの書き手は sleep-time だけ
         #: という不変則 (c_16 §2.1) を **慣習ではなくロックで** 守る。Full は
         #: 待って直列化し、Light は取れなければ飛ばす (:meth:`run_light`)。
@@ -677,6 +681,29 @@ class SleepTimeWorker:
             self._workspace = self.episodic.open_workspace()
         return self._workspace
 
+    # ── 件数の倍率 (c_16 §7.2.3) ────────────────────────
+
+    def _refresh_background_scale(self, llm_client) -> None:
+        """実測の decode tps から、このサイクルの件数の倍率を引き直す (読むだけ)。"""
+        from backend.free.core.tuning.tuners.background_budget import background_scale
+
+        scale = background_scale(llm_client)
+        if scale != self._background_scale:
+            logger.info("Sleep-time per-cycle counts scaled by %.2f (measured tps)", scale)
+        self._background_scale = scale
+
+    def _cycle_config(self) -> dict:
+        """既定のままの件数にこのサイクルの倍率を掛けた config (倍率 1.0 なら ``self.config``)。"""
+        from backend.free.core.tuning.tuners.background_budget import scaled_background_config
+
+        return scaled_background_config(self.config, self._background_scale)
+
+    def _cycle_count(self, default: int) -> int:
+        """config を持たない件数 (curator の上限) にこのサイクルの倍率を掛ける。"""
+        from backend.free.core.tuning.tuners.background_budget import scaled_count
+
+        return scaled_count(default, self._background_scale)
+
     async def _step6_resolve_conflicts(
         self, llm_client, params_b: float, result: dict,
     ) -> None:
@@ -687,7 +714,7 @@ class SleepTimeWorker:
         """
         from backend.free.memory.pipeline.conflict_resolver import ConflictResolver
         resolver = ConflictResolver(
-            self.config, params_b=params_b,
+            self._cycle_config(), params_b=params_b,
             policy=getattr(self, "_policy", None),
             debug_logger=self._debug_logger,
         )
@@ -744,7 +771,7 @@ class SleepTimeWorker:
         """
         from backend.free.memory.notes.note_evolver import NoteEvolver
         evolver = NoteEvolver(
-            self.config,
+            self._cycle_config(),
             params_b=params_b,
             aux_prompt_manager=self._aux_prompt_manager,
             debug_logger=self._debug_logger,
@@ -853,6 +880,9 @@ class SleepTimeWorker:
                 "No LLM client for Full sleep-time update, skipping steps 5.8-10",
             )
             return result
+
+        # 件数の倍率をサイクルごとに引き直す (tps の実測は走りながら貯まる)
+        self._refresh_background_scale(llm_client)
 
         # Step 8-9: 未要約セッションの要約生成 + 埋め込み。
         # Full の LLM 版の **先頭** に置く — 手前に corpus 再構築 (5.85) /
@@ -1214,9 +1244,12 @@ class SleepTimeWorker:
             return 0
 
         logger.info("Embedding %d workspace note(s)...", len(pending))
+        from backend.free.core.tuning.tuners.embed_params import http_batch_of
+
+        step = http_batch_of(self.embedder, _EMBED_BATCH_SIZE)
         embedded = 0
-        for start_at in range(0, len(pending), _EMBED_BATCH_SIZE):
-            batch = pending[start_at:start_at + _EMBED_BATCH_SIZE]
+        for start_at in range(0, len(pending), step):
+            batch = pending[start_at:start_at + step]
             texts = [_truncate_for_embedding(n.content) for n in batch]
             try:
                 embeddings = await self.embedder.embed(texts, is_query=False)
@@ -1390,7 +1423,7 @@ class SleepTimeWorker:
         quiet = quiet_seconds(self.config)
         return await generate_pseudo_queries(
             llm_client,
-            config=self.config,
+            config=self._cycle_config(),
             cartridge_manager=self.cartridge_manager,
             is_cancelled=self._check_cancelled,
             # 「今生成中か」ではなく静穏窓 (f_01 §6.4)。ターンの合間に割り込むと
@@ -1412,7 +1445,7 @@ class SleepTimeWorker:
             summarize_unsummarized_sessions,
         )
 
-        history_cfg = self.config.get("history") or {}
+        history_cfg = self._cycle_config().get("history") or {}
         return await summarize_unsummarized_sessions(
             llm_client,
             self.embedder,
@@ -1470,6 +1503,7 @@ class SleepTimeWorker:
             3 つ目に出し、Full の再要求の判定に使う (scheduler)。
         """
         from backend.free.memory.sleep.correction_curator import (
+            _MAX_PER_CYCLE,
             curate_corrections,
             pending_notes,
         )
@@ -1487,6 +1521,7 @@ class SleepTimeWorker:
         verified = await curate_corrections(
             notes, aux_client=llm_client,
             should_pause=lambda: self._chat_recent(quiet),
+            max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
         )
         return verified, pending, 0
 
@@ -1621,6 +1656,7 @@ class SleepTimeWorker:
         に分離されている。本メソッドは state を詰め替える薄いラッパ。
         """
         from backend.free.memory.sleep.personal_fact_curator import (
+            _MAX_PER_CYCLE,
             curate_personal_facts,
         )
 
@@ -1632,6 +1668,7 @@ class SleepTimeWorker:
             embedder=self.embedder,
             profile_id=self._profile_id,
             should_pause=self._chat_in_flight,
+            max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
         )
 
     # ── Step 8.4 (assertion curator) ───────────────────
@@ -1643,6 +1680,7 @@ class SleepTimeWorker:
         に分離されている。本メソッドは state を詰め替える薄いラッパ。
         """
         from backend.free.memory.sleep.assertion_curator import (
+            _MAX_PER_CYCLE,
             curate_assertion_facts,
         )
 
@@ -1654,6 +1692,7 @@ class SleepTimeWorker:
             embedder=self.embedder,
             profile_id=self._profile_id,
             should_pause=self._chat_in_flight,
+            max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
         )
 
     def _sweep_assertions_by_changes(self) -> int:

@@ -5,7 +5,7 @@ EvorefConfig 直下の細かいセクションをここに集約する。
 llm) に属さない Config を置く。
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -45,7 +45,8 @@ class RuntimeConfig(BaseModel):
       ``scripts/launch_llama.py --all`` が本値を参照し、ベース /
       埋め込みの GPU レイヤ推定 VRAM 合計がこの値を超える場合に
       警告を出して起動を中断する (``--force`` で強制起動可能)。
-      None の場合は検査を行わない (従来挙動と同じ)。
+      None の場合は環境調整 (c_16 §7.2.3) が GPU の空き × 0.9 から導いた値で
+      検査する (GPU が無い・導けなければ検査しない)。
     - ``min_llamacpp_build``: 起動時に確認する llama-server の
       最低 build 番号 (例: ``"b8946"``)。CVE-2026-21869 (heap-buffer-overflow)
       および SWA-full ロジック修正取り込み済みのビルドを要件として宣言する。
@@ -73,7 +74,7 @@ class RuntimeConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # GPU 搭載 VRAM のソフト上限 (MB)。None の場合は検査を行わない。
+    # GPU 搭載 VRAM のソフト上限 (MB)。None の場合は環境調整の導出値 (GPU 無しなら検査しない)。
     total_vram_budget_mb: int | None = Field(default=None, ge=1)
 
     # llama-server の最低 build 番号 (例: "b8946")。None の場合は検査を行わない。
@@ -102,8 +103,8 @@ class RuntimeConfig(BaseModel):
     #: ``"messages-allowed"`` にしても ``/v1/messages`` が使えるようにはならない。
     llama_endpoint_policy: Literal["oai-only", "messages-allowed"] = "oai-only"
 
-    # ``llama.gpu_layers`` が ``"auto"``
-    # の場合の Vulkan host buffer 予約量 (MiB)。
+    # ``llama.gpu_layers`` / ``context_size`` が ``"auto"``
+    # の場合に iGPU の空きから引く Vulkan host buffer 予約量 (MiB)。単体 GPU には使わない。
     # iGPU 環境では embed (CPU モード) でも llama.cpp が Vulkan
     # backend を初期化し model loading 時に host (pinned) buffer を要求する。
     # base が GPU メモリを占有しすぎると後発の embed で
@@ -506,7 +507,9 @@ class ProcessManagerConfig(BaseModel):
     #: 起動は launch_llama / evoref-ctl / AuxResidencyManager が担当する。
     enabled: bool = False
     #: 起動後ヘルスチェックの待機上限 (秒)。``enabled`` と違い実際に効く。
-    health_timeout: int = 120
+    #: 整数は利用者の明示値でそのまま使う (サイズ連動しない)。``auto`` / ``null`` は起動する
+    #: GGUF のサイズ連動 (15 秒/GB、下限 120・上限 600、c_16 §7.2.3)。
+    health_timeout: int | Literal["auto"] | None = "auto"
     #: SIGTERM 後のグレースフル終了待機 (秒)。
     stop_timeout: int = 10
 
@@ -525,7 +528,8 @@ class AutoServeConfig(BaseModel):
     timeout_backend: int = Field(default=30, ge=5, le=600)
     #: llama-server 群が ``/health`` を返すまでの待機上限 (秒)。大きい GGUF の
     #: ロードを待てる値にする。
-    timeout_llama: int = Field(default=120, ge=10, le=1800)
+    #: 整数は明示値 (そのまま)。``auto`` / ``null`` は base の GGUF サイズ連動 (下限 120・上限 600)。
+    timeout_llama: Annotated[int, Field(ge=10, le=1800)] | Literal["auto"] | None = "auto"
 
 
 class ProUrlRecallConfig(BaseModel):

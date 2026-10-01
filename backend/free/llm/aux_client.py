@@ -254,6 +254,9 @@ DEFERRABLE_AUX_PURPOSES: frozenset[str] = frozenset({
 _CHAT_YIELD_MAX_WAIT_SEC = 120.0
 
 
+#: ベースの context_size が分からないとき (``LocalClient.context_size`` が未設定) の既定。
+_CONTEXT_SIZE_UNKNOWN = 8192
+
 class AuxClient:
     """ベースモデル上で補助タスクを実行するクライアント。
 
@@ -366,8 +369,9 @@ class AuxClient:
 
     @property
     def context_size(self) -> int:
-        """ベースモデルの有効 context_size (サイズガードが参照する)。"""
-        return int(getattr(self.local, "context_size", 8192) or 8192)
+        """ベースモデルの有効 context_size (サイズガードが参照する)。未設定・不正値は 8192。"""
+        size = getattr(self.local, "context_size", None)
+        return size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else _CONTEXT_SIZE_UNKNOWN
 
     def _background_timeout_floor(self) -> float:
         """背景 purpose のタイムアウト下限 (モデルの decode 速度由来)。
@@ -375,6 +379,7 @@ class AuxClient:
         取得できない構成 (メタデータ未解決) では 0.0 を返し、床を掛けない。
         """
         from backend.free.llm.capability import probe_timeout_sec
+        from backend.free.llm.tps_calibration import MEASURED_MAX_SCALE, measured_tps_of
 
         try:
             params_b = float(self.metadata.params_b)
@@ -382,9 +387,43 @@ class AuxClient:
             return 0.0
         if params_b <= 0:
             return 0.0
-        return probe_timeout_sec(params_b, _BACKGROUND_TIMEOUT_TOKENS)
+        tps = measured_tps_of(self.local)
+        # 背景はユーザーを待たせないので、実測で延ばす天井は背景の 3 倍のまま
+        return probe_timeout_sec(
+            params_b, _BACKGROUND_TIMEOUT_TOKENS,
+            decode_tps=tps.decode_tps if tps is not None else None,
+            max_scale=MEASURED_MAX_SCALE,
+        )
 
-    def resolve_effective_timeout(self, purpose: str) -> float:
+    def _tps_extended_chat_timeout(
+        self, purpose: str, current: float, *, prompt_tokens: int, max_tokens: int,
+    ) -> float:
+        """チャット応答パスの purpose の上限を、実測が遅いマシンでだけ延ばす (c_16 §7.2.3)。
+
+        「出力トークン ÷ decode tps + prompt ÷ prefill tps」(余裕込み) まで延ばし、天井は
+        既定の ``CHAT_PATH_MAX_SCALE`` (1.5) 倍 — 延ばした分は応答前の同期の待ちに乗るので、
+        背景の反応的較正 (``_CALIB_MAX_SCALE`` = 3 倍) より低く抑える。未測定なら ``current`` のまま。
+        **純粋な上限** (``PURPOSE_TIMEOUT_CALIBRATION_EXEMPT``: タイムアウトしたら答え無しで
+        安全側へ倒れる purpose) は延ばさない — 延ばしても失敗のコストが増えるだけ。
+        """
+        if purpose in PURPOSE_TIMEOUT_CALIBRATION_EXEMPT:
+            return current
+        from backend.free.llm.tps_calibration import (
+            CHAT_PATH_MAX_SCALE,
+            chat_path_timeout,
+            measured_tps_of,
+        )
+
+        base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, _DEFAULT_TIMEOUT)
+        return chat_path_timeout(
+            current, measured_tps_of(self.local),
+            prompt_tokens=prompt_tokens, max_tokens=max_tokens,
+            ceiling=base * CHAT_PATH_MAX_SCALE,
+        )
+
+    def resolve_effective_timeout(
+        self, purpose: str, *, prompt_tokens: int = 0, max_tokens: int | None = None,
+    ) -> float:
         """purpose に適用されるタイムアウト秒を返す (較正値込み)。
 
         背景 purpose では **較正値にもモデルサイズ由来の下限を掛ける**。反応的
@@ -399,11 +438,18 @@ class AuxClient:
 
         **チャット応答パスの purpose には掛けない** — あちらの短い予算は
         「ユーザーを待たせない」ための意図的な打ち切りで、伸ばすと目的が壊れる。
+        例外は生成速度の実測 (c_16 §7.2.3) が遅いマシンで、``prompt_tokens`` /
+        ``max_tokens`` から導いた所要秒まで延ばす (:meth:`_tps_extended_chat_timeout`、
+        天井は既定の 1.5 倍)。実測が速いマシンでは縮めない。
         """
         calibrated = self._calibrated.get(purpose)
         base = PURPOSE_TIMEOUT_DEFAULTS.get(purpose, _DEFAULT_TIMEOUT)
         if purpose in CHAT_PATH_PURPOSES:
-            return calibrated if calibrated is not None else base
+            current = calibrated if calibrated is not None else base
+            return self._tps_extended_chat_timeout(
+                purpose, current, prompt_tokens=prompt_tokens,
+                max_tokens=max_tokens if max_tokens is not None else 256,
+            )
         floor = self._background_timeout_floor()
         if calibrated is not None:
             return max(calibrated, floor)
@@ -622,7 +668,9 @@ class AuxClient:
             messages, slot, constrained=resolved is not None,
         )
         effective_timeout = (
-            timeout if timeout is not None else self.resolve_effective_timeout(purpose)
+            timeout if timeout is not None else self.resolve_effective_timeout(
+                purpose, prompt_tokens=_prompt_tokens(messages), max_tokens=max_tokens,
+            )
         )
         queued_at = time.monotonic()
         if self._is_deferrable(purpose, deferrable):
@@ -899,6 +947,15 @@ def _finish_reason_of(result: dict) -> str:
         if isinstance(fr, str):
             return fr
     return ""
+
+
+def _prompt_tokens(messages: list[dict]) -> int:
+    """プロンプトの粗いトークン数 (実測 tps から上限を導く見積り用)。"""
+    from backend.utils import estimate_tokens
+
+    return sum(
+        estimate_tokens(str(m.get("content") or "")) for m in messages if isinstance(m, dict)
+    )
 
 
 def _served_model_path(local: Any) -> str:

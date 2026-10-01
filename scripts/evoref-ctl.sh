@@ -22,6 +22,10 @@ start_all() {
     # (config.yaml.g0-<stamp> へ退避)。別の evoref がロックを持っていれば拒否。
     python -m backend.free.cli.main config normalize --if-needed || exit 1
 
+    # PC の環境が変わっていれば llama-server を起こす前に 1 回だけ確認する
+    # (標準入力が端末でなければ聞かず pending のまま。失敗しても起動は止めない)。
+    python -m backend.free.cli.main tune --startup-check || true
+
     echo "[start] Starting llama-server (base + embedding + rerank if enabled)..."
     python scripts/launch_llama.py config.yaml --all &
     PIDS+=($!)
@@ -33,7 +37,7 @@ start_all() {
 
     # リランカー (rag.rerank、既定 off) の自己テスト (PC が変わったときだけ) を待つ。
     # backend は起動時に結果を 1 回読むだけなので先に終わらせる。off なら即終了。
-    python scripts/launch_llama.py config.yaml --wait-rerank 120
+    python scripts/launch_llama.py config.yaml --wait-rerank 240
 
     echo "[start] Starting FastAPI backend on :8000..."
     uvicorn backend.main:app --host 127.0.0.1 --port 8000 &

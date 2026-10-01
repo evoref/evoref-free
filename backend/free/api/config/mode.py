@@ -15,6 +15,7 @@ from backend.config import (
     get_project_root,
 )
 from backend.free.core.launch_adapters import LaunchAdapters, adapters_for_launch
+from backend.free.llm._base_client import health_wait_for_cfg
 from backend.log_config import get_logger
 
 logger = get_logger("api.mode")
@@ -145,9 +146,17 @@ async def _restart_base_server(
     #    旧サーバの 200 を拾う窓を潰す)。
     await asyncio.to_thread(wait_port_released, "base", cfg, 10.0)
 
-    # 3. model_override / adapters 付きで新プロセス起動
-    managed = _spawn_server_with_override(
-        "base", cfg, model_override=model_path, adapters=adapters,
+    # 3. model_override / adapters 付きで新プロセス起動。base は止めたので環境調整の予約の再計算・
+    #    その場の見積りを許す (ブロッキングなので executor で、c_16 §7.2.3)
+    from functools import partial
+
+    from backend.trace_context import run_in_executor_with_context
+
+    managed = await run_in_executor_with_context(
+        asyncio.get_running_loop(), None, partial(
+            _spawn_server_with_override, "base", cfg, model_override=model_path, adapters=adapters,
+            allow_decide=True,
+        ),
     )
     if managed is None:
         logger.error("Failed to spawn base server with model override")
@@ -156,9 +165,11 @@ async def _restart_base_server(
     # 4. ヘルスチェック。``/health`` 200 だけでなく ``/props`` の load 済みモデルが
     #    要求モデルと一致するまで待つ (旧サーバの 200 やロード途中を成功と誤判定
     #    しない)。大きい create GGUF は load に時間がかかるためタイムアウトは
-    #    process_manager.health_timeout (既定 120s) を採用。
+    #    process_manager.health_timeout (整数は明示値、auto / 無しは GGUF サイズ連動で下限 120s) を採用。
     expected_model_id = Path(model_path).name
-    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+    health_timeout = health_wait_for_cfg(
+        cfg, model_path, project_root=get_project_root(), label="base",
+    )
     healthy = await asyncio.to_thread(
         wait_for_health, managed.host, managed.port, health_timeout, expected_model_id,
     )

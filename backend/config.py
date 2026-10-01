@@ -96,6 +96,12 @@ class PathResolver:
         # 埋め込みサーバの配置 (GPU / CPU) の判別結果 (PC 固有の測定値。c_16 §7.2.2)。
         # 書き手は起動スクリプト、backend と再起動の経路は読むだけ。store/ の外。
         "embed_placement_file": "cache/embed_placement.json",
+        # 環境調整 (auto-tune) の結果と環境移行の確認状態 (PC 固有、c_16 §7.2.3)。
+        # 書き手は起動スクリプト / evoref tune / 管理画面の実行、backend は読むだけ。store/ の外。
+        "auto_tune_file": "cache/auto_tune.json",
+        # 生成速度 (prefill / decode tok/s) の実測 (model_key 単位、PC 固有、c_16 §7.2.3)。
+        # 書き手は backend (応答の timings を間引いて保存)。store/ の外。
+        "tps_calibration_file": "cache/tps_calibration.json",
         # 疑似クエリの品質検査の閾値 (リランカーの model_key 単位、c_17 §3.15)。
         # 書き手は較正、backend は起動時に読むだけ。store/ の外。
         "pseudo_query_gate_file": "cache/pseudo_query_gate.json",
@@ -940,9 +946,31 @@ def _profile_context_size(cfg: dict, target: str) -> int | None:
     return value if value >= 512 else None
 
 
-def _resolve_profile_context_size(cfg: dict, slot: str) -> int | None:
-    """slot ("base") のプロファイルから ``context_size`` を返す。"""
-    return _profile_context_size(cfg, slot)
+#: 接続中の llama-server (8080) が ``/props`` で報告した実際の n_ctx。``build_local_client`` が
+#: 接続のたびに記録し、``/props`` に n_ctx が無ければ外す (不明 = 従来どおり config 由来の値)。
+#:
+#: config 由来の値 (明示 / 環境調整の保存値) は llama-server の ``-c`` と一致する前提だが、起動側が
+#: 保守側へ倒れた回 (例: GPU 名だけ変わって環境移行の確認待ち → ``-c 8192``) には backend だけが
+#: 保存値 (32768) を読み、8192 を超えるプロンプトを組んで HTTP 400 になる。予算は実際の窓を超えない。
+_served_context_size: int | None = None
+
+
+def note_served_context_size(n_ctx: object) -> None:
+    """接続した llama-server の実際の n_ctx を記録する (正の整数でなければ「不明」へ戻す)。"""
+    global _served_context_size
+    valid = isinstance(n_ctx, int) and not isinstance(n_ctx, bool) and n_ctx > 0
+    _served_context_size = n_ctx if valid else None
+
+
+def served_context_size() -> int | None:
+    """接続中の llama-server の実際の n_ctx (不明なら ``None``)。"""
+    return _served_context_size
+
+
+def _clamp_to_served(value: int) -> int:
+    """config 由来の context_size を、実際に起動している llama-server の n_ctx 以下へ丸める。"""
+    served = _served_context_size
+    return min(int(value), served) if served else int(value)
 
 
 def _resolve_profile_context_size_for_mode(cfg: dict, mode: str) -> int | None:
@@ -954,34 +982,54 @@ def resolve_context_size_for_mode(cfg: dict, mode: str) -> int:
     """アクティブモード ("chat"|"create") の有効 context_size を解決する。
 
     create モードで ``model_paths.create_model`` が base と別 arch (別 context
-    window) の場合に、その実窓を反映する。優先順位は :func:`resolve_context_size`
-    と同じ: config 明示 (``llama.context_size``) > arch プロファイル > 既定。
-    ``llama.context_size`` の明示はモードに依らず手動 pin として優先する。
+    window) の場合に、その実窓を反映する。``llama.context_size`` の明示はモードに
+    依らず手動 pin として優先する。``auto`` / ``null`` は base と同じモデルなら環境調整の
+    値 (:func:`resolve_context_size`)、別モデルの create はそのモデルの arch プロファイル > 既定
+    (調整は ``base_model`` について決めるため。起動フラグ側の ``model_override`` と同じ)。
+    いずれも接続中の llama-server の実際の n_ctx (:func:`served_context_size`) を超えない。
     """
     explicit = (cfg.get("llama") or {}).get("context_size")
-    if explicit is not None:
-        return int(explicit)
+    if explicit is not None and explicit != "auto":
+        return _clamp_to_served(int(explicit))
+    model_paths = cfg.get("model_paths") or {}
+    create_model = model_paths.get("create_model")
+    if mode != "create" or not create_model or create_model == model_paths.get("base_model"):
+        return _clamp_to_served(_tuned_context_size(cfg))
     profile_ctx = _resolve_profile_context_size_for_mode(cfg, mode)
     if profile_ctx is not None:
-        return profile_ctx
-    return _CONTEXT_SIZE_FALLBACK
+        return _clamp_to_served(profile_ctx)
+    return _clamp_to_served(_CONTEXT_SIZE_FALLBACK)
 
 
-def resolve_context_size(cfg: dict, slot: str) -> int:
+def _tuned_context_size(cfg: dict) -> int:
+    """``llama.context_size: auto`` / ``null`` の値 (c_16 §7.2.3)。起動スクリプトが決めた保存値を読む。
+
+    backend は測らない (``allow_decide=False``): 保存値が無い / 別の PC の値なら保守側 (8192)。
+    llama-server の ``-c`` より小さい側に倒れるだけで、窓を超えるプロンプトは組まない。
+    """
+    from backend.free.core.tuning.resolve import resolve_tuned
+
+    try:
+        value = resolve_tuned(cfg, "ctx", project_root=get_project_root(), allow_decide=False).value
+    except Exception as e:  # noqa: BLE001 - 読めなければ保守側 (チャットを止めない)
+        logger.warning("Tuned context size unreadable: %s", e)
+        return _CONTEXT_SIZE_FALLBACK
+    return int(value) if isinstance(value, int) else _CONTEXT_SIZE_FALLBACK
+
+
+def resolve_context_size(cfg: dict, slot: str) -> int:  # noqa: ARG001 - slot は "base" だけ (呼び手との互換)
     """slot ("base") の有効 context_size を解決する (docs/c_15)。
 
-    優先順位: config 明示 (``llama.context_size``) > arch プロファイル
-    ``context_size`` > 既定 (``_CONTEXT_SIZE_FALLBACK``)。起動フラグ ``-c``
-    (scripts/launch_llama.py::resolve_context_size_for) と同じ優先順位で解決し、
-    llama-server 起動値とランタイム値 (token budget 表示等) を一致させる。
+    config 明示 (``llama.context_size``) はそのまま。``auto`` / ``null`` は環境調整の項目 ctx
+    (c_16 §7.2.3) で、起動スクリプト (scripts/launch_llama.py::resolve_context_size_for) が
+    決めて保存した値を読み、llama-server 起動値とランタイム値 (token budget 表示等) を一致させる。
+    起動側が保守側へ倒れて食い違ったときに備え、接続中の llama-server の実際の n_ctx
+    (:func:`served_context_size`) を超えない。
     """
     explicit = (cfg.get("llama") or {}).get("context_size")
-    if explicit is not None:
-        return int(explicit)
-    profile_ctx = _resolve_profile_context_size(cfg, slot)
-    if profile_ctx is not None:
-        return profile_ctx
-    return _CONTEXT_SIZE_FALLBACK
+    if explicit is not None and explicit != "auto":
+        return _clamp_to_served(int(explicit))
+    return _clamp_to_served(_tuned_context_size(cfg))
 
 
 def get_mode_generation_params(mode: str) -> dict:

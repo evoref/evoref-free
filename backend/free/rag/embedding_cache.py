@@ -330,6 +330,12 @@ class CachedEmbeddingBackend:
     def dim(self) -> int:
         return self._inner.dim()
 
+    def http_batch_size(self) -> int | None:
+        """内部バックエンドの 1 HTTP あたりの件数 (持たなければ ``None``)。"""
+        fn = getattr(self._inner, "http_batch_size", None)
+        value = fn() if callable(fn) else None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
     def model_name(self) -> str:
         return self._inner.model_name()
 

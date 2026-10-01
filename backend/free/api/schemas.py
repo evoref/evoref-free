@@ -221,6 +221,10 @@ class RerankStatusInfo(BaseModel):
     tested_at: str | None = None
     #: 自己テストの後に ``model_paths.rerank_model`` が変わった (再テストはしない、警告だけ)。
     model_changed_since_selftest: bool = False
+    #: 実行時の遮断器 (直近の失敗率が高く、冷却中は HTTP を送らず cosine 順のまま)。
+    #: ``breaker_remaining_s`` は冷却の残り秒 (遮断していなければ None)。
+    breaker_open: bool = False
+    breaker_remaining_s: float | None = None
 
 
 class EmbedPlacementInfo(BaseModel):
@@ -239,6 +243,22 @@ class EmbedPlacementInfo(BaseModel):
     cpu_p50_ms: float | None = None
     gpu_p50_ms: float | None = None
     cosine_min: float | None = None
+
+
+class AutoTuneInfo(BaseModel):
+    """環境調整 (auto-tune) の状態 (c_16 §7.2.3)。起動時に結果ファイルと確認状態から 1 回決める。
+
+    ``state`` は ``fresh`` (結果なし) / ``ok`` (同じ PC) / ``pending`` / ``declined`` / ``accepted`` /
+    ``unchanged`` (環境移行の確認状態) / ``unknown`` (読めない)。``changed_axes`` は変わった PC の軸
+    (``hostname`` / ``cpu`` / ``logical_cores`` / ``memory_gb``。backend は GPU 名を比べない)。
+    ``items_summary`` は項目の件数 (``total`` / ``applied`` / ``manual`` / ``failed``)。
+    ``measured_at`` は最後に項目を測った時刻 (ISO 8601 UTC)。
+    """
+    state: str = "unknown"
+    reason: str = ""
+    changed_axes: list[str] = Field(default_factory=list)
+    items_summary: dict[str, int] = Field(default_factory=dict)
+    measured_at: str | None = None
 
 
 class StatusResponse(BaseModel):
@@ -262,6 +282,7 @@ class StatusResponse(BaseModel):
     data_health: DataHealthInfo = Field(default_factory=DataHealthInfo)
     rerank: RerankStatusInfo = Field(default_factory=RerankStatusInfo)
     embed_placement: EmbedPlacementInfo = Field(default_factory=EmbedPlacementInfo)
+    auto_tune: AutoTuneInfo = Field(default_factory=AutoTuneInfo)
 
 
 # ===== RAG =====

@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         WorkingMemoryRegistry,
     )
     from backend.free.rag.cartridge_manager import CartridgeManager
+    from backend.free.core.tuning.gate import AutoTuneStatus
     from backend.free.rag.embed_placement import EmbedPlacementStatus
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.rerank_llamacpp import RerankClient
@@ -68,6 +69,8 @@ class GenPillar:
         rerank_status: rerank の状態 (``/api/status`` 用、起動時に 1 回決める)。
         embed_placement: 埋め込みサーバの配置 GPU / CPU (``/api/status`` 用、起動時に 1 回決める、
             c_16 §7.2.2)。
+        auto_tune: 環境調整の確認状態と結果の要約 (``/api/status`` 用、起動時に 1 回決める、
+            c_16 §7.2.3)。
 
     語彙索引は pillar に持たない。3 ストアとも ``EvidenceStore`` が snapshot
     ごとに numpy CSR の転置索引を作る (c_16 §6.2) ので、共有の
@@ -81,6 +84,7 @@ class GenPillar:
     reranker: "RerankClient | None" = None
     rerank_status: "RerankStatus | None" = None
     embed_placement: "EmbedPlacementStatus | None" = None
+    auto_tune: "AutoTuneStatus | None" = None
 
 
 @dataclass

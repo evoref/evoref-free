@@ -3,7 +3,9 @@
 
 	interface Props {
 		label: string;
-		value: number;
+		/** null は自動 (環境調整が決める値)。欄を空にして `autoLabel` を出す */
+		value: number | null;
+		autoLabel?: string;
 		description?: string;
 		disabled?: boolean;
 		error?: string;
@@ -16,6 +18,7 @@
 	let {
 		label,
 		value,
+		autoLabel = 'auto',
 		description = '',
 		disabled = false,
 		error = '',
@@ -32,7 +35,8 @@
 	<input
 		id={fieldId}
 		type="number"
-		{value}
+		value={value ?? ''}
+		placeholder={value === null ? autoLabel : undefined}
 		{disabled}
 		{min}
 		{max}

@@ -66,6 +66,13 @@ MEASURE_RUNS = 3
 #: 1 回の自己テスト要求の HTTP timeout (秒)。CPU 配置の最悪 (20 件 14 秒) より長く取る。
 REQUEST_TIMEOUT_SEC = 60.0
 
+#: 環境起因の失敗 (``server_unhealthy`` / ``http_error:*``) がこの回数続いたら、無効を保存して
+#: 次の起動から測り直さない (手動の --rerank-selftest と PC の変化では測り直す)。埋め込みの
+#: ``embed_placement.GPU_UNHEALTHY_LIMIT`` と同じ考え方・同じ値。
+ENVIRONMENTAL_FAILURE_LIMIT = 3
+#: 利用可能な物理メモリが足りなくて自己テストを見送った理由 (保存しない・数えない状態)。
+LOW_MEMORY = "low_memory"
+
 Placement = Literal["gpu", "cpu", ""]
 
 
@@ -166,31 +173,78 @@ class PcInfo:
         return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
-def _physical_memory_gb() -> int:
-    """物理メモリ (GB、四捨五入)。取れなければ 0。"""
+def _windows_memory_status() -> tuple[int, int] | None:
+    """Windows の (物理メモリの総量, 利用可能量) をバイトで。取れなければ ``None``。"""
+    import ctypes
+
+    class _MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
+        return None
+    return int(status.ullTotalPhys), int(status.ullAvailPhys)
+
+
+def _read_meminfo() -> str:
+    """``/proc/meminfo`` の本文 (テストで差し替える)。"""
+    with open("/proc/meminfo", encoding="utf-8") as f:
+        return f.read()
+
+
+def _physical_total_bytes() -> int | None:
+    """物理メモリの総量 (バイト)。取れなければ ``None``。"""
     try:
         if sys.platform == "win32":
-            import ctypes
-
-            class _MemoryStatusEx(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            status = _MemoryStatusEx()
-            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
-            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
-                return 0
-            total = int(status.ullTotalPhys)
-        else:
-            total = int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+            mem = _windows_memory_status()
+            return mem[0] if mem else None
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
     except (AttributeError, OSError, ValueError):
-        return 0
-    return round(total / (1024 ** 3))
+        return None
+
+
+def _physical_available_bytes() -> int | None:
+    """いま利用可能な物理メモリ (バイト)。総量とは別に取る (片方の失敗でもう片方を失わない)。
+
+    Linux は ``/proc/meminfo`` の ``MemAvailable`` (キャッシュの回収分を含む)。読めなければ
+    ``SC_AVPHYS_PAGES`` (macOS 等では無い)。どちらも無ければ ``None``。
+    """
+    try:
+        if sys.platform == "win32":
+            mem = _windows_memory_status()
+            return mem[1] if mem else None
+    except (AttributeError, OSError, ValueError):
+        return None
+    if sys.platform.startswith("linux"):
+        try:
+            for line in _read_meminfo().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_AVPHYS_PAGES"))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _physical_memory_gb() -> int:
+    """物理メモリ (GB、四捨五入)。取れなければ 0。"""
+    total = _physical_total_bytes()
+    return round(total / (1024 ** 3)) if total else 0
+
+
+def available_physical_memory_mb() -> int:
+    """いま利用可能な物理メモリ (MiB)。取れなければ 0 (= 判定しない)。"""
+    avail = _physical_available_bytes()
+    return avail // (1024 * 1024) if avail else 0
 
 
 def _cpu_name() -> str:
@@ -356,6 +410,9 @@ class RerankSelftestResult:
     scores: list[float] = field(default_factory=list)
     prompt_tokens: int | None = None
     tested_at: str = ""
+    #: 環境起因の失敗 (:func:`is_environmental_failure`) が同じ PC で続けて起きた回数 (この回を含む)。
+    #: :data:`ENVIRONMENTAL_FAILURE_LIMIT` に届くまで次の起動でまた測り、届いたら無効を確定する。
+    environmental_streak: int = 0
     #: 記録だけ (指紋には入れない)。
     model_key: str = ""
     model_file: str = ""
@@ -423,7 +480,8 @@ def selftest_needed(
 ) -> tuple[bool, str]:
     """自己テストを走らせるか、とその理由。
 
-    理由: ``forced`` / ``no_result`` / ``fingerprint_changed`` / ``placement_setting_changed``。
+    理由: ``forced`` / ``no_result`` / ``fingerprint_changed`` / ``placement_setting_changed`` /
+    ``environmental_retry`` (環境起因の失敗を数えている途中。上限に届いたら測り直さない)。
     読めない結果 (新しい版・壊れ) は ``saved=None`` で渡る (``no_result``)。
 
     **再テストは PC が変わったときだけ** — 唯一の例外が明示の ``gpu_layers`` (整数) で、
@@ -438,15 +496,33 @@ def selftest_needed(
         return True, "fingerprint_changed"
     if explicit_gpu_layers is not None and saved.gpu_layers != explicit_gpu_layers:
         return True, "placement_setting_changed"
+    if (
+        not saved.enabled and is_environmental_failure(saved.reason)
+        and saved.environmental_streak < ENVIRONMENTAL_FAILURE_LIMIT
+    ):
+        return True, "environmental_retry"
     return False, ""
 
 
 def is_environmental_failure(reason: str) -> bool:
-    """環境起因の失敗 (``server_unhealthy`` / ``http_error:*``) か。
+    """環境起因の失敗 (``server_unhealthy`` / ``http_error:*`` / ``low_memory``) か。
 
-    PC の性質ではないので無効として保存せず、次の起動でまた試す。
+    PC の性質ではないので、すぐには無効として確定しない。``low_memory`` は保存も数えもせず
+    次の起動でまた試す。``server_unhealthy`` / ``http_error:*`` は :data:`ENVIRONMENTAL_FAILURE_LIMIT`
+    回続いたら無効を保存する (:func:`next_environmental_streak`)。
     """
-    return reason == "server_unhealthy" or reason.startswith("http_error:")
+    return reason in ("server_unhealthy", LOW_MEMORY) or reason.startswith("http_error:")
+
+
+def next_environmental_streak(saved: RerankSelftestResult | None, fingerprint: str) -> int:
+    """今回の環境起因の失敗を数えた連続回数 (同じ PC で環境起因の失敗を数えている記録があれば +1)。"""
+    prior = 0
+    if (
+        saved is not None and saved.fingerprint == fingerprint and not saved.enabled
+        and is_environmental_failure(saved.reason) and saved.reason != LOW_MEMORY
+    ):
+        prior = saved.environmental_streak
+    return max(0, prior) + 1
 
 
 def warm_budget_ms(deadline_ms: int, min_candidates: int, n_docs: int = 0) -> float:
@@ -563,12 +639,28 @@ class RerankStatus:
     placement: str = ""
     ms_per_doc: float | None = None
     candidates: int = 0
-    #: 無効の理由 (``off`` / ``not_tested`` / ``stale_fingerprint`` / 自己テストの理由 /
-    #: ``server_unreachable``)。
+    #: 無効の理由 (``off`` / ``no_model`` (``model_paths.rerank_model`` 未設定) /
+    #: ``model_missing`` (設定したファイルが無い) / ``not_tested`` / ``stale_fingerprint`` /
+    #: 自己テストの理由 / ``server_unreachable``)。``no_model`` / ``model_missing`` は
+    #: 既定 on でモデルを置いていない環境の正常な状態 (失敗ではない)。
     reason: str = ""
     tested_at: str | None = None
     #: 自己テストの後に ``model_paths.rerank_model`` が変わった (再テストはしない、警告だけ)。
     model_changed_since_selftest: bool = False
+
+
+def rerank_model_unavailable_reason(model_rel: object, model_exists: bool) -> str:
+    """リランカーのモデルが使えない理由 (純関数)。使えれば空文字。
+
+    ``model_rel`` は ``model_paths.rerank_model`` の生の値、``model_exists`` はそれを
+    解決したパスにファイルがあるか (``model_rel`` が空なら見ない)。
+    未設定 (``None`` / 空) → ``no_model``、ファイルが無い → ``model_missing``。
+    """
+    if not model_rel:
+        return "no_model"
+    if not model_exists:
+        return "model_missing"
+    return ""
 
 
 def resolve_rerank_status(
@@ -623,13 +715,18 @@ __all__ = [
     "collect_pc_info",
     "decide_candidates",
     "effective_candidates",
+    "ENVIRONMENTAL_FAILURE_LIMIT",
+    "LOW_MEMORY",
+    "available_physical_memory_mb",
     "is_environmental_failure",
+    "next_environmental_streak",
     "evaluate_measurement",
     "judge_scores",
     "load_selftest_result",
     "measure_rerank_server",
     "ms_per_doc",
     "pc_mismatch",
+    "rerank_model_unavailable_reason",
     "resolve_rerank_status",
     "save_selftest_result",
     "selftest_needed",

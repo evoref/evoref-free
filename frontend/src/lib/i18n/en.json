@@ -117,6 +117,32 @@
 		"documents_off": "Off",
 		"documents_hint": "Whether installed documents (corpus) are used for answers. Auto = decided per question by relevance"
 	},
+	"autotune": {
+		"banner": {
+			"message": "This PC's environment has changed. Run auto-tune?",
+			"changed_axes": "(changed: {axes})",
+			"accept": "Run",
+			"decline": "Not now",
+			"unchanged": "No change",
+			"running": "Running auto-tune..."
+		},
+		"axis": {
+			"hostname": "hostname",
+			"cpu": "CPU",
+			"logical_cores": "cores",
+			"memory_gb": "memory"
+		},
+		"decision": {
+			"auto": "Automatic",
+			"accepted": "Accepted",
+			"declined": "Declined",
+			"pending": "Awaiting confirmation",
+			"unchanged": "No change"
+		},
+		"load_failed": "Could not load the auto-tune status.",
+		"run_failed": "Could not start auto-tune.",
+		"decision_failed": "Could not send the confirmation."
+	},
 	"vram": {
 		"placement_cpu": "CPU"
 	},
@@ -273,6 +299,60 @@
 		"tab_prompts": "Prompts",
 		"tab_generation": "Generation",
 		"tab_develop": "Develop",
+		"tab_system": "System",
+		"system": {
+			"title": "Environment tuning",
+			"description": "Measures and proposes values that depend on this PC (RAM / VRAM / GPU / cores). Items you set explicitly in config.yaml are never overwritten.",
+			"pc_title": "This PC",
+			"pc_hostname": "Hostname",
+			"pc_cpu": "CPU",
+			"pc_cores": "Logical cores",
+			"pc_memory": "Memory",
+			"pc_gpu": "GPU",
+			"pc_gpu_none": "None",
+			"run_title": "Auto-tune",
+			"run": "Run auto-tune",
+			"running": "Running...",
+			"decision_label": "Confirmation",
+			"done": "Tuning finished ({applied} applied / {manual} not applied).",
+			"failed": "Auto-tune failed",
+			"restart_required": "A restart is required to apply these. Restart llama-server from the server control in the Model tab.",
+			"open_model_tab": "Open Model tab",
+			"items_title": "Tuned items",
+			"items_empty": "No tuning results yet.",
+			"col_item": "Item",
+			"col_value": "Proposed value",
+			"col_status": "Status",
+			"item": {
+				"ctx": "Context length",
+				"ngl": "GPU layers",
+				"vram_budget": "VRAM budget",
+				"threads": "Thread allocation",
+				"ram_params": "RAM (checkpoints / cache)",
+				"batch": "Batch size",
+				"embed_params": "Embedding batch / timeouts",
+				"embed_placement": "Embedding placement (GPU/CPU)",
+				"rerank": "Reranker",
+				"startup_timeouts": "Startup wait times",
+				"tps": "Measured generation speed",
+				"background_budget": "Background work counts"
+			},
+			"status_applied": "Applied",
+			"status_restart": "Restart required",
+			"status_requires_stop": "Stop required (run the CLI while stopped)",
+			"status_requires_explicit": "Not measured by a full run while running (run this item by name)",
+			"status_scheduled": "Recomputed and applied at restart (scheduled)",
+			"status_manual": "Not applied: set manually (proposed {value})",
+			"status_manual_rows": "Not applied: set manually (see the proposed value on the left)",
+			"status_not_auto": "Not applied: not set to auto",
+			"manual_keys": "Set manually: {keys}",
+			"status_no_samples": "No measurements yet; running with current values",
+			"status_failed": "Failed: {reason}",
+			"source_measured": "measured",
+			"source_estimated": "estimated",
+			"source_skipped": "skipped",
+			"source_failed": "failed"
+		},
 		"develop": {
 			"title": "Danger Zone",
 			"description": "Developer-only maintenance actions. These are destructive and only available in the Develop edition.",
@@ -825,6 +905,8 @@
 		"copy_failed": "Copy failed"
 	},
 	"api": {
+		"auto_tune_restamp_refused": "Could not keep the saved results for this PC. \"No change\" is only allowed when only the hostname changed (not the CPU, memory or GPUs); run the tuning to measure again.",
+		"auto_tune_unknown_item": "Unknown environment tuning item.",
 		"learning_invalid_level": "level must be 'level1' or 'full'",
 		"learning_scheduler_not_initialized": "Learning scheduler not initialized",
 		"learning_cycle_running": "Learning cycle already running",
