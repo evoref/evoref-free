@@ -313,6 +313,7 @@ model_paths:
   create_model: null                                 # クリエイトモード用 GGUF（null/空欄 = base_model にフォールバック）
                                                       # 設定すると /api/mode/switch が chat⇄create 切替時に
                                                       # 補助タスクサーバも非破壊的 (config.yaml 非変更) に差し替える
+  rerank_model: null                                 # リランカー用 GGUF（例: models/japanese-bge-reranker-v2-m3-v1-q8_0.gguf。null = 使わない。rag.rerank.mode も参照）
 
 # ===== ベースモデル移行 / 起動時整合性チェック =====
 model_migration:
@@ -561,6 +562,22 @@ rag:
       max_per_session: 5          # 1 セッション内の LLM 判定発火上限 (0 以下で無制限)
       max_per_query: 1            # 1 クエリ内の LLM 判定発火上限 (0 以下で無制限)
 
+  # --- 再順位段 (リランカー、c_16 §7.2.1) ---
+  # mode: on で、関連度の床を通った文書 (corpus) の候補を上位 N 件だけ並べ替える
+  # (記憶 (episodic) は並べ替えない。ゲートは cosine のまま)。モデルは model_paths.rerank_model (例:
+  # japanese-bge-reranker-v2-m3-v1-q8_0.gguf)。既定は off (rerank 用 llama-server を起動しない)。
+  # 自己テストは PC が変わったとき (指紋: ホスト名・CPU・コア数・メモリ・GPU 名) だけ
+  # 起動スクリプトが走らせ、結果を <data_root>/g1/cache/rerank_selftest.json に残す。
+  # 手動で測り直す: python scripts/launch_llama.py config.yaml --rerank-selftest
+  rerank:
+    mode: "off"                   # off: 起動しない・並べ替えない / on: 起動して文書の候補を並べ替える
+    port: 8083                    # rerank 用 llama-server のポート
+    gpu_layers: auto              # auto: GPU の空きがモデル + 約 1GB あれば GPU (-ngl 999 -fa on)、無ければ CPU (-ngl 0)。整数なら -ngl
+    deadline_ms: 1000             # 1 回の rerank 呼出の締切 (ミリ秒)。超えたら cosine 順のまま
+    max_candidates: 20            # 1 回に並べ替える候補数の上限 (実際の候補数は自己テストの速度で決める)
+    min_candidates: 3             # 締切に収まる候補数がこれ未満なら無効 (too_slow)
+    threads: 0                    # -t (0 = 自動: GPU 配置は 2、CPU 配置は llama.cpp の既定)
+
 # ===== 埋め込みモデル設定 =====
 embedding:
   backend: llama-cpp              # 埋め込みバックエンド: llama-cpp
@@ -581,12 +598,16 @@ embedding:
   # モデル既定 n_ctx=32768 は過剰なので max_length に合わせて縮小し KV を節約する
   # (実測 0.6B で active WorkingSet 7.5GB→4.2GB、速度・次元は同等)。
   context_size: 8192
-  # 埋め込みモデルの GPU オフロード層数
-  # null は CPU フォールバック (-ngl 0) が既定。GPU に載せたい場合は
-  # 明示的に 999 等を指定する。ベースモデルの llama.gpu_layers には追従しない。
+  # 埋め込みモデルの GPU オフロード層数 (c_16 §7.2.2)。ベースモデルの llama.gpu_layers には追従しない。
+  #   auto: 初回起動時 (PC か埋め込みモデルが変わったとき) だけ一時ポートで CPU (-ngl 0) と GPU (-ngl 999) を
+  #         測り、GPU が起動でき・ベクトルが CPU と一致し (cosine >= 0.999)・速いときだけ GPU。結果は
+  #         <data_root>/g1/cache/embed_placement.json。GPU で起動しなければ CPU で起こし直す。
+  #         測り直しは scripts/launch_llama.py --embed-placement
+  #   null: CPU (-ngl 0)。以前の既定 (弱い GPU 環境での OOM 回避)
+  #   整数: そのまま -ngl (999 = 全層 GPU、0 = CPU)
   # 補足: 埋め込みの GPU オフロードはクエリ時最大の速度ノブ。base との
   # VRAM 競合に注意し、設定変更時は起動時サマリで VRAM 予算を確認すること。
-  gpu_layers: null                # 既定: CPU 配置 (弱い GPU 環境での OOM 回避)
+  gpu_layers: auto
   # 物理バッチサイズ。llama-server デフォルト 512 のままだと長文ノート (>512 tok)
   # の単一埋め込みリクエストで 500 エラーになり、EvorefMem sleep-time update が連鎖失敗する。
   # 4096 は rag.chunk_size (既定 512) + STM ノート (通常 <2048 tok) を十分カバーし、
@@ -601,7 +622,7 @@ embedding:
   # slots × context_size 分の KV を無駄に確保する。埋め込みは概ね逐次アクセスの
   # ため 2 (前景クエリ + 背景ノート埋め込みの最小並列) で十分。
   slots: 2
-  # スレッド数 (-t)。0=自動検出 (全物理コア)。CPU 埋め込み (gpu_layers: null/0) 時は
+  # スレッド数 (-t)。0=自動検出 (全物理コア)。CPU 埋め込み (gpu_layers: null/0、auto で CPU と判別された場合) 時は
   # base と CPU を分け合うため、物理コア数より小さい値を指定して
   # ヘッドルームを残すとチャット応答との競合を抑えられる。
   threads: 0

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from backend.free.agent.tools.history_rerank import (
+    HistoryReranker,
+    rerank_history_candidates,
+)
 from backend.free.api.chat.chat_constants import (
     LLM_TOOL_EXECUTION_TIMEOUT_SEC,
     LLM_TOOL_MAX_TOKENS,
@@ -522,8 +527,17 @@ def _local_session_stamp(started_at: str, tz) -> str:
     return f"{local.strftime('%Y-%m-%d %H:%M')} {label}"
 
 
-def _make_search_history(manager: HistoryManager):
-    """search_history ツールハンドラを生成（HistoryManager をクロージャでバインド）"""
+def _make_search_history(
+    manager: HistoryManager,
+    reranker: HistoryReranker | None = None,
+    debug_logger: Any = None,
+):
+    """search_history ツールハンドラを生成（HistoryManager をクロージャでバインド）
+
+    ``reranker`` (``rag.rerank.mode: on`` で自己テストを通った ``RerankClient``) が
+    あれば、字句スコア順の候補の上位を再順位で並べ替える非同期ハンドラを返す
+    (c_16 §7.2.1 の第 5 段階 A)。無ければ従来の同期ハンドラそのもの。
+    """
     from backend.config import get_config
 
     local_tz = _resolve_history_tz(get_config)
@@ -567,65 +581,140 @@ def _make_search_history(manager: HistoryManager):
             # 結果が少ない場合のみターン検索で再検索
             if len(results) < limit:
                 results = _search(search_turns=True)
-            # summary も matched_turns も無いヒットは **会話の中身を 1 文字も
-            # 運んでいない**。``search_sessions`` は ``max(score, 0.1)`` で全件に
-            # 下駄を履かせ、``session_id`` 指定時はクエリ絞り込み自体を行わない
-            # ため、無関係なセッションが必ず score=0.1 のヘッダだけで返る。
-            # これを「根拠」の枠で base に渡すと、中身が無いのに検索が当たった
-            # ことになり、モデルは仕方なく手元の (切り詰め済み) 文脈から適当な
-            # 発言を選んで断定する。実インシデント (2026-08-14 ライブ監査
-            # ターン19): 「この会話で一番最初に送ったメッセージは？」に対し
-            # ``[2026-08-14T04:14:43Z] mode=chat score=0.1`` だけが返り、
-            # 実際の 1 通目ではなく窓の先頭 (7 ターン目の質問) を答えた。
-            results = [
-                r for r in results
-                if r.get("summary") or r.get("matched_turns")
-            ]
-            if not results:
-                # 位置指定の自己参照 (「この会話の一番最初に言ったこと」) は
-                # 逐語一致では構造的に当たらない。セッションが特定できている
-                # ときに限り、境界ターンを直接返す (_POSITIONAL_SESSION_QUERY_RE)。
-                boundary = (
-                    _boundary_turns_answer(manager, session_id, query)
-                    if session_id else None
-                )
-                if boundary:
-                    return boundary
-                return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}"
-
-            lines: list[str] = []
-            # 由来 (今回の会話 / 別の会話) を本文先頭で必ず宣言する。
-            # exclude_session_id が入っている = 現在セッションを除外した検索
-            # なので、ヒットは構造的に全て別セッション。session_id 明示時は
-            # 逆に全て現在セッション。どちらでもない (スコープ未注入) 場合は
-            # 混在し得るので宣言しない。
-            if exclude_session_id:
-                lines.append(SEARCH_HISTORY_OTHER_SESSIONS_HEADER)
-            elif session_id:
-                lines.append(SEARCH_HISTORY_CURRENT_SESSION_HEADER)
-            for r in results:
-                header = (
-                    f"[{_local_session_stamp(r['started_at'], local_tz)}] "
-                    f"mode={r['mode']} score={r['relevance_score']:.1f}"
-                )
-                if r.get("summary"):
-                    # summary はそのセッションの「最初のユーザ発話」そのもの。
-                    # 同じ会話の後半で訂正されていてもここには反映されないため、
-                    # 裸で出すと現在も有効な事実として読まれ、訂正済みの値へ
-                    # 巻き戻す (2026-07-26 ライブ検証: 火曜→水曜と訂正済みの
-                    # 予約が、過去セッションの要約「来週の火曜日に歯科の予約を
-                    # 入れました。」経由で火曜へ戻った)。由来を明示して、
-                    # 会話冒頭の発言にすぎないことが読み取れるようにする。
-                    header += f" | first_message: {r['summary']}"
-                lines.append(header)
-                for turn in r.get("matched_turns", []):
-                    lines.append(f"  turn#{turn['index']} ({turn['role']}): {turn['content_preview']}")
-            return "\n".join(lines)
+            return _render(results, query, session_id, exclude_session_id)
         except Exception as e:
             logger.error("search_history tool failed: %s", e)
             return f"Error: {e}"
 
-    return search_history
+    def _render(
+        results: list[dict], query: str,
+        session_id: str | None, exclude_session_id: str | None,
+    ) -> str:
+        """検索結果をツールの戻り文字列にする (再順位の有無で共通)。"""
+        # summary も matched_turns も無いヒットは **会話の中身を 1 文字も
+        # 運んでいない**。``search_sessions`` は ``max(score, 0.1)`` で全件に
+        # 下駄を履かせ、``session_id`` 指定時はクエリ絞り込み自体を行わない
+        # ため、無関係なセッションが必ず score=0.1 のヘッダだけで返る。
+        # これを「根拠」の枠で base に渡すと、中身が無いのに検索が当たった
+        # ことになり、モデルは仕方なく手元の (切り詰め済み) 文脈から適当な
+        # 発言を選んで断定する。実インシデント (2026-08-14 ライブ監査
+        # ターン19): 「この会話で一番最初に送ったメッセージは？」に対し
+        # ``[2026-08-14T04:14:43Z] mode=chat score=0.1`` だけが返り、
+        # 実際の 1 通目ではなく窓の先頭 (7 ターン目の質問) を答えた。
+        results = [
+            r for r in results
+            if r.get("summary") or r.get("matched_turns")
+        ]
+        if not results:
+            # 位置指定の自己参照 (「この会話の一番最初に言ったこと」) は
+            # 逐語一致では構造的に当たらない。セッションが特定できている
+            # ときに限り、境界ターンを直接返す (_POSITIONAL_SESSION_QUERY_RE)。
+            boundary = (
+                _boundary_turns_answer(manager, session_id, query)
+                if session_id else None
+            )
+            if boundary:
+                return boundary
+            return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}"
+
+        lines: list[str] = []
+        # 由来 (今回の会話 / 別の会話) を本文先頭で必ず宣言する。
+        # exclude_session_id が入っている = 現在セッションを除外した検索
+        # なので、ヒットは構造的に全て別セッション。session_id 明示時は
+        # 逆に全て現在セッション。どちらでもない (スコープ未注入) 場合は
+        # 混在し得るので宣言しない。
+        if exclude_session_id:
+            lines.append(SEARCH_HISTORY_OTHER_SESSIONS_HEADER)
+        elif session_id:
+            lines.append(SEARCH_HISTORY_CURRENT_SESSION_HEADER)
+        for r in results:
+            header = (
+                f"[{_local_session_stamp(r['started_at'], local_tz)}] "
+                f"mode={r['mode']} score={r['relevance_score']:.1f}"
+            )
+            if r.get("summary"):
+                # summary はそのセッションの「最初のユーザ発話」そのもの。
+                # 同じ会話の後半で訂正されていてもここには反映されないため、
+                # 裸で出すと現在も有効な事実として読まれ、訂正済みの値へ
+                # 巻き戻す (2026-07-26 ライブ検証: 火曜→水曜と訂正済みの
+                # 予約が、過去セッションの要約「来週の火曜日に歯科の予約を
+                # 入れました。」経由で火曜へ戻った)。由来を明示して、
+                # 会話冒頭の発言にすぎないことが読み取れるようにする。
+                header += f" | first_message: {r['summary']}"
+            lines.append(header)
+            for turn in r.get("matched_turns", []):
+                lines.append(f"  turn#{turn['index']} ({turn['role']}): {turn['content_preview']}")
+        return "\n".join(lines)
+
+    if reranker is None:
+        return search_history
+
+    def _sync_equivalent(
+        all_candidates: list, query: str, limit: int, exclude_session_id: str | None,
+    ) -> str:
+        """同期版 ``search_history`` と同じ結果を、取得済みの候補から組む (縮退した回)。
+
+        同期版は上位 ``limit`` 件を切ってから現在のセッションを外し、その件数が ``limit``
+        未満ならターン照合ありで組み直す (照合の加点で並べ直す)。同じ手順をなぞる。
+        """
+        top = all_candidates[:limit]
+        kept = sum(1 for e, _ in top if not exclude_session_id or e.session_id != exclude_session_id)
+        results = manager.build_search_results(top, query, search_turns=kept < limit)
+        if exclude_session_id:
+            results = [r for r in results if r.get("session_id") != exclude_session_id]
+        return _render(results, query, None, exclude_session_id)
+
+    async def search_history_reranked(
+        query: str, mode: str | None = None, limit: int = 10,
+        date_from: str | None = None, date_to: str | None = None,
+        session_id: str | None = None,
+        exclude_session_id: str | None = None,
+    ) -> str:
+        """過去の会話履歴を検索する (字句の候補の上位を再順位で並べる)
+
+        引数と戻りは同期版 ``search_history`` と同じ。``session_id`` 指定 (自己参照の
+        全ターン走査) は同期版をそのまま呼ぶ。再順位の縮退は、取得済みの候補から同期版と
+        **同じ結果** を組む (索引を二度走査しない)。索引とセッション本体の読み出しは
+        スレッドで行う (イベントループを止めない)。
+
+        現在のセッションの除外 (``exclude_session_id``) の順は経路で違う: 同期版 (と縮退) は
+        上位 ``limit`` 件に切ってから外す (現在のセッションが枠を 1 つ使う)、再順位の経路は
+        プールを作る前に外す (再順位の枠を使わない)。後者は件数が最大 1 件多くなる。
+        """
+        kwargs = {
+            "query": query, "mode": mode, "limit": limit,
+            "date_from": date_from, "date_to": date_to,
+            "session_id": session_id, "exclude_session_id": exclude_session_id,
+        }
+        if session_id:
+            return await asyncio.to_thread(search_history, **kwargs)
+        try:
+            all_candidates = await asyncio.to_thread(
+                manager.search_candidates,
+                query, mode=mode, date_from=date_from, date_to=date_to,
+            )
+            candidates = [
+                c for c in all_candidates
+                if not exclude_session_id or c[0].session_id != exclude_session_id
+            ]
+            ranked = await rerank_history_candidates(
+                query, candidates, reranker, limit=limit, debug_logger=debug_logger,
+            )
+            if ranked is None:
+                return await asyncio.to_thread(_sync_equivalent, all_candidates, query, limit, exclude_session_id)
+            top = ranked[:limit]
+            # 同期版と同じく、候補が limit に満たないときだけターンも照合する。
+            # 並びは再順位のまま (ターンの一致数で並べ直さない)。
+            results = await asyncio.to_thread(
+                manager.build_search_results, top, query,
+                search_turns=len(top) < limit, keep_order=True,
+            )
+            return await asyncio.to_thread(_render, results, query, None, exclude_session_id)
+        except Exception as e:
+            logger.error("search_history tool failed: %s", e)
+            return f"Error: {e}"
+
+    return search_history_reranked
 
 
 def register_builtin_tools(
@@ -635,6 +724,8 @@ def register_builtin_tools(
     history_manager: HistoryManager | None = None,
     aux_client: AuxClient | None = None,
     project_map_reader_getter: "Callable[[], ProjectMapReader | None] | None" = None,
+    reranker: HistoryReranker | None = None,
+    debug_logger: Any = None,
 ) -> None:
     """ビルトインツールをレジストリに一括登録
 
@@ -642,6 +733,8 @@ def register_builtin_tools(
     の生成経路。``None`` (degraded) なら ``local_client`` を直接使う。
     ``project_map_reader_getter`` は ProjectMap reader を返すコールバック
     (未指定なら常に ``None`` = 未構築として振る舞う、c_16 §4.4)。
+    ``reranker`` は ``search_history`` の再順位 (c_16 §7.2.1 の第 5 段階 A)。``None``
+    なら従来の同期ハンドラ。``debug_logger`` はその記録 (``op="history_rerank"``)。
     """
     cfg = config or {}
     pm_reader_getter = project_map_reader_getter or (lambda: None)
@@ -931,7 +1024,9 @@ def register_builtin_tools(
     if history_manager is not None:
         registry.register(
             name="search_history",
-            func=_make_search_history(history_manager),
+            func=_make_search_history(
+                history_manager, reranker=reranker, debug_logger=debug_logger,
+            ),
             description="Search past conversation history by keyword and/or date range",
             parameters={
                 "query": {

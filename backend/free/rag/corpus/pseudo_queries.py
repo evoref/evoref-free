@@ -86,12 +86,13 @@ class PseudoQueryIndex:
             shard_key_for=ConstantShardKey(package_id),
         )
         self._loaded = False
-        #: put 済みで未 commit の対象チャンク id (同じサイクル内の二重生成を防ぐ)。
-        self._pending_targets: set[str] = set()
         #: ``_snapshot_target_ids`` の版単位キャッシュ (commit で捨てる)。
         self._target_ids_cache: dict[tuple, frozenset[str]] = {}
         #: 対象チャンクが本体 snapshot に生きているか (f_01 §6.2 の孤児 GC)。
         self._is_live: Callable[[str], bool] = lambda _target: True
+        #: 保存前の品質検査 (c_16 §7.2.1 の第 5 段階 B) で問いを全部捨てた対象チャンク id。
+        #: プロセス内だけ (ディスクに書かない)。充足率には数えず、生成対象からだけ外す。
+        self._screened_out: set[str] = set()
 
     def bind_targets(self, is_live: Callable[[str], bool]) -> None:
         """対象チャンクの生存判定を束ねる。孤児は検索 / 充足率から外し、commit で物理 GC する。"""
@@ -170,8 +171,50 @@ class PseudoQueryIndex:
     # ── 参照 ──
 
     def covered_target_ids(self) -> set[str]:
-        """問いを持つ対象チャンク id の集合。"""
-        return self._snapshot_target_ids() | self._pending_targets
+        """問いを作り済みの対象チャンク id の集合 (Step 5.9 の生成対象の選別用)。
+
+        put 済み・未 commit の対象を含む — 検索に出るとは限らない。充足率 (検索に出る問いの
+        割合) には :meth:`searchable_target_ids` を使う。
+        """
+        return self._snapshot_target_ids() | self._uncommitted_target_ids()
+
+    def searchable_target_ids(self) -> set[str]:
+        """検索に出る問い (snapshot に畳んだ問い) を持つ対象チャンク id の集合 (充足率用)。"""
+        return self._snapshot_target_ids()
+
+    def _uncommitted_target_ids(self) -> set[str]:
+        """put 済みで snapshot に未だ無い問いの対象チャンク id。
+
+        事象ログから replay したオーバーレイから引くので再起動を跨ぐ — プロセス内の集合だけで
+        持つと、取消で commit されずに残った問いのチャンクを再起動の後に作り直す (f_01 §6.4、2026-09-30)。
+        """
+        if not self.exists():
+            return set()
+        out: set[str] = set()
+        for record_id in self._store.pending_ids():
+            record = self._store.get(record_id)
+            target = (record.attrs or {}).get("target_id") if record is not None else None
+            if isinstance(target, str) and target and self._is_live(target):
+                out.add(target)
+        return out
+
+    def uncommitted_count(self) -> int:
+        """事象ログに put 済みで、まだ snapshot に畳んでいない事象の数 (再起動後は replay した数)。
+
+        開けていない索引 (起動時の :meth:`load` が失敗した等) は読み直さず 0 を返す —
+        毎サイクル同じ失敗を Step 5.9 へ上げないように。
+        """
+        if not self.exists() or not self._loaded:
+            return 0
+        return max(0, int(self._store.manifest.events_since_snapshot))
+
+    def screened_out_target_ids(self) -> set[str]:
+        """品質検査で問いを全部捨てた対象チャンク id (このプロセスの間は作り直さない)。"""
+        return set(self._screened_out)
+
+    def mark_screened_out(self, target_id: str) -> None:
+        """問いを全部捨てた対象チャンクを覚える (Step 5.9 が backfill で毎回選び直さないように)。"""
+        self._screened_out.add(target_id)
 
     # ── 書き込み (sleep-time だけ) ──
 
@@ -186,6 +229,7 @@ class PseudoQueryIndex:
         if not self.exists():
             self.directory.mkdir(parents=True, exist_ok=True)
             self._store.load()
+            self._loaded = True
         elif not self._loaded:
             self.load()
         now = utc_now()
@@ -214,10 +258,7 @@ class PseudoQueryIndex:
                 confidence=confidence,
                 attrs=attrs,
             ))
-        count = self._store.put_many(records, by="pseudo_query_gen")
-        if count:
-            self._pending_targets.add(target_id)
-        return count
+        return self._store.put_many(records, by="pseudo_query_gen")
 
     async def commit(self) -> int:
         """put した問いを snapshot に畳み、新規行だけ埋め込む。孤児は新しい版に書かない。"""
@@ -243,7 +284,6 @@ class PseudoQueryIndex:
         self._store.manifest.folded_through = EventPosition()
         self._store.manifest.events_since_snapshot = 0
         self._store.save_manifest()
-        self._pending_targets.clear()
         self._target_ids_cache = {}
         return len(self._store)
 

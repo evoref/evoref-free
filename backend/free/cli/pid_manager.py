@@ -511,7 +511,19 @@ def collect_configured_ports(config: dict) -> list[int]:
     if embed_cfg.get("backend") == "llama-cpp" and embed_cfg.get("llama_port"):
         ports.append(embed_cfg["llama_port"])
 
+    # リランカー (rag.rerank.mode が off 以外のときだけ。起動時のポート競合検査の対象、c_16 §7.2.1)
+    from backend.schemas.rag import rerank_mode_of
+
+    if rerank_mode_of(config) != "off":
+        ports.append(_rerank_port(config))
+
     return ports
+
+
+def _rerank_port(config: dict) -> int:
+    """rerank 用 llama-server のポート (既定 8083)。"""
+    rr = (config.get("rag") or {}).get("rerank") or {}
+    return int(rr.get("port", 8083))
 
 
 def expected_images_by_port(
@@ -528,6 +540,9 @@ def expected_images_by_port(
     embed_cfg = config.get("embedding", {})
     if embed_cfg.get("backend") == "llama-cpp" and embed_cfg.get("llama_port"):
         expected[embed_cfg["llama_port"]] = IMAGE_LLAMA
+    # rerank のポートは mode off でも掃除する (off に変えた後に残った llama-server を止める)。
+    # 止めるのは llama-server のイメージだけ (別のプロセスは触らない)。
+    expected.setdefault(_rerank_port(config), IMAGE_LLAMA)
     if include_frontend:
         expected[FRONTEND_PORT] = IMAGE_FRONTEND
     return expected

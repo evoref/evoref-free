@@ -1,6 +1,6 @@
 """サーバー管理 API: llama-server プロセスの起動・停止
 
-フロントエンドからベース/補助タスク/埋め込みの
+フロントエンドからベース/埋め込み/リランカーの
 llama-server プロセスを個別に起動・停止できるようにする。
 """
 
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api/servers", tags=["server-control"])
 # プロセス管理コンテナ（モジュールレベルシングルトン）
 # ────────────────────────────────────────────
 
-ServerName = Literal["base", "embed"]
+ServerName = Literal["base", "embed", "rerank"]
 
 
 @dataclass
@@ -138,6 +138,23 @@ def _build_cmd(
         port = embed_cfg.get("llama_port", 8082)
         return (cmd, host, port)
 
+    if name == "rerank":
+        # 保存済みの自己テストで有効な配置だけで起こす (測り直すのは起動スクリプト、c_16 §7.2.1)
+        from scripts.launch_llama import (
+            RERANK_HOST,
+            build_rerank_cmd,
+            rerank_port,
+            saved_rerank_placement,
+        )
+
+        placement = saved_rerank_placement(cfg, project_root)
+        if placement is None:
+            return None
+        cmd = build_rerank_cmd(cfg, project_root, placement)
+        if cmd is None:
+            return None
+        return (cmd, RERANK_HOST, rerank_port(cfg))
+
     return None
 
 
@@ -177,8 +194,10 @@ def _rotate_if_large(path: Path) -> None:
         logger.warning("Failed to rotate %s: %s", path, exc)
 
 
-def _spawn_server(name: ServerName, cfg: dict) -> ManagedProcess | None:
-    """llama-server プロセスを起動"""
+def _spawn_server(
+    name: ServerName, cfg: dict, *, cmd_override: list[str] | None = None,
+) -> ManagedProcess | None:
+    """llama-server プロセスを起動 (``cmd_override`` は埋め込みの CPU 再起動用)"""
     project_root = _find_project_root()
     result = _build_cmd(name, cfg, project_root)
     if result is None:
@@ -186,6 +205,8 @@ def _spawn_server(name: ServerName, cfg: dict) -> ManagedProcess | None:
         return None
 
     cmd, host, port = result
+    if cmd_override is not None:
+        cmd = cmd_override
     logger.info("server_control: starting %s on %s:%d", name, host, port)
     logger.debug("server_control: cmd=%s", cmd)
 
@@ -276,6 +297,9 @@ def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
     if name == "embed":
         emb = cfg.get("embedding", {}) or {}
         return emb.get("llama_host", "localhost"), int(emb.get("llama_port", 8082))
+    if name == "rerank":
+        rr = (cfg.get("rag") or {}).get("rerank") or {}
+        return "127.0.0.1", int(rr.get("port", 8083))
     return None
 
 
@@ -466,12 +490,32 @@ async def start_server(
 
     # ヘルスチェック待機。expected_model_id で /props の load 済みモデルまで
     # 検証し、旧プロセス残響の誤 ready 判定を防ぐ。
-    from scripts.launch_llama import wait_for_health, _extract_model_basename
-    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
-    healthy = await asyncio.to_thread(
-        wait_for_health, managed.host, managed.port, health_timeout,
-        _extract_model_basename(cmd) if cmd else None,
+    from scripts.launch_llama import (
+        EMBED_GPU_START_TIMEOUT_SEC,
+        _extract_model_basename,
+        embed_cpu_fallback_cmd,
+        wait_for_health,
     )
+    health_timeout = int((cfg.get("process_manager") or {}).get("health_timeout", 120))
+    expected = _extract_model_basename(cmd) if cmd else None
+    # 埋め込みが保存済みの GPU 配置 (auto) なら、起動しなければ CPU で 1 回だけ起こし直す
+    # (埋め込みは必須機能。保存結果は書き換えない、c_16 §7.2.2)
+    fallback = embed_cpu_fallback_cmd(cfg, cmd) if name == "embed" and cmd else None
+    first_timeout = min(health_timeout, EMBED_GPU_START_TIMEOUT_SEC) if fallback else health_timeout
+    healthy = await asyncio.to_thread(
+        wait_for_health, managed.host, managed.port, first_timeout, expected,
+    )
+    if not healthy and fallback is not None:
+        logger.warning(
+            "server_control: embed on GPU did not become healthy within %ds; restarting it on CPU",
+            first_timeout,
+        )
+        _stop_server(name)
+        managed = _spawn_server(name, cfg, cmd_override=fallback)
+        if managed is not None:
+            healthy = await asyncio.to_thread(
+                wait_for_health, managed.host, managed.port, health_timeout, expected,
+            )
 
     if healthy:
         await _try_reconnect(name, state, cfg)
@@ -524,6 +568,8 @@ async def stop_server(
                     await state.embedder.aclose()
                 except Exception as e:
                     logger.warning("server_control: failed to close embedder client: %s", e)
+        elif name == "rerank":
+            await _close_reranker_client(state)
 
     return ServerActionResponse(
         name=name,
@@ -559,3 +605,19 @@ async def _try_reconnect(
             await reload_embedder(state)
         except Exception as e:
             logger.warning("server_control: embed reload after start failed: %s", e)
+
+    elif name == "rerank":
+        # 死んだサーバへの kept-alive socket を捨てる (次の rerank 呼出で作り直す)
+        await _close_reranker_client(state)
+
+
+async def _close_reranker_client(state: AppState) -> None:
+    """``RerankClient`` の httpx クライアントだけ閉じる (オブジェクトは残す)。"""
+    gen = getattr(state, "gen", None)
+    reranker = getattr(gen, "reranker", None) if gen is not None else None
+    if reranker is None:
+        return
+    try:
+        await reranker.aclose()
+    except Exception as e:
+        logger.warning("server_control: failed to close rerank client: %s", e)

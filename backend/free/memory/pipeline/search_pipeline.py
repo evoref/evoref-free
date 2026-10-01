@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import re
 import zlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
@@ -34,6 +34,7 @@ from backend.free.constants import (
 )
 from backend.free.rag.chunk_content_gate import ChunkContentGate, GateConfig
 from backend.free.rag.evidence.types import compute_claim_key
+from backend.free.rag.rerank_llamacpp import degenerate_reason
 from backend.free.core.inference import SUMMARY_TAIL_RE
 from backend.free.core.intent_vocab import NUMERAL_HINT_RE
 from backend.free.rag.self_rag_judge import (
@@ -382,6 +383,7 @@ async def _search_episodic_layer(
     threshold: float = 0.0,
     own_session: str | None = None,
     create_session: str | None = None,
+    mode: str = "chat",
 ) -> list[StoreEntry]:
     """エピソード記憶 (``short`` → ``long``) を 1 回で引く。
 
@@ -449,7 +451,7 @@ async def _search_episodic_layer(
                 "as reference material", before - len(hits),
             )
     else:
-        hits = _answers_for_question_only_hits(episodic, hits)
+        hits = _answers_for_question_only_hits(episodic, hits, query, mode)
     hits = _latest_statement_per_slot(hits)
 
     entries: list[StoreEntry] = []
@@ -576,7 +578,9 @@ def _latest_statement_per_slot(hits: list) -> list:
     return kept
 
 
-def _answers_for_question_only_hits(episodic, hits: list) -> list:
+def _answers_for_question_only_hits(
+    episodic, hits: list, query: str = "", mode: str = "chat",
+) -> list:
     """問いだけの user ノートが当たったら、その **答え** の assistant ノートを差し出す。
 
     過去セッションのユーザーの問い (「発表の日付とテーマを確認させてください」)
@@ -591,10 +595,39 @@ def _answers_for_question_only_hits(episodic, hits: list) -> list:
     (走査しない)。答えのノートが無い / 退役済み / 自分が注入した出力なら
     元の問いのまま (後段が従来どおり捨てる)。順位 (cosine / score) は問いの
     ものを継ぐ — 当たったのは問いであり、答えはその付属。
+
+    差し替えは origin 規則 (assistant のノートを落とす) の迂回路なので、次の
+    2 つでは差し替えない (2026-09-30 実機 QC01、f_02 §8.3):
+
+    - 問いが利用者の属性を尋ねている (``MemoryInjector._asked_attributes`` が
+      空でない)。個人の値の出所は利用者の発話と SemMem だけにする
+      (:func:`_latest_statement_per_slot` が assistant を勝者にしないのと同じ)。
+      「私の犬の名前は何?」に過去の答え「猫の名前はきなこです」を渡していた。
+    - 答えの本文が値を述べていない (問いの側と同じ既存の判定)。問い返しや
+      「参考情報には記載がありません」を証拠として手渡さない。
     """
     if not hits or episodic is None:
         return hits
-    from backend.free.core.text_quality import carries_no_assertion, states_no_user_value
+    from backend.free.core.session_mode import normalize_session_mode
+    from backend.free.memory.pipeline.injector import MemoryInjector
+
+    asked = MemoryInjector._asked_attributes(query, normalize_session_mode(mode))
+    if asked:
+        if any(
+            h.record.origin == "user" and (getattr(h.record, "attrs", None) or {}).get("answered_by")
+            for h in hits
+        ):
+            logger.info(
+                "Episodic: the query asks for user attribute(s) (%s); question-only "
+                "hits are not replaced by our own answers",
+                ", ".join(sorted(asked)),
+            )
+        return hits
+    from backend.free.core.text_quality import (
+        abstains_on_reference_material,
+        carries_no_assertion,
+        states_no_user_value,
+    )
     from backend.free.memory.episodic.store import EpisodicHit
     from backend.free.rag.evidence.store import is_active
 
@@ -620,6 +653,9 @@ def _answers_for_question_only_hits(episodic, hits: list) -> list:
             or not is_active(answer, now_epoch)
             or not (answer.text or "").strip()
             or _is_injected_output(answer.text)
+            or carries_no_assertion(answer.text)
+            or states_no_user_value(answer.text)
+            or abstains_on_reference_material(answer.text)
         ):
             out.append(hit)
             continue
@@ -766,8 +802,12 @@ def _resolve_corpus_thresholds(
 
     Returns:
         ``(corpus の QualityThresholds, pq_gate, veto, on_topic_bar)``。
-        ``on_topic_bar`` は充足率が低い間の関連性ゲートで本体側に使う棒
-        (較正の ``match_top1_p25``、無ければ ``None`` = confidence に倒す)。
+        ``veto`` は ``pq_gate`` だけで corpus ごと拒否してよいか (充足率 ≥
+        ``gate_min_coverage`` かつ較正の ``pq_veto_allowed``)。``on_topic_bar`` は
+        拒否しないときの OR で本体側に使う棒 — 較正の ``on_topic_threshold``
+        (``match_top1_p25``)、問いの少ない較正ではプロファイルの棒、どちらも
+        無ければ ``None`` (呼び出し側が confidence に倒す)。未較正は
+        ``(記憶側の棒, None, False, None)``。
 
     有効条件は 2 段 (2026-09-12 (b) で分離):
 
@@ -779,7 +819,12 @@ def _resolve_corpus_thresholds(
     2. **関連性ゲート** (Step 3d の「pq_gate を越える疑似クエリが無ければ corpus
        ごと引かない」という拒否) だけ充足率 ≥ ``rag.pseudo_query.gate_min_coverage``
        を要る。疑似クエリを持たないチャンクへの問いは pq が無いのが当然で、
-       充足率が低い間に拒否すると正解を落とす。
+       充足率が低い間に拒否すると正解を落とす。充足していても、較正の正側と
+       null 側が重なる (``pq_overlap``) か問いが ``MIN_PQ_FOR_TOPIC_GATE`` 未満なら
+       拒否しない (``pq_veto_allowed``、2026-09-30)。
+    3. ``on_topic_bar`` は問いが ``MIN_PQ_FOR_TOPIC_GATE`` 未満の較正では
+       埋め込みプロファイルの棒 (``injection_relevance_min_score``) に倒す
+       (``on_topic_calibrated``。プロファイルに値が無ければ較正値のまま)。
 
     以前は両方を充足率で縛っていたため、大きな corpus を入れ直すと充足 50% まで
     (1070 チャンクで約 3 時間のアイドル) 記憶側の棒 0.64 に倒れ、その間 corpus の
@@ -805,8 +850,17 @@ def _resolve_corpus_thresholds(
     )
     pq_gate = calibration.get("pq_gate")
     thresholds = QualityThresholds.from_config(rag_cfg, calibration=calibration)
-    veto = pq_gate is not None and coverage >= min_coverage
+    # 重なった較正 / 問いの少ない較正は拒否しない (低充足率と同じ OR に倒す)。
+    veto = (
+        pq_gate is not None and coverage >= min_coverage
+        and bool(calibration.get("pq_veto_allowed", True))
+    )
     on_topic = calibration.get("on_topic_threshold")
+    if not calibration.get("on_topic_calibrated", True):
+        # 問いが少ない p25 は揺れる — 較正前と同じ埋め込みプロファイルの棒に倒す。
+        profile_bar = _profile_absolute_floor()
+        if profile_bar is not None:
+            on_topic = profile_bar
     on_topic_bar = float(on_topic) if on_topic is not None else None
     return thresholds, (float(pq_gate) if pq_gate is not None else None), veto, on_topic_bar
 
@@ -903,7 +957,7 @@ async def _search_pseudo_query_layer(
         raise
     except (RAGError, RuntimeError, ValueError, TypeError, OSError) as e:
         logger.warning("Pseudo-query search failed: %s", e)
-        return []
+        return [], set()
 
 
 def _interleave_pseudo(
@@ -1188,6 +1242,22 @@ def _resolve_relative_keep_ratio(rag_cfg: dict) -> float:
     return max(0.0, min(1.0, ratio))
 
 
+def _pseudo_floor(
+    rag_cfg: dict, corpus_thresholds: QualityThresholds, pq_gate: float | None,
+) -> float:
+    """疑似クエリ由来の行の棒 (f_01 §6.3)。
+
+    較正済みなら ``pq_gate``、無ければ :func:`_resolve_keep_floor` の絶対の棒
+    (相対の棒・弱い集合の上乗せ無し)。フロアを切った構成 (``low_quality_keep_floor``
+    が 0) では他の棒と同じく 0.0。
+    """
+    if float((rag_cfg.get("self_rag") or {}).get("low_quality_keep_floor", 0.0)) <= 0.0:
+        return 0.0
+    if pq_gate is not None:
+        return pq_gate
+    return _resolve_keep_floor(rag_cfg, corpus_thresholds, top_raw_score=0.0)
+
+
 def _resolve_keep_floor(
     rag_cfg: dict,
     thresholds: QualityThresholds,
@@ -1330,7 +1400,9 @@ async def unified_search(
     judge_tracker: "JudgeUsageTracker | None" = None,
     corpus_mode: str = "auto",
     correction_trail: dict[str, str] | None = None,
+    correction_successors: Mapping[str, Sequence[str]] | None = None,
     skip_gate=None,
+    reranker: "Reranker | None" = None,
 ) -> SearchResult:
     """統合検索パイプライン: Self-RAG + エピソード記憶 + corpus
 
@@ -1372,16 +1444,27 @@ async def unified_search(
             参照へ ``（訂正済み）`` を付け、現在値を随伴させるために使う。
             セッションを跨いだ訂正はこちらでしか解けない
             (:func:`attach_superseding_corrections`、2026-09-14 監査 F-01)。
+        correction_successors: SemMem の世代から引いた
+            ``{被訂正ノート id: 訂正後の根拠ノート id 列}``。再順位段が episodic を
+            並べ替えた回に、採用した訂正の組を訂正後が上になるよう入れ替えるために使う
+            (:func:`enforce_correction_order`、f_02 §5.3)。
+        reranker: 再順位段 (c_16 §7.2.1)。``rag.rerank.mode: on`` かつ自己テストを
+            通ったときだけ渡る (``GenPillar.reranker``)。``None`` なら従来どおり。
     """
     cfg = config or {}
     rag_cfg = cfg.get("rag", {})
     top_k, stm_top_k, noise_sigma = _resolve_search_params(policy, rag_cfg, mode)
     multiplier = _resolve_fetch_multiplier(cfg)
     fetch_k = top_k * multiplier
+    # 再順位段が動くときだけ、候補プール用に corpus と episodic を候補数まで広く引く。
+    # 席の除外・関連性ゲート・floor の top1・スロットごとの最新は元の fetch_k 幅の結果で
+    # 決め、広げて増えた行はプールの候補にだけ使う (c_16 §7.2.1 の第 2 / 第 4 段階)。
+    corpus_fetch_k = max(fetch_k, _rerank_candidates(reranker))
+    episodic_fetch_k = corpus_fetch_k
     rescore_candidates = _resolve_rescore_candidates(rag_cfg)
     logger.debug(
-        "unified_search: query=%r, top_k=%d, fetch_k=%d (mult=%d)",
-        query[:80], top_k, fetch_k, multiplier,
+        "unified_search: query=%r, top_k=%d, fetch_k=%d (mult=%d, corpus=%d)",
+        query[:80], top_k, fetch_k, multiplier, corpus_fetch_k,
     )
 
     # Step 1: Self-RAG 検索必要性判定 (純ルール、uncertain は retrieve に倒す)
@@ -1476,11 +1559,16 @@ async def unified_search(
                 "Corpus layer skipped: the query is date arithmetic answered by a tool: %s",
                 query[:50],
             )
-    epi_entries, corpus_entries, (pseudo_entries, hinted_pq_ids) = await asyncio.gather(
+    widen_corpus = corpus_fetch_k > fetch_k and not skip_corpus
+    widen_episodic = episodic_fetch_k > fetch_k and episodic is not None
+    (
+        epi_entries, corpus_entries, (pseudo_entries, hinted_pq_ids), wide_corpus, wide_episodic,
+    ) = await asyncio.gather(
         _search_episodic_layer(
             episodic, query, query_vec, fetch_k, drop_past_answers,
             threshold=store_gate, own_session=own_session,
             create_session=session_id if is_create_mode(mode) else None,
+            mode=mode,
         ),
         _empty_corpus_layer() if skip_corpus else _search_corpus_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
@@ -1489,6 +1577,16 @@ async def unified_search(
         _search_pseudo_query_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
         ) if pseudo_enabled and not skip_corpus else _empty_pseudo_layer(),
+        _search_corpus_layer(
+            cartridge_mgr, query_vec, corpus_fetch_k, timeout_ms=cart_timeout_ms,
+            rescore_candidates=rescore_candidates, query_text=query,
+        ) if widen_corpus else _empty_corpus_layer(),
+        _search_episodic_layer(
+            episodic, query, query_vec, episodic_fetch_k, drop_past_answers,
+            threshold=store_gate, own_session=own_session,
+            create_session=session_id if is_create_mode(mode) else None,
+            mode=mode,
+        ) if widen_episodic else _empty_corpus_layer(),
     )
     if timer is not None:
         timer.stop("retrieval_ms")
@@ -1532,14 +1630,15 @@ async def unified_search(
         top_body = max((entry[1] for entry in corpus_entries), default=0.0)
         if not passes and not pq_veto:
             # 充足率が低い間は疑似クエリを持たないチャンクへの問いが pq を
-            # 持てないので、本体 top1 が正解 top1 の p50 (confidence) を越える
+            # 持てないので、本体 top1 が正解 top1 の p25 (on_topic) を越える
             # ことも、転置索引の席が立ったこと (固有語の一致) も「話題が合う」
             # 信号として認める (f_01 §6.6 / §8.1 の 4.3、2026-09-12 (b))。
+            # 較正が重なる / 問いが少ないときも同じ OR に倒す (2026-09-30)。
             passes = top_body >= on_topic_bar or bool(seat_entries)
         if not passes:
             logger.info(
                 "Pseudo-query gate: corpus skipped (top pq cosine %.3f < gate %.3f, "
-                "top body %.3f < on_topic %.3f, coverage veto=%s) for query: %s",
+                "top body %.3f < on_topic %.3f, veto=%s) for query: %s",
                 top_pq, pq_gate, top_body, on_topic_bar, pq_veto,
                 query[:50],
             )
@@ -1553,6 +1652,10 @@ async def unified_search(
     # (品質判定 / gate / floor 用)。2 つは同じ id 集合を指すので、片方で落とした
     # ものをもう片方へ射影する下流の手順が id で完全に揃う。
     merged_entries = _merge_results(epi_entries, corpus_entries)
+    # 広く引いた corpus のうち元の幅に無かった行 (Step 6.8 のプール候補だけに使う)。
+    step4_ids = {entry[0] for entry in merged_entries} | {entry[0] for entry in pseudo_entries}
+    pool_extras = [] if corpus_gated else [e for e in wide_corpus if e[0] not in step4_ids]
+    episodic_pool_extras = [e for e in wide_episodic if e[0] not in step4_ids]
     # Step 4.2 / 4.3: 疑似クエリ由来と転置索引の席を先頭に位置で interleave
     # (f_01 §6.3 / §8.1 の 4.3)。席は疑似クエリの後ろ。
     # 疑似クエリ由来を先頭に置くのは充足率 ≥ gate_min_coverage のときだけ —
@@ -1573,6 +1676,12 @@ async def unified_search(
             len(pseudo_entries) - len(kept), len(pseudo_entries), len(kept),
         )
         pseudo_entries = kept
+    # 疑似クエリ由来の列に入れるのは、自身の棒 (Step 6.5 の floor_pseudo) を越える
+    # 行だけ (f_01 §6.3)。越えない行を先頭に置くと、同じチャンクの本体の行が id の
+    # 畳み込みで消え、その行も floor で落ちて本体 top1 の正解ごと注入されない。
+    floor_pseudo = _pseudo_floor(rag_cfg, corpus_thresholds, pq_gate)
+    if pseudo_entries and floor_pseudo > 0.0:
+        pseudo_entries = [e for e in pseudo_entries if e[1] >= floor_pseudo]
     head = list(pseudo_entries) + [e for e in seat_entries if not corpus_gated]
     merged_entries = _interleave_pseudo(head, merged_entries)
     merged = rank_view(merged_entries)
@@ -1705,10 +1814,6 @@ async def unified_search(
         rag_cfg, corpus_thresholds,
         top_raw_score=max((s for cid, s, _ in merged_raw if cid in corpus_ids), default=0.0),
     )
-    floor_pseudo = (
-        pq_gate if pq_gate is not None
-        else _resolve_keep_floor(rag_cfg, corpus_thresholds, top_raw_score=0.0)
-    )
 
     def _floor_for(cid: str) -> float:
         if cid in pseudo_ids:
@@ -1778,7 +1883,24 @@ async def unified_search(
             corpus_starved=pq_gate is not None and bool(corpus_ids),
         )
 
-    # Step 7: 最終順位付け (merged は順位式のスコア降順) から top_k 件を採用。
+    # Step 6.8: 再順位段 (c_16 §7.2.1)。floor を通った corpus / episodic の候補だけを
+    # 1 回の呼出で並べ替え、各ストアが占める位置の集合は変えない (ストア間の配分・
+    # store_prior・freshness を保つ)。
+    reranked_ids: set[str] = set()
+    outcome: RerankOutcome | None = None
+    if reranker is not None:
+        extras = _eligible_pool_extras(query, pool_extras, merged, floor=floor_corpus)
+        episodic_extras = _eligible_episodic_extras(
+            query, episodic_pool_extras, [*merged, *extras], floor=floor_epi,
+        )
+        outcome = await _rerank_corpus(
+            query, merged, reranker, extras=extras, episodic_extras=episodic_extras, timer=timer,
+        )
+        merged = outcome.merged
+        if outcome.scores is not None:
+            reranked_ids = set(outcome.pool_ids)
+
+    # Step 7: 最終順位付け (merged は順位式のスコア降順。Step 6.8 が並べ替えたらその順) から top_k 件を採用。
     # カートリッジ公平性保証 (旧 Step 7.5) と語彙アンカーの随伴 (旧 Step 7.55) は
     # 廃止した (c_16 §7)。前者は ``priority`` 由来の席の奪い合いを補正するための
     # 装置で、順位式が 1 本になり ``store_prior`` が明示の係数になった今は、
@@ -1788,9 +1910,11 @@ async def unified_search(
     final_sources = merged[:top_k]
     # 転置索引の席 (f_01 §8.1 の 4.3): 棒を越えて残った席が中間の並べ替えで
     # top_k の外へ出ていたら、末尾の 1 席と入れ替える (席は位置の予約であって
-    # スコアではない)。
-    if seat_entries and not corpus_gated:
-        seat_ids = {entry[0] for entry in seat_entries}
+    # スコアではない)。再順位段のプールに入って判定を受けた席は保証しない
+    # (実測: 保証すると r@5 63.7 → 62.5、c_16 §7.2.1)。
+    guarded_seats = {entry[0] for entry in seat_entries} - reranked_ids
+    if guarded_seats and not corpus_gated:
+        seat_ids = guarded_seats
         chosen = {cid for cid, _, _ in final_sources}
         for entry in merged[top_k:]:
             if entry[0] in seat_ids and entry[0] not in chosen and final_sources:
@@ -1798,6 +1922,16 @@ async def unified_search(
                 chosen.add(entry[0])
                 if len(chosen & seat_ids) >= len(seat_ids):
                     break
+
+    # Step 7.2: 6.8 が episodic を並べ替えた回だけ、採用した訂正の組を訂正後が上になるよう
+    # 入れ替える (f_02 §5.3)。top_k の後に掛けるので採用の集合は変わらない — 前に掛けると
+    # 訂正前が席から押し出され、話題語を持たない訂正だけが残る。訂正前だけの組は 7.6 に任せる。
+    swapped: list[tuple[str, str]] = []
+    if outcome is not None and outcome.episodic_scores is not None:
+        final_sources, swapped = enforce_correction_order(
+            final_sources, correction_pairs(correction_successors),
+        )
+    _log_rerank_applied(debug_logger, outcome, swapped)
 
     # Step 7.6: 採用ノートが後続の訂正で上書きされているなら、訂正も一緒に出す。
     # top_k で切った **後** に足す — 訂正は席を争う候補ではなく随伴情報であり、
@@ -1845,6 +1979,327 @@ async def unified_search(
         corpus_starved=pq_gate is not None and bool(corpus_ids) and not any(
             cid in corpus_ids for cid, _, _ in final_sources
         ),
+    )
+
+
+class Reranker(Protocol):
+    """再順位段のクライアント (EvorefGen の ``RerankClient`` が満たす面)。"""
+
+    candidates: int
+
+    async def rerank(
+        self, query: str, documents: Sequence[str], *, ids: Sequence[str] | None = None,
+    ) -> list[float] | None: ...
+
+
+def _rerank_candidates(reranker: Reranker | None) -> int:
+    """1 回に並べ替える候補数 (自己テストと設定で決まる値)。再順位段が無ければ 0。"""
+    if reranker is None:
+        return 0
+    return max(0, int(reranker.candidates))
+
+
+def store_rerank_positions(
+    merged: Sequence[tuple[str, float, str]], limit: int, store: str,
+) -> list[int]:
+    """``merged`` の中で ``store`` の項目が占める位置 (現順位で上位 ``limit`` 件)。"""
+    positions = [i for i, (cid, _score, _text) in enumerate(merged) if _store_of(cid) == store]
+    return positions[:max(0, limit)]
+
+
+def corpus_rerank_positions(
+    merged: Sequence[tuple[str, float, str]], limit: int,
+) -> list[int]:
+    """``merged`` の中で corpus 項目が占める位置 (現順位で上位 ``limit`` 件)。"""
+    return store_rerank_positions(merged, limit, "corpus")
+
+
+def apply_store_rerank(
+    merged: Sequence[tuple[str, float, str]],
+    scores: Sequence[float],
+    limit: int,
+    store: str,
+) -> list[tuple[str, float, str]]:
+    """``store`` の位置の集合を保ったまま、候補プール (上位 ``limit`` 件) を再順位で並べる。
+
+    他のストアの項目と位置は動かさない。``store`` の位置には「プールを再順位の降順 (同点は
+    現順位) → プール外の同じストアの項目を現順位」で詰める。``scores`` はプールの入力順。
+    """
+    positions = [i for i, (cid, _score, _text) in enumerate(merged) if _store_of(cid) == store]
+    pool = positions[:max(0, limit)]
+    if len(scores) != len(pool):
+        raise ValueError(f"rerank scores ({len(scores)}) do not match the pool ({len(pool)})")
+    order = sorted(range(len(pool)), key=lambda j: -scores[j])
+    sequence = [pool[j] for j in order] + positions[len(pool):]
+    out = list(merged)
+    for slot, source in zip(positions, sequence):
+        out[slot] = merged[source]
+    return out
+
+
+def apply_corpus_rerank(
+    merged: Sequence[tuple[str, float, str]],
+    scores: Sequence[float],
+    limit: int,
+) -> list[tuple[str, float, str]]:
+    """corpus の位置の集合を保ったまま、候補プール (上位 ``limit`` 件) を再順位で並べる。"""
+    return apply_store_rerank(merged, scores, limit, "corpus")
+
+
+def _eligible_pool_extras(
+    query: str,
+    extras: Sequence[StoreEntry],
+    merged: Sequence[tuple[str, float, str]],
+    *,
+    floor: float,
+) -> list[tuple[str, float, str]]:
+    """広く引いた層の追加行のうち、プールに足してよいもの (``(id, score, text)``)。
+
+    元の幅の候補と同じ関所を掛ける: そのストアの floor (素の cosine)、注入できる本文か
+    (``eligible_rag_indices``)、``merged`` と同じ言明でないか (``claim_key``)。並びは順位式の降順。
+    """
+    seen_ids = {cid for cid, _score, _text in merged}
+    seen_claims = {_claim_key_of(text) for _cid, _score, text in merged if text}
+    passed = [e for e in extras if e[0] not in seen_ids and e[1] >= floor]
+    eligible = set(eligible_rag_indices([e[3] for e in passed], query))
+    out: list[tuple[str, float, str]] = []
+    for i, (cid, _cos, score, text) in enumerate(sorted(passed, key=lambda e: -e[2])):
+        claim = _claim_key_of(text) if text else ""
+        if i not in eligible or (claim and claim in seen_claims):
+            continue
+        seen_ids.add(cid)
+        if claim:
+            seen_claims.add(claim)
+        out.append((cid, score, text))
+    return out
+
+
+def _eligible_episodic_extras(
+    query: str,
+    extras: Sequence[StoreEntry],
+    merged: Sequence[tuple[str, float, str]],
+    *,
+    floor: float,
+) -> list[tuple[str, float, str]]:
+    """広く引いた episodic の追加行のうち、プールに足してよいもの。
+
+    :func:`_eligible_pool_extras` の関所に加えて、元の幅の episodic と **同じ属性スロット**
+    を述べる行は入れない — 「スロットごとの最新の言明」(:func:`_latest_statement_per_slot`)
+    は元の幅で決めたので、広げた幅から同じスロットの別の言明を足すと、元の幅では 1 件に
+    絞った値が 2 件並ぶ (c_16 §7.2.1 の第 4 段階)。
+    """
+    from backend.free.memory.notes.note_builder import restated_attribute_slot
+
+    candidates = [e for e in extras if _store_of(e[0]) == "episodic"]
+    passed = _eligible_pool_extras(query, candidates, merged, floor=floor)
+    if not passed:
+        return passed
+    taken_slots = {
+        slot for cid, _score, text in merged
+        if _store_of(cid) == "episodic" and (slot := restated_attribute_slot(text)) is not None
+    }
+    # 広げた幅の中の重複は層 (``_latest_statement_per_slot``) が既に 1 スロット 1 件に畳んでいる。
+    return [e for e in passed if restated_attribute_slot(e[2]) not in taken_slots]
+
+
+@dataclass(frozen=True)
+class RerankOutcome:
+    """Step 6.8 の結果。``scores`` は corpus のプールの入力順 (``pool_ids`` と同じ並び)。
+
+    corpus を並べなかった (候補 2 件未満) / 縮退した回は ``scores`` が ``None``。``episodic_scores`` / ``episodic_pool_ids``
+    は episodic のプールの同じ値 (並べなかった回は ``None`` / 空)。縮退した回の ``merged`` は入力のまま。
+    """
+
+    merged: list[tuple[str, float, str]]
+    pool_ids: tuple[str, ...] = ()
+    scores: tuple[float, ...] | None = None
+    episodic_pool_ids: tuple[str, ...] = ()
+    episodic_scores: tuple[float, ...] | None = None
+
+
+def _pool_order(pool_ids: Sequence[str], scores: Sequence[float] | None) -> list[str]:
+    """プールの id を再順位の降順 (同点は現順位) に並べる。スコアが無ければ空。"""
+    if scores is None:
+        return []
+    return [pool_ids[j] for j in sorted(range(len(pool_ids)), key=lambda j: -scores[j])]
+
+
+async def _rerank_corpus(
+    query: str,
+    merged: list[tuple[str, float, str]],
+    reranker: Reranker,
+    *,
+    extras: Sequence[tuple[str, float, str]] = (),
+    episodic_extras: Sequence[tuple[str, float, str]] = (),
+    timer: "StageTimer | None" = None,
+) -> RerankOutcome:
+    """Step 6.8 の本体。corpus と episodic のプールを 1 回の呼出で並べ替える (c_16 §7.2.1)。
+
+    ``extras`` / ``episodic_extras`` (元の幅に無かった追加行) は ``merged`` の後ろに置いて
+    プールの候補にし、縮退した回は捨てる (結果は再順位段が無いときと同じ)。総数は
+    ``candidates`` 件で、corpus が先に取り、episodic は残りの枠を取る (corpus のプールと
+    注入の確認の較正の前提を変えないため)。各ストアとも 2 件未満なら送らない。
+    位置の集合はストアごとに保つ。失敗・締切超過・退化 (``rerank`` が ``None``) は現順位のまま
+    (チャットを止めない、e_03 §4.4)。
+    """
+    limit = _rerank_candidates(reranker)
+    widened = (
+        list(merged)
+        + [e for e in extras if _store_of(e[0]) == "corpus"]
+        + [e for e in episodic_extras if _store_of(e[0]) == "episodic"]
+    )
+    positions = store_rerank_positions(widened, limit, "corpus")
+    if len(positions) < 2:
+        positions = []
+    epi_positions = store_rerank_positions(widened, limit - len(positions), "episodic")
+    if len(epi_positions) < 2:
+        epi_positions = []
+    if not positions and not epi_positions:
+        return RerankOutcome(merged=merged)
+    sent = positions + epi_positions
+    if timer is not None:
+        timer.start("rerank_ms")
+    try:
+        scores = await reranker.rerank(
+            query,
+            [widened[i][2] for i in sent],
+            ids=[widened[i][0] for i in sent],
+        )
+    except Exception as e:  # noqa: BLE001 — 再順位の失敗で応答を止めない
+        logger.warning("Rerank failed, keeping the current order: %s: %s", type(e).__name__, e)
+        scores = None
+    finally:
+        if timer is not None:
+            timer.stop("rerank_ms")
+    if scores is None or len(scores) != len(sent):
+        return RerankOutcome(merged=merged)
+    corpus_scores = [float(s) for s in scores[:len(positions)]]
+    epi_scores = [float(s) for s in scores[len(positions):]]
+    # 呼出全体では健全でも、ストアの中で退化 (全 0 / 同値) していればそのストアは縮退扱い
+    # (現順位のまま、追加行は入れない)。
+    corpus_degenerate = bool(positions) and degenerate_reason(corpus_scores) is not None
+    epi_degenerate = bool(epi_positions) and degenerate_reason(epi_scores) is not None
+    if corpus_degenerate or epi_degenerate:
+        logger.info(
+            "Rerank: degenerate scores inside a store (corpus=%s, episodic=%s); keeping its order",
+            corpus_degenerate, epi_degenerate,
+        )
+    if corpus_degenerate:
+        positions, corpus_scores = [], []
+    if epi_degenerate:
+        epi_positions, epi_scores = [], []
+    if not positions and not epi_positions:
+        return RerankOutcome(merged=merged)
+    applied = positions + epi_positions
+    out = widened
+    if positions:
+        out = apply_store_rerank(out, corpus_scores, len(positions), "corpus")
+    if epi_positions:
+        out = apply_store_rerank(out, epi_scores, len(epi_positions), "episodic")
+    # 追加行のうちプールに送らなかったものは判定を受けていないので入れない (補充しない)。
+    applied_set = set(applied)
+    unsent_extras = {
+        widened[i][0] for i in range(len(merged), len(widened)) if i not in applied_set
+    }
+    if unsent_extras:
+        out = [e for e in out if e[0] not in unsent_extras]
+    logger.info(
+        "Rerank: %d corpus / %d episodic candidate(s) reordered (%d from the widened fetch)",
+        len(positions), len(epi_positions), sum(1 for i in applied if i >= len(merged)),
+    )
+    return RerankOutcome(
+        merged=out,
+        pool_ids=tuple(widened[i][0] for i in positions),
+        scores=tuple(corpus_scores) if positions else None,
+        episodic_pool_ids=tuple(widened[i][0] for i in epi_positions),
+        episodic_scores=tuple(epi_scores) if epi_positions else None,
+    )
+
+
+def correction_pairs(
+    correction_successors: Mapping[str, Sequence[str]] | None,
+) -> list[tuple[str, str]]:
+    """訂正の組 ``(訂正前のノート id, 訂正後のノート id)`` (f_02 §5.3)。
+
+    SemMem の世代から引いた後継台帳 (``{被訂正ノート id: 訂正後の根拠ノート id 列}``) **だけ**
+    を使う。検証済みの訂正 (``from_correction``) だけが世代を作り、宛先も抽出が決めたもの
+    (不変則 #12 / #13)。同一セッションの ``corrections_by_target`` は訂正かどうかも宛先も
+    字句の候補なので、順位を入れ替える根拠にしない (7.6 の注記には従来どおり使う)。
+    自分自身を指す組は捨てる。
+    """
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for before, afters in (correction_successors or {}).items():
+        for after in afters:
+            pair = (str(before), str(after))
+            if not pair[0] or not pair[1] or pair[0] == pair[1] or pair in seen:
+                continue
+            seen.add(pair)
+            pairs.append(pair)
+    return pairs
+
+
+def enforce_correction_order(
+    sources: Sequence[tuple[str, float, str]],
+    pairs: Sequence[tuple[str, str]],
+) -> tuple[list[tuple[str, float, str]], list[tuple[str, str]]]:
+    """訂正の組が両方 ``sources`` にあれば、訂正後が訂正前より上になるよう 2 つの位置を入れ替える。
+
+    入れ替えるのは組の 2 つの位置だけで、集合と他の項目の位置は変えない (多値スロットの兄弟の
+    ノートは組に入らないので動かない、不変則 #13)。訂正前だけがある組は触らない (手順 7.6 が
+    注記と随伴を付ける)。互いに逆向きの組 (矛盾) は両方とも使わない。それより長い循環でも
+    止まるよう走査は組の数 + 1 回で打ち切り、入れ替えた組は 1 回だけ数える。
+
+    Returns:
+        ``(並べ直した sources, 入れ替えた組 (訂正前, 訂正後))``。
+    """
+    out = list(sources)
+    swapped: list[tuple[str, str]] = []
+    pair_set = set(pairs)
+    pairs = [(b, a) for b, a in pairs if (a, b) not in pair_set]
+    if not pairs or len(out) < 2:
+        return out, swapped
+    for _ in range(len(pairs) + 1):
+        changed = False
+        for before, after in pairs:
+            pos = {cid: i for i, (cid, _score, _text) in enumerate(out)}
+            i, j = pos.get(before), pos.get(after)
+            if i is None or j is None or j < i:
+                continue
+            out[i], out[j] = out[j], out[i]
+            if (before, after) not in swapped:
+                swapped.append((before, after))
+            changed = True
+        if not changed:
+            break
+    if swapped:
+        logger.info(
+            "Rerank: moved %d correction(s) above the note(s) they supersede", len(swapped),
+        )
+    return out, swapped
+
+
+def _log_rerank_applied(
+    debug_logger, outcome: RerankOutcome | None, swapped: Sequence[tuple[str, str]],
+) -> None:
+    """``op="rerank_apply"``: ストア別の前後 id と訂正の入れ替え (本文は出さない)。"""
+    if debug_logger is None or outcome is None:
+        return
+    by_store: dict[str, dict[str, list[str]]] = {}
+    if outcome.scores is not None:
+        by_store["corpus"] = {
+            "before": list(outcome.pool_ids),
+            "after": _pool_order(outcome.pool_ids, outcome.scores),
+        }
+    if outcome.episodic_scores is not None:
+        by_store["episodic"] = {
+            "before": list(outcome.episodic_pool_ids),
+            "after": _pool_order(outcome.episodic_pool_ids, outcome.episodic_scores),
+        }
+    if not by_store:
+        return
+    debug_logger.log_rerank_applied(
+        by_store=by_store, correction_swaps=len(swapped), swapped_pairs=list(swapped),
     )
 
 

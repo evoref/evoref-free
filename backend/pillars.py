@@ -46,7 +46,10 @@ if TYPE_CHECKING:
         WorkingMemoryRegistry,
     )
     from backend.free.rag.cartridge_manager import CartridgeManager
+    from backend.free.rag.embed_placement import EmbedPlacementStatus
     from backend.free.rag.embedding_backend import EmbeddingBackend
+    from backend.free.rag.rerank_llamacpp import RerankClient
+    from backend.free.rag.rerank_selftest import RerankStatus
     from backend.pro.learn_components import ProLearnComponents
 
 
@@ -59,6 +62,12 @@ class GenPillar:
         llm_client: LocalClient を束ねたファサード (chat_in_flight / is_serving_user を提供)。
         aux_client: 補助タスク LLM クライアント。未設定時は ``None``。
         embedder: 埋め込みバックエンド (llama-cpp server 経由)。未初期化時は ``None``。
+        reranker: 再順位 (``/v1/rerank``) クライアント。``rag.rerank.mode`` が off /
+            自己テストで無効 / 未テスト / サーバ不達なら ``None`` (c_16 §7.2.1)。
+            非 ``None`` なら検索経路 (``unified_search`` の Step 6.8) が corpus の候補を並べ替える。
+        rerank_status: rerank の状態 (``/api/status`` 用、起動時に 1 回決める)。
+        embed_placement: 埋め込みサーバの配置 GPU / CPU (``/api/status`` 用、起動時に 1 回決める、
+            c_16 §7.2.2)。
 
     語彙索引は pillar に持たない。3 ストアとも ``EvidenceStore`` が snapshot
     ごとに numpy CSR の転置索引を作る (c_16 §6.2) ので、共有の
@@ -69,6 +78,9 @@ class GenPillar:
     llm_client: "LLMClient | None" = None
     aux_client: "AuxClient | None" = None
     embedder: "EmbeddingBackend | None" = None
+    reranker: "RerankClient | None" = None
+    rerank_status: "RerankStatus | None" = None
+    embed_placement: "EmbedPlacementStatus | None" = None
 
 
 @dataclass

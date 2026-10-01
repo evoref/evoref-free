@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -759,6 +759,146 @@ async def _init_embedding(
     return embedder
 
 
+def _init_embed_placement_status(cfg: dict[str, Any], resolver: Any) -> Any:
+    """7e'. 埋め込みサーバの配置 (GPU / CPU) を設定と判別結果から決める (c_16 §7.2.2)。
+
+    判別するのは起動スクリプトで、ここは結果ファイルを読むだけ (起動の経路と同じ純関数
+    ``resolve_embed_placement_status``)。GPU 名は subprocess (--list-devices) が要るので比べない。
+    読めなければ CPU として返す (起動は止めない)。
+    """
+    from backend.free.rag.embed_placement import (
+        gpu_layers_setting,
+        load_placement_result,
+        resolve_embed_placement_status,
+    )
+    from backend.free.rag.rerank_selftest import collect_pc_info
+
+    raw = (cfg.get("embedding") or {}).get("gpu_layers")
+    saved = None
+    current_model_key = None
+    if gpu_layers_setting(raw) == "auto":
+        try:
+            saved, read_status = load_placement_result(resolver.resolve_local("embed_placement_file"))
+        except Exception as e:  # noqa: BLE001 - 読めなければ未判別 (起動は続ける)
+            logger.warning("Embed placement result unreadable: %s", e)
+            read_status = "error"
+        if saved is None:
+            logger.info("Embed placement not decided yet (%s); the embed server runs on CPU", read_status)
+        model_rel = (cfg.get("model_paths") or {}).get("embed_model")
+        if saved is not None and model_rel:
+            try:
+                current_model_key = resolver.model_key_for(model_rel)
+            except Exception as e:  # noqa: BLE001 - 比べられないだけ
+                logger.info("Embed model_key unavailable: %s", e)
+    status = resolve_embed_placement_status(
+        raw, saved, current_pc=collect_pc_info([]), current_model_key=current_model_key,
+    )
+    logger.info(
+        "Embed placement: %s (-ngl %d, setting=%s, reason=%s)",
+        status.placement, status.gpu_layers, status.setting, status.reason,
+    )
+    return status
+
+
+async def _init_reranker(
+    cfg: dict[str, Any],
+    resolver: Any,
+    debug_logger: "DebugLogger",
+) -> tuple[Any, Any]:
+    """7e. 再順位 (リランカー) クライアント (c_16 §7.2.1)。
+
+    自己テストの結果ファイルを読むだけ (測るのは起動スクリプト)。mode off / 未テスト /
+    無効 / 保存時と PC が違う (``stale_fingerprint``) / サーバ不達なら ``(None, status)``。
+    候補数は保存済みの ms/件と現在の締切・候補数の設定で引き直す。モデルが自己テスト後に
+    変わっていても再テストはせず WARNING だけ出す。失敗は起動を止めない。
+    """
+    from backend.free.rag.rerank_llamacpp import RerankClient
+    from backend.free.rag.rerank_selftest import (
+        collect_pc_info,
+        load_selftest_result,
+        resolve_rerank_status,
+    )
+    from backend.schemas.rag import rerank_mode_of
+
+    rr = (cfg.get("rag") or {}).get("rerank") or {}
+    mode = rerank_mode_of(cfg)
+    saved = None
+    current_pc = None
+    current_model_key = None
+    if mode != "off":
+        try:
+            saved, read_status = load_selftest_result(resolver.resolve_local("rerank_selftest_file"))
+        except Exception as e:  # noqa: BLE001 - 読めなければ無効 (起動は続ける)
+            logger.warning("Rerank self-test result unreadable: %s", e)
+            read_status = "error"
+        if saved is None:
+            logger.info("Reranker disabled: no self-test result (%s)", read_status)
+        else:
+            # GPU 名は subprocess (--list-devices) が要るので比べない
+            current_pc = collect_pc_info([])
+            model_rel = (cfg.get("model_paths") or {}).get("rerank_model")
+            if model_rel:
+                try:
+                    current_model_key = resolver.model_key_for(model_rel)
+                except Exception as e:  # noqa: BLE001 - 比べられないだけ
+                    logger.info("Rerank model_key unavailable: %s", e)
+    status = resolve_rerank_status(
+        mode, saved,
+        deadline_ms=int(rr.get("deadline_ms", 1000)),
+        max_candidates=int(rr.get("max_candidates", 20)),
+        min_candidates=int(rr.get("min_candidates", 3)),
+        current_pc=current_pc,
+        current_model_key=current_model_key,
+    )
+    if status.model_changed_since_selftest:
+        logger.warning(
+            "Rerank model changed since the self-test (%s); not re-testing "
+            "(only a PC change re-tests). Run launch_llama.py --rerank-selftest to measure it",
+            saved.model_file if saved is not None else "",
+        )
+    if not status.enabled or saved is None:
+        if mode != "off" and saved is not None:
+            logger.info("Reranker disabled: %s", status.reason)
+        return None, status
+    client = RerankClient(
+        port=int(rr.get("port", 8083)),
+        deadline_ms=int(rr.get("deadline_ms", 1000)),
+        candidates=status.candidates,
+        placement=status.placement,
+        ms_per_doc=status.ms_per_doc,
+        debug_logger=debug_logger,
+        pseudo_query_calibration=_load_pseudo_query_gate_calibration(resolver, current_model_key),
+    )
+    try:
+        reachable = await client.health_check()
+    except Exception as e:  # noqa: BLE001 - 不達と同じに扱う (起動は続ける)
+        logger.warning("Reranker health check failed: %s", e)
+        reachable = False
+    if not reachable:
+        await client.aclose()
+        logger.warning("Reranker disabled: server on :%s is not reachable", rr.get("port", 8083))
+        return None, _dc_replace(status, enabled=False, reason="server_unreachable")
+    logger.info(
+        "Reranker ready: %s, %.0f ms/doc, %d candidates (mode=%s, pseudo-query gate %s)",
+        status.placement, status.ms_per_doc or 0.0, status.candidates, mode,
+        "calibrated" if client.pseudo_query_calibration is not None else "uncalibrated",
+    )
+    return client, status
+
+
+def _load_pseudo_query_gate_calibration(resolver: Any, model_key: str | None) -> Any:
+    """疑似クエリの品質検査の較正 (c_17 §3.15)。無い / 読めなければ ``None`` (捨てない)。"""
+    if not model_key:
+        return None
+    from backend.free.rag.pseudo_query_gate import load_pseudo_query_gate_calibration
+
+    try:
+        return load_pseudo_query_gate_calibration(resolver.resolve_local("pseudo_query_gate_file"), model_key)
+    except Exception as e:  # noqa: BLE001 - 読めなければ検査で捨てない (起動は続ける)
+        logger.warning("Pseudo-query gate calibration unreadable: %s", e)
+        return None
+
+
 async def _warm_embedder(embedder: "EmbeddingBackend") -> None:
     """埋め込みサーバを 1 回叩いて初回計算のコストを起動時に払う (失敗は無視)。"""
     try:
@@ -1093,6 +1233,8 @@ def _init_sleep_time_worker(
             triggers_dir=triggers_dir,
             private_trace_ids_provider=_private_trace_ids,
             learning_disabled=learning_disabled,
+            # Step 5.9 の疑似クエリの品質検査 (c_16 §7.2.1 の第 5 段階 B)。無効なら None。
+            reranker=getattr(getattr(state, "gen", None), "reranker", None),
         )
         sleep_scheduler.set_worker(worker)
         logger.info(
@@ -1558,6 +1700,9 @@ def _init_tools(
         history_manager=get_history_manager(),
         aux_client=state.aux_client,
         project_map_reader_getter=project_map_reader_getter,
+        # search_history の再順位 (c_16 §7.2.1 の第 5 段階 A)。無効なら None で従来どおり。
+        reranker=getattr(getattr(state, "gen", None), "reranker", None),
+        debug_logger=state.debug_logger,
     )
 
     state.tools_registry = tools_reg
@@ -2178,10 +2323,19 @@ async def _build_gen_pillar(
                 _init_embedding(state, cfg, project_root, debug_logger),
             ),
         )
+        t_rerank = tg.create_task(
+            _timed_task(
+                timings, "reranker", _init_reranker(cfg, resolver, debug_logger),
+            ),
+        )
     client = t_llama.result()
     pro_shutdown = t_pro_gen.result()
     develop_shutdown = t_develop_gen.result()
     embedder = t_embed.result()
+    reranker, rerank_status = t_rerank.result()
+
+    with _timed(timings, "embed_placement"):
+        embed_placement = _init_embed_placement_status(cfg, resolver)
 
     with _timed(timings, "llm_client"):
         _init_llm_client(state, client)
@@ -2200,6 +2354,9 @@ async def _build_gen_pillar(
         llm_client=state.llm_client,
         aux_client=aux_client,
         embedder=embedder,
+        reranker=reranker,
+        rerank_status=rerank_status,
+        embed_placement=embed_placement,
     )
     return gen, pro_shutdown, develop_shutdown
 
@@ -2471,6 +2628,11 @@ async def _build_learn_pillar(
     from backend.free.generation import requested_data_file
 
     requested_data_file.bind_debug_logger(debug_logger)
+
+    # 疑似クエリの品質検査 (c_17 §3.15、sleep-time Step 5.9) も段を直接実装した判定点。
+    from backend.free.rag import pseudo_query_gate
+
+    pseudo_query_gate.bind_debug_logger(debug_logger)
 
     with _timed(timings, "component_wiring"):
         _wire_sleep_scheduler_models(

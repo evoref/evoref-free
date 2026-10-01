@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class CartridgeGateConfig(BaseModel):
@@ -213,6 +213,76 @@ class SelfRagConfig(BaseModel):
     )
 
 
+#: ``shadow`` (並べ替えを記録だけ) は採用しない (c_16 §7.2.1、2026-09-29)。書くと検証エラー。
+RerankMode = Literal["off", "on"]
+
+
+def normalize_rerank_mode(value: object) -> str:
+    """``rag.rerank.mode`` の生の値を正規化する (起動スクリプト・backend・スキーマの SSOT)。
+
+    YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す。未指定は ``off``。
+    """
+    if value is False or value is None:
+        return "off"
+    if value is True:
+        return "on"
+    return str(value)
+
+
+def rerank_mode_of(cfg: dict) -> str:
+    """素の config dict から ``rag.rerank.mode`` を読む (検証前の dict でも使える)。"""
+    rerank = (cfg.get("rag") or {}).get("rerank") or {}
+    return normalize_rerank_mode(rerank.get("mode", "off"))
+
+
+class RerankConfig(BaseModel):
+    """再順位段 (リランカー) の設定 (c_16 §7.2.1)。
+
+    ``mode: on`` で検索経路 (``unified_search`` の Step 6.8) が floor を通った corpus の
+    候補を並べ替える。``off`` なら rerank 用 llama-server は起動せず、並べ替えもしない。
+    自己テストは PC の指紋が変わったときだけ起動スクリプトが走らせる。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: RerankMode = Field(
+        default="off",
+        description="off: 起動しない・並べ替えない / on: 起動して corpus の候補を並べ替える",
+    )
+    port: int = Field(default=8083, ge=1024, le=65535, description="rerank 用 llama-server のポート")
+    gpu_layers: Literal["auto"] | int = Field(
+        default="auto",
+        description="auto: GPU の空きがモデル + 計算バッファの見積りを満たせば GPU、でなければ CPU。整数なら -ngl にそのまま渡す (0 = CPU)",
+    )
+    deadline_ms: int = Field(default=1000, ge=50, description="1 回の rerank 呼出の締切 (ミリ秒)。超えたら並べ替えを諦める")
+    max_candidates: int = Field(default=20, ge=1, le=200, description="1 回に並べ替える候補数の上限 (実際の候補数は自己テストが締切と 1 件あたり ms から決める)")
+    min_candidates: int = Field(
+        default=3, ge=1,
+        description="締切に収まる候補数がこれ未満なら自己テストで無効にする (too_slow)",
+    )
+    threads: int = Field(default=0, ge=0, description="-t (0 = 自動: GPU 配置なら 2、CPU 配置なら llama.cpp の既定)")
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def coerce_yaml_bool_mode(cls, value: object) -> object:
+        """YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す"""
+        if isinstance(value, bool):
+            return normalize_rerank_mode(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> "RerankConfig":
+        """gpu_layers の範囲と、候補数の下限 <= 上限を検証"""
+        if isinstance(self.gpu_layers, int) and self.gpu_layers < 0:
+            raise ValueError(f"rag.rerank.gpu_layers must be 'auto' or >= 0 (got {self.gpu_layers})")
+        if self.min_candidates > self.max_candidates:
+            raise ValueError(
+                f"rag.rerank.min_candidates ({self.min_candidates}) は "
+                f"max_candidates ({self.max_candidates}) 以下である必要があります"
+            )
+        return self
+
+
 class RAGConfig(BaseModel):
     """RAG 設定"""
 
@@ -285,6 +355,8 @@ class RAGConfig(BaseModel):
     hysteresis_band: float = Field(default=0.02, ge=0.0, le=0.5)
     # --- Self-RAG 補助機能 ---
     self_rag: SelfRagConfig = Field(default_factory=SelfRagConfig)
+    # --- 再順位段 (リランカー、c_16 §7.2.1) ---
+    rerank: RerankConfig = Field(default_factory=RerankConfig)
 
     @model_validator(mode="after")
     def validate_rag_constraints(self) -> "RAGConfig":
@@ -368,11 +440,20 @@ class EmbeddingConfig(BaseModel):
     # 通常不要)。値は llama-server --pooling が受理する 5 値のみ許容する。
     pooling: Literal["none", "mean", "cls", "last", "rank"] | None = None
     # GPU オフロード層数
-    # None の場合は CPU フォールバック (``-ngl 0``) が既定となる。
-    # GPU に乗せたい場合は明示的に 999 等を指定する。ベースモデルの
-    # ``llama.gpu_layers`` には追従しない (CPU default はユーザ明示の opt-in で
-    # のみ上書きされる)。
-    gpu_layers: int | None = Field(default=None, ge=-1)
+    # None の場合は CPU フォールバック (``-ngl 0``) が既定となる (既存の config の値のまま)。
+    # 整数はそのまま ``-ngl`` へ。``auto`` は PC の指紋が変わったときだけ一時ポートで CPU と
+    # GPU を測って決める (c_16 §7.2.2、雛形の既定)。ベースモデルの ``llama.gpu_layers``
+    # には追従しない。
+    gpu_layers: Literal["auto"] | int | None = Field(default=None)
+
+    @field_validator("gpu_layers")
+    @classmethod
+    def _gpu_layers_range(cls, v: "Literal['auto'] | int | None") -> "Literal['auto'] | int | None":
+        """整数は -1 以上 (``auto`` / ``null`` はそのまま)。"""
+        if isinstance(v, int) and v < -1:
+            raise ValueError(f"embedding.gpu_layers must be 'auto', null or >= -1 (got {v})")
+        return v
+
     # 物理バッチサイズ。max_length トークン分の単一入力を 1 回で処理できる値に揃える。
     # llama-server デフォルト 512 のままだと、長い STM ノート (例: 933 tok) の埋め込み
     # リクエストが 500 エラーになり EvorefMem sleep-time update が連鎖失敗する

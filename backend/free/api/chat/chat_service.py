@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 import weakref
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -37,7 +38,9 @@ from backend.free.core.text_quality import (
 from backend.free.core.inference import build_messages
 from backend.free.core.turn_text import append_to_last_user
 from backend.free.llm.llm_client import LLMClient
+from backend.free.memory.notes.note_builder import is_span_only_fold_subject
 from backend.free.memory.pipeline.search_pipeline import unified_search
+from backend.free.memory.semantic.fact import fact_value_update
 from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
 
@@ -331,6 +334,8 @@ async def run_search_pipeline(
         # content gate のセッション上限判定に使う session_id。呼出側が渡さない
         # legacy 経路では WM の session_id で代用する。
         session_id = session_id or getattr(wm, "session_id", None) or "default"
+        # 再順位段 (c_16 §7.2.1)。mode on かつ自己テストを通ったときだけ非 None。
+        reranker = getattr(getattr(state, "gen", None), "reranker", None)
         search_result = await unified_search(
             query=query,
             query_vec=query_vec,
@@ -350,6 +355,12 @@ async def run_search_pipeline(
             # 規則の skip に事例の確認を掛ける (未構築なら None = 従来どおり)。
             skip_gate=getattr(state, "retrieval_skip_gate", None),
             correction_trail=_collect_correction_trail(state),
+            # 訂正の正順の組 (f_02 §5.3)。使うのは再順位段が episodic を並べ替えた回だけなので、
+            # 再順位段が無いターンは作らない。
+            correction_successors=(
+                _collect_correction_successors(state) if reranker is not None else None
+            ),
+            reranker=reranker,
         )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]
@@ -672,7 +683,23 @@ def _collect_correction_trail(state: AppState) -> dict[str, str]:
     return trail
 
 
-_CORRECTION_GENERATION_CACHE: "weakref.WeakKeyDictionary[Any, dict[str, tuple[int, tuple[dict[str, str], dict[str, str]]]]]" = (
+def _collect_correction_successors(state: AppState) -> dict[str, tuple[str, ...]]:
+    """全 scope の SemMem から訂正の後継台帳を集める (失敗しても検索は続ける)。"""
+    successors: dict[str, tuple[str, ...]] = {}
+    for _scope, store in _iter_scopes(state):
+        try:
+            for before, afters in _correction_successors_for_store(store).items():
+                known = successors.get(before, ())
+                successors[before] = known + tuple(a for a in afters if a not in known)
+        except Exception:
+            # 訂正の正順が掛からないだけで検索自体は成立する (fail-open)。
+            continue
+    return successors
+
+
+_CorrectionGenerations = tuple[dict[str, str], dict[str, str], dict[str, tuple[str, ...]]]
+
+_CORRECTION_GENERATION_CACHE: "weakref.WeakKeyDictionary[Any, dict[str, tuple[int, _CorrectionGenerations]]]" = (
     weakref.WeakKeyDictionary()
 )
 
@@ -693,31 +720,38 @@ def _final_correction_winner(by_id: dict[str, Any], fact: Any) -> Any | None:
     return winner
 
 
-def _compute_correction_generations(
-    store: Any,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """SemMem の世代を 1 回走査して ``(訂正前の値, 訂正の宛先)`` を組む。
+def _compute_correction_generations(store: Any) -> _CorrectionGenerations:
+    """SemMem の世代を 1 回走査して ``(訂正前の値, 訂正の宛先, 訂正の後継)`` を組む。
 
     以前は :func:`_previous_values_for_store` と
     :func:`_correction_trail_for_store` が同じ連鎖歩きを別々に持ち、毎ターン
-    2 回全件を舐めていた。
+    2 回全件を舐めていた。後継は :func:`_correction_successors_for_store` の値。
     """
     by_id = {f.id: f for f in store.all_facts(include_superseded=True)}
     oldest: dict[str, tuple[float, str]] = {}
     trail: dict[str, str] = {}
-    for fact in by_id.values():
-        if not fact.superseded_by:
-            continue
-        winner = _final_correction_winner(by_id, fact)
-        if winner is None:
-            continue
+    successors: dict[str, tuple[str, ...]] = {}
+    pairs = [
+        (fact, winner) for fact in by_id.values()
+        if fact.superseded_by
+        and (winner := _final_correction_winner(by_id, fact)) is not None
+    ]
+    pairs += _span_only_fold_generations(by_id.values())
+    for fact, winner in pairs:
+        before_notes = [p.note_id for p in fact.provenances if p.note_id]
+        before_notes += [str(n) for n in getattr(fact, "retired_note_ids", None) or ()]
+        after_notes = tuple(
+            p.note_id for p in (getattr(winner, "provenances", None) or ()) if p.note_id
+        )
+        for note_id in before_notes:
+            afters = tuple(a for a in after_notes if a != note_id)
+            if afters:
+                known = successors.get(note_id, ())
+                successors[note_id] = known + tuple(a for a in afters if a not in known)
         current = str(getattr(winner, "object", "") or "").strip()
         if current:
-            for p in fact.provenances:
-                if p.note_id:
-                    trail[p.note_id] = current
-            for note_id in getattr(fact, "retired_note_ids", None) or ():
-                trail[str(note_id)] = current
+            for note_id in before_notes:
+                trail[note_id] = current
         old = str(getattr(fact, "object", "") or "").strip()
         if not old or old == current:
             continue
@@ -726,10 +760,42 @@ def _compute_correction_generations(
         if prev is None or at < prev[0]:
             oldest[winner.id] = (at, old)
     previous = {wid: old for wid, (_at, old) in oldest.items()}
-    return previous, trail
+    return previous, trail, successors
 
 
-def _correction_generations(store: Any) -> tuple[dict[str, str], dict[str, str]]:
+def _span_only_fold_generations(facts: Iterable[Any]) -> list[tuple[Any, Any]]:
+    """``span_only_fold`` のスロットで、span の無い検証済み訂正と live の兄弟を世代として組む。
+
+    name / birthday は旧値の span を持たない訂正では兄弟を畳まない (不変則 #13、
+    docs/f_02 §5.3) ので、``superseded_by`` だけでは組が作れず、旧ノートへの
+    「（訂正済み）」注記と訂正の正順が効かなくなる。ストアは書き換えず、live の値の
+    うち **自分より新しい span の無い ``from_correction``** の最新を現在値として扱う。
+    span を持つ訂正は宛先が決まっている (畳むべき兄弟は既に畳まれている) ので使わない。
+    """
+    slots: dict[tuple[str, str], list[Any]] = {}
+    for fact in facts:
+        subject = str(getattr(fact, "subject", "") or "")
+        if fact.superseded_by or not is_span_only_fold_subject(subject):
+            continue
+        slots.setdefault((subject, getattr(fact, "predicate", "")), []).append(fact)
+    out: list[tuple[Any, Any]] = []
+    for live in slots.values():
+        corrections = [
+            f for f in live
+            if getattr(f, "from_correction", False) and not fact_value_update(f)
+        ]
+        if not corrections:
+            continue
+        winner = max(corrections, key=lambda f: float(getattr(f, "created_at", 0.0) or 0.0))
+        at = float(getattr(winner, "created_at", 0.0) or 0.0)
+        out.extend(
+            (f, winner) for f in live
+            if f is not winner and float(getattr(f, "created_at", 0.0) or 0.0) < at
+        )
+    return out
+
+
+def _correction_generations(store: Any) -> _CorrectionGenerations:
     return _cached_by_revision(
         store, _CORRECTION_GENERATION_CACHE, _compute_correction_generations,
     )
@@ -774,6 +840,18 @@ def _correction_trail_for_store(store: Any) -> dict[str, str]:
         含めない。
     """
     return _correction_generations(store)[1]
+
+
+def _correction_successors_for_store(store: Any) -> dict[str, tuple[str, ...]]:
+    """``被訂正ノート id -> 訂正後 (最終世代) の根拠ノート id 列`` を SemMem の世代から引く。
+
+    再順位段が episodic を並べ替えた回に、採用した訂正の組を「訂正後が上」へ入れ替える
+    ための組 (``search_pipeline.enforce_correction_order``、f_02 §5.3)。宛先の辿り方は
+    :func:`_correction_trail_for_store` と同じで、検証済みの訂正 (勝者が
+    ``from_correction``) だけが立てる (不変則 #12)。多値スロットで旧値の span を持たない
+    訂正は兄弟を畳まない (#13) ので、畳まれていない兄弟の根拠ノートはここに現れない。
+    """
+    return _correction_generations(store)[2]
 
 
 def build_semmem_injection(

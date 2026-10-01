@@ -206,6 +206,41 @@ class DataHealthInfo(BaseModel):
     formats: dict[str, FormatHealthInfo] = Field(default_factory=dict)
 
 
+class RerankStatusInfo(BaseModel):
+    """再順位段 (リランカー) の状態 (c_16 §7.2.1)。起動時に自己テストの結果から 1 回決める。
+
+    ``reason`` は無効の理由 (``off`` / ``not_tested`` / ``stale_fingerprint`` / ``too_slow`` /
+    ``degenerate_flat`` / ``server_unreachable`` 等、英語の識別子)。``tested_at`` は自己テストの時刻 (ISO 8601 UTC)。
+    """
+    mode: str = "off"
+    enabled: bool = False
+    placement: str = ""
+    ms_per_doc: float | None = None
+    candidates: int = 0
+    reason: str = "off"
+    tested_at: str | None = None
+    #: 自己テストの後に ``model_paths.rerank_model`` が変わった (再テストはしない、警告だけ)。
+    model_changed_since_selftest: bool = False
+
+
+class EmbedPlacementInfo(BaseModel):
+    """埋め込みサーバの配置 GPU / CPU (c_16 §7.2.2)。起動時に設定と判別結果から 1 回決める。
+
+    ``setting`` は ``auto`` / ``explicit`` / ``default`` (``gpu_layers: null``)。``reason`` は
+    ``gpu_faster`` / ``gpu_not_faster`` / ``cosine_mismatch`` / ``no_gpu_device`` / ``not_decided`` /
+    ``stale_fingerprint`` / ``explicit_gpu_layers`` / ``default_cpu`` 等の英語の識別子。
+    ``decided_at`` は判別の時刻 (ISO 8601 UTC)。
+    """
+    setting: str = "default"
+    placement: str = "cpu"
+    gpu_layers: int = 0
+    reason: str = "default_cpu"
+    decided_at: str | None = None
+    cpu_p50_ms: float | None = None
+    gpu_p50_ms: float | None = None
+    cosine_min: float | None = None
+
+
 class StatusResponse(BaseModel):
     status: str = "ok"
     edition: str = "free"
@@ -225,6 +260,8 @@ class StatusResponse(BaseModel):
     #: 効果の死活監視で現在立っている警告 (c_07 §7.1)。空なら異常なし。
     liveness: list[LivenessAlertModel] = Field(default_factory=list)
     data_health: DataHealthInfo = Field(default_factory=DataHealthInfo)
+    rerank: RerankStatusInfo = Field(default_factory=RerankStatusInfo)
+    embed_placement: EmbedPlacementInfo = Field(default_factory=EmbedPlacementInfo)
 
 
 # ===== RAG =====

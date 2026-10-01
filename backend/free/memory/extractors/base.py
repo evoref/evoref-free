@@ -39,6 +39,7 @@ from backend.free.memory.types import (
 )
 from backend.free.core.correction_verdict import (
     POINTING_TARGETS as _POINTING_TARGETS,
+    marks_not_own_restatement,
 )
 from backend.free.core.numerals import kanji_number_value
 from backend.free.core.relative_date import annotate_relative_dates
@@ -87,6 +88,45 @@ def note_verification_rejected(note: object) -> bool:
     if getattr(note, "correction_verified_at", None) is None:
         return False
     return not note_is_verified_correction(note)
+
+
+#: 検証が「訂正ではない」と答えたが、本人の値の更新として旧値を置き換えてよい帰属
+#: (「本社ではなく名古屋支社です」、J-03)。Step 8 (抽出) と Step 8.4 (assertion) が
+#: 同じこの集合を読む (不変則 #14a)。Step 8.4 は未検証の候補を次サイクルへ持ち越す
+#: (検証を待つ) ので、共有するのは集合だけで、未検証の扱いは各段が持つ。
+OWN_VALUE_UPDATE_VERDICTS = frozenset({"premise_change", "none"})
+
+#: 検証が **本人の値であること / その値であること** を否定した帰属。本人の値更新
+#: (J-03 / J-02) にも使わない。``third_party`` は他人の値 (「田中さんの住まいは東京
+#: ではなく大阪です」)、``disputed`` は訂正への回答がその値を退けた (J-04 — Step 8.4
+#: も世界の事実として書かない)。
+NOT_OWN_VALUE_VERDICTS = frozenset({"third_party", "disputed"})
+
+
+def note_may_update_own_value(note: object) -> bool:
+    """「X ではなく Y」を本人の値更新 (J-03 / J-02) として消費してよいノートか (純粋関数)。
+
+    落とすのは検証が本人の値であることを否定した帰属 (:data:`NOT_OWN_VALUE_VERDICTS`)
+    だけ — 「田中さんの住まいは東京ではなく大阪です」が本人の location「東京」を
+    宛先にしていた (2026-09-30、不変則 #12)。**検証できなかった** 印 (``no_context`` =
+    直前応答が無い / ``invalid_span`` / ``same_value`` / ``already_stated`` …) は
+    未検証 (``correction_verified_at is None``) と同じく通す。セッション冒頭の
+    「引っ越しました。住まいは東京ではなく大阪です。」は直前応答が無いので
+    ``no_context`` になるのが常態で、落とすと多値スロットに新旧が並ぶ (F-02 / F-14)。
+
+    ``premise_change`` / ``none`` (前の値の誤りではないと答えた) は、仮定・時間の対比・
+    伝聞の標識がある発話 (「部下によると、試験日は18日ではなく25日でした。」) を
+    落とす。標識は ``restated_own_value`` の門と同じ判定
+    (:func:`~backend.free.core.correction_verdict.marks_not_own_restatement`)。
+    """
+    verdict = str(getattr(note, "correction_verdict", "") or "")
+    if getattr(note, "correction_verified_at", None) is None:
+        return True
+    if verdict in NOT_OWN_VALUE_VERDICTS:
+        return False
+    if verdict in OWN_VALUE_UPDATE_VERDICTS:
+        return not marks_not_own_restatement(str(getattr(note, "content", "") or ""))
+    return True
 
 
 def value_update_spans(content: str) -> tuple[str, str] | None:

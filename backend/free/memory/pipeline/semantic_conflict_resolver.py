@@ -76,7 +76,10 @@ import numpy as np
 
 from backend.free.core.correction_verdict import norm_span
 from backend.free.memory.attribute_key import attribute_key, is_generic_slot
-from backend.free.memory.notes.note_builder import is_multi_valued_subject
+from backend.free.memory.notes.note_builder import (
+    is_multi_valued_subject,
+    is_span_only_fold_subject,
+)
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.protocols import SemanticFactStoreProtocol
 from backend.free.memory.semantic.fact import fact_carries_span, fact_value_update
@@ -680,7 +683,8 @@ class SemanticConflictResolver:
         そのまま束ねると偽の競合になるので、類似度で塊に割ってから競合とみなす
         (:func:`split_by_attribute_similarity`)。
 
-        **宣言済みの多値スロット** (``multi_valued: true``) は値の違いを競合に
+        **宣言済みの多値スロット** (``multi_valued: true``) と **span でしか畳まない
+        スロット** (``span_only_fold: true``、name / birthday) は値の違いを競合に
         しない — 訂正由来のファクトが旧値の span を持つときだけ、その span を
         本文に含む古い兄弟と組にする (:func:`_correction_span_groups`、不変則 #13 /
         2026-09-27 監査 M1)。``mem.world.assertion.*`` も訂正は同じく span で絞り、
@@ -701,7 +705,7 @@ class SemanticConflictResolver:
             if len(facts) < 2:
                 continue
             facts.sort(key=lambda x: x.created_at)
-            if _is_declared_multi_valued(subject):
+            if _is_declared_multi_valued(subject) or is_span_only_fold_subject(subject):
                 groups.extend(_correction_span_groups(facts))
                 continue
             if subject.startswith(_ASSERTION_SUBJECT_PREFIX):

@@ -37,6 +37,7 @@ EvorefMem 側の ``memory.sleep.correction_curator`` も同じ門を使うので
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from backend.free.core.correction_verdict import (
@@ -59,6 +60,11 @@ logger = get_logger("learning.correction_verifier")
 #: 1 回の呼出で問い合わせる候補の上限。1 件 30〜40 秒なので、溜まっていても
 #: 1 サイクルを占有しないよう新しい方から打ち切る。
 DEFAULT_MAX_ITEMS = 12
+
+#: 答えが取れなかった回 (出力の切断・パース不能で空の結果) を一過性として
+#: 再試行する回数。これに達したら ``no_verdict`` で閉じる — 崩れた出力しか
+#: 返らない候補に毎サイクル補助タスクを払い続けない。
+MAX_UNANSWERED_ATTEMPTS = 3
 
 #: 昇格させる帰属。
 _PROMOTED_TARGET = "assistant"
@@ -195,6 +201,8 @@ async def verify_pending_corrections(
     *,
     max_items: int = DEFAULT_MAX_ITEMS,
     learning_disabled: bool = False,
+    unanswered: dict[str, int] | None = None,
+    should_pause: Callable[[], bool] | None = None,
 ) -> dict:
     """未検証の訂正候補を検証し、``assistant`` のものだけを昇格させる。
 
@@ -203,15 +211,22 @@ async def verify_pending_corrections(
         aux_client: ``AuxClient``。``None`` なら縮退して何もしない。
         max_items: 1 回で問い合わせる上限 (新しい方から)。
         learning_disabled: ``--no-learning`` 中は no-op。
+        unanswered: エントリ id → 答えが取れなかった回数。呼出を跨いで持つ
+            (``MAX_UNANSWERED_ATTEMPTS`` に達したら ``no_verdict`` で閉じる)。
+        should_pause: 真ならユーザーが活動中。検証を出さずに打ち切る。
 
     Returns:
         ``{"checked": int, "promoted": int, "rejected": int, "pending": int,
-        "skipped": str | None, "demoted": int}`` — ``demoted`` は
-        :func:`recheck_promoted` が候補へ戻した昇格済みエントリ数。
+        "skipped": str | None, "demoted": int, "unanswered": int}`` —
+        ``demoted`` は :func:`recheck_promoted` が候補へ戻した昇格済みエントリ数、
+        ``unanswered`` は答えが取れず次回へ回した数。
     """
     out: dict = {
         "checked": 0, "promoted": 0, "rejected": 0, "pending": 0, "skipped": None,
+        "unanswered": 0,
     }
+    if unanswered is None:
+        unanswered = {}
     if learning_disabled:
         out["skipped"] = "learning_disabled"
         return out
@@ -257,6 +272,13 @@ async def verify_pending_corrections(
         return out
 
     for index in pending[-max_items:]:
+        if should_pause is not None and should_pause():
+            out["skipped"] = "chat_active"
+            logger.info(
+                "Correction verifier: user is active; remaining candidates wait "
+                "for a quiet window",
+            )
+            break
         entry = entries[index]
         candidate = entry.signals.correction_candidate or ""
         prev_response, prev_query = _resolve_previous_context(entries, index)
@@ -279,12 +301,31 @@ async def verify_pending_corrections(
             logger.warning(
                 "Correction verification failed (entry=%s): %r", entry.id, exc,
             )
+            if getattr(exc, "contended", False):
+                # 横取りされたなら次の候補もまた横取りされる。残りは次回へ回す
+                # (記憶側 Step 8.0 と同じ、2026-09-26 監査 #12)。
+                break
             continue
-        out["checked"] += 1
         if not isinstance(parsed, dict) or not parsed:
+            # 出力の切断・パース不能で答えが取れなかった。判定ではないので
+            # 上限までは刻まずに次回へ回す (2026-09-26 監査: create の生成と
+            # 併走した崩れた出力が no_verdict として刻まれ、二度と検証されなかった)。
+            attempts = unanswered.get(entry.id, 0) + 1
+            if attempts < MAX_UNANSWERED_ATTEMPTS:
+                unanswered[entry.id] = attempts
+                out["unanswered"] += 1
+                logger.info(
+                    "Correction verifier: no usable verdict (entry=%s, attempt %d/%d); "
+                    "will retry", entry.id, attempts, MAX_UNANSWERED_ATTEMPTS,
+                )
+                continue
+            unanswered.pop(entry.id, None)
+            out["checked"] += 1
             _apply_verdict(entry, "no_verdict")
             out["rejected"] += 1
             continue
+        unanswered.pop(entry.id, None)
+        out["checked"] += 1
 
         check = check_verdict(
             parsed, candidate=candidate, prev_response=prev_response,
@@ -342,6 +383,7 @@ async def verify_pending_corrections(
 
 __all__ = [
     "DEFAULT_MAX_ITEMS",
+    "MAX_UNANSWERED_ATTEMPTS",
     "has_pending_candidates",
     "recheck_promoted",
     "verify_pending_corrections",

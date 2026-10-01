@@ -90,6 +90,15 @@ class PathResolver:
         "run_dir": "run/",
         "cache_dir": "cache/",
         "embedding_cache_dir": "cache/embeddings/",
+        # リランカー自己テストの結果 (volatile、PC 固有の測定値。c_16 §7.2.1)。
+        # 書き手は起動スクリプト、backend は読むだけ。store/ の外なので readonly でも書ける。
+        "rerank_selftest_file": "cache/rerank_selftest.json",
+        # 埋め込みサーバの配置 (GPU / CPU) の判別結果 (PC 固有の測定値。c_16 §7.2.2)。
+        # 書き手は起動スクリプト、backend と再起動の経路は読むだけ。store/ の外。
+        "embed_placement_file": "cache/embed_placement.json",
+        # 疑似クエリの品質検査の閾値 (リランカーの model_key 単位、c_17 §3.15)。
+        # 書き手は較正、backend は起動時に読むだけ。store/ の外。
+        "pseudo_query_gate_file": "cache/pseudo_query_gate.json",
         "profiles_dir": "profiles/",
         # 利用者のファイルを上書きする前の退避 (f_11 §5.6)。store/ の外 (readonly でも書ける)。
         "backup_overwrite_dir": "bk/overwrite/",

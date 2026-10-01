@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class ModelPathsConfig(BaseModel):
     """モデルファイルパス
 
-    標準 2 モデル (base/embed) を明示フィールドとして定義。
+    標準 2 モデル (base/embed) と任意のリランカー (rerank) を明示フィールドとして定義。
     カスタムモデル種を追加できるよう ``extra="allow"`` を維持する。
     """
 
@@ -17,6 +17,10 @@ class ModelPathsConfig(BaseModel):
     create_model: str | None = Field(
         default=None,
         description="クリエイトモード用 GGUF パス。未指定 (None / 空文字列) の場合は base_model にフォールバック",
+    )
+    rerank_model: str | None = Field(
+        default=None,
+        description="リランカー (rag.rerank) 用 GGUF パス。未指定なら rerank 用 llama-server は起動しない",
     )
 
 

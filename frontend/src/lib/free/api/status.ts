@@ -101,6 +101,33 @@ export interface FormatHealthInfo {
 	reason: string;
 }
 
+/** 再順位段 (リランカー) の状態 (c_16 §7.2.1)。reason は無効の理由の識別子 */
+export interface RerankStatusInfo {
+	mode: string;
+	enabled: boolean;
+	placement: string;
+	ms_per_doc: number | null;
+	candidates: number;
+	reason: string;
+	tested_at: string | null;
+	/** 自己テストの後にリランカーのモデルが変わった (再テストはしない) */
+	model_changed_since_selftest: boolean;
+}
+
+/** 埋め込みサーバの配置 GPU / CPU (c_16 §7.2.2)。setting は auto / explicit / default、reason は判別の理由の識別子 */
+export interface EmbedPlacementInfo {
+	setting: string;
+	placement: string;
+	gpu_layers: number;
+	reason: string;
+	/** 判別の時刻 (ISO 8601 UTC)。明示の設定・未判別なら null */
+	decided_at: string | null;
+	cpu_p50_ms: number | null;
+	gpu_p50_ms: number | null;
+	/** 同じ文の CPU と GPU のベクトルの cosine の最小 */
+	cosine_min: number | null;
+}
+
 export interface StatusResponse {
 	status: string;
 	edition: string;
@@ -121,6 +148,10 @@ export interface StatusResponse {
 	liveness?: LivenessAlert[];
 	/** データ根の状態 (readonly なら入力欄に常時表示) */
 	data_health?: DataHealthInfo;
+	/** 再順位段 (リランカー) の状態 */
+	rerank?: RerankStatusInfo;
+	/** 埋め込みサーバの配置 */
+	embed_placement?: EmbedPlacementInfo;
 }
 
 /** ステータス取得 */

@@ -30,6 +30,7 @@ from backend.free.core.correction_verdict import (
     mask_quoted_speech,
     norm_span,
 )
+from backend.free.core.correction_target import split_sentences
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.relative_date import strip_date_annotation_after
 from backend.free.core.text_quality import (
@@ -51,6 +52,7 @@ from backend.free.memory.extractors.base import (
     ExtractionContext,
     ExtractionResult,
     note_is_verified_correction,
+    note_may_update_own_value,
     note_verification_rejected,
 )
 from backend.free.memory.notes.note_builder import (
@@ -1424,6 +1426,19 @@ def _contains_anchor(haystack: str, anchor: str) -> bool:
     return anchor in haystack
 
 
+def value_names_span(value: str, span: str) -> bool:
+    """``value`` (live 値の本文) が逐語 span を **値として** 含むか (純粋関数)。
+
+    値で宛先を決める照合の 1 実装 (不変則 #14(a))。値アンカー
+    (:func:`_span_hit_length` / 本人の値更新の J-03 経路) と、sleep-time の
+    宛先スロットの継承 (``sleep.extraction._inherit_corrected_slot``) が共有する。
+    正規化 (:func:`norm_span`) の後、数字だけの span は数字の境界で照合する
+    (J-10、:func:`_contains_anchor`)。
+    """
+    needle = norm_span(span)
+    return bool(needle) and _contains_anchor(norm_span(value or ""), needle)
+
+
 def _anchor_hit_length(anchors: tuple[str, ...], haystack: str) -> tuple[int, str]:
     """``haystack`` に現れる最長のアンカーを ``(長さ, アンカー)`` で返す。"""
     best = (0, "")
@@ -1447,7 +1462,7 @@ def _span_hit_length(
         return (0, "")
     best = (0, "")
     for value in values:
-        if _contains_anchor(norm_span(value), needle) and len(needle) > best[0]:
+        if value_names_span(value, span) and len(needle) > best[0]:
             best = (len(needle), span)
     for anchor in anchors:
         normalized = norm_span(anchor)
@@ -1487,9 +1502,13 @@ def resolve_value_anchored_matches(
     for note in notes:
         content = note.content or ""
         # 検証で却下された候補でも、「X ではなく Y」の本人の値更新なら記憶の
-        # 宛先は旧値 X で決まる (:func:`value_update_spans`)。それ以外の却下は
-        # 従来どおり経路に乗せない。
-        if note_verification_rejected(note) and value_update_spans(content) is None:
+        # 宛先は旧値 X で決まる (:func:`value_update_spans`)。それ以外の却下と、
+        # 本人の値であることを検証が否定した帰属 (third_party / disputed、仮定・伝聞の
+        # premise_change / none。:func:`note_may_update_own_value`) は経路に乗せない (不変則 #12)。
+        if note_verification_rejected(note) and (
+            value_update_spans(content) is None
+            or not note_may_update_own_value(note)
+        ):
             continue
         if not content:
             continue
@@ -1536,7 +1555,7 @@ def resolve_value_anchored_matches(
                 needle = norm_span(update[0])
                 for (tag, attr), (values, _anchors) in index.items():
                     for value in values:
-                        if needle and needle in norm_span(value):
+                        if value_names_span(value, update[0]):
                             if _better_hit(best.get(tag), len(needle), attr):
                                 best[tag] = (len(needle), attr, update[0])
                                 explicit.add(tag)
@@ -1574,6 +1593,12 @@ def third_party_correction_slots(
     本人の文 / 持ち主が見つからない (判定の根拠が無い — 従来どおり)。訂正が
     解決したスロットのトリガ語の人 (family の「娘」) は第三者と数えない。
     Step 8 (抽出) と Step 8.3 (分割) が同じこの関数を呼ぶ (M5)。
+
+    **検証器が ``third_party`` (他人の値) と答えたノート** は、持ち主のノートを
+    探さずに訂正の文が解決したスロットを返す (2026-09-30、不変則 #12)。「田中さんの
+    住まいは東京ではなく大阪です。」は属性語「住まい」で本人の location に解決し、
+    location は単値なので、span に関係なく本人の「東京に住んでいます」を畳んでいた。
+    一人称が持ち主として現れる文 (上の条件) は検証の答えより構造を優先して空にする。
     """
     content = note.content or ""
     update = value_update_spans(content)
@@ -1585,8 +1610,11 @@ def third_party_correction_slots(
     correction = " ".join(s for s in _SENTENCE_SPLIT_RE.split(content) if old in s)
     if names_self_as_owner(correction):
         return frozenset()
+    verified_third_party = (
+        str(getattr(note, "correction_verdict", "") or "") == "third_party"
+    )
     holder = None
-    for other in notes:
+    for other in () if verified_third_party else notes:
         if (
             other is note
             or getattr(other, "source", "user") != "user"
@@ -1597,7 +1625,7 @@ def third_party_correction_slots(
             continue
         if holder is None or other.created_at > holder.created_at:
             holder = other
-    if holder is None:
+    if holder is None and not verified_third_party:
         return frozenset()
     per_type = get_fact_attributes(resolve_fact_attributes_path(triggers_dir)).get("chat") or {}
     slots: set[tuple[str, str]] = set()
@@ -1615,6 +1643,8 @@ def third_party_correction_slots(
         )
     if not slots:
         return frozenset()
+    if verified_third_party:
+        return frozenset(slots)
     own_words = tuple(own)
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(holder.content or "") if old in s]
     # 旧値を含む文の **すべて** が他者の文のときだけ第三者 (「同僚が建設会社で
@@ -1625,6 +1655,18 @@ def third_party_correction_slots(
         for s in sentences
     )
     return frozenset(slots) if third else frozenset()
+
+
+def _trigger_outside_update(content: str, trigger_words: tuple[str, ...]) -> bool:
+    """宛先の属性語が「X ではなく Y」の文に 1 つも無いか (純粋関数)。
+
+    属性語が無い (値アンカー・継承・事例で決まった宛先) なら判定できないので偽。
+    文の分解と対比の分解は :func:`split_sentences` / :func:`value_update_spans` の 1 実装。
+    """
+    if not trigger_words:
+        return False
+    contrast = [s for s in split_sentences(content) if value_update_spans(s) is not None]
+    return not any(word in sentence for sentence in contrast for word in trigger_words)
 
 
 def _better_hit(
@@ -2006,20 +2048,59 @@ class ChatExtractor(BaseExtractor):
                     correct_value = (
                         _verified_correct_value(note) if len(matches) == 1 else ""
                     )
-                    wrong_claim = str(getattr(note, "correction_wrong_claim", "") or "")
-                    if not correct_value and len(matches) == 1:
-                        # 本人の値更新 (検証の verdict に依らない)。旧値が宛先
-                        # スロットの現在値に逐語で在るときだけ採る (J-03)。
+                    # 誤りの span を旧値として使ってよいのは **検証済みの訂正だけ**。
+                    # 却下 (same_value / premise_change / third_party …) のノートにも
+                    # 検証器の wrong_claim は刻まれるが、それを value_update にすると
+                    # 訂正ではないと判定済みの発話が畳む側に回る (不変則 #12、
+                    # 2026-09-30: 「名前を打ち間違えていました。」(same_value) が
+                    # name に value_update=ひなた の行を作った)。
+                    wrong_claim = (
+                        str(getattr(note, "correction_wrong_claim", "") or "")
+                        if note_is_verified_correction(note) else ""
+                    )
+                    if (
+                        not correct_value and len(matches) == 1
+                        and note_may_update_own_value(note)
+                    ):
+                        # 本人の値更新 (検証の verdict に依らない — ただし本人の値で
+                        # あることを検証が否定した帰属は除く)。旧値が宛先スロットの
+                        # 現在値に逐語で在るときだけ採る (J-03)。
                         update = value_update_spans(content)
-                        _anchor_hit = value_anchored_matches.get((note.id, tag), ("", ""))[1]
+                        _dest = matches[0][0] or "user"
+                        _anchor_attr, _anchor_hit = value_anchored_matches.get(
+                            (note.id, tag), ("", ""),
+                        )
+                        # 値アンカーが旧値 X を **別のスロット** の live 値に見つけたなら、
+                        # その X は宛先スロットの旧値ではない。属性語で解決した宛先に
+                        # X → Y を書くと、別スロットの値が宛先の現在値になる
+                        # (2026-10-01 実機: 「長女はひなたではなくひなのです。名前を
+                        # 打ち間違えていました。」の X「ひなた」は family に在るのに、
+                        # 「名前を」で解決した本人の name に「ひなの」を書き、Step 6B の
+                        # newest_wins で本人の氏名を畳んだ)。宛先の live 値も X を
+                        # 持つときだけ宛先で当てる。
+                        # 汎用スロット ``user`` は分類できなかった発話の寄せ場で、
+                        # 旧値の持ち主の証拠にならないので別スロット扱いしない。
+                        _foreign_anchor = bool(_anchor_hit) and _anchor_attr not in (
+                            _dest, _GENERIC_ATTRIBUTE,
+                        )
+                        if _foreign_anchor:
+                            _anchor_hit = next(
+                                (
+                                    update[0]
+                                    for value in ctx.live_attribute_values.get((tag, _dest)) or ()
+                                    if update is not None and value_names_span(value, update[0])
+                                ),
+                                "",
+                            )
                         if update is not None and not _anchor_hit:
                             # 旧値が **同じバッチで先に組んだ候補** にしか無い
                             # (言明と更新が同じ Full で抽出される常態)。ストアの
                             # live 値の索引には無いので候補側で当てる。
+                            # 照合は値アンカーと同じ 1 実装 (:func:`value_names_span`、
+                            # 数字だけの旧値は数字の境界で見る — 「30」を「302号室」に当てない)。
                             _subject_u = make_mem_subject(kind, matches[0][0] or "user")
-                            _needle = norm_span(update[0])
                             for _n, f in reversed(candidates):
-                                if f.subject == _subject_u and _needle in norm_span(f.object or ""):
+                                if f.subject == _subject_u and value_names_span(f.object or "", update[0]):
                                     _anchor_hit = update[0]
                                     break
                         if update is not None and _anchor_hit and (
@@ -2028,6 +2109,22 @@ class ChatExtractor(BaseExtractor):
                         ):
                             wrong_claim, correct_value = update
                             value_update_restated = True
+                        elif update is not None and _foreign_anchor and _trigger_outside_update(
+                            content, tuple(matches[0][1]),
+                        ):
+                            # 値の更新は別スロットのもので、宛先の属性語は「X ではなく
+                            # Y」の文に無い — この発話が宛先スロットに述べているのは別の
+                            # 文の誤りの告知 (「名前を打ち間違えていました」) だけ。宛先へは
+                            # 書かない (移しもしない — 宛先の継承は検証済み self の行に
+                            # 限る、f_02 §5.3)。属性語が対比と同じ文に在る言明
+                            # (「勤務地は東京ではなく横浜です。」) は J-03 を採らずに
+                            # 従来どおり言明として書く。
+                            logger.info(
+                                "ChatExtractor: old value of the update is held by "
+                                "slot %r, not the resolved slot %r; not writing it "
+                                "(note=%s)", _anchor_attr, _dest, note.id,
+                            )
+                            continue
                         elif update is None:
                             # 「会議が 1 週間延期」— 既存の予定の日付をずらす申告。
                             # 同じ事象の語 (会議) を共有する live 値の併記日付を
@@ -2213,6 +2310,20 @@ class ChatExtractor(BaseExtractor):
                     # 無い」状態になっていた (2026-09-14 監査 F-02 の追補)。
                     if wrong_claim:
                         fact.value_update = wrong_claim  # type: ignore[attr-defined]
+                        # 旧値が **本人の記憶させた値** か (検証の verdict が self)。
+                        # assistant の wrong_claim はアシスタントの言い誤りなので、
+                        # 宛先スロットの継承 (``sleep.extraction._inherit_corrected_slot``)
+                        # の材料にしない。作業値で、永続化しない。
+                        # 行の旧値が検証器の旧値と同じときに限る (字句の分解
+                        # value_update_spans / J-02 由来の旧値と検証の新値を混ぜない)。
+                        if str(getattr(note, "correction_verdict", "") or "") == "self" and (
+                            norm_span(wrong_claim)
+                            == norm_span(str(getattr(note, "correction_wrong_claim", "") or ""))
+                        ):
+                            fact.value_update_owner = "self"  # type: ignore[attr-defined]
+                            fact.value_update_new = str(  # type: ignore[attr-defined]
+                                getattr(note, "correction_correct_value", "") or "",
+                            ).strip()
                     candidates.append((note, fact))
 
         candidates, collapsed = _collapse_equivalent_candidates(candidates)

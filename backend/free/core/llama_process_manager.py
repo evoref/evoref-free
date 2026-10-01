@@ -1,6 +1,6 @@
 """llama-server プロセスマネージャ
 
-base / embedding の 2 種 llama-server プロセスを
+base / embedding / rerank (リランカー、c_16 §7.2.1) の llama-server プロセスを
 単一のレジストリで管理する。`migrate_component` API がモデル切替成功後に
 `restart()` を呼び出し、無停止 (ユーザーが手動シェル操作不要) でモデルを
 切り替える。
@@ -30,8 +30,9 @@ from backend.log_config import get_logger
 logger = get_logger("core.llama_process_manager")
 
 
-# コンポーネント名 (embedding は L1 と一致)
-PROCESS_COMPONENTS: tuple[str, ...] = ("base", "embedding")
+# コンポーネント名 (embedding は L1 と一致)。rerank は保存済みの自己テストの配置で起こす
+# (測り直さない。測るのは起動スクリプト)。
+PROCESS_COMPONENTS: tuple[str, ...] = ("base", "embedding", "rerank")
 
 
 class ProcessManagerError(Exception):
@@ -61,12 +62,14 @@ def _resolve_endpoint(component: str, cfg: dict) -> tuple[str, int]:
             emb.get("llama_host", "localhost"),
             int(emb.get("llama_port", 8082)),
         )
+    if component == "rerank":
+        rr = (cfg.get("rag") or {}).get("rerank") or {}
+        return "127.0.0.1", int(rr.get("port", 8083))
     raise ProcessManagerError(f"Unknown component: {component}")
 
 
-def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | None:
-    """`scripts/launch_llama.py` の build_*_cmd を流用"""
-    # scripts は import path 上に無いことがあるため動的 import
+def _load_launch_module(project_root: Path):
+    """``scripts/launch_llama.py`` を読み込む (scripts は import path 上に無いことがあるため動的 import)。"""
     import importlib.util
 
     launch_py = project_root / "scripts" / "launch_llama.py"
@@ -79,6 +82,12 @@ def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | Non
         raise ProcessManagerError("Failed to load launch_llama.py spec")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    return mod
+
+
+def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | None:
+    """`scripts/launch_llama.py` の build_*_cmd を流用"""
+    mod = _load_launch_module(project_root)
 
     if component == "base":
         # 学習済みアダプタ (Pro) はモード切替経路 (backend.free.api.config.mode)
@@ -99,6 +108,12 @@ def _build_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | Non
         )
     if component == "embedding":
         return mod.build_embed_cmd(cfg, project_root)
+    if component == "rerank":
+        # 自己テストで有効と記録された配置だけで起こす (無効・未テストなら起動しない)
+        placement = mod.saved_rerank_placement(cfg, project_root)
+        if placement is None:
+            return None
+        return mod.build_rerank_cmd(cfg, project_root, placement)
     raise ProcessManagerError(f"Unknown component: {component}")
 
 
@@ -158,12 +173,26 @@ class LlamaProcessManager:
             )
         host, port = _resolve_endpoint(component, cfg)
 
-        logger.info("Starting %s: %s", component, " ".join(cmd))
-        proc = subprocess.Popen(cmd)
-        entry = ProcessEntry(component, proc, host, port)
-        self._procs[component] = entry
+        # 埋め込みが保存済みの GPU 配置 (auto) なら、起動しなければ CPU で 1 回だけ起こし直す
+        # (埋め込みは必須機能。保存結果は書き換えない、c_16 §7.2.2)
+        if component == "embedding":
+            try:
+                mod = _load_launch_module(self.project_root)
+            except ProcessManagerError:
+                mod = None  # launch_llama.py が読めない: CPU への起こし直しを諦めるだけ
+            fallback = mod.embed_cpu_fallback_cmd(cfg, cmd) if mod is not None else None
+            if fallback is not None:
+                first = min(self.health_timeout, int(mod.EMBED_GPU_START_TIMEOUT_SEC))
+                if self._spawn_and_wait(component, cmd, host, port, first):
+                    logger.info("%s is ready at %s:%s", component, host, port)
+                    return self._procs[component]
+                logger.warning(
+                    "%s on GPU did not become healthy within %ss; restarting it on CPU", component, first,
+                )
+                self.stop(component)
+                cmd = fallback
 
-        if not _wait_for_health(host, port, self.health_timeout):
+        if not self._spawn_and_wait(component, cmd, host, port, self.health_timeout):
             logger.error(
                 "%s health check timed out at %s:%s", component, host, port,
             )
@@ -173,7 +202,16 @@ class LlamaProcessManager:
                 f"{self.health_timeout}s",
             )
         logger.info("%s is ready at %s:%s", component, host, port)
-        return entry
+        return self._procs[component]
+
+    def _spawn_and_wait(
+        self, component: str, cmd: list[str], host: str, port: int, timeout: int,
+    ) -> bool:
+        """``cmd`` を起動して登録し、health を ``timeout`` 秒待つ。"""
+        logger.info("Starting %s: %s", component, " ".join(cmd))
+        proc = subprocess.Popen(cmd)
+        self._procs[component] = ProcessEntry(component, proc, host, port)
+        return _wait_for_health(host, port, timeout)
 
     def stop(self, component: str) -> None:
         """指定コンポーネントを終了する"""

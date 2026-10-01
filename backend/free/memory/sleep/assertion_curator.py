@@ -54,6 +54,7 @@ from backend.free.llm.json_schemas import AssertionNaming
 from backend.free.memory.corrections import correction_target
 from backend.free.core.correction_verdict import strip_copula
 from backend.free.memory.extractors.base import (
+    OWN_VALUE_UPDATE_VERDICTS,
     note_is_verified_correction,
     note_verification_rejected,
     value_update_spans,
@@ -261,22 +262,16 @@ def _is_curatable(note: "MemoryNote", builder) -> bool:
     )
 
 
-#: 検証が「訂正ではない」と答えたが、本人の値の更新として旧値を置き換えてよい帰属
-#: (「本社ではなく名古屋支社です」、J-03)。``third_party`` (他人の値) や門の却下
-#: (引用 / 同値 / 既述 …) は含めない。
-_OWN_VALUE_UPDATE_VERDICTS = frozenset({"premise_change", "none"})
-
-
 def _replaces_a_value(note: "MemoryNote") -> bool:
     """訂正候補のノートが旧値を置き換える力 (slug の継承・旧値の span での畳み) を持つか。
 
-    検証済みの訂正 (assistant / self) と、本人の値更新 (:data:`_OWN_VALUE_UPDATE_VERDICTS`)
+    検証済みの訂正 (assistant / self) と、本人の値更新 (:data:`~backend.free.memory.extractors.base.OWN_VALUE_UPDATE_VERDICTS`)
     だけ。検証で他人の値と判った候補 (「取引先の創立記念日は6月1日ではなく6月2日だ
     そうです」= ``third_party``) が本人の言明の slug を継いで「当社の創立記念日は
     2001年6月1日です。」を畳んでいた (2026-09-28 独立レビュー、不変則 #12)。
     """
     return note_is_verified_correction(note) or (
-        str(getattr(note, "correction_verdict", "") or "") in _OWN_VALUE_UPDATE_VERDICTS
+        str(getattr(note, "correction_verdict", "") or "") in OWN_VALUE_UPDATE_VERDICTS
     )
 
 

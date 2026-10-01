@@ -25,6 +25,8 @@
 - :func:`reversed_restatement` — 検証器の span の組が、発話の「X ではなく Y」と
   逆向き (ユーザーが退けた X を正しい値としている) なら判定ごと捨てる
   (却下理由は ``invalid_span``。永続の語彙は増やさない)。
+- :func:`widen_to_restated_value` — ``correct_value`` が発話の「X ではなく Y」の
+  Y の途中で切れていて ``wrong_claim`` と同値に見えるなら、Y へ広げる。
 - :func:`check_verdict` — 上の門を LLM 出力へ順に当て、通ったものだけ
   :class:`VerdictCheck` として返す。
 """
@@ -342,6 +344,15 @@ _NOT_OWN_RESTATEMENT_RE = re.compile(
 )
 
 
+def marks_not_own_restatement(text: str) -> bool:
+    """発話 (引用の内側は除く) に仮定・時間の対比・伝聞の標識があるか (純粋関数)。
+
+    :func:`restated_own_value` の門と、記憶側の本人の値更新 (J-03、
+    ``extractors.base.note_may_update_own_value``) が同じこの判定を読む (不変則 #14a)。
+    """
+    return bool(_NOT_OWN_RESTATEMENT_RE.search(mask_quoted_speech(text or "")))
+
+
 def restated_own_value(candidate: str, prev_user: str) -> tuple[str, str] | None:
     """ユーザーが **自分の前の値** を言い直しているなら ``(旧値, 新値)`` (純粋関数)。
 
@@ -361,9 +372,9 @@ def restated_own_value(candidate: str, prev_user: str) -> tuple[str, str] | None
     source = norm_span(prev_user)
     if not source:
         return None
-    masked = mask_quoted_speech(candidate or "")
-    if _NOT_OWN_RESTATEMENT_RE.search(masked):
+    if marks_not_own_restatement(candidate):
         return None
+    masked = mask_quoted_speech(candidate or "")
     for sentence in split_sentences(masked):
         if not is_plain_statement(sentence):
             continue
@@ -406,6 +417,54 @@ def reversed_restatement(wrong_claim: str, correct_value: str, candidate: str) -
     return backward and not forward
 
 
+def widen_to_restated_value(
+    wrong_claim: str, correct_value: str, candidate: str,
+) -> str | None:
+    """途中で切れた ``correct_value`` を発話の「X ではなく Y」の Y へ広げる (純粋関数)。
+
+    検証器は「長女はひなたではなくひなのです。」に ``wrong_claim=ひなた`` /
+    ``correct_value=ひな`` を返した (2026-10-01 実機、4/4 回)。ひらがなの値に
+    ひらがなの述語 (「のです」) が続くと、LLM は値を述語の手前で切る。「ひな」は
+    発話に逐語で在るので逐語の門は通り、包含で比べる同値の門 (:func:`claims_equivalent`
+    — 「横浜」と「横浜市」を同じとみなす) が「ひな」⊂「ひなた」で ``same_value`` に
+    落としていた。文字種の境界では切れ目が決まらない (値も述語もひらがな) ので、
+    発話の構造 (:func:`restatement_pairs`、:func:`reversed_restatement` /
+    :func:`restated_own_value` と同じ分解。語彙は足さない) で決める。
+
+    広げるのは次をすべて満たすときだけ:
+
+    - ``wrong_claim`` と ``correct_value`` が同値に見える (広げなければ ``same_value``
+      で却下される組だけを救う。通っていた判定の span は変えない)
+    - 発話 (引用の内側は除く) の文末で断定に閉じた対比 (X, Y) で、X が
+      ``wrong_claim`` と同値、Y が ``correct_value`` を真に含み、X と Y は同値でない
+    - そういう Y が 1 通りに決まる
+    - 発話に仮定・時間の対比・伝聞の標識が無い (:func:`marks_not_own_restatement`)
+    - Y が否定 (「ない」) で終わらない (値ではない)
+
+    帰属は上げない span の修復 (:func:`narrow_to_new_value` と同類) で、
+    不変則 #12 の例外 (:func:`restated_own_value`) ではない。
+
+    該当しなければ ``None`` (呼出側は従来どおり ``same_value`` で却下する)。
+    """
+    c = norm_span(correct_value)
+    if not c or not norm_span(wrong_claim) or not claims_equivalent(wrong_claim, correct_value):
+        return None
+    if marks_not_own_restatement(candidate):
+        return None
+    widened: set[str] = set()
+    for sentence in split_sentences(mask_quoted_speech(candidate or "")):
+        for old, new in restatement_pairs(sentence, sentence_final=True):
+            value = strip_copula(new)
+            n = norm_span(value)
+            if (
+                n != c and c in n and not n.endswith("ない")
+                and claims_equivalent(wrong_claim, old)
+                and not claims_equivalent(old, value)
+            ):
+                widened.add(value)
+    return widened.pop() if len(widened) == 1 else None
+
+
 @dataclass(frozen=True)
 class VerdictCheck:
     """LLM 出力にコード側の門を当てた結果。
@@ -419,8 +478,9 @@ class VerdictCheck:
     target: str
     wrong_claim: str
     correct_value: str
-    #: 門が LLM の帰属を上書きしたときの理由 (``"restated"`` = premise_change を
-    #: :func:`restated_own_value` で self に上げた)。LLM の答えのままなら ``None``。
+    #: 門が LLM の答えを上書きしたときの理由 (``"restated"`` = premise_change を
+    #: :func:`restated_own_value` で self に上げた、``"widened"`` = 切れた
+    #: ``correct_value`` を :func:`widen_to_restated_value` で広げた)。LLM の答えのままなら ``None``。
     overridden: str | None = None
     #: 却下理由の内訳 (非永続。ログ / テスト用)。``"reversed"`` = span の組が発話の
     #: 「X ではなく Y」と逆向き (:func:`reversed_restatement`) で ``invalid_span``。
@@ -445,7 +505,9 @@ def check_verdict(
     4. 向き — 発話の「X ではなく Y」と逆向きの組 (:func:`reversed_restatement`)
        は入れ替えずに ``invalid_span`` で却下する (帰属も誤っている見込みが高い。
        ``detail="reversed"`` とログで区別する)
-    5. 同値 — ``wrong_claim`` と ``correct_value`` が同じ値なら訂正でない
+    5. 同値 — ``wrong_claim`` と ``correct_value`` が同じ値なら訂正でない。ただし
+       ``correct_value`` が発話の「X ではなく Y」の Y の途中で切れていたなら Y へ
+       広げて通す (:func:`widen_to_restated_value`)
     6. 既述 — 帰属先の本文が ``correct_value`` を既に述べているなら訂正でない
 
     消費側は ``ok`` のものをさらに ``target`` で絞る (学習側は ``assistant`` のみ)。
@@ -498,7 +560,15 @@ def check_verdict(
         )
         return _check(False, "invalid_span", "reversed")
     if claims_equivalent(wrong_claim, correct_value):
-        return _check(False, "same_value")
+        widened = widen_to_restated_value(wrong_claim, correct_value, candidate)
+        if widened is None:
+            return _check(False, "same_value")
+        logger.info(
+            "Correction verdict correct_value widened to the utterance's restated "
+            "value: %r -> %r (wrong_claim=%r)",
+            correct_value[:40], widened[:40], wrong_claim[:40],
+        )
+        correct_value, overridden = widened, "widened"
     if response_already_states(correct_value, source):
         return _check(False, "already_stated")
     return _check(True, None)

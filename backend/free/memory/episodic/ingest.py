@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -252,16 +253,30 @@ def ingest_session(
     return created
 
 
-def ingest_new_turns(
+@dataclass
+class IngestReport:
+    """1 サイクルの E1 の結果。"""
+
+    created: int = 0
+    #: このサイクルの後もなお未処理のセッション数 / ターン数 (上限で持ち越した分)。
+    pending_sessions: int = 0
+    pending_turns: int = 0
+    #: 読めず候補から外しているセッション数 (原本なし / 空 / 索引より短い / 例外の繰り返し)。
+    unreadable_sessions: int = 0
+
+
+def ingest_pending(
     store: EpisodicStore,
     source: TurnSource,
     *,
     session_limit: int = DEFAULT_SESSION_LIMIT,
     triggers_dir: str | Path | None = None,
     config: dict[str, Any] | None = None,
-) -> int:
-    """未ノート化のターンを全セッション分ノートにする。作った件数を返す。
+) -> IngestReport:
+    """未処理のターンがあるセッション (古い順に上限まで、現セッションは先頭枠) をノートにする。
 
+    索引の件数が progress の処理済み件数を上回るセッションだけを選ぶので、
+    直近から外れた古いセッションも数サイクルで消化される (f_02 §4.2)。
     進捗ファイルが readonly (書き戻すと壊す) の間は取り込まない — 進捗を残せない
     まま取り込むと、再起動のたびに同じターンを二度ノートにする。
     """
@@ -270,15 +285,42 @@ def ingest_new_turns(
             "Episodic ingest skipped: progress %s cannot be written back (%s)",
             store.progress.path, store.progress.last_status,
         )
-        return 0
+        return IngestReport()
     pin_cfg = ((config or {}).get("memory") or {}).get("pin") or {}
     auto_pin = bool(pin_cfg.get("auto_detect", True))
-    total = 0
-    for session in source.recent_sessions(limit=session_limit):
-        total += ingest_session(
+    report = IngestReport()
+    pick = getattr(source, "pending_sessions", None)
+    if pick is not None:
+        processed = {
+            sid: p.turn_count for sid, p in store.progress.sessions.items()
+        }
+        pending = pick(processed, session_limit)
+        sessions = pending.sessions
+        report.pending_sessions = pending.remaining_sessions
+        report.pending_turns = pending.remaining_turns
+        report.unreadable_sessions = pending.unreadable_sessions
+    else:
+        sessions = source.recent_sessions(limit=session_limit)
+    for session in sessions:
+        report.created += ingest_session(
             store, session, triggers_dir=triggers_dir, auto_pin=auto_pin,
         )
-    return total
+    return report
 
 
-__all__ = ["build_note_from_turn", "ingest_new_turns", "ingest_session"]
+def ingest_new_turns(
+    store: EpisodicStore,
+    source: TurnSource,
+    *,
+    session_limit: int = DEFAULT_SESSION_LIMIT,
+    triggers_dir: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+) -> int:
+    """:func:`ingest_pending` の作った件数だけを返す薄い版。"""
+    return ingest_pending(
+        store, source, session_limit=session_limit,
+        triggers_dir=triggers_dir, config=config,
+    ).created
+
+
+__all__ = ["IngestReport", "build_note_from_turn", "ingest_new_turns", "ingest_pending", "ingest_session"]

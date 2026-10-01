@@ -688,6 +688,20 @@ class HistoryManager:
         # いないことがある)。
         self._run(lambda: self._fold(session_id), paths=(self._turns_path(session_id),), wait=wait)
 
+    def last_active_session_id(self) -> str | None:
+        """追記ログの mtime が最新のセッション ID (いま話しているセッション)。無ければ ``None``。"""
+        if not self._active_dir.is_dir():
+            return None
+        best: tuple[float, str] | None = None
+        for path in self._active_dir.glob(f"*{TURNS_SUFFIX}"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if best is None or mtime > best[0]:
+                best = (mtime, path.name[: -len(TURNS_SUFFIX)])
+        return best[1] if best else None
+
     def fold_active_sessions(self, *, idle_seconds: float | None = None) -> int:
         """追記ログを畳む (起動時の取り残し・停止時・sleep-time の放置分)。
 
@@ -1047,6 +1061,26 @@ class HistoryManager:
         等のセッション自己参照質問を他セッションの内容と混同しないための
         スコープ限定 (呼出元は ``ToolCallJudge._maybe_scope_session_search``)。
         """
+        scored = self.search_candidates(
+            query, mode=mode, date_from=date_from, date_to=date_to, session_id=session_id,
+        )
+        return self.build_search_results(
+            scored[:limit], query, search_turns=search_turns, session_id=session_id,
+        )
+
+    def search_candidates(
+        self,
+        query: str,
+        mode: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        session_id: str | None = None,
+    ) -> list[tuple[IndexEntry, float]]:
+        """:meth:`search_sessions` の候補 ``(索引エントリ, 字句スコア)`` をスコア降順で返す。
+
+        ``limit`` で切る前の全候補。再順位 (c_16 §7.2.1 の第 5 段階) はこの上位を
+        並べ替えてから :meth:`build_search_results` に渡す。
+        """
         if session_id:
             # session_id 指定時はクエリ絞り込みを **かけずに** 対象セッションを
             # 取り、本体の turns を直接走査する。list_sessions(query=...) は
@@ -1074,10 +1108,24 @@ class HistoryManager:
             score = _score_entry(entry, q_lower)
             scored.append((entry, max(score, 0.1)))
 
-        # スコア降順でソートし、上位 limit 件に絞る
+        # スコア降順でソート (上位 limit 件に絞るのは呼出側)
         scored.sort(key=lambda x: x[1], reverse=True)
-        top_entries = scored[:limit]
+        return scored
 
+    def build_search_results(
+        self,
+        top_entries: list[tuple[IndexEntry, float]],
+        query: str,
+        *,
+        search_turns: bool = False,
+        session_id: str | None = None,
+        keep_order: bool = False,
+    ) -> list[dict]:
+        """上位の候補を検索結果の辞書へ (ターンマッチ込み)。
+
+        ``keep_order`` は再順位で並べた順を保つ (ターンマッチの加点で並べ直さない)。
+        """
+        q_lower = query.lower()
         # ターンマッチは上位 N 件のみに適用（N+1 解消）
         results: list[dict] = []
         for entry, score in top_entries:
@@ -1100,7 +1148,7 @@ class HistoryManager:
             })
 
         # ターンマッチでスコアが変動した場合に再ソート
-        if search_turns:
+        if search_turns and not keep_order:
             results.sort(key=lambda r: r["relevance_score"], reverse=True)
         return results
 
