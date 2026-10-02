@@ -31,6 +31,8 @@ class GateResult:
     skip_kind: str | None = None
     #: ``skip_kind`` の補足 (止めた書込み先・欠けた依存名)。
     skip_detail: str | None = None
+    #: skip したテストの理由 (pytest の ``SKIPPED`` 行。``stdout_tail`` からは除いてある)。
+    skip_messages: tuple[str, ...] = ()
 
     def is_failure(self) -> bool:
         """ゲート実行が失敗とみなされる (= 後段のリトライ判定対象) か"""

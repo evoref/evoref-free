@@ -758,7 +758,8 @@ def register_builtin_tools(
                     "this sandbox and will error). Only these names are "
                     "available: " + " ".join(sorted(_SAFE_NAMES)) + ". Any "
                     "other name (or any variable) will error, so inline the "
-                    "numeric value instead."
+                    "numeric value instead. A list literal is allowed only as "
+                    "the argument of sum/min/max/len, e.g. sum([12, 25, 8])."
                 ),
             },
         },

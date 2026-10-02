@@ -30,7 +30,7 @@ from backend.free.core.correction_verdict import (
     mask_quoted_speech,
     norm_span,
 )
-from backend.free.core.correction_target import split_sentences
+from backend.free.core.correction_target import old_value_core, split_sentences
 from backend.free.core.intent_vocab import is_plain_statement
 from backend.free.core.relative_date import strip_date_annotation_after
 from backend.free.core.text_quality import (
@@ -45,6 +45,7 @@ from backend.free.core.text_quality import (
     value_modifies_another_person,
 )
 from backend.free.memory.extractors.base import (
+    OWN_VALUE_UPDATE_VERDICTS,
     date_shift_days,
     shift_annotated_date,
     value_update_spans,
@@ -66,6 +67,7 @@ from backend.free.memory.notes.note_builder import (
     resolve_fact_attributes_path,
 )
 from backend.free.memory.attribute_key import GENERIC_ATTRIBUTE as _GENERIC_ATTRIBUTE
+from backend.free.memory.corrections import has_correction_shape
 from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
@@ -583,6 +585,31 @@ def _verified_correct_value(note: MemoryNote) -> str:
     if len(value) < _VALUE_ANCHOR_MIN_CHARS:
         return ""
     return value if norm_span(value) in norm_span(note.content or "") else ""
+
+
+def _verified_new_value_for(note: MemoryNote, old_span: str, content: str) -> str:
+    """検証済みの訂正の旧値が ``old_span`` と同じなら、その新値 (発話の逐語 span) を返す。
+
+    対比の新値の区間 (「母と行くこと」) は述語の手前までを取るので、言い直しの材料
+    (:func:`restate_with_correction`) には検証が抜いた新値 (「母」) の方が合う。
+    検証の旧値が別の値を指すとき・新値が発話に逐語で無いときは空文字列。
+
+    検証器が本人の値更新を ``premise_change`` / ``none`` と答えたノート
+    (:data:`OWN_VALUE_UPDATE_VERDICTS`、本人の値であることは否定していない —
+    :func:`note_may_update_own_value`) も、旧値が一致し新値が発話に逐語で在れば
+    同じく使う。使わないと対比の区間「母と行くこと」で置換し、言い直しが
+    「母と行くこと京都に…」と崩れた (2026-10-02 独立レビュー)。
+    """
+    own_update = (
+        str(getattr(note, "correction_verdict", "") or "") in OWN_VALUE_UPDATE_VERDICTS
+        and note_may_update_own_value(note)
+    )
+    if not (note_is_verified_correction(note) or own_update):
+        return ""
+    if norm_span(str(getattr(note, "correction_wrong_claim", "") or "")) != norm_span(old_span):
+        return ""
+    value = str(getattr(note, "correction_correct_value", "") or "").strip()
+    return value if value and norm_span(value) in norm_span(content) else ""
 
 
 def restate_with_correction(
@@ -1471,6 +1498,22 @@ def _span_hit_length(
     return best
 
 
+def _old_value_forms(note: MemoryNote, old: str) -> tuple[str, ...]:
+    """本人の値更新の旧値 X を照合する形を、試す順に返す (純粋関数)。
+
+    区間のまま (「やっぱり妻」) が先。前置きを外した形 (:func:`old_value_core`、
+    「妻」) は **検証が済んだ** ノートにだけ足す — 検証待ち・検証不能 (aux 不在) の
+    候補は従来どおり区間のままでしか当てず、当たらなければ並列に足す
+    (``test_contrast_old_value_span_20261002``)。検証の結果が本人の値であることを
+    否定した帰属は、呼出側が先に経路から外している (:func:`note_may_update_own_value`)。
+    検証器が計画の変更を ``premise_change`` と答えた D01 (「やっぱり妻ではなく母と
+    行くことになりました」) はここで「妻」に当たる (2026-10-02 監査の統合テスト)。
+    """
+    if getattr(note, "correction_verified_at", None) is None:
+        return (old,)
+    return tuple(dict.fromkeys((old, old_value_core(old))))
+
+
 def resolve_value_anchored_matches(
     notes: Iterable[MemoryNote],
     live_values: dict[tuple[str, str], tuple[str, ...]],
@@ -1513,10 +1556,7 @@ def resolve_value_anchored_matches(
         if not content:
             continue
         verified = note_is_verified_correction(note)
-        if not verified and not (
-            getattr(note, "is_correction", False)
-            or has_correction_form(content)
-        ):
+        if not verified and not has_correction_shape(note):
             continue
         spans = [
             span for span in (
@@ -1551,15 +1591,20 @@ def resolve_value_anchored_matches(
             # live 値に逐語で在るスロットを直接当てる (J-03)。
             update = value_update_spans(content)
             explicit: set[str] = set()
-            if update is not None:
-                needle = norm_span(update[0])
+            # 旧値の区間に区切りの無い前置きが入る形 (「やっぱり妻」) は、前置きを
+            # 外した形で当てる — 区間のままでどのスロットにも当たらず、検証が済んで
+            # 本人の値の更新と読めるときだけ (:func:`_old_value_forms`)。
+            for old in _old_value_forms(note, update[0]) if update is not None else ():
+                needle = norm_span(old)
                 for (tag, attr), (values, _anchors) in index.items():
                     for value in values:
-                        if value_names_span(value, update[0]):
+                        if value_names_span(value, old):
                             if _better_hit(best.get(tag), len(needle), attr):
-                                best[tag] = (len(needle), attr, update[0])
+                                best[tag] = (len(needle), attr, old)
                                 explicit.add(tag)
                             break
+                if explicit:
+                    break
             for (tag, attr), (values, anchors) in index.items():
                 # 明示された旧値 (「本社ではなく」) が当たった tag は、一般の
                 # アンカー (live 値の全文 = 値なしの旧行「会議の場所も変わり
@@ -1791,6 +1836,77 @@ def _correction_points_at(note: MemoryNote, statement: str) -> bool:
     return False
 
 
+def _batch_statement_values(
+    notes: Iterable[MemoryNote], builder: "ChatNoteBuilder",
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """未抽出の言明ノートの ``{(fact_type, 属性スロット): (本文, ...)}`` (純粋関数)。
+
+    利用者の発話で、訂正の形を持たず (:func:`has_correction_shape`)、まだ抽出されて
+    いないノートの **属性語で解決したスロット** だけ (汎用スロットへは足さない)。
+    形は ``sleep.extraction.collect_live_attribute_values`` と同じ。
+    """
+    values: dict[tuple[str, str], tuple[str, ...]] = {}
+    for note in notes:
+        if getattr(note, "source", "user") != "user" or note.extracted_fact_ids:
+            continue
+        if has_correction_shape(note):
+            continue
+        content = (note.content or "").strip()
+        if not content:
+            continue
+        for tag in builder.candidate_fact_tags(content):
+            if tag not in _USER_SUBJECT_TAGS:
+                continue
+            for attr, _words in resolve_fact_attribute_matches(
+                content, tag, mode="chat", triggers_dir=builder.triggers_dir,
+            ):
+                if attr and content not in values.get((tag, attr), ()):
+                    values[(tag, attr)] = (*values.get((tag, attr), ()), content)
+    return values
+
+
+def resolve_batch_anchored_matches(
+    notes: list[MemoryNote],
+    live_values: dict[tuple[str, str], tuple[str, ...]],
+    builder: "ChatNoteBuilder",
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """検証が済んだ訂正の宛先を、**同じセッションの先行する未抽出の言明** でも決める (純粋関数)。
+
+    値アンカー (:func:`resolve_value_anchored_matches`) はストアの live 値しか見ない。
+    言明と訂正が同じ Full で抽出される (会話中に Full が走らなかった) と、旧値の
+    言明はまだストアに無く、属性語を持たない訂正 (「すみません、期限は3月15日では
+    なく3月16日でした。」) は宛先が決まらずに抽出されなかった — 旧値が live のまま
+    残る (2026-10-02 監査 D09 を同じ Full で通した統合テスト)。J-03 の経路が
+    「同じバッチで先に組んだ候補」を見るのと同じ扱いを宛先の決定にも掛ける。
+
+    対象は検証が済んだノート (``correction_verified_at`` あり) だけで、照合先に足すのは
+    **同じセッションでそれより前** の言明だけ — 検証の無い候補の推測の照合
+    (アンカー索引の全文照合) を別セッションの言明へ広げない。戻り値の形は
+    :func:`resolve_value_anchored_matches` と同じ (呼出側はストアの live 値で決まった
+    宛先を優先する)。
+    """
+    resolved: dict[tuple[str, str], tuple[str, str]] = {}
+    for note in notes:
+        if getattr(note, "correction_verified_at", None) is None:
+            continue
+        session = note.session_id or ""
+        at = float(note.created_at or 0.0)
+        earlier = _batch_statement_values(
+            [
+                n for n in notes
+                if (n.session_id or "") == session and float(n.created_at or 0.0) < at
+            ],
+            builder,
+        )
+        if not earlier:
+            continue
+        merged = dict(live_values or {})
+        for key, values in earlier.items():
+            merged[key] = (*merged.get(key, ()), *values)
+        resolved.update(resolve_value_anchored_matches([note], merged))
+    return resolved
+
+
 class ChatExtractor(BaseExtractor):
     """チャットモード用 SemanticFact 抽出器。"""
 
@@ -1826,6 +1942,13 @@ class ChatExtractor(BaseExtractor):
         value_anchored_matches = resolve_value_anchored_matches(
             note_list, ctx.live_attribute_values,
         )
+        # ストアの live 値で決まらなかった検証済みの訂正は、同じセッションの先行する
+        # 未抽出の言明でも宛先を探す (:func:`resolve_batch_anchored_matches`)。
+        for key, hit in resolve_batch_anchored_matches(
+            note_list, ctx.live_attribute_values, self._builder,
+        ).items():
+            if not any(k[0] == key[0] for k in value_anchored_matches):
+                value_anchored_matches[key] = hit
         value_anchored = {
             key: attr for key, (attr, _anchor) in value_anchored_matches.items()
         }
@@ -2099,15 +2222,40 @@ class ChatExtractor(BaseExtractor):
                             # 照合は値アンカーと同じ 1 実装 (:func:`value_names_span`、
                             # 数字だけの旧値は数字の境界で見る — 「30」を「302号室」に当てない)。
                             _subject_u = make_mem_subject(kind, matches[0][0] or "user")
-                            for _n, f in reversed(candidates):
-                                if f.subject == _subject_u and value_names_span(f.object or "", update[0]):
-                                    _anchor_hit = update[0]
+                            # 前置きを外した形 (「やっぱり妻」の「妻」) は区間のままで
+                            # 当たらないときだけ使う (値アンカーの経路と同じ扱い)。
+                            for _old in _old_value_forms(note, update[0]):
+                                _anchor_hit = next(
+                                    (
+                                        _old for _n, f in reversed(candidates)
+                                        if f.subject == _subject_u
+                                        and value_names_span(f.object or "", _old)
+                                    ),
+                                    "",
+                                )
+                                if _anchor_hit:
                                     break
                         if update is not None and _anchor_hit and (
                             norm_span(update[0]) in norm_span(_anchor_hit)
                             or norm_span(_anchor_hit) in norm_span(update[0])
                         ):
                             wrong_claim, correct_value = update
+                            if (
+                                _anchor_hit != update[0]
+                                and update[0].endswith(_anchor_hit)
+                                and old_value_core(update[0]) == _anchor_hit
+                            ):
+                                # 対比の旧値の区間が区切りの無い前置きまで含む
+                                # (「やっぱり妻ではなく母と…」の「やっぱり妻」)。旧値は
+                                # live 値に当たった側で継ぐ — 区間のままでは多値スロットの
+                                # 旧値の行に span が合わず畳めない (2026-10-02 監査 #6、#13)。
+                                # 絞るのは前置き (先頭のひらがなの並び) を外した形が
+                                # アンカーと一致するときだけ (区間の途中の語へは絞らない)。
+                                wrong_claim = _anchor_hit
+                                correct_value = (
+                                    _verified_new_value_for(note, _anchor_hit, content)
+                                    or correct_value
+                                )
                             value_update_restated = True
                         elif update is not None and _foreign_anchor and _trigger_outside_update(
                             content, tuple(matches[0][1]),
@@ -2310,6 +2458,13 @@ class ChatExtractor(BaseExtractor):
                     # 無い」状態になっていた (2026-09-14 監査 F-02 の追補)。
                     if wrong_claim:
                         fact.value_update = wrong_claim  # type: ignore[attr-defined]
+                        if len(norm_span(wrong_claim)) == 1:
+                            # 1 文字の旧値 (「妻」— 前置きを外した形や検証器の span) は、
+                            # 誰の・どの行の値かを旧値だけでは決められない。畳むのは
+                            # 最後に述べた 1 行だけ (``sleep.extraction._latest_mention``、
+                            # 別セッションの「妻は看護師です」を巻き添えにしない、#13)。
+                            # 作業値で、永続化しない。
+                            fact.value_update_latest_only = True  # type: ignore[attr-defined]
                         # 旧値が **本人の記憶させた値** か (検証の verdict が self)。
                         # assistant の wrong_claim はアシスタントの言い誤りなので、
                         # 宛先スロットの継承 (``sleep.extraction._inherit_corrected_slot``)

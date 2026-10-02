@@ -49,7 +49,11 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Sequence
 
-from backend.free.core.correction_target import contrast_pair, split_sentences
+from backend.free.core.correction_target import (
+    contrast_pair,
+    old_value_core,
+    split_sentences,
+)
 from backend.free.core.correction_verdict import strip_copula
 from backend.free.core.intent_vocab import asks_user_profile_summary, is_plain_statement
 from backend.free.core.relative_date import absolutize_annotated_dates, annotate_relative_dates
@@ -64,6 +68,7 @@ from backend.free.core.session_mode import (
     is_create_mode,
     is_valid_session_mode,
 )
+from backend.free.memory.corrections import is_correction_candidate
 from backend.free.memory.attribute_key import (
     NON_ATTRIBUTE_TAILS,
     attribute_key,
@@ -131,6 +136,15 @@ def _render_labels() -> dict[str, str]:
     """prompt_locale に応じたラベル辞書 (未知 locale は ja)。"""
     return _RENDER_LABELS.get(prompt_locale(), _RENDER_LABELS["ja"])
 
+
+#: 数字を含む値 (「3歳」「2泊3日」) — 値だけでは誰の値か分からない (:meth:`MemoryInjector._claimed_correction_mark`)。
+_DIGIT_RE = re.compile(r"\d")
+#: 同じセッションで話題語なしに注記してよい、申告の直前のターン数 (利用者の発話)。
+_CLAIM_RECENT_TURNS = 3
+#: 未検証の申告 ``(X, Y, 発話時刻, 話題語, セッション, 同セッションの先行発話)``。
+_CorrectionClaim = tuple[
+    str, str, float, tuple[str, ...], str, tuple[tuple[float, str], ...],
+]
 
 #: 値の境界を判定する文字の組 (数字・英字 / 漢字 / カタカナ)。
 _VALUE_CHAR_CLASSES: tuple[str, ...] = ("0-9.A-Za-z", KANJI, KATAKANA_WORD)
@@ -2046,8 +2060,10 @@ class MemoryInjector:
     @staticmethod
     def _unverified_correction_claims(
         stm_notes: Sequence[MemoryNote],
-    ) -> list[tuple[str, str, float, tuple[str, ...]]]:
-        """未検証の訂正候補ノートの対比 ``(X, Y, 発話時刻, 話題語)`` を集める (読むだけ)。
+    ) -> list["_CorrectionClaim"]:
+        """未検証の訂正候補ノートの対比 ``(X, Y, 発話時刻, 話題語, セッション, 先行発話)`` を集める (読むだけ)。
+
+        先行発話は同じセッションで申告より前の利用者の発話 ``(時刻, 本文)``。
 
         検証 (Step 8.0) は静穏窓でしか走らないので、会話が続く間は訂正前の値の
         ファクトが注記なしで注入され、後のターンで古い値が答えになった
@@ -2058,14 +2074,17 @@ class MemoryInjector:
         もの (「コタロウ」「アレルギー」)。X が内容語を持たないときの照合に使う
         (:meth:`_claimed_correction_mark`)。
         """
-        claims: list[tuple[str, str, float, tuple[str, ...]]] = []
-        for note in stm_notes:
-            if (
-                getattr(note, "private", False)
-                or str(getattr(note, "source", "user") or "user") != "user"
-                or not getattr(note, "is_correction", False)
-                or getattr(note, "correction_verified_at", None) is not None
-            ):
+        claims: list[_CorrectionClaim] = []
+        user_notes = [
+            note for note in stm_notes
+            if not getattr(note, "private", False)
+            and str(getattr(note, "source", "user") or "user") == "user"
+        ]
+        for note in user_notes:
+            # 候補の判定は検証 (Step 8.0) の対象選びと同じ 1 実装 (不変則 #14(a))。
+            # ``is_correction`` だけを見ると、形だけを持つ候補 (検証の対象には
+            # なる) が検証待ちの間に注記されない。
+            if not is_correction_candidate(note):
                 continue
             at = float(getattr(note, "created_at", 0.0) or 0.0)
             content = getattr(note, "content", "") or ""
@@ -2073,14 +2092,41 @@ class MemoryInjector:
             if form is None:
                 continue
             values, topics = form
+            session = str(getattr(note, "session_id", "") or "")
+            earlier = tuple(
+                (float(getattr(n, "created_at", 0.0) or 0.0), str(getattr(n, "content", "") or ""))
+                for n in user_notes
+                if session and str(getattr(n, "session_id", "") or "") == session
+                and float(getattr(n, "created_at", 0.0) or 0.0) < at
+            )
             for wrong, right in zip(values[0::2], values[1::2]):
-                claims.append((wrong, right, at, topics))
+                claims.append((wrong, right, at, topics, session, earlier))
         return claims
 
     @staticmethod
+    def _latest_mention_in_session(
+        fact: SemanticFact, wrong: str, session: str,
+        earlier: tuple[tuple[float, str], ...],
+    ) -> bool:
+        """ファクトが申告と同じセッションの直前 ``_CLAIM_RECENT_TURNS`` ターン以内で、
+        その後の発話に ``wrong`` が出てこない (= 申告が指す最後の言及) か。
+
+        「妻の誕生日は5月3日」→「妻と京都に旅行」→「妻ではなく母と行く」で、
+        誕生日の行まで「妻ではなく母」と読まれないようにする (独立レビュー 2026-10-02)。
+        """
+        if not session or session not in set(getattr(fact, "session_ids", None) or ()):
+            return False
+        created = float(getattr(fact, "created_at", 0.0) or 0.0)
+        after = [content for at, content in earlier if at > created]
+        if len(after) >= _CLAIM_RECENT_TURNS:
+            return False
+        return not any(_value_boundary_re(wrong).search(content) for content in after)
+
+    @classmethod
     def _claimed_correction_mark(
+        cls,
         fact: SemanticFact,
-        claims: Sequence[tuple[str, str, float, tuple[str, ...]]],
+        claims: Sequence["_CorrectionClaim"],
     ) -> str:
         """``fact`` の行末に付ける未確認の訂正申告 (無ければ空文字)。
 
@@ -2090,17 +2136,36 @@ class MemoryInjector:
         X が内容語を持たない (「3歳」「2泊3日」) ときは、訂正発話の話題語が 1 つ
         以上ファクト本文にも在ることを要求する — 値だけでは誰・何の値か分からず、
         「コタロウは3歳ではなく5歳」が「娘は3歳です」にも付いていた (f_02 §5.3)。
+        数字を含まない X (「妻」— 1 文字の名詞は内容語に数えられない) は、ファクトが
+        申告と同じセッションの直前の数ターンで述べられ、その後に X の言及が無い
+        (:meth:`_latest_mention_in_session`) ときだけ話題語を要求しない。
+
+        X の区間が区切りの無い前置きを含む (「やっぱり妻」) と本文に当たらないので、
+        区間のまま本文に当たらないときに限り、前置きを外した形 (:func:`old_value_core`)
+        で当てる (2026-10-02 監査 #6)。区間が当たるなら外した形は使わない
+        (「ほうじ茶」を「茶」に削って広げない)。
         """
         if not claims:
             return ""
         text = str(getattr(fact, "text", "") or "")
         created = float(getattr(fact, "created_at", 0.0) or 0.0)
-        for wrong, right, at, topics in claims:
+        for claimed, right, at, topics, session, earlier in claims:
             if created >= at or right in text:
                 continue
-            if not query_anchors(wrong) and not any(t in text for t in topics):
-                continue
-            if _value_boundary_re(wrong).search(text):
+            wrong = claimed
+            if not _value_boundary_re(wrong).search(text):
+                wrong = old_value_core(claimed)
+                if wrong == claimed or not _value_boundary_re(wrong).search(text):
+                    continue
+            linked = (
+                bool(query_anchors(wrong))
+                or any(t in text for t in topics)
+                or (
+                    not _DIGIT_RE.search(wrong)
+                    and cls._latest_mention_in_session(fact, wrong, session, earlier)
+                )
+            )
+            if linked:
                 return _render_labels()["claimed_correction"].format(
                     wrong=wrong, right=right,
                 )

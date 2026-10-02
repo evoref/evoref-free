@@ -6,15 +6,19 @@ staged v2 は Python を平置き (``src/<name>.py``、bare import) で生成・
 
 引き金は使い方と共通の親の一致だけ — ``__init__.py`` の有無では決めない (平置きのアプリに付いた
 余計な ``__init__.py`` で ``python main.py`` が壊れる)、``python -m http.server`` のような無関係な
-モジュール名もパッケージにしない (反証レビュー S6)。純粋関数だけを置く (実行は
-``smoke_validator.run_usage``)。
+モジュール名もパッケージにしない (反証レビュー S6)。使い方が ``python -m <パッケージ> <サブコマンド> …`` なら
+``__main__.py`` は各モジュールの入口への振り分けを作る (2026-10-03 K04)。使い方の読み取りと実行結果の判定は
+平置きの使い方 (``python main.py …``) にも使う。純粋関数だけを置く (実行は ``smoke_validator.run_usage``)。
 """
 
 from __future__ import annotations
 
 import ast
 import builtins
+import importlib.util
+import keyword
 import re
+import sys
 import shlex
 import textwrap
 from pathlib import PurePosixPath, PureWindowsPath
@@ -42,6 +46,8 @@ _TRACE_FILE_RE = re.compile(r'File "([^"]+)"')
 #: traceback の最後の例外の行 (``ValueError: …`` / ``json.decoder.JSONDecodeError: …``)。
 _EXCEPTION_LINE_RE = re.compile(r"^[A-Za-z_][\w.]*(?::\s|$)")
 _TRACEBACK_HEAD = "Traceback (most recent call last):"
+#: 別のプロセスが使用中で消せない (Windows の共有違反。実行フォルダ自身の削除で出る)。
+_IN_USE_RE = re.compile(r"\[WinError 32\]")
 
 
 # ── 引き金 ─────────────────────────────────────────────────────────────
@@ -56,12 +62,11 @@ def _split(line: str) -> list[str]:
     return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in tokens]
 
 
-def usage_command(usage: str) -> tuple[str, list[str]] | None:
-    """使い方 ``python -m <モジュール> <引数…>`` を ``(モジュール, 引数)`` にする (その形でなければ ``None``)。
+def _command_tokens(usage: str) -> list[str] | None:
+    """使い方の起動コマンドの後ろ (インタプリタのオプションを除いた ``-m x …`` / ``main.py …``)。無ければ ``None``。
 
     起動コマンド (``python`` / ``py`` / ``C:\\Python312\\python.exe`` …) の語から後ろだけを読む — 前置き
     (``$ `` / ``PS> `` / バッククォート / 「コマンド例:」 / ``cd x &&``) は捨てる。起動コマンドのある最初の行を見る。
-    引数は ``#`` のコメントと ``;`` の後ろを捨てる。
     """
     for raw in str(usage or "").splitlines():
         tokens = _split(raw.replace("`", " "))
@@ -72,19 +77,111 @@ def usage_command(usage: str) -> tuple[str, list[str]] | None:
         i = 1
         while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "-m":
             i += 2 if tokens[i] in _OPTIONS_WITH_VALUE else 1
-        if i + 1 >= len(tokens) or tokens[i] != "-m":
-            return None
-        args: list[str] = []
-        for token in tokens[i + 2:]:
-            if token.startswith("#"):
-                break
-            if token.endswith(";"):
-                if token[:-1]:
-                    args.append(token[:-1])
-                break
-            args.append(token)
-        return tokens[i + 1], args
+        return tokens[i:]
     return None
+
+
+def _command_args(tokens: list[str]) -> list[str]:
+    """引数の列から ``#`` のコメントと ``;`` の後ろを捨てる。"""
+    args: list[str] = []
+    for token in tokens:
+        if token.startswith("#"):
+            break
+        if token.endswith(";"):
+            if token[:-1]:
+                args.append(token[:-1])
+            break
+        args.append(token)
+    return args
+
+
+def usage_command(usage: str) -> tuple[str, list[str]] | None:
+    """使い方 ``python -m <モジュール> <引数…>`` を ``(モジュール, 引数)`` にする (その形でなければ ``None``)。
+
+    前置きの扱いは :func:`_command_tokens`。引数は ``#`` のコメントと ``;`` の後ろを捨てる。
+    """
+    rest = _command_tokens(usage)
+    if not rest or len(rest) < 2 or rest[0] != "-m":
+        return None
+    return rest[1], _command_args(rest[2:])
+
+
+def script_command(usage: str) -> tuple[str, list[str]] | None:
+    """使い方 ``python <ファイル>.py <引数…>`` を ``(ファイルのパス, 引数)`` にする (その形でなければ ``None``)。
+
+    パスの区切りは ``/`` に揃える。前置きと引数の扱いは :func:`usage_command` と同じ。
+    """
+    rest = _command_tokens(usage)
+    if not rest or not rest[0].lower().endswith(".py"):
+        return None
+    return rest[0].replace("\\", "/"), _command_args(rest[1:])
+
+
+#: 依頼文の ASCII の連なりの前後から外す囲みと句読点 (``(python -m x)`` / ``python -m x.``)。
+_RUN_EDGE_CHARS = " \t\"'([{)]}.,;:!?"
+#: 依頼文のバッククォートで囲んだ 1 行の中身。
+_QUOTED_COMMAND_RE = re.compile(r"`([^`\n]+)`")
+#: コマンドの後ろの説明の始まりとみなす語 (結果を示す矢印)。
+_PROSE_ARROWS = frozenset({"->", "=>", "→", "⇒"})
+
+
+def _until_prose(args: list[str]) -> list[str]:
+    """引数の列を、2 番目以降で説明の文 (ASCII 以外の文字を含む語・矢印) が始まる手前で打ち切る。
+
+    最初の引数 (サブコマンド ``追加`` のような和語もありうる) は残す。
+    """
+    out: list[str] = []
+    for i, arg in enumerate(args):
+        if i >= 1 and (arg in _PROSE_ARROWS or not arg.isascii()):
+            break
+        out.append(arg)
+    return out
+
+
+def usage_from_request(text: str, folder: str = "") -> str:
+    """依頼文が書いた ``python -m <モジュール>`` (無ければ空)。骨組みの ``usage`` が空のときの代わり。
+
+    字句の鍵 (語彙ではなく文字の種類で切る): 行をバッククォートと ASCII 以外の文字で切った連なりから
+    ``python -m <モジュール>`` を拾う。引数は採らない — 依頼文では使い方の後ろの文 (``-> 6.2 mi と出る`` /
+    英文の続き) と区別できず、誤った引数で使い方の実行が落ちると正しいモジュールを作り直してしまう。
+    モジュール名の前後の引用符・句読点は剥がす。複数あれば ``folder`` (骨組みの共通の親) で
+    パッケージ形が成り立つものを優先し、無ければ最初のもの。
+
+    例外はバッククォートで囲んだコマンド (`` `python -m textkit count file.txt` ``) — 囲みの中がコマンドだけ
+    (起動コマンドから始まる) なら後ろの文と混ざらないので引数も採る (2026-10-03 K04: サブコマンド ``count`` が
+    分からず ``__main__.py`` を補完できなかった)。囲みの中でもコマンドの後ろに説明が続くこと
+    (`` `python -m textkit count file.txt で行数を数える` `` / `` `python -m units 10 km mi -> 6.21` ``) があるので、
+    2 番目以降の引数に ASCII 以外の文字を含む語・矢印 (``->`` / ``=>``) が出たらそこで打ち切る (独立レビュー 中 2)。
+    """
+    quoted: dict[str, str] = {}
+    for span in _QUOTED_COMMAND_RE.findall(str(text or "")):
+        tokens = _split(span.strip())
+        command = usage_command(span) if tokens and _PYTHON_EXE_RE.match(PureWindowsPath(tokens[0]).name) else None
+        if command and all(p.isidentifier() for p in command[0].split(".")) and command[0] not in quoted:
+            # 空白を含む引数だけ二重引用符で囲む (:func:`_split` が外す。和語・Windows のパスは囲まない)
+            quoted[command[0]] = " ".join(
+                f'"{a}"' if any(c.isspace() for c in a) else a
+                for a in ["python", "-m", command[0], *_until_prose(command[1])]
+            )
+    modules: list[str] = []
+    for line in str(text or "").splitlines():
+        run = ""
+        for ch in line + "`":
+            if ch.isascii() and ch != "`":
+                run += ch
+                continue
+            tokens = [t.strip(_RUN_EDGE_CHARS) for t in run.split()]
+            run = ""
+            # 1 つの連なりに起動コマンドが複数 (英文の「… python -m pytest … python -m textkit」) でも全部拾う
+            for i, token in enumerate(tokens):
+                if not _PYTHON_EXE_RE.match(PureWindowsPath(token).name):
+                    continue
+                command = usage_command(" ".join(tokens[i:]))
+                module = command[0].strip(_RUN_EDGE_CHARS) if command else ""
+                if module and all(p.isidentifier() for p in module.split(".")) and module not in modules:
+                    modules.append(module)
+    usages = [quoted.get(m) or f"python -m {m}" for m in modules]
+    return next((u for u in usages if package_from_usage(u, folder)), usages[0] if usages else "")
 
 
 def package_from_usage(usage: str, folder: str) -> str:
@@ -288,17 +385,127 @@ def choose_entry(code_map: dict[str, str], declared: str) -> str:
     return "__init__.py" if "__init__.py" in code_map else ""
 
 
-def package_code_map(code_map: dict[str, str], entry: str, *, synthesize_main: bool = True) -> dict[str, str]:
+# ── サブコマンドの振り分け (``python -m textkit count file.txt``) ─────────────
+
+#: サブコマンドのモジュールの入口として呼ぶ関数の名前 (この順に探す)。
+SUBCOMMAND_ENTRY_NAMES = ("main", "run", "cli")
+#: 骨組みがサブコマンドのモジュールに足す入口 (argv はサブコマンドより後ろの引数、戻り値は終了コード)。
+SUBCOMMAND_ENTRY_SIGNATURE = "def main(argv: list[str] | None = None) -> int"
+
+
+def subcommand_modules(usage: str, package: str, modules: list[dict], text: str = "") -> list[str]:
+    """使い方 ``python -m <package> <サブコマンド> …`` のサブコマンドに当たるモジュールの stem (先頭が使い方のもの)。
+
+    使い方がパッケージそのものを起動し、最初の引数がパッケージのモジュールの stem のときだけ (それ以外は空)。
+    残りは骨組みで他のモジュールから使われない (``imports_from`` に現れない) モジュール — 共通の部品
+    (``utils.py``) はサブコマンドにしない。``__init__`` / ``__main__`` は数えない。モジュール名で決める (語彙は見ない)。
+    骨組みがどのモジュールにも ``imports_from`` を書いていない (使われる・使われないが分からない) ときは、
+    使い方か ``text`` (依頼文) に名前が語として出るものだけを残す (独立レビュー 低 a: ``utils`` に入口を強いない)。
+    """
+    command = usage_command(usage)
+    if command is None or not package or command[0] != package.replace("/", ".") or not command[1]:
+        return []
+    stems = [
+        PurePosixPath(m["path"]).stem for m in modules
+        if str(m.get("path") or "").endswith(".py") and PurePosixPath(m["path"]).stem not in ("__init__", "__main__")
+        and PurePosixPath(m["path"]).stem.isidentifier() and not keyword.iskeyword(PurePosixPath(m["path"]).stem)
+    ]
+    first = command[1][0]
+    if first not in stems:
+        return []
+    used = {PurePosixPath(str(p)).stem for m in modules for p in m.get("imports_from") or []}
+    others = [s for s in stems if s != first and s not in used]
+    if not used:
+        named = f"{usage}\n{text}"
+        others = [s for s in others if re.search(rf"(?<![A-Za-z0-9_]){re.escape(s)}(?![A-Za-z0-9_])", named)]
+    return [first, *others]
+
+
+def subcommand_entry(source: str) -> tuple[str, bool] | None:
+    """サブコマンドのモジュールの入口 ``(関数名, argv を渡すか)``。呼べる入口が無ければ ``None``。
+
+    モジュール直下の ``main`` / ``run`` / ``cli`` (この順) のうち、引数 1 つ (argv) で呼べるもの、または引数を
+    取らないもの (``sys.argv`` を自分で読む) を採る。必須の引数が 2 つ以上・必須のキーワード専用引数があれば呼べない。
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    for name in SUBCOMMAND_ENTRY_NAMES:
+        fn = defs.get(name)
+        if fn is None:
+            continue
+        a = fn.args
+        positional = [*a.posonlyargs, *a.args]
+        required = len(positional) - len(a.defaults)
+        if required > 1 or any(d is None for d in a.kw_defaults):
+            continue
+        return name, bool(positional) or a.vararg is not None
+    return None
+
+
+def synthesize_dispatcher(code_map: dict[str, str], subcommands: list[str], prog: str) -> str:
+    """サブコマンドを各モジュールの入口へ振り分ける ``__main__.py`` (作れなければ空文字列)。
+
+    使い方のサブコマンド (``subcommands[0]``) のモジュールに入口 (:func:`subcommand_entry`) が無ければ作らない —
+    入口を推し量った呼出しで使い方の実行を通したように見せない。ほかのサブコマンドは入口のあるものだけを
+    振り分けに入れる (入口の無いものは :func:`unwired_subcommands` が挙げる)。入口が argv を取るならサブコマンドより
+    後ろの引数を渡し、取らなければ ``sys.argv`` をその形にして呼ぶ。戻り値が int ならそれを終了コードにする。
+    """
+    entries = {s: subcommand_entry(code_map.get(f"{s}.py", "")) for s in subcommands}
+    if not subcommands or entries[subcommands[0]] is None:
+        return ""
+    wired = [(s, e) for s, e in entries.items() if e is not None]
+    table = "\n".join(f"    {s!r}: ({name!r}, {takes_argv})," for s, (name, takes_argv) in wired)
+    choices = ",".join(s for s, _ in wired)
+    # サブコマンドのモジュールは名前で束縛せず使うときに import する (``sys`` という名前のサブコマンドが標準の
+    # sys を上書きしない、独立レビュー 低 c)
+    return (
+        "import importlib as _importlib\n"
+        "import sys as _sys\n\n"
+        f"_COMMANDS = {{\n{table}\n}}\n\n\n"
+        "def _dispatch(argv):\n"
+        "    if not argv or argv[0] not in _COMMANDS:\n"
+        f"        print({f'usage: python -m {prog} {{{choices}}} ...'!r}, file=_sys.stderr)\n"
+        "        return 2\n"
+        "    name, rest = argv[0], argv[1:]\n"
+        "    func, takes_argv = _COMMANDS[name]\n"
+        "    entry = getattr(_importlib.import_module(\".\" + name, __package__), func)\n"
+        "    if takes_argv:\n"
+        "        result = entry(rest)\n"
+        "    else:\n"
+        "        _sys.argv = [f\"{_sys.argv[0]} {name}\", *rest]\n"
+        "        result = entry()\n"
+        "    return result if type(result) is int else 0\n\n\n"
+        'if __name__ == "__main__":\n'
+        "    _sys.exit(_dispatch(_sys.argv[1:]))\n"
+    )
+
+
+def unwired_subcommands(code_map: dict[str, str], subcommands: list[str]) -> list[str]:
+    """入口 (:func:`subcommand_entry`) が無く振り分けられないサブコマンドのモジュールの stem。"""
+    return [s for s in subcommands if subcommand_entry(code_map.get(f"{s}.py", "")) is None]
+
+
+def package_code_map(
+    code_map: dict[str, str], entry: str, *, synthesize_main: bool = True,
+    subcommands: list[str] | None = None, prog: str = "",
+) -> dict[str, str]:
     """平置きのコード (``length.py`` …) からパッケージの中身 (同じ名前 + ``__init__.py`` / ``__main__.py``) を作る。
 
     ``synthesize_main=False`` は ``__main__.py`` を合成しない (使い方が ``python -m units.cli`` の形)。
+    ``subcommands`` (:func:`subcommand_modules`) があれば、まず各モジュールの入口への振り分け
+    (:func:`synthesize_dispatcher`) を作り、作れなければ入口のモジュールのガードから合成する。
     """
     siblings = {PurePosixPath(p).stem for p in code_map if p.endswith(".py")}
     out = {p: (to_package_imports(c, siblings) if p.endswith(".py") else c) for p, c in code_map.items()}
     out.setdefault("__init__.py", "")
-    if synthesize_main and "__main__.py" not in out and entry in code_map:
-        # ガードの本体の兄弟 import (``from length import convert``) も相対にする
-        main = to_package_imports(_synthesize_main(entry, code_map[entry], siblings), siblings)
+    if synthesize_main and "__main__.py" not in out:
+        main = synthesize_dispatcher(code_map, list(subcommands or []), prog) if subcommands else ""
+        if not main and entry in code_map:
+            # ガードの本体の兄弟 import (``from length import convert``) も相対にする
+            main = to_package_imports(_synthesize_main(entry, code_map[entry], siblings), siblings)
         if main:
             out["__main__.py"] = main
     return out
@@ -344,6 +551,110 @@ def usage_blocker(args: list[str], code_map: dict[str, str], available: set[str]
     return ""
 
 
+#: import したら使い方を実行しないモジュール — 隔離 (f_10 §11.1-4) が止めない外部への作用 (別プロセス・シェル・
+#: ネットワークの接続や待受・ブラウザ・ネイティブ呼出し・サーバのフレームワーク)。``a.b`` は ``a.b`` とその下。
+_SIDE_EFFECT_MODULES = frozenset({
+    "subprocess", "socket", "socketserver", "http.server", "http.client", "urllib.request", "xmlrpc",
+    "ftplib", "smtplib", "poplib", "imaplib", "telnetlib", "ssl", "webbrowser", "ctypes", "winreg", "_winapi",
+    "multiprocessing", "requests", "httpx", "aiohttp", "urllib3", "paramiko", "websocket", "websockets",
+    "flask", "fastapi", "uvicorn", "django", "bottle", "tornado", "pyautogui", "pynput",
+})
+#: ``os.<名前>(…)`` で別プロセス・シェルを起こす / プロセスを止める呼出し (前方一致は exec* / spawn* / posix_spawn*)。
+_OS_SIDE_EFFECT_CALLS = frozenset({"system", "popen", "startfile", "kill", "killpg", "fork", "forkpty"})
+_OS_SIDE_EFFECT_PREFIXES = ("exec", "spawn", "posix_spawn")
+#: どのオブジェクトの属性でも待受・画面を開く呼出し (``asyncio.start_server`` / ``serve_forever`` / ``plt.show``)。
+_SERVE_CALLS = frozenset({"start_server", "create_server", "serve_forever", "run_forever"})
+
+
+def _module_matches(name: str, roots: frozenset[str]) -> str:
+    return next((r for r in roots if name == r or name.startswith(r + ".")), "")
+
+
+def usage_side_effect(code_map: dict[str, str]) -> str:
+    """使い方を実行すると隔離の外へ作用する恐れのある書き方 (最初の 1 つ、無ければ空)。
+
+    隔離 (f_10 §11.1-4) は Python の中のファイル書込みしか止めない — シェル (``os.system('echo > 外')``)・
+    別プロセス・ソケットの接続や待受・ブラウザ・ネイティブ呼出しは通る (独立レビュー 高)。それらを import する・
+    呼ぶ成果物は実行しない (未検査)。``matplotlib.pyplot`` は ``show()`` を呼ぶときだけ (画像の保存は実行する)。
+    字句の鍵 (AST の import と呼出し) だけを見る — 語彙の判定ではない。
+    """
+    for path, source in code_map.items():
+        if not path.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        os_names: set[str] = set()
+        pyplot_names: set[str] = set()
+        for node in ast.walk(tree):
+            names: list[tuple[str, str]] = []
+            if isinstance(node, ast.Import):
+                names = [(a.name, a.asname or a.name.split(".")[0]) for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                names = [(f"{node.module}.{a.name}", a.asname or a.name) for a in node.names]
+                names.append((node.module, ""))
+            for full, bound in names:
+                hit = _module_matches(full, _SIDE_EFFECT_MODULES)
+                if hit:
+                    return hit
+                if isinstance(node, ast.Import) and full.split(".")[0] == "os":
+                    # ``import os`` / ``import os as o`` / ``import os.path`` (``os`` を束縛する)
+                    os_names.add(bound)
+                elif isinstance(node, ast.ImportFrom) and full.startswith("os.") and full.count(".") == 1:
+                    attr = full.split(".", 1)[1]
+                    if attr in _OS_SIDE_EFFECT_CALLS or attr.startswith(_OS_SIDE_EFFECT_PREFIXES):
+                        return full
+                elif full == "matplotlib.pyplot" and bound:
+                    pyplot_names.add(bound)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            attr = node.func.attr
+            base = node.func.value
+            if isinstance(base, ast.Name) and base.id in os_names and (
+                attr in _OS_SIDE_EFFECT_CALLS or attr.startswith(_OS_SIDE_EFFECT_PREFIXES)
+            ):
+                return f"os.{attr}"
+            if attr in _SERVE_CALLS:
+                return attr
+            if attr == "show" and isinstance(base, ast.Name) and base.id in pyplot_names:
+                return "matplotlib.pyplot.show"
+    return ""
+
+
+def usage_missing_dependency(code_map: dict[str, str]) -> str:
+    """成果物が import する外部依存のうち、この環境に入っていないもの (最初の 1 つ、無ければ空)。
+
+    兄弟モジュール・標準ライブラリ・相対 import は見ない。入っていない依存で使い方を実行すると
+    ``ModuleNotFoundError`` の不合格になり、正しいコードを作り直してしまう (環境の欠けでコードの欠陥ではない)。
+    """
+    siblings = {PurePosixPath(p).stem for p in code_map if p.endswith(".py")}
+    for path, source in code_map.items():
+        if not path.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            heads = (
+                [a.name.split(".")[0] for a in node.names] if isinstance(node, ast.Import)
+                else [(node.module or "").split(".")[0]] if isinstance(node, ast.ImportFrom) and not node.level
+                else []
+            )
+            for head in heads:
+                if not head or head in siblings or head in sys.stdlib_module_names or head == "__future__":
+                    continue
+                try:
+                    found = importlib.util.find_spec(head) is not None
+                except (ImportError, ValueError):
+                    found = False
+                if not found:
+                    return head
+    return ""
+
+
 def _last_exception(stderr: str) -> str:
     for line in reversed([ln.strip() for ln in stderr.splitlines() if ln.strip()]):
         match = _EXCEPTION_LINE_RE.match(line)
@@ -352,24 +663,33 @@ def _last_exception(stderr: str) -> str:
     return ""
 
 
-def _blamed_stem(stderr: str, package: str) -> str:
-    """traceback の最後のパッケージ内のファイルの stem (無ければ空)。"""
+def _blamed_stem(stderr: str, package: str, stems: set[str] | None = None) -> str:
+    """traceback の最後のパッケージ内のファイルの stem (無ければ空)。
+
+    平置き (``package`` が空) は ``stems`` (成果物のモジュール) に入る stem のファイルだけを見る (標準ライブラリの
+    ``json/decoder.py`` を宛先にしない)。
+    """
     parts = [p for p in package.replace("\\", "/").split("/") if p]
     for path in reversed(_TRACE_FILE_RE.findall(stderr)):
         pure = PurePosixPath(path.replace("\\", "/"))
+        if not parts:
+            if pure.suffix == ".py" and pure.stem in (stems or set()):
+                return pure.stem
+            continue
         if len(pure.parts) > len(parts) and list(pure.parts[-len(parts) - 1:-1]) == parts:
             return pure.stem
     return ""
 
 
 def usage_outcome(
-    run: "UsageRun", package: str, *, args: list[str] | None = None,
+    run: "UsageRun", package: str, *, args: list[str] | None = None, stems: set[str] | None = None,
 ) -> tuple[CheckOutcome, str]:
     """使い方の実行結果を 3 値にする。戻り値は (結果, 作り直す stem — 無ければ空)。
 
     終了コード 0 かつ traceback が無ければ合格。隔離が書込みを止めた・時間切れ・``EOFError`` (対話) は未検査。
-    ``args`` が空 (引数を渡していない) で traceback 無しの非 0 終了 (argparse の必須引数のエラー) も入力待ちの
-    未検査。不合格なら traceback の最後の ``<package>/`` の中のファイルを作り直しの宛先に返す。
+    ``args`` が空 (引数を渡していない) で traceback 無しの非 0 終了 (argparse の必須引数のエラー・「入力ファイルが
+    ありません」で終わる) も入力待ちの未検査で、理由に最後の出力の行 (stderr、無ければ stdout) を添える。
+    不合格なら traceback の最後の ``<package>/`` の中のファイル (平置きは ``stems`` のファイル) を作り直しの宛先に返す。
     """
     from backend.i18n_helper import msg
 
@@ -391,21 +711,38 @@ def usage_outcome(
         return CheckOutcome.unchecked(CheckKind.USAGE, UncheckedReason.NEEDS_INPUT, detail=exception[:200]), ""
     if run.returncode == 0 and not has_traceback:
         return CheckOutcome.passed(CheckKind.USAGE), ""
+    if _IN_USE_RE.search(exception):
+        # 実行フォルダ自身 (CWD・実行中のファイル) を消そうとして掴まれていた (``shutil.rmtree('.')``) — 実行の場の
+        # 制約でコードの欠陥ではない。不合格にして正しいコードを作り直さない (独立レビュー 中 1)
+        return CheckOutcome.unchecked(CheckKind.USAGE, UncheckedReason.NOT_RUN, detail=exception[:200]), ""
     if args is not None and not args and not has_traceback:
-        last = next((ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), f"exit code {run.returncode}")
+        lines = [ln.strip() for ln in (stderr or run.stdout or "").splitlines() if ln.strip()]
+        last = lines[-1] if lines else f"exit code {run.returncode}"
         return CheckOutcome.unchecked(CheckKind.USAGE, UncheckedReason.NEEDS_INPUT, detail=last[:200]), ""
     summary = exception or f"exit code {run.returncode}: {stderr.strip()[-200:]}"
-    return CheckOutcome.failed(CheckKind.USAGE, errors=1, failures=[summary[:300]]), _blamed_stem(stderr, package)
+    return CheckOutcome.failed(CheckKind.USAGE, errors=1, failures=[summary[:300]]), _blamed_stem(
+        stderr, package, stems,
+    )
 
 
 __all__ = [
+    "SUBCOMMAND_ENTRY_NAMES",
+    "SUBCOMMAND_ENTRY_SIGNATURE",
     "choose_entry",
     "is_main_guard",
     "package_code_map",
     "package_from_usage",
+    "script_command",
+    "subcommand_entry",
+    "subcommand_modules",
+    "synthesize_dispatcher",
     "synthesize_main",
     "to_package_imports",
+    "unwired_subcommands",
     "usage_blocker",
     "usage_command",
+    "usage_from_request",
+    "usage_missing_dependency",
     "usage_outcome",
+    "usage_side_effect",
 ]

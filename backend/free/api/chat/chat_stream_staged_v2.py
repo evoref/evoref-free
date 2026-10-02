@@ -53,16 +53,26 @@ from backend.free.generation.contract_tests import (
     rebase_absolute_paths_in_expression,
     path_constants_by_module,
     rebase_absolute_paths_in_source,
+    repair_windows_path_literals,
     unbake_default_data_paths,
 )
 from backend.free.generation.package_layout import (
+    SUBCOMMAND_ENTRY_NAMES,
+    SUBCOMMAND_ENTRY_SIGNATURE,
     choose_entry,
     package_code_map,
     package_from_usage,
+    script_command,
+    subcommand_modules,
+    synthesize_dispatcher,
     to_package_imports,
+    unwired_subcommands,
     usage_blocker,
     usage_command,
+    usage_from_request,
+    usage_missing_dependency,
     usage_outcome,
+    usage_side_effect,
 )
 from backend.free.generation.smoke_validator import check_call_arity, run_usage
 from backend.free.core.prompt_blocks import SHARED_CONTEXT_BOUNDARY
@@ -526,6 +536,71 @@ def package_of(modules: list[dict], usage: str, folder: str) -> str:
     return package_from_usage(usage, folder)
 
 
+def _flat_usage_command(skeleton: dict) -> tuple[str, list[str]] | None:
+    """平置きの Python の使い方を ``(起動するモジュール, 引数)`` にする (f_10 §11.1-3)。その形でなければ ``None``。
+
+    ``python <名前>.py …`` / ``python -m <名前> …`` で、``<名前>.py`` が骨組みの (平置きの) モジュールのときだけ。
+    無関係なモジュール (``python -m http.server``) と Python 以外の使い方 (``open index.html``) は実行しない。
+    """
+    paths = {m["path"] for m in skeleton.get("modules") or [] if str(m.get("path") or "").endswith(".py")}
+    usage = str(skeleton.get("usage") or "")
+    script = script_command(usage)
+    if script is not None:
+        name = PurePosixPath(script[0]).name
+        return (PurePosixPath(name).stem, script[1]) if name in paths else None
+    module = usage_command(usage)
+    if module is not None and f"{module[0]}.py" in paths:
+        return module
+    return None
+
+
+def _require_subcommand_entries(modules: list[dict], subcommands: list[str], prog: str) -> list[dict]:
+    """サブコマンドのモジュールに入口 ``main(argv)`` を足す (既に ``main`` / ``run`` / ``cli`` を挙げていれば足さない)。
+
+    骨組みの components は生成の契約なので、ここに足せばモジュールの生成指示に載る (f_10 §11.1-1 (b))。
+    """
+    from backend.i18n_helper import msg
+
+    out = []
+    for m in modules:
+        stem = PurePosixPath(m["path"]).stem
+        components = list(m.get("components") or [])
+        declared = {
+            str(c.get("signature") or "").split("(")[0].replace("async def ", "").replace("def ", "").strip()
+            for c in components
+        }
+        if stem in subcommands and not declared & set(SUBCOMMAND_ENTRY_NAMES):
+            components.append({
+                "signature": SUBCOMMAND_ENTRY_SIGNATURE,
+                "summary": msg("create.subcommand_entry_summary", command=f"python -m {prog} {stem}"),
+            })
+            m = {**m, "components": components}
+        out.append(m)
+    return out
+
+
+def _fill_empty_usage_from_request(data: dict, query: str) -> dict:
+    """骨組みの ``usage`` が空のとき、依頼文の ``python -m <共通の親>`` で埋める (f_10 §11.1-1)。
+
+    2026-10-02 ライブ監査 K04: 依頼は ``python -m textkit count file.txt`` と書いたのに骨組みの usage が空で、
+    パッケージ形にならず ``textkit/`` に平置き (bare import・``__main__.py`` 無し・SPEC.md が中) で配信された。
+    埋めるのはパッケージ形の引き金が成り立つ (依頼のモジュールが骨組みの共通の親) ときだけ。剥がし
+    (``_strip_output_folder_prefix``) が共通の親を見る前に埋める。
+    """
+    if str(data.get("usage") or "").strip():
+        return data
+    try:
+        common = posixpath.commonpath([posixpath.dirname(p) for p in skeleton_paths(data)])
+    except ValueError:
+        return data
+    # 依頼文からはモジュールだけ (``python -m <共通の親>``) を採る — 引数は後ろの文と区別できない
+    usage = usage_from_request(query, common)
+    if not usage or not package_from_usage(usage, common):
+        return data
+    logger.info("staged v2: the skeleton has no usage; taking `%s` from the request", usage)
+    return {**data, "usage": usage}
+
+
 def normalize_skeleton(data: dict, query: str = "") -> tuple[dict, str]:
     """骨組みを検証・正規化する。戻り値は (正規化済み骨組み, 出力フォルダ)。
 
@@ -534,7 +609,9 @@ def normalize_skeleton(data: dict, query: str = "") -> tuple[dict, str]:
     モデルが書いた絶対パスは先に出力先からの相対へ直し (``_rebase_absolute_paths``)、先頭に繰り返された
     出力フォルダの名前を剥がす (``_strip_output_folder_prefix``)。
     """
-    data = _strip_output_folder_prefix(_rebase_absolute_paths(data, query), query)
+    data = _strip_output_folder_prefix(
+        _fill_empty_usage_from_request(_rebase_absolute_paths(data, query), query), query,
+    )
     kept = set(skeleton_paths(data))
     modules = [
         {**m, "path": _norm_path(m.get("path", ""))} for m in data.get("modules") or []
@@ -583,15 +660,30 @@ def normalize_skeleton(data: dict, query: str = "") -> tuple[dict, str]:
     )
     examples = [
         {**e, "module": _local(e.get("module", "") or ""),
-         "call": rebase_absolute_paths_in_expression(str(e.get("call") or ""), relative_of)}
+         # バックスラッシュを重ねずに書いた Windows パス (``'E:\tmp\…'``) を先に直す — ``\t`` がタブになり相対化も外れる
+         "call": rebase_absolute_paths_in_expression(
+             # 直すのは相対化の対象 (出力フォルダの配下) のパスだけ — ``'C:\n'`` 等の意図したエスケープを残す
+             repair_windows_path_literals(str(e.get("call") or ""), lambda v: relative_of(v) is not None),
+             relative_of,
+         )}
         for e in data.get("examples") or []
     ]
+    usage = relativize_usage(str(data.get("usage") or ""), usage_relative_of)
+    # ``python -m textkit count file.txt`` のサブコマンド (f_10 §11.1-1 (b)): 各モジュールに入口 main(argv) を
+    # 書かせ、配信形の __main__.py はその振り分けを決定論で作る (2026-10-03 K04: __main__.py が無く起動できなかった)
+    package = package_of(flat, usage, folder)
+    # 骨組みが __main__.py を挙げていればモデルの __main__ を尊重し、振り分けを補わない (独立レビュー 低 b)
+    subcommands = subcommand_modules(usage, package, flat, query) if package and "__main__.py" not in names else []
+    if subcommands:
+        flat = _require_subcommand_entries(flat, subcommands, package.replace("/", "."))
+    extra: dict = {"subcommands": subcommands} if subcommands else {}
     return {
         "summary": str(data.get("summary") or ""),
         "language": family or "python",
         "modules": flat,
         "entry_module": entry if entry in names else "",
-        "usage": relativize_usage(str(data.get("usage") or ""), usage_relative_of),
+        "usage": usage,
+        **extra,
         "examples": [e for e in examples if e["module"] in names and e["module"].endswith(".py")],
         "data_files": [
             n for n in _file_names(data.get("data_files"))
@@ -620,7 +712,17 @@ def _module_instruction(
     siblings = [m["path"] for m in skeleton["modules"] if m["path"] != module["path"]]
     is_entry = skeleton.get("entry_module") == module["path"]
     usage = skeleton.get("usage", "")
-    if is_entry and module["path"].endswith(".py"):
+    stem = PurePosixPath(module["path"]).stem
+    if module["path"].endswith(".py") and stem in (skeleton.get("subcommands") or []):
+        # サブコマンドの入口 (配信形の __main__.py が main(argv) へ振り分ける、f_10 §11.1-1 (b))
+        command = usage_command(usage)
+        entry_rule = (
+            f"- `main(argv)` runs the sub-command `{stem}` of `python -m {command[0] if command else ''} {stem} …`: "
+            f"argv holds only the arguments after `{stem}` (do not read sys.argv). Print the results as plain values "
+            "and return 0 (non-zero on an error). Do not add an `if __name__ == \"__main__\":` guard — the "
+            "package's __main__.py calls main(argv).\n"
+        )
+    elif is_entry and module["path"].endswith(".py"):
         entry_rule = (
             f"- This is the entry point. Parse the command line exactly as `{usage}` and "
             "end with `if __name__ == \"__main__\":` calling main(). Print results as plain values "
@@ -904,6 +1006,30 @@ def _read_text(path) -> str:
         return ""
 
 
+#: 依頼文が名指したテストファイル (``test_cli.py`` / ``cli_test.py``、パスの末尾も拾う)
+_NAMED_TEST_FILE_RE = re.compile(r"(?<![\w.\-])((?:test_\w+|\w+_test)\.py)(?![\w.])", re.ASCII)
+
+
+def _test_files_named_in(query: str) -> list[str]:
+    """依頼文が名指したテストファイルの名前 (出た順、重複なし)。"""
+    return list(dict.fromkeys(m.group(1) for m in _NAMED_TEST_FILE_RE.finditer(query or "")))
+
+_EXAMPLE_TEST_RE = re.compile(r"test_example_(\d+)\b")
+
+
+def _failed_example_cases(cases: list, failures: list[str]) -> list:
+    """契約テストの失敗の行 (``test_example_2 — AssertionError: …``) に対応する入出力例。"""
+    numbers = {int(m.group(1)) for line in failures for m in [_EXAMPLE_TEST_RE.match(line)] if m}
+    return [case for i, case in enumerate(cases, start=1) if i in numbers]
+
+
+def _contract_evidence(failed_cases: list, stdout_tail: str) -> str:
+    """契約テスト後の作り直しに渡す証拠: 落ちた例の式と期待値 + pytest の出力の末尾。"""
+    lines = [f"- `{case.module}.{case.call}` must return `{case.expected}`" for case in failed_cases]
+    head = "These input/output examples from the contract failed:\n" + "\n".join(lines) + "\n\n" if lines else ""
+    return head + "pytest output:\n" + stdout_tail[-3000:]
+
+
 def _unchecked_reason(gate) -> UncheckedReason:
     """skipped のゲートの理由 (``GateResult.skip_kind``)。知らない値は「実行できなかった」。"""
     try:
@@ -948,16 +1074,25 @@ async def run_staged_v2_pipeline(
 ) -> AsyncIterator[dict]:
     """staged v2 を駆動し、旧経路と同じ形の構造化イベントを yield する。"""
     from backend.config import get_path_resolver
-    from backend.free.generation.as_built import render_flowchart, render_spec
+    from backend.free.generation.as_built import render_flowchart, render_spec, subcommand_usages
     from backend.free.generation.contract_tests import (
         build_example_tests,
+        examples_skip_reason,
+        file_dependent_example_count,
         lint_generated_tests,
         malformed_example_count,
         usable_examples,
     )
     from backend.free.generation.direct_codegen import generate_single_file
     from backend.free.loop.staged import RunEventLog, RunRecordStore, WorkspaceManager
-    from backend.free.loop.staged.test_runner import StagedTestRunner, failed_count, failure_lines
+    from backend.free.loop.staged.test_runner import (
+        StagedTestRunner,
+        failed_count,
+        failure_lines,
+        progress_marks,
+        skip_messages,
+        skipped_count,
+    )
     from backend.free.loop.staged.workspace import StageTestResult
     from backend.i18n_helper import get_locale, msg
     from backend.io.id_registry import new_id
@@ -1086,6 +1221,12 @@ async def run_staged_v2_pipeline(
     command = usage_command(skeleton.get("usage", "")) if package else None
     # ``python -m units`` はパッケージそのものを起動する (__main__.py を合成)、``python -m units.cli`` は cli.py のガード
     runs_package = command is not None and command[0] == package.replace("/", ".")
+    # ``python -m textkit count …`` のサブコマンドのモジュール (配信形の __main__.py が振り分ける、§11.1-1 (b))
+    subcommands = list(skeleton.get("subcommands") or []) if runs_package else []
+    if not package:
+        # 平置きの Python も使い方 (``python json2csv.py`` / ``python -m json2csv``) を 1 回実行する (§11.1-3、
+        # 2026-10-03 K05: 引数なしで rc=1 なのに SPEC にも返答にも出なかった)
+        command = _flat_usage_command(skeleton)
     if package:
         logger.info("staged v2: delivering the Python package %s/ (usage: %s)", package, skeleton.get("usage", ""))
 
@@ -1234,7 +1375,18 @@ async def run_staged_v2_pipeline(
 
     def _package_code(cmap: dict[str, str]) -> dict[str, str]:
         py = {p: c for p, c in cmap.items() if p.endswith(".py")}
-        return package_code_map(py, _entry(cmap), synthesize_main=runs_package)
+        return package_code_map(
+            py, _entry(cmap), synthesize_main=runs_package, subcommands=subcommands,
+            prog=package.replace("/", "."),
+        )
+
+    def _subcommand_gap(cmap: dict[str, str]) -> list[str]:
+        # 振り分けの __main__.py を作れない (使い方のサブコマンドに入口が無い) ときの入口の無いモジュール。
+        # 合成も既存の __main__.py も無ければ、捏造せずに不合格として作り直しへ回す (§11.1-1 (b))
+        py = {p: c for p, c in cmap.items() if p.endswith(".py")}
+        if not subcommands or synthesize_dispatcher(py, subcommands, "") or "__main__.py" in _package_code(cmap):
+            return []
+        return unwired_subcommands(py, subcommands)
 
     def _package_files(cmap: dict[str, str]) -> dict[str, str]:
         # 配信形のパッケージ (``units/__init__.py`` …、f_10 §11.1-1)
@@ -1394,7 +1546,7 @@ async def run_staged_v2_pipeline(
         verification.append(warning)
         notices.append(warning)
 
-    # ── 3c. パッケージ形は使い方を配信形で 1 回実行する (f_10 §11.1-3) ──────
+    # ── 3c. 使い方を配信形で 1 回実行する (パッケージ形・平置きの Python、f_10 §11.1-3) ──────
     usage_timeout = min(smoke_timeout, _USAGE_TIMEOUT_SEC)
 
     # 実行するフォルダに置く依頼されたデータファイル (この時点の extra_files はデータだけ。テストは §4 で足す)
@@ -1403,11 +1555,26 @@ async def run_staged_v2_pipeline(
     async def _run_usage_check(cmap: dict[str, str]) -> tuple[CheckOutcome, str, str]:
         # 戻り値は (結果, 作り直す stem, traceback の末尾)
         module, args = command
+        py = {p: c for p, c in cmap.items() if p.endswith(".py")}
+        # 隔離が止めない外部への作用 (シェル・別プロセス・ソケット・ブラウザ) は実行しない (独立レビュー 高)
+        effect = usage_side_effect(py)
+        if effect:
+            return CheckOutcome.unchecked(CheckKind.USAGE, UncheckedReason.SIDE_EFFECTS, detail=effect), "", ""
         blocker = usage_blocker(args, cmap, set(usage_data))
         if blocker:
             return CheckOutcome.unchecked(CheckKind.USAGE, UncheckedReason.NEEDS_INPUT, detail=blocker), "", ""
-        run = await asyncio.to_thread(run_usage, {**_package_files(cmap), **usage_data}, module, args, usage_timeout)
-        outcome, blamed = usage_outcome(run, package, args=args)
+        dependency = usage_missing_dependency(py)
+        if dependency:
+            # 入っていない外部依存は環境の欠け — 実行すると ModuleNotFoundError で正しいコードを作り直す
+            return CheckOutcome.unchecked(
+                CheckKind.USAGE, UncheckedReason.MISSING_DEPENDENCY, detail=dependency,
+            ), "", ""
+        # パッケージ形は配信形のパッケージ、平置きは成果物をそのまま (フォルダ直下で ``python main.py`` と同じ)
+        files = _package_files(cmap) if package else dict(cmap)
+        run = await asyncio.to_thread(run_usage, {**files, **usage_data}, module, args, usage_timeout)
+        outcome, blamed = usage_outcome(
+            run, package, args=args, stems={PurePosixPath(p).stem for p in py},
+        )
         return outcome, blamed, (run.stderr or "")[-3000:]
 
     usage_check: CheckOutcome | None = None
@@ -1415,6 +1582,15 @@ async def run_staged_v2_pipeline(
     if command is not None and code_map and not smoke_errors:
         t0 = time.monotonic()
         usage_check, blamed, trace = await _run_usage_check(code_map)
+        # 振り分けの __main__.py を作れなかった (サブコマンドに入口が無い) ならそのモジュールを作り直す
+        gap = _subcommand_gap(code_map)
+        if gap:
+            blamed = gap[0]
+            trace = (
+                f"`python -m {package.replace('/', '.')}` needs `{gap[0]}.main(argv)` (the package's __main__.py "
+                f"calls it with the arguments after `{gap[0]}`), but `{gap[0]}.py` defines no "
+                f"{' / '.join(SUBCOMMAND_ENTRY_NAMES)} function.\n" + trace
+            )
         target = next((m for m in modules if PurePosixPath(m["path"]).stem == blamed), None) or next(
             (m for m in modules if m["path"] == _entry(code_map)), None,
         )
@@ -1433,9 +1609,12 @@ async def run_staged_v2_pipeline(
             ) + "\n\n" + _REPAIR_TASK.format(
                 path=target["path"], fence=languages.fence_language(target["path"]),
                 errors=(
-                    f"Running `{skeleton.get('usage', '')}` in the folder that contains the package "
-                    f"`{package}/` (these files are delivered as that Python package) failed:\n"
-                    + (trace or "; ".join(usage_check.failures))
+                    f"Running `{skeleton.get('usage', '')}` in the folder that contains "
+                    + (
+                        f"the package `{package}/` (these files are delivered as that Python package)"
+                        if package else "these files"
+                    )
+                    + " failed:\n" + (trace or "; ".join(usage_check.failures))
                 ),
                 previous=code_map[target["path"]][:12000],
             )
@@ -1460,13 +1639,26 @@ async def run_staged_v2_pipeline(
 
     # ── 4. (Pro) 契約テスト ──────────────────────────────────────
     advisory_note = ""
+    # SPEC.md に載せる入出力例。契約テストで例ごとに判定できたときは合格した例だけ (除外・不合格の例を落とす)。
+    # 判定できなかったとき (smoke 不合格・例が組めない・進捗行が読めない) は None = 骨組みのまま「(未検証)」を添える
+    # (骨組みの例は創作で、実コードと食い違う例を仕様として配っていた、2026-10-02 ライブ監査 K01 / K05)
+    spec_examples: list[dict] | None = None
     # lint が参考テストから落とした理由 (finalize のイベントと notes へ、f_10 §11.1-4)
     advisory_dropped: list[str] = []
-    # 依頼されたテストの名前 (Python の参考テストを配信するので .py だけ。無ければ test_<入口>.py)
-    requested_tests = [n for n in skeleton.get("tests") or [] if n.endswith(".py")] or (
+    # 骨組みが挙げたテストの名前 (Python の参考テストを配信するので .py だけ。無ければ test_<入口>.py)。
+    # 「依頼されたテスト」は依頼文が名指した名前だけ — 骨組みの tests 欄はモデルの設計案で、依頼に無い
+    # test_convert.py 等を「生成できませんでした」と出していた (2026-10-02 ライブ監査 K04)
+    named_tests = _test_files_named_in(query)
+    planned_tests = [n for n in skeleton.get("tests") or [] if n.endswith(".py")] or (
         [f"test_{PurePosixPath(py_modules[0]['path']).stem}.py"] if skeleton.get("tests") and py_modules
         else list(skeleton.get("tests") or [])
     )
+    # 配信する名前の候補 (先頭に参考テストを配信する)。依頼が名指した名前を先に。どちらもファイル名
+    # (骨組みの tests は normalize_skeleton が、依頼の名前は _test_files_named_in がファイル名にする)
+    requested_tests = list(dict.fromkeys([*named_tests, *planned_tests]))
+
+    def _is_named(name: str) -> bool:
+        return name in named_tests
     if tests_enabled and code_map and not smoke_errors:
         t0 = time.monotonic()
         runner = StagedTestRunner(
@@ -1504,9 +1696,15 @@ async def run_staged_v2_pipeline(
             if not gate.ok and not gate.skipped and _remaining() >= _CALL_FLOOR_SEC:
                 gate_before = gate
                 code_before = dict(code_map)
-                # 例 (契約) に反するのはコード側 — 失敗の証拠を渡して対象モジュールを 1 回だけ作り直す
-                failing = [m for m in modules if any(c.module == PurePosixPath(m["path"]).stem for c in cases)]
-                evidence = (gate.stdout_tail or "")[-3000:]
+                # 例 (契約) に反するのはコード側 — 失敗の証拠を渡して対象モジュールを 1 回だけ作り直す。
+                # 証拠には落ちた例の式と期待値を添え、作り直すのは落ちた例のモジュールだけ (2026-10-02 ライブ
+                # 監査 K01: pytest の末尾だけを渡した作り直しが 83 秒かけて同じ本文を返した)
+                failed_cases = _failed_example_cases(cases, failure_lines(gate, limit=len(cases)))
+                failing = [
+                    m for m in modules
+                    if any(c.module == PurePosixPath(m["path"]).stem for c in failed_cases or cases)
+                ]
+                evidence = _contract_evidence(failed_cases, gate.stdout_tail or "")
                 repair_jobs = [
                     _module_job(m, _module_instruction(skeleton, m, request=query, brief=brief, locale=locale)
                                 + "\n\n" + _REPAIR_TASK.format(
@@ -1520,6 +1718,12 @@ async def run_staged_v2_pipeline(
                     for m, content in zip([m for m in failing if m["path"] in code_map], repaired)
                     if content
                 }
+                # 同じ本文が返った作り直しは検査し直しても結果が変わらない — smoke と契約の再実行を飛ばす
+                unchanged = [p for p, c in candidates.items() if c.strip() == code_map.get(p, "").strip()]
+                for path in unchanged:
+                    logger.info("staged v2: the contract repair of %s returned the same code; not re-checking", path)
+                    candidates.pop(path)
+                repair_changed = bool(candidates)
                 # 作り直した版は smoke を通してから採る (f_10 §11.1-4)。いまの code_map は smoke
                 # 合格済みなので、落ちたモジュールは修正前の版に戻す (K05 run2: 構文エラー版が
                 # smoke 合格の元コードに取って代わった)
@@ -1549,8 +1753,9 @@ async def run_staged_v2_pipeline(
                             adopted = True
                             ws.write_file(path, content, kind="src", stage="code", task_id=_task_id(path))
                 contract_now = _read_text(ws.path("tests/test_examples.py"))
-                gate = await asyncio.to_thread(runner.run, test_logical_path="test_examples.py")
-                _record_gate("test_examples", gate, kind="pytest")
+                if repair_changed:
+                    gate = await asyncio.to_thread(runner.run, test_logical_path="test_examples.py")
+                    _record_gate("test_examples", gate, kind="pytest")
                 # 契約そのものを作り直した回は件数を比べられない
                 comparable = adopted and contract_now == example_src
                 # 修正前は不合格 (検査できた) — 修正版が未検査なら「不合格」が「未検査」に化ける
@@ -1578,20 +1783,35 @@ async def run_staged_v2_pipeline(
                     gate = gate_before
                     # 最新の記録を戻した版の結果にする (悪化版のまま残さない)
                     _record_gate("test_examples", gate, kind="pytest")
+            # skip した例 (ファイル・前の例の結果・乱数に依存) は契約から外したもの — 件数に数えない。
+            # 全件 skip の実行は rc 0 で ok になるが「合格」ではない (2026-10-02 ライブ監査 K01)
+            checked = len(cases) - skipped_count(gate)
+            marks = progress_marks(gate)
+            if len(marks) == len(cases):
+                spec_examples = [
+                    {"module": c.module, "call": c.call, "expected": c.expected}
+                    for c, mark in zip(cases, marks) if mark == "."
+                ]
             if gate.skipped:
                 contract_check = CheckOutcome.unchecked(
                     CheckKind.CONTRACT, _unchecked_reason(gate), detail=gate.skip_detail or "", count=len(cases),
                 )
+            elif gate.ok and checked <= 0:
+                # 理由は skip の理由から (乱数・時刻だけで外した回を「ファイルに依存」と書かない)
+                contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, examples_skip_reason(skip_messages(gate)))
             elif gate.ok:
-                contract_check = CheckOutcome.passed(CheckKind.CONTRACT, count=len(cases))
+                contract_check = CheckOutcome.passed(CheckKind.CONTRACT, count=checked)
             else:
                 tasks_failed += 1
                 contract_check = CheckOutcome.failed(
-                    CheckKind.CONTRACT, count=len(cases), errors=failed_count(gate), failures=failure_lines(gate),
+                    CheckKind.CONTRACT, count=checked, errors=failed_count(gate), failures=failure_lines(gate),
                 )
         elif malformed_example_count(skeleton, list(code_map)):
             # 例はあるのに形が崩れていて組めない — 「例なし」と黙らない (2026-09-27 ライブ監査 M7)
             contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, UncheckedReason.INVALID_EXAMPLES)
+        elif file_dependent_example_count(skeleton, list(code_map)):
+            # 例はファイルを名指すので組まなかった — 「例なし」とは書かない (2026-10-02 ライブ監査 K03 / K05)
+            contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, UncheckedReason.STATEFUL_EXAMPLES)
         else:
             contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, UncheckedReason.NO_EXAMPLES)
         checks.append(contract_check)
@@ -1635,7 +1855,11 @@ async def run_staged_v2_pipeline(
                     # 依頼されたテストは参考テストを依頼の名前で配信する (f_10 §11.1-1 / §11.3)
                     extra_files[requested_tests[0]] = linted
                     if advisory_check.is_failure:
-                        notices.append(msg("create.requested_tests_failing", name=requested_tests[0]))
+                        notices.append(msg(
+                            "create.requested_tests_failing" if _is_named(requested_tests[0])
+                            else "create.tests_failing",
+                            name=requested_tests[0],
+                        ))
                 elif advisory_check.is_failure:
                     # 配信しない参考テストの不合格も本文に 1 行 (SPEC にしか無かった、2026-09-27 ライブ監査 M7)
                     notices.append(
@@ -1660,8 +1884,10 @@ async def run_staged_v2_pipeline(
                 verification.append(advisory_check.render_failures())
         phase_sec["tests"] = round(time.monotonic() - t0, 1)
     if usage_check is not None:
-        if code_map != usage_checked_code:
-            # 契約テストの作り直しでコードが変わった — 作り直しなしでもう 1 回実行して差し替える
+        timed_out = usage_check.is_unchecked and usage_check.reason is UncheckedReason.NOT_RUN
+        if code_map != usage_checked_code and not timed_out:
+            # 契約テストの作り直しでコードが変わった — 作り直しなしでもう 1 回実行して差し替える。前回が時間切れ・
+            # 実行の場の制約 (NOT_RUN) なら同じ結果になるので 1 回目を使う (最大 30 秒増えた、独立レビュー 低 d)
             usage_check, _, _ = await _run_usage_check(code_map)
         if usage_check.is_failure:
             tasks_failed += 1
@@ -1674,14 +1900,57 @@ async def run_staged_v2_pipeline(
             "status": "failed" if usage_check.is_failure else "skipped" if usage_check.is_unchecked else "done",
             "failures": list(usage_check.failures),
         })
+        # 本文にも 1 行 — 実行して失敗した回と、外部への作用の恐れで止めた回だけ。入力が要る・依存が無い等の
+        # 未検査は SPEC の検証行だけ (毎回出すとうるさい、独立レビュー 中 3)。外への書込みで止めた回は
+        # ``create.checks_not_run`` が伝える
+        if usage_check.is_failure:
+            notices.append(msg(
+                "create.usage_failed", usage=skeleton.get("usage", ""),
+                reason=(usage_check.failures or [""])[0],
+            ))
+        elif usage_check.is_unchecked and usage_check.reason is UncheckedReason.SIDE_EFFECTS:
+            notices.append(msg("create.usage_not_checked", usage=skeleton.get("usage", ""), line=usage_check.render()))
+    # サブコマンドの振り分け (§11.1-1 (b)): 補完できなかった・振り分けに入らなかったモジュールを伝える
+    if subcommands and code_map:
+        py_code = {p: c for p, c in code_map.items() if p.endswith(".py")}
+        unwired = unwired_subcommands(py_code, subcommands)
+        if _subcommand_gap(code_map):
+            line = msg(
+                "create.package_main_missing", package=package.replace("/", "."),
+                modules=", ".join(f"{s}.py" for s in unwired),
+            )
+            verification.append(line)
+            notices.append(line)
+        elif unwired and synthesize_dispatcher(py_code, subcommands, ""):
+            line = msg(
+                "create.subcommands_unwired", package=package.replace("/", "."),
+                modules=", ".join(f"{s}.py" for s in unwired),
+            )
+            verification.append(line)
+            notices.append(line)
+    named_only = [name for name in requested_tests if _is_named(name)]
+    planned_only = [name for name in requested_tests if not _is_named(name)]
     if requested_tests and not tests_enabled:
         # テスト工程の無い構成 (Free) — 作っていないことを本文で伝える
-        notices.append(msg("create.requested_tests_not_available", names=", ".join(requested_tests)))
+        if named_only:
+            notices.append(msg("create.requested_tests_not_available", names=", ".join(named_only)))
+        if planned_only:
+            notices.append(msg("create.tests_not_available", names=", ".join(planned_only)))
     elif requested_tests:
-        # 依頼 − 配信の差分を名前ごとに (1 本配ると残りが黙って消えた、2026-09-27 ライブ監査 K04)
-        undelivered = [name for name in requested_tests if name not in extra_files]
+        # 依頼 − 配信の差分を名前ごとに (1 本配ると残りが黙って消えた、2026-09-27 ライブ監査 K04)。
+        # 依頼が名指した名前は「生成できませんでした」、骨組みの案だけの名前は「作成していません」
+        # (参考テストは 1 本だけ作る。モジュールごとには作らない — f_10 §11.1-2 の同時生成の枠に収める)
+        undelivered = [name for name in named_only if name not in extra_files]
         if undelivered:
             notices.append(msg("create.requested_tests_not_generated", names=", ".join(undelivered)))
+        delivered = [name for name in requested_tests if name in extra_files]
+        not_created = [name for name in planned_only if name not in extra_files]
+        if not_created and delivered:
+            notices.append(msg(
+                "create.planned_tests_not_created", delivered=delivered[0], names=", ".join(not_created),
+            ))
+        elif not_created:
+            notices.append(msg("create.tests_not_generated", names=", ".join(not_created)))
     # 外へ書こうとして検査できなかった回は完了扱いにしない (成功の教師にしない)。本文でも明示する
     # (入出力例なし・外部依存なしの未検査は環境・契約の欠けで、コードの挙動ではないので数えない)
     blocked = [c for c in checks if c.is_unchecked and c.reason is UncheckedReason.SANDBOX_VIOLATION]
@@ -1698,8 +1967,22 @@ async def run_staged_v2_pipeline(
             extra_files[name] = to_package_imports(extra_files[name], siblings, anchor=package.replace("/", "."))
     other_facts = {p: languages.facts(p, c) for p, c in code_map.items() if not p.endswith(".py")}
     refs = languages.references({p: c for p, c in code_map.items() if not p.endswith(".py")})
+    # 振り分けの __main__.py が呼ぶサブコマンドの使い方 (argparse の補完は __main__.py を読めない、独立レビュー 低 e)
+    extra_usages: list[str] = []
+    py_code = {p: c for p, c in code_map.items() if p.endswith(".py")}
+    if subcommands and synthesize_dispatcher(py_code, subcommands, ""):
+        unwired = set(unwired_subcommands(py_code, subcommands))
+        extra_usages = subcommand_usages(
+            skeleton.get("usage", ""), package.replace("/", "."),
+            {s: py_code[f"{s}.py"] for s in subcommands if s not in unwired},
+        )
     spec_md = render_spec(
-        skeleton=skeleton, request=query, locale=locale, verification=verification, other_facts=other_facts,
+        skeleton=skeleton if spec_examples is None else {**skeleton, "examples": spec_examples},
+        request=query, locale=locale, verification=verification, other_facts=other_facts,
+        # 例ごとに判定できなかった (全件ファイル依存で契約から外した・テスト工程が無い等) 骨組みの例は「(未検証)」
+        # と書いて残す (2026-10-03 ライブ再実行 K03: 実出力と食い違う例が検証済みのように載った)
+        examples_verified=spec_examples is not None,
+        extra_usages=extra_usages,
         # SPEC のモジュール一覧は配信形のパス (``units/length.py``)
         code_map={f"{package}/{p}": c for p, c in delivered_code.items()} if package else code_map,
     )

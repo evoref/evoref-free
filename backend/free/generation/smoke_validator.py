@@ -24,6 +24,8 @@ import posixpath
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -67,9 +69,22 @@ def _module_paths(paths) -> set[str]:
     return {os.path.splitext(p.replace("\\", "/"))[0].replace("/", ".") for p in paths}
 
 
+@contextmanager
+def _eval_dir(prefix: str) -> Iterator[str]:
+    """評価の一時フォルダ。片付けの失敗では例外を上げず、残ったフォルダを WARNING に 1 行出す。
+
+    ウイルス対策等が書いたばかりのファイルを掴むと削除が WinError 32 で落ち、その例外が「起動できなかった」と
+    して拾われて、終わった実行の結果が未検査に化けた (f_10 §11.1-3)。
+    """
+    with tempfile.TemporaryDirectory(prefix=prefix, ignore_cleanup_errors=True) as tmp:
+        yield tmp
+    if os.path.exists(tmp):
+        logger.warning("could not remove the evaluation temp folder %s (a file is still in use)", tmp)
+
+
 def _run_sandboxed(
     tmp: Path, py_files: dict[str, str], runner: str, args: list[str], exe: str, timeout_sec: float,
-    *, stdin=None,
+    *, stdin=None, base_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """生成物を ``tmp/src`` に書き、``runner`` をスクリプトとして隔離下で実行する (f_10 §11.1-4)。
 
@@ -86,7 +101,7 @@ def _run_sandboxed(
     return fs_sandbox.run_bounded(
         [exe, str(script), *args],
         cwd=str(src), timeout=timeout_sec, stdin=stdin,
-        env=fs_sandbox.sandbox_env(tmp, write_dirs=[src]),
+        env=fs_sandbox.sandbox_env(tmp, base_env, write_dirs=[src]),
     )
 
 
@@ -914,7 +929,7 @@ def run_import_smoke(
 
     violations: list[str] = []
     try:
-        with tempfile.TemporaryDirectory(prefix="evoref_smoke_") as tmp:
+        with _eval_dir("evoref_smoke_") as tmp:
             # import 時の副作用で一時フォルダの外へ書かせない (f_10 §11.1-4)
             proc = _run_sandboxed(
                 Path(tmp), py_files, _SMOKE_RUNNER, [json.dumps(sorted(module_paths))], exe, timeout_sec,
@@ -1143,7 +1158,7 @@ def run_entry_smoke(
     ep_module = os.path.splitext(entry_path.replace("\\", "/"))[0].replace("/", ".")
     exe = python_exe or sys.executable
     try:
-        with tempfile.TemporaryDirectory(prefix="evoref_entry_") as tmp:
+        with _eval_dir("evoref_entry_") as tmp:
             proc = _run_sandboxed(Path(tmp), py_files, _ENTRY_SMOKE_RUNNER, [ep_module], exe, timeout_sec)
     except subprocess.TimeoutExpired:
         result.warnings.append(
@@ -1194,6 +1209,20 @@ _USAGE_RUNNER = (
 )
 
 
+#: 使い方の実行の子プロセスへ渡す環境変数 (これと ``PYTHON*`` だけ)。API キー・``EVOREF_*`` 等の秘密を
+#: 生成コードに見せない (独立レビュー 高)。Windows の Python とソケット・乱数は SYSTEMROOT を要る。
+_USAGE_ENV_KEYS = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "OS", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "VIRTUAL_ENV",
+})
+
+
+def usage_env(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """使い方の実行に渡す最小の環境変数 (:data:`_USAGE_ENV_KEYS` と ``PYTHON*``)。"""
+    source = os.environ if environ is None else environ
+    return {k: v for k, v in source.items() if k.upper() in _USAGE_ENV_KEYS or k.upper().startswith("PYTHON")}
+
+
 def run_usage(
     files: dict[str, str], module: str, args: list[str], timeout_sec: float = 30.0,
     python_exe: str | None = None,
@@ -1201,15 +1230,17 @@ def run_usage(
     """配信形 (``units/__init__.py`` … と依頼されたデータファイル) を一時フォルダに置き、その親を CWD にして
     ``python -m <module> <args>`` を隔離の下で 1 回実行する (f_10 §11.1-3 / §11.1-4)。
 
-    stdin は空。書込みを許すのは一時フォルダの中だけで、止めた書込みは ``unchecked`` に入る。
+    stdin は空。書込みを許すのは一時フォルダの中だけで、止めた書込みは ``unchecked`` に入る。環境変数は
+    :func:`usage_env` の最小の組だけを渡す。シェル・別プロセス・ソケット等は隔離が止めないので、呼出側が
+    ``package_layout.usage_side_effect`` で実行前に外す。
     """
     exe = python_exe or sys.executable
     try:
-        with tempfile.TemporaryDirectory(prefix="evoref_usage_") as tmp:
+        with _eval_dir("evoref_usage_") as tmp:
             try:
                 proc = _run_sandboxed(
                     Path(tmp), files, _USAGE_RUNNER, [module, json.dumps(list(args))], exe, timeout_sec,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL, base_env=usage_env(),
                 )
             except subprocess.TimeoutExpired as expired:
                 return UsageRun(

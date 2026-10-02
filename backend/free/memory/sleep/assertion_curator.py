@@ -51,7 +51,7 @@ from backend.free.core.text_quality import (
     value_was_adopted,
 )
 from backend.free.llm.json_schemas import AssertionNaming
-from backend.free.memory.corrections import correction_target
+from backend.free.memory.corrections import correction_target, has_correction_shape
 from backend.free.core.correction_verdict import strip_copula
 from backend.free.memory.extractors.base import (
     OWN_VALUE_UPDATE_VERDICTS,
@@ -538,7 +538,7 @@ async def curate_assertion_facts(
         # ものは通常の言明として進む。検証済みでも宛先が言明でない (属性
         # スロットの訂正) ものは Step 8 の値アンカーが受け持つのでここでは
         # 書かない。
-        if getattr(note, "is_correction", False) or _has_correction_form(content):
+        if has_correction_shape(note):
             if not note_is_verified_correction(note):
                 if not note_verification_rejected(note):
                     logger.debug(
@@ -669,9 +669,7 @@ async def curate_assertion_facts(
             )
             # 畳む範囲は旧値の span で絞る (#13)。assertion は多値が既定なので、
             # span の無い訂正は兄弟を畳まない (共通入口 write_sleep_facts が畳む)。
-            if (
-                getattr(note, "is_correction", False) or _has_correction_form(content)
-            ) and _replaces_a_value(note):
+            if has_correction_shape(note) and _replaces_a_value(note):
                 fact.value_update = _old_value_span(note, content)  # type: ignore[attr-defined]
             if not write_sleep_facts(store, [fact], label="assertion"):
                 continue
@@ -706,12 +704,6 @@ def _correction_targets_attribute(store: "SemanticFactStore", note: object) -> b
         if any(wrong in norm_span(getattr(f, "object", "") or "") for f in facts):
             return True
     return False
-
-
-def _has_correction_form(text: str) -> bool:
-    from backend.free.memory.extractors.chat import has_correction_form
-
-    return has_correction_form(text)
 
 
 def _same_claim_is_live(store: "SemanticFactStore", subject: str, obj: str) -> bool:

@@ -33,10 +33,8 @@ from backend.free.agent.meta_cognitive_tasks import (
     task_expects_write,
 )
 from backend.free.agent.meta_cognitive_tools import infer_tool_from_task
-from backend.free.agent.meta_cognitive_content_gate import (
-    is_edit_request,
-    is_pure_append_request,
-)
+from backend.free.agent.meta_cognitive_content_gate import is_edit_request
+from backend.free.agent.edit_mode_gate import resolve_edit_mode
 from backend.free.agent.output_format import WRITTEN_PATH_RE, anchor_relative_output_path
 from backend.free.agent.write_gate import WRITE_DENIED_RE
 from backend.io.text_file import decode_text_prefix_for_display
@@ -109,6 +107,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.agent.agent_tracer import AgentTracer
+    from backend.free.agent.edit_mode_gate import EditModeGate
     from backend.free.agent.tool_call_judge import ToolCallJudge
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.harness.production import ProductionHarness, ProductionResult
@@ -228,8 +227,15 @@ class MetaCognitiveAgent(
         brief: str = "",
         write_impact_classifier: Callable[[list[str]], list[dict]] | None = None,
         recent_file_target: str = "",
+        edit_mode_gate: "EditModeGate | None" = None,
     ) -> None:
         self.max_steps = max_steps
+        # 判定点 edit_mode (追記 / 書き直し / 部分修正) の事例ゲート。process() の
+        # 冒頭でターンに 1 回だけ評価し、書込みの各経路はその結果を読む
+        # (``_pure_append_requested``、docs/f_11 §5 / c_17 §3.16)。
+        self._edit_mode_gate = edit_mode_gate
+        self._edit_mode_query: str | None = None
+        self._edit_mode_verdict = None
         # 判定点 recent_file_reference = write のターンの宛先 (直近のファイル)。
         # chat.py が計画の前に台帳から確定して渡す。空でなければ計画の LLM を
         # 呼ばず、このファイルへの write-fast 1 タスクにする (docs/f_03 §4.3)。
@@ -569,6 +575,11 @@ class MetaCognitiveAgent(
         self._constants_cache = None
         query, system_prompt, _ = self._expand_self_in_inputs(query, system_prompt)
 
+        # 判定点 edit_mode はターンに 1 回 (docs/c_17 §3.16)。計画の短絡・書込み本文の
+        # 合流点・失敗の注記はこの結果を読む (``_pure_append_requested``)。
+        self._edit_mode_query = query
+        self._edit_mode_verdict = await resolve_edit_mode(self._edit_mode_gate, query)
+
         # Step 0: 対象の無い create 依頼は計画の前に問い返す (f_03 §4.4)。
         blocked = await self._precheck_production_stage(query, on_step)
         if blocked is not None:
@@ -582,9 +593,11 @@ class MetaCognitiveAgent(
             # 引き受けるので、計画は「制作タスク 1 件」と決まっている — LLM を呼ばない
             # (f_10 §11。旧経路では 1,000 トークン超の prefill で毎回 15 秒前後かかっていた)。
             recent_write = self._recent_file_write_plan(query)
+            deterministic = False
             if recent_write is not None:
                 tasks = recent_write
             elif getattr(self._production_stage, "deterministic_plan", False):
+                deterministic = True
                 tasks = [TaskItem(description=f"Create the requested deliverable: {query}")]
             else:
                 tasks = await self._plan(query, conversation, llm_client, on_step)
@@ -599,7 +612,9 @@ class MetaCognitiveAgent(
             tasks = merge_same_file_tasks(tasks)
             # 単一 URL → 単一ファイル保存の過分割 (fetch/extract/generate/save) を
             # fetch+write へ集約する。抽出/保存タスクでの小型モデル拒否を防ぐ。
-            if self._output_target == "file":
+            # 制作タスク 1 件の決定論の計画は畳まない — 説明は依頼文そのもので、依頼の「Python スクリプト」が
+            # 計画の退行シグナルと読まれ「Write the requested document」になっていた (2026-10-02 ライブ監査 K03 / K05)
+            if self._output_target == "file" and not deterministic:
                 tasks = collapse_fetch_save_tasks(tasks, query)
                 # URL 無しの文書/データ出力で「スクリプト生成 → 実行」と誤分解された
                 # プランを単一 write タスクへ正規化する (内容を直接 write_file させ、
@@ -804,7 +819,7 @@ class MetaCognitiveAgent(
 
         判定点 ``recent_file_reference`` が ``write`` を返したターン (chat.py が宛先を
         渡す) のうち、書込みの述語が発話の唯一の依頼 (``is_sole_write_request``) で、
-        追記だけの依頼 (``is_pure_append_request``) に限る。以前は計画の LLM が
+        追記だけの依頼 (判定点 ``edit_mode`` = append) に限る。以前は計画の LLM が
         「read_file + パスの無い追記タスク」に分け、追記タスクで分類器が
         ``draft_document`` を選んで書込みまで進まなかった (2026-09-28 実機再監査 R2、
         C05#5)。タスク文にパスを入れるので ``infer_tool_from_task`` が
@@ -817,7 +832,7 @@ class MetaCognitiveAgent(
         target = self._recent_file_target
         if not target or self._output_target != "file" or self._production_stage is not None:
             return None
-        if not (is_sole_write_request(query) and is_pure_append_request(query)):
+        if not (is_sole_write_request(query) and self._pure_append_requested(query)):
             logger.info(
                 "Recent file write is not a sole append request; planning with the "
                 "target resolved: %s", target,
@@ -895,7 +910,7 @@ class MetaCognitiveAgent(
 
         if self._production_result is not None:
             return
-        append = is_pure_append_request(query)
+        append = self._pure_append_requested(query)
         wrote_any = any(tc.get("tool") in WRITE_PATH_TOOLS for tc in all_tool_calls)
         for task in tasks:
             if task.status != "failed" or not task_expects_write(task.description):
@@ -1734,6 +1749,14 @@ class MetaCognitiveAgent(
             if task.result and WRITE_DENIED_RE.match(task.result):
                 # 書込みゲートの判定は作り直しても変わらない (docs/f_03 §4.y)。
                 logger.info("Skipping retry for a denied write: %s", task.description[:80])
+                continue
+            if task.result and "(edit_without_change)" in task.result:
+                # 差分指示つきの再生成まで済んだ上での棄却。同じ生成を作り直しても
+                # 43 秒級の生成が増えるだけ (2026-10-02 ライブ監査 D07#3)。
+                logger.info(
+                    "Skipping retry for an unchanged-edit rejection: %s",
+                    task.description[:80],
+                )
                 continue
             logger.info("Retrying failed write task [%d]: %s",
                         idx + 1, task.description[:80])

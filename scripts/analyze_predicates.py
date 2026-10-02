@@ -186,6 +186,7 @@ def collect_exemplar_gates(embedder: Any) -> dict[str, Any]:
     重複・包含・恒真が見える** — 例えば「事例ゲートが結局ある正規表現と同じ
     発話でしか発火していない」ことが検出できる。
     """
+    from backend.free.agent.edit_mode_gate import EditModeGate
     from backend.free.agent.layer_shadow import LayerClassificationShadow
     from backend.free.agent.statement_gate import StatementGate
     from backend.free.agent.write_intent_gate import WriteIntentGate
@@ -202,6 +203,7 @@ def collect_exemplar_gates(embedder: Any) -> dict[str, Any]:
         "gate.local_write_intent": WriteIntentGate(embedder),
         "gate.fewshot_context_bound": ContextBoundGate(embedder),
         "gate.plain_statement": StatementGate(embedder),
+        "gate.edit_mode": EditModeGate(embedder),
     }
 
 

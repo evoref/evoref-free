@@ -447,14 +447,16 @@ def _php_undefined_variable_errors(path: str, code: str) -> list[str]:
 
 
 def syntax_errors(code_map: dict[str, str]) -> list[str]:
-    """tree-sitter の構文検査 (Python 以外)。"""
-    from backend.free.core.code_syntax import syntax_error_detail
+    """tree-sitter の構文検査 (Python 以外)。HTML はタグの開閉の対応も見る (tree-sitter の HTML 文法は検出しない)。"""
+    from backend.free.core.code_syntax import html_balance_error, syntax_error_detail
 
     errors = []
     for path, code in code_map.items():
         if path.endswith(".py"):
             continue
         detail = syntax_error_detail(code, path)
+        if detail is None and PurePosixPath(path).suffix.lower() in (".html", ".htm"):
+            detail = html_balance_error(code)
         if detail:
             errors.append(f"{path}: syntax error: {detail}")
         elif path.endswith(".php"):

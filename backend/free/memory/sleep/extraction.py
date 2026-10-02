@@ -424,6 +424,41 @@ def _retire_assertions_contradicted_by_change(
     return superseded
 
 
+def _latest_mention(fact: object, siblings: list) -> list:
+    """畳む候補を、旧値を **最後に述べた 1 行** に絞る (純粋関数)。
+
+    1 文字の旧値 (「やっぱり妻」の「妻」、検証器が返した「妻」。ChatExtractor の
+    ``value_update_latest_only``) は、span で絞っても「妻は看護師です」「妻の誕生日は…」
+    のような兄弟まで当たる (多値の family、不変則 #13)。訂正が指すのは旧値の最後の
+    言及なので、``fact`` と同じセッションの行があればその中で、無ければ全体で、
+    ``fact`` より前に述べた最新の 1 行だけを畳む (注入の注記の 1 文字の旧値の扱い
+    「申告が指す最後の言及」と同じ、f_02 §5.3)。
+    """
+    at = float(getattr(fact, "created_at", 0.0) or 0.0)
+    older = [
+        o for o in siblings
+        if getattr(o, "id", None) != getattr(fact, "id", None)
+        and float(getattr(o, "created_at", 0.0) or 0.0) <= at
+    ]
+    sessions = set(getattr(fact, "session_ids", None) or ())
+    same = [o for o in older if sessions & set(getattr(o, "session_ids", None) or ())]
+    pool = same or older
+    if not pool:
+        return []
+    return [max(pool, key=lambda o: float(getattr(o, "created_at", 0.0) or 0.0))]
+
+
+def _span_carriers_including_retired(
+    store: "SemanticFactStore", subject: str, needle: str,
+) -> list:
+    """``subject`` の行のうち span ``needle`` を本文に含むもの (畳まれた行も含む)。"""
+    try:
+        rows = store.search_by_subject(subject, include_superseded=True)
+    except Exception:  # noqa: BLE001 - 読めなければ候補なし (畳まない側へ倒れる)
+        return []
+    return [r for r in rows if fact_carries_span(r, needle)]
+
+
 def _supersede_corrected_slots(
     store: "SemanticFactStore", persisted: list, label: str,
 ) -> int:
@@ -527,6 +562,8 @@ def _supersede_corrected_slots(
 
             needle = norm_span(update_span)
             siblings = [o for o in siblings if fact_carries_span(o, needle)]
+            if getattr(fact, "value_update_latest_only", False):
+                siblings = _latest_mention(fact, siblings)
         elif _folds_as_multi_valued(fact.subject):
             # **並列多値スロットは、どの要素を置き換えるか特定できないなら
             # 畳まない。** 単値スロットの全畳みは「単値」の定義そのものだが、
@@ -633,6 +670,8 @@ def _retire_stale_arrivals_into_corrected_slots(
     畳みは **訂正と会話 (session) か元ノートを共有する到着に限る** — 別セッションの
     「息子は中学1年です。」が、value_update の無い「夫と小学 4 年の娘の3人」の訂正で
     畳まれた (2026-09-27 独立レビュー M-b、M1 と同じ実害の別経路)。
+    1 文字の span (「妻」) は、その span を最後に述べた 1 行だけを畳む
+    (:func:`_latest_mention`、2026-10-02 独立レビュー)。
 
     **宣言の無いスロットも、勝者が span を持つなら span で絞る** (2026-09-30 C01)。
     ``name`` へ取り違えた訂正 (``value_update=ポチ``) が、ポチを含まない本人の氏名を
@@ -670,6 +709,15 @@ def _retire_stale_arrivals_into_corrected_slots(
             if not single:
                 needle = norm_span(fact_value_update(other))
                 if needle and not fact_carries_span(fact, needle):
+                    continue
+                if len(needle) == 1 and fact.id not in {
+                    o.id for o in _latest_mention(
+                        other, _span_carriers_including_retired(store, fact.subject, needle),
+                    )
+                }:
+                    # 1 文字の旧値は最後に述べた 1 行だけを畳む (:func:`_latest_mention`)。
+                    # 最後の言及が既に畳まれていても数える — 本体の畳み
+                    # (:func:`_supersede_corrected_slots`) の後に走るので。
                     continue
                 if multi and not needle and (
                     fact.subject.startswith(_ASSERTION_SUBJECT_PREFIX)

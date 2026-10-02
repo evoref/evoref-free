@@ -134,6 +134,35 @@ def write_user_bytes(path: Path | str, data: bytes) -> UserWriteResult:
     return UserWriteResult(target, size, None, None, backup)
 
 
+def roll_back_user_write(path: Path | str, previous: bytes | None) -> None:
+    """直前の :func:`write_user_bytes` を取り消し、書く前の状態へ戻す。
+
+    ``previous`` が ``None`` (書く前は無かった) なら書いたファイルを消す。シンボリック
+    リンクならリンクではなく書いたリンク先を消す (リンクは書く前から在った)。
+    戻すのは書き直しではないので **退避しない**。直前の書込みが :func:`record_backups`
+    へ積んだ退避の記録も外す (配信記録に「置き換え」を残さない、f_11 §3.3)。
+
+    Raises:
+        OSError: 戻せなかった (書いた中身が残っている)。
+    """
+    target = _resolve_target(Path(path))
+    sink = _backup_sink.get()
+    if sink is not None:
+        for index in range(len(sink) - 1, -1, -1):
+            if sink[index][0] == target:
+                del sink[index]
+                break
+    if previous is None:
+        target.unlink(missing_ok=True)
+        return
+    tmp = _write_tmp(target, previous, target.stat())
+    try:
+        _replace_with_retry(tmp, target)
+    except BaseException:
+        _discard(tmp)
+        raise
+
+
 # ── 符号化 ────────────────────────────────────────────────────────────────
 
 

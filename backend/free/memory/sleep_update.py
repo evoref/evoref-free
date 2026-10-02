@@ -50,6 +50,16 @@ FULL_COMPLETED_KEY = "full_completed"
 #: 結果辞書で「段 <key> の入力件数」を表す接尾辞 (死活監視の約束、c_07 §7.1)。
 INPUT_SUFFIX = "_input"
 
+#: Step 8.0 の短い許可窓 (2026-10-02 監査 #6)。静穏窓が来ないまま候補が静穏窓の
+#: この倍数より長く待ったら、生成中でない合間に ``_SHORT_WINDOW_MAX`` 件だけ検証する。
+_SHORT_WINDOW_AGE_FACTOR = 2.0
+_SHORT_WINDOW_MAX = 1
+#: Step 8.0 が刻むノートのフィールド (:meth:`SleepTimeWorker._persist_correction_verdicts`)。
+_CORRECTION_VERDICT_FIELDS: tuple[str, ...] = (
+    "correction_verified_at", "correction_verdict", "correction_wrong_claim",
+    "correction_correct_value", "curation_failures",
+)
+
 logger = get_logger("memory.sleep_update")
 
 _T = TypeVar("_T")
@@ -224,6 +234,7 @@ class SleepTimeWorker:
         self._pq_rerank_stats: dict[str, int] = {}
         #: 取消された Step 5.9 の件数の持ち越し (次に Step 5.9 を終えた Full の結果辞書に足す)。
         self._pq_rerank_carry: dict[str, int] = {}
+        self._pq_activity: dict[str, int] = {}
 
     def set_fewshot_pool(self, pool) -> None:
         """FewShotPool を設定 (手本の埋め込み backfill に使用)。"""
@@ -967,11 +978,7 @@ class SleepTimeWorker:
         # 継承で **訂正の力** を使う前に、「本当に過去の発言の誤りを指して
         # いるか」を判定してノートへ刻む (2026-09-08 夜の監査 G-01 / G-04)。
         ts = time.monotonic()
-        (
-            result["corrections_verified"],
-            result["corrections_verified" + INPUT_SUFFIX],
-            result["corrections_deferred"],
-        ) = await self._step8_0_verify_corrections(llm_client)
+        result.update(await self._step8_0_verify_corrections(llm_client))
         step_durations["step8_0_correction_verify"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
@@ -1163,7 +1170,13 @@ class SleepTimeWorker:
         # 要約) を 10〜20 分待たせていた (2026-09-12 実測: Full 時間の 77%)。
         # 索引は corpus 側の別ストアなので、記憶の版 (E5) と順序の依存は無い。
         ts = time.monotonic()
-        from backend.free.memory.sleep.pseudo_query import CARRIED_OVER_KEY, empty_rerank_stats
+        from backend.free.memory.sleep.pseudo_query import (
+            CARRIED_OVER_KEY,
+            PSEUDO_QUERIES_DEFERRED_KEY,
+            PSEUDO_QUERIES_INPUT_KEY,
+            PSEUDO_QUERIES_UNPRODUCTIVE_KEY,
+            empty_rerank_stats,
+        )
 
         # 前の Full が Step 5.9 の途中で取消されていれば、その回の件数 (結果辞書ごと捨てられた)
         # を結果辞書にだけ足す (memory JSONL は取消の回にその場で書いたので二重に数えない)。
@@ -1171,7 +1184,14 @@ class SleepTimeWorker:
         for key, value in self._pq_rerank_stats.items():
             self._pq_rerank_carry[key] = self._pq_rerank_carry.get(key, 0) + value
         self._pq_rerank_stats = empty_rerank_stats()
+        # 入力件数は持ち越さない (効果は取消の回の結果辞書ごと捨てられ、持ち越すと誤報になる)。
+        self._pq_activity = {
+            PSEUDO_QUERIES_INPUT_KEY: 0,
+            PSEUDO_QUERIES_DEFERRED_KEY: 0,
+            PSEUDO_QUERIES_UNPRODUCTIVE_KEY: 0,
+        }
         result["pseudo_queries"] = await self._step5_9_pseudo_queries(llm_client)
+        result.update(self._pq_activity)
         # 品質検査の件数 (c_16 §7.2.1 の第 5 段階 B)。再順位段が無い回も 0 で必ず載せる。
         result.update(self._pq_rerank_stats)
         for key, value in self._pq_rerank_carry.items():
@@ -1431,6 +1451,7 @@ class SleepTimeWorker:
             should_pause=lambda: self._chat_recent(quiet),
             reranker=self.reranker,
             stats=self._pq_rerank_stats,
+            activity=self._pq_activity,
             debug_logger=self._debug_logger,
         )
 
@@ -1485,22 +1506,29 @@ class SleepTimeWorker:
 
     # ── Step 8.0 (correction curator) ──────────────────
 
-    async def _step8_0_verify_corrections(
-        self, llm_client=None,
-    ) -> tuple[int, int, int]:
+    async def _step8_0_verify_corrections(self, llm_client=None) -> dict[str, int]:
         """Step 8.0: 字句で立てた訂正候補を検証してノートへ帰属を刻む。
 
         実ロジックは :mod:`backend.free.memory.sleep.correction_curator`
         に分離されている。本メソッドは state を詰め替える薄いラッパ。
 
-        検証は静穏窓でだけ出す (Step 5.85 と同じ ``_chat_recent``)。チャットの
-        合間に出すと横取りされて全滅する (2026-09-26 監査 #12)。
+        検証は静穏窓で出す (Step 5.85 と同じ ``_chat_recent``)。チャットの
+        合間に出すと横取りされて全滅する (2026-09-26 監査 #12)。ただし静穏窓が
+        来ないまま ``_SHORT_WINDOW_AGE_FACTOR`` × 静穏窓より長く待った候補は、
+        生成中でなければターンの合間に ``_SHORT_WINDOW_MAX`` 件だけ出す — 連投が
+        続くと静穏窓は会話が止まるまで来ず、その間の別セッションが訂正前の値を
+        答えた (2026-10-02 監査 #6)。検証は ``background_slot`` の文法制約 JSON で、
+        チャットの要求が届けば打ち切られる (``correction_verify`` は preemptible)。
+
+        刻んだ結果は作業領域ごと先に事象へ落とす (:meth:`_persist_correction_verdicts`)。
 
         Returns:
-            ``(検証したノート数, 検証待ちの候補数, 静穏窓で見送った候補数)``。
-            2 つ目は死活監視の入力件数 (c_07 §7.1) で、aux が無い構成と静穏窓で
-            見送ったサイクルは 0 (母数外 — 見送りは正常動作)。見送った件数は
-            3 つ目に出し、Full の再要求の判定に使う (scheduler)。
+            結果辞書へ足す件数 (c_07 §7.1)。``corrections_verified`` は刻んだノート数、
+            ``_input`` は検証へ出した候補数で、見送り (``corrections_deferred`` —
+            窓が無かった) と打ち切り (``corrections_preempted`` — チャットに譲った)
+            は母数外 (正常動作)。``corrections_failed`` は一過性の実失敗の数。
+            aux が無い構成は全部 0。見送りと打ち切りは Full の再要求の判定に使う
+            (scheduler)。
         """
         from backend.free.memory.sleep.correction_curator import (
             _MAX_PER_CYCLE,
@@ -1509,21 +1537,73 @@ class SleepTimeWorker:
         )
         from backend.free.memory.sleep.pseudo_query import quiet_seconds
 
+        counts = {
+            "corrections_verified": 0,
+            "corrections_verified" + INPUT_SUFFIX: 0,
+            "corrections_deferred": 0,
+            "corrections_preempted": 0,
+            "corrections_failed": 0,
+        }
         notes = self._curatable_notes()
-        pending = len(pending_notes(notes)) if llm_client is not None else 0
+        waiting = pending_notes(notes) if llm_client is not None else []
+        if not waiting:
+            return counts
         quiet = quiet_seconds(self.config)
-        if pending and self._chat_recent(quiet):
+        limit = self._cycle_count(_MAX_PER_CYCLE)
+
+        def should_pause() -> bool:
+            return self._chat_recent(quiet)
+
+        if self._chat_recent(quiet):
+            if not self._verification_overdue(waiting, quiet):
+                logger.info(
+                    "Step 8.0: %d correction candidate(s) wait for a quiet window",
+                    len(waiting),
+                )
+                counts["corrections_deferred"] = len(waiting)
+                return counts
+            limit = min(limit, _SHORT_WINDOW_MAX)
+            should_pause = self._chat_in_flight
+            counts["corrections_deferred"] = max(0, len(waiting) - limit)
             logger.info(
-                "Step 8.0: %d correction candidate(s) wait for a quiet window",
-                pending,
+                "Step 8.0: no quiet window yet; verifying %d of %d overdue correction "
+                "candidate(s) between turns", min(limit, len(waiting)), len(waiting),
             )
-            return 0, 0, pending
-        verified = await curate_corrections(
-            notes, aux_client=llm_client,
-            should_pause=lambda: self._chat_recent(quiet),
-            max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
+        stats: dict[str, int] = {}
+        counts["corrections_verified"] = await curate_corrections(
+            notes, aux_client=llm_client, should_pause=should_pause,
+            max_per_cycle=limit, stats=stats,
         )
-        return verified, pending, 0
+        self._persist_correction_verdicts(waiting)
+        counts["corrections_preempted"] = stats.get("preempted", 0)
+        counts["corrections_failed"] = stats.get("failed", 0)
+        counts["corrections_verified" + INPUT_SUFFIX] = max(
+            0,
+            len(waiting) - counts["corrections_deferred"] - counts["corrections_preempted"],
+        )
+        return counts
+
+    def _verification_overdue(self, waiting: list, quiet: float) -> bool:
+        """生成中でなく、最も古い候補が静穏窓の ``_SHORT_WINDOW_AGE_FACTOR`` 倍より前か。"""
+        if self._chat_in_flight():
+            return False
+        oldest = min(float(getattr(n, "created_at", 0.0) or 0.0) for n in waiting)
+        return time.time() - oldest >= _SHORT_WINDOW_AGE_FACTOR * quiet
+
+    def _persist_correction_verdicts(self, notes: list) -> int:
+        """Step 8.0 が刻んだ検証結果を、サイクルの最後を待たずに事象へ落とす。
+
+        Full は Step 8 以降でもユーザー入力で打ち切られ、そのとき作業領域は
+        :meth:`EpisodicWorkspace.flush` まで届かず次のサイクルで開き直される。
+        検証結果も一緒に捨てると、静穏窓 (または短い許可窓) をもう一度待って
+        検証し直すことになる (2026-10-02 監査 #6)。
+        """
+        workspace = self._workspace
+        if workspace is None:
+            return 0
+        return workspace.flush_fields(
+            [str(getattr(n, "id", "")) for n in notes], _CORRECTION_VERDICT_FIELDS,
+        )
 
     # ── Step 8 (Chat/Create/MDP Extractor) ─────────────
 

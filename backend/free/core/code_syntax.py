@@ -230,6 +230,78 @@ def runtime_environment_line() -> str:
     return f"Python runtime: {env['python']} ({SYNTAX_CHECKER_PACKAGE}: {state})"
 
 
+#: 終了タグを持たない要素 (HTML Living Standard の void elements と旧要素)
+_HTML_VOID = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr",
+    "basefont", "bgsound", "frame", "keygen", "command", "isindex", "image",
+})
+#: 終了タグを省略してよい要素 (閉じていなくても誤りにしない。親の終了タグが暗黙に閉じる)
+_HTML_OPTIONAL_END = frozenset({
+    "html", "head", "body", "p", "li", "dt", "dd", "rt", "rp", "rb", "rtc", "optgroup", "option",
+    "colgroup", "caption", "thead", "tbody", "tfoot", "tr", "td", "th",
+})
+#: 中身を文字として読む要素 (中のタグを数えない)
+_HTML_RCDATA = frozenset({"title", "textarea"})
+#: テンプレートの構文 (条件で開閉が分かれるので平衡を数えない)
+_HTML_TEMPLATE_RE = re.compile(r"\{%|\{\{|<\?|<%")
+
+
+def html_balance_error(code: str) -> str | None:
+    """HTML のタグの開閉の対応を検査し、明確な不平衡があれば ``line N: 理由`` を返す (無ければ ``None``)。
+
+    tree-sitter の HTML 文法は閉じていない ``<div>`` を誤りにしない (2026-10-03 ライブ再実行 K02: 閉じていない
+    ``<div class="timer">`` のまま静的検査が「合格」と書いた)。標準ライブラリの ``html.parser`` で開始・終了タグを
+    数える。不合格にするのは、終了タグを省略できない要素 (``div`` / ``span`` / ``section`` …) が閉じていない・対応の
+    無い終了タグがある、の 2 つだけ。void 要素 (``br`` / ``img`` …)、省略が合法な要素 (``p`` / ``li`` / ``td`` …)、
+    自己終了の書き方 (``<path/>``) は数えない。テンプレートの構文 (``{% %}`` / ``{{ }}`` / ``<? ?>``) を含む本文は
+    開閉が条件で分かれるので検査しない。
+    """
+    from html.parser import HTMLParser
+
+    if _HTML_TEMPLATE_RE.search(code):
+        return None
+    problems: list[tuple[int, str]] = []
+    stack: list[tuple[str, int]] = []
+
+    def _in_rcdata() -> str:
+        # title / textarea の中身は文字だけ (RCDATA)。html.parser が RCDATA として読むかは Python の版で違う
+        # (3.12 はタグとして渡す) ので、自前で中身のタグを無視して版によらず同じ結果にする
+        return stack[-1][0] if stack and stack[-1][0] in _HTML_RCDATA else ""
+
+    class _Balance(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list) -> None:  # noqa: ARG002 - HTMLParser の署名
+            if _in_rcdata():
+                return
+            if tag not in _HTML_VOID:
+                stack.append((tag, self.getpos()[0]))
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in _HTML_VOID or _in_rcdata() not in ("", tag):
+                return
+            if not any(name == tag for name, _ in stack):
+                if tag not in _HTML_OPTIONAL_END:
+                    problems.append((self.getpos()[0], f"</{tag}> has no matching <{tag}>"))
+                return
+            while stack:
+                name, line = stack.pop()
+                if name == tag:
+                    break
+                if name not in _HTML_OPTIONAL_END:
+                    problems.append((line, f"<{name}> is not closed (closed by </{tag}>)"))
+
+    parser = _Balance(convert_charrefs=True)
+    try:
+        parser.feed(code)
+        parser.close()
+    except Exception:  # noqa: BLE001 — 読めない本文は平衡を判定しない (誤検出を避ける)
+        return None
+    problems += [(line, f"<{name}> is not closed") for name, line in stack if name not in _HTML_OPTIONAL_END]
+    if not problems:
+        return None
+    line, reason = min(problems)
+    return f"line {line}: html {reason}"
+
+
 def syntax_error_detail(code: str, path: str) -> str | None:
     """``path`` の言語で構文を検査し、誤りがあれば ``line N: 理由`` を返す (無ければ ``None``)。"""
     if is_python_path(path):

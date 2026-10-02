@@ -609,10 +609,13 @@ class SleepTimeScheduler:
         verified = result.get("corrections_verified")
         if not isinstance(pending, int) or not isinstance(verified, int):
             return
-        # 静穏窓で見送った件数は死活監視の母数外なので別キーで来る。
-        deferred = result.get("corrections_deferred")
-        if not isinstance(deferred, int):
-            deferred = 0
+        # 静穏窓で見送った件数とチャットに譲って打ち切った件数は、死活監視の
+        # 母数外なので別キーで来る。どちらも検証を待っている。
+        deferred = 0
+        for key in ("corrections_deferred", "corrections_preempted"):
+            value = result.get(key)
+            if isinstance(value, int):
+                deferred += value
         pending += deferred
         self._verification_waiting = pending > 0 and verified == 0
         if pending <= 0 or verified > 0:

@@ -10,7 +10,13 @@ import io
 from pathlib import Path
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ContentBlock, ExportContent
+from backend.export.base import ContentBlock, ExportContent, ExportError
+from backend.export.markdown_patterns import (
+    BOLD_KINDS,
+    CODE_KINDS,
+    ITALIC_KINDS,
+    iter_inline_groups,
+)
 from backend.export.media import (
     export_base_dir,
     resolve_image_path,
@@ -86,6 +92,32 @@ def _find_content_layout(prs):
     return None
 
 
+def _set_inline_text(para, text: str, *, inline: bool = True) -> None:
+    """段落の本文を設定する。``inline`` なら inline Markdown (``**太字**`` 等) を run にする。
+
+    解析しないと ``**`` や `` ` `` が生のまま投影される (docx writer と同じ原則、
+    パターンは ``markdown_patterns`` が SSOT)。
+    """
+    if not inline:
+        para.text = text
+        return
+    for url, pieces in iter_inline_groups(text):
+        for piece, kind in pieces:
+            for i, line in enumerate(piece.split("\n")):
+                if i:
+                    para.add_line_break()
+                run = para.add_run()
+                run.text = line
+                if kind in BOLD_KINDS:
+                    run.font.bold = True
+                if kind in ITALIC_KINDS:
+                    run.font.italic = True
+                if kind in CODE_KINDS:
+                    run.font.name = "Consolas"
+                if url:
+                    run.hyperlink.address = url
+
+
 class _BodyText:
     """本文プレースホルダへ段落を積む。最初の 1 段落は既存の空段落を使う。"""
 
@@ -94,13 +126,13 @@ class _BodyText:
         self._tf.clear()
         self._used_first = False
 
-    def add(self, text: str, level: int = 0):
+    def add(self, text: str, level: int = 0, *, inline: bool = True):
         if self._used_first:
             para = self._tf.add_paragraph()
         else:
             para = self._tf.paragraphs[0]
             self._used_first = True
-        para.text = text
+        _set_inline_text(para, text, inline=inline)
         para.level = level
         return para
 
@@ -124,7 +156,7 @@ def _add_block_to_body(body: _BodyText, block: ContentBlock) -> None:
             body.add(text, level=min(1 + level, 8))
 
     elif block.type == "code":
-        para = body.add(block.content)
+        para = body.add(block.content, inline=False)
         for run in para.runs:
             run.font.name = "Consolas"
             run.font.size = Pt(10)
@@ -183,6 +215,17 @@ def _add_shapes(slide, block: ContentBlock) -> None:
             drawn.text_frame.text = shape.text
 
 
+def _pptx_has_content(prs) -> bool:
+    """どれかのスライドに文字・表・画像・図形があるか (空のプレースホルダは数えない)。"""
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text_frame.text.strip():
+                return True
+            if getattr(shape, "has_table", False) or not shape.is_placeholder:
+                return True
+    return False
+
+
 def _render_slide(prs, layout, slide_data: Slide, base_dir=None) -> None:
     """1 枚のスライドを描く。"""
     from pptx.util import Inches
@@ -207,7 +250,8 @@ def _render_slide(prs, layout, slide_data: Slide, base_dir=None) -> None:
             ).table
             for r_idx, row_data in enumerate(block.rows):
                 for c_idx, cell_text in enumerate(row_data):
-                    table.cell(r_idx, c_idx).text = cell_text
+                    cell_tf = table.cell(r_idx, c_idx).text_frame
+                    _set_inline_text(cell_tf.paragraphs[0], cell_text)
         elif block.type == "image":
             _add_image(slide, block, base_dir)
         elif block.type == "shapes":
@@ -263,6 +307,15 @@ def _build_pptx(content: ExportContent) -> bytes:
 
     for slide_data in deck.slides:
         _render_slide(prs, layout_content, slide_data, base_dir)
+
+    if (content.blocks or (content.raw_markdown or "").strip()) and not _pptx_has_content(prs):
+        # 中身を渡したのに何も描けなかった (存在しない画像だけ・壊れた図形だけ等)
+        # 文書を成功として書かない (f_11 §3.3、docx と同じ規則)。
+        raise ExportError(
+            "empty_output",
+            f"Nothing in the content can be drawn in .pptx "
+            f"(block types: {sorted({b.type for b in content.blocks})})",
+        )
 
     buf = io.BytesIO()
     prs.save(buf)

@@ -19,6 +19,7 @@ phase 4 で SemMem 側の工程を Evidence 直読みに書き換えたら、こ
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any
 
@@ -167,6 +168,31 @@ class EpisodicWorkspace:
                 "Episodic workspace flushed: %d put, %d retracted", put, retracted,
             )
         return {"put": put, "retracted": retracted}
+
+    def flush_fields(self, note_ids: Iterable[str], names: Iterable[str]) -> int:
+        """既存ノートの ``names`` の変更だけを先に事象へ落とす。書いたノート数を返す。
+
+        サイクルの途中で確定した結果 (Step 8.0 の検証) を、後段の打ち切りで
+        :meth:`flush` まで届かなくても失わないための口。書いた分は基準を進めるので
+        最後の :meth:`flush` で二重に書かない。作業領域で足したノートは対象外
+        (``create`` は :meth:`flush` が書く)。
+        """
+        wanted = tuple(names)
+        written = 0
+        for note_id in note_ids:
+            note = self.notes.get(note_id)
+            baseline = self._baseline.get(note_id)
+            if note is None or baseline is None:
+                continue
+            fingerprint = _fingerprint(note)
+            changed = [name for name in wanted if baseline.get(name) != fingerprint.get(name)]
+            if not changed:
+                continue
+            self.store.update_note(note, changed)
+            for name in changed:
+                baseline[name] = fingerprint[name]
+            written += 1
+        return written
 
     def unembedded(self) -> list[MemoryNote]:
         """まだベクトルを持たないノート (競合検出 / 進化の対象外になる)。"""

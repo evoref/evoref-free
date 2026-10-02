@@ -18,6 +18,7 @@ import re
 from collections.abc import Callable, Iterable, Sequence
 from functools import cache
 from backend.free.core.numerals import kanji_number_value
+from backend.free.core.relative_date import PERIOD_UNIT_ALTERNATION
 from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
@@ -1946,6 +1947,13 @@ def ignores_calculate_result(response: str, result: float | None) -> str | None:
     return f"calculate result {result:g} does not appear in the answer"
 
 
+#: 率の分母になる期間 (「1 週間あたり」「3 日ごと」)。期間そのものの答え
+#: (「約5日」「約11年」) は対象外 — それは結果の丸めでありうる。
+_PERIOD_DENOMINATOR_TAIL_RE = re.compile(
+    r"\s*(?:" + PERIOD_UNIT_ALTERNATION + r")\s*(?:あたり|当たり|ごと|毎|につき)",
+)
+
+
 def misrounded_result_values(text: str, result: float | None) -> list[str]:
     """``text`` の数値のうち、計算結果の近くにあるのに **その桁で丸めても一致しない** もの。
 
@@ -1956,6 +1964,9 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
     値の桁 (小数 1 桁なら 0.1) で丸めた結果と比べるので、「約28」「27.7」は
     一致扱い。対象は結果から最小桁 1 つぶん以内の数だけ — それより離れた数は
     別の量 (「標準は25未満」) か、:func:`ignores_calculate_result` が扱う大外れ。
+    率の分母の期間 (「1 週間あたり 0.38kg」の 1) も別の量で、結果の丸めではない
+    (2026-10-02 ライブ監査 D03#3: 結果 0.3833 に対する「1」を丸め違いとし、正答の
+    ターンを失敗として学習させていた)。
 
     Returns:
         丸めが合わない数値の原文 (出現順、重複なし)。
@@ -1967,7 +1978,7 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
     body = normalize_numerals(_CODE_FENCE_RE.sub("\n", text or ""))
     magnitude = abs(result)  # 本文の数は符号を読まない (ignores_calculate_result と同じ)
     for num in iter_ja_numbers(body):
-        if num.has_unit:
+        if num.has_unit or _PERIOD_DENOMINATOR_TAIL_RE.match(body, num.end):
             continue
         raw = body[num.start:num.end].strip()
         decimals = len(raw.split(".", 1)[1]) if "." in raw else 0

@@ -27,21 +27,20 @@ _SAFE_NODES = {
 # できない。Attribute ノードを許可しないため ``x.__class__`` 等の経由もできない。
 # ``**`` が既に許可されている以上、pow / factorial による巨大値生成のリスクは
 # 現状から増えない。
-#: ``sum`` は **載せない**。引数に渡せる列 (``range`` / リストリテラル) が
-#: どちらも作れないので構造的に到達不能で、それでいて名前だけは許可リストと
-#: エラーメッセージ (``_DISALLOWED_NODE_HINTS``) に出るため、モデルを必ず
-#: 失敗する式へ誘導していた。実測 (2026-08-27 ライブ監査):
-#:
-#:     sum(range(1,101))  -> Error: Unsafe expression (unknown name: range)
-#:     sum([1, 2, 3])     -> Error: Unsafe expression (disallowed node: List)
-#:
-#: 「1から100までの整数の和」で分類器が ``sum(range(1,101))`` を組み立てて
-#: 失敗し (agent_trace の reward=0.0)、暗算フォールバックでたまたま正答した
-#: ためユーザーからは見えなかった。``range`` を足す案は上限なしだと
-#: ``sum(range(10**12))`` を許すことになり、AST の許可面も広がるので採らない
-#: (数個の加算は ``1+2+3`` で足りる)。
+#: ``sum`` / ``len`` は **リスト・タプルのリテラル 1 個だけを引数に取る形** で呼べる
+#: (:data:`_SEQUENCE_FUNCS`)。以前は列を作れず構造的に到達不能だったので載せて
+#: いなかった (2026-08-27 ライブ監査: ``sum([1, 2, 3])`` が disallowed node: List)。
+#: 9B の分類器は会話の数を合計するとき ``sum(...)`` を組み、未知の名前で落ちて
+#: 「計算ツールが利用できない」と答えていた (2026-10-03 再実行 D08#4)。
+#: 列を **返す** 呼び方を作らないのが要点 — ``max([0], [1])`` / ``sum([], [0])`` は
+#: 列を返し、その戻り値は ``* 10**9`` の被演算子にできる (独立レビュー 2026-10-03:
+#: ``len(max((0,), (1,)) * 10**7)`` が 0.03 秒で 1000 万要素)。引数が列リテラル 1 個
+#: なら、入れ子の列は拒むので戻り値は要素 (数か文字列) か数になる。文字列・列の
+#: 繰り返しと連結は結果の長さで別に打ち切る (:data:`_MAX_SEQUENCE_RESULT_LEN`)。
+#: ``range`` は上限なしだと ``sum(range(10**12))`` を許すので引き続き載せない。
 _SAFE_NAMES: dict[str, object] = {
     "abs": abs, "round": round, "min": min, "max": max,
+    "sum": sum, "len": len,
     "pow": pow,
     "sqrt": math.sqrt, "exp": math.exp,
     "log": math.log, "log2": math.log2, "log10": math.log10,
@@ -57,6 +56,12 @@ _SAFE_NAMES: dict[str, object] = {
     "hex": hex, "bin": bin, "oct": oct, "int": int,
 }
 
+#: リスト・タプルのリテラルを受け取れる関数。列のリテラルは、ここに載る関数の
+#: **唯一の** 引数であるときだけ許す (2 個以上の引数の列・入れ子の列・演算の被演算子・
+#: 他の関数の引数は拒む)。
+_SEQUENCE_FUNCS = frozenset({"sum", "min", "max", "len"})
+_SEQUENCE_NODES = (ast.List, ast.Tuple)
+
 # 非許可ノードごとの自己修正ヒント。LLM が同一ターン内でエラーを見て
 # 書き直せるよう、そのノードが生じがちな典型的な誤記法を指す (実インシデント:
 # 「πr²」を "π*5^2" と書いて BitXor に、「GCD」を "gcd(360,504)" と書いて
@@ -66,6 +71,10 @@ _DISALLOWED_NODE_HINTS: dict[str, str] = {
     # 一覧は _SAFE_NAMES から生成する (直書きすると許可リストとドリフトする)
     "Call": "only these names are available: " + " ".join(sorted(_SAFE_NAMES)),
     "Name": "only these names are available: " + " ".join(sorted(_SAFE_NAMES)),
+    "List": "a list literal is allowed only as the single argument of "
+            + "/".join(sorted(_SEQUENCE_FUNCS)) + ", e.g. sum([12, 25, 8])",
+    "Tuple": "a tuple literal is allowed only as the single argument of "
+             + "/".join(sorted(_SEQUENCE_FUNCS)),
 }
 
 
@@ -77,6 +86,11 @@ _DISALLOWED_NODE_HINTS: dict[str, str] = {
 _MAX_POW_EXPONENT = 10_000
 _MAX_FACTORIAL_ARG = 5_000
 _MAX_INT_POW_RESULT_BITS = 1_000_000
+#: 文字列・バイト列・列の繰り返し (``*``) と連結 (``+``) の結果の長さの上限。
+#: ``'a' * 10**9`` は数値の検査をすべて通り、1 GB の文字列を作っていた (calculate に
+#: タイムアウトは無い。独立レビュー 2026-10-03)。
+_MAX_SEQUENCE_RESULT_LEN = 100_000
+_SIZED_TYPES = (str, bytes, list, tuple)
 
 
 def _eval_subtree(node: ast.expr) -> object:
@@ -97,6 +111,8 @@ def _reject_expensive(node: ast.AST) -> str | None:
         reason = _reject_expensive(child)
         if reason:
             return reason
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Add)):
+        return _reject_long_sequence(node)
     exponent: object = None
     base: object = None
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
@@ -126,6 +142,32 @@ def _reject_expensive(node: ast.AST) -> str | None:
     return None
 
 
+def _reject_long_sequence(node: ast.BinOp) -> str | None:
+    """文字列・列の繰り返し / 連結の結果が長すぎれば理由を返す (子は検査済み)。
+
+    被演算子の評価が失敗する式 (0 除算など) はここでは判定せず、実行時のエラーに任せる。
+    """
+    try:
+        left = _eval_subtree(node.left)
+        right = _eval_subtree(node.right)
+    except Exception:  # noqa: BLE001 - 実行時に同じ例外が理由の文字列になる
+        return None
+    if isinstance(node.op, ast.Mult):
+        for seq, count in ((left, right), (right, left)):
+            if (
+                isinstance(seq, _SIZED_TYPES) and isinstance(count, int)
+                and len(seq) * count > _MAX_SEQUENCE_RESULT_LEN
+            ):
+                return "Error: result too large to compute"
+        return None
+    if (
+        isinstance(left, _SIZED_TYPES) and isinstance(right, _SIZED_TYPES)
+        and len(left) + len(right) > _MAX_SEQUENCE_RESULT_LEN
+    ):
+        return "Error: result too large to compute"
+    return None
+
+
 def _format_calc_result(result: object) -> str:
     """計算結果を人間が読める形に整形する (純粋関数)。
 
@@ -148,8 +190,13 @@ def _format_calc_result(result: object) -> str:
 
 def _check_tree(tree: ast.AST) -> str | None:
     """許可リスト (ノード・名前・呼び出し) とコスト上限を検査し、違反なら理由を返す。"""
+    # ast.walk は親を子より先に返すので、列を受け取る呼び出しを見た時点でその
+    # 直接の引数の列を許可に積めば、列そのものの検査に間に合う。
+    allowed_sequences: set[int] = set()
     for node in ast.walk(tree):
         node_name = type(node).__name__
+        if isinstance(node, _SEQUENCE_NODES) and id(node) in allowed_sequences:
+            continue
         if type(node) not in _SAFE_NODES:
             msg = f"Error: Unsafe expression (disallowed node: {node_name})"
             hint = _DISALLOWED_NODE_HINTS.get(node_name)
@@ -175,6 +222,13 @@ def _check_tree(tree: ast.AST) -> str | None:
                     "Error: Unsafe expression (keyword arguments are not "
                     "supported)"
                 )
+            # 列リテラルは唯一の引数のときだけ。2 個以上の引数の列 (``max([0], [1])``)
+            # は列を返し、その戻り値を繰り返しの被演算子にできる。
+            if (
+                node.func.id in _SEQUENCE_FUNCS and len(node.args) == 1
+                and isinstance(node.args[0], _SEQUENCE_NODES)
+            ):
+                allowed_sequences.add(id(node.args[0]))
     return _reject_expensive(tree)
 
 
@@ -190,6 +244,29 @@ def validate_expression(expression: str) -> str | None:
         return _check_tree(tree)
     except Exception as e:  # noqa: BLE001 - calculate と同じく理由の文字列で返す
         return f"Error: {e}"
+
+
+def unknown_names(expression: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """式の許可リスト外の名前を ``(変数として使った名前, 関数として呼んだ名前)`` で返す。
+
+    出現順・重複なし。構文エラーなら ``SyntaxError`` を送出する。ツール判定が
+    「会話の語を変数名にした式」(組み直せる) と「計算機に無い関数を呼ぶ式」
+    (``fibonacci(10)`` / ``timedelta(days=100)``、組み直しても数を尋ねる理由が無い) を
+    分けるのに使う (docs/f_03 §3.1)。
+    """
+    tree = ast.parse(expression, mode="eval")
+    called = {
+        id(node.func) for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    variables: list[str] = []
+    functions: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id not in _SAFE_NAMES:
+            bucket = functions if id(node) in called else variables
+            if node.id not in bucket:
+                bucket.append(node.id)
+    return tuple(variables), tuple(functions)
 
 
 def calculate(expression: str) -> str:

@@ -67,6 +67,42 @@ def _is_user_note(note: Any) -> bool:
     return (getattr(note, "source", None) or "user") != "assistant"
 
 
+def has_correction_shape(note: Any) -> bool:
+    """ノートが訂正の **候補** の形を持つか (純粋関数、検証の有無は問わない)。
+
+    ``is_correction`` (応答パスの ``restates_a_value`` / 取り込みの
+    ``restates_attribute_value`` が立てる) か、本文が訂正の形
+    (``extractors.chat.has_correction_form``: 「ではなく」「正しくは」「変わりました」…)
+    を持つか。検証 (Step 8.0) の対象選び・Step 8 の据え置き・Step 8.4 の持ち越し・
+    注入の未検証の注記は **すべてこの 1 実装** を読む (不変則 #14(a))。以前は注入側
+    だけが ``is_correction`` しか見ておらず、検証の対象になる形だけのノートに
+    注記が付かなかった (2026-10-02 監査)。
+    """
+    if getattr(note, "is_correction", False):
+        return True
+    from backend.free.memory.extractors.chat import has_correction_form
+
+    return has_correction_form(str(getattr(note, "content", "") or ""))
+
+
+def is_correction_candidate(note: Any) -> bool:
+    """未検証の訂正候補か (Step 8.0 の検証対象・Step 8 の据え置き・注入の注記の SSOT)。
+
+    **ユーザー発話** で、本文が空でなく、まだ検証されておらず
+    (``correction_verified_at`` が無い)、:func:`has_correction_shape` を満たすもの。
+    据え置きだけ形を見て候補選びが ``is_correction`` だけを見ていたため、
+    ``is_correction=False`` で形を持つノートが永久に検証も抽出もされなかった
+    (2026-10-01、不変則 #14(a))。
+    """
+    if str(getattr(note, "source", "user") or "user") != "user":
+        return False
+    if getattr(note, "correction_verified_at", None) is not None:
+        return False
+    if not str(getattr(note, "content", "") or "").strip():
+        return False
+    return has_correction_shape(note)
+
+
 def correction_target(correction: Any, notes: list) -> Any | None:
     """``correction`` が言い直している **元の言明ノート** を返す (純粋関数)。
 

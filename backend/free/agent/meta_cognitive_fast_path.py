@@ -36,6 +36,7 @@ from backend.free.agent.meta_cognitive_defs import (
 from backend.free.agent.meta_cognitive_content import ExistingContentRefused
 from backend.free.agent.tools.filesystem import append_existing_text
 from backend.free.agent.meta_cognitive_content_gate import is_pure_append_request
+from backend.free.agent.edit_mode_gate import is_append_verdict
 from backend.io.text_file import Unreadable
 
 from backend.free.core.response_dates import fix_weekday_claims
@@ -44,6 +45,14 @@ from backend.free.core.prompt_blocks import local_today
 
 logger = get_logger("agent.meta_cognitive")
 
+#: 既存と同一の生成を棄却した後の再生成に添える指示。同じプロンプトのまま
+#: 再生成すると同じ写しが返り、長い生成を無駄に繰り返す (2026-10-02 ライブ監査 D07#3)。
+_UNCHANGED_EDIT_RETRY_HINT = (
+    "[再生成の指示] 直前の出力は既存ファイルの内容と同一で、依頼の変更が一つも"
+    "反映されていなかった。次のユーザー指示を必ず反映した内容を出力すること"
+    "(既存内容の写しは不可): {instruction}"
+)
+
 
 class _FastPathMixin:
     """ツールループを介さない直接実行 (ファストパス)。
@@ -51,6 +60,16 @@ class _FastPathMixin:
     ツール名と引数が決定論で確定しているタスクを、LLM のツールループを
     回さずに実行する層。書込みでは本文の解決・検証・救出までを担う。
     """
+
+    def _pure_append_requested(self, query: str) -> bool:
+        """追記だけの依頼か (判定点 ``edit_mode`` = append)。
+
+        ``process()`` の冒頭でターンに 1 回評価した結果 (事例の確認と記録つき) を
+        読む。同じ依頼文の評価が無いとき (単体の呼出) は字句段だけで決める。
+        """
+        if query is not None and getattr(self, "_edit_mode_query", None) == query:
+            return is_append_verdict(getattr(self, "_edit_mode_verdict", None))
+        return is_pure_append_request(query)
 
     def _resolve_read_args(self, tool_args: dict, query: str) -> dict:
         """read_file の ``file_path`` を文脈から解決する (裸の名前の救済)。
@@ -247,7 +266,7 @@ class _FastPathMixin:
         集約し、解決順序を 1 箇所で決める。
 
         出力先の既存ファイル (docs/f_11 §5): 追記だけの依頼
-        (``is_pure_append_request``。書き換えの語が同居すれば書き直し) なら
+        (判定点 ``edit_mode`` = append。本文を変える指示が同居すれば書き直し) なら
         どの段で得た本文も ``既存内容 + 区切り + 本文`` へ決定論で連結する
         (生成段はモデルに追記分だけを出させる)。既存ファイルが読めなければ、
         追記と生成 (既存内容に依存する本文) は書かずに ``existing_unreadable``
@@ -259,7 +278,7 @@ class _FastPathMixin:
         loaded = await self._load_existing_for_edit(file_path)
         unreadable = isinstance(loaded, Unreadable)
         existing = loaded if isinstance(loaded, str) else ""
-        append = loaded is not None and is_pure_append_request(original_query)
+        append = loaded is not None and self._pure_append_requested(original_query)
         if unreadable and append:
             logger.warning(
                 "Write: refusing to append to unreadable file (%s): %s",
@@ -330,6 +349,10 @@ class _FastPathMixin:
             content = await self._generate_content(
                 original_query, task_description, llm_client,
                 file_path=file_path, existing=existing, append=append,
+                retry_hint=(
+                    _UNCHANGED_EDIT_RETRY_HINT.format(instruction=original_query)
+                    if rejection == "edit_without_change" else ""
+                ),
             )
             content, rejection = self._validate_generated_content(
                 content, file_path, original_query, existing_content=compare_with,
@@ -562,7 +585,7 @@ class _FastPathMixin:
                 loaded = await self._load_existing_for_edit(file_path)
                 # 既存ファイルへの追記 / 読めない既存ファイルは合流点に任せる (f_11 §5)
                 defer = isinstance(loaded, Unreadable) or (
-                    loaded is not None and is_pure_append_request(original_query)
+                    loaded is not None and self._pure_append_requested(original_query)
                 )
                 if not defer:
                     validated, rejection = self._validate_generated_content(

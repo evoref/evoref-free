@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from backend.export.base import ContentBlock, ExportContent
+from backend.export.markdown_patterns import strip_inline
 
 
 @dataclass(frozen=True)
@@ -92,4 +93,8 @@ def split_into_slides(content: ExportContent) -> SlideDeck:
     if not cover_title and not slides:
         cover_title = content.title or "Untitled"
 
-    return SlideDeck(cover_title, slides)
+    # 題は 1 行のプレーンテキスト。``# **売上**`` の記号を生のまま表紙 / 題に出さない。
+    return SlideDeck(
+        strip_inline(cover_title),
+        [Slide(strip_inline(sl.title), sl.blocks) for sl in slides],
+    )

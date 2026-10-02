@@ -38,7 +38,9 @@ from backend.free.core.intent_vocab import (
     EXPLICIT_WINDOWS_PATH_RE,
     FILE_NAME_IN_TEXT_RE,
     FORWARD_REFERENCE_JA,
+    PAYLOAD_COLON_RE,
     QUESTION_END_RE,
+    QUOTED_SPAN_RE,
     REFERENTIAL_WRITE_TARGET_RE,
     WRITE_VERB_RE,
     ascii_boundary_alternation,
@@ -100,7 +102,7 @@ _GOVERNING_TAIL_RE = re.compile(
 #: 宛先句と書込みの述語の間に別の述語がある形 (「誤字がないか確認して追記して」)。
 _INTERVENING_PREDICATE_RE = re.compile(r"して|って|んで|か確認|たら|なら|ので|けど|、")
 #: 引用の中身 (「git stash の使い方」) は述語の解析から外す。
-_QUOTED_SPAN_RE = re.compile(r"「[^」]*」|『[^』]*』|\"[^\"]*\"")
+_QUOTED_SPAN_RE = QUOTED_SPAN_RE
 #: 「保存したファイルに加えて」— 「に加えて」は宛先ではなく「〜のほかに」。
 _IN_ADDITION_TO_RE = re.compile(r"^\s*に\s*加え")
 #: ``を`` 格で直近ファイルそのものを書き換える動詞 (「作成していただいたファイルを
@@ -151,7 +153,7 @@ _OBJECT_FROM_ELSEWHERE_RE = re.compile(
 )
 #: 依頼文と中身 (本文) の区切り (「次の一文を追加してください：以上です。」)。
 #: ASCII の ``:`` はパス (``E:\``) や URL にも現れるので、後ろに空白が続く形だけ。
-_PAYLOAD_COLON_RE = re.compile(r"：|:(?=\s)")
+_PAYLOAD_COLON_RE = PAYLOAD_COLON_RE
 #: 後ろに続く中身を指す前方参照 (「次の一文を」「以下を」)。
 _FORWARD_REFERENCE_RE = re.compile(FORWARD_REFERENCE_JA)
 #: 中身の無い括弧書きだけの後半 (「（中身は後で送ります）」)。

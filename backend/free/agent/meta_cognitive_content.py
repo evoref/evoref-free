@@ -10,6 +10,7 @@ from backend.free.agent.context_budget import SEND_GUARD_RESERVE_TOKENS
 from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.agent.output_format import (
     is_media_capable_output,
+    is_shape_capable_output,
     is_table_output,
 )
 from backend.free.agent.meta_cognitive_utils import (
@@ -32,8 +33,9 @@ from backend.free.agent.meta_cognitive_defs import (
     CONTENT_GENERATION_PROMPT,
     CSV_CONTENT_INSTRUCTION,
     MARKDOWN_CONTENT_INSTRUCTION,
-    MEDIA_CONTENT_INSTRUCTION,
+    IMAGE_CONTENT_INSTRUCTION,
     RICH_DOC_CONTENT_INSTRUCTION,
+    SHAPES_CONTENT_INSTRUCTION,
     TABLE_CONTENT_INSTRUCTION,
     _PRIOR_CONTENT_REFERENCE_RE,
 )
@@ -110,8 +112,12 @@ class _ContentGenerationMixin:
         *,
         existing: str | None = None,
         append: bool = False,
+        retry_hint: str = "",
     ) -> str:
         """write_file 用のコンテンツを LLM に生成させる
+
+        ``retry_hint`` は棄却後の再生成で、直前の失敗の理由をモデルへ伝える一文
+        (プロンプト末尾へ足す)。
 
         ``existing`` は出力先の既存内容 (読み済みなら渡す。``None`` ならここで読む)。
         ``append`` が真なら既存内容の末尾の抜粋だけを見せて **追記する部分だけ** を
@@ -173,6 +179,8 @@ class _ContentGenerationMixin:
             user_prompt = self._inject_existing_content(
                 user_prompt, existing_content, file_path, ctx_size,
             )
+        if retry_hint:
+            user_prompt = f"{user_prompt}\n\n{retry_hint}"
 
         # Level 1 で進化した few-shot を参考例として system に注入する
         system_content = CONTENT_GENERATION_PROMPT
@@ -193,7 +201,9 @@ class _ContentGenerationMixin:
         # 画像・図形の記法を知らせる。無いと「青い四角形」が箇条書きになるだけで
         # 図形へ到達できない (f_11 §4)。
         if is_media_capable_output(file_path):
-            system_content = f"{system_content}\n{MEDIA_CONTENT_INSTRUCTION}"
+            system_content = f"{system_content}\n{IMAGE_CONTENT_INSTRUCTION}"
+        if is_shape_capable_output(file_path):
+            system_content = f"{system_content}\n{SHAPES_CONTENT_INSTRUCTION}"
         # 出力言語指示 (locale 追従)。ここは write 全経路 (ツールループ /
         # ファストパス / auto-recovery / editor タスク) の合流点なので、
         # この 1 箇所で全ファイル出力に効く。

@@ -2514,6 +2514,8 @@ async def _dispatch_meta_cognitive(
         # 直近ファイルへの書込み (判定点 recent_file_reference = write) の宛先。
         # 渡されたら計画せずに write-fast へ入る (docs/f_03 §4.3)。
         recent_file_target=recent_file_target,
+        # 判定点 edit_mode (追記 / 書き直し / 部分修正) の事例ゲート (c_17 §3.16)
+        edit_mode_gate=getattr(state, "edit_mode_gate", None),
     )
     keepalive_sec = cfg.get("streaming", {}).get(
         "keepalive_interval_sec", DEFAULT_KEEPALIVE_INTERVAL_SEC,
