@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import override
 
 from backend.export._writer_base import BytesWriterBase
@@ -16,10 +17,11 @@ from backend.export.base import (
     sibling_runs,
 )
 from backend.export.markdown_patterns import (
-    RE_BOLD as _RE_BOLD,
-    RE_INLINE_CODE as _RE_CODE_INLINE,
-    RE_ITALIC as _RE_ITALIC,
-    RE_LINK as _RE_LINK,
+    BOLD_KINDS,
+    CODE_KINDS,
+    ITALIC_KINDS,
+    iter_inline_groups,
+    strip_inline,
 )
 from backend.log_config import get_logger
 
@@ -68,23 +70,56 @@ _PREAMBLE = r"""\documentclass[a4paper,11pt]{article}
 """
 
 
+_RE_LATEX_SPECIAL = re.compile(r"[\\&%$#_{}~^]")
+
+
 def _escape_latex(text: str) -> str:
-    """LaTeX 特殊文字をエスケープ"""
-    # \ は最初に処理（他のエスケープで \ を使うため）
-    text = text.replace("\\", r"\textbackslash{}")
-    for ch, repl in _LATEX_SPECIAL.items():
-        text = text.replace(ch, repl)
-    return text
+    """LaTeX 特殊文字をエスケープ (1 パス。置換結果の ``{}`` を再エスケープしない)"""
+    return _RE_LATEX_SPECIAL.sub(
+        lambda m: r"\textbackslash{}" if m.group(0) == "\\" else _LATEX_SPECIAL[m.group(0)],
+        text,
+    )
+
+
+def _marked_latex(pieces) -> str:
+    """``(断片, 種別)`` の列の特殊文字をエスケープし、LaTeX の書式命令にする。
+
+    種別は重ねて包む (強調の中のコードは ``\textbf{\texttt{…}}``)。
+    """
+    out = []
+    for piece, kind in pieces:
+        body = _escape_latex(piece)
+        if kind in CODE_KINDS:
+            body = rf"\texttt{{{body}}}"
+        if kind in ITALIC_KINDS:
+            body = rf"\textit{{{body}}}"
+        if kind in BOLD_KINDS:
+            body = rf"\textbf{{{body}}}"
+        out.append(body)
+    return "".join(out)
+
+
+def _escape_href_url(url: str) -> str:
+    """``\\href`` の URL の ``%`` と ``#`` をエスケープする。
+
+    ``%`` はそのままだと行末までのコメント、``#`` は見出しなど命令の引数の中では
+    引数の番号として読まれる。hyperref は ``\\%`` / ``\\#`` を URL の ``%`` / ``#``
+    に戻す。``{`` ``}`` ``\\`` を含む URL は ``safe_link_url`` がリンクにしない。
+    """
+    return url.replace("%", "\\%").replace("#", "\\#")
 
 
 def _inline_latex(text: str) -> str:
-    """inline Markdown → LaTeX 変換"""
-    # まず太字・斜体・コード・リンクを処理（エスケープ前）
-    text = _RE_BOLD.sub(lambda m: rf"\textbf{{{m.group(1) or m.group(2)}}}", text)
-    text = _RE_ITALIC.sub(lambda m: rf"\textit{{{m.group(1) or m.group(2)}}}", text)
-    text = _RE_CODE_INLINE.sub(lambda m: rf"\texttt{{{m.group(1)}}}", text)
-    text = _RE_LINK.sub(lambda m: rf"\href{{{m.group(2)}}}{{{m.group(1)}}}", text)
-    return text
+    """inline Markdown → LaTeX 変換 (段落・見出し・箇条書き・引用・表セル共通)。
+
+    本文は ``_marked_latex`` で特殊文字をエスケープする (``50% & a_b $5`` が
+    そのまま出るとコンパイルが通らない)。リンクの URL だけは ``\\href`` へ原文で渡す。
+    """
+    return "".join(
+        rf"\href{{{_escape_href_url(url)}}}{{{_marked_latex(pieces)}}}" if url
+        else _marked_latex(pieces)
+        for url, pieces in iter_inline_groups(text)
+    )
 
 
 def _list_latex_lines(nodes: list[ListItemNode], indent: str = "") -> list[str]:
@@ -110,7 +145,7 @@ def _blocks_to_latex(blocks: list[ContentBlock], title: str) -> str:
     parts: list[str] = [_PREAMBLE]
 
     if title:
-        parts.append(rf"\title{{{_escape_latex(title)}}}")
+        parts.append(rf"\title{{{_escape_latex(strip_inline(title))}}}")
         parts.append(r"\date{}")
         parts.append("")
 
@@ -144,7 +179,7 @@ def _blocks_to_latex(blocks: list[ContentBlock], title: str) -> str:
                 parts.append(rf"\begin{{longtable}}{{{col_spec}}}")
                 parts.append(r"\toprule")
                 for i, row in enumerate(block.rows):
-                    cells = " & ".join(_escape_latex(c) for c in row)
+                    cells = " & ".join(_inline_latex(c) for c in row)
                     parts.append(rf"{cells} \\")
                     if i == 0:
                         parts.append(r"\midrule")

@@ -295,6 +295,13 @@ def is_media_capable_output(file_path: str) -> bool:
     return Path(file_path).suffix.lower() in MEDIA_CAPABLE_OUTPUT_EXTS
 
 
+def is_shape_capable_output(file_path: str) -> bool:
+    """``file_path`` が図形 (``shapes`` ブロック) を描く形式か (f_11 §3.1 / §4.2)。"""
+    from backend.export.shapes import DRAWN_EXTS
+
+    return Path(file_path).suffix.lower() in DRAWN_EXTS
+
+
 def wants_fetched_table(file_path: str) -> bool:
     """取得済み実テーブルを決定論的に書き込むべき出力先か (表計算 or リッチ文書)。"""
     return Path(file_path).suffix.lower() in FETCHED_TABLE_EXTS

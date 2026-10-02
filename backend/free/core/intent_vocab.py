@@ -113,8 +113,9 @@ APPEND_HINT_RE = re.compile(
 )
 
 #: 既存内容を **書き換える** 依頼の動詞 (追記・加筆以外の編集: 差し替え / 修正 /
-#: 削除 …)。追記の語と同居していたら決定論の連結にしない — 連結すると書き換えの
-#: 部分が黙って落ちる (docs/f_11 §5、``meta_cognitive_content_gate.is_pure_append_request``)。
+#: 削除 …)。``EDIT_REQUEST_RE`` (無変更の検出) の材料。追記だけの依頼かの判定には
+#: 使わない — ``更新`` のような「ファイルへ書き戻す」動詞も含むので、追記と同居する
+#: と追記を書き直しと誤る (2026-10-02 D07#3)。その判定は下の ``edit_mode_rule``。
 REVISE_REQUEST_RE = re.compile(
     r"差し替え|差替え|置き換え|置換|入れ替え|変更|修正|直して|直す|更新"
     r"|書き換え|書き直|削除|消して|除いて|外して"
@@ -136,6 +137,196 @@ EDIT_REQUEST_RE = re.compile(
     REVISE_REQUEST_RE.pattern + r"|追加|追記|書き足|末尾に|足して|加えて|append",
     re.IGNORECASE,
 )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 既存ファイルの編集の種類 (判定点 edit_mode の字句段、docs/f_11 §5 / c_17 §3.16)
+# ─────────────────────────────────────────────────────────────────────
+#
+# 「これを報告書に追記して同じファイルを更新してください。」が追記と読まれず、
+# 全文の書き直しへ回った (2026-10-02 ライブ監査 D07#3: 9B が既存 858 文字を写して
+# ``edit_without_change`` で 2 回棄却、136 秒)。``REVISE_REQUEST_RE`` は
+# **ファイルへ書き戻す動詞** (更新) と **本文を変える動詞** (直す・削除) を同じ集合に
+# 入れていた。境界は語の有無ではなく「依頼が既存の本文のどこかを変えよと言って
+# いるか」にあるので、次の 3 つの構造で見る (語形は足さない、不変則 #12 / #14):
+#
+# 1. 置換の値の形 ``<対象>を<値>に<変える動詞>`` — 部分修正
+# 2. 本文を変える操作 (置換・削除・書き直し・訂正) の依頼の形 — 目的語によらず書き直し
+# 3. 書き戻しの動詞 (更新・上書き) の **目的語が本文の一部** (「売上の数字を更新して」)
+#    — 部分修正。目的語が無い / ファイル・宛先・指示詞を指すときは「結果をファイルへ
+#    書け」と言っているだけで、本文のどこを変えるかを言っていない
+
+#: 編集の種類のラベル (判定点 ``edit_mode`` の値)。
+EDIT_MODE_APPEND = "append"
+EDIT_MODE_REWRITE = "rewrite"
+EDIT_MODE_PATCH = "patch"
+
+#: 引用の中身 (「…」『…』"…")。依頼の構造を読む前に空白へ置き換える — 追記する
+#: 本文や見出しの中の語 (「修正版」) を依頼の動詞と読まないため。
+QUOTED_SPAN_RE = re.compile(r"「[^」]*」|『[^』]*』|\"[^\"]*\"")
+
+#: 依頼 (前半) と中身 (後半) の区切りの「：」(半角は後ろが空白のときだけ)。
+#: 「作ったファイルに次の一文を追加してください：以上です。」の後半は追記する中身。
+PAYLOAD_COLON_RE = re.compile(r"：|:(?=\s)")
+
+
+def _request_text(text: str) -> str:
+    """引用の中身と、各文の「：」より後ろ (中身) を落とした依頼の部分 (純粋関数)。"""
+    t = QUOTED_SPAN_RE.sub(" ", text or "")
+    return "".join(PAYLOAD_COLON_RE.split(s, maxsplit=1)[0] for s in split_sentences(t))
+
+#: 1. 置換の値の形。値の位置は 1 文・読点の手前まで。
+_REPLACE_TARGET_RE = re.compile(
+    r"[をは][^。．！？!?\n、]{1,40}?に"
+    r"(?:変え|変更し|修正し|直し|直す|更新し|置き換え|差し替え|書き換え|訂正し)"
+    r"|\b(?:change|update|set)\b[^.!?\n]{1,60}?\bto\b|\breplace\b[^.!?\n]{1,60}?\bwith\b",
+    re.IGNORECASE,
+)
+
+#: 2. 本文を変える操作の依頼の形。名詞として出る形 (「変更点を追記」「修正履歴」
+#: 「削除した項目の一覧」) は拾わない — 依頼の活用 (て形・終止形・お願い) だけを見る。
+#: 補助動詞の「〜し直す」(「保存し直して」= 保存をやり直す) と「見直す」は本文の
+#: 操作ではないので ``直す`` から外す (「書き直す」「誤字を直す」は残る)。
+#:
+#: 操作の名詞が **そのまま依頼・指示の述部になる形** も拾う (2026-10-02 レビュー中 1):
+#: 名詞 + (も / は / を)? + お願い / 頼む、または文・節の終わりの「〜で」
+#: (「タイトルも変更お願いします」「誤字の修正もお願い」「古い段落は削除で」
+#: 「書き直しも頼む」)。名詞の直後に別の名詞が続く形 (「変更点」「修正履歴」) は
+#: 依頼の述部ではないので拾わない。
+_CONTENT_EDIT_NOUN = (
+    r"(?:変更|修正|訂正|削除|置換|差し替え|差替え|置き換え|入れ替え"
+    r"|書き直し|書き換え|言い換え)"
+)
+_CONTENT_EDIT_VERB_RE = re.compile(
+    r"(?:差し替え|差替え|置き換え|入れ替え|書き換え|言い換え|変え)(?:て|る|[、，,])"
+    r"|(?:置換|削除|修正|訂正|変更)(?:して|する|し[、，,]|を(?:お願い|して|加え))"
+    r"|" + _CONTENT_EDIT_NOUN
+    + r"[もはを]?(?:お願い|頼|で(?=[。．！!？?、，,\s]|$|お願い|頼))"
+    r"|(?<![見し])直(?:して|す)|消(?:して|す)|除(?:いて|く)|外(?:して|す)"
+    r"|\b(?:replace|rewrite|remove|delete|fix|correct|modify|edit)\b"
+    r"|(?<!the )\bchange\b(?!s)",
+    re.IGNORECASE,
+)
+
+#: 3. ファイルへ書き戻す動詞。``更新`` / ``上書き`` だけは目的語が本文の一部でありうる
+#: (「3 行目を上書きして」)。``保存`` / ``反映`` は目的語が何でも書き戻し。
+_FILE_COMMIT_VERB_RE = re.compile(r"更新|上書き|保存|反映")
+_COMMIT_VERBS_TAKING_CONTENT = frozenset({"更新", "上書き"})
+_EN_COMMIT_VERB_RE = re.compile(
+    r"\b(update|save|overwrite)\b(?P<rest>[^.!?\n]{0,40})", re.IGNORECASE,
+)
+#: 英語の書き戻しの目的語がファイル (宛先) か、目的語が無いか。
+_EN_FILE_OBJECT_RE = re.compile(
+    r"\s*(?:$|,|and\b|(?:it|this|that)\b|the\s+(?:same\s+)?(?:file|document)\b"
+    r"|[\w.\-]+\.[A-Za-z][A-Za-z0-9]{0,5}\b)",
+    re.IGNORECASE,
+)
+
+#: 追記の宛先 (``<宛先>に追記`` / ``<宛先>の末尾に追加``)。直前の名詞が宛先。
+_APPEND_DESTINATION_RE = re.compile(
+    r"(?:の(?:末尾|最後|後ろ))?に(?:追記|追加|書き足|足し|加え)",
+)
+
+#: 名詞句の末尾 (主名詞) を切り出す境界: 句読点・空白・格助詞・「して」。
+_NOUN_TAIL_BOUNDARY_RE = re.compile(r"[、。．！？!?\s「」『』,，]|して|[をにがはへもの]")
+
+#: 書き戻しの目的語がファイルそのものを指す主名詞 (宛先を言い直しているだけ)。
+_FILE_CONTAINER_TAIL_RE = re.compile(r"(?:ファイル|それ|これ|そちら|こちら)$")
+
+
+def _noun_tail(text: str) -> str:
+    """名詞句の主名詞 (最後の境界より後ろ)。"""
+    return _NOUN_TAIL_BOUNDARY_RE.split(text)[-1].strip()
+
+
+def _names_destination(obj: str, destinations: list[str]) -> bool:
+    """書き戻しの目的語がファイル (宛先) を指しているか。"""
+    tail = _noun_tail(obj)
+    if not tail:
+        return True
+    if _FILE_CONTAINER_TAIL_RE.search(tail):
+        return True
+    if FILE_NAME_IN_TEXT_RE.fullmatch(tail) or EXPLICIT_WINDOWS_PATH_RE.search(tail):
+        return True
+    return any(
+        len(d) >= 2 and len(tail) >= 2 and (tail.endswith(d) or d.endswith(tail))
+        for d in destinations
+    )
+
+
+def edit_mode_rule(text: str) -> tuple[str, str]:
+    """既存ファイルの編集の種類を構造で読む (判定点 ``edit_mode`` の字句段、純粋関数)。
+
+    Returns:
+        ``(label, evidence)``。``label`` は :data:`EDIT_MODE_APPEND` /
+        :data:`EDIT_MODE_REWRITE` / :data:`EDIT_MODE_PATCH`、編集の動詞が 1 つも
+        無ければ ``""``。追記の語と本文を変える指示が同居すれば変える側
+        (連結すると変更が黙って落ちる、docs/f_11 §5)。
+    """
+    t = _request_text(text)
+    if _REPLACE_TARGET_RE.search(t):
+        return EDIT_MODE_PATCH, "replace_target"
+    if _CONTENT_EDIT_VERB_RE.search(t):
+        return EDIT_MODE_REWRITE, "content_edit_verb"
+    destinations = [
+        _noun_tail(t[:m.start()]) for m in _APPEND_DESTINATION_RE.finditer(t)
+    ]
+    commits = False
+    for m in _FILE_COMMIT_VERB_RE.finditer(t):
+        commits = True
+        before = t[:m.start()].rstrip()
+        if (
+            m.group() in _COMMIT_VERBS_TAKING_CONTENT
+            and before.endswith("を")
+            and not _names_destination(before[:-1], destinations)
+        ):
+            return EDIT_MODE_PATCH, "commit_object_content"
+    for m in _EN_COMMIT_VERB_RE.finditer(t):
+        commits = True
+        if m.group(1).lower() == "update" and not _EN_FILE_OBJECT_RE.match(m.group("rest")):
+            return EDIT_MODE_PATCH, "commit_object_content"
+    if APPEND_HINT_RE.search(t):
+        return EDIT_MODE_APPEND, "append_file_commit" if commits else "append_only"
+    if commits:
+        return EDIT_MODE_REWRITE, "commit_only"
+    return "", "no_edit_verb"
+
+
+#: 追記の依頼を節に切る境界 (読点・て形の「して」・英語の and / then)。
+_APPEND_CLAUSE_BOUNDARY_RE = re.compile(r"[、,，]|して|\b(?:and|then)\b", re.IGNORECASE)
+#: 節に中身があるか (漢字・カタカナ・英字)。「ください」「おいて」だけの節は落とす。
+_CLAUSE_CONTENT_RE = re.compile(f"[{KANJI}{KATAKANA}A-Za-z]")
+#: 書き戻しだけの節 (「同じファイルを更新」「上書き保存」「保存し直」「save the file」)。
+#: 字句段が append と読んだ依頼では、書き戻しの目的語は宛先か無しだと確かめ済みなので、
+#: この節は既存の本文について何も言っていない。
+_COMMIT_ONLY_CLAUSE_RE = re.compile(
+    r"^(?:[^、。]{0,30}?[をにへ])?(?:上書き)?(?:更新|上書き|保存|反映)(?:し直)?[\s。．！!]*$"
+    r"|^\s*(?:save|overwrite|update)\b(?:\s+(?:it|this|that|the\s+(?:same\s+)?(?:file|document)"
+    r"|[\w.\-]+\.[A-Za-z][A-Za-z0-9]{0,5}))?\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def append_residual(text: str) -> str:
+    """追記の依頼から、構造で説明の付いた節を除いた残り (純粋関数)。
+
+    除くのは追記そのものの節・書き戻しだけの節・依頼でない文 (追記する本文の申告
+    「来月の目標売上は1,500万円です。」)・引用の中身・「：」の後ろの中身・中身の無い節
+    (「ください」)。
+    残りは字句段の構造では読めなかった依頼で、判定点 ``edit_mode`` はそれを事例に
+    確かめるまで追記と決めない (残りが空なら追記と決まる)。事例段もこの残りだけを
+    比べる — 「Xに追記して」の節は追記の依頼どうしで共通なので、文全体の埋め込みでは
+    残りの節の差が埋もれる。
+    """
+    t = _request_text(text)
+    parts = [
+        seg.strip()
+        for seg in _APPEND_CLAUSE_BOUNDARY_RE.split(request_clauses(t))
+        if not APPEND_HINT_RE.search(seg)
+        and _CLAUSE_CONTENT_RE.search(seg)
+        and not _COMMIT_ONLY_CLAUSE_RE.match(seg.strip())
+    ]
+    return " ".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────

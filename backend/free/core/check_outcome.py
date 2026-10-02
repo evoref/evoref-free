@@ -24,7 +24,7 @@ class CheckKind(StrEnum):
     CONTRACT = "contract"
     #: 参考テスト (生成したテスト)。警告だけで未完了にも作り直しにも数えない。
     ADVISORY = "advisory"
-    #: 使い方を配信形で 1 回実行する (Python のパッケージ形だけ、f_10 §11.1-3)。不合格は ``tasks_failed`` に数える。
+    #: 使い方を配信形で 1 回実行する (Python のパッケージ形と平置き、f_10 §11.1-3)。不合格は ``tasks_failed`` に数える。
     USAGE = "usage"
 
 
@@ -56,12 +56,21 @@ class UncheckedReason(StrEnum):
     NO_EXAMPLES = "no_examples"
     #: 骨組みに入出力例はあるが、形が崩れていて (式の構文エラー / 期待値がリテラルでない) 1 つも組めない。
     INVALID_EXAMPLES = "invalid_examples"
+    #: 入出力例はあるが、どれもファイル (前の例・前の実行が残したデータ) に依存するので契約から外した。
+    STATEFUL_EXAMPLES = "stateful_examples"
+    #: 入出力例はあるが、どれも同じ呼出しで値が変わる (乱数・時刻など) ので契約から外した。
+    NONDETERMINISTIC_EXAMPLES = "nondeterministic_examples"
+    #: 入出力例を全件外したが、理由が混在する・結果が長すぎる・理由が読めない (どれか 1 つを名指せない)。
+    UNCOMPARABLE_EXAMPLES = "uncomparable_examples"
     #: 参考テストが残らなかった (生成できない・テスト関数が無い)。
     NO_TESTS = "no_tests"
     #: 参考テストを生成したが lint が全件落とした (detail は落とした件数、f_10 §11.1-4)。
     LINT_DROPPED = "lint_dropped"
     #: 使い方が入力 (置き場所の引数・成果物に無いファイル・対話) か画面 (tkinter 等) を要求する (f_10 §11.1-3)。
     NEEDS_INPUT = "needs_input"
+    #: 使い方の実行が隔離の外へ作用する恐れ (シェル・別プロセス・ソケット・ブラウザ等) があるので実行しなかった
+    #: (detail はその書き方、f_10 §11.1-3)。
+    SIDE_EFFECTS = "side_effects"
     #: テストを実行できなかった (その他)。
     NOT_RUN = "not_run"
 
@@ -174,14 +183,26 @@ def unchecked_labels(checks: list[dict] | None) -> list[str]:
 
     ``"contract:no_examples"`` の形。経験の成否をラベル無しにする材料
     (``FeedbackCollector.record(unchecked_checks=)``、docs/f_04 §2.5)。
+
+    契約テストの行が無く、成否に効く検査に合格でないもの (smoke の不合格で契約テストを飛ばした回) が
+    あるときも契約の未検査で、``contract:not_run`` (2026-10-02 ライブ監査 #10: 静的検査が落ちた回が
+    成功の教師になっていた)。成否に効く検査が全部合格で契約の行が無いのはテスト工程の無い構成
+    (Free、``tests_enabled=False``) で、従来どおり成功にする。行が 1 つも無い (staged 以外の経路) は対象外。
     """
     labels: list[str] = []
+    seen: set[str] = set()
+    all_passed = True
     for check in checks or []:
         if not isinstance(check, dict):
             continue
         name = str(check.get("check") or "")
+        seen.add(name)
+        if name in OUTCOME_BEARING_CHECKS and check.get("status") != CheckStatus.PASSED.value:
+            all_passed = False
         if name in OUTCOME_BEARING_CHECKS and check.get("status") == CheckStatus.UNCHECKED.value:
             labels.append(f"{name}:{check.get('reason') or UncheckedReason.NOT_RUN.value}")
+    if seen and CheckKind.CONTRACT not in seen and not all_passed:
+        labels.append(f"{CheckKind.CONTRACT.value}:{UncheckedReason.NOT_RUN.value}")
     return labels
 
 

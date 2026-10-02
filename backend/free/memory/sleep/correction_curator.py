@@ -47,6 +47,9 @@ from backend.free.core.correction_verdict import (
     check_verdict,
 )
 from backend.free.llm.json_schemas import CorrectionVerdict
+# 候補の判定は注入の注記と共有する 1 実装 (不変則 #14(a))。本モジュールからも
+# 引けるよう名前を残す。
+from backend.free.memory.corrections import is_correction_candidate
 from backend.free.memory.sleep._curator_common import public_notes
 from backend.free.memory.sleep.curation_backoff import (
     clear_failure,
@@ -92,30 +95,6 @@ def verification_pending(note: object, now: float) -> bool:
     if not is_correction_candidate(note):
         return False
     return not in_cooldown(note, VERIFY_FAILURE_KEY, now)
-
-
-def is_correction_candidate(note: object) -> bool:
-    """訂正候補か (Step 8.0 の検証対象と Step 8 の据え置き対象の SSOT)。
-
-    ``is_correction`` か訂正の形を持つ **ユーザー発話** で、未検証のもの。
-    据え置きだけ形を見て候補選びが ``is_correction`` だけを見ていたため、
-    ``is_correction=False`` で形を持つノートが永久に検証も抽出もされなかった
-    (2026-10-01、不変則 #14(a))。
-    """
-    if str(getattr(note, "source", "user") or "user") != "user":
-        return False
-    if getattr(note, "correction_verified_at", None) is not None:
-        return False
-    content = str(getattr(note, "content", "") or "")
-    if not content.strip():
-        return False
-    return bool(getattr(note, "is_correction", False)) or _has_correction_form(content)
-
-
-def _has_correction_form(text: str) -> bool:
-    from backend.free.memory.extractors.chat import has_correction_form
-
-    return has_correction_form(text)
 
 
 def _session_of(note: "MemoryNote") -> str:
@@ -235,6 +214,7 @@ async def curate_corrections(
     now_provider: Callable[[], float] | None = None,
     max_per_cycle: int = _MAX_PER_CYCLE,
     should_pause: Callable[[], bool] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> int:
     """訂正候補のノートを検証し、帰属と逐語 span をノートへ刻む。
 
@@ -245,10 +225,15 @@ async def curate_corrections(
         max_per_cycle: 1 サイクルの上限。
         should_pause: 真ならチャットが最近あった (静穏窓の外)。検証を出さずに
             打ち切る — 出してもチャットに横取りされるだけ (2026-09-26 監査 #12)。
+        stats: 渡すと ``preempted`` (チャットに譲って検証しなかった候補数 —
+            ``should_pause`` と横取り) と ``failed`` (一過性の実失敗の数) を書く。
+            「検証 0 件」が見送りか欠陥かを死活監視で分けるため (2026-10-02 監査)。
 
     Returns:
         マーカーを立てたノート数 (却下も含む)。
     """
+    if stats is not None:
+        stats.update(preempted=0, failed=0)
     ordered = sorted(
         public_notes(list(notes)),
         key=lambda n: float(getattr(n, "created_at", 0.0) or 0.0),
@@ -277,12 +262,14 @@ async def curate_corrections(
         candidates = candidates[:max_per_cycle]
 
     marked = 0
-    for note in candidates:
+    for index, note in enumerate(candidates):
         if should_pause is not None and should_pause():
             logger.info(
                 "correction_curator: chat is recent; verification waits for a "
-                "quiet window (%d candidate(s) carried over)", len(candidates),
+                "quiet window (%d candidate(s) carried over)", len(candidates) - index,
             )
+            if stats is not None:
+                stats["preempted"] += len(candidates) - index
             break
         content = str(note.content or "")
         prev_response, prev_user = previous_turn_context(ordered, note)
@@ -317,7 +304,11 @@ async def curate_corrections(
             if contended:
                 # 横取りされたなら次の候補もまた横取りされる。残りは次の
                 # サイクルへ回す (2026-09-26 監査 #12: 11 回とも全滅)。
+                if stats is not None:
+                    stats["preempted"] += len(candidates) - index
                 break
+            if stats is not None:
+                stats["failed"] += 1
             continue
         if not isinstance(parsed, dict) or not parsed:
             # 出力の切断・パース不能で答えが取れなかった。判定ではないので刻まず、
@@ -328,6 +319,8 @@ async def curate_corrections(
                 getattr(note, "id", "?"),
             )
             record_transient_failure(note, VERIFY_FAILURE_KEY, now_fn())
+            if stats is not None:
+                stats["failed"] += 1
             continue
         clear_failure(note, VERIFY_FAILURE_KEY)
         check = check_verdict(

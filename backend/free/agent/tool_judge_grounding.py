@@ -1003,6 +1003,58 @@ def percent_scale_slips(
     return tuple(slips)
 
 
+#: 価格に含まれた百分率 (「消費税10%込み」「10%税込」)。式の被演算子にならない。
+_INCLUSIVE_PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:%|％|パーセント)\s*税?込")
+
+
+def _percent_usage_values(query: str) -> list[float]:
+    """クエリの百分率・割合を式が「使った」とみなす値 (純粋関数)。
+
+    率 r ごとに r / 1 ± r / 百分率 p / 100 ± p (``90/100`` の 90)。割合の語は
+    さらに n / 10 / 10 ± n (``7/10``、``3/10``)、半分・半額は 0.5 / 2 / 50。
+    内税の百分率 (:data:`_INCLUSIVE_PERCENT_RE`) は数えない。
+    """
+    text = _INCLUSIVE_PERCENT_RE.sub(" ", query or "")
+    values: list[float] = []
+
+    def add_rate(rate: float) -> None:
+        pct = rate * 100.0
+        values.extend((rate, 1.0 + rate, 1.0 - rate, pct, 100.0 - pct, 100.0 + pct))
+
+    for pct in _PERCENT_LITERAL_RE.findall(text):
+        add_rate(float(pct) / 100.0)
+    for token in _WARI_RE.findall(text):
+        tenths = _wari_tenths(token)
+        if tenths is None:
+            continue
+        add_rate(tenths / 10.0)
+        values.extend((tenths, 10.0, 10.0 - tenths, 10.0 + tenths))
+    if _HALF_RE.search(text):
+        values.extend((0.5, 2.0, 50.0))
+    return values
+
+
+def query_percents_unused(expression: str, query: str) -> bool:
+    """クエリに百分率・割合があり、式がそのどれも使っていないか (純粋関数)。
+
+    使ったとみなす値は :func:`_percent_usage_values` (率・倍率・百分率・100 - p・
+    割合の分子と分母・半分の 2)。値で比べる (``0.90`` / ``.9`` の表記ゆれを吸収する)。
+    実インシデント (2026-10-02 ライブ監査 D08#4): 「全員の残業を10%減らしたら合計は？」
+    に分類器が窓内の ``25 + 31`` を返し、10% が式に無かった。
+    """
+    candidates = _percent_usage_values(query)
+    if not candidates:
+        return False
+    for literal in _NUMBER_LITERAL_RE.findall(expression or ""):
+        try:
+            value = float(literal)
+        except ValueError:
+            continue
+        if any(math.isclose(value, c, rel_tol=1e-9, abs_tol=1e-12) for c in candidates):
+            return False
+    return True
+
+
 def _myriad_pairs(text: str) -> list[tuple[str, str]]:
     """万進表記の (係数, 展開値) 対。``2,850万`` → ``("2850", "28500000")``。"""
     out: list[tuple[str, str]] = []

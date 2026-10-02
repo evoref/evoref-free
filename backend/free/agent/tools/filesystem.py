@@ -23,7 +23,7 @@ from backend.io.text_file import (
     decode_text_for_display,
     read_text_for_edit,
 )
-from backend.io.user_file import UnencodableTextError, write_user_text
+from backend.io.user_file import UnencodableTextError, roll_back_user_write, write_user_text
 
 logger = get_logger("agent.tools.builtin")
 
@@ -237,8 +237,16 @@ _EXPORT_DOC_EXTS = frozenset(
 )
 
 
-def _block_has_renderable_content(block) -> bool:
-    """ContentBlock が文書に描画される実体を持つか (空行/水平線は False)。"""
+def _block_has_renderable_content(block, ext: str) -> bool:
+    """ContentBlock が ``ext`` の文書に描画される実体を持つか (空行/水平線は False)。
+
+    図形は ``.pptx`` / ``.odp`` でしか描かれない (f_11 §3.1)。他の形式で図形を
+    実体と数えると、図形だけの本文が本文ゼロの文書として「成功」する
+    (2026-10-02 ライブ監査 D07#2: 生成プロンプトの図形の例をモデルが写し、
+    段落 0 の .docx が書かれた)。
+    """
+    from backend.export.shapes import DRAWN_EXTS
+
     if block.type == "table":
         return bool(block.rows)
     if block.type == "list":
@@ -246,10 +254,30 @@ def _block_has_renderable_content(block) -> bool:
     if block.type == "image":
         return bool(block.src)
     if block.type == "shapes":
-        return bool(block.shapes)
+        return bool(block.shapes) and ext in DRAWN_EXTS
     if block.type == "hr":
         return False
     return bool((block.content or "").strip())
+
+
+def _written_document_is_empty(p: Path) -> bool:
+    """書いたリッチ文書を読み戻し、本文が空と判定されたときだけ ``True``。
+
+    抽出器が無い・形式が未対応など **読み戻せない** 場合は判定できないので
+    ``False`` (空とはみなさない)。
+    """
+    try:
+        import backend.free.extraction  # noqa: F401  (レジストリへの登録副作用)
+        from backend.extraction import get_registry
+        from backend.extraction.base import ExtractionError
+
+        try:
+            get_registry().extract(p)
+        except ExtractionError as e:
+            return e.code == "empty_content"
+    except Exception as e:  # noqa: BLE001 - 読み戻しの失敗は書込みの失敗と区別できない
+        logger.warning("Read-back of %s failed: %r", p, e)
+    return False
 
 
 def _reject_unrenderable_rich_content(ext: str, content: str, export_content) -> str | None:
@@ -262,7 +290,7 @@ def _reject_unrenderable_rich_content(ext: str, content: str, export_content) ->
     問題なければ ``None`` を返す。
     """
     blocks = export_content.blocks
-    if not any(_block_has_renderable_content(b) for b in blocks):
+    if not any(_block_has_renderable_content(b, ext) for b in blocks):
         return (
             f"Error: '{ext}' output produced no document content. "
             "Provide the document body as Markdown (headings, paragraphs, tables)."
@@ -380,7 +408,28 @@ def _write_rich_document(p: Path, content: str) -> str:
         calendar_error = _check_calendar_table(export_content)
         if calendar_error:
             return calendar_error
+        previous = p.read_bytes() if p.is_file() else None
         result = registry.write(export_content, p)
+        # 描かれるはずの中身を渡したのに読み戻すと空なら、成功として返さない
+        # (f_11 §3.3)。空の文書が残ると次の追記が「既存ファイルを読めない」で
+        # 止まる (2026-10-02 ライブ監査 D07#3)。書く前の状態へ戻す。
+        if any(
+            _block_has_renderable_content(b, ext) for b in export_content.blocks
+        ) and _written_document_is_empty(p):
+            try:
+                roll_back_user_write(p, previous)
+            except OSError as e:
+                logger.error("Rolling back the empty document %s failed: %s", p, e)
+                return (
+                    f"Error: '{ext}' output produced an empty document, and rolling "
+                    f"it back failed — the empty document remains at {p} ({e})."
+                )
+            logger.warning("Rich document %s read back empty; write rolled back", p)
+            return (
+                f"Error: '{ext}' output produced an empty document (no text on "
+                "read-back). Provide the document body as Markdown (headings, "
+                "paragraphs, tables)."
+            )
         if "template" in result.metadata:
             # 実際に書けたターンだけ来歴を運ぶ (c_05 §0.6)。選ばれただけで
             # guard_error 等で書込みに至らなかったターンはここへ来ない。

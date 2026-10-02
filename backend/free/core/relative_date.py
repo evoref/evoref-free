@@ -49,11 +49,15 @@ _DAY_RELATIVE_RE = re.compile(
     "(" + "|".join(sorted(DAY_OFFSETS, key=len, reverse=True)) + ")",
 )
 
+#: 期間の単位 (「3 日」「2 週間」「1 か月」「1 年」)。オフセットの読みと、計算結果の
+#: 丸め違いから率の分母の期間を外す判定 (``text_quality.misrounded_result_values``) が共有する。
+PERIOD_UNIT_ALTERNATION = "日|週間|か月|ヶ月|カ月|ヵ月|年"
+
 #: 「今日から 2 週間後」「3 日後」「1 か月前」— 起点 (省略時は発話日) からの
 #: オフセット。月は暦月で進める (末日超過は末日へ丸める)。
 _OFFSET_RE = re.compile(
     r"(?:(?P<base>" + "|".join(sorted(DAY_OFFSETS, key=len, reverse=True)) + r")\s*から\s*)?"
-    r"(?P<n>\d+)\s*(?P<unit>日|週間|か月|ヶ月|カ月|ヵ月|年)\s*(?P<dir>後|前)"
+    r"(?P<n>\d+)\s*(?P<unit>" + PERIOD_UNIT_ALTERNATION + r")\s*(?P<dir>後|前)"
 )
 _UNIT_DAYS = {"日": 1, "週間": 7}
 

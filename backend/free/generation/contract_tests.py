@@ -14,11 +14,14 @@ staged v2 (Pro) のテスト工程の決定論部分。純粋関数だけを置�
 from __future__ import annotations
 
 import ast
+import json
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
+from backend.free.core.check_outcome import UncheckedReason
+from backend.free.core.fs_sandbox_runtime import ROOTS_ENV
 from backend.free.core.intent_vocab import is_absolute_path_text
 
 
@@ -29,6 +32,39 @@ class ExampleCase:
     module: str  # import 名 (拡張子なしのモジュール名)
     call: str
     expected: str
+    #: 骨組みの signature が宣言する戻り型 (``-> list[str]`` の ``list[str]``)。無ければ空
+    returns: str = ""
+
+
+#: 戻り型が具体的な入れ物の宣言 (反復子を返したら具体化せず不合格にする)
+CONTAINER_TYPES = ("list", "tuple", "set", "frozenset", "dict", "str", "bytes")
+
+
+def _called_name(call: str) -> str:
+    """式の外側の呼出しの関数名 (``f(…)`` の ``f``)。属性の呼出し・呼出しでない式は空。"""
+    node = ast.parse(call, mode="eval").body
+    return node.func.id if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) else ""
+
+
+def _declared_returns(skeleton: dict, module: str, name: str) -> str:
+    """骨組みの ``module`` の部品のうち関数 ``name`` の signature が宣言する戻り型 (無ければ空)。"""
+    for mod in skeleton.get("modules") or []:
+        if not isinstance(mod, dict) or PurePosixPath(str(mod.get("path") or "")).stem != module:
+            continue
+        for comp in mod.get("components") or []:
+            src = str((comp or {}).get("signature") or "").strip() if isinstance(comp, dict) else ""
+            if not src.startswith(("def ", "async def ")):
+                continue
+            try:
+                func = ast.parse(src.rstrip(":") + ":\n    pass\n").body[0]
+            except (SyntaxError, ValueError, IndexError):
+                continue
+            if isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef) and func.name == name and func.returns:
+                text = ast.unparse(func.returns)
+                # 使うのは具体的な入れ物の宣言だけ (反復子を返したら不合格にする判定)
+                head = text.split("[", 1)[0].rsplit(".", 1)[-1].strip().lower()
+                return text if head in CONTAINER_TYPES else ""
+    return ""
 
 
 def _is_expr(text: str) -> bool:
@@ -77,7 +113,8 @@ def usable_examples(skeleton: dict, module_paths: list[str]) -> list[ExampleCase
         if not call or not expected or module not in stems:
             continue
         if _is_expr(call) and _is_literal(expected) and not _touches_files(call):
-            out.append(ExampleCase(module, call, expected))
+            returns = _declared_returns(skeleton, module, _called_name(call))
+            out.append(ExampleCase(module, call, expected, returns))
     return out
 
 
@@ -94,13 +131,74 @@ def malformed_example_count(skeleton: dict, module_paths: list[str]) -> int:
         call = str(ex.get("call") or "").strip()
         expected = str(ex.get("expected") or "").strip()
         module = PurePosixPath(str(ex.get("module") or "")).stem
-        if call and expected and module in stems and not (_is_expr(call) and _is_literal(expected)):
+        if not (call and expected and module in stems):
+            continue
+        if _is_expr(call) and _touches_files(call):
+            continue  # 2026-10-02 ライブ監査 K05: 期待値が和文でもファイルを名指す例は意図した除外
+        if not (_is_expr(call) and _is_literal(expected)):
             count += 1
     return count
 
 
+def file_dependent_example_count(skeleton: dict, module_paths: list[str]) -> int:
+    """骨組みの例のうち、ファイルを名指すので契約から外した件数 (:func:`malformed_example_count` には数えない)。"""
+    stems = {PurePosixPath(p).stem for p in module_paths if p.endswith(".py")}
+    count = 0
+    for ex in skeleton.get("examples") or []:
+        call = str(ex.get("call") or "").strip()
+        module = PurePosixPath(str(ex.get("module") or "")).stem
+        if call and str(ex.get("expected") or "").strip() and module in stems and _is_expr(call) and _touches_files(call):
+            count += 1
+    return count
+
+
+#: 例の結果が遅延評価の反復子のとき、比べる前に取り出す件数と時間の上限。骨組みの例の期待値は
+#: 手で書くリテラルなので 1 万件を超える期待は無い。上限を越えたら (無限のジェネレータ等) 固定値と比べられない例として外す。
+#: 1 回の ``next`` が戻らない反復子は止められない (テストの実行全体の時間上限に任せる)。
+LAZY_MAX_ITEMS = 10_000
+LAZY_MAX_SECONDS = 5.0
+
+#: 契約テストが例を skip するときの理由の書き出し (:func:`examples_skip_reason` が読み分ける)
+SKIP_FILES = "example reads or writes files"
+SKIP_ENVIRONMENT = "example depends on the environment"
+SKIP_NONDETERMINISTIC = "example is not deterministic"
+SKIP_TOO_LONG = "example returns an iterator too long to compare"
+
+
+def examples_skip_reason(messages: list[str]) -> UncheckedReason:
+    """全件 skip した契約テストの未検査の理由 (pytest の skip の理由の列から)。
+
+    ファイル・環境だけなら :attr:`~UncheckedReason.STATEFUL_EXAMPLES`、呼ぶたびに値が変わるだけなら
+    :attr:`~UncheckedReason.NONDETERMINISTIC_EXAMPLES`。混在・長すぎる結果・理由が読めないときは
+    :attr:`~UncheckedReason.UNCOMPARABLE_EXAMPLES` (どれか 1 つの理由を名指すと実態とずれる)。
+    """
+    kinds = set()
+    for text in messages:
+        if text.startswith((SKIP_FILES, SKIP_ENVIRONMENT)):
+            kinds.add(UncheckedReason.STATEFUL_EXAMPLES)
+        elif text.startswith(SKIP_NONDETERMINISTIC):
+            kinds.add(UncheckedReason.NONDETERMINISTIC_EXAMPLES)
+        else:
+            kinds.add(UncheckedReason.UNCOMPARABLE_EXAMPLES)
+    return kinds.pop() if len(kinds) == 1 else UncheckedReason.UNCOMPARABLE_EXAMPLES
+
+
 def build_example_tests(cases: list[ExampleCase]) -> str:
-    """入出力例の pytest ファイル本文 (例が無ければ空文字列)。"""
+    """入出力例の pytest ファイル本文 (例が無ければ空文字列)。
+
+    例の呼出し中にファイル・フォルダへ触れた例は skip する (契約から外す)。値が前の例・前の実行の残したデータで
+    決まり、固定値の契約にできない (2026-10-02 ライブ監査 K01)。評価フォルダの中への読み書きは止めて状態を
+    残さず、外はサンドボックスに任せる (止めた書込みは「未検査」として記録される)。
+
+    結果が遅延評価の反復子 (ジェネレータ・``map``・``filter`` 等) なら、傍受の内側で取り出して list
+    (期待値が tuple なら tuple) にしてから比べる。外で回すとファイルの読込みが傍受の後に走って検出を逃れ、
+    期待がリストでジェネレータを返す関数は 2 回の評価のジェネレータが等しくならず「値が食い違う」で skip された
+    (検査されない)。具体化して比べるのは、食い違いがコードの欠陥ではなく契約の言い方 (「返す値の並び」を
+    list のリテラルで書いた) だから。ただし戻り型を具体的な入れ物 (``-> list`` 等。骨組みの signature、無ければ
+    本体の関数の注釈) と宣言して反復子を返す関数は具体化せず不合格にする (呼出側の ``len``・添字が落ちる欠陥)。
+    件数・時間の上限 (:data:`LAZY_MAX_ITEMS` / :data:`LAZY_MAX_SECONDS`) を越えた反復子は固定値と比べられない
+    例として skip する。
+    """
     if not cases:
         return ""
     lines = [
@@ -117,7 +215,8 @@ def build_example_tests(cases: list[ExampleCase]) -> str:
         "    spec = importlib.util.find_spec(name)",
         "    module = importlib.util.module_from_spec(spec)",
         "    spec.loader.exec_module(module)",
-        "    return dict(vars(module))",
+        "    # 本体の関数が読む大域 (= この辞書) で評価する。名前で取り込んだ関数の傍受も届く",
+        "    return vars(module)",
         "",
         "",
         "def _same(got, exp):",
@@ -135,28 +234,201 @@ def build_example_tests(cases: list[ExampleCase]) -> str:
         "        return last",
         "",
         "",
-        "def _value(call, module, exp):",
+        "_SYSTEM_ROOTS = tuple({",
+        "    os.path.normcase(os.path.abspath(p)).rstrip(os.sep) + os.sep",
+        "    for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)",
+        "})",
+        "",
+        "",
+        "class _FileAccess(Exception):",
+        "    pass",
+        "",
+        "",
+        "_SANDBOX_ROOTS = tuple(",
+        "    os.path.normcase(os.path.abspath(p)).rstrip(os.sep) + os.sep",
+        f"    for p in os.environ.get({ROOTS_ENV!r}, '').split(os.pathsep) if p",
+        ")",
+        "",
+        "",
+        "_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC",
+        "_CODE_SUFFIXES = ('.py', '.pyc', '.pyd', '.so', '.dll')",
+        "#: 傍受する関数 (持ち主, 名前, 種類)。種類は open / os.open (引数で読み書きが決まる) / read / write",
+        "_TARGETS = [",
+        "    (builtins, 'open', 'open'), (io, 'open', 'open'), (os, 'open', 'os.open'),",
+        "    (os, 'listdir', 'read'), (os, 'scandir', 'read'), (os, 'stat', 'read'),",
+        "    (os.path, 'exists', 'read'), (os.path, 'isfile', 'read'), (os.path, 'isdir', 'read'),",
+        "    (os, 'remove', 'write'), (os, 'unlink', 'write'), (os, 'mkdir', 'write'), (os, 'makedirs', 'write'),",
+        "    (os, 'rmdir', 'write'), (os, 'rename', 'write'), (os, 'replace', 'write'),",
+        "    (shutil, 'rmtree', 'write'), (shutil, 'copy', 'write'), (shutil, 'copy2', 'write'),",
+        "    (shutil, 'copyfile', 'write'), (shutil, 'copytree', 'write'), (shutil, 'move', 'write'),",
+        "    (sqlite3, 'connect', 'write'),",
+        "]",
+        "",
+        "",
+        "def _writes(kind, args, kwargs):",
+        "    if kind == 'open':",
+        "        mode = args[1] if len(args) > 1 else kwargs.get('mode', 'r')",
+        "        return isinstance(mode, str) and any(c in mode for c in 'wax+')",
+        "    if kind == 'os.open':",
+        "        flags = args[1] if len(args) > 1 else kwargs.get('flags', 0)",
+        "        return isinstance(flags, int) and bool(flags & _WRITE_FLAGS)",
+        "    return kind == 'write'",
+        "",
+        "",
+        "def _guarded(original, touched, kind):",
+        "    # 例の呼出し中のファイル・フォルダへのアクセスを止める (標準ライブラリ・コードの読み込みは通す。",
+        "    # 書込みは拡張子・置き場によらず止める)。評価フォルダの外はサンドボックスに任せる (止めた書込みを",
+        "    # 「未検査」として記録させる)",
+        "    def _call(*args, **kwargs):",
+        "        writes = _writes(kind, args, kwargs)",
+        "        targets = list(args[:2] if kind == 'write' else args[:1]) or [",
+        "            kwargs.get('file', kwargs.get('path', kwargs.get('database', '.'))),",
+        "        ]",
+        "        for target in targets:",
+        "            if not isinstance(target, (str, bytes, os.PathLike)):",
+        "                continue",
+        "            text = os.fsdecode(target)",
+        "            if text in ('', ':memory:') or text.startswith('file::memory:'):",
+        "                continue",
+        "            norm = os.path.normcase(os.path.abspath(text))",
+        "            if not writes and (norm.endswith(_CODE_SUFFIXES) or norm.startswith(_SYSTEM_ROOTS)):",
+        "                continue",
+        "            touched.append(text)",
+        "            if not _SANDBOX_ROOTS or (norm + os.sep).startswith(_SANDBOX_ROOTS):",
+        "                raise _FileAccess(text)",
+        "        return original(*args, **kwargs)",
+        "    return _call",
+        "",
+        "",
+        "def _module_dicts(ns):",
+        "    # 名前で取り込んだ関数 (``from os.path import exists``) の束縛先: 評価する本体と、同じフォルダの兄弟",
+        "    yield ns",
+        "    home = os.path.normcase(os.path.dirname(os.path.abspath(ns.get('__file__') or '.'))) + os.sep",
+        "    for module in list(sys.modules.values()):",
+        "        path = getattr(module, '__file__', None)",
+        "        if path and module.__dict__ is not ns and os.path.normcase(os.path.abspath(path)).startswith(home):",
+        "            yield module.__dict__",
+        "",
+        "",
+        "class _TooLong(Exception):",
+        "    pass",
+        "",
+        "",
+        f"_LAZY_MAX_ITEMS = {LAZY_MAX_ITEMS}",
+        f"_LAZY_MAX_SECONDS = {LAZY_MAX_SECONDS}",
+        "",
+        "",
+        f"_CONTAINERS = {CONTAINER_TYPES!r}",
+        "",
+        "",
+        "def _container(ann):",
+        "    # 戻り型の注釈が具体的な入れ物 (list / tuple / set …) ならその名前、それ以外 (無し・Iterator 等) は空",
+        "    if ann is None:",
+        "        return ''",
+        "    text = ann if isinstance(ann, str) else getattr(typing.get_origin(ann) or ann, '__name__', '')",
+        "    head = str(text).strip().split('[', 1)[0].rsplit('.', 1)[-1].lower()",
+        "    return head if head in _CONTAINERS else ''",
+        "",
+        "",
+        "def _declared(call, ns, returns):",
+        "    # 骨組みの signature の戻り型、無ければ本体の関数の戻り型の注釈",
+        "    if returns:",
+        "        return _container(returns)",
+        "    node = ast.parse(call, mode='eval').body",
+        "    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):",
+        "        return ''",
+        "    annotations = getattr(ns.get(node.func.id), '__annotations__', None)",
+        "    return _container(annotations.get('return')) if isinstance(annotations, dict) else ''",
+        "",
+        "",
+        "def _materialize(got, exp, declared):",
+        "    # 遅延評価の結果 (ジェネレータ・map・filter 等) は傍受の内側で値にする。外で回すとファイルの読込みが",
+        "    # 傍受の後に走って検出を逃れ、期待がリストのジェネレータは 2 回の評価が等しくならず「値が食い違う」になる。",
+        "    # 等価が同一性のままの反復子だけを対象にする (自前の == を持つ型は従来どおりそのまま比べる)",
+        "    if not isinstance(got, collections.abc.Iterator) or type(got).__eq__ is not object.__eq__:",
+        "        return got",
+        "    if declared:",
+        "        # 具体的な入れ物を返すと宣言して反復子を返すのは欠陥 (呼出側の len・添字が落ちる) — 具体化しない",
+        "        raise AssertionError(f'returns a lazy {type(got).__name__} but declares -> {declared}')",
+        "    items = []",
+        "    deadline = time.monotonic() + _LAZY_MAX_SECONDS",
+        "    for item in got:",
+        "        items.append(item)",
+        "        if len(items) > _LAZY_MAX_ITEMS or time.monotonic() > deadline:",
+        "            raise _TooLong(f'more than {_LAZY_MAX_ITEMS} items or {_LAZY_MAX_SECONDS} s')",
+        "    return tuple(items) if isinstance(exp, tuple) else items",
+        "",
+        "",
+        "def _eval_isolated(call, ns, exp, returns):",
+        "    # 結果がファイル (前の例・前の実行が残したデータ) に依存する例は固定値の契約にできない",
+        "    # (2026-10-02 ライブ監査 K01: 前の例の追加を前提にした集計の例が、正しい本体を不合格にした)",
+        "    touched = []",
+        "    too_long = ''",
+        "    names = [(owner, name, kind) for owner, name, kind in _TARGETS if owner is not None]",
+        "    originals = [getattr(owner, name) for owner, name, _kind in names]",
+        "    guards = {}",
+        "    for (_owner, _name, kind), original in zip(names, originals):",
+        "        guards.setdefault(id(original), _guarded(original, touched, kind))",
+        "    rebound = []",
+        "    for (owner, name, _kind), original in zip(names, originals):",
+        "        setattr(owner, name, guards[id(original)])",
+        "    for space in _module_dicts(ns):",
+        "        for key, value in list(space.items()):",
+        "            if id(value) in guards and any(value is o for o in originals):",
+        "                rebound.append((space, key, value))",
+        "                space[key] = guards[id(value)]",
+        "    try:",
+        "        got = _materialize(eval(call, ns), exp, _declared(call, ns, returns))",
+        "    except _TooLong as exc:",
+        "        got, too_long = None, str(exc)",
+        "    except Exception:",
+        "        if not touched:",
+        "            raise",
+        "        got = None",
+        "    finally:",
+        "        for (owner, name, _kind), original in zip(names, originals):",
+        "            setattr(owner, name, original)",
+        "        for space, key, value in rebound:",
+        "            space[key] = value",
+        "    if touched:",
+        f"        pytest.skip(f'{SKIP_FILES} ({{touched[0]}}); its value depends on state outside the call')",
+        "    if too_long:",
+        f"        pytest.skip(f'{SKIP_TOO_LONG} ({{too_long}})')",
+        "    return got",
+        "",
+        "",
+        "def _value(call, module, exp, returns=''):",
         "    buf = io.StringIO()",
+        "    ns = _ns(module)",
         "    try:",
         "        with contextlib.redirect_stdout(buf):",
-        "            got = eval(call, _ns(module))",
+        "            got = _eval_isolated(call, ns, exp, returns)",
         "    except OSError as exc:  # 例が環境 (ファイル等) に依存していた — 契約の判定から外す",
-        "        pytest.skip(f'example depends on the environment: {exc}')",
+        f"        pytest.skip(f'{SKIP_ENVIRONMENT}: {{exc}}')",
         "    if got is None and exp is not None:",
         "        got = _printed(buf.getvalue())",
         "    return got",
     ]
-    lines[2:2] = ["import ast", "import contextlib", "import io"]
+    lines[2:2] = [
+        "import ast", "import builtins", "import collections.abc", "import contextlib", "import io", "import os",
+        "import shutil", "import sys", "import time", "import typing",
+        "",
+        "try:",
+        "    import sqlite3",
+        "except ImportError:  # sqlite3 の無い Python",
+        "    sqlite3 = None",
+    ]
     for i, case in enumerate(cases, start=1):
+        returns = f", {case.returns!r}" if case.returns else ""
         lines += [
             "",
             "",
             f"def test_example_{i}():",
             f"    exp = {case.expected}",
-            f"    got = _value({case.call!r}, {case.module!r}, exp)",
+            f"    got = _value({case.call!r}, {case.module!r}, exp{returns})",
             "    # 同じ式で値が変わる (乱数・時刻) 例は固定値の契約にできない — 判定から外す",
-            f"    if not _same(_value({case.call!r}, {case.module!r}, exp), got):",
-            "        pytest.skip('example is not deterministic (the same call returned different values)')",
+            f"    if not _same(_value({case.call!r}, {case.module!r}, exp{returns}), got):",
+            f"        pytest.skip('{SKIP_NONDETERMINISTIC} (the same call returned different values)')",
             "    assert _same(got, exp), (got, exp)",
         ]
     return "\n".join(lines) + "\n"
@@ -345,6 +617,52 @@ def rebase_absolute_paths_in_source(
     return out, rebased
 
 
+#: 文字列リテラルの本文 (引用符の内側) がドライブ付きの Windows パスを 1 個の ``\`` で区切っている
+_UNESCAPED_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:\\(?!\\)")
+_STRING_TOKEN_RE = re.compile(r"(?is)^([a-z]*)('''|\"\"\"|'|\")(.*)\2$")
+
+
+def repair_windows_path_literals(expression: str, accept: Callable[[str], bool]) -> str:
+    r"""Python 式の中の、``\`` を重ねずに書いた Windows パスの文字列リテラルを正しいリテラルにする。
+
+    骨組みの例はモデルが手で書く Python 式で、``'E:\\tmp\\x\\sales.csv'`` ではなく ``'E:\tmp\x\sales.csv'``
+    と書く。Python としては ``\t`` がタブになり、絶対パスの相対化 (:func:`rebase_absolute_paths_in_expression`)
+    も外れて、SPEC.md にタブに化ける式のまま載った (2026-10-03 ライブ再実行 K03)。接頭辞の無い (``r`` / ``b`` / ``f`` で
+    ない) リテラルの本文がドライブ付きのパスを 1 個の ``\`` で区切り、``\\`` を 1 つも含まず、さらに raw として読んだ
+    パスを ``accept`` が受け入れる (相対化の対象 = 依頼の出力フォルダの配下) ときだけ、本文をそのままの文字 (raw) として
+    読み直す。``'C:\n'`` のように意図したエスケープかもしれない文字列や、出力フォルダの外のパスは直さない
+    (独立レビュー 低 c)。それ以外 (正しく重ねた・相対パス・接頭辞付き) もそのまま。
+    """
+    import io
+    import tokenize
+
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(expression).readline))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return expression
+    starts = [0]
+    for line in expression.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    edits: list[tuple[int, int, str]] = []
+    for tok in tokens:
+        if tok.type != tokenize.STRING:
+            continue
+        m = _STRING_TOKEN_RE.match(tok.string)
+        body = m.group(3) if m else ""
+        if (
+            m and not m.group(1) and _UNESCAPED_DRIVE_PATH_RE.match(body) and "\\\\" not in body
+            and accept(body)
+        ):
+            begin = starts[tok.start[0] - 1] + tok.start[1]
+            edits.append((begin, begin + len(tok.string), repr(body)))
+    if not edits:
+        return expression
+    repaired = expression
+    for begin, end, text in reversed(edits):
+        repaired = repaired[:begin] + text + repaired[end:]
+    return repaired if _is_expr(repaired) else expression
+
+
 def rebase_absolute_paths_in_expression(
     expression: str, relative_of: Callable[[str], str | None],
 ) -> str:
@@ -383,9 +701,32 @@ def _brittle_reason(func: ast.AST, allowed_text: str) -> str:
                 if (
                     isinstance(side, ast.Constant) and isinstance(side.value, str)
                     and len(side.value.strip()) >= 8 and side.value.strip() not in allowed_text
+                    and not _is_structured_data(side.value)
                 ):
                     return "asserts exact text that the contract does not specify"
     return ""
+
+
+#: 表の列の区切り (CSV / TSV / セミコロン / パイプ)
+_FIELD_DELIMITERS = (",", "\t", ";", "|")
+
+
+def _is_structured_data(text: str) -> bool:
+    """利用者向けの文言ではなくデータの本文か (JSON の配列・オブジェクト / 2 行以上で列の数が揃った表)。
+
+    lint が落とすのは骨組みに無い文言との完全一致 (表示文・メッセージ)。CSV の本文との ``==`` は値の比較で、
+    本体の欠陥 (キーの揃わない行で ValueError) を検出するテストまで落としていた (2026-10-02 ライブ監査 K05)。
+    """
+    value = text.strip()
+    try:
+        if isinstance(json.loads(value), (dict, list)):
+            return True
+    except ValueError:
+        pass
+    rows = [line for line in value.splitlines() if line.strip()]
+    if len(rows) < 2:
+        return False
+    return any(len({row.count(d) for row in rows}) == 1 and rows[0].count(d) >= 1 for d in _FIELD_DELIMITERS)
 
 
 @dataclass(frozen=True)
@@ -1255,9 +1596,11 @@ __all__ = [
     "add_missing_pytest_import",
     "build_example_tests",
     "file_based_data_locations",
+    "file_dependent_example_count",
     "here_expression",
     "lint_generated_tests",
     "rebase_absolute_paths_in_expression",
+    "repair_windows_path_literals",
     "path_constants_by_module",
     "rebase_absolute_paths_in_source",
     "unbake_default_data_paths",

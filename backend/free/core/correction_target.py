@@ -220,6 +220,23 @@ def contrast_pair(text: str) -> tuple[str, str] | None:
     pairs = contrast_pairs(text)
     return pairs[0] if pairs else None
 
+
+#: 旧値の区間の先頭の、ひらがな 2 文字以上の並び (直後がひらがな以外のときだけ)。
+_LEADING_KANA_RUN_RE = re.compile(f"^[{HIRAGANA}]{{2,}}(?=[^{HIRAGANA}])")
+
+
+def old_value_core(old: str) -> str:
+    """旧値の区間から、先頭のひらがなの並びを外した形を返す (外せなければ ``old``)。
+
+    旧値の区間は直前の区切り (読点・助詞) から取るので、区切りの無い前置き
+    (「やっぱり妻ではなく母と…」の「やっぱり」) が旧値に入る (2026-10-02 監査 #6)。
+    外す境界は字種だけで決め、語を列挙しない。値そのものがひらがなで始まる
+    (「ほうじ茶」) こともあるので、呼出側は **区間のままで当たらないときだけ**
+    この形を使う。
+    """
+    match = _LEADING_KANA_RUN_RE.match(old or "")
+    return old[match.end():] if match else old
+
 #: どんな文にも現れる語。証拠にならない。
 STOP_IDENTIFIERS = frozenset({
     "the", "and", "for", "not", "but", "with", "from", "import", "def", "class",

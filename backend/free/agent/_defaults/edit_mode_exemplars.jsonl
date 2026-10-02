@@ -1,0 +1,95 @@
+{"_comment": "既存ファイルの編集の種類の事例 (判定点 edit_mode)。字句段 (intent_vocab.edit_mode_rule) が追記の語を見つけたが、追記の節と書き戻しだけの節の外に構造で読めない依頼の残り (intent_vocab.append_residual) があって棄権した依頼だけがここへ来る。事例段は文全体ではなく **残りの節** を比べる (事例も同じ関数で残りへ削ってから埋め込む)。label=append は残りの節が **足す分の書き方** か既存の本文に触れない依頼 (箇条書きで / 敬語で / 見出しも付けて / 200字で / 終わったら件数を教えて)。label=rewrite は残りの節が **既存の本文** を変える依頼 (全体を / 古い / 既存の / 前の章 / 重複はまとめて / 表記ゆれを統一 …) で、字句段の構造 (置換の値の形 / 本文を変える操作の依頼の形 / 書き戻しの目的語が本文の一部) に当たらない言い回し。全事例が字句段で棄権 (= 事例段へ届く) することを test_edit_mode_gate が固定する。検証セット (backend/free/agent/tests/data/edit_mode_heldout.jsonl) と文を共有しない。"}
+{"text": "議事録に今日の決定事項を追記して、箇条書きで書いて。", "label": "append", "id": "a01"}
+{"text": "報告書に結論を追加して、です・ます調で書いてください。", "label": "append", "id": "a02"}
+{"text": "日報に作業内容を追記して、3行くらいに収めて。", "label": "append", "id": "a03"}
+{"text": "memo.md に買い物の予定を追加して、チェックボックス付きのリストにして。", "label": "append", "id": "a04"}
+{"text": "README に使い方の節を追記して、コード例も付けて。", "label": "append", "id": "a05"}
+{"text": "レポートの末尾に考察を追加して、根拠となる数字も添えて。", "label": "append", "id": "a06"}
+{"text": "日記に今日の出来事を追記して、日付を見出しにして。", "label": "append", "id": "a07"}
+{"text": "議事録に次回の議題を追加して、担当者名も書いておいて。", "label": "append", "id": "a08"}
+{"text": "設計メモに今日の方針を追記して、理由も一緒に書いて。", "label": "append", "id": "a09"}
+{"text": "予定表に来週の会議を追記して、時刻と場所も入れて。", "label": "append", "id": "a10"}
+{"text": "todo.txt にタスクを追加して、期限も併記して。", "label": "append", "id": "a11"}
+{"text": "報告書に今月の売上を追記して、前月比も計算して載せて。", "label": "append", "id": "a12"}
+{"text": "読書メモに感想を追記して、印象に残った一文も引用して。", "label": "append", "id": "a13"}
+{"text": "ブログ下書きに締めの段落を追加して、柔らかい口調で。", "label": "append", "id": "a14"}
+{"text": "議事録に決定事項を追記して、終わったら結果を教えて。", "label": "append", "id": "a15"}
+{"text": "参考文献を末尾に追加して、何件になったか教えてください。", "label": "append", "id": "a16"}
+{"text": "FAQ に質問を追加して、回答は短めにして。", "label": "append", "id": "a17"}
+{"text": "報告書に結論を追記して、見出しは「まとめ」にして。", "label": "append", "id": "a18"}
+{"text": "議事録に追記して、発言者ごとに分けて書いて。", "label": "append", "id": "a19"}
+{"text": "日報に今日の振り返りを追加して、良かった点と課題に分けて。", "label": "append", "id": "a20"}
+{"text": "手順書に新しい手順を追記して、番号付きで。", "label": "append", "id": "a21"}
+{"text": "報告書に表を追加して、列は月と売上と前年比にして。", "label": "append", "id": "a22"}
+{"text": "報告書に追記して、最後に一言感想も添えて。", "label": "append", "id": "a23"}
+{"text": "議事録に追記して、敬体で書いてください。", "label": "append", "id": "a24"}
+{"text": "日記に今日のことを追記して、天気も一緒に書いて。", "label": "append", "id": "a25"}
+{"text": "レシピ集に新しいレシピを追加して、材料と手順を分けて書いて。", "label": "append", "id": "a26"}
+{"text": "用語集に新しい用語を追記して、読み仮名も付けて。", "label": "append", "id": "a27"}
+{"text": "報告書の末尾に追記して、200字以内に収めて。", "label": "append", "id": "a28"}
+{"text": "議事録に追記して、重要な点は太字にして。", "label": "append", "id": "a29"}
+{"text": "ノートに今日の学びを追記して、要点を3つに絞って。", "label": "append", "id": "a30"}
+{"text": "連絡帳に今日の様子を追記して、です・ます調の短い文で。", "label": "append", "id": "a31"}
+{"text": "家計簿に今日の支出を追加して、金額は税込みで書いて。", "label": "append", "id": "a32"}
+{"text": "Append a summary to notes.md and keep it under 100 words.", "label": "append", "id": "a33"}
+{"text": "Append the meeting notes to minutes.md and use bullet points.", "label": "append", "id": "a34"}
+{"text": "Append a new FAQ entry to faq.md and include a code example.", "label": "append", "id": "a35"}
+{"text": "Append today's log to journal.txt, written in a casual tone.", "label": "append", "id": "a36"}
+{"text": "Append the results to report.md and tell me how many rows there are now.", "label": "append", "id": "a37"}
+{"text": "Append a changelog entry to CHANGELOG.md and put today's date in its heading.", "label": "append", "id": "a38"}
+{"text": "Append a short paragraph to essay.md and write it in a formal style.", "label": "append", "id": "a39"}
+{"text": "Append the new contacts to contacts.md and format them as a table.", "label": "append", "id": "a40"}
+{"text": "Append a section to guide.md and add a short example at the end.", "label": "append", "id": "a41"}
+{"text": "Append the totals to summary.md and round them to two decimals.", "label": "append", "id": "a42"}
+{"text": "最新の為替レートを調べて、保存したファイルに追記して。", "label": "append", "id": "a43"}
+{"text": "今日のニュースを検索して、メモに追加して。", "label": "append", "id": "a44"}
+{"text": "売上を集計して、報告書の末尾に追記して。", "label": "append", "id": "a45"}
+{"text": "議事録に追記して、report.md にも同じ内容を書いて。", "label": "append", "id": "a46"}
+{"text": "Look up today's weather, then append it to notes.md.", "label": "append", "id": "a47"}
+{"text": "Append the summary to notes.md and also write it to summary.md.", "label": "append", "id": "a48"}
+{"text": "報告書に結論を追記して、全体を丁寧な文体にしてください。", "label": "rewrite", "id": "r01"}
+{"text": "memo.txt に1行追加して、重複している行はまとめてください。", "label": "rewrite", "id": "r02"}
+{"text": "議事録に決定事項を追記して、冒頭の日付を今日にしてください。", "label": "rewrite", "id": "r03"}
+{"text": "買い物リストに牛乳を追加して、卵はもう要らないのでリストから無くして。", "label": "rewrite", "id": "r04"}
+{"text": "日報に作業内容を追記して、全体を短く整えてください。", "label": "rewrite", "id": "r05"}
+{"text": "todo.txt に項目を追記して、終わったものには取り消し線を付けて。", "label": "rewrite", "id": "r06"}
+{"text": "README に使い方を追加して、古いインストール手順は不要なので落として。", "label": "rewrite", "id": "r07"}
+{"text": "表に10月の行を追加して、合計の行も新しい値に揃えて。", "label": "rewrite", "id": "r08"}
+{"text": "Append the new section to report.md and make the whole document more concise.", "label": "rewrite", "id": "r09"}
+{"text": "Append a line to notes.md and merge the duplicate entries.", "label": "rewrite", "id": "r10"}
+{"text": "予定表に会議を追記して、時間がかぶっている予定は後ろにずらして。", "label": "rewrite", "id": "r11"}
+{"text": "設計メモに方針を追記して、矛盾する古い記述は整理してください。", "label": "rewrite", "id": "r12"}
+{"text": "レポートに参考文献を追加して、本文の表記ゆれも統一して。", "label": "rewrite", "id": "r13"}
+{"text": "売上表に行を追加して、行の並びを日付順に並べ替えて。", "label": "rewrite", "id": "r14"}
+{"text": "議事録に次回日程を追記して、これまでの部分も含めて常体にしてください。", "label": "rewrite", "id": "r15"}
+{"text": "memo.md に追記して、既存の見出しのレベルを一段下げて。", "label": "rewrite", "id": "r16"}
+{"text": "日記に今日のことを追加して、昨日の分は要約して短くして。", "label": "rewrite", "id": "r17"}
+{"text": "報告書に追記して、数字はすべて最新の値にそろえて。", "label": "rewrite", "id": "r18"}
+{"text": "contacts.csv に連絡先を追加して、電話番号の書式をハイフン区切りに統一して。", "label": "rewrite", "id": "r19"}
+{"text": "設計メモに追記して、全体の構成を見やすく組み替えてください。", "label": "rewrite", "id": "r20"}
+{"text": "報告書に結論を追加して、前の章の説明も分かりやすく書き改めて。", "label": "rewrite", "id": "r21"}
+{"text": "Append the results to log.md and tidy up the older entries.", "label": "rewrite", "id": "r22"}
+{"text": "議事録に追記して、古い議題は消さずに完了済みの印を付けて。", "label": "rewrite", "id": "r23"}
+{"text": "todo.txt に追加して、済んだ項目はリストから抜いて。", "label": "rewrite", "id": "r24"}
+{"text": "在庫表に入荷分を追記して、在庫数の列を入荷後の数に合わせて。", "label": "rewrite", "id": "r25"}
+{"text": "報告書に追記して、既存の段落の誤字もついでに整えて。", "label": "rewrite", "id": "r26"}
+{"text": "README に追記して、リンク切れの URL は新しいものにして。", "label": "rewrite", "id": "r27"}
+{"text": "名簿に新入社員を追加して、部署名の古い表記を新しい名称にそろえて。", "label": "rewrite", "id": "r28"}
+{"text": "Append the new rule to policy.md and renumber all the sections.", "label": "rewrite", "id": "r29"}
+{"text": "Append the entry to glossary.md and sort the whole list alphabetically.", "label": "rewrite", "id": "r30"}
+{"text": "Append a note to plan.md and mark the finished tasks as done.", "label": "rewrite", "id": "r31"}
+{"text": "Append a paragraph to essay.md and tighten the earlier paragraphs.", "label": "rewrite", "id": "r32"}
+{"text": "Append the data to sales.md and recalculate the totals in the existing table.", "label": "rewrite", "id": "r33"}
+{"text": "日報に追記して、先週分の箇条書きを文章に書き起こして。", "label": "rewrite", "id": "r34"}
+{"text": "メモに追記して、既にある項目の順番を重要度順にして。", "label": "rewrite", "id": "r35"}
+{"text": "報告書に追記して、冒頭の要約も今回の内容を踏まえたものにして。", "label": "rewrite", "id": "r36"}
+{"text": "FAQ に質問を追加して、古い回答は今の仕様に合わせて。", "label": "rewrite", "id": "r37"}
+{"text": "用語集に追記して、全項目の説明を一文ずつに縮めて。", "label": "rewrite", "id": "r38"}
+{"text": "Append the summary to notes.md and convert the existing bullet points into prose.", "label": "rewrite", "id": "r39"}
+{"text": "予定表に追記して、終わった予定は灰色にして。", "label": "rewrite", "id": "r40"}
+{"text": "報告書に追記して、表のタイトルを全部英語にして。", "label": "rewrite", "id": "r41"}
+{"text": "Append the new chapter to book.md and rebuild the table of contents.", "label": "rewrite", "id": "r42"}
+{"text": "全体を丁寧な文体にして、末尾に結論を追記して。", "label": "rewrite", "id": "r43"}
+{"text": "古い項目を整理して、新しい項目を追加して。", "label": "rewrite", "id": "r44"}
+{"text": "表記ゆれをそろえて、最後に参考文献を追記して。", "label": "rewrite", "id": "r45"}
+{"text": "Tidy up the existing notes, then append today's entry to notes.md.", "label": "rewrite", "id": "r46"}

@@ -196,6 +196,9 @@ class AppState:
     write_intent_gate: Any = None
     #: 申告の確認ゲート (c_17 §3.9 / statement_gate)。言い換え確認の注記の要否。
     statement_gate: Any = None
+    #: 既存ファイルの編集の種類の確認ゲート (c_17 §3.16 / edit_mode_gate)。追記だけの
+    #: 依頼を決定論の連結へ回すか (docs/f_11 §5)。
+    edit_mode_gate: Any = None
     # Reactive 層 (挨拶/日時/キャッシュ即応) の常駐インスタンス。リクエスト毎に
     # 生成すると LRU キャッシュが温まらないため AppState に保持する。
     reactive_agent: "ReactiveAgent | None" = None

@@ -22,6 +22,10 @@ logger = get_logger("export.shapes")
 #: 描ける図形の種類。
 KINDS = frozenset({"rect", "oval", "line"})
 
+#: 図形を実際に描く出力形式 (f_11 §3.1)。それ以外の Writer は図形を落とすので、
+#: 図形だけの本文はその形式では「中身ゼロ」になる。
+DRAWN_EXTS = frozenset({".pptx", ".odp"})
+
 _DEFAULT_FILL = "#4472C4"
 _DEFAULT_LINE = "#000000"
 _DEFAULT_LINE_WIDTH_PT = 2.0

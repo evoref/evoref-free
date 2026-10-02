@@ -133,13 +133,17 @@ RICH_DOC_CONTENT_INSTRUCTION = (
 # 到達できない**: 画像は `![alt](path)` を行単独で置いたときだけ実体が埋め込まれ、
 # 図形は ```shapes フェンスでしか表現できないため、モデルが記法を知らないと
 # 「青い四角形」という箇条書きが出るだけになる (2026-09-16 実測)。
-# 図形は .pptx / .odp でのみ描かれる。
-MEDIA_CONTENT_INSTRUCTION = (
+# 図形は .pptx / .odp でのみ描かれるので、図形の案内もその 2 形式にだけ出す。
+# .docx にも例を見せていたため、9B が営業報告の代わりに例の図形を写し、
+# 段落 0 の .docx が書かれた (2026-10-02 ライブ監査 D07#2)。
+IMAGE_CONTENT_INSTRUCTION = (
     "Images: to embed a picture, put `![alt text](path/to/image.png)` on a line "
     "of its own (not inside a sentence). Use the exact path the user gave you. "
     "Never invent an image path, and never use a URL — only files that already "
-    "exist on disk are embedded.\n"
-    "Shapes (PowerPoint/.odp only): to draw shapes, emit a fenced block whose "
+    "exist on disk are embedded."
+)
+SHAPES_CONTENT_INSTRUCTION = (
+    "Shapes: to draw shapes, emit a fenced block whose "
     "language is `shapes` containing a JSON array. Units are centimetres; the "
     "slide is 25.4cm x 19.05cm. Example:\n"
     "```shapes\n"

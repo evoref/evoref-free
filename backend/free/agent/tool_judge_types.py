@@ -49,6 +49,13 @@ class ToolJudgement:
     #: 落ち、組み直しも回数の置き換えも通らず no_tool にしたか (上と同じ理由で結果に
     #: 載せる)。回答側は「計算を検証できなかった」と注記する (docs/f_03 §3.1 / §3.5)。
     calculation_rejected: bool = False
+    #: ``calculation_rejected`` のうち、分類器の式が calculate の式として成り立たず
+    #: (未知の名前 / 構文、``validate_expression``) 組み直しも通らなかった回か。回答側は
+    #: 「計算ツールが使えない」ではなく「式を組めなかった」と述べ、:attr:`stated_numbers`
+    #: を挙げて利用者に確認を求める (2026-10-03 再実行 D08#4、docs/f_03 §3.1 / §3.5)。
+    calculation_unbuildable: bool = False
+    #: 会話で利用者が述べた数 (出現順・重複なし)。``calculation_unbuildable`` の回だけ入る。
+    stated_numbers: tuple[str, ...] = ()
     #: 窓内想起のガードが「答えはこの会話の窓にある」と判断して履歴検索を
     #: 止めたか。回答側は「過去の会話を検索していない」ではなく「対象はこの
     #: 会話の中」と注記する (2026-09-26 監査 C05#5、docs/f_03 §3.5)。

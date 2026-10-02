@@ -206,6 +206,8 @@ class StagedTestRunner:
             # 失敗トレースを圧縮し、spec 見直しループの evidence 窓 (末尾 3000
             # chars) に複数の失敗が収まるようにする。
             "--tb=short",
+            # 末尾の要約に skip の理由も出す (既定の fE に s を足す)。契約テストの全件 skip の理由を読み分ける
+            "-rfEs",
             "--rootdir", str(self.workspace.root),
             str(target),
         )
@@ -233,6 +235,7 @@ class StagedTestRunner:
         violations = fs_sandbox.violation_paths(fs_sandbox.read_violations(self.workspace.root))
 
         out = (result.output or "") + "\n" + (result.error or "")
+        stdout_text, skip_lines = _split_skip_lines(result.output or "")
         rc_raw = (result.metadata or {}).get("returncode", "")
         try:
             returncode: int | None = int(rc_raw) if rc_raw != "" else None
@@ -257,7 +260,8 @@ class StagedTestRunner:
                 skipped=True,
                 returncode=returncode,
                 duration_ms=int(result.duration_ms),
-                stdout_tail=result.output or "",
+                stdout_tail=stdout_text,
+                skip_messages=skip_lines,
                 stderr_tail=result.error or "",
                 error=summary,
                 skip_reason=f"sandbox violation: {', '.join(violations[:3])}",
@@ -285,7 +289,8 @@ class StagedTestRunner:
                     skipped=True,
                     returncode=returncode,
                     duration_ms=int(result.duration_ms),
-                    stdout_tail=result.output or "",
+                    stdout_tail=stdout_text,
+                    skip_messages=skip_lines,
                     stderr_tail=result.error or "",
                     error=summary,
                     skip_reason=f"外部依存 '{env_dep}' が未インストール (環境要因)",
@@ -300,7 +305,8 @@ class StagedTestRunner:
             skipped=False,
             returncode=returncode,
             duration_ms=int(result.duration_ms),
-            stdout_tail=result.output or "",
+            stdout_tail=stdout_text,
+            skip_messages=skip_lines,
             stderr_tail=result.error or "",
             error=None if ok else summary,
         )
@@ -442,6 +448,56 @@ def failed_count(gate: GateResult) -> int:
         return 0
     failed, _passed, errors = _parse_pytest_summary(gate.error or "")
     return failed + errors
+
+
+_SKIPPED_RE = re.compile(r"(\d+) skipped")
+
+
+def skipped_count(gate: GateResult) -> int:
+    """pytest が skip したテストの件数 (末尾サマリの ``N skipped``)。ゲートごと未検査なら 0。
+
+    skip だけの実行は rc 0 で ``ok`` になる — 件数を見ないと「全件を契約から外した」が「合格」に化ける
+    (2026-10-02 ライブ監査 K01)。
+    """
+    if gate.skipped:
+        return 0
+    text = ((gate.stdout_tail or "") + "\n" + (gate.stderr_tail or "")).replace("\r", "")
+    return max((int(m.group(1)) for m in _SKIPPED_RE.finditer(text)), default=0)
+
+
+#: ``-rs`` の要約の skip 行 (``SKIPPED [2] tests/test_examples.py:301: example is not deterministic …``)
+_SKIPPED_LINE_RE = re.compile(r"^SKIPPED \[(\d+)\] .*?:\d+: (.+?)\s*$", re.MULTILINE)
+_SKIPPED_LINE_FULL_RE = re.compile(r"^SKIPPED \[\d+\] [^\n]*\n?", re.MULTILINE)
+
+
+def _split_skip_lines(text: str) -> tuple[str, tuple[str, ...]]:
+    """出力から ``SKIPPED`` 行を抜き出す (本文, 理由の列)。
+
+    要約の末尾に並ぶ skip の理由行は、失敗のトレースを末尾 2000 / 3000 字の証拠の窓 (契約の作り直し・spec 見直し・
+    失敗の記録) から押し出す — 本文からは除き、理由は別に持つ (独立レビュー 中1)。まとめられた行は件数ぶん並べる。
+    """
+    plain = text.replace("\r", "")
+    messages = tuple(m.group(2) for m in _SKIPPED_LINE_RE.finditer(plain) for _ in range(int(m.group(1))))
+    return (_SKIPPED_LINE_FULL_RE.sub("", plain) if messages else text), messages
+
+
+def skip_messages(gate: GateResult) -> list[str]:
+    """skip したテストの理由 (``-rs`` の要約行。まとめられた行は件数ぶん並べる)。読めなければ空。"""
+    if gate.skipped:
+        return []
+    return list(gate.skip_messages)
+
+
+#: ``-q`` の進捗行 (``.Fs     [100%]``)。テスト 1 件に 1 文字、ファイル内の定義順
+_PROGRESS_RE = re.compile(r"^([.FEsxX]+)[ \t]+\[\s*\d+%\]\s*$", re.MULTILINE)
+
+
+def progress_marks(gate: GateResult) -> str:
+    """テストごとの結果の文字 (``.`` 合格 / ``F`` 不合格 / ``s`` skip …) を実行順に並べたもの。読めなければ空。"""
+    if gate.skipped:
+        return ""
+    text = (gate.stdout_tail or "").replace("\r", "")
+    return "".join(m.group(1) for m in _PROGRESS_RE.finditer(text))
 
 
 def _parse_pytest_summary(text: str) -> tuple[int, int, int]:

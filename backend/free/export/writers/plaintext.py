@@ -18,25 +18,18 @@ from backend.export.base import (
     build_item_tree,
     sibling_runs,
 )
-from backend.export.markdown_patterns import (
-    RE_BOLD as _RE_BOLD,
-    RE_INLINE_CODE as _RE_CODE,
-    RE_ITALIC as _RE_ITALIC,
-)
+from backend.export.markdown_patterns import strip_inline
 
-# inline Markdown 書式除去パターン (link/image は URL を捨てる plaintext 固有)
-_RE_LINK = re.compile(r"\[(.+?)\]\(.+?\)")
-_RE_IMAGE = re.compile(r"!\[.*?\]\(.+?\)")
+# 画像の記法は丸ごと捨てる (plaintext 固有)。リンクは strip_inline が本文だけ残す
+# (コードの中の [..](..) は残す)。角括弧・括弧・空白を本文 / URL に許さない線形の形
+# (markdown_patterns.RE_LINK と同じ。以前の .+? は三次のバックトラックがあった)。
+_RE_IMAGE = re.compile(r"!\[[^\[\]\n]*\]\([^()\s\[\]]+\)")
 
 
 def _strip_inline_formatting(text: str) -> str:
     """inline Markdown 書式を除去してプレーンテキストにする"""
     text = _RE_IMAGE.sub("", text)
-    text = _RE_LINK.sub(r"\1", text)
-    text = _RE_BOLD.sub(lambda m: m.group(1) or m.group(2), text)
-    text = _RE_ITALIC.sub(lambda m: m.group(1) or m.group(2), text)
-    text = _RE_CODE.sub(r"\1", text)
-    return text
+    return strip_inline(text)
 
 
 def _list_plaintext_lines(nodes: list[ListItemNode], depth: int = 0) -> list[str]:
@@ -83,7 +76,7 @@ def _blocks_to_plaintext(blocks: list[ContentBlock]) -> str:
 
         elif block.type == "table":
             for row in block.rows:
-                parts.append(" | ".join(row))
+                parts.append(" | ".join(_strip_inline_formatting(c) for c in row))
             parts.append("")
 
         elif block.type == "list":

@@ -63,7 +63,8 @@ call :start_core
 if errorlevel 1 exit /b 1
 
 echo [start] Starting SvelteKit dev server on :5173...
-start "evoref-frontend" /min cmd /c "cd frontend && npm run dev -- --host 127.0.0.1"
+set SPAWN_CMD=cd frontend ^&^& npm run dev -- --host 127.0.0.1
+call :spawn
 
 echo.
 echo === evoref is running ===
@@ -80,7 +81,7 @@ goto :eof
 rem --- Start core services only (llama + backend; frontend is left running) ---
 rem Called from `:start`, and invoked directly as the `start-core` command.
 rem Restarts llama and backend while keeping frontend(vite:5173) alive.
-rem Window titles are kept so `stop` still works.
+rem `stop` identifies services by port occupant (image name checked); :spawn gives the child no window title.
 :start_core
 call :check_dep python "python.org or winget install Python.Python.3"
 if errorlevel 1 exit /b 1
@@ -133,7 +134,8 @@ rem Not a console / any failure is ignored (it stays pending and the GUI asks).
 echo [start] Starting llama-server (base + embedding + rerank if enabled)...
 rem The launcher adds the trained adapters (--lora / --control-vector, Pro only)
 rem and runs scripts\launch_llama.py, which never resolves adapters itself.
-start "llama-server" /min cmd /c ""%VENV_PYTHON%" -m backend.free.cli.llama_launcher config.yaml --all"
+set SPAWN_CMD="%VENV_PYTHON%" -m backend.free.cli.llama_launcher config.yaml --all
+call :spawn
 
 rem wait targets come from launch_llama.py --print-health-ports
 rem The embedding server may first decide its GPU / CPU placement (embedding.gpu_layers: auto,
@@ -152,8 +154,18 @@ rem self-test itself, so the wait is 240s.
 "%VENV_PYTHON%" scripts\launch_llama.py config.yaml --wait-rerank 240
 
 echo [start] Starting FastAPI backend on :8000...
-start "evoref-backend" /min cmd /c ""%VENV_UVICORN%" backend.main:app --host 127.0.0.1 --port 8000"
+set SPAWN_CMD="%VENV_UVICORN%" backend.main:app --host 127.0.0.1 --port 8000
+call :spawn
 goto :eof
+
+rem --- Launch %SPAWN_CMD% in a minimized window that does NOT inherit our stdio handles ---
+rem cmd's "start" lets the child inherit the caller's stdout/stderr/stdin handles (even with
+rem ">nul 2>&1 <nul" on the start line, the original pipe handles stay inheritable), so when
+rem ctl is run with its output piped (a CI step, Claude Code background run) the caller does
+rem not return until every service exits. Start-Process (ShellExecute) inherits nothing.
+:spawn
+powershell -NoProfile -Command "Start-Process -WindowStyle Minimized -FilePath cmd.exe -ArgumentList ('/c \"' + $env:SPAWN_CMD + '\"')" <nul
+exit /b %errorlevel%
 
 rem --- Stop services ---
 :stop

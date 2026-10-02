@@ -42,6 +42,16 @@ RERANK_SCORED_INPUT_KEY = RERANK_SCORED_KEY + "_input"
 #: 事象は問い 1 件 = 1 行なので、畳んだ事象の数と同じ。
 #: Full の結果辞書に必ず載せる (無い回も 0)。
 CARRIED_OVER_KEY = "pseudo_query_carried_over"
+#: 生成の対象にしたチャンク数 (``pseudo_queries`` の入力件数、c_07 §7.1)。**入力が 0 の回は
+#: 「対象が無い」正常な 0** (corpus 未導入・全チャンクが問い済み)。入力 > 0 で ``pseudo_queries``
+#: が 0 なら「対象があるのに生成できない」異常な 0 で、死活監視が ``stalled`` に数える。
+#: 補助タスクが無い回と、チャット・予算・取消で途中までしか試せなかった回は母数外の 0
+#: (譲るのも正常動作で、``PSEUDO_QUERIES_DEFERRED_KEY`` に対象数を別に出す)。
+PSEUDO_QUERIES_INPUT_KEY = "pseudo_queries_input"
+PSEUDO_QUERIES_DEFERRED_KEY = "pseudo_queries_deferred"
+#: 生成を試したのに問いが 1 件も返らなかったチャンク数。入力から除く (毎サイクル同じチャンクが
+#: 再対象になり、入力 > 0・効果 0 で ``stalled`` を誤報するため)。全部が空なら WARNING を出す。
+PSEUDO_QUERIES_UNPRODUCTIVE_KEY = "pseudo_queries_unproductive"
 
 
 def empty_rerank_stats() -> dict[str, int]:
@@ -70,6 +80,15 @@ def _heading_context(corpus, package_id: str, evidence_id: str) -> str:
     if len(path) > 1:
         path = path[1:]
     return " › ".join(path)
+
+
+def _can_hold_questions(package: Any) -> bool:
+    """疑似クエリを持てるパッケージか。ProjectMap (c_16 §4.3) は統合検索に載せないので対象外。"""
+    return (
+        package is not None
+        and package.pseudo_queries is not None
+        and not getattr(package, "is_project_map", False)
+    )
 
 
 def collect_targets(
@@ -107,7 +126,7 @@ def collect_targets(
 
     def is_covered(package_id: str, evidence_id: str) -> bool:
         package = corpus.get(package_id)
-        if package is None or package.pseudo_queries is None:
+        if not _can_hold_questions(package):
             return True  # 索引を持てないパッケージは対象外
         if package_id not in covered:
             covered[package_id] = set(package.pseudo_queries.covered_target_ids())
@@ -123,7 +142,7 @@ def collect_targets(
         if not sep or not evidence_id:
             continue
         package = corpus.get(package_id)
-        if package is None or package.pseudo_queries is None:
+        if not _can_hold_questions(package):
             continue
         if not push(package_id, evidence_id):
             return by_package
@@ -142,7 +161,7 @@ def collect_targets(
         return by_package
     for package_id in corpus.loaded_ids:
         package = corpus.get(package_id)
-        if package is None or package.pseudo_queries is None:
+        if not _can_hold_questions(package):
             continue
         snapshot = package.store.snapshot
         if snapshot is None:
@@ -329,6 +348,7 @@ async def generate_pseudo_queries(
     should_pause: Callable[[], bool] | None = None,
     reranker: Any = None,
     stats: dict[str, int] | None = None,
+    activity: dict[str, int] | None = None,
     debug_logger: Any = None,
 ) -> int:
     """Step 5.9 本体。問いを書いたチャンク数を返す。
@@ -341,9 +361,15 @@ async def generate_pseudo_queries(
             生成の後に問いを採点し、較正済みの判定点が反対した問いを書かない
             (c_16 §7.2.1 の第 5 段階 B)。``None`` なら従来どおり全部書く。
         stats: 品質検査の件数を書き込む辞書 (:func:`empty_rerank_stats` の形)。
+        activity: 生成の入力件数 ``PSEUDO_QUERIES_INPUT_KEY`` と、譲って試せなかった対象数
+            ``PSEUDO_QUERIES_DEFERRED_KEY`` を書き込む辞書 (死活監視、c_07 §7.1)。
         debug_logger: 品質検査の件数を memory JSONL (``op="pseudo_query_rerank"``) に残す。
     """
     stats = stats if stats is not None else empty_rerank_stats()
+    activity = activity if activity is not None else {}
+    activity.setdefault(PSEUDO_QUERIES_INPUT_KEY, 0)
+    activity.setdefault(PSEUDO_QUERIES_DEFERRED_KEY, 0)
+    activity.setdefault(PSEUDO_QUERIES_UNPRODUCTIVE_KEY, 0)
     if reranker is not None:
         stats.setdefault(RERANK_SCORED_INPUT_KEY, 0)
     if cartridge_manager is None:
@@ -373,6 +399,7 @@ async def generate_pseudo_queries(
     deadline = (time.monotonic() + budget_seconds) if budget_seconds > 0 else None
     total = sum(len(v) for v in targets.values())
     if total == 0:
+        logger.debug("Step 5.9: no pseudo-query targets (no loaded corpus package or all chunks covered)")
         if carried_over:
             await _recalibrate(cartridge_manager)
         return 0
@@ -386,8 +413,11 @@ async def generate_pseudo_queries(
     corpus = cartridge_manager.corpus
     written = 0
     preempted = False
+    cut_short = False
+    attempted = 0  # 生成を試したチャンク数 (入力の母数)
+    unproductive = 0  # うち問いが 1 件も返らなかった数
     try:
-        for package_id, evidence_ids in targets.items():
+        for package_index, (package_id, evidence_ids) in enumerate(targets.items()):
             package = corpus.get(package_id)
             if package is None or package.pseudo_queries is None:
                 continue
@@ -407,6 +437,7 @@ async def generate_pseudo_queries(
                     done = written + added_here + len(generated)
                     if (is_cancelled and is_cancelled()) or (should_pause and should_pause()):
                         logger.info("Step 5.9: paused/cancelled after %d chunk(s)", done)
+                        cut_short = True
                         break
                     if deadline is not None and time.monotonic() >= deadline:
                         logger.info(
@@ -414,10 +445,12 @@ async def generate_pseudo_queries(
                             "remaining targets retry in a later cycle", budget_seconds, done,
                         )
                         preempted = True
+                        cut_short = True
                         break
                     row = snapshot.row_of(evidence_id)
                     if row is None:
                         continue
+                    attempted += 1
                     text = snapshot.text_at(row)
                     take_hints = getattr(corpus, "take_pq_hints", None)
                     hints = take_hints(f"{package_id}:{evidence_id}") if take_hints else []
@@ -434,8 +467,11 @@ async def generate_pseudo_queries(
                             "remaining targets retry in a later cycle", done,
                         )
                         preempted = True
+                        cut_short = True
+                        attempted -= 1  # 横取りされた 1 件は結果が出ていない
                         break
                     if not questions:
+                        unproductive += 1
                         continue
                     hinted_from = getattr(generator, "hinted_from", None)
                     generated.append((
@@ -486,7 +522,20 @@ async def generate_pseudo_queries(
                         package_id, e,
                     )
             if preempted or (is_cancelled and is_cancelled()) or (should_pause and should_pause()):
+                # 実際に残りがあるときだけ「譲った」(全部試し終えた直後の到着は完走)。
+                if package_index < len(targets) - 1:
+                    cut_short = True
                 break
+        activity[PSEUDO_QUERIES_UNPRODUCTIVE_KEY] = unproductive
+        if cut_short:
+            activity[PSEUDO_QUERIES_DEFERRED_KEY] = total - attempted
+        else:
+            activity[PSEUDO_QUERIES_INPUT_KEY] = attempted - unproductive
+            if attempted and unproductive == attempted:
+                logger.warning(
+                    "Step 5.9: generation returned no questions for all %d attempted chunk(s)",
+                    attempted,
+                )
         if written or carried_over:
             await _recalibrate(cartridge_manager)
     except BaseException as exc:
@@ -519,6 +568,9 @@ async def _recalibrate(cartridge_manager: Any) -> None:
 
 __all__ = [
     "CARRIED_OVER_KEY",
+    "PSEUDO_QUERIES_DEFERRED_KEY",
+    "PSEUDO_QUERIES_INPUT_KEY",
+    "PSEUDO_QUERIES_UNPRODUCTIVE_KEY",
     "RERANK_DROPPED_KEY",
     "RERANK_SCORED_INPUT_KEY",
     "RERANK_SCORED_KEY",

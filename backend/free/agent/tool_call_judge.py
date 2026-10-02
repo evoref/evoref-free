@@ -46,7 +46,7 @@ from backend.free.core.correction_target import (
     wrong_side_spans,
 )
 from backend.free.core.response_arithmetic import iter_ja_numbers
-from backend.free.agent.tools.calc import calculate, validate_expression
+from backend.free.agent.tools.calc import calculate, unknown_names, validate_expression
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -160,6 +160,7 @@ from backend.free.agent.tool_judge_grounding import (
     percent_derived_values,
     percent_scale_slips,
     period_exponent_mismatches,
+    query_percents_unused,
     repair_period_exponents,
 )
 from backend.free.agent.tool_judge_commands import (
@@ -444,21 +445,32 @@ def _corrected_new_value_forms(query: str) -> set[str]:
 def _beyond_window_reason(
     expression: str, query: str, conversation: list[dict] | None,
 ) -> str | None:
-    """分類器の式を判定窓の外の値の訂正として組み直す理由 (純粋関数)。無ければ ``None``。
+    """分類器の式を判定窓の外の値を使って組み直す理由 (純粋関数)。無ければ ``None``。
 
-    前提: 会話が窓より長く、クエリの「誤りの側」の数値が **窓の外** の発言に
-    既出 (旧値が窓の中にしか無ければ分類器はそれを見ている、2026-09-26 レビュー)。
-    そのうえで次のどちらか (docs/f_03 §3.1、2026-09-27 監査 C03#3):
+    前提: 会話が窓より長い。クエリの「誤りの側」の数値が **窓の外** の発言に
+    既出 (旧値が窓の中にしか無ければ分類器はそれを見ている、2026-09-26 レビュー)
+    なら訂正として次のどちらか (docs/f_03 §3.1、2026-09-27 監査 C03#3):
 
     - ``ordinal_reference``: 序数での参照 (「最初の計算」)。語彙は既存の序数
       (``only_session_ordinal_recall``) を使い、新しい語彙は作らない。
     - ``classifier_ignores_new_value``: 訂正形で新値が取れ、分類器の式がそのどの
       綴りも使っていない。新値が取れなければこの理由は **棄権** (分類器を保つ)。
+
+    訂正でなければ次の 1 つ (2026-10-02 監査 D08#4):
+
+    - ``classifier_ignores_query_number``: クエリの百分率・割合を分類器の式が 1 つも
+      使っておらず (:func:`query_percents_unused`)、窓の外にしか無い数が会話にある
+      (元データが窓の外)。
     """
     outside = (conversation or [])[:-_CALCULATE_CONTEXT_TURNS]
     if not outside:
         return None
     if not _replaces_dialogue_value(query, _dialogue_text(outside)):
+        if query_percents_unused(expression, query) and (
+            _known_numbers(_dialogue_text(outside))
+            - _known_numbers(_dialogue_text(conversation, _CALCULATE_CONTEXT_TURNS))
+        ):
+            return "classifier_ignores_query_number"
         return None
     if only_session_ordinal_recall(query):
         return "ordinal_reference"
@@ -468,6 +480,54 @@ def _beyond_window_reason(
     if forms & set(NUMBER_LITERAL_RE.findall(expression or "")):
         return None
     return "classifier_ignores_new_value"
+
+
+def _invalid_expression_reason(
+    expression: str, query: str, conversation: list[dict] | None,
+) -> str | None:
+    """分類器の式を ``classifier_expression_invalid`` で組み直す理由 (純粋関数)。
+
+    返すのは ``validate_expression`` の理由の文字列。対象は **会話の語を変数名にした
+    式** (``sum(employees_overtime_hours) * 0.9``) と構文エラーだけで、次は対象外
+    (``None``、従来どおり) にする (docs/f_03 §3.1、独立レビュー 2026-10-03):
+
+    - 占位語・空の式 — ``_suppress_expressionless_calculate`` の格下げに任せる
+    - 日付演算の手掛かりがある問い — 層 5.97 が calculate に流れた日付演算を演算
+      コマンドへ差し替える (``date(2026,10,3)+timedelta(days=100)``)
+    - 計算機に無い関数を呼ぶ式 (``fibonacci(10)``) — 数は揃っていて、足りないのは
+      計算機の機能。「数を尋ねる」注記は誤りで、従来は知識で答えていた
+    - 許可外のノード・キーワード引数・コスト上限 — 会話の数の欠落ではない
+    """
+    stripped = (expression or "").strip()
+    if not stripped or stripped.lower() in guards._EXPRESSION_PLACEHOLDERS:
+        return None
+    invalid = validate_expression(stripped)
+    if invalid is None or conversation_has_date_math_cue(query, conversation):
+        return None
+    try:
+        variables, functions = unknown_names(stripped)
+    except SyntaxError:
+        return invalid
+    if functions or not variables:
+        return None
+    return invalid
+
+
+#: 「式を組めなかった」回に回答側へ渡す数の上限 (注記を長くしない)。
+_STATED_NUMBERS_LIMIT = 20
+
+
+def _stated_numbers(user_text: str) -> tuple[str, ...]:
+    """利用者が会話で述べた数を出現順・重複なしで返す (純粋関数、docs/f_03 §3.1)。
+
+    分類器の式も組み直しも calculate の式にならなかった回に、回答側が確認を
+    求めるときに挙げる数。桁区切りは落とす (``1,280`` → ``1280``)。
+    """
+    seen: list[str] = []
+    for n in NUMBER_LITERAL_RE.findall(ungroup_thousands(user_text or "")):
+        if n not in seen:
+            seen.append(n)
+    return tuple(seen[:_STATED_NUMBERS_LIMIT])
 
 
 def _is_recompute_request(query: str, dialogue: str) -> bool:
@@ -1832,7 +1892,7 @@ class ToolCallJudge:
             )
             classified = None
         if classified is not None:
-            # 桁を取り違えた / 窓の外の値を訂正する calculate は式合成で 1 回だけ
+            # 式として成り立たない / 桁を取り違えた / 窓の外の値を訂正する calculate は式合成で 1 回だけ
             # 組み直す。桁の取り違えで組み直しが通らなければ no_tool (docs/f_03 §3.1)。
             resynthesized = await self._resynthesize_beyond_window(
                 classified, query, tools_registry, mode, conversation, call,
@@ -1982,8 +2042,17 @@ class ToolCallJudge:
     ) -> "ToolJudgement | None":
         """分類器の ``calculate`` を式合成で **1 回だけ** 組み直すか決め、組み直す。
 
-        組み直す理由は 3 つ (docs/f_03 §3.1、この順に 1 つだけ採る):
+        組み直す理由は 4 つ (docs/f_03 §3.1、この順に 1 つだけ採る):
 
+        0. **calculate の式として成り立たない** (``validate_expression``: 会話の語を
+           変数名にした ``sum(employees_overtime_hours) * 0.9`` の未知の名前 / 構文
+           エラー。2026-10-03 再実行 D08#4)。実行しても必ず ``Unsafe expression`` /
+           ``invalid syntax`` で落ちるので **実行前に** 判定する (規則は calculate と
+           同じ 1 つなので、実行失敗後に組み直すのと同じ集合を拾う)。占位語・日付演算・
+           計算機に無い関数の呼び出しは対象外 (:func:`_invalid_expression_reason`)。組み直した式が
+           通らなければ **no_tool** にし、``calculation_unbuildable`` と会話で利用者が
+           述べた数 (``stated_numbers``) を載せる — 回答側は「計算ツールが使えない」
+           ではなく「式を組めなかった」と述べ、数を挙げて確認を求める。
         1. **百分率の桁の取り違え** (:func:`percent_scale_slips`、1.2% に対する
            0.12)。分類器の式は採らない (開示で通さない)。組み直した式が通らなければ
            **no_tool** を返す (calculate を使わず「厳密な計算結果」と言わせない)。
@@ -1999,7 +2068,10 @@ class ToolCallJudge:
            新しい値で組む。旧値が窓の外にあることに加えて、序数での参照か、
            訂正形で取れた新値を分類器の式が使っていないことを要求する
            (:func:`_beyond_window_reason`)。組み直した式が通らなければ ``None``
-           (分類器の結果を使う)。
+           (分類器の結果を使う)。訂正でなく、クエリの百分率を分類器の式が使って
+           いない理由 (``classifier_ignores_query_number``、2026-10-02 監査 D08#4) は、
+           組み直しが分類器と **別の** 式で、かつ百分率を使うときだけ差し替え、
+           それ以外は ``None`` (分類器の式を残す。百分率を使わない正しい式もある)。
 
         組み直した式は接地・式の妥当性 (構造検査を含む)・構文を通ったときだけ採る
         (``_judge_with_expression_synthesis(recompose=True)``)。差し替えたら
@@ -2009,11 +2081,14 @@ class ToolCallJudge:
         if classified.tool_name != "calculate":
             return None
         expression = str((classified.tool_args or {}).get("expression") or "")
-        slips = percent_scale_slips(expression, query, call.dialogue_text)
-        unexplained, period_mismatch = ((), ()) if slips else _recompute_ungrounded(
+        invalid = _invalid_expression_reason(expression, query, conversation)
+        slips =() if invalid else percent_scale_slips(expression, query, call.dialogue_text)
+        unexplained, period_mismatch = ((), ()) if invalid or slips else _recompute_ungrounded(
             expression, query, call.dialogue_text, call.user_dialogue_text,
         )
-        if slips:
+        if invalid:
+            reason = "classifier_expression_invalid"
+        elif slips:
             reason = "percent_scale_slip"
         elif unexplained or period_mismatch:
             reason = "recompute_ungrounded"
@@ -2025,6 +2100,24 @@ class ToolCallJudge:
         synthesized = await self._judge_with_expression_synthesis(
             query, tools_registry, mode, conversation, call=call, recompose=True,
         )
+        if reason == "classifier_ignores_query_number":
+            # 百分率を使わない正しい式もありうる (内税の価格 × 個数 等) ので、ここでは
+            # 分類器を捨てない。組み直しが **別の** 式を出し、それが百分率を使うときだけ
+            # 差し替える (独立レビュー 2026-10-02)。
+            new_expression = str(
+                ((synthesized.tool_args or {}) if synthesized else {}).get("expression") or "",
+            )
+            if (
+                synthesized is None or not synthesized.tool_needed
+                or "".join(new_expression.split()) == "".join(expression.split())
+                or query_percents_unused(new_expression, query)
+            ):
+                logger.info(
+                    "Classifier calculate(%r) kept: the re-synthesized expression %r "
+                    "does not use the query's percentage either",
+                    expression[:120], new_expression[:120],
+                )
+                return None
         if synthesized is not None and synthesized.tool_needed:
             logger.info(
                 "Classifier calculate(%r) replaced by re-synthesized %r (reason=%s)",
@@ -2033,6 +2126,19 @@ class ToolCallJudge:
                 reason,
             )
             return synthesized
+        if invalid:
+            stated = _stated_numbers(call.user_dialogue_text)
+            logger.info(
+                "Classifier calculate(%r) is not a calculate expression (%s); the "
+                "re-synthesized expression did not pass, asking the user to confirm "
+                "the operands %s",
+                expression[:120], invalid[:120], list(stated),
+            )
+            call.calculation_rejected = True
+            return ToolJudgement(
+                tool_needed=False, source=classified.source, calculation_rejected=True,
+                calculation_unbuildable=True, stated_numbers=stated,
+            )
         if slips:
             rejected = f"percent scale slip {list(slips)}"
         elif period_mismatch:

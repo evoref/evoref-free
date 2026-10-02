@@ -11,7 +11,7 @@ import re
 
 from pathlib import Path
 from backend.app_state import AppState
-from backend.free.agent.meta_cognitive_content_gate import is_pure_append_request
+from backend.free.agent.edit_mode_gate import is_append_verdict, resolve_edit_mode
 from backend.free.agent.meta_cognitive_utils import is_tool_error
 from backend.free.agent.tool_call_judge import _extract_file_path
 from backend.free.agent.tools.filesystem import append_existing_text, read_existing_text
@@ -514,7 +514,9 @@ async def long_form_write_file(
                     existing.reason, file_path,
                 )
                 return f"{EDIT_REFUSED_UNREADABLE_PREFIX}{file_path}"
-            if existing and not is_pure_append_request(query):
+            if existing and not is_append_verdict(
+                await resolve_edit_mode(getattr(state, "edit_mode_gate", None), query),
+            ):
                 # 書き換えの語が同居する依頼。長文の生成は末尾を文脈にした続きしか
                 # 書けないので、連結すれば書き換えが黙って落ち、上書きすれば既存
                 # 内容が消える。どちらもせずに断る。

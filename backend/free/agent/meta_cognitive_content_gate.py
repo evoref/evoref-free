@@ -31,11 +31,11 @@ from backend.free.core.script_ranges import (
 )
 from backend.free.core.file_names import allows_empty_content
 from backend.free.core.intent_vocab import (
-    APPEND_HINT_RE,
+    EDIT_MODE_APPEND,
     EDIT_REQUEST_RE,
-    REVISE_REQUEST_RE,
+    append_residual,
+    edit_mode_rule,
 )
-from backend.free.core.predicate import LexicalPredicate
 from backend.free.generation.validators import file_suffix, is_low_information
 
 
@@ -337,28 +337,19 @@ def is_edit_request(text: str) -> bool:
     return bool(_EDIT_REQUEST_RE.search(text or ""))
 
 
-def _edit_mode_label(query: str) -> str:
-    """既存ファイルの編集の種類 (``edit_mode_predicate`` の字句段)。
-
-    ``"revise"`` = 書き換えの語がある (追記の語と同居していても)、``"append"`` =
-    追記の語だけ、``""`` = どちらも無い。
-    """
-    if REVISE_REQUEST_RE.search(query or ""):
-        return "revise"
-    if APPEND_HINT_RE.search(query or ""):
-        return "append"
-    return ""
-
-
-#: 判定点としての編集の種類 (c_17 / CLAUDE.md #14)。追記の語だけの依頼を
-#: 決定論の連結 (docs/f_11 §5) へ回すかの判定。書き換えの語が同居する依頼を
-#: 連結すると書き換えが黙って落ちる (2026-09-27 レビュー)。
-edit_mode_predicate = LexicalPredicate("edit_mode", _edit_mode_label, evidence="lexical")
-
-
 def is_pure_append_request(query: str) -> bool:
-    """追記だけを求める依頼か (書き換えの語が同居していない)。"""
-    return edit_mode_predicate.evaluate(query).value == "append"
+    """追記だけを求める依頼か (判定点 ``edit_mode`` の字句段、記録しない純粋関数)。
+
+    既存の本文を変える指示 (置換の値の形 / 本文を変える操作 / 書き戻しの目的語が
+    本文の一部) が同居すれば偽 — 連結すると変更が黙って落ちる (docs/f_11 §5)。
+    構造で読めない依頼の残り (``append_residual``) があるときも偽 (事例で確かめて
+    いないので書き直し側へ倒す)。ターンの判定 (事例の確認と記録つき) は
+    ``edit_mode_gate.resolve_edit_mode``。
+    """
+    return (
+        edit_mode_rule(query or "")[0] == EDIT_MODE_APPEND
+        and not append_residual(query or "")
+    )
 
 
 def _normalize_for_content_compare(text: str) -> str:

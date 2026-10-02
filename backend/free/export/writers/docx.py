@@ -10,17 +10,17 @@ import io
 from pathlib import Path
 
 from backend.export._writer_base import BytesWriterBase
-from backend.export.base import ContentBlock, ExportContent
+from backend.export.base import ContentBlock, ExportContent, ExportError
 from backend.export.media import (
     export_base_dir,
     resolve_image_path,
     scaled_width_cm,
 )
 from backend.export.markdown_patterns import (
-    INLINE_BOLD_GROUPS,
-    INLINE_CODE_GROUP,
-    INLINE_ITALIC_GROUPS,
-    RE_INLINE,
+    BOLD_KINDS,
+    CODE_KINDS,
+    ITALIC_KINDS,
+    iter_inline_groups,
 )
 from backend.log_config import get_logger
 
@@ -49,27 +49,35 @@ def _list_style_name(level: int, ordered: bool) -> str:
 
 
 class _ListNumbering:
-    """番号付きリストごとに番号定義 (``w:num``) を作り、1 から数え直させる。
+    """リストの段落に多段の番号定義 (``w:numPr`` の ``numId`` + ``ilvl``) を当てる。
 
-    ``List Number`` 系の組込みスタイルは段ごとに 1 つの番号定義を共有するので、
-    スタイルを当てるだけだと Word 上では文書内の**全ての番号付きリストが
-    通し番号**になる (2 つ目のリストが 4 から始まる。別の親の下の
-    ``List Number 2`` も続きから数える)。同じ abstractNum を指す ``w:num`` を
-    リストごとに作り、``startOverride=1`` を付けて段落から直接参照する。
-    見た目 (字下げ・番号の書式) は同じ abstractNum なので変わらない。
+    ``List Bullet`` / ``List Bullet 2`` … の組込みスタイルは段ごとに**別の**番号定義
+    (1 段だけの abstractNum) を持つ。スタイルを当てるだけでは字下げで入れ子に
+    見えるが、構造としては段ごとに別のリストで、読み手 (pandoc など) には平らな
+    リストが並んで見える。そこで箇条書き / 番号付きのそれぞれについて、各段の
+    スタイルの番号定義 (``w:lvl``) を ``ilvl`` 0-2 に写した多段の abstractNum を
+    1 つずつ作り、段落から ``ilvl`` = 段で参照する。見た目 (記号・字下げ) は
+    スタイルの定義をそのまま写すので変わらない。
+
+    番号付きはリストごと (段ごと・``sibling_runs`` と同じ区切り) に ``w:num`` を
+    作って ``startOverride=1`` を付け、1 から数え直させる (同じ番号定義を共有すると
+    文書内の全ての番号付きリストが通し番号になる)。
     """
 
     def __init__(self, doc) -> None:
         self._doc = doc
-        #: 段 → いま続いている番号付きの (numId, ilvl)
-        self._active: dict[int, tuple[int, int]] = {}
+        #: ordered → 多段の abstractNumId (作れなければ ``None``)
+        self._abstract: dict[bool, int | None] = {}
+        self._bullet_num: int | None = None
+        #: 段 → いま続いている番号付きの numId
+        self._active: dict[int, int] = {}
 
     def begin_block(self) -> None:
         """list ブロックの境界。前のリストの番号を引き継がない。"""
         self._active.clear()
 
-    def apply(self, para, style_name: str, level: int, ordered: bool) -> None:
-        """``para`` が番号付きなら、その段でいま続いているリストの番号定義を当てる。
+    def apply(self, para, level: int, ordered: bool) -> None:
+        """``para`` に段 ``level`` の番号定義を当てる。作れなければスタイルのまま描く。
 
         深い段の番号は親が進めば終わる。同じ段に箇条書きが挟まれば、その後の
         番号付きは別のリスト (``sibling_runs`` と同じ区切り)。
@@ -78,17 +86,36 @@ class _ListNumbering:
             del self._active[deeper]
         if not ordered:
             self._active.pop(level, None)
+            if self._bullet_num is None:
+                self._bullet_num = self._new_num(False, None)
+            num_id = self._bullet_num
+        else:
+            num_id = self._active.get(level) or self._new_num(True, level)
+            if num_id is not None:
+                self._active[level] = num_id
+        if num_id is None:
             return
-        ref = self._active.get(level) or self._new_num(style_name)
-        if ref is None:
-            return
-        self._active[level] = ref
         num_pr = para._p.get_or_add_pPr().get_or_add_numPr()
-        num_pr.get_or_add_numId().val = ref[0]
-        num_pr.get_or_add_ilvl().val = ref[1]
+        num_pr.get_or_add_ilvl().val = level
+        num_pr.get_or_add_numId().val = num_id
 
-    def _new_num(self, style_name: str) -> tuple[int, int] | None:
-        """``style_name`` の番号定義を複製して 1 から始める。番号を持たなければ ``None``。"""
+    def _new_num(self, ordered: bool, restart_level: int | None) -> int | None:
+        if ordered not in self._abstract:
+            self._abstract[ordered] = self._build_abstract(ordered)
+        abstract_id = self._abstract[ordered]
+        if abstract_id is None:
+            return None
+        num = self._doc.part.numbering_part.element.add_num(abstract_id)
+        if restart_level is not None:
+            num.add_lvlOverride(restart_level).add_startOverride(1)
+        return num.numId
+
+    def _style_lvl(self, style_name: str):
+        """``style_name`` が参照する番号定義の ``w:lvl`` (無ければ ``None``)。"""
+        from docx.oxml.ns import qn
+
+        if style_name not in {s.name for s in self._doc.styles}:
+            return None
         style = self._doc.styles[style_name]
         source: tuple[int, int] | None = None
         while style is not None and source is None:
@@ -99,15 +126,62 @@ class _ListNumbering:
             style = style.base_style
         if source is None:
             return None
+        numbering = self._doc.part.numbering_part.element
+        abstract_id = str(numbering.num_having_numId(source[0]).abstractNumId.val)
+        for abstract in numbering.findall(qn("w:abstractNum")):
+            if abstract.get(qn("w:abstractNumId")) == abstract_id:
+                for lvl in abstract.findall(qn("w:lvl")):
+                    if lvl.get(qn("w:ilvl")) == str(source[1]):
+                        return lvl
+        return None
+
+    def _build_abstract(self, ordered: bool) -> int | None:
+        """段 0-2 のスタイルの ``w:lvl`` を写した多段の abstractNum を作る。
+
+        下位の段のスタイルが無い (継承元に ``List Bullet 2`` が無い) ときは 0 段目の
+        定義を写す。字下げは描画側の ``left_indent`` (直接書式) が上書きする。
+        """
+        import copy
+        import re
+
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
         try:
             numbering = self._doc.part.numbering_part.element
-            abstract_id = numbering.num_having_numId(source[0]).abstractNumId.val
+            base = self._style_lvl(_list_style_name(0, ordered))
+            if base is None:
+                return None
+            lvls = []
+            for level in range(len(_LIST_LEVEL_SUFFIX)):
+                src = self._style_lvl(_list_style_name(level, ordered)) if level else base
+                lvl = copy.deepcopy(src if src is not None else base)
+                lvl.set(qn("w:ilvl"), str(level))
+                # 段落スタイルとの結び付けは元の定義に残す (2 つの定義に結ぶと Word が迷う)
+                for p_style in lvl.findall(qn("w:pStyle")):
+                    lvl.remove(p_style)
+                text = lvl.find(qn("w:lvlText"))
+                if text is not None and text.get(qn("w:val")):
+                    text.set(qn("w:val"), re.sub(r"%\d", f"%{level + 1}", text.get(qn("w:val"))))
+                lvls.append(lvl)
         except (KeyError, NotImplementedError):
             # 継承元 (f_11 §9.1) の番号定義が欠けている。スタイルの番号のまま描く。
             return None
-        num = numbering.add_num(abstract_id)
-        num.add_lvlOverride(source[1]).add_startOverride(1)
-        return num.numId, source[1]
+        used = [int(a.get(qn("w:abstractNumId"))) for a in numbering.findall(qn("w:abstractNum"))]
+        abstract_id = max(used, default=-1) + 1
+        abstract = OxmlElement("w:abstractNum")
+        abstract.set(qn("w:abstractNumId"), str(abstract_id))
+        multi = OxmlElement("w:multiLevelType")
+        multi.set(qn("w:val"), "multilevel")
+        abstract.append(multi)
+        abstract.extend(lvls)
+        # abstractNum は num より前に置く (CT_Numbering の sequence)
+        first_num = numbering.find(qn("w:num"))
+        if first_num is not None:
+            first_num.addprevious(abstract)
+        else:
+            numbering.append(abstract)
+        return abstract_id
 
 
 def _resolve_docx_template(content: ExportContent) -> Path | None:
@@ -150,6 +224,16 @@ def _required_styles(blocks: list[ContentBlock]) -> set[str]:
     return needed
 
 
+def _docx_body_has_content(doc) -> bool:
+    """本文に文字・表・画像のいずれかがあるか。"""
+    from docx.oxml.ns import qn
+
+    body = doc.element.body
+    if any((t.text or "").strip() for t in body.iter(qn("w:t"))):
+        return True
+    return any(True for _ in body.iter(qn("w:tbl"), qn("w:drawing")))
+
+
 def _clear_docx_body(doc) -> None:
     """``body`` 直下の ``sectPr`` 以外を除く (f_11 §9.1)。
 
@@ -167,36 +251,76 @@ def _clear_docx_body(doc) -> None:
         body.remove(child)
 
 
+#: inline のコードとリンクに当てる文字スタイル。``Verbatim Char`` は pandoc の docx
+#: リーダがコードと読む名前 (継承元に同名があればそれを使う)。
+_CODE_CHAR_STYLE = "Verbatim Char"
+_LINK_CHAR_STYLE = "Hyperlink"
+
+
+def _ensure_inline_char_styles(doc) -> None:
+    """コードとリンクの文字スタイルが無ければ作る。"""
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.shared import RGBColor
+
+    names = {s.name for s in doc.styles}
+    if _CODE_CHAR_STYLE not in names:
+        doc.styles.add_style(_CODE_CHAR_STYLE, WD_STYLE_TYPE.CHARACTER).font.name = "Consolas"
+    if _LINK_CHAR_STYLE not in names:
+        font = doc.styles.add_style(_LINK_CHAR_STYLE, WD_STYLE_TYPE.CHARACTER).font
+        font.color.rgb = RGBColor(0x05, 0x63, 0xC1)
+        font.underline = True
+
+
+def _add_hyperlink(paragraph, url: str):
+    """``paragraph`` の末尾に外部リンク (``w:hyperlink`` + 関係) を足して返す。"""
+    from docx.opc.constants import RELATIONSHIP_TYPE
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    link = OxmlElement("w:hyperlink")
+    r_id = paragraph.part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+    link.set(qn("r:id"), r_id)
+    paragraph._p.append(link)
+    return link
+
+
 def _add_inline_runs(paragraph, text: str) -> None:
     """inline Markdown を解析して Word の Run に変換
 
     パターンは ``backend.export.markdown_patterns`` が SSOT。以前はここに私有の
     結合正規表現を持っており、``markdown_patterns`` 側と**同じ欠陥を二重に**
     抱えていた (語中のアンダースコアを斜体と誤認して区切り文字を落とす)。
+    リンクは ``w:hyperlink`` に、コードは文字スタイル ``Verbatim Char`` にする
+    (文字スタイルは ``_ensure_inline_char_styles`` が先に用意する)。
     """
-    last_end = 0
-    for m in RE_INLINE.finditer(text):
-        # マッチ前の通常テキスト
-        if m.start() > last_end:
-            paragraph.add_run(text[last_end:m.start()])
+    for url, pieces in iter_inline_groups(text):
+        link = _add_hyperlink(paragraph, url) if url else None
+        for piece, kind in pieces:
+            run = paragraph.add_run(piece)
+            if kind in BOLD_KINDS:
+                run.bold = True
+            if kind in ITALIC_KINDS:
+                run.italic = True
+            if kind in CODE_KINDS:
+                run.style = _CODE_CHAR_STYLE
+                run.font.name = "Consolas"
+            elif link is not None:
+                run.style = _LINK_CHAR_STYLE
+            if link is not None:
+                link.append(run._r)
 
-        bold = m.group(INLINE_BOLD_GROUPS[0]) or m.group(INLINE_BOLD_GROUPS[1])
-        italic = m.group(INLINE_ITALIC_GROUPS[0]) or m.group(INLINE_ITALIC_GROUPS[1])
-        code = m.group(INLINE_CODE_GROUP)
-        if bold is not None:
-            run = paragraph.add_run(bold)
-            run.bold = True
-        elif italic is not None:
-            run = paragraph.add_run(italic)
-            run.italic = True
-        elif code is not None:
-            run = paragraph.add_run(code)
-            run.font.name = "Consolas"
-        last_end = m.end()
 
-    # 残りのテキスト
-    if last_end < len(text):
-        paragraph.add_run(text[last_end:])
+def _add_horizontal_rule(paragraph) -> None:
+    """段落の下罫線で水平線を描く (ページ幅に追従し、文字数に依存しない)。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    p_bdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    for key, value in (("val", "single"), ("sz", "6"), ("space", "1"), ("color", "808080")):
+        bottom.set(qn(f"w:{key}"), value)
+    p_bdr.append(bottom)
+    paragraph._p.get_or_add_pPr().append(p_bdr)
 
 
 def _build_docx(content: ExportContent) -> bytes:
@@ -244,12 +368,13 @@ def _build_docx(content: ExportContent) -> bytes:
         font.name = "Arial"
         font.size = Pt(11)
 
+    _ensure_inline_char_styles(doc)
     available_style_names = {s.name for s in doc.styles}
     numbering = _ListNumbering(doc)
 
     for block in blocks:
         if block.type == "heading":
-            doc.add_heading(block.content, level=block.level)
+            _add_inline_runs(doc.add_heading("", level=block.level), block.content)
 
         elif block.type == "paragraph":
             para = doc.add_paragraph()
@@ -272,7 +397,7 @@ def _build_docx(content: ExportContent) -> bytes:
                 )
                 for i, row_data in enumerate(block.rows):
                     for j, cell_text in enumerate(row_data):
-                        table.rows[i].cells[j].text = cell_text
+                        _add_inline_runs(table.rows[i].cells[j].paragraphs[0], cell_text)
                     # ヘッダー行を太字に
                     if i == 0:
                         for cell in table.rows[0].cells:
@@ -289,7 +414,7 @@ def _build_docx(content: ExportContent) -> bytes:
                     # (f_11 §9.1)。1 段目のスタイル + left_indent で描く。
                     style_name = _list_style_name(0, ordered)
                 para = doc.add_paragraph(style=style_name)
-                numbering.apply(para, style_name, level, ordered)
+                numbering.apply(para, level, ordered)
                 if style_name != _list_style_name(level, ordered):
                     para.paragraph_format.left_indent = Cm(
                         _LIST_FALLBACK_INDENT_CM * (level + 1),
@@ -303,7 +428,7 @@ def _build_docx(content: ExportContent) -> bytes:
                 para.paragraph_format.left_indent = Pt(36)
 
         elif block.type == "hr":
-            doc.add_paragraph("_" * 50)
+            _add_horizontal_rule(doc.add_paragraph())
 
         elif block.type == "image":
             path = resolve_image_path(block.src, base_dir)
@@ -316,6 +441,16 @@ def _build_docx(content: ExportContent) -> bytes:
                 "shapes blocks are not drawn in .docx; %d shape(s) skipped",
                 len(block.shapes),
             )
+
+    if blocks and not _docx_body_has_content(doc):
+        # 中身を渡したのに本文が空の文書を成功として書かない (f_11 §3.3)。
+        # 図形だけの本文 (docx は図形を描かない) が段落 0 の文書になり、次の
+        # 追記が既存ファイルを読めずに止まった (2026-10-02 ライブ監査 D07#2/#3)。
+        raise ExportError(
+            "empty_output",
+            f"Nothing in the content can be drawn in .docx "
+            f"(block types: {sorted({b.type for b in blocks})})",
+        )
 
     buf = io.BytesIO()
     doc.save(buf)

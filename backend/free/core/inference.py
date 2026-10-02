@@ -357,7 +357,7 @@ def _correction_target_note(history: list[ChatMessage]) -> str:
     広すぎ、「数字だけで」の ``だけで`` で想起の問いに注記が付いた
     (2026-09-09 ライブ監査 B-01)。
     """
-    from backend.free.agent.feedback import points_at_assistant_error
+    from backend.free.agent.feedback import attribution_prev_user, points_at_assistant_error
     from backend.free.core.correction_target import (
         resolve_correction_target,
         score_correction_match,
@@ -366,7 +366,28 @@ def _correction_target_note(history: list[ChatMessage]) -> str:
     if len(history) < 3 or history[-1].get("role") != "user":
         return ""
     correction = str(history[-1].get("content") or "")
-    if not points_at_assistant_error(correction):
+    # 帰属は記録側と同じ文脈・同じ範囲で判定する (前のユーザー発話 / 直前の応答 /
+    # その応答が答えた発話)。本人の値の言い直しに「過去の回答を検証し直せ」を付けない。
+    prior = history[:-1]
+    reply_at = next(
+        (i for i in range(len(prior) - 1, -1, -1) if prior[i].get("role") == "assistant"),
+        -1,
+    )
+    answered = next(
+        (
+            str(prior[i].get("content") or "") for i in range(reply_at - 1, -1, -1)
+            if prior[i].get("role") == "user"
+        ),
+        "",
+    )
+    if not points_at_assistant_error(
+        correction,
+        prev_user=attribution_prev_user([
+            str(t.get("content") or "") for t in prior if t.get("role") == "user"
+        ]),
+        prev_response=str(prior[reply_at].get("content") or "") if reply_at >= 0 else "",
+        prev_query=answered,
+    ):
         return ""
     # (id, 応答, 問い) を古い順に。id は履歴内の位置。
     candidates: list[tuple[str, str, str]] = []

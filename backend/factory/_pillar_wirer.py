@@ -1825,6 +1825,7 @@ def _init_tools(
     _wire_layer_shadow(state, embedder, state.debug_logger)
     _wire_write_intent_gate(state, embedder, state.debug_logger)
     _wire_statement_gate(state, embedder, state.debug_logger)
+    _wire_edit_mode_gate(state, embedder, state.debug_logger)
 
     # Reactive 層を常駐化 (挨拶パターンのみ。LLM 非依存なので構築コストはほぼゼロ)。
     state.reactive_agent = ReactiveAgent()
@@ -1962,6 +1963,32 @@ def _wire_statement_gate(
         _track_background_task(state, gate.warmup(), name="statement_gate_warmup")
     except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
         logger.info("Statement gate warmup deferred: no running event loop")
+
+
+def _wire_edit_mode_gate(
+    state: AppState, embedder: Any, debug_logger: Any,
+) -> None:
+    """既存ファイルの編集の種類の確認ゲートを構築する (c_17 §3.16 / edit_mode_gate)。
+
+    字句が追記と読んだ依頼だけ事例に確認させ、反対されたら書き直しへ倒す。
+    埋め込みが無い / 構築に失敗したときはゲート無しで動き、字句段だけで決める
+    (``resolve_edit_mode`` の縮退)。
+    """
+    if embedder is None:
+        logger.info("Edit mode gate skipped: no embedder")
+        return
+    from backend.free.agent.edit_mode_gate import EditModeGate
+
+    try:
+        gate = EditModeGate(embedder, debug_logger=debug_logger)
+    except Exception as e:  # pragma: no cover - 縮退で吸収する
+        logger.warning("Edit mode gate construction failed: %s", e)
+        return
+    state.edit_mode_gate = gate
+    try:
+        _track_background_task(state, gate.warmup(), name="edit_mode_gate_warmup")
+    except RuntimeError:  # イベントループ外 (同期テスト等) では見送る
+        logger.info("Edit mode gate warmup deferred: no running event loop")
 
 
 def _agent_trace_dir() -> Path | None:
@@ -2692,6 +2719,11 @@ async def _build_learn_pillar(
     from backend.free.agent import session_answer_gate
 
     session_answer_gate.bind_debug_logger(debug_logger)
+
+    # 訂正候補の帰属の判定点 (c_17 §3.17、学習側の候補判定) も字句段だけ。
+    from backend.free.agent import correction_attribution_gate
+
+    correction_attribution_gate.bind_debug_logger(debug_logger)
 
     # 元利均等の毎月返済額の問いの判定点 (c_17 §3.13、層 5.8) も字句段だけ。
     from backend.free.agent import tool_judge_annuity

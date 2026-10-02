@@ -58,6 +58,7 @@ config.yaml の llama / embedding セクションから起動コマンドを組�
 """
 
 import contextlib
+import importlib
 import os
 import re
 import struct
@@ -83,6 +84,17 @@ def _resolve_embed_gpu_layers(cfg: dict, project_root: Path | None = None) -> in
     return saved_embed_placement(cfg, project_root).gpu_layers
 
 
+def _import_canonical() -> bool:
+    """正規の ``scripts.launch_llama`` を import できたか (``__main__`` では試さない — 起動の挙動を変えない)。"""
+    if __name__ == "__main__":
+        return False
+    try:
+        importlib.import_module("scripts.launch_llama")
+    except ImportError:
+        return False
+    return True
+
+
 def _tuned(cfg: dict, project_root: Path, key: str):
     """環境調整の項目 ``key`` の起動時の値 (``resolve_tuned``、c_16 §7.2.3)。backend が無ければ ``None``。
 
@@ -90,10 +102,13 @@ def _tuned(cfg: dict, project_root: Path, key: str):
     環境移行の確認待ちの間の ctx / ngl / VRAM 予算は、保存しない一時の見積り
     (``base_model.resolve_or_provisional``。起動スクリプトは ``--list-devices`` を読めるので)。
     """
-    # ``python scripts/launch_llama.py`` で起動されたとき (``__main__``) や backend が
-    # ファイルから読み込んだ複製では ``scripts.launch_llama`` を import できない。環境調整は
-    # その名前で GGUF / ``--list-devices`` の実装を引くので、自分自身を登録しておく。
-    if "scripts.launch_llama" not in sys.modules:
+    # ``python scripts/launch_llama.py`` で起動されたとき (``__main__``) は ``scripts.launch_llama`` を
+    # import できない。環境調整はその名前で GGUF / ``--list-devices`` の実装を引くので、自分自身を登録しておく。
+    # backend がファイルから読み込んだ複製 (``_launch_llama*``) は、正規の ``scripts.launch_llama`` を
+    # import できるならそれを使い、複製を同じ名前で登録しない — 同名のモジュールが 2 つになり、正規の
+    # モジュールへの差し替え (``monkeypatch.setattr("scripts.launch_llama.…")``) と ``from scripts.launch_llama
+    # import …`` が別のものを指した (並列の全体回帰で test_model_migration が揺れた)
+    if "scripts.launch_llama" not in sys.modules and not _import_canonical():
         me = sys.modules.get(__name__)
         if me is None:  # spec_from_file_location で読んで sys.modules に載せていない複製
             me = types.ModuleType("scripts.launch_llama")

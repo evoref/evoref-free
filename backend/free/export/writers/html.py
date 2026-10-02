@@ -20,10 +20,10 @@ from backend.log_config import get_logger
 
 logger = get_logger("export.writers.html")
 from backend.export.markdown_patterns import (
-    RE_BOLD as _RE_BOLD,
-    RE_INLINE_CODE as _RE_CODE,
-    RE_ITALIC as _RE_ITALIC,
-    RE_LINK as _RE_LINK,
+    BOLD_KINDS,
+    CODE_KINDS,
+    ITALIC_KINDS,
+    iter_inline_groups,
 )
 
 _MINIMAL_CSS = """\
@@ -38,14 +38,28 @@ hr { border: none; border-top: 1px solid #ddd; margin: 2em 0; }
 """
 
 
+def _marked_html(pieces) -> str:
+    """``(断片, 種別)`` の列をエスケープして HTML の要素にする (入れ子の強調・強調の中のコード)。"""
+    out = []
+    for piece, kind in pieces:
+        body = html.escape(piece)
+        if kind in CODE_KINDS:
+            body = f"<code>{body}</code>"
+        if kind in ITALIC_KINDS:
+            body = f"<em>{body}</em>"
+        if kind in BOLD_KINDS:
+            body = f"<strong>{body}</strong>"
+        out.append(body)
+    return "".join(out)
+
+
 def _inline_html(text: str) -> str:
-    """inline Markdown → HTML 変換"""
-    text = html.escape(text)
-    text = _RE_BOLD.sub(lambda m: f"<strong>{m.group(1) or m.group(2)}</strong>", text)
-    text = _RE_ITALIC.sub(lambda m: f"<em>{m.group(1) or m.group(2)}</em>", text)
-    text = _RE_CODE.sub(r"<code>\1</code>", text)
-    text = _RE_LINK.sub(r'<a href="\2">\1</a>', text)
-    return text
+    """inline Markdown → HTML 変換。リンクの URL は強調の解析にかけない。"""
+    return "".join(
+        f'<a href="{html.escape(url)}">{_marked_html(pieces)}</a>' if url
+        else _marked_html(pieces)
+        for url, pieces in iter_inline_groups(text)
+    )
 
 
 def _item_html(text: str) -> str:

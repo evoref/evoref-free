@@ -217,6 +217,41 @@ _CALCULATION_REJECTED_GUIDANCES: dict[str, str] = {
     ),
 }
 
+#: 分類器の式が calculate の式として成り立たず (未知の名前 / 構文)、組み直しも通らなかった
+#: 回の注記 (``ToolJudgement.calculation_unbuildable``、docs/f_03 §3.1 / §3.5)。以前は式を
+#: そのまま実行して ``Unsafe expression`` で落ち、汎用の失敗注記から「計算ツールが利用
+#: できないため算出できませんでした」と答えていた (2026-10-03 再実行 D08#4)。ツールは
+#: 使えるので理由を取り違えさせず、会話の数を挙げて利用者に確認を求める (捏造させない)。
+_CALCULATION_UNBUILDABLE_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: このターンの計算式を組み立てられなかった (計算ツール自体は"
+        "使えるが、会話の数値から計算ツールが受け付ける式を組めず、実行していない)。"
+        "「計算ツールが使えない」「利用できない」と述べないこと。答えの数値を推測・断定"
+        "しないこと。{numbers}"
+    ),
+    "en": (
+        "\n\nConfirmed fact: the calculation for this turn could not be built (the "
+        "calculator tool itself is available, but no expression it accepts could be "
+        "built from the numbers in the conversation, so it was not run). Do not say "
+        "the calculator is unavailable. Do not guess or state a numeric answer. "
+        "{numbers}"
+    ),
+}
+_CALCULATION_UNBUILDABLE_NUMBERS: dict[str, str] = {
+    "ja": (
+        "会話で述べられた数値 ({numbers}) を挙げ、どの数をどう計算すればよいか利用者に"
+        "確認を求めること。"
+    ),
+    "en": (
+        "List the numbers stated in the conversation ({numbers}) and ask the user "
+        "which of them to use and how to combine them."
+    ),
+}
+_CALCULATION_UNBUILDABLE_NO_NUMBERS: dict[str, str] = {
+    "ja": "計算に必要な数値を利用者に尋ねること。",
+    "en": "Ask the user for the numbers the calculation needs.",
+}
+
 #: 過去の会話について訊かれたが、履歴検索を 1 度も実行しなかった場合の文言。
 #:
 #: 「実行していないツールについて実行したと述べない」は
@@ -2625,6 +2660,27 @@ class DeliberativeAgent:
         )
 
     @staticmethod
+    def _append_calculation_unbuildable_note(
+        messages: list[dict], stated_numbers: tuple[str, ...],
+    ) -> None:
+        """最後の user メッセージへ「式を組めなかった」注記を追記する (数を挙げて確認を求める)。"""
+        numbers = (
+            _localized(_CALCULATION_UNBUILDABLE_NUMBERS).format(
+                numbers=", ".join(stated_numbers),
+            )
+            if stated_numbers else _localized(_CALCULATION_UNBUILDABLE_NO_NUMBERS)
+        )
+        append_to_last_user(
+            messages,
+            _localized(_CALCULATION_UNBUILDABLE_GUIDANCES).format(numbers=numbers),
+            separator="",
+        )
+        logger.info(
+            "Calculation expression could not be built; asked the model to say so and "
+            "to confirm the operands %s with the user", list(stated_numbers),
+        )
+
+    @staticmethod
     def _append_history_not_searched_note(
         messages: list[dict], query: str,
     ) -> bool:
@@ -3041,6 +3097,13 @@ class DeliberativeAgent:
                 # 実測を試みたが撃てなかった。この状態で base に丸投げすると
                 # 測っていない値を断定する (_UNMEASURED_FACT_GUIDANCE 参照)。
                 self._append_unmeasured_fact_note(messages)
+            elif judgement.calculation_unbuildable:
+                # 式が calculate の式にならず、組み直しも通らなかった。「ツールが
+                # 使えない」と取り違えさせず、会話の数を挙げて確認を求めさせる
+                # (_CALCULATION_UNBUILDABLE_GUIDANCES 参照)。
+                self._append_calculation_unbuildable_note(
+                    messages, judgement.stated_numbers,
+                )
             elif judgement.calculation_rejected:
                 # 分類器の式も組み直しも門で落ちた。丸投げすると暗算の値を検証済みの
                 # 口調で述べる (_CALCULATION_REJECTED_GUIDANCES 参照)。

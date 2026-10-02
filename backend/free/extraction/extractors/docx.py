@@ -11,6 +11,14 @@ from typing import Any, BinaryIO
 
 from backend.extraction._binary_source_base import BinarySourceExtractorBase
 from backend.extraction.base import ExtractionError
+from backend.free.extraction.extractors._document_parts import IMAGE_MARK, gfm_table_lines
+
+
+def _has_image(paragraph_element) -> bool:
+    """段落に画像 (``w:drawing`` / VML の ``w:pict``) があるか。"""
+    from docx.oxml.ns import qn
+
+    return any(True for _ in paragraph_element.iter(qn("w:drawing"), qn("w:pict")))
 
 
 class DocxExtractor(BinarySourceExtractorBase):
@@ -122,19 +130,7 @@ class DocxExtractor(BinarySourceExtractorBase):
     @staticmethod
     def _table_lines(table) -> list[str]:
         """表を GFM テーブルにする (先頭行をヘッダとみなす)。"""
-        rows = [
-            [cell.text.strip().replace("|", r"\|") for cell in row.cells]
-            for row in table.rows
-        ]
-        rows = [r for r in rows if any(c for c in r)]
-        if not rows:
-            return []
-        width = max(len(r) for r in rows)
-        rows = [r + [""] * (width - len(r)) for r in rows]
-        lines = ["| " + " | ".join(rows[0]) + " |"]
-        lines.append("|" + "---|" * width)
-        lines.extend("| " + " | ".join(r) + " |" for r in rows[1:])
-        return lines
+        return gfm_table_lines([[cell.text for cell in row.cells] for row in table.rows])
 
     @classmethod
     def _extract_content(cls, doc) -> tuple[str, int, int]:
@@ -169,6 +165,10 @@ class DocxExtractor(BinarySourceExtractorBase):
             tag = child.tag.rsplit("}", 1)[-1]
             if tag == "p":
                 line = cls._paragraph_line(Paragraph(child, doc), style_name_of(child.style))
+                if not line and _has_image(child):
+                    # 画像だけの段落 (f_11 §3.3)。印が無いと画像だけの文書が
+                    # empty_content になり、追記が既存ファイルを読めずに止まる。
+                    line = IMAGE_MARK
                 if line:
                     lines.append(line)
                     para_count += 1

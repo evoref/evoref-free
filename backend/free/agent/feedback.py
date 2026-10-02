@@ -31,10 +31,16 @@ from backend.free.core.correction_target import (
     CONTRAST_MARKER,
     DEFAULT_LOOKBACK as CORRECTION_LOOKBACK,
     contrast_pair,
+    contrast_pairs,
+    old_value_core,
     resolve_correction_target,
     split_sentences,
 )
-from backend.free.core.correction_verdict import mask_quoted_speech
+from backend.free.core.correction_verdict import (
+    marks_not_own_restatement,
+    mask_quoted_speech,
+    norm_span,
+)
 from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
@@ -409,11 +415,109 @@ _ASSISTANT_OUTPUT_REF_RE = re.compile(
 _ASSERTS_CORRECT_VALUE_RE = re.compile(r"正しくは|ではなく|じゃなく|が正しい")
 
 
-def classify_correction_target(query: str) -> str:
-    """訂正候補の帰属を返す: ``assistant`` / ``self`` / ``not_correction``。
+#: 帰属の根拠が何も無かった (末尾の既定で ``assistant`` に倒した) ことを示す根拠名。
+#: 判定点 ``correction_attribution`` はこれを **棄権** として記録する (不変則 #14)。
+ATTRIBUTION_DEFAULT_EVIDENCE = "no_attribution_evidence"
 
-    純粋関数。``assistant`` のみが「直前のアシスタント応答が誤っていた」を
-    意味する。判別できないものは ``assistant`` に倒す (現行挙動を維持)。
+#: 「同じ出力のやり直し」を頼む形として訂正から外した根拠。外す前提は「直前の
+#: 出力は正しかった」なので、直前ターンが実際に失敗していれば前提が崩れ、訂正に
+#: 戻す (:meth:`FeedbackCollector._detect_correction`)。仮定の変更・質問・本人の
+#: 言い直しは直前の成否と無関係に訂正ではないので含めない。
+REDO_SAME_OUTPUT_EVIDENCE: frozenset[str] = frozenset({
+    "referential_write_edit", "reformat_request",
+})
+
+
+def _names_prior_value(text: str, value: str) -> bool:
+    """``text`` が値 ``value`` を逐語で含むか (空白無視・全角半角同一視)。
+
+    数字で始まる / 終わる値は数字の境界で見る — 「15」を「2015年」に当てない。
+    """
+    v, t = norm_span(value), norm_span(text)
+    if not v or v not in t:
+        return False
+    if not (v[0].isdigit() or v[-1].isdigit()):
+        return True
+    return re.search(r"(?<![0-9.,])" + re.escape(v) + r"(?![0-9.,])", t) is not None
+
+
+#: 帰属の文脈に入れる前のユーザー発話の件数。学習側 (経験バッファの同じセッション) と
+#: 応答パス (履歴) で同じ範囲を見る (#14(a))。訂正の宛先解決の窓と揃える。
+ATTRIBUTION_CONTEXT_TURNS = CORRECTION_LOOKBACK
+
+
+def attribution_prev_user(utterances: list[str]) -> str:
+    """訂正より前のユーザー発話 (古い順) から帰属の文脈 ``prev_user`` を組む (純粋関数)。
+
+    直近 :data:`ATTRIBUTION_CONTEXT_TURNS` 件を改行で連結する。学習側と応答パスが
+    同じこの関数を通す — 範囲が読み手ごとに違うと、同じ発話の帰属が食い違う。
+    """
+    recent = [u for u in utterances if u][-ATTRIBUTION_CONTEXT_TURNS:]
+    return "\n".join(recent)
+
+
+def _own_statements(text: str) -> list[str]:
+    """本人の申告として数える文 (平叙で、仮定・時間の対比・伝聞の標識が無い文)。"""
+    return [
+        s for s in split_sentences(mask_quoted_speech(text or ""))
+        if is_plain_statement(s) and not marks_not_own_restatement(s)
+    ]
+
+
+def _prior_value_owner(
+    query: str, *, prev_user: str, prev_response: str, prev_query: str = "",
+) -> tuple[str, str] | None:
+    """対比「X ではなく Y」の旧値 X を **誰が先に述べたか** で帰属を決める (純粋関数)。
+
+    - X が直前のアシスタント応答に在る:
+      - その応答が答えたユーザー発話 (``prev_query``) の申告の文にも X が在る →
+        ``self`` (応答は本人の申告の復唱・受け取りで、アシスタントの主張ではない)
+      - そうでない (問い・依頼に答えた応答が X を述べた) → ``assistant``。本人が
+        以前に X を述べていても、答えとしての X はアシスタントの主張
+        (「予算は10万円です」→「残りは？」→「10万円です」→「10万円ではなく5万円」)
+    - X が応答に無く、前のユーザー発話 (``prev_user``) の申告の文に在る → ``self``
+      (本人の値の言い直し・計画の変更。D01「やっぱり妻ではなく母と…」)
+    - どちらにも無い / 対比が無い → ``None`` (構造では決まらない)
+
+    申告の文は平叙で、仮定・時間の対比・伝聞の標識 (:func:`marks_not_own_restatement`)
+    の無い文だけ (問い・仮定の X は本人の値ではない)。``prev_query`` を渡さない読み手は
+    応答の X を答えか復唱か区別できないので、本人の申告を先に見る。旧値の区間に
+    区切りの無い前置きが入る形 (「やっぱり妻」) は、区間のままでどこにも当たらない
+    ときだけ :func:`old_value_core` の形で当てる。分解は :func:`contrast_pairs` の
+    1 実装 (不変則 #14a)。
+    """
+    if not prev_user and not prev_response:
+        return None
+    statements = _own_statements(prev_user)
+    answered = _own_statements(prev_query)
+    for old, _new in contrast_pairs(mask_quoted_speech(query or "")):
+        # 前置きを外した形は、区間のままでどちらにも当たらないときだけ使う
+        # (「ほうじ茶」の「茶」を本人の「緑茶」に当てない)。
+        for value in dict.fromkeys((old, old_value_core(old))):
+            in_response = _names_prior_value(prev_response or "", value)
+            if in_response and prev_query:
+                if any(_names_prior_value(s, value) for s in answered):
+                    return "self", "own_prior_value"
+                return "assistant", "assistant_prior_claim"
+            if any(_names_prior_value(s, value) for s in statements):
+                return "self", "own_prior_value"
+            if in_response:
+                return "assistant", "assistant_prior_claim"
+    return None
+
+
+def correction_attribution_reason(
+    query: str, *, prev_user: str = "", prev_response: str = "", prev_query: str = "",
+) -> tuple[str, str]:
+    """訂正候補の帰属と **その根拠名** を返す (純粋関数)。
+
+    帰属は ``assistant`` / ``self`` / ``not_correction``、根拠名は規則の識別子
+    (英語。``decision.jsonl`` の reason)。字句の規則で決まらないとき、文脈
+    (``prev_user`` = 訂正より前のユーザー発話 (:func:`attribution_prev_user` で範囲を
+    揃える)、``prev_response`` = 直前のアシスタント応答、``prev_query`` = その応答が
+    答えたユーザー発話) があれば対比の旧値の出所 (:func:`_prior_value_owner`) で決め、
+    それも無ければ ``("assistant", ATTRIBUTION_DEFAULT_EVIDENCE)`` に倒す
+    (判別できないものは ``assistant`` — 従来の挙動)。
     """
     # 「過去の誤りを **尋ねる**」形は、誰の出力を指していようと訂正ではない。
     # 出力参照より先に見る — 「私があなたの回答を訂正させたのは何回で…」は
@@ -421,29 +525,29 @@ def classify_correction_target(query: str) -> str:
     # ただし正しい値を併せて述べている場合は本物の訂正なので除外しない
     # (「あなたの回答は間違いです。正しくは 2027-01-06 です」)。
     if _ASKS_ABOUT_CORRECTION_RE.search(query) and not _ASSERTS_CORRECT_VALUE_RE.search(query):
-        return "not_correction"
+        return "not_correction", "asks_about_correction"
     # アシスタント出力への言及。「すみません、その計算は違います」のように
     # 謝罪語と併存しうるため、自己訂正判定より先に見る。
     if _ASSISTANT_OUTPUT_REF_RE.search(query):
-        return "assistant"
+        return "assistant", "assistant_output_ref"
     if _SELF_CORRECTION_RE.search(query):
-        return "self"
+        return "self", "self_correction_form"
     if _RECALL_QUESTION_RE.search(query):
-        return "not_correction"
+        return "not_correction", "recall_question"
     if _ASKS_ABOUT_DIFFERENCE_RE.search(query):
-        return "not_correction"
+        return "not_correction", "asks_about_difference"
     # 正しい値を併せて述べていれば本物の訂正 (「違うのです。正しくは 10.95 度です」)。
     if _HEARSAY_DIFFERENCE_RE.search(query) and not _ASSERTS_CORRECT_VALUE_RE.search(query):
-        return "not_correction"
+        return "not_correction", "hearsay_difference"
     # 複合動詞の「違」を除いた残りに訂正語彙が無ければ、字句一致は複合動詞
     # だけだったということ。
     stripped = _COMPOUND_DIFFERENCE_RE.sub("", query)
     if stripped != query and not any(p.search(stripped) for p in CORRECTION_PATTERNS):
-        return "not_correction"
+        return "not_correction", "compound_difference"
     if _REFORMAT_REQUEST_RE.search(query):
-        return "not_correction"
+        return "not_correction", "reformat_request"
     if _PREMISE_CHANGE_REDO_RE.search(query):
-        return "not_correction"
+        return "not_correction", "premise_change_redo"
     # 既存ファイルへの再保存を伴う依頼は編集であって訂正ではない。
     # 「3 番目を『ヘッドランプ』に直して、同じファイルに保存し直して」の
     # 「直して」が CORRECTION_PATTERNS に掛かるのを打ち消す。
@@ -454,8 +558,31 @@ def classify_correction_target(query: str) -> str:
     if REFERENTIAL_WRITE_TARGET_RE.search(query) and not any(
         p.search(query) for p in WEAK_CORRECTION_PATTERNS_ALL
     ):
-        return "not_correction"
-    return "assistant"
+        return "not_correction", "referential_write_edit"
+    # 語形の規則で決まらない対比は、旧値を誰が先に述べたかで決める
+    # (2026-10-02 監査 D01#4「やっぱり妻ではなく母と行くことになりました」が
+    # 既定の assistant に倒れていた。妻は本人の申告で、アシスタントは復唱しただけ)。
+    owner = _prior_value_owner(
+        query, prev_user=prev_user, prev_response=prev_response, prev_query=prev_query,
+    )
+    if owner is not None:
+        return owner
+    return "assistant", ATTRIBUTION_DEFAULT_EVIDENCE
+
+
+def classify_correction_target(
+    query: str, *, prev_user: str = "", prev_response: str = "", prev_query: str = "",
+) -> str:
+    """訂正候補の帰属を返す: ``assistant`` / ``self`` / ``not_correction``。
+
+    純粋関数。``assistant`` のみが「直前のアシスタント応答が誤っていた」を
+    意味する。判別できないものは ``assistant`` に倒す (現行挙動を維持)。
+    文脈 (``prev_user`` / ``prev_response``) の使い方と根拠名は
+    :func:`correction_attribution_reason`。
+    """
+    return correction_attribution_reason(
+        query, prev_user=prev_user, prev_response=prev_response, prev_query=prev_query,
+    )[0]
 
 
 # 弱い訂正パターン: 単独では新規依頼との区別がつかないため、直前ターンの
@@ -566,7 +693,9 @@ _VALUE_CHANGE_CORE_RE = re.compile(_VALUE_CHANGE_CORE)
 _QUESTION_TAIL_RE = re.compile(r"(?:か|の|でしょう)?[?？]\s*$|(?:ますか|ですか|でしょうか)[。．]?\s*$")
 
 
-def _correction_attribution(query: str) -> str | None:
+def _correction_attribution(
+    query: str, *, prev_user: str = "", prev_response: str = "", prev_query: str = "",
+) -> str | None:
     """字句一致した訂正候補の **帰属** を返す。訂正でなければ ``None``。
 
     「訂正の言い回しが出ているか」(字句) と「誰が誤っていたか」(帰属) を 1 箇所に
@@ -579,6 +708,9 @@ def _correction_attribution(query: str) -> str | None:
     引用 (鉤括弧) の内側は本人の主張ではないので、字句照合の前に
     :func:`mask_quoted_speech` で落とす — 「営業から『色が違う』という
     クレーム」の「違う」で候補を立てない (2026-09-09 監査 G-01 系)。
+
+    文脈 (``prev_user`` / ``prev_response``) は :func:`correction_attribution_reason`
+    へそのまま渡す (対比の旧値の出所で帰属を決める)。
     """
     if not query:
         return None
@@ -588,10 +720,14 @@ def _correction_attribution(query: str) -> str | None:
     )
     if not lexical:
         return None
-    return classify_correction_target(masked)
+    return classify_correction_target(
+        masked, prev_user=prev_user, prev_response=prev_response, prev_query=prev_query,
+    )
 
 
-def points_at_assistant_error(query: str) -> bool:
+def points_at_assistant_error(
+    query: str, *, prev_user: str = "", prev_response: str = "", prev_query: str = "",
+) -> bool:
     """この発話が **アシスタントの誤りの指摘** か (純粋関数)。
 
     **応答パス** (``core.inference._correction_target_note``) が使う述語。
@@ -604,8 +740,11 @@ def points_at_assistant_error(query: str) -> bool:
     ドル額 (2,400) ではなく円額 (348,000) を返した (2026-09-09 ライブ監査
     B-01)。記録側 (``_detect_correction``) はこの発話を候補にしていない —
     同じ判定を 2 箇所で別々に実装していたのが原因なので、芯を共有する。
+    文脈 (``prev_user`` / ``prev_response``) も記録側と同じものを渡す。
     """
-    return _correction_attribution(query) == "assistant"
+    return _correction_attribution(
+        query, prev_user=prev_user, prev_response=prev_response, prev_query=prev_query,
+    ) == "assistant"
 
 
 def restates_a_value(query: str) -> bool:
@@ -1094,7 +1233,9 @@ class FeedbackCollector:
         # 消費する ``user_correction`` へは、``learning.correction_verifier``
         # が直前応答との突き合わせで検証してから昇格させる (F-03)。除外正規表現は
         # 事故のたびに 1 分岐ずつ増えており、次の語形で必ずまた漏れる。
-        correction_text, detected_by = self._detect_correction(query, mode=mode)
+        correction_text, detected_by = self._detect_correction(
+            query, mode=mode, session_id=session_id,
+        )
         # 訂正と言い直しは排他: 訂正が検出されたターンを rephrase として
         # 二重学習しない
         rephrased = (
@@ -1829,31 +1970,55 @@ class FeedbackCollector:
         )
 
     def _detect_correction(
-        self, query: str, *, mode: str = "chat",
+        self, query: str, *, mode: str = "chat", session_id: str = "",
     ) -> tuple[str | None, str | None]:
         """ユーザーの訂正のうち **アシスタントの誤りに対するもの** を検出する。
 
-        字句一致で拾った候補 (``hardcoded`` / ``same_target``) は
-        ``classify_correction_target`` で帰属を判定し、ユーザー自身の申告訂正
-        (「すみません、火曜ではなく水曜でした」) と編集依頼・質問を除外する。
-        除外しないと、正しく応答したターンが失敗として学習される (実データでは
-        訂正 24 件のうち 19 件が該当した)。
+        字句一致で拾った候補 (``hardcoded`` / ``same_target``) は判定点
+        ``correction_attribution`` (:mod:`backend.free.agent.correction_attribution_gate`、
+        記録付き) で帰属を判定し、ユーザー自身の申告訂正 (「すみません、火曜では
+        なく水曜でした」) と編集依頼・質問を除外する。除外しないと、正しく応答した
+        ターンが失敗として学習される (実データでは訂正 24 件のうち 19 件が該当した)。
+        帰属には同じセッションの前のユーザー発話と直前の応答を渡す — 語形で
+        決まらない対比は旧値を誰が先に述べたかで決める (2026-10-02 監査 D01#4)。
 
-        直前ターンが実際に失敗している場合 (``_prev_turn_failed``) は、字句に
-        依らない独立した証拠があるため帰属判定を通さない。書込みが失敗した直後の
-        「同じファイルに保存し直して」は編集依頼の体裁でも本物の訂正である。
+        直前ターンが実際に失敗している場合 (``_prev_turn_failed``) でも帰属判定は
+        **飛ばさない**。直前の失敗が覆すのは「直前の出力は正しかった」を前提に
+        外した編集・書き直しの依頼 (:data:`REDO_SAME_OUTPUT_EVIDENCE`) だけで、
+        書込みが失敗した直後の「同じファイルに保存し直して」は訂正に戻す。本人の
+        言い直し・質問・仮定の変更は直前の成否と無関係に訂正ではない — 以前は
+        帰属判定ごと飛ばしており、成否の検証器の誤検知 (2026-10-02 監査 D03#3 の
+        「1 does not round from 0.383333」) の次の「訂正です。身長は175cmではなく
+        178cmでした。」が候補になった。
         """
         raw, detected_by = self._detect_correction_lexical(query, mode=mode)
-        if raw is None or self._prev_turn_failed:
+        if raw is None:
             return raw, detected_by
-        target = classify_correction_target(mask_quoted_speech(query))
-        if target != "assistant":
-            logger.debug(
-                "Correction candidate reclassified as %s (not an assistant "
-                "error); dropping: %s", target, query[:60],
-            )
-            return None, None
-        return raw, detected_by
+        from backend.free.agent.correction_attribution_gate import (
+            attribution_target,
+            correction_attribution_verdict,
+        )
+
+        verdict = correction_attribution_verdict(
+            mask_quoted_speech(query),
+            prev_user=attribution_prev_user([
+                e.query or "" for e in (getattr(self.buffer, "entries", None) or [])
+                if getattr(e, "session_id", "") == session_id
+            ]),
+            prev_response=self._prev_response,
+            prev_query=self._prev_query or "",
+        )
+        target = attribution_target(verdict)
+        if target == "assistant":
+            return raw, detected_by
+        if self._prev_turn_failed and verdict.evidence in REDO_SAME_OUTPUT_EVIDENCE:
+            # 直前の出力が失敗しているので「やり直し」は誤りへの反応 (上の説明)。
+            return raw, detected_by
+        logger.debug(
+            "Correction candidate reclassified as %s (%s; not an assistant "
+            "error); dropping: %s", target, verdict.evidence, query[:60],
+        )
+        return None, None
 
     def _detect_correction_lexical(
         self, query: str, *, mode: str = "chat",

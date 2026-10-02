@@ -172,9 +172,9 @@ class JudgeCall(GuardContext):
     #: 規則層が ``calculate`` を選んだが式が取れず降格した (「BMIを計算して」)。
     #: 層 5.95 の式合成が、クエリに数値が無くても会話の数値で式を組む手掛かり。
     calculate_requested: bool = False
-    #: 分類器の ``calculate`` を組み直した理由 (``percent_scale_slip`` /
-    #: ``recompute_ungrounded`` / ``ordinal_reference`` /
-    #: ``classifier_ignores_new_value``)。decision.jsonl の
+    #: 分類器の ``calculate`` を組み直した理由 (``classifier_expression_invalid`` /
+    #: ``percent_scale_slip`` / ``recompute_ungrounded`` / ``ordinal_reference`` /
+    #: ``classifier_ignores_new_value`` / ``classifier_ignores_query_number``)。decision.jsonl の
     #: reason に載せる (docs/f_03 §3.1)。
     recompose_reason: str = ""
     #: 分類器の ``calculate`` が門で落ち、組み直しも回数の置き換えも通らず no_tool に

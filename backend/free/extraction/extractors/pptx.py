@@ -11,6 +11,11 @@ from typing import Any, BinaryIO
 
 from backend.extraction._binary_source_base import BinarySourceExtractorBase
 from backend.extraction.base import ExtractionError
+from backend.free.extraction.extractors._document_parts import (
+    IMAGE_MARK,
+    SHAPE_MARK,
+    gfm_table_lines,
+)
 
 
 class PptxExtractor(BinarySourceExtractorBase):
@@ -60,16 +65,41 @@ class PptxExtractor(BinarySourceExtractorBase):
             )
 
     @staticmethod
-    def _extract_slides(prs) -> tuple[str, int]:
+    def _shape_lines(shape) -> list[str]:
+        """1 つの図形を行にする。文字枠の段落・表 (GFM)・画像と図形の印。
+
+        画像と文字の無い図形は印 (``[image]`` / ``[shape]``) で在ることだけを示す。
+        表と印が無いと、表だけ・図形だけのスライドが empty_content になり、
+        追記が既存ファイルを読めずに止まる (f_11 §3.3 / §5.1)。空の
+        プレースホルダ (未入力の本文枠) は印を付けない。
+        """
+        if shape.has_text_frame:
+            lines = [p.text for p in shape.text_frame.paragraphs if p.text.strip()]
+            if lines or shape.is_placeholder:
+                return lines
+        if getattr(shape, "has_table", False):
+            rows = [[cell.text for cell in row.cells] for row in shape.table.rows]
+            table_lines = gfm_table_lines(rows)
+            return ["", *table_lines, ""] if table_lines else []
+        if shape.is_placeholder:
+            return []
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            return [IMAGE_MARK]
+        if shape.shape_type in (MSO_SHAPE_TYPE.AUTO_SHAPE, MSO_SHAPE_TYPE.LINE):
+            return [SHAPE_MARK]
+        return []
+
+    @classmethod
+    def _extract_slides(cls, prs) -> tuple[str, int]:
         """全スライドからテキストを抽出"""
         texts: list[str] = []
         for i, slide in enumerate(prs.slides, 1):
             slide_texts: list[str] = []
             for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
-                        if para.text.strip():
-                            slide_texts.append(para.text)
-            if slide_texts:
-                texts.append(f"[Slide {i}]\n" + "\n".join(slide_texts))
+                slide_texts.extend(cls._shape_lines(shape))
+            body = "\n".join(slide_texts).strip("\n")
+            if body:
+                texts.append(f"[Slide {i}]\n{body}")
         return "\n\n".join(texts), len(prs.slides)

@@ -11,6 +11,7 @@ from typing import Any, BinaryIO
 
 from backend.extraction._binary_source_base import BinarySourceExtractorBase
 from backend.extraction.base import ExtractionError
+from backend.free.extraction.extractors._document_parts import IMAGE_MARK, SHAPE_MARK
 
 
 class OdfExtractor(BinarySourceExtractorBase):
@@ -92,9 +93,21 @@ class OdfExtractor(BinarySourceExtractorBase):
 
         # .odt / .odp: 見出しと段落を出現順に拾う。get_headers() /
         # get_paragraphs() は種別ごとの取得なので、順序を保つために
-        # 要素の文書順で走査する。
-        for element in body.get_elements("//text:h | //text:p"):
-            text = (element.text_recursive or "").strip()
-            if text:
-                parts.append(text)
+        # 要素の文書順で走査する。画像と文字の無い図形は印で在ることだけを
+        # 示す (無いと画像だけ・図形だけの文書が empty_content になり、追記が
+        # 既存ファイルを読めずに止まる、f_11 §3.3)。図形の中の文字は図形の
+        # text:p として拾うので、文字のある図形には印を付けない。
+        for element in body.get_elements(
+            "//text:h | //text:p | //draw:image | //draw:rect | //draw:ellipse | //draw:line",
+        ):
+            tag = element.tag
+            if tag == "draw:image":
+                parts.append(IMAGE_MARK)
+            elif tag.startswith("draw:"):
+                if not (element.text_recursive or "").strip():
+                    parts.append(SHAPE_MARK)
+            else:
+                text = (element.text_recursive or "").strip()
+                if text:
+                    parts.append(text)
         return "\n\n".join(parts)
