@@ -44,6 +44,7 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     # (2) 本文が自分自身 / 手元の事実と食い違う。プロンプトと推論の寄与が大きい。
     ("arithmetic contradiction", "outcome_contradiction"),
     ("conclusion contradiction", "outcome_contradiction"),
+    ("sign contradiction", "outcome_contradiction"),
     ("response retracts", "outcome_contradiction"),
     ("retracted by assistant", "outcome_contradiction"),
     ("measured value contradiction", "outcome_contradiction"),
@@ -51,6 +52,7 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     ("date result ignored", "outcome_contradiction"),
     ("claimed completion while blocked", "outcome_contradiction"),
     ("fabricated count", "outcome_contradiction"),
+    ("fabricated entity", "outcome_contradiction"),
     # (3) 明示された指示を守っていない。プロンプトの寄与が大きい。
     ("length constraint", "outcome_instruction"),
     ("output form", "outcome_instruction"),

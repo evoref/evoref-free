@@ -18,6 +18,7 @@ import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
+from backend.free.rag.rerank_llamacpp import fit_rerank_pool
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -25,12 +26,11 @@ if TYPE_CHECKING:
 
 logger = get_logger("agent.tools.history_rerank")
 
-#: 1 候補あたりリランカーへ渡す本文の上限 (字)。自己テストの 1 件あたり ms は実際の
-#: チャンク長 (300 トークン前後、c_16 §7.2.1) で測っているので、それに揃えて締切と
-#: 候補数の前提を崩さない。索引の検索テキスト (最大 5000 字) をそのまま渡すと 1 件が
-#: 10 倍以上重くなる。
+#: 1 候補あたりリランカーへ渡す本文の上限 (字)。索引の検索テキスト (最大 5000 字) をそのまま
+#: 渡すと 1 件が 10 倍以上重くなる。送る件数は検索経路と同じトークン予算 (:func:`fit_rerank_pool`)
+#: でも止まる。
 RERANK_PASSAGE_CHARS = 400
-#: プールは ``limit`` のこの倍まで (上限は ``RerankClient.candidates``)。
+#: プールは ``limit`` のこの倍まで (上限は ``RerankClient.candidates`` と ``token_budget``)。
 POOL_PER_LIMIT = 3
 #: プールがこれ未満なら呼ばない (並べ替える相手が無い)。
 MIN_POOL = 2
@@ -40,6 +40,7 @@ class HistoryReranker(Protocol):
     """再順位のクライアント (EvorefGen の ``RerankClient`` が満たす面)。"""
 
     candidates: int
+    token_budget: float | None
 
     async def rerank(
         self, query: str, documents: Sequence[str], *, ids: Sequence[str] | None = None,
@@ -70,7 +71,10 @@ def rerank_passage(entry: "IndexEntry", query: str, *, max_chars: int = RERANK_P
 
 
 def pool_size(limit: int, reranker: HistoryReranker) -> int:
-    """1 回に並べ替える候補数 (``limit × POOL_PER_LIMIT`` とリランカーの候補数の小さい方)。"""
+    """1 回に並べ替える件数の上限 (``limit × POOL_PER_LIMIT`` とリランカーの件数の上限の小さい方)。
+
+    実際に送る件数はトークン予算でこれより少なくなりうる (:func:`rerank_history_candidates`)。
+    """
     return max(0, min(max(0, int(limit)) * POOL_PER_LIMIT, int(reranker.candidates)))
 
 
@@ -87,8 +91,12 @@ async def rerank_history_candidates(
     プール (上位 :func:`pool_size` 件) を再順位の降順 (同点は字句の順) に並べ、プール外は
     後ろに字句の順で続ける。字句スコア (``relevance_score`` の元) は書き換えない。
     """
-    n_pool = pool_size(limit, reranker)
-    pool = list(candidates[:n_pool])
+    head = list(candidates[:pool_size(limit, reranker)])
+    passages = [rerank_passage(e, query) for e, _ in head]
+    n_pool = fit_rerank_pool(
+        query, passages, max_count=len(head), token_budget=reranker.token_budget,
+    )
+    pool = head[:n_pool]
     started = time.perf_counter()
     reason = ""
     scores: list[float] | None = None
@@ -97,7 +105,7 @@ async def rerank_history_candidates(
     else:
         ids = [entry.session_id for entry, _ in pool]
         try:
-            raw = await reranker.rerank(query, [rerank_passage(e, query) for e, _ in pool], ids=ids)
+            raw = await reranker.rerank(query, passages[:n_pool], ids=ids)
         except Exception as e:  # noqa: BLE001 — 再順位の失敗で検索を止めない
             logger.warning("History rerank failed, keeping the lexical order: %s: %s", type(e).__name__, e)
             raw = None

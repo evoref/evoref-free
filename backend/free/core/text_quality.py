@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable, Sequence
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from functools import cache
 from backend.free.core.numerals import kanji_number_value
 from backend.free.core.relative_date import PERIOD_UNIT_ALTERNATION
 from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
+    find_sign_contradiction,
     iter_ja_numbers,
     normalize_numerals,
 )
@@ -289,7 +291,8 @@ def _add_claim(claims: dict[str, set[str]], run: str, number: str) -> None:
 #:
 #: 形は 2 種:
 #:
-#: - ``(注: …)`` / ``（注：…）`` — 開示注記。括弧は 1 段までの入れ子を許す
+#: - ``(注: …)`` / ``（注：…）`` / ``(System note: …)`` (en の開示注記。モデルが自分で
+#:   書く ``(Note: …)`` と区別する固有の見出し) — 開示注記。括弧は 1 段までの入れ子を許す
 #:   (「(注: 上限 300 字 (空白込み) を超過)」のような形で ``[^）)]*`` が途中で
 #:   閉じて注記が残った)。連続して複数付くこともある (文字数 + 禁止語)。
 #: - ``※会話の前半は参照できない…`` — 可視範囲の断り
@@ -302,7 +305,7 @@ def _add_claim(claims: dict[str, set[str]], run: str, number: str) -> None:
 #:
 #: いずれも **文末に連なっている分だけ** を落とす。本文中の丸括弧には触らない。
 _SYSTEM_NOTE_UNIT = (
-    r"[（(]注[:：](?:[^（）()]|[（(][^（）()]*[）)])*[）)]"
+    r"[（(](?:注|System note)[:：](?:[^（）()]|[（(][^（）()]*[）)])*[）)]"
     r"|(?:※\s*)?会話の前半は参照できない(?:ため|ので|から|、)[^\n]*"
 )
 SYSTEM_NOTE_TAIL_RE = re.compile(
@@ -674,7 +677,7 @@ def claims_completed_state_change(text: str) -> str | None:
 #: EvorefMem (注入側) と EvorefLoop (生成側) の両方から使うため core に置く。
 _TASK_LOG_FRAGMENT_RE = re.compile(
     r"Written\s+\d+\s+bytes\s+to\s+\S"
-    r"|\[(?:done|failed|skipped)\]\s",
+    r"|\[(?:done|failed|skipped|pending)\]\s",
 )
 
 
@@ -889,6 +892,27 @@ def strip_first_person_topic(text: str) -> str:
     return _FIRST_PERSON_TOPIC_RE.sub("", text or "", count=1)
 
 
+#: **述語を省いて目的語で終わる依頼** の文末 (「両方を1日で回るプランを。」
+#: 「それぞれの見どころを3つずつ。」)。``を`` で目的語を示したまま、数量
+#: (任意) と句点で文が終わる。値の言明は ``を`` の後に必ず述語が続くので
+#: (「猫を 2 匹飼っています」)、この形は依頼でしかない。
+#:
+#: :data:`_REQUEST_ENDING_RE` の 1 選択肢であり、学習側の継続指示の判定
+#: (:func:`backend.free.core.context_bound.refers_to_previous_turn`) も
+#: :func:`ends_with_elided_predicate_request` 経由でこの 1 本を読む
+#: (不変則 #14 (a): 「依頼の文末」の定義を 2 つ持たない)。以前は学習側だけが
+#: 「…を。」を継続指示と読み、記憶側は依頼と読まなかったため、依頼文が
+#: 言明として補助タスクの命名に回った (2026-10-05 trace 8232204694b3)。
+#:
+#: 述語の無い断片 (「本を。」「誕生日には花を。」) も依頼に数える。値を述べて
+#: いない点は依頼と同じで (どちらも記憶の値にならない)、狭めて得るものが無い
+#: ので受け入れる (2026-10-05 独立レビュー L1)。
+_ELIDED_PREDICATE_REQUEST_TAIL = (
+    r"を\s*(?:[0-9０-９一二三四五六七八九十]{1,3}\s*(?:つ|個|点|件|行|文|項目|案)"
+    r"\s*(?:ずつ)?)?"
+    r"[。．.！!\s\"'」』）)]*\s*$"
+)
+
 #: アシスタントへの **依頼** の文末。疑問形ではないが、ユーザー自身の事実の
 #: 表明でもない。
 #:
@@ -977,8 +1001,98 @@ _REQUEST_ENDING_RE = re.compile(
     r"[。．.！!\s\"'」』）)]*\s*$"
     # ``べ`` は ``すべて`` (副詞) と衝突するので、その 1 語だけ手前で外す。
     r"|(?:[いえきぎしちにびみりっん]|(?<!す)べ)[てで]"
-    r"[。．.！!\s\"'」』）)]*\s*$",
+    r"[。．.！!\s\"'」』）)]*\s*$"
+    # 述語を省いて目的語で終わる依頼 (_ELIDED_PREDICATE_REQUEST_TAIL)。
+    "|" + _ELIDED_PREDICATE_REQUEST_TAIL,
 )
+
+_ELIDED_PREDICATE_REQUEST_RE = re.compile(_ELIDED_PREDICATE_REQUEST_TAIL)
+
+
+def ends_with_request(sentence: str) -> bool:
+    """1 文が依頼の文末 (:data:`_REQUEST_ENDING_RE`) で終わるか (純粋関数)。"""
+    return bool(_REQUEST_ENDING_RE.search(sentence or ""))
+
+
+def ends_with_elided_predicate_request(sentence: str) -> bool:
+    """述語を省いて目的語で終わる依頼 (「〜を。」「〜を3つずつ。」) か (純粋関数)。
+
+    :func:`ends_with_request` の部分集合 (同じ正規表現の 1 選択肢)。
+    """
+    return bool(_ELIDED_PREDICATE_REQUEST_RE.search(sentence or ""))
+
+
+#: 文末の **願望・意志** の述語 (たい / つもり / 動詞 + 予定 / 意志形 + と思う)。
+#: 閉じた文法の類で、語彙の列挙ではない。この形の文は話者自身の予定・希望の
+#: 表明であって、世界についての言明ではない (「1日目は嵐山、2日目は東山に
+#: したいです。」が ``mem.world.assertion.travel_itinerary`` として別の会話へ
+#: 注入された、2026-10-05 trace 8232204694b3)。
+#:
+#: 願望の ``たい`` は動詞の連用形 (漢字の語幹 / い段・え段のかな) に付く。形容詞の
+#: 語尾 (冷たい / 重たい / 眠たい / 平たい / つめたい / めでたい / けむたい /
+#: ありがたい / 野暮ったい) と推量の ``みたい`` (「雨みたいです」「原因みたい
+#: です」) は除く。``み`` を丸ごと除くので「読みたい」「住みたい」も拾わない —
+#: 推量と字面で分けられないので、落とす側 (世界の事実として残す = 従来どおり)
+#: に倒す。
+_OWN_WISH_TAIL_RE = re.compile(
+    rf"(?<=[{KANJI}いきぎしじちにひびりえけげせぜてでねへべめれ])"
+    r"(?<![冷重眠平])(?<!つめ)(?<!めで)"
+    r"たい(?:んです|のです|です|と(?:思|考え)(?:う|います|っています|ています))?"
+    r"[。．.！!\s]*$",
+)
+#: 意志形 + と思う / にしよう。推量 (``だろうと思う`` / ``でしょうと思う``) は除く。
+_OWN_VOLITION_TAIL_RE = re.compile(
+    r"(?:(?:しよう|ましょう|(?<!だ)[おこごそぞとどのぼぽもよろ]う)"
+    r"と(?:思|考え)(?:う|います|っています|ています)"
+    r"|(?:に|と)しよう)"
+    r"[。．.！!\s]*$",
+)
+#: 予定・つもり。主語が本人と言えるときだけ本人の予定 (:func:`_topic_is_self_or_time`)。
+#: ``予定`` は動詞の連体形 (ひらがな) に続くものだけ — 「リリースは10月の予定
+#: です。」は日付の言明として残す。
+_OWN_PLAN_TAIL_RE = re.compile(
+    r"(?:つもり(?:です|だ|でいます)?"
+    r"|(?<=[うくぐすつぬぶむる])予定(?:です|だ|でいます|にしています)?)"
+    r"[。．.！!\s]*$",
+)
+#: 節頭の主題 / 主語 (「兄は」「新製品は」「Python 3.14 は」「明日は」)。
+_CLAUSE_TOPIC_RE = re.compile(r"(?:^|[、，,])\s*([^、，,。]{1,20}?)\s*(?:は|が)")
+#: 時を表す主題の数字形 (「10日は」「3月は」「週末は」は語彙で持たない)。
+_TIME_TOPIC_NUMBER_RE = re.compile(r"\d+\s*(?:日|月|年|週|時)")
+
+
+def _topic_is_self_or_time(sentence: str) -> bool:
+    """節頭の主題がすべて本人 (一人称) か時の表現か (主題が無ければ真、純粋関数)。
+
+    「兄は来年結婚する予定です。」「新製品は来月発売する予定です。」のように
+    主題が他者・物なら本人の予定ではない。時の語は ``core.temporal_deixis`` の
+    1 本を読む。分からない主題 (「夏休みは」) は本人と言えないので偽 — 落とす側
+    (世界の事実として残す = 従来どおり) に倒す。
+    """
+    from backend.free.core.temporal_deixis import all_terms
+
+    time_terms = all_terms()
+    for m in _CLAUSE_TOPIC_RE.finditer(sentence):
+        topic = m.group(1).strip()
+        if _SELF_REFERENCE_RE.search(topic):
+            continue
+        if any(term in topic for term in time_terms) or _TIME_TOPIC_NUMBER_RE.search(topic):
+            continue
+        return False
+    return True
+
+
+def states_own_intention(sentence: str) -> bool:
+    """1 文が話者自身の願望・意志 (予定・希望) で終わるか (純粋関数)。
+
+    動詞の活用の閉じた類で決める (意味の分類ではないので判定点の契約には
+    載せない — c_17 §1.1)。``予定`` / ``つもり`` は主題が本人か時の表現のとき
+    だけ (:func:`_topic_is_self_or_time`)。
+    """
+    text = (sentence or "").strip()
+    if _OWN_WISH_TAIL_RE.search(text) or _OWN_VOLITION_TAIL_RE.search(text):
+        return True
+    return bool(_OWN_PLAN_TAIL_RE.search(text)) and _topic_is_self_or_time(text)
 
 #: 一人称マーカー。依頼形でもこれを伴う文は本人の事実表明を含みうるため
 #: (例:「私はダークテーマが好きなので、そう設定してください。」)、依頼を
@@ -988,11 +1102,19 @@ _SELF_REFERENCE_RE = re.compile(r"(?:私|僕|俺|自分|わたし|ぼく|うち)
 
 #: 本人以外の人を指す名詞 (家族・続柄・関係者・三人称)。この語に主格 / 主題の
 #: 助詞が続く節は **その人についての** 述語で、本人の属性ではない。
-_OTHER_PERSON_NOUN = (
+#: 人を呼ぶ敬称 (人名にも続柄の語にも付く)。:data:`_PERSON_SUFFIX` と人名の検査
+#: (:data:`_ANSWER_NAME_RE`) が共有する (不変則 #14(a))。
+_NAME_HONORIFIC = r"さん|ちゃん|くん|君"
+#: 人を指す語の後ろに付く敬称・複数の接尾 (「妻さん」は無いが「娘ちゃん」「友達たち」)。
+_PERSON_SUFFIX = rf"(?:{_NAME_HONORIFIC}|たち|達)"
+_OTHER_PERSON_WORDS = (
     r"(?:妹|弟|姉|兄|母|父|両親|祖父|祖母|夫|妻|主人|旦那|家内|息子|娘|子ども|子供|"
     r"孫|叔父|叔母|甥|姪|いとこ|従兄弟|従姉妹|親戚|友人|友達|同僚|上司|部下|同期|"
     r"先輩|後輩|恋人|彼氏|彼女|彼|パートナー|ルームメイト|隣人|知人|先生|社長)"
-    r"(?:さん|ちゃん|くん|君|たち|達)?"
+)
+_OTHER_PERSON_NOUN = (
+    _OTHER_PERSON_WORDS
+    + _PERSON_SUFFIX + "?"
     # 語の境界: 直後が助詞・区切り・括弧 (「夫婦」「社長室」「娘道成寺」を人と読まない)
     r"(?=[がはもをにでとのへやか、。，,・（(「」）)\s]|$)"
 )
@@ -1002,19 +1124,19 @@ _OTHER_PERSON_NOUN_RE = re.compile(_OTHER_PERSON_NOUN + r"(?:が|は|も)")
 _MODIFIED_PERSON_RE = re.compile(
     r"[^、。，,！!？?\n]{0,12}?の(?P<person>" + _OTHER_PERSON_NOUN + r")",
 )
-_PERSON_HONORIFIC_TAIL_RE = re.compile(r"(?:さん|ちゃん|くん|君|たち|達)$")
+_PERSON_HONORIFIC_TAIL_RE = re.compile(_PERSON_SUFFIX + "$")
 
 
 #: 人を指す語の直後の斜格の助詞。「息子と一緒に」「妻に」「娘を」— その人は
 #: 述語の主体でも「いる」対象でもなく、別の事柄の相手・目的である。
 _OBLIQUE_AFTER_PERSON_RE = re.compile(
-    r"^(?:さん|ちゃん|くん|君|たち|達)?(?:と一緒に|と共に|とともに|と|に|へ|を|から|より|まで)",
+    "^" + _PERSON_SUFFIX + r"?(?:と一緒に|と共に|とともに|と|に|へ|を|から|より|まで)",
 )
 #: 棄権 (:func:`person_trigger_abstains`) に使う斜格 — **同行・起点・方向** だけ。
 #: を格・に格・裸の「と」は家族構成そのものの言明がとる形なので含めない
 #: (「妻を亡くしました」「妻に先立たれました」「夫と共働きです」)。
 _COMPANION_AFTER_PERSON_RE = re.compile(
-    r"^(?:さん|ちゃん|くん|君|たち|達)?"
+    "^" + _PERSON_SUFFIX + "?"
     r"(?:と一緒に|と共に|とともに|と[0-9０-９一二三四五六七八九十]+人で|へ|から|より|まで)",
 )
 #: 家族・関係の **存在 / 同居** を述べる述語。これがあれば人の語は属性の値。
@@ -1129,7 +1251,7 @@ def attribute_belongs_to_another_person(
             head = text[:pos]
             last_other = -1
             for m in _OTHER_PERSON_NOUN_RE.finditer(head):
-                noun = re.sub(r"(?:さん|ちゃん|くん|君|たち|達)?(?:が|は|も)$", "", m.group(0))
+                noun = re.sub(_PERSON_SUFFIX + r"?(?:が|は|も)$", "", m.group(0))
                 if noun in own_words:
                     continue
                 last_other = m.start()
@@ -1197,6 +1319,28 @@ def value_modifies_another_person(
             return False
         person = _PERSON_HONORIFIC_TAIL_RE.sub("", m.group("person"))
         if person in own:
+            return False
+    return saw
+
+
+def value_followed_by_another_persons_subject(sentence: str, value: str) -> bool:
+    """``value`` の後ろ (同じ文の中) に本人以外の人の主語 (「息子が」「妻は」) があるか (純粋関数)。
+
+    「キャンプは息子がやめました。」のキャンプは主題で、述語の主語は息子
+    (2026-10-05 レビュー)。:func:`attribute_belongs_to_another_person` は値の **前** の
+    主語、:func:`value_modifies_another_person` は値が修飾する人を見るので、値の後ろに
+    置いた主語を拾えない。人名詞の一覧は同じもの (:data:`_OTHER_PERSON_NOUN_RE`)。
+    ``value`` の全出現の後ろに他者の主語があるときだけ True。
+    """
+    text = sentence or ""
+    if not text or not value:
+        return False
+    saw = False
+    search_from = 0
+    while (pos := text.find(value, search_from)) >= 0:
+        search_from = pos + len(value)
+        saw = True
+        if _OTHER_PERSON_NOUN_RE.search(text, pos + len(value)) is None:
             return False
     return saw
 
@@ -1327,6 +1471,32 @@ _QUANTITY_PREMISE_RE = re.compile(
 )
 
 
+def poses_only_questions_or_requests(text: str) -> bool:
+    """本文が問いと依頼だけでできているか — 問いに置いた数量の前提も問いの一部と読む (純粋関数)。
+
+    :func:`carries_no_assertion` / :func:`states_no_user_value` は、問いの前に置いた
+    数量の前提 (:func:`_states_premise_before_question`) を「値あり」と読む — 後の
+    セッションの想起 (「私が注文した個数は」) の根拠になるため (E-05)。しかし試算の
+    前提の多くは **その会話の仮定** で、別の会話へ持ち出すと今の問いの数を取り違えさせる
+    (2026-10-05 ライブ監査 trace 22d3d78a7b38: 「元本との差額はいくらですか？」に別の
+    会話の「100万円を年利3%の複利で10年運用すると…？」が 3 件 ``(過去の記録)`` で載った)。
+    この関数は数量の前提の例外だけを外して「問い・依頼だけか」を返す
+    (:func:`_is_non_assertive_sentence` の ``premise_is_value=False``)。問いの前の節で
+    本人が言明した文 (「私の誕生日は3月14日なんですけど、あと何日ですか？」) は言明を
+    含むので偽。言明の文が 1 つでもあれば偽。空なら偽 (判定の根拠が無い)。
+    """
+    sentences = [s.strip() for s in _SENTENCE_RE.findall(text or "")]
+    sentences = [s for s in sentences if s]
+    if not sentences:
+        return False
+    return all(_is_non_assertive_sentence(s, premise_is_value=False) for s in sentences)
+
+
+def mentions_self(text: str) -> bool:
+    """本文に一人称 (私 / 僕 / 自分 …、:data:`_SELF_REFERENCE_RE`) があるか (純粋関数)。"""
+    return bool(_SELF_REFERENCE_RE.search(text or ""))
+
+
 def _states_premise_before_question(sentence: str) -> bool:
     """疑問文が、問いの前に **本人が置いた数量の前提** を含むか (純粋関数)。
 
@@ -1339,14 +1509,18 @@ def _states_premise_before_question(sentence: str) -> bool:
     return bool(_QUANTITY_PREMISE_RE.search(sentence))
 
 
-def _is_non_assertive_sentence(sentence: str) -> bool:
+def _is_non_assertive_sentence(sentence: str, *, premise_is_value: bool = True) -> bool:
     """1 文が「値の表明ではない」か (疑問形 または 純粋な依頼形)。
 
     疑問形でも、問いの前に本人の数量の前提を置いていれば値の表明を兼ねる
-    (:func:`_states_premise_before_question`)。
+    (:func:`_states_premise_before_question`)。``premise_is_value=False`` なら数量の前提を
+    値と読まず、依頼と同じく **前の節の本人の言明** (:func:`_asserts_before_request`) だけを
+    値と読む (:func:`poses_only_questions_or_requests`)。
     """
     if _INTERROGATIVE_TAIL_RE.search(sentence):
-        return not _states_premise_before_question(sentence)
+        if premise_is_value:
+            return not _states_premise_before_question(sentence)
+        return not _asserts_before_request(sentence)
     if not _REQUEST_ENDING_RE.search(sentence):
         return False
     return not _asserts_before_request(sentence)
@@ -1379,6 +1553,9 @@ def _looks_like_bare_noun_fragment(sentence: str, *, max_len: int = 20) -> bool:
 
 __all__ = [
     "abstains_on_reference_material",
+    "ends_with_elided_predicate_request",
+    "ends_with_request",
+    "states_own_intention",
     "count_response_defects",
     "response_defect_total",
     "asks_verbatim_excerpt",
@@ -1425,6 +1602,10 @@ __all__ = [
     "unwritten_file_claims",
     "unwritten_file_disclosure_note",
     "fabricated_household_count",
+    "asks_for_person",
+    "ungrounded_answer_names",
+    "unread_file_entity_note",
+    "sign_correction_note",
 ]
 
 #: 「N 人」「N 名」の N。漢数字・全角・半角を受ける。
@@ -1510,6 +1691,133 @@ def fabricated_household_count(
             continue
         return f"{m.group(0)} is not a count the user stated"
     return None
+
+
+#: 答えとして敬称付きで名指した人名 (漢字・カタカナの連なり + 敬称 + 断定)。T2 の形
+#: 「一番給与が高い人は、佐藤健太さんです。」だけを見る — 「佐藤さんの給与は読めて
+#: いません」のように答えの位置に無い名前 (否定・断りの文の主題) は数えない。直前の
+#: 「お / ご」は敬語の接頭で人名ではない (「お客様」「ご苦労様」)。連なりの途中から
+#: 始めない (直前が同じ字種なら当たらない)。敬称は :data:`_NAME_HONORIFIC` と共有する。
+_ANSWER_NAME_RE = re.compile(
+    rf"(?<![おご{KANJI}{KANJI_MARKS}{KATAKANA_WORD}])"
+    rf"(?P<name>[{KANJI}{KANJI_MARKS}{KATAKANA_WORD}]{{2,8}})(?:{_NAME_HONORIFIC}|様|氏)"
+    r"\**(?=です|でした|だった|だ[。！!、]|である|となります|になります|で[、,])"
+)
+#: 人名でなく続柄・役割・組織・地名を指す連なり。続柄・役割の語は
+#: :data:`_OTHER_PERSON_WORDS` と共有し (不変則 #14(a))、ほかは閉じた構造の接尾
+#: (「〇〇会社」「営業部」「東京都」「各位」「経理担当」「運転手」「看護師」「担当者」)。
+_ROLE_OR_ORG_RE = re.compile(
+    rf"^{_OTHER_PERSON_WORDS}$|会社|(?:社|部|課|室|都|道|府|県|各位|担当|先生|[者員長手師])$"
+)
+#: 名前の前に連なった順位・役職・所属の末尾 (「1位佐藤」の「位」、「担当者田中」の「者」、
+#: 「営業部長田中」の「長」)。ここで切った残りを名前として接地を見る。「部」は含めない —
+#: 阿部・服部・長谷部のように姓の末尾に来るので、切ると姓が消えて名だけで接地する。
+_NAME_PREFIX_TAIL_RE = re.compile(r"(?:位|者|員|長|課|室|社|担当|先生)$")
+#: カタカナだけの連なり (読みの表記・外来の役割語。漢字の名前と突き合わせられない)。
+_KATAKANA_ONLY_RE = re.compile(rf"^[{KATAKANA_WORD}]+$")
+#: 人を尋ねる問い (「誰」「どなた」「名前」)。人名の検査はこの問いの答えだけに掛ける
+#: (:func:`asks_for_person`)。
+_ASKS_PERSON_RE = re.compile(
+    r"誰|だれ|どなた|どの人|名前|氏名|\bwho(?:m|se)?\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_person(query: str) -> bool:
+    """問いが人を尋ねているか (純粋関数)。
+
+    人名の検査 (:func:`ungrounded_answer_names`) の門。それ以外の問いの答えに出る
+    「〜さんです」は役割・呼称の語 (「新人さん」「大家さん」「職人さん」) が多く、
+    人名と字面で見分けられない。語を足して除外を広げる代わりに、名前が答えになる
+    問いに絞る (不変則 #14)。
+    """
+    return bool(_ASKS_PERSON_RE.search(query or ""))
+
+
+def _name_is_grounded(name: str, grounded: str) -> bool:
+    """名前 (前に連なった順位・役職を除いたもの) が ``grounded`` にあるか。"""
+    if name in grounded:
+        return True
+    for i in range(1, len(name) - 1):
+        if _NAME_PREFIX_TAIL_RE.search(name[:i]) and name[i:] in grounded:
+            return True
+    return False
+
+
+def ungrounded_answer_names(
+    response: str, grounded: str,
+) -> tuple[list[str], list[str]]:
+    """答えとして敬称付きで名指した人名のうち ``grounded`` に無いもの (出現順・重複なし)。
+
+    2026-10-05 ライブ監査 T2: staff.csv の読みが失敗した次のツール無しのターンで
+    「一番給与が高い人は、佐藤健太さんです。」と、どこからも取っていない人名を答えた。
+
+    Returns:
+        ``(漢字を含む名前, カタカナだけの名前)``。名前の接地は、前に連なった順位・
+        役職 (「1位」「担当者」「営業部長」) を除いた **名前全体** が ``grounded`` に
+        あること — 「佐藤」しか無いのに「佐藤健太」、「健太」しか無いのに「佐藤健太」と
+        述べたのはどちらも名を補っている。カタカナだけの名前は読み (「サトウ」と
+        「佐藤」) や外来の役割語 (「スタッフさん」) と区別できないので分けて返す
+        (呼出側は失敗にしない)。
+
+    敬称の無い人名 (「総大将は徳川家康です」) は見ない — 一般知識の答えの人名を
+    巻き込まないための枠で、呼出側も読めていないファイルの確定事実を渡した、人を
+    尋ねるターン (:func:`asks_for_person`) に限って呼ぶ (字句の鍵による出力検査、
+    docs/c_17 §7 の対象外)。
+    """
+    names: list[str] = []
+    kana: list[str] = []
+    for m in _ANSWER_NAME_RE.finditer(response or ""):
+        name = m.group("name")
+        if name in names or name in kana or _ROLE_OR_ORG_RE.search(name):
+            continue
+        if _name_is_grounded(name, grounded or ""):
+            continue
+        (kana if _KATAKANA_ONLY_RE.match(name) else names).append(name)
+    return names, kana
+
+
+def _output_note(key: str, **kwargs: str) -> str:
+    """末尾の開示注記を応答の言語 (``i18n.prompt_locale``) で組む。"""
+    from backend.i18n_helper import msg_for_locale, prompt_locale
+
+    return "\n\n" + msg_for_locale(prompt_locale(), key, **kwargs)
+
+
+def unread_file_entity_note(files: "Sequence[str]", names: "Sequence[str]") -> str:
+    """読めていないファイルの問いに根拠の無い人名で答えたときに末尾へ足す開示文。
+
+    ja は ``(注: …)``、en は ``(System note: …)`` の形 (``strip_system_notes`` が
+    記憶・経験へ積む前に落とす)。文言は i18n (``agent.output_note.*``)。
+    """
+    if not files or not names:
+        return ""
+    return _output_note(
+        "agent.output_note.unread_file_entity",
+        files=", ".join(files), names=", ".join(names),
+    )
+
+
+def sign_correction_note(response: str) -> str:
+    """冒頭の値の符号が本文の計算と異なることを末尾へ足す開示文 (無ければ空)。
+
+    判定は ``response_arithmetic.find_sign_contradiction`` と同じ 1 本
+    (``sign_contradiction_values``)。本文は既にストリーミングで送っているので書き換え
+    ず、注記で示す (2026-10-05 ライブ監査: 「2人で4000円です。… = -4,000円」)。
+    文言は **符号が異なる** ことだけを述べ、どちらが正しいか (残りか不足か) は言わない —
+    判定は「冒頭が符号無し・本文がラベル付きの負の値」の形しか見ておらず、変化量や
+    差の向き (「1500 度下がります」/「変化 = -1500」) でも当たる。残高・残りを主張する
+    文かを見分ける語彙の SSOT は無いので、語を足して絞らない (不変則 #14)。
+    """
+    from backend.free.core.response_arithmetic import sign_contradiction_values
+
+    found = sign_contradiction_values(response)
+    if found is None:
+        return ""
+    lead, magnitude = found
+    return _output_note(
+        "agent.output_note.sign_differs", lead=lead, magnitude=magnitude,
+    )
 
 #: 「<パス> に書き込みました」型の主張。**実際に書けたか** は別途 file system で
 #: 確かめる (下記 :func:`unwritten_file_claims`)。
@@ -1954,6 +2262,37 @@ _PERIOD_DENOMINATOR_TAIL_RE = re.compile(
 )
 
 
+#: 数の直後の丸めの向きの明示 (閉じた語)。切り捨て・切り上げは明示があるときだけ
+#: 受け入れる — 黙った切り上げは 2026-09-22 の「約27.8」(27.7177)、黙った切り捨ては
+#: 2026-10-02 の「約11年」(11.9) と区別できない。
+_ROUND_DOWN_TAIL_RE = re.compile(
+    r"[^。\n]{0,12}?(?:切り捨て|切捨て|round(?:ed|ing)?\s+down|truncated)", re.IGNORECASE,
+)
+_ROUND_UP_TAIL_RE = re.compile(
+    r"[^。\n]{0,12}?(?:切り上げ|切上げ|round(?:ed|ing)?\s+up)", re.IGNORECASE,
+)
+
+
+def _accepted_roundings(
+    magnitude: float, decimals: int, *, round_down: bool, round_up: bool,
+) -> set[Decimal]:
+    """表示の桁 ``decimals`` で受け入れる丸めの値 (純粋関数)。
+
+    四捨五入 (``ROUND_HALF_UP``) は常に、切り捨て (``ROUND_FLOOR``) / 切り上げ
+    (``ROUND_CEILING``) は明示があるときだけ。Python の ``round`` は偶数丸めで、
+    1343916.5 → 1,343,917 円 / BMI 24.25 → 24.3 を誤りとしていた (独立レビュー 2026-10-05)。
+    浮動小数の 2 進誤差を持ち込まないよう、10 進の表記 (``repr``) から丸める。
+    """
+    exact = Decimal(repr(magnitude))
+    quantum = Decimal(1).scaleb(-decimals)
+    modes = [ROUND_HALF_UP]
+    if round_down:
+        modes.append(ROUND_FLOOR)
+    if round_up:
+        modes.append(ROUND_CEILING)
+    return {exact.quantize(quantum, rounding=mode) for mode in modes}
+
+
 def misrounded_result_values(text: str, result: float | None) -> list[str]:
     """``text`` の数値のうち、計算結果の近くにあるのに **その桁で丸めても一致しない** もの。
 
@@ -1962,7 +2301,8 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
     監査の再検証): 前ターンに暗算で「BMIは約27.8」と答え、訂正後のターンで
     calculate が 27.7177 を返しても、同じ「約27.8」を一字一句繰り返した。
     値の桁 (小数 1 桁なら 0.1) で丸めた結果と比べるので、「約28」「27.7」は
-    一致扱い。対象は結果から最小桁 1 つぶん以内の数だけ — それより離れた数は
+    一致扱い。受け入れる丸めは四捨五入と、明示した切り捨て・切り上げ
+    (:func:`_accepted_roundings`、2026-10-05)。対象は結果から最小桁 1 つぶん以内の数だけ — それより離れた数は
     別の量 (「標準は25未満」) か、:func:`ignores_calculate_result` が扱う大外れ。
     率の分母の期間 (「1 週間あたり 0.38kg」の 1) も別の量で、結果の丸めではない
     (2026-10-02 ライブ監査 D03#3: 結果 0.3833 に対する「1」を丸め違いとし、正答の
@@ -1984,7 +2324,15 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
         decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
         if abs(num.value - magnitude) > 10 ** -decimals:
             continue  # 最小桁 1 つぶんより離れた数は別の量 (基準値の 25 等)
-        if round(magnitude, decimals) != round(num.value, decimals) and raw not in out:
+        accepted = _accepted_roundings(
+            magnitude, decimals,
+            round_down=_ROUND_DOWN_TAIL_RE.match(body, num.end) is not None,
+            round_up=_ROUND_UP_TAIL_RE.match(body, num.end) is not None,
+        )
+        shown = Decimal(repr(num.value)).quantize(Decimal(1).scaleb(-decimals))
+        if shown not in accepted and (
+            raw not in out
+        ):
             out.append(raw)
     return out
 
@@ -3050,6 +3398,7 @@ def count_response_defects(
         ),
         "arithmetic_contradiction": int(bool(find_arithmetic_contradictions(text))),
         "conclusion_contradiction": int(find_conclusion_contradiction(text) is not None),
+        "sign_contradiction": int(find_sign_contradiction(text) is not None),
     }
 
 

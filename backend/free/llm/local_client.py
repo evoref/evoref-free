@@ -512,6 +512,15 @@ class _ReasoningTimeoutTracker:
         return now - self.start
 
 
+def _error_type_of(body: str) -> str:
+    """llama-server のエラー本文 (``{"error": {"type": ...}}``) から type を取る。無ければ空。"""
+    try:
+        err = json.loads(body).get("error")
+    except (ValueError, AttributeError):
+        return ""
+    return str(err.get("type") or "") if isinstance(err, dict) else ""
+
+
 def _map_llama_error(exc: BaseException, *, host: str, label: str) -> BaseException:
     """llama-server 呼出の例外を evoref の型付き例外へ正規化する。
 
@@ -643,6 +652,11 @@ class LocalClient(BaseHTTPClient):
     def classifier_slot_prefix(self) -> str | None:
         """分類器スロットの共有接頭辞 (分類器の system)。未公開なら ``None``。"""
         return self._classifier_slot_prefix
+
+    @property
+    def debug_logger(self):
+        """注入された DebugLogger (直接 ``generate_constrained`` を呼ぶ判定が aux 行を残す)。"""
+        return self._debug_logger
 
     def set_classifier_slot_prefix(self, prefix: str) -> None:
         """分類器スロットの共有接頭辞を公開する (ツール分類器が呼ぶ)。"""
@@ -1364,11 +1378,16 @@ class LocalClient(BaseHTTPClient):
                 "llama-server returned HTTP %d: %s", resp.status_code, body,
             )
             message = f"llama-server HTTP {resp.status_code}: {body}"
+            error_type = _error_type_of(resp.text)
             if resp.status_code < 500:
                 raise LLMRequestRejectedError(
                     message, host=self.url, http_status=resp.status_code,
+                    error_type=error_type,
                 )
-            raise LLMError(message, host=self.url, http_status=resp.status_code)
+            raise LLMError(
+                message, host=self.url, http_status=resp.status_code,
+                error_type=error_type,
+            )
         content_type = resp.headers.get("content-type", "")
         logger.debug(
             "Stream response: status=%d, content-type=%s",
@@ -1740,10 +1759,14 @@ class LocalClient(BaseHTTPClient):
         timeout: float | None = None,
         result_meta: dict | None = None,
         cache_prompt: bool | None = None,
+        usage_purpose: str = "",
     ) -> str | None:
         """``response_format`` (json_schema) で文法制約した非ストリーミング生成。
 
         ``cache_prompt`` は :meth:`generate` と同じ要求単位の上書き。
+
+        ``usage_purpose`` を渡すと、成功・失敗とも所要時間をそのターンの
+        ``op=timing`` の ``aux_usage`` へ足す (``AuxClient`` 経由は自前で記録するので渡さない)。
 
         ``result_meta`` (省略可) を渡すと ``finish_reason`` を書き戻す。
         ``"length"`` は max_tokens 到達 = JSON が途中で切れている印で、呼出側
@@ -1800,6 +1823,18 @@ class LocalClient(BaseHTTPClient):
             self._record_prompt_cache(data, slot=payload.get("id_slot"))
             return data
 
+        import time as _time
+
+        started_at = _time.monotonic()
+
+        def _record_usage() -> None:
+            dl = self._debug_logger
+            if usage_purpose and dl is not None:
+                try:
+                    dl.record_turn_aux(usage_purpose, _time.monotonic() - started_at)
+                except Exception:  # noqa: BLE001 - 計測の失敗で判定を失わない
+                    pass
+
         try:
             if self._is_chat_slot(id_slot):
                 async with chat_generation():
@@ -1817,7 +1852,9 @@ class LocalClient(BaseHTTPClient):
                     retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
                 )
         except Exception as e:
+            _record_usage()
             raise _map_llama_error(e, host=self.url, label="json_schema") from e
+        _record_usage()
         choices = data.get("choices") or [{}]
         message = choices[0].get("message") or {}
         content = message.get("content")

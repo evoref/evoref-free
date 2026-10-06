@@ -215,6 +215,7 @@ async def curate_corrections(
     max_per_cycle: int = _MAX_PER_CYCLE,
     should_pause: Callable[[], bool] | None = None,
     stats: dict[str, int] | None = None,
+    continue_on_preempt: bool = False,
 ) -> int:
     """訂正候補のノートを検証し、帰属と逐語 span をノートへ刻む。
 
@@ -228,6 +229,8 @@ async def curate_corrections(
         stats: 渡すと ``preempted`` (チャットに譲って検証しなかった候補数 —
             ``should_pause`` と横取り) と ``failed`` (一過性の実失敗の数) を書く。
             「検証 0 件」が見送りか欠陥かを死活監視で分けるため (2026-10-02 監査)。
+        continue_on_preempt: 真なら横取りされた候補だけを数えて次の候補へ進む
+            (強制実行の Full。件数は上限で絞られており、先頭の 1 件で全体を止めない)。
 
     Returns:
         マーカーを立てたノート数 (却下も含む)。
@@ -301,6 +304,10 @@ async def curate_corrections(
             record_transient_failure(
                 note, VERIFY_FAILURE_KEY, now_fn(), counts=not contended,
             )
+            if contended and continue_on_preempt:
+                if stats is not None:
+                    stats["preempted"] += 1
+                continue
             if contended:
                 # 横取りされたなら次の候補もまた横取りされる。残りは次の
                 # サイクルへ回す (2026-09-26 監査 #12: 11 回とも全滅)。

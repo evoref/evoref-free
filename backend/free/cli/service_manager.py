@@ -67,6 +67,8 @@ class AutoServeState:
     managed_ports: list[int] = field(default_factory=list)  # 全管理対象ポート
     stderr_files: list = field(default_factory=list)  # stderr ログファイルハンドル
     status_data: dict | None = None  # ヘルスチェック完了時の /api/status キャッシュ
+    # procs の部分集合 (rerank)。死んでも起動を失敗にしない (後始末では他と同じく止める)
+    optional_procs: list[subprocess.Popen] = field(default_factory=list)
 
     @property
     def active(self) -> bool:
@@ -367,6 +369,26 @@ def _spawn_rerank_server(
     """
     if args.no_llama:
         return None
+    started = _start_rerank_process(project_root, config, stderr_files, console)
+    if started is None:
+        return None
+    proc, endpoint = started
+    procs.append(proc)
+    optional_procs.append(proc)
+    return endpoint
+
+
+def _start_rerank_process(
+    project_root: Path,
+    config: dict,
+    stderr_files: list,
+    console=None,
+) -> tuple[subprocess.Popen, tuple[str, int]] | None:
+    """rerank llama-server を起動する共通処理 (serve / auto-serve の両経路が使う)。
+
+    起動対象でない・起動に失敗したときは ``None``。理由は logger に残す
+    (起動対象外は INFO、起動失敗は WARNING)。``console`` があれば画面にも出す。
+    """
     from scripts.launch_llama import (
         RERANK_HOST,
         rerank_launchable,
@@ -374,10 +396,13 @@ def _spawn_rerank_server(
         start_rerank_server,
     )
 
-    launchable, _why = rerank_launchable(config, project_root)
+    launchable, why = rerank_launchable(config, project_root)
     if not launchable:
+        logger.info("rerank server not started: %s", why)
         return None
-    render_info(console, "Starting rerank server (self-test runs only when the PC changed)...")
+    logger.info("Starting rerank server (self-test runs only when the PC changed)")
+    if console is not None:
+        render_info(console, "Starting rerank server (self-test runs only when the PC changed)...")
     stderr_f = _open_stderr_log(project_root, "llama-rerank")
     stderr_files.append(stderr_f)
     launched = start_rerank_server(
@@ -385,11 +410,11 @@ def _spawn_rerank_server(
         popen_kwargs={"stdout": subprocess.DEVNULL, "stderr": stderr_f},
     )
     if launched.proc is None:
-        render_info(console, f"rerank disabled: {launched.message}")
+        logger.warning("rerank disabled: %s", launched.message)
+        if console is not None:
+            render_info(console, f"rerank disabled: {launched.message}")
         return None
-    procs.append(launched.proc)
-    optional_procs.append(launched.proc)
-    return RERANK_HOST, rerank_port(config)
+    return launched.proc, (RERANK_HOST, rerank_port(config))
 
 
 def _build_backend_env(args: argparse.Namespace) -> dict | None:
@@ -911,6 +936,59 @@ def _spawn_all_servers(
     return servers
 
 
+def _spawn_auto_serve_rerank(
+    project_root: Path, cfg: dict, state: AutoServeState,
+) -> tuple[str, int] | None:
+    """auto-serve の rerank を起動して後始末の対象に積む (ブロックする。executor から呼ぶ)。
+
+    base が healthy になってから呼ぶこと — 配置・メモリ判定と自己テストの遅延測定が
+    base の読み込み中の負荷に引きずられないように。起動失敗は auto-serve を止めない。
+    """
+    try:
+        started = _start_rerank_process(project_root, cfg, state.stderr_files)
+    except (FileNotFoundError, ValueError, OSError) as e:
+        logger.warning("auto-serve: rerank server start failed: %s", e)
+        return None
+    if started is None:
+        return None
+    proc, endpoint = started
+    state.procs.append(proc)
+    state.optional_procs.append(proc)
+    state.proc_names.append("llama-rerank")
+    state.managed_ports.append(endpoint[1])
+    logger.debug("auto-serve: spawned rerank server on :%d (pid=%d)", endpoint[1], proc.pid)
+    return endpoint
+
+
+async def _start_auto_serve_rerank_after_base(
+    project_root: Path, cfg: dict, state: AutoServeState, no_llama: bool, timeout_llama: int,
+) -> tuple[str, int] | None:
+    """base の /health が通ってから rerank を起動する (backend を起こす前に呼ぶ)。
+
+    serve 経路が base の health を待ってから rerank を起こすのと同じ順序。base が
+    時間内に healthy にならない (または死んだ) ときは rerank を起こさない — その失敗は
+    後段のヘルスチェックが報告する。
+    """
+    if no_llama:
+        return None
+    llama_cfg = cfg.get("llama", {})
+    base_url = f"http://{llama_cfg.get('host', '127.0.0.1')}:{state.llama_port or llama_cfg.get('port', 8080)}"
+    for _ in range(timeout_llama):
+        if await _check_llama_health(base_url):
+            break
+        if not _check_procs_alive(state):
+            logger.info("rerank server not started: a server process died before base became healthy")
+            return None
+        await asyncio.sleep(1)
+    else:
+        logger.info("rerank server not started: base was not healthy within %ds", timeout_llama)
+        return None
+    return await run_in_executor_with_context(
+        asyncio.get_running_loop(), None,
+        partial(_spawn_auto_serve_rerank, project_root, cfg, state),
+    )
+
+
 async def _check_llama_health(llama_url: str) -> bool:
     """llama-server に直接ヘルスチェック"""
     try:
@@ -1069,6 +1147,8 @@ def _check_procs_alive(state: AutoServeState) -> bool:
     """
     for i, p in enumerate(state.procs):
         if p.poll() is not None:
+            if any(p is o for o in state.optional_procs):
+                continue
             name = (
                 state.proc_names[i]
                 if i < len(state.proc_names) else "unknown"
@@ -1358,11 +1438,37 @@ async def _auto_serve_start(
 ) -> AutoServeState:
     """バックエンドをバックグラウンドで起動し、ヘルスチェックが通るまで待機
 
+    起動中の中断 (Ctrl+C / キャンセル) では、それまでに起こした子プロセスを止めてから再送出する
+    (状態は戻り値でしか呼び出し側へ渡らないため)。
+
     Returns:
         AutoServeState（/exit 時にクリーンアップ用）
     """
     state = AutoServeState()
+    try:
+        return await _auto_serve_start_inner(
+            state, project_root, host, port, no_llama=no_llama, develop=develop,
+            edition=edition, no_learning=no_learning, force=force, console=console,
+        )
+    except BaseException:
+        _auto_serve_cleanup(state, console)
+        raise
 
+
+async def _auto_serve_start_inner(
+    state: AutoServeState,
+    project_root: Path,
+    host: str,
+    port: int,
+    *,
+    no_llama: bool,
+    develop: str | None,
+    edition: str | None,
+    no_learning: bool,
+    force: bool,
+    console,
+) -> AutoServeState:
+    """:func:`_auto_serve_start` の本体 (``state`` は呼び出し側が持つ)。"""
     if not _check_auto_serve_pid_collision(project_root, console, force):
         return state
 
@@ -1387,6 +1493,12 @@ async def _auto_serve_start(
 
     servers = await _maybe_spawn_auto_serve_llama(
         project_root, cfg, state, no_llama, console,
+    )
+
+    # ── rerank (base が healthy になってから、backend が自己テスト結果を読む前に) ──
+    # (起動関数が health まで確認して返す。任意の proc なので health 待ちの対象にはしない)
+    await _start_auto_serve_rerank_after_base(
+        project_root, cfg, state, no_llama, timeout_llama,
     )
 
     # ── FastAPI バックエンド ──

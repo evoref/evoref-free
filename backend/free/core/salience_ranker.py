@@ -96,6 +96,17 @@ class SalienceRanker:
         Returns:
             予算内で情報量を最大化するチャンクテキストのリスト（挿入順）
         """
+        return [text for _, _, text in self.rank_entries(chunks, budget_tokens)]
+
+    def rank_entries(
+        self,
+        chunks: list[tuple[str, float, str]],
+        budget_tokens: int,
+    ) -> list[tuple[str, float, str]]:
+        """:meth:`rank` と同じ選別で、選んだ入力の組 ``(chunk_id, score, text)`` を返す。
+
+        注入に残った id (``[参考情報]`` に実際に見せた分) を呼び手が記録するため。
+        """
         if not chunks or budget_tokens <= 0:
             return []
 
@@ -144,7 +155,7 @@ class SalienceRanker:
         # 元のドキュメント順序を保持（検索結果の自然な流れを維持）
         selected.sort(key=lambda x: x[0])
 
-        result = [text for _, text in selected]
+        result = [chunks[idx] for idx, _ in selected]
 
         logger.debug(
             "SalienceRanker: %d/%d chunks selected, "

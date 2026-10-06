@@ -107,7 +107,12 @@ export interface RerankStatusInfo {
 	enabled: boolean;
 	placement: string;
 	ms_per_doc: number | null;
+	/** 自己テストの文書長 (1 組 約 390 トークン) で締切に収まる件数 (有効かどうかの判定) */
 	candidates: number;
+	/** 実行時に 1 回で送る件数の上限。無効なら 0 */
+	max_candidates: number;
+	/** 実行時に 1 回で送る近似トークンの予算 (件数の上限との早い方で止める)。無効なら null */
+	token_budget: number | null;
 	reason: string;
 	tested_at: string | null;
 	/** 自己テストの後にリランカーのモデルが変わった (再テストはしない) */

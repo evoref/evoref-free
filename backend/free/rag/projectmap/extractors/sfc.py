@@ -28,7 +28,9 @@ from backend.log_config import get_logger
 logger = get_logger("rag.projectmap.sfc")
 
 #: 1 ブロックの抽出結果 (nodes, imports, calls, inherits)。
-_BlockResult = tuple[list[Node], list[str], list[RawCall], list[tuple[str, str]]]
+_BlockResult = tuple[
+    list[Node], list[str], list[RawCall], list[tuple[str, str]], dict[str, tuple[str, str | None]],
+]
 
 
 def _line_count(source: bytes) -> int:
@@ -49,11 +51,12 @@ def _top_level_sections(root: Any, section_type: str) -> list[Any]:
 
 
 def _extract_script_block(
-    path: str, start_tag: Any, raw_text: Any, source: bytes,
+    path: str, start_tag: Any, raw_text: Any, source: bytes, component_id: str,
 ) -> _BlockResult | None:
     lang = _script_lang(start_tag, source)
     content = source[raw_text.start_byte:raw_text.end_byte]
-    extracted = treesitter.extract_file(path, lang, content)
+    # 定義の外の呼出 (``<script>`` 直下 / ``onMount(() => …)`` の中) は component の呼出とする
+    extracted = treesitter.extract_file(path, lang, content, orphan_caller_id=component_id)
     if extracted is None:
         logger.warning(
             "projectmap: failed to extract <script> block in %s (lang=%s)", path, lang,
@@ -64,7 +67,7 @@ def _extract_script_block(
         replace(n, line_start=offset + n.line_start, line_end=offset + n.line_end)
         for n in extracted.nodes
     ]
-    return nodes, extracted.imports, extracted.calls, extracted.inherits
+    return nodes, extracted.imports, extracted.calls, extracted.inherits, extracted.import_bindings
 
 
 def _dedupe_top_level(
@@ -126,20 +129,22 @@ def extract_file(path: str, lang: str, source: bytes) -> ExtractedFile | None:
     imports: list[str] = []
     calls: list[RawCall] = []
     inherits: list[tuple[str, str]] = []
+    import_bindings: dict[str, tuple[str, str | None]] = {}
 
     for script_node in _top_level_sections(root, "script_element"):
         start_tag = child_of_type(script_node, "start_tag")
         raw_text = child_of_type(script_node, "raw_text")
         if start_tag is None or raw_text is None:
             continue
-        result = _extract_script_block(path, start_tag, raw_text, source)
+        result = _extract_script_block(path, start_tag, raw_text, source, component_id)
         if result is None:
             continue
-        block_nodes, block_imports, block_calls, block_inherits = result
+        block_nodes, block_imports, block_calls, block_inherits, block_bindings = result
         nodes_by_block.append(block_nodes)
         imports.extend(block_imports)
         calls.extend(block_calls)
         inherits.extend(block_inherits)
+        import_bindings.update(block_bindings)
 
     for style_node in _top_level_sections(root, "style_element"):
         raw_text = child_of_type(style_node, "raw_text")
@@ -158,7 +163,7 @@ def extract_file(path: str, lang: str, source: bytes) -> ExtractedFile | None:
         for n in merged_nodes
     ]
     calls = [
-        RawCall(caller_id=id_map.get(c.caller_id, c.caller_id), callee_name=c.callee_name)
+        replace(c, caller_id=id_map.get(c.caller_id, c.caller_id))
         for c in calls
     ]
     inherits = [
@@ -171,6 +176,7 @@ def extract_file(path: str, lang: str, source: bytes) -> ExtractedFile | None:
     return ExtractedFile(
         path=path, lang=lang, line_count=_line_count(source),
         nodes=all_nodes, imports=imports, calls=calls, inherits=inherits,
+        import_bindings=import_bindings,
     )
 
 

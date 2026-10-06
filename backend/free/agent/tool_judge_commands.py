@@ -29,9 +29,20 @@ from backend.free.core.numerals import kanji_number_value
 from backend.free.core.response_dates import nearest_date
 from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
 from backend.free.core.relative_date import (
+    ANCHOR_REFERENT,
+    ANCHOR_TODAY,
+    OFFSET_DIRECTION_PATTERN,
+    OFFSET_NUMBER_GUARD,
+    PERIOD_UNIT_ALTERNATION,
     WEEK_OF_WEEKDAY_RE,
     WEEK_OFFSETS,
     WEEKDAY_INDEX,
+    OffsetAnchor,
+    offset_anchors,
+)
+from backend.free.core.temporal_deixis import (
+    MONTH_OFFSETS,
+    alternation,
 )
 from backend.free.agent.safety_patterns import reject_readonly_violation
 from backend.free.agent.tool_judge_grounding import _numeric_literals
@@ -42,6 +53,7 @@ from backend.free.core.intent_vocab import (
     NETWORK_IDENTITY_TERMS,
     OS_QUERY_TERMS,
     PAST_RECALL_TAIL_RE,
+    PRESENT_ANCHOR_RE,
     PYTHON_VERSION_TERMS,
     STORAGE_SPEC_TERMS,
     is_plain_statement,
@@ -168,9 +180,11 @@ def _build_spec_command(query: str) -> str:
 _DATETIME_QUERY_RE = DATETIME_QUERY_RE
 
 #: 「N 日後 / N 年前」等の相対日付。単位の直後に 前/後 を要求するので
-#: 「1 月 3 日」のような絶対日付には掛からない。
+#: 「1 月 3 日」のような絶対日付には掛からない。単位と向きの語彙は
+#: ``core.relative_date`` が SSOT (起点の分類・相対日付の注記と同じ語を読む)。
 _RELATIVE_OFFSET_RE = re.compile(
-    r"(\d{1,4})\s*(週間|週|[かヶケヵ箇]月|月|日|年)\s*(前|後|先)",
+    OFFSET_NUMBER_GUARD + r"(\d{1,4})\s*(" + PERIOD_UNIT_ALTERNATION + r")"
+    r"\s*(" + OFFSET_DIRECTION_PATTERN + ")",
 )
 
 #: コマンドが日付演算をしている印。``_build_datetime_command`` が相対日付用に
@@ -217,28 +231,57 @@ _WEEKDAY_ASK_RE = re.compile(
 _OFFSET_UNITS = {
     "日": "days", "週": "weeks", "週間": "weeks",
     "月": "months", "か月": "months", "ヶ月": "months",
-    "ケ月": "months", "ヵ月": "months", "箇月": "months",
+    "ケ月": "months", "ヵ月": "months", "カ月": "months", "箇月": "months",
     "年": "years",
 }
 
-#: 現在日時のみを返す既定コマンド。
-#:
-#: ``astimezone()`` を付けて **UTC オフセット付き**で出力する。プロンプトには
-#: 別途 ``[現在日時 (UTC基準)]`` が注入されており、コマンド出力が naive
-#: ローカル時刻だと 2 つの時計が無印で並ぶ。JST では 00:00-09:00 の間、
-#: ローカル日付と UTC 日付が 1 日ずれるため、モデルはどちらを「今日」と
-#: 呼ぶべきか判断できない (2026-08-05 ライブ監査で構造として確認)。
-#:
-#: 曜日 (``%A``) も出す。出さないと「今日は何曜日」以外のターンで曜日に触れた
-#: とき、モデルが日付から曜日を暗算して外す (実測 2026-08-22 ライブ監査の
-#: 修正検証: 「今の時刻を教えてください。」→「2026年8月22日（金）の午前1時37分」。
-#: 8/22 は土曜)。``datetime.datetime.now()`` は ``_DATE_ARITHMETIC_RE``
-#: (``datetime.datetime(``) に一致しないので、リコール時の日付演算ガードは
-#: この追加後も従来どおり now-only コマンドを弾く。
-_DATETIME_NOW_COMMAND = (
-    'python -c "import datetime; n=datetime.datetime.now().astimezone();'
-    " print(n); print('weekday:', n.strftime('%A'))\""
+#: 現在時刻を読むコマンドの印 (Python の ``now()`` / ``today()`` / ``time.localtime()`` 等、
+#: PowerShell の ``Get-Date``)。``reads_clock_without_date_math`` が
+#: :data:`_DATE_ARITHMETIC_RE` と組んで「現在日時を返すだけのコマンド」を見分ける。
+_CLOCK_READ_RE = re.compile(
+    r"\b(?:now|utcnow|today)\s*\(|\btime\.(?:localtime|gmtime|strftime|ctime|time)\s*\("
+    r"|\bGet-Date\b",
+    re.IGNORECASE,
 )
+
+#: その場で組んだ 1 行のプログラム (``python -c "..."``)。
+_INLINE_PROGRAM_RE = re.compile(r"(?:^|\s)-c\s")
+
+#: 時計を読んだうえで **別の計算や参照** をしている印。``_DATE_ARITHMETIC_RE``
+#: (timedelta / datetime.date( …) に当たらない演算 — PowerShell の
+#: ``(Get-Date).AddDays(-7)`` / ``New-TimeSpan``、日付同士の引き算、ファイルの
+#: 更新日時との比較、通算日・週番号 — は現在日時だけのコマンドではない。
+_CLOCK_COMPUTE_RE = re.compile(
+    r"\.Add(?:Days|Months|Years|Hours|Minutes|Seconds)\b|New-TimeSpan"
+    r"|LastWriteTime|CreationTime|LastAccessTime|Get-ChildItem|Get-Item\b"
+    r"|getmtime|getctime|getatime|st_[mca]time|fromtimestamp|relativedelta"
+    r"|isocalendar|toordinal|timetuple|%[jUWV]|\breplace\s*\("
+    r"|\)\s*-\s*[\w($]|\w\s+-\s+[\w($]",
+    re.IGNORECASE,
+)
+
+
+def reads_clock_without_date_math(command: str) -> bool:
+    """現在日時を読むだけで日付演算をしないコマンドか (純粋関数)。
+
+    現在日時だけを返すコマンド (旧 now-only) は廃止した (2026-10-03、不変則
+    #15)。現在日時は注記 (``core.inference._current_date_note``) が常に渡すので、
+    このコマンドの結果は注記と同じ値を「唯一の事実根拠」枠で重ねるだけで、
+    不要な問い (「公開 URL は何日で使えなくなる?」) では「特定できません」を
+    後押しした。規則・想起・分類器のどの層が出しても
+    ``tool_judge_guards._suppress_clock_only_command`` が no_tool へ落とす。
+    """
+    text = command or ""
+    # 対象はその場で組んだ 1 行のプログラム (``python -c``) と ``Get-Date`` だけ。
+    # ``python tests/datetime.py`` のようなファイル実行は時計を読むとは限らない。
+    if not (_INLINE_PROGRAM_RE.search(text) or "get-date" in text.lower()):
+        return False
+    return (
+        bool(_CLOCK_READ_RE.search(text))
+        and command_lacks_date_arithmetic(text)
+        and not _CLOCK_COMPUTE_RE.search(text)
+    )
+
 
 #: 相対日付コマンドの共通前置き (now と目標日を両方出す)。
 _REL_PREFIX = 'python -c "import datetime; n=datetime.datetime.now().astimezone();'
@@ -272,7 +315,7 @@ def _absolute_weekday_command(query: str) -> str:
         'python -c "import datetime;'
         " n=datetime.datetime.now().astimezone();"
         f" t={dates[0].datetime_expr()};"
-        " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
+        + _anchored_suffix(" print('target:',t.strftime('%Y-%m-%d (%A)'))\"", "literal")
     )
 
 
@@ -320,7 +363,7 @@ def _week_of_weekday_command(query: str) -> str:
         # その週の月曜へ寄せてから、週オフセットと曜日を足す。
         f" w=t-datetime.timedelta(days=t.weekday())+datetime.timedelta(days={offset}+{weekday});"
         " print('now:',n);"
-        " print('target:',w.strftime('%Y-%m-%d (%A)'))\""
+        + _anchored_suffix(" print('target:',w.strftime('%Y-%m-%d (%A)'))\"", "today")
     )
 
 
@@ -612,24 +655,19 @@ def _day_count_command(query: str) -> str:
 #: いるのは記憶の想起であって現在時刻ではなく、注入された「今日の日付」は
 #: 誤答の材料にしかならない。
 #:
-#: 抑止は **now-only コマンドに落ちる分岐だけ** に掛ける。絶対日付
-#: (「1987年3月14日は何曜日でしたか？」) や相対日付 (「3年前の今日は何曜日
-#: でしたか？」) は過去形でも計算が要るため、従来どおり撃つ。
+#: 現在日時だけを返すコマンドは 2026-10-03 に廃止した (不変則 #15) ので、
+#: 今この判定を使うのは学習済みコマンドの想起 (``recalled_command_fits_query``)
+#: だけ。日付演算を含まないコマンドの再生を止める。絶対日付 (「1987年3月14日は
+#: 何曜日でしたか？」) や相対日付 (「3年前の今日は何曜日でしたか？」) は過去形でも
+#: 計算が要るため、演算コマンドは従来どおり通す。
 #: 語彙は core.intent_vocab が SSOT (``tool_judge_history`` の既出対象の
 #: 尋ね直し判定と同じ文末形)。後方互換で旧名を残す。
 _PAST_RECALL_TAIL_RE = PAST_RECALL_TAIL_RE
 
-#: 「現在」を指す語。1 つでもあれば now-only コマンドを抑止しない。
-#: ``いま`` / ``きょう`` は 2 文字の部分文字列で、無関係な語に埋もれる
-#: (変わって**いま**せん / **興味** → きょうみ)。実際に「誕生日は変わって
-#: いませんよね？何日でしたか？」の「て**いま**せん」が現在アンカーとして
-#: 誤ヒットし、抑止が効かなかった。後続文字で除外する。
-_PRESENT_ANCHOR_RE = re.compile(
-    r"今日|本日|現在|ただいま|只今|今[のはがもへ、。 ]|今$"
-    r"|いま(?![すせしそまん])|きょう(?![みりょ])"
-    r"|(?<![A-Za-z])(?:now|today|current|currently)(?![A-Za-z])",
-    re.IGNORECASE,
-)
+#: 「現在」を指す語。1 つでもあれば過去事実の想起とはみなさない。語彙と除外
+#: (「て**いま**せん」「興味」) は core.intent_vocab が SSOT (現在日時の注記の
+#: 発火条件と同じ語)。後方互換で旧名を残す。
+_PRESENT_ANCHOR_RE = PRESENT_ANCHOR_RE
 
 
 def _relative_anchor(query: str, offset_start: int) -> "_QueryDate | None":
@@ -641,6 +679,27 @@ def _relative_anchor(query: str, offset_start: int) -> "_QueryDate | None":
     """
     candidates = [d for d in _iter_query_dates(query) if d.end <= offset_start]
     return candidates[-1] if candidates else None
+
+
+def _offset_anchor_at(query: str, offset_start: int) -> OffsetAnchor | None:
+    """``offset_start`` の数量を持つオフセットの起点 (起点の語句が無ければ ``None``)。
+
+    起点の構造は :func:`backend.free.core.relative_date.offset_anchors` が SSOT。
+    """
+    for a in offset_anchors(query):
+        if a.offset_start == offset_start:
+            return a
+    return None
+
+
+def _anchored_suffix(suffix: str, provenance: str) -> str:
+    """コマンド末尾 (``...")`` の閉じ引用符) の前に起点の出所 ``anchor:`` を印字する。
+
+    ``today`` (実行時の今日) / ``literal`` (発話の具体日付) / ``conversation``
+    (会話で確定した日付)。検証側 (``agent.feedback``) が、起点を会話に置く問いに
+    今日起点の target を突き合わせて「無視した」と誤判定しないために読む。
+    """
+    return suffix[:-1] + f"; print('anchor:',{provenance!r})\""
 
 
 def _is_past_fact_recall(query: str) -> bool:
@@ -669,7 +728,9 @@ def _build_datetime_command(query: str) -> str:
     ``target: 2026-08-04`` (正しくは 8/24) を出力していた
     (2026-08-25 ライブ監査 T2-9)。
 
-    どれでもなければ従来どおり現在日時のみを返す。
+    どれでもなければ **空文字** (ツール不要) を返す。現在日時だけを返すコマンド
+    (旧 now-only) は 2026-10-03 に廃止した — 現在日時は注記
+    (``core.inference._current_date_note``) が常に渡す (不変則 #15)。
     """
     # 日数カウントは **両端が決まるときだけ** コマンドを返す。返せたならそれが
     # 最も具体的なので優先する。
@@ -677,35 +738,51 @@ def _build_datetime_command(query: str) -> str:
     if day_count:
         return day_count
     # 「来週の金曜日」型は数字を伴わないので相対オフセットに掛からず、絶対日付
-    # でもないため now-only へ落ちて曜日→日付の変換が暗算に残っていた。
+    # でもないため、曜日→日付の変換が暗算に残っていた。
     # 日数カウントが空を返した後に見る (日数の語彙に掛かっても両端が決まらなければ
-    # 空になるので、ここで拾える。now-only より常に情報が多い)。
+    # 空になるので、ここで拾える)。
     week_of = _week_of_weekday_command(query)
     if week_of:
         return week_of
     m = _RELATIVE_OFFSET_RE.search(query or "")
     if m is None:
-        absolute = _absolute_weekday_command(query)
-        if absolute:
-            return absolute
-        # now-only へ落ちる分岐だけ、過去事実の想起を抑止する
-        # (_is_past_fact_recall 参照)。
-        if _is_past_fact_recall(query):
-            return ""
-        return _DATETIME_NOW_COMMAND
+        # 演算を組めなければ空 (ツール不要)。現在日時は注記が渡す。
+        return _absolute_weekday_command(query)
     kind = _OFFSET_UNITS.get(m.group(2))
     if kind is None:
-        return _DATETIME_NOW_COMMAND
+        return ""
     n = int(m.group(1))
     signed = -n if m.group(3) == "前" else n
 
     anchor = _relative_anchor(query, m.start())
-    if anchor is None:
-        base = " b=n;"
-        base_echo = ""
-    else:
+    offset_anchor = _offset_anchor_at(query, m.start(1)) if anchor is None else None
+    day_shift: int | None = None
+    if offset_anchor is not None and offset_anchor.kind != ANCHOR_TODAY:
+        if offset_anchor.day_offset is None:
+            # 「さっきのリリース日の 1 週間前」の起点は会話で確定した日付で、今日では
+            # ない (「月末の 3 日前」も今日ではない)。今日起点で組むと誤った target を
+            # 「確かめた事実」として渡し、date_intent 層 (起点を会話・抽出器で解く)
+            # にも届かない (2026-10-05 ライブ監査: target 2026-09-28、正 10/13)。
+            # 空を返して下の層へ委ねる。
+            logger.info(
+                "relative offset anchored on %s; deferring to date intent: %s",
+                offset_anchor.kind, (query or "")[:60],
+            )
+            return ""
+        # 「明日の 3 日後」は明日を起点にする (今日起点だと 1 日ずれる)。
+        day_shift = offset_anchor.day_offset
+    if anchor is not None:
         base = f" b={anchor.datetime_expr()};"
         base_echo = " print('base:',b.strftime('%Y-%m-%d'));"
+        provenance = "literal"
+    elif day_shift is not None:
+        base = f" b=n+datetime.timedelta(days={day_shift});"
+        base_echo = " print('base:',b.strftime('%Y-%m-%d'));"
+        provenance = "literal"
+    else:
+        base = " b=n;"
+        base_echo = ""
+        provenance = "today"
 
     if kind in ("days", "weeks"):
         body = base + f" t=b+datetime.timedelta({kind}={signed});"
@@ -724,7 +801,7 @@ def _build_datetime_command(query: str) -> str:
             " dim=[31,29 if lp else 28,31,30,31,30,31,31,30,31,30,31][mo-1];"
             " t=datetime.datetime(y,mo,min(b.day,dim));"
         )
-    return _REL_PREFIX + body + base_echo + _REL_SUFFIX
+    return _REL_PREFIX + body + base_echo + _anchored_suffix(_REL_SUFFIX, provenance)
 
 
 # ===========================================================================
@@ -785,13 +862,17 @@ DATE_INTENT_SYSTEM = (
     "kind の選び方:\n"
     "- business_days_from: 起点から N 営業日 (土日・祝日を除く) 後の日付\n"
     "- days_from: 起点から N 日後 (暦日)\n"
-    "- days_between: 2 つの日付の間の日数\n"
+    "- days_between: 2 つの日付の間の日数、またはどちらが先か (start に先に述べられた"
+    "日付、end に後に述べられた日付)\n"
     "- weekday_of: ある日付の曜日\n"
     "- none: 日付の計算が不要\n"
     "規則:\n"
     "- start / end は YYYY-MM-DD 形式、または今日なら today と書くこと。\n"
     "- 質問と直前の会話に書かれていない日付・日数を発明しないこと。追い質問"
     "(「その日から」「〜だとすると」) の起点日や日数は直前の会話から取ること。\n"
+    "- 2 つの日付の間の日数・営業日数を数えるときは days_between (営業日なら"
+    " skip_weekends を true)。business_days_from / days_from は n が 1 以上のとき"
+    "だけ使うこと。\n"
     "- skip_weekends は土日を数えないときだけ true。\n"
     "- holidays には質問文に明示された休日だけを YYYY-MM-DD で入れること。休日の"
     "日付を自分で発明しないこと。\n"
@@ -816,7 +897,8 @@ DATE_INTENT_SYSTEM_EN = (
     "- business_days_from: the date N business days (weekends/holidays skipped) "
     "from the start date\n"
     "- days_from: the date N calendar days from the start date\n"
-    "- days_between: the number of days between two dates\n"
+    "- days_between: the number of days between two dates, or which of them comes "
+    "first (start is the date mentioned first, end the one mentioned second)\n"
     "- weekday_of: the day of the week of one date\n"
     "- none: no date arithmetic is needed\n"
     "Rules:\n"
@@ -824,6 +906,9 @@ DATE_INTENT_SYSTEM_EN = (
     "- Never invent a date or count that is neither in the question nor in the "
     "preceding conversation; a follow-up question takes its start date and "
     "count from the previous turns.\n"
+    "- To count the days or business days between two dates use days_between "
+    "(with skip_weekends for business days). Use business_days_from / days_from "
+    "only when n is 1 or more.\n"
     "- Set skip_weekends only when Saturdays and Sundays must not be counted.\n"
     "- Put in holidays only the dates the question states, as YYYY-MM-DD. Never "
     "invent a holiday date.\n"
@@ -867,6 +952,10 @@ class DateIntentParams:
     #: 作業日・営業日から除外する曜日 (0=月曜〜6=日曜)。``skip_weekends`` とは
     #: 独立 — 両者は :func:`_business_day_candidates` で合算する。
     excluded_weekdays: tuple[int, ...] = ()
+    #: 起点の出所 (``today`` / ``literal`` / ``conversation``)。空なら ``start`` から
+    #: 決める (``None`` は today、確定日は literal)。会話から起点を解いた層が
+    #: ``conversation`` を入れ、生成コマンドが ``anchor:`` 行に印字する。
+    anchor: str = ""
 
 
 def command_lacks_date_arithmetic(command: str) -> bool:
@@ -936,7 +1025,7 @@ def parse_date_intent(payload: object) -> DateIntentParams | None:
     守らないため (``json_schema`` は enum と型までしか強制しない)、日付が ISO
     として読めること・``n`` が現実的な範囲にあること・祝日がすべて読めること・
     ``excluded_weekdays`` が 0-6 の整数であることをここで確かめる。1 つでも
-    欠ければ ``None`` を返し、呼出側は now-only のままにして「ツールで検証
+    欠ければ ``None`` を返し、呼出側は演算コマンド無しのまま「ツールで検証
     していない」印 (``unexplained_date_math``) を立てる。``direction`` /
     ``excluded_weekdays`` は省略可 (未指定時は forward / 空)。
     """
@@ -951,13 +1040,27 @@ def parse_date_intent(payload: object) -> DateIntentParams | None:
         return None
     raw_n = payload.get("n")
     n = raw_n if isinstance(raw_n, int) and not isinstance(raw_n, bool) else 0
+    skip_weekends = bool(payload.get("skip_weekends"))
+    if kind in ("business_days_from", "days_from") and n == 0 and isinstance(
+        end, datetime.date,
+    ):
+        # 「今日から 10 月 20 日まで何営業日」を抽出器が ``business_days_from`` +
+        # ``n=0`` + ``end`` で返す (2026-10-05 ライブ監査: コマンドを組めず
+        # calculate の構文エラーへ落ち、回答は諦めた)。2 点間の数え上げなので
+        # ``days_between`` に読み替える (営業日の指定は skip_weekends で保つ)。
+        logger.info(
+            "date intent kind normalized: %s with n=0 and end=%s -> days_between",
+            kind, end.isoformat(),
+        )
+        if kind == "business_days_from":
+            skip_weekends = True
+        kind = "days_between"
     if kind in ("business_days_from", "days_from") and not 1 <= n <= _MAX_DATE_INTENT_N:
         return None
     exclusions = parse_date_intent_exclusions(payload)
     if exclusions is None:
         return None
     holidays, excluded_weekdays = exclusions
-    skip_weekends = bool(payload.get("skip_weekends"))
     if kind == "business_days_from":
         # 種別自体が「営業日で数える」なので、モデルが false を返しても従う
         # 理由が無い (false なら days_from と区別が付かない)。
@@ -1103,7 +1206,9 @@ def business_days_between(
         lo, (hi - lo).days + 1, skip_weekends=skip_weekends, holidays=holidays,
         excluded_weekdays=excluded_weekdays,
     )
-    return len(candidates) - (0 if count_start_day else 1)
+    # 起点が休み (土日 / 祝日) なら候補に入っていないので引かない (2026-10-05 レビュー:
+    # 土曜 10/10 → 10/20 が 6、正 7)。
+    return len(candidates) - (0 if count_start_day or start not in candidates else 1)
 
 
 def _date_literal(value: datetime.date | None) -> str:
@@ -1164,6 +1269,7 @@ def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
         ``python -c "..."`` 形式のコマンド。組めない場合は空文字列。
     """
     start = _date_literal(params.start)
+    provenance = params.anchor or ("today" if params.start is None else "literal")
     if params.kind == "business_days_from":
         span = _candidate_span(params.n, params.holidays)
         # index は実行時に決める: 起点が休みなら候補の先頭が既に 1 日目
@@ -1192,7 +1298,7 @@ def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
             f" print('holidays_excluded:',{len(params.holidays)});"
             f" print('start_counted_as_day1:',{params.count_start_day});"
             f" print('business_day_number:',{params.n});"
-            " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
+            + _anchored_suffix(" print('target:',t.strftime('%Y-%m-%d (%A)'))\"", provenance)
         )
     if params.kind == "days_from":
         direction = _effective_direction(params.direction, query)
@@ -1204,11 +1310,12 @@ def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
             " print('now:',n); print('start:',s.strftime('%Y-%m-%d (%A)'));"
             f" print('direction:',{direction!r});"
             f" print('offset_days:',{signed});"
-            " print('target:',t.strftime('%Y-%m-%d (%A)'))\""
+            + _anchored_suffix(" print('target:',t.strftime('%Y-%m-%d (%A)'))\"", provenance)
         )
     if params.kind == "days_between":
         if params.skip_weekends or params.holidays or params.excluded_weekdays:
-            adjust = 0 if params.count_start_day else 1
+            # 起点が休みなら候補に入っていないので引かない (:func:`business_days_between`)。
+            adjust = "0" if params.count_start_day else "(1 if a in b else 0)"
             # 曜日除外は起点からの数え (business_days_from) と同じ合算 (F-03)。
             excluded = set(params.excluded_weekdays)
             if params.skip_weekends:
@@ -1229,20 +1336,26 @@ def build_date_intent_command(params: DateIntentParams, query: str = "") -> str:
                 f" print('start_counted_as_day1:',{params.count_start_day});"
                 f" print('business_days:',len(b)-{adjust})\""
             )
+        # 前後の比較 (「どちらが先か」) は from / to の並べ替えで失われるので、述べられた
+        # 順 (start → end) の符号付きの差と、どちらが先かも印字する。
         return (
             _DATE_INTENT_PREFIX
             + f" a={start}; z={_date_literal(params.end)};"
             " lo=min(a,z); hi=max(a,z);"
             " print('now:',n); print('from:',lo.strftime('%Y-%m-%d (%A)'));"
             " print('to:',hi.strftime('%Y-%m-%d (%A)'));"
-            " print('days:',(hi-lo).days)\""
+            " print('days:',(hi-lo).days);"
+            " print('start:',a.strftime('%Y-%m-%d (%A)'));"
+            " print('end:',z.strftime('%Y-%m-%d (%A)'));"
+            " print('signed_days_start_to_end:',(z-a).days);"
+            " print('earlier:','start' if a<z else 'end' if z<a else 'same')\""
         )
     if params.kind == "weekday_of":
         return (
             _DATE_INTENT_PREFIX
             + f" s={start};"
             " print('now:',n);"
-            " print('target:',s.strftime('%Y-%m-%d (%A)'))\""
+            + _anchored_suffix(" print('target:',s.strftime('%Y-%m-%d (%A)'))\"", provenance)
         )
     return ""
 
@@ -1275,6 +1388,7 @@ def inherit_date_intent(
         excluded_weekdays=tuple(sorted(
             set(previous.excluded_weekdays) | set(current.excluded_weekdays),
         )),
+        anchor=previous.anchor,
     )
 
 
@@ -1386,7 +1500,7 @@ def _resolve_yearless(month: int, day: int, today: datetime.date) -> datetime.da
 #: ``kind: none``、モデルの暗算は土日を 8 日と数えて 20 (正 19)。2026-09-10
 #: ライブ監査 (f) F-01) コード側で ``days_between`` を組む。
 _MONTH_BUSINESS_DAYS_RE = re.compile(
-    r"(?P<month>今月|来月|再来月|先月"
+    r"(?P<month>" + alternation(MONTH_OFFSETS) +
     r"|(?P<year>\d{4})\s*年\s*(?P<ynum>\d{1,2})\s*月"
     r"|(?P<num>\d{1,2})\s*月)"
     # 名詞の直後の括弧補足 (「営業日 (平日) は何日」) は読み飛ばす。密着を
@@ -1468,7 +1582,7 @@ def month_business_days_from_query(
 #: (``weekday_of`` は「ある日付の曜日」)、now-only に落ちてモデルの暗算 +
 #: 「ツールで検証していない」の開示になっていた (2026-09-10 (f) 検証 V05/2)。
 _NTH_WEEKDAY_OF_MONTH_RE = re.compile(
-    r"(?P<month>今月|来月|再来月|先月"
+    r"(?P<month>" + alternation(MONTH_OFFSETS) +
     r"|(?P<year>\d{4})\s*年\s*(?P<ynum>\d{1,2})\s*月"
     r"|(?P<num>\d{1,2})\s*月)"
     r"(?:の)?\s*(?:第\s*(?P<nth>[1-5１-５一二三四五])|(?P<last>最終|最後の))"
@@ -1553,21 +1667,6 @@ def query_has_anaphoric_start(query: str) -> bool:
     return bool(_ANAPHORIC_START_RE.search(query or ""))
 
 
-#: 「<起点>の N 営業日前」「<起点>から 2 週間後」— 起点となる名詞句と、その後ろの
-#: オフセット。起点が日付表現 (今日 / 来週の水曜日 / 9月25日 …) でなければ、
-#: それは直前の会話で日付が確定した **参照名詞** (締め切り / 納期 / 会議 …)。
-_OFFSET_FROM_REFERENT_RE = re.compile(
-    r"([^\s、。,！？!?]+?)(?:から|の)\s*\d+\s*"
-    r"(?:営業日|日|週間|か月|ヶ月|カ月|ヵ月|年)\s*(?:前|後|以内)"
-)
-#: 起点が「時間表現そのもの」なら参照ではない (抽出器が解決できる)。
-_TEMPORAL_ANCHOR_RE = re.compile(
-    r"今日|本日|明日|明後日|昨日|一昨日|今週|来週|再来週|先週|先々週|今月|来月|先月"
-    r"|今年|来年|去年|昨年|今|現在|\d+\s*年|\d+\s*月|\d+\s*日|[月火水木金土日]曜"
-    r"|[0-9]{4}-[0-9]{2}-[0-9]{2}"
-)
-
-
 def query_anchors_on_prior_result(query: str) -> bool:
     """起点が直前の会話で確定した日付を指しているか (純粋関数)。
 
@@ -1576,14 +1675,23 @@ def query_anchors_on_prior_result(query: str) -> bool:
     抽出器が自分で解決できるので対象外。実機 (2026-09-11 ライブ監査): 直前の
     回答で締め切り = 9/25 と確定した後の「締め切りの 3 営業日前」を抽出器が
     ``start: today`` で返し、今日起点の 9/8 を計算しつつモデルは 9/18 と答えた。
+    起点の構造は :func:`backend.free.core.relative_date.offset_anchors` が SSOT。
     """
     if query_has_anaphoric_start(query):
         return True
-    for m in _OFFSET_FROM_REFERENT_RE.finditer(query or ""):
-        anchor = m.group(1)
-        if not _TEMPORAL_ANCHOR_RE.search(anchor):
-            return True
-    return False
+    return any(a.kind == ANCHOR_REFERENT for a in offset_anchors(query))
+
+
+def referent_anchor_nouns(query: str) -> list[str]:
+    """オフセットの起点に置かれた参照名詞 (「リリース日の 1 週間前」→ リリース日)。
+
+    照応 (「その日から」) は直前の回答の日付で解くので含めない (純粋関数)。
+    """
+    return [
+        a.referent for a in offset_anchors(query)
+        if a.kind == ANCHOR_REFERENT and a.referent
+        and not _ANAPHORIC_START_RE.search(a.phrase)
+    ]
 
 
 def last_date_in_text(
@@ -1718,40 +1826,193 @@ def day_count_target_from_conversation(
     ]
     if not nouns:
         return None
-    topic_re = re.compile(
-        "(?:" + "|".join(re.escape(n) for n in nouns) + r")\s*(?:は|が|:|：)",
-    )
+    _key, candidates = _conversation_dates_bound_to(nouns, conversation, current=text)
+    if not candidates:
+        return None
+    if len({(d.year, d.month, d.day) for d in candidates}) > 1:
+        logger.info(
+            "day count target abstained: %d candidate dates for %s",
+            len(candidates), nouns,
+        )
+        return None
     backward = bool(_DAY_COUNT_BACKWARD_RE.search(text))
-    current = " ".join(text.split())
-    for msg in reversed(conversation or []):
-        if str(msg.get("role") or "") != "user":
+    target = _next_occurrence(candidates[0], today)
+    if target is None or (target < today and not backward):
+        return None
+    return DateIntentParams(
+        kind="days_between", start=None, end=target, n=0,
+        skip_weekends=False, holidays=(), count_start_day=False,
+    )
+
+
+#: 節の区切り (主題と日付が同じ節にあるかを見る)。「リリース日が近いので、会議は
+#: 10月13日」「リリース日は未定ですが、10月13日に会議」の日付は主題の値ではない。
+_CLAUSE_BREAK_RE = re.compile(r"[、，,]|ので|けど|けれど|のに")
+#: 読点の直前が主題の印 (「試験日は、4月18日です」) なら区切りではない。接続の
+#: 「ですが、」「だが、」は区切り。
+_TOPIC_BEFORE_COMMA_RE = re.compile(r"(?<![すだた])[はが:：]\s*$")
+#: 主題の値が無いと言っている (「リリース日は未定」「まだ決まっていない」)。
+_TOPIC_UNSET_RE = re.compile(r"\s*(?:未定|まだ|不明)")
+#: 「<日付>が<名詞>」の名詞の直後。述語で閉じる形 (「10月20日がリリース日です」) だけを
+#: 採り、「10月13日はリリース日の1週間前ですか」(名詞が修飾) は採らない。
+_TRAILING_NOUN_END_RE = re.compile(r"\s*(?:です|だ|でした|。|！|!|$)")
+
+
+def _clause_start(text: str, pos: int) -> int:
+    """``text`` の位置 ``pos`` を含む節の先頭位置 (純粋関数)。"""
+    start = _sentence_start(text, pos)
+    clause = start
+    for m in _CLAUSE_BREAK_RE.finditer(text, start, pos):
+        if m.group(0) in "、，," and _TOPIC_BEFORE_COMMA_RE.search(text, start, m.start()):
+            continue
+        clause = m.end()
+    return clause
+
+
+def _conversation_dates_bound_to(
+    nouns: list[str],
+    conversation: list[dict] | None,
+    *,
+    current: str,
+    roles: tuple[str, ...] = ("user",),
+    trailing: bool = False,
+    include_current: bool = False,
+) -> tuple[int, list[_QueryDate]]:
+    """名詞に結び付いた日付を、会話を新しい順に辿って探す (純粋関数)。
+
+    結び付きは同じ節の中だけで見る — 「<名詞> は / が / : … <日付>」(日付の直前の
+    区間に主題があり、主題が「未定」等で否定されていない)。``trailing`` なら
+    「<日付> が / は <名詞> です」も採る (「10月20日がリリース日です」)。候補を持つ
+    **最初の発話** の候補だけを、その発話の新しさ (0 = 今回の発話、1 = 直前 …) と
+    組で返す (複数なら呼出側が棄権する)。今回の発話は内容の一致で飛ばし、
+    ``include_current`` なら最初に見る。該当なしは ``(-1, [])``。
+    """
+    alternatives = "|".join(re.escape(n) for n in nouns)
+    topic_re = re.compile("(?:" + alternatives + r")\s*(?:は|が|:|：)")
+    trail_re = re.compile(
+        r"\s*(?:[（(][^）)]{0,8}[）)])?\s*(?:が|は)\s*(?:" + alternatives + ")",
+    )
+    normalized_current = " ".join((current or "").split())
+    sources: list[tuple[int, str]] = [(0, current)] if include_current else []
+    for age, msg in enumerate(reversed(conversation or []), start=1):
+        if str(msg.get("role") or "") not in roles:
             continue
         content = str(msg.get("content") or "")
-        if " ".join(content.split()) == current:
-            continue
+        if " ".join(content.split()) != normalized_current:
+            sources.append((age, content))
+    for age, content in sources:
         candidates: list[_QueryDate] = []
         previous_end = 0
         for d in _drop_corrected_dates(content, _iter_query_dates(content)):
-            lead = content[max(previous_end, _sentence_start(content, d.start)):d.start]
+            lead_start = max(previous_end, _clause_start(content, d.start))
             previous_end = d.end
-            if topic_re.search(lead):
+            topic = None
+            for t in topic_re.finditer(content, lead_start, d.start):
+                topic = t
+            bound = topic is not None and not _TOPIC_UNSET_RE.match(content, topic.end())
+            if not bound and trailing:
+                trail = trail_re.match(content, d.end)
+                bound = trail is not None and bool(
+                    _TRAILING_NOUN_END_RE.match(content, trail.end()),
+                )
+            if bound:
                 candidates.append(d)
-        if not candidates:
-            continue
-        if len(candidates) > 1:
-            logger.info(
-                "day count target abstained: %d candidate dates for %s",
-                len(candidates), nouns,
-            )
-            return None
-        target = _next_occurrence(candidates[0], today)
-        if target is None or (target < today and not backward):
-            return None
-        return DateIntentParams(
-            kind="days_between", start=None, end=target, n=0,
-            skip_weekends=False, holidays=(), count_start_day=False,
+        if candidates:
+            return age, candidates
+    return -1, []
+
+
+def _referent_dates(found: list[_QueryDate], today: datetime.date) -> list[datetime.date]:
+    """候補の日付を実日付に (年なしは今日に最も近い巡り)、重複を除いて返す。"""
+    dates: list[datetime.date] = []
+    for d in found:
+        resolved = (
+            _next_occurrence(d, today) if d.year is not None
+            else _resolve_yearless(d.month, d.day, today)
         )
-    return None
+        if resolved is not None and resolved not in dates:
+            dates.append(resolved)
+    return dates
+
+
+def referent_anchor_candidates(
+    query: str, conversation: list[dict] | None, today: datetime.date,
+) -> list[datetime.date]:
+    """オフセットの起点の参照名詞に会話で結び付いた日付の候補 (純粋関数)。
+
+    「10月20日がリリース日です。…」の 2 ターン後の「さっきのリリース日の
+    1 週間前は？」の起点は 10/20。抽出器は ``start: today`` を返し、規則は
+    今日起点で組んでいた (2026-10-05 ライブ監査: 9/28、正 10/13)。同じ節で名詞と
+    結び付いた日付だけを採る (:func:`_conversation_dates_bound_to`)。
+
+    ユーザーが述べた日付 (今回の発話を含む) を優先し、応答の日付はユーザーの
+    発話に候補が無いときだけ使う。ユーザーの発話より **新しい** 応答が別の日付を
+    述べていれば両方を返す (食い違い → 呼出側が棄権)。返すのは重複を除いた日付で、
+    2 つ以上なら呼出側は棄権する。
+    """
+    nouns = referent_anchor_nouns(query)
+    if not nouns:
+        return []
+    user_age, user_found = _conversation_dates_bound_to(
+        nouns, conversation, current=query or "",
+        roles=("user",), trailing=True, include_current=True,
+    )
+    asst_age, asst_found = _conversation_dates_bound_to(
+        nouns, conversation, current=query or "",
+        roles=("assistant",), trailing=True,
+    )
+    user_dates = _referent_dates(user_found, today)
+    asst_dates = _referent_dates(asst_found, today)
+    if not user_dates:
+        return asst_dates
+    if asst_dates and asst_age < user_age and set(asst_dates) != set(user_dates):
+        logger.info(
+            "referent anchor: the user said %s but a later reply said %s",
+            [d.isoformat() for d in user_dates], [d.isoformat() for d in asst_dates],
+        )
+        return user_dates + [d for d in asst_dates if d not in user_dates]
+    return user_dates
+
+
+def referent_anchor_date(
+    query: str, conversation: list[dict] | None, today: datetime.date,
+) -> datetime.date | None:
+    """参照名詞の起点の日付。候補が無い / 2 つ以上なら ``None`` (棄権、純粋関数)。"""
+    dates = referent_anchor_candidates(query, conversation, today)
+    if len(dates) > 1:
+        logger.info(
+            "referent anchor abstained: %d candidate dates for %s",
+            len(dates), referent_anchor_nouns(query),
+        )
+    return dates[0] if len(dates) == 1 else None
+
+
+def referent_defined_in_query(query: str, today: datetime.date) -> datetime.date | None:
+    """参照名詞が **同じ発話の中で** 今日起点のオフセットで定義されていればその日付。
+
+    「締め切りは今日から 2 週間後です。締め切りの 3 営業日前は？」の起点 (9/25)。
+    名詞を主題に置いた文の中のオフセットだけを採る — 別の話題の「今日から
+    2 週間後に会議」を起点にしない (純粋関数)。
+    """
+    nouns = referent_anchor_nouns(query)
+    if not nouns:
+        return None
+    topic_re = re.compile(
+        "(?:" + "|".join(re.escape(n) for n in nouns) + r")\s*(?:は|が|:|：)",
+    )
+    text = query or ""
+    found: list[datetime.date] = []
+    start = 0
+    for boundary in [*_SENTENCE_BOUNDARY_RE.finditer(text), None]:
+        end = boundary.end() if boundary is not None else len(text)
+        sentence = text[start:end]
+        start = end
+        if not topic_re.search(sentence):
+            continue
+        offset = offset_date_in_query(sentence, today)
+        if offset is not None and offset not in found:
+            found.append(offset)
+    return found[0] if len(found) == 1 else None
 
 
 def date_intent_command_from_params(params: DateIntentParams, query: str = "") -> str:
@@ -1768,7 +2029,7 @@ def date_intent_command_from_payload(payload: object, query: str = "") -> str:
     """``date_intent`` の生応答からコマンドを組む (検証込み、純粋関数)。
 
     ``kind == "none"`` / 検証失敗 / readonly 違反はすべて空文字列を返し、
-    呼出側は now-only のまま「未検証」の印を立てる。
+    呼出側は演算コマンド無しのまま「未検証」の印を立てる。
     """
     params = parse_date_intent(payload)
     if params is None:

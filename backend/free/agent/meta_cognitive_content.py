@@ -58,6 +58,40 @@ class ExistingContentRefused(Exception):
         self.code = code
 
 
+class InsufficientSourceRefused(ExistingContentRefused):
+    """素材 (このターンの取得) に書く内容が無いと生成側が答えたので書かない。
+
+    ``missing`` は生成側が挙げた足りないもの (依頼の言語の 1 文、空もありうる)。
+    コードは ``insufficient_source`` (i18n ``agent.write_rejection.insufficient_source``)。
+    """
+
+    def __init__(self, missing: str) -> None:
+        super().__init__("insufficient_source")
+        self.missing = missing
+
+
+#: 素材に依存する書込みの生成 (``write_content_from_source``) の指示。本文は
+#: ``content`` に入れ、素材に書く内容が無ければ書かずに足りないものを答えさせる。
+#: 2026-10-05 ライブ監査 T6: 無関係なファイルを素材に、謝罪文を summary.md へ書いて
+#: 成功と報告した — 生成の自由文では「書けない」を表す枠が無かった。
+_SOURCE_CHECKED_WRITE_INSTRUCTION = (
+    "[Output format] Return a JSON object instead of the bare file content.\n"
+    "- If the source data above contains what the request needs, set "
+    "\"fulfillable\": true, \"missing\": \"\", and put the complete file content "
+    "(exactly what should be saved, no code fences) in \"content\".\n"
+    "- If the source data does not contain it (for example the data read is a "
+    "different file, or the needed values are absent), set \"fulfillable\": false, "
+    "\"content\": \"\", and state in \"missing\" what is missing, in the language "
+    "of the request. Never put an apology, an explanation, or invented values in "
+    "\"content\"."
+)
+
+
+#: 素材に依存する書込みの JSON 生成の ``max_tokens`` に掛ける余裕 (本文の改行・引用符の
+#: エスケープでトークンが増える分)。
+_JSON_ESCAPE_HEADROOM = 1.25
+
+
 #: 追記の生成でモデルに見せる既存内容の末尾の上限 (文字)。書き方を揃えるための
 #: 抜粋で、既存内容そのものはモデルを通さず連結する。
 _APPEND_TAIL_MAX_CHARS = 4000
@@ -233,9 +267,23 @@ class _ContentGenerationMixin:
             system_content + user_prompt, ctx_size,
         )
 
+        # 素材に依存する書込みの生成と、その縮退の通常の生成は 1 つの締切を分け合う
+        # (``content_gen_timeout``)。別々に数えると最悪で 2 倍待たせる。
+        started = time.monotonic()
+        if not append and self._source_dependent_write():
+            checked = await self._generate_content_from_source(
+                system_content, user_prompt, ctx_size,
+                preserve_markdown=file_path.lower().endswith((".md", ".markdown")),
+            )
+            if checked is not None:
+                return checked
+
         generated = await self._stream_and_clean(
             llm_client, messages, gen_max_tokens,
             preserve_markdown=file_path.lower().endswith((".md", ".markdown")),
+            total_timeout=max(
+                1.0, self._content_gen_timeout - (time.monotonic() - started),
+            ),
         )
         if append:
             # 「完全なファイルを出す」癖で既存内容ごと出したら、既存部分を落とす
@@ -244,6 +292,91 @@ class _ContentGenerationMixin:
             if body and generated.startswith(body):
                 generated = generated[len(body):].lstrip("\n")
         return generated
+
+    def _source_dependent_write(self) -> bool:
+        """このターンの取得 (素材) に依存する書込みか (補助タスクが配線されているときだけ)。"""
+        return bool(getattr(self, "_fetched_tool_outputs", None)) and (
+            getattr(self, "_aux_client", None) is not None
+        )
+
+    async def _generate_content_from_source(
+        self,
+        system_content: str,
+        user_prompt: str,
+        ctx_size: int,
+        *,
+        preserve_markdown: bool,
+    ) -> str | None:
+        """素材に依存する書込みの本文を、書けるかの申告つきの JSON で生成する。
+
+        補助タスク ``write_content_from_source`` (文法制約 JSON、背景スロット) に
+        ``{fulfillable, missing, content}`` を返させる。``fulfillable`` が偽なら
+        :class:`InsufficientSourceRefused` を上げて書かない (謝罪文・作話の本文を
+        書かない)。
+
+        - 時間: 補助タスクの予算は purpose の既定 (較正込み) で、全体は
+          ``content_gen_timeout`` の締切で打ち切る。**時間切れなら通常の生成へ縮退
+          しない** — 同じ締切をもう一度待たせるだけなので、生成の失敗
+          (``(Content generation failed: timeout …)``) として書込みを失敗にする。
+        - JSON の判定が無い / 壊れた応答 (時間切れ以外) は ``None`` を返し、呼出側が
+          残りの締切で通常の生成へ縮退する。
+        - ``max_tokens`` は本文の上限に JSON のエスケープ分 (改行・引用符) の余裕を
+          足し、文脈の残りに収める。
+        - 利用者の中止 (``CancelledError``) は握らずに伝える。
+
+        Raises:
+            InsufficientSourceRefused: 素材に書く内容が無いと生成側が答えた。
+        """
+        aux_client = getattr(self, "_aux_client", None)
+        if aux_client is None:
+            return None
+        prompt = f"{user_prompt}\n\n{_SOURCE_CHECKED_WRITE_INSTRUCTION}"
+        available = max(
+            ctx_size - _estimate_tokens(system_content + prompt) - 128
+            - SEND_GUARD_RESERVE_TOKENS,
+            1024,
+        )
+        max_tokens = min(
+            available, int(self._execute_max_tokens * _JSON_ESCAPE_HEADROOM) + 64,
+        )
+        deadline = float(self._content_gen_timeout)
+        try:
+            data = await asyncio.wait_for(
+                aux_client.generate_json(
+                    prompt,
+                    system=system_content,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                    purpose="write_content_from_source",
+                ),
+                timeout=deadline,
+            )
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            logger.warning("Source-checked content generation timed out: %s", e)
+            return f"(Content generation failed: timeout after {deadline:g}s)"
+        except Exception as e:
+            logger.warning("Source-checked content generation failed: %s", e)
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("fulfillable"), bool):
+            logger.warning(
+                "Source-checked content generation returned no verdict; "
+                "falling back to plain generation",
+            )
+            return None
+        if not data["fulfillable"]:
+            missing = str(data.get("missing") or "").strip()
+            logger.info(
+                "Write refused: the source data does not contain what the request "
+                "needs (missing=%r)", missing[:200],
+            )
+            raise InsufficientSourceRefused(missing)
+        raw = str(data.get("content") or "").strip()
+        content = unwrap_sole_code_fence(raw) if preserve_markdown else strip_markdown_wrapper(raw)
+        content = truncate_repetition(content)
+        if not content:
+            logger.warning("Source-checked content generation returned empty content")
+            return "(Content generation failed: empty output)"
+        return content
 
     #: 生成プロンプトに添える直近会話の上限。
     #:
@@ -448,17 +581,26 @@ class _ContentGenerationMixin:
             raise ExistingContentRefused("existing_too_large")
         return user_prompt
 
-    def _inject_fetched_data(self, user_prompt: str, ctx_size: int) -> str:
+    def _inject_fetched_data(
+        self, user_prompt: str, ctx_size: int,
+        *, system_text: str = CONTENT_GENERATION_PROMPT,
+        note: str = FETCHED_DATA_BLOCK_NOTE,
+        outputs: list[str] | None = None,
+    ) -> str:
         """タスク横断で取得したツール結果を「使うべき実データ」として注入する。
 
-        コンテキスト予算 (おおよそ ctx_size/2) に収まる範囲で取得データを付与し、
-        モデルにデータ由来の出力を促す。予算不足なら付与しない (安全縮退)。
+        コンテキスト予算 (おおよそ ctx_size/2 から ``system_text`` と ``user_prompt``
+        を引いた分) に収まる範囲で取得データを付与し、モデルにデータ由来の出力を
+        促す。予算不足なら付与しない (安全縮退)。``system_text`` は一緒に送る
+        system の本文、``note`` は見出しの直後に置く注記。``outputs`` を渡すとターンの
+        取得全体の代わりにそれだけを渡す。
         """
-        outputs = getattr(self, "_fetched_tool_outputs", [])
+        if outputs is None:
+            outputs = getattr(self, "_fetched_tool_outputs", [])
         if not outputs:
             return user_prompt
         combined = "\n\n".join(outputs)
-        base_tokens = _estimate_tokens(CONTENT_GENERATION_PROMPT + user_prompt)
+        base_tokens = _estimate_tokens(system_text + user_prompt)
         budget_tokens = ctx_size // 2 - base_tokens
         if budget_tokens < 100:
             return user_prompt
@@ -466,7 +608,7 @@ class _ContentGenerationMixin:
         snippet = combined[: budget_tokens * 2]
         return user_prompt + (
             f"\n\n{FETCHED_DATA_BLOCK_HEADING}\n"
-            f"{FETCHED_DATA_BLOCK_NOTE}\n"
+            f"{note}\n"
             f"{snippet}"
         )
 
@@ -499,8 +641,12 @@ class _ContentGenerationMixin:
         gen_max_tokens: int,
         *,
         preserve_markdown: bool = False,
+        total_timeout: float | None = None,
     ) -> str:
         """LLM ストリーミング生成 + 後処理（フェンス除去・繰り返し切除）
+
+        ``total_timeout`` は総上限 (省略時は ``content_gen_timeout``)。同じ書込みの
+        前段 (素材に依存する JSON 生成) が使った分を差し引いて渡す。
 
         ``preserve_markdown`` は出力先が Markdown 文書 (.md/.markdown) の場合に
         立てる。``strip_markdown_wrapper`` は「最長のフェンス内」だけを取り出す
@@ -518,6 +664,9 @@ class _ContentGenerationMixin:
         低速だが進行中の生成は総上限 (``content_gen_timeout``) まで継続させる。
         総ウォールクロックで一律に打ち切らない。
         """
+        total_cap = (
+            self._content_gen_timeout if total_timeout is None else total_timeout
+        )
         stream = await llm_client.generate(
             messages, stream=True,
             max_tokens=gen_max_tokens,
@@ -562,12 +711,11 @@ class _ContentGenerationMixin:
                     )
                 first_token = False
                 chunks.append(token)
-                if time.monotonic() - start > self._content_gen_timeout:
+                if time.monotonic() - start > total_cap:
                     logger.warning(
-                        "Content generation exceeded total cap %ds",
-                        self._content_gen_timeout,
+                        "Content generation exceeded total cap %ds", total_cap,
                     )
-                    return f"(Content generation failed: timeout after {self._content_gen_timeout}s)"
+                    return f"(Content generation failed: timeout after {total_cap:g}s)"
             note_stream_truncation(self, stream, "content")
             raw = "".join(chunks).strip()
             content = (

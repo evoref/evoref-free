@@ -243,8 +243,8 @@ def rerank_mode_of(cfg: dict) -> str:
 class RerankConfig(BaseModel):
     """再順位段 (リランカー) の設定 (c_16 §7.2.1)。
 
-    ``mode: on`` で検索経路 (``unified_search`` の Step 6.8) が floor を通った corpus の
-    候補を並べ替える。``off`` なら rerank 用 llama-server は起動せず、並べ替えもしない。
+    ``mode: on`` で検索経路 (``unified_search`` の Step 6.8) が floor を通った corpus と
+    episodic の候補をストアごとに並べ替える (履歴検索ツールと sleep-time の疑似クエリ採点も同じクライアントを使う)。``off`` なら rerank 用 llama-server は起動せず、並べ替えもしない。
     既定は ``on`` だが、``model_paths.rerank_model`` が未設定かファイルが無ければ起動せず
     並べ替えもしない (cosine 順のまま)。モデルは利用者が ``models/`` に置く (自動ダウンロードは無い)。
     自己テストは PC の指紋が変わったときだけ起動スクリプトが走らせる。
@@ -256,7 +256,7 @@ class RerankConfig(BaseModel):
         default="on",
         description=(
             "off: 起動しない・並べ替えない / on (既定): model_paths.rerank_model のファイルがあれば"
-            "起動して corpus の候補を並べ替える (無ければ起動しない)"
+            "起動して corpus と episodic の候補を並べ替える (無ければ起動しない)"
         ),
     )
     port: int = Field(default=8083, ge=1024, le=65535, description="rerank 用 llama-server のポート")
@@ -265,7 +265,7 @@ class RerankConfig(BaseModel):
         description="auto: GPU の空きがモデル + 計算バッファの見積りを満たせば GPU、でなければ CPU。整数なら -ngl にそのまま渡す (0 = CPU)",
     )
     deadline_ms: int = Field(default=1000, ge=50, description="1 回の rerank 呼出の締切 (ミリ秒)。超えたら並べ替えを諦める")
-    max_candidates: int = Field(default=20, ge=1, le=200, description="1 回に並べ替える候補数の上限 (実際の候補数は自己テストが締切と 1 件あたり ms から決める)")
+    max_candidates: int = Field(default=12, ge=1, le=200, description="1 回に並べ替える候補数の上限 (実際に送る量はこの上限と、自己テストの速度から決まる近似トークンの予算の早い方。12 は締切超過を p90 で抑える値、c_16 §7.2.1)")
     min_candidates: int = Field(
         default=3, ge=1,
         description="締切に収まる候補数がこれ未満なら自己テストで無効にする (too_slow)",
@@ -293,6 +293,24 @@ class RerankConfig(BaseModel):
                 f"max_candidates ({self.max_candidates}) 以下である必要があります"
             )
         return self
+
+
+class QueryDecomposeConfig(BaseModel):
+    """決定論の問い分解 (D2) の設定 (f_01 §8.1 の 7.9)。
+
+    ``shadow`` は構文で割れる問いを分解の項ごとに検索し、元の問いの採用で空いた枠に
+    入る id を ``decision.jsonl`` に記録するだけで、応答には何も足さない。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["off", "shadow"] = Field(
+        default="off",
+        description=(
+            "off (既定): 分解しない / shadow: 分解の項ごとに埋め込み 1 回 + 統合検索 1 回を"
+            "応答と並走させ、空いた枠に入る id を記録だけする"
+        ),
+    )
 
 
 class RAGConfig(BaseModel):
@@ -335,6 +353,8 @@ class RAGConfig(BaseModel):
     # スコアを持ち込まないので (c_16 §6.3)、重み付け融合のキーは意味を失った。
     # --- 疑似クエリ索引 (f_01 §6) ---
     pseudo_query: PseudoQueryConfig = Field(default_factory=PseudoQueryConfig)
+    # --- 問い分解の影 (f_01 §8.1 の 7.9) ---
+    query_decompose: QueryDecomposeConfig = Field(default_factory=QueryDecomposeConfig)
     # --- code グラフ (c_16 §4.4) ---
     project_map: ProjectMapConfig = Field(default_factory=ProjectMapConfig)
 

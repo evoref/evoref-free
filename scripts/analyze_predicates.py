@@ -63,6 +63,7 @@ DEFAULT_MODULES: tuple[str, ...] = (
     "backend.free.core.correction_target",
     "backend.free.core.correction_verdict",
     "backend.free.core.query_anchors",
+    "backend.free.core.context_bound",
     "backend.free.core.locale_patterns",
     "backend.free.core.response_dates",
     "backend.free.core.relative_date",

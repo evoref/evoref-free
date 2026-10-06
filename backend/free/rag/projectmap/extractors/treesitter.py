@@ -290,6 +290,68 @@ def _definition_bases(node: Any, lang: str) -> list[Any]:
 # ── 言語別: 呼出し名 ────────────────────────────────────────────────────
 
 
+#: リテラル (とその内包表記) の受け手。呼ぶのは組込み型のメソッドでプロジェクト内の定義ではない。
+_LITERAL_RECEIVER_TYPES: dict[str, frozenset[str]] = {
+    "python": frozenset({
+        "string", "concatenated_string", "integer", "float", "list", "dictionary", "set",
+        "tuple", "list_comprehension", "dictionary_comprehension", "set_comprehension",
+        "true", "false", "none",
+    }),
+    "web": frozenset({
+        "string", "template_string", "number", "array", "object", "regex", "true", "false", "null",
+    }),
+}
+_RECEIVER_LANGS = {
+    "python": ("python", "attribute", "object", "attribute", ("identifier",)),
+    "javascript": ("web", "member_expression", "object", "property", ("identifier", "this")),
+    "typescript": ("web", "member_expression", "object", "property", ("identifier", "this")),
+    "tsx": ("web", "member_expression", "object", "property", ("identifier", "this")),
+}
+
+#: :func:`_call_receiver` がリテラルの受け手に返す印 (呼出ごと捨てる)。
+_LITERAL = object()
+
+
+def _call_receiver(node: Any, lang: str, source: bytes) -> "str | None | object":
+    """呼出の受け手 (:class:`RawCall` の ``receiver`` と同じ規約)。
+
+    Python / JS / TS だけ記録し、他の言語は ``None`` (受け手を見ない解決のまま)。
+    リテラルの受け手は :data:`_LITERAL` を返す (呼出ごと捨てる)。
+    """
+    spec = _RECEIVER_LANGS.get(lang)
+    if spec is None:
+        return None
+    family, member_type, object_field, attr_field, base_types = spec
+    fn = node.child_by_field_name("function")
+    if fn is None or fn.type != member_type:
+        return None
+    obj = fn.child_by_field_name(object_field)
+    # ``("a" "b").format()`` の括弧は外して中身で判定する (ast 版は括弧が残らない)
+    while obj is not None and obj.type == "parenthesized_expression" and obj.named_child_count == 1:
+        obj = obj.named_children[0]
+    if obj is None:
+        return ""
+    if obj.type in _LITERAL_RECEIVER_TYPES[family]:
+        return _LITERAL
+    if obj.type == "super":
+        return "super"  # JS の ``super.f()``
+    if obj.type == "call":
+        callee = obj.child_by_field_name("function")
+        if callee is not None and callee.type == "identifier" and _text(callee, source) == "super":
+            return "super"  # Python の ``super().f()``
+    parts: list[str] = []
+    while obj is not None and obj.type == member_type:
+        attr = obj.child_by_field_name(attr_field)
+        if attr is None:
+            return ""
+        parts.append(_text(attr, source))
+        obj = obj.child_by_field_name(object_field)
+    if obj is None or obj.type not in base_types:
+        return ""
+    parts.append(_text(obj, source))
+    return ".".join(reversed(parts))
+
+
 def _call_name(node: Any, lang: str) -> Any | None:
     if lang == "python":
         fn = node.child_by_field_name("function")
@@ -437,6 +499,77 @@ def _pack_import_spec(node: Any, source: bytes, rule: ImportRule) -> str | None:
     return None
 
 
+def _python_import_bindings(
+    node: Any, source: bytes,
+    import_names: list[tuple[str, str]],
+    import_bindings: dict[str, tuple[str, str | None]],
+) -> None:
+    """Python の import 文 1 つの束縛 (``ExtractedFile.import_bindings`` と同じ規約) を足す。
+
+    ``from M import a, b as c`` は ``import_names`` にも ``(M, a)`` / ``(M, b)`` を足す
+    (絶対 import のみ、``*`` は除く)。
+    """
+    if node.type == "import_statement":
+        for child in node.children_by_field_name("name"):
+            if child.type == "aliased_import":
+                target, alias = child.child_by_field_name("name"), child.child_by_field_name("alias")
+                if target is not None and alias is not None:
+                    import_bindings[_text(alias, source)] = (_text(target, source), None)
+            elif child.type == "dotted_name":
+                top = _text(child, source).split(".", 1)[0]
+                import_bindings[top] = (top, None)
+        return
+    if node.type != "import_from_statement":
+        return
+    module = node.child_by_field_name("module_name")
+    if module is None or module.type != "dotted_name":
+        return
+    module_text = _text(module, source)
+    for child in node.children_by_field_name("name"):
+        target, alias = child, None
+        if child.type == "aliased_import":
+            target, alias = child.child_by_field_name("name"), child.child_by_field_name("alias")
+        if target is None or target.type != "dotted_name":
+            continue
+        member = _text(target, source)
+        import_names.append((module_text, member))
+        import_bindings[_text(alias, source) if alias is not None else member] = (module_text, member)
+
+
+def _js_import_bindings(
+    node: Any, source: bytes, import_bindings: dict[str, tuple[str, str | None]],
+) -> None:
+    """JS / TS の ``import`` 文 1 つの束縛 (``ExtractedFile.import_bindings`` と同じ規約)。
+
+    ``import * as ns from 'm'`` → ``ns: ("m", None)``、``import { a as b } from 'm'`` →
+    ``b: ("m", "a")``。モジュールは指定子のまま (解決は graph 側)。default import は
+    相手の名前が決まらないので記録しない。
+    """
+    if node.type != "import_statement":
+        return
+    source_node = node.child_by_field_name("source")
+    if source_node is None:
+        return
+    spec = _text(source_node, source).strip("'\"`")
+    for clause in node.named_children:
+        if clause.type != "import_clause":
+            continue
+        for part in clause.named_children:
+            if part.type == "namespace_import":
+                ident = next((c for c in part.named_children if c.type == "identifier"), None)
+                if ident is not None:
+                    import_bindings[_text(ident, source)] = (spec, None)
+            elif part.type == "named_imports":
+                for spec_node in part.named_children:
+                    if spec_node.type != "import_specifier":
+                        continue
+                    name = spec_node.child_by_field_name("name")
+                    alias = spec_node.child_by_field_name("alias")
+                    if name is not None:
+                        local = _text(alias if alias is not None else name, source)
+                        import_bindings[local] = (spec, _text(name, source))
+
+
 def _import_specs(
     node: Any, lang: str, source: bytes, *, pack_language: "PackLanguage | None" = None,
 ) -> list[str]:
@@ -556,8 +689,13 @@ def _containing_depth(key: tuple[int, int], def_keys: set[tuple[int, int]]) -> i
 
 def extract_file(
     path: str, lang: str, source: bytes, *, pack_language: "PackLanguage | None" = None,
+    orphan_caller_id: str | None = None,
 ) -> ExtractedFile | None:
     """1 ファイルを tree-sitter で抽出する。
+
+    ``orphan_caller_id`` を渡すと、定義の外の呼出 (モジュール直下 / 定義の外の
+    関数式の中) をそのノードの呼出として残す (Svelte / Vue の ``<script>`` を
+    component に帰属させる、c_16 §4.4)。渡さなければ従来どおり捨てる。
 
     言語のクエリが構築できない (tree-sitter 不在 / grammar 未対応 / クエリ
     不正) 場合は ``None``。呼出側 (``builder.py``) が Python ならこの後で
@@ -683,15 +821,29 @@ def extract_file(
         parent_key = _nearest_enclosing(
             (call_node.start_byte, call_node.end_byte), def_keys,
         )
+        receiver = _call_receiver(call_node, lang, source)
+        if receiver is _LITERAL:
+            continue
         parent_entry = entries.get(parent_key) if parent_key else None
-        if parent_entry is None:
-            continue  # モジュール直下の呼出しは呼出し元が定まらないので捨てる
-        calls.append(RawCall(caller_id=parent_entry["node"].id, callee_name=callee))
+        caller_id = parent_entry["node"].id if parent_entry is not None else orphan_caller_id
+        if caller_id is not None:
+            calls.append(RawCall(caller_id=caller_id, callee_name=callee, receiver=receiver))
+        # それ以外 (モジュール直下の呼出し) は呼出し元が定まらないので捨てる
+
+    import_names: list[tuple[str, str]] = []
+    import_bindings: dict[str, tuple[str, str | None]] = {}
+    if lang == "python":
+        for imp_node in import_ts:
+            _python_import_bindings(imp_node, source, import_names, import_bindings)
+    elif lang in ("javascript", "typescript", "tsx"):
+        for imp_node in import_ts:
+            _js_import_bindings(imp_node, source, import_bindings)
 
     line_count = source.count(b"\n") + (0 if source.endswith(b"\n") else 1)
     return ExtractedFile(
         path=path, lang=lang, line_count=max(line_count, 1),
         nodes=nodes, imports=imports, calls=calls, inherits=inherits,
+        import_names=import_names, import_bindings=import_bindings,
     )
 
 

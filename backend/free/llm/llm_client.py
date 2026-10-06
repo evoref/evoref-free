@@ -114,6 +114,15 @@ class LLMClient:
         """分類器スロットの共有接頭辞を公開する (LocalClient への委譲)。"""
         self.local.set_classifier_slot_prefix(prefix)
 
+    def measured_tps(self):
+        """生成速度の実測 (LocalClient への委譲、``tps_calibration.measured_tps_of`` が読む)。"""
+        return self.local.measured_tps()
+
+    @property
+    def debug_logger(self):
+        """注入された DebugLogger (LocalClient への委譲)。"""
+        return self.local.debug_logger
+
     @property
     def metadata(self):
         """モデルメタデータ (ローカル LLM)"""
@@ -177,6 +186,7 @@ class LLMClient:
         max_tokens: int = 64,
         id_slot: int | None = None,
         timeout: float | None = None,
+        usage_purpose: str = "",
     ) -> str | None:
         """``response_format`` (json_schema) で文法制約した非ストリーミング生成
 
@@ -197,6 +207,7 @@ class LLMClient:
             max_tokens=max_tokens,
             id_slot=id_slot,
             timeout=timeout,
+            usage_purpose=usage_purpose,
         )
 
     async def generate_with_logprobs(

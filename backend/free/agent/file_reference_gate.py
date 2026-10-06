@@ -35,6 +35,7 @@ from typing import Any
 from backend.free.agent.file_ledger import last_written_path, restore_from_conversation
 from backend.free.core.intent_vocab import (
     DESCRIBED_OBJECT_PATTERN,
+    EDIT_REQUEST_RE,
     EXPLICIT_WINDOWS_PATH_RE,
     FILE_NAME_IN_TEXT_RE,
     FORWARD_REFERENCE_JA,
@@ -104,7 +105,8 @@ _INTERVENING_PREDICATE_RE = re.compile(r"して|って|んで|か確認|たら|�
 #: 引用の中身 (「git stash の使い方」) は述語の解析から外す。
 _QUOTED_SPAN_RE = QUOTED_SPAN_RE
 #: 「保存したファイルに加えて」— 「に加えて」は宛先ではなく「〜のほかに」。
-_IN_ADDITION_TO_RE = re.compile(r"^\s*に\s*加え")
+_IN_ADDITION_TO_WORD = "加え"
+_IN_ADDITION_TO_RE = re.compile(r"^\s*に\s*" + _IN_ADDITION_TO_WORD)
 #: ``を`` 格で直近ファイルそのものを書き換える動詞 (「作成していただいたファイルを
 #: 更新して」)。「保存したファイルを読んで」「…を削除して」は含めない。
 _REWRITE_OBJECT_VERB_RE = re.compile(
@@ -120,10 +122,28 @@ _SAVE_ELSEWHERE_VERB_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: 説明節の直後の格が **出典・話題** (宛先ではない) の形。
+#: 説明節の直後の格が **所在** (「保存したファイルにある表」— 中身の在り処) の形。
+_LOCATION_CASE_RE = re.compile(
+    r"^\s*(?:に|へ)\s*(?:ある|あった|書いてあ|書かれ|載って|含まれ|入って|記載)",
+)
+#: 説明節の直後の格が **話題・根拠** (「このファイルに対するテスト」— 何について書くか) の形。
+_TOPIC_CASE_WORDS = r"(?:基づ|もとづ|ついて|関して|関する|対して|対する)"
+_TOPIC_CASE_RE = re.compile(r"^\s*(?:に|へ)\s*" + _TOPIC_CASE_WORDS)
+#: 「に」の **直後** が話題・根拠の格かを見る断片 (話題・根拠の語 + 「に加えて」)。
+#: :func:`is_topic_case` とルータの宛先の格 (``router._NON_DESTINATION_NI``) が **これ 1 本**
+#: を読む (#14 (a)、docs/f_03 §1.4)。
+TOPIC_CASE_AFTER_NI = r"\s*(?:" + _TOPIC_CASE_WORDS + "|" + _IN_ADDITION_TO_WORD + ")"
+#: :func:`is_topic_case` の本体。「に」の後ろは上の断片、「へ」の後ろは話題・根拠の語だけ
+#: (「へ加えて」は無い)。
+_TOPIC_OR_ADDITION_CASE_RE = re.compile(
+    r"^\s*(?:に" + TOPIC_CASE_AFTER_NI + r"|へ\s*" + _TOPIC_CASE_WORDS + ")",
+)
+#: 「への / にの」— 宛先の格を連体にした形 (「保存したファイルへの追記」)。説明節の判定では
+#: 宛先と取らないが、話題・根拠でもない (「このファイルへの追記をお願いします」は書込み)。
+_ADNOMINAL_CASE_RE = re.compile(r"^\s*(?:に|へ)\s*の")
+#: 説明節の直後の格が **出典・話題** (宛先ではない) の形 = 所在 + 話題・根拠 + 連体。
 _SOURCE_CASE_RE = re.compile(
-    r"^\s*(?:に|へ)\s*(?:ある|あった|書いてあ|書かれ|載って|含まれ|入って|記載"
-    r"|基づ|もとづ|ついて|関して|関する|対して|対する|の)",
+    f"{_LOCATION_CASE_RE.pattern}|{_TOPIC_CASE_RE.pattern}|{_ADNOMINAL_CASE_RE.pattern}",
 )
 #: 説明節の直後の宛先の格 (閉じ括弧を挟む形も)。
 _DESTINATION_CASE_RE = re.compile(r"^[)）」』\s]*(?:に|へ)")
@@ -294,12 +314,33 @@ def _payload_like(head: str, tail: str) -> bool:
     )
 
 
-def _clause_role(clause: Any, rest: str) -> tuple[str, str]:
-    """説明節の直後の格から ``(役割, 格の後ろの本文)`` を返す。
+def is_topic_case(rest: str) -> bool:
+    """名指しの直後が **話題・根拠の格** か (純粋関数)。
 
-    役割は ``destination`` (に / へ / の末尾に) / ``object`` (を) / ``source`` (それ以外)。
+    「に対する / について / に関する / に基づ / に加えて」— 名指しは何について書くかの題材で、
+    中身の在り処 (「にある」) でも宛先でもない。ルータの宛先の証拠 (参照表現) と書込みの
+    対象の判定点 ``overwrite_target`` が読む (docs/f_03 §1.4 / §4.y)。
     """
-    if not clause.names_file or _IN_ADDITION_TO_RE.match(rest) or _SOURCE_CASE_RE.match(rest):
+    return bool(_TOPIC_OR_ADDITION_CASE_RE.match(rest))
+
+
+def is_source_case(rest: str) -> bool:
+    """名指し (説明節 / 指示詞 + ファイル / ファイル名) の直後が **話題・出典の格** か (純粋関数)。
+
+    「に対する / について / にある / に基づ / に加えて …」— 何について・何を元に
+    書くかを言っているだけで、どこへ書くかを言っていない。``rest`` は名指しの直後からの本文。
+    """
+    return bool(_IN_ADDITION_TO_RE.match(rest) or _SOURCE_CASE_RE.match(rest))
+
+
+def case_role(rest: str) -> tuple[str, str]:
+    """名指しの直後の格から ``(役割, 格の後ろの本文)`` を返す (純粋関数)。
+
+    役割は ``destination`` (に / へ / の末尾に) / ``object`` (を) / ``source`` (それ以外。
+    話題・出典の格 :func:`is_source_case` を含む)。説明節 (判定点 ``recent_file_reference``) と
+    書込みの対象の判定点 ``overwrite_target`` (c_17 §3.21) が同じ 1 本を読む (#14 (a))。
+    """
+    if is_source_case(rest):
         return "source", rest
     m = _POSITION_DESTINATION_RE.match(rest) or _DESTINATION_CASE_RE.match(rest)
     if m:
@@ -308,6 +349,61 @@ def _clause_role(clause: Any, rest: str) -> tuple[str, str]:
     if m:
         return "object", rest[m.end():]
     return "source", rest
+
+
+#: 目的語の格 (``を``) の名指しを書込みの対象にする動詞 — 直近ファイルの更新の動詞・宛先へ
+#: 書き込む動詞・既存の本文を変える依頼の動詞 (``EDIT_REQUEST_RE``)・作る / 書く動詞
+#: (``WRITE_VERB_RE``) の和 (語は足さない、#14)。読む・要約する・訳す等の派生の動詞は
+#: どの集合にも無いので、「util.py を要約して」は目的語でも対象にならない。
+_OVERWRITE_OBJECT_VERB_RE = re.compile(
+    f"{_REWRITE_OBJECT_VERB_RE.pattern}|{_WRITE_INTO_VERB_RE.pattern}"
+    f"|{EDIT_REQUEST_RE.pattern}|{WRITE_VERB_RE.pattern}",
+    re.IGNORECASE,
+)
+
+
+#: 動詞の直後に名指しが来る形 (英語の「update util.py」「overwrite the file X」)。
+_VERB_DIRECTLY_BEFORE_RE = re.compile(
+    rf"(?:{_OVERWRITE_OBJECT_VERB_RE.pattern})[A-Za-z]*\s+(?:the\s+)?(?:file\s+)?[\"'`]?$",
+    re.IGNORECASE,
+)
+
+
+def verb_directly_before(before: str) -> bool:
+    """名指しの直前が書込み・編集の動詞か (英語の語順、``before`` は名指しより前の本文)。"""
+    return bool(_VERB_DIRECTLY_BEFORE_RE.search(before or ""))
+
+
+def names_write_verb(text: str) -> bool:
+    """``text`` に書込み・編集の動詞があるか (参照表現が「上書き」「保存し直」そのものか)。"""
+    return bool(_OVERWRITE_OBJECT_VERB_RE.search(text or ""))
+
+
+def object_governed_by_write(after: str) -> bool:
+    """目的語の格の後の **最初の述語** が書込み・編集の動詞の依頼のテ形か (純粋関数)。
+
+    「util.py を上書きして」「このファイルを更新してください」は真、「util.py を読んで
+    テストを書いて」(最初の述語は読む) は偽。``after`` は ``を`` の直後からの本文。
+    語がテ形まで含む形 (「作って」「直して」) はその語の直後でなく語そのもので依頼のテ形と読む。
+    """
+    m = _OVERWRITE_OBJECT_VERB_RE.search(after or "")
+    if m is None or _INTERVENING_PREDICATE_RE.search(after[:m.start()]):
+        return False
+    if "を" in after[:m.start()]:
+        # 動詞の前に別の目的語がある — 動詞はそちらを取る (「util.py を参考にテストを書いて」
+        # 「util.py をテストするコードを書いて」、2026-10-05 2 周目レビュー HIGH-1)
+        return False
+    return m.group(0).endswith(("て", "で")) or bool(_GOVERNING_TAIL_RE.match(after[m.end():]))
+
+
+def _clause_role(clause: Any, rest: str) -> tuple[str, str]:
+    """説明節の直後の格から ``(役割, 格の後ろの本文)`` を返す (:func:`case_role`)。
+
+    対象がファイルでない説明節 (「保存した内容」) は ``source``。
+    """
+    if not clause.names_file:
+        return "source", rest
+    return case_role(rest)
 
 
 def _clause_verdict(
@@ -502,9 +598,16 @@ def is_sole_write_request(text: str) -> bool:
 __all__ = [
     "LOCATE_LABEL",
     "PREDICATE_NAME",
+    "TOPIC_CASE_AFTER_NI",
     "WRITE_LABEL",
     "bind_debug_logger",
+    "case_role",
     "is_sole_write_request",
+    "is_source_case",
+    "is_topic_case",
+    "names_write_verb",
+    "object_governed_by_write",
+    "verb_directly_before",
     "predicate",
     "recent_file_context",
     "recent_file_reference_rule",

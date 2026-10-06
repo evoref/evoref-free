@@ -26,6 +26,10 @@ start_all() {
     # (標準入力が端末でなければ聞かず pending のまま。失敗しても起動は止めない)。
     python -m backend.free.cli.main tune --startup-check || true
 
+    # 前回の rerank 起動断念の印を --all を起こす前に消す (--all 側でも消すが、埋め込みが llama-cpp で
+    # ない構成では下の --wait-embed が即座に返り、--all が消す前に --wait-rerank が古い印を読みうる)
+    python scripts/launch_llama.py config.yaml --clear-rerank-abandoned || true
+
     echo "[start] Starting llama-server (base + embedding + rerank if enabled)..."
     python scripts/launch_llama.py config.yaml --all &
     PIDS+=($!)
@@ -35,7 +39,7 @@ start_all() {
     # 配置 (GPU / CPU) の判別が先に走り、GPU で起動しなければ CPU で起こし直すので長めに待つ。
     python scripts/launch_llama.py config.yaml --wait-embed 240
 
-    # リランカー (rag.rerank、既定 off) の自己テスト (PC が変わったときだけ) を待つ。
+    # リランカー (rag.rerank、既定 on。モデルファイルがあるときだけ起動) の自己テスト (PC が変わったときだけ) を待つ。
     # backend は起動時に結果を 1 回読むだけなので先に終わらせる。off なら即終了。
     python scripts/launch_llama.py config.yaml --wait-rerank 240
 

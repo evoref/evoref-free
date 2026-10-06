@@ -874,7 +874,7 @@ async def _init_reranker(
     候補数は保存済みの ms/件と現在の締切・候補数の設定で引き直す。モデルが自己テスト後に
     変わっていても再テストはせず WARNING だけ出す。失敗は起動を止めない。
     """
-    from backend.free.rag.rerank_llamacpp import RerankClient
+    from backend.free.rag.rerank_llamacpp import BREAKER_STARTUP_COOLDOWN_S, RerankClient
     from backend.free.rag.rerank_selftest import (
         RerankStatus,
         collect_pc_info,
@@ -919,7 +919,7 @@ async def _init_reranker(
     status = resolve_rerank_status(
         mode, saved,
         deadline_ms=int(rr.get("deadline_ms", 1000)),
-        max_candidates=int(rr.get("max_candidates", 20)),
+        max_candidates=int(rr.get("max_candidates", 12)),
         min_candidates=int(rr.get("min_candidates", 3)),
         current_pc=current_pc,
         current_model_key=current_model_key,
@@ -937,7 +937,8 @@ async def _init_reranker(
     client = RerankClient(
         port=int(rr.get("port", 8083)),
         deadline_ms=int(rr.get("deadline_ms", 1000)),
-        candidates=status.candidates,
+        candidates=status.max_candidates,
+        token_budget=status.token_budget,
         placement=status.placement,
         ms_per_doc=status.ms_per_doc,
         debug_logger=debug_logger,
@@ -949,12 +950,19 @@ async def _init_reranker(
         logger.warning("Reranker health check failed: %s", e)
         reachable = False
     if not reachable:
-        await client.aclose()
-        logger.warning("Reranker disabled: server on :%s is not reachable", rr.get("port", 8083))
-        return None, _dc_replace(status, enabled=False, reason="server_unreachable")
+        # 読み込み中 / 後から起動されるサーバを待てるよう、クライアントは残して遮断から始める
+        # (冷却明けの試しで自然に復帰する。参照は配り直さない)
+        client.open_breaker(BREAKER_STARTUP_COOLDOWN_S)
+        logger.warning(
+            "Reranker server on :%s is not reachable; starting with the circuit open (retry in %d s)",
+            rr.get("port", 8083), BREAKER_STARTUP_COOLDOWN_S,
+        )
+        return client, _dc_replace(status, reason="server_unreachable")
     logger.info(
-        "Reranker ready: %s, %.0f ms/doc, %d candidates (mode=%s, pseudo-query gate %s)",
-        status.placement, status.ms_per_doc or 0.0, status.candidates, mode,
+        "Reranker ready: %s, %.0f ms/doc, up to %d candidates within ~%s tokens "
+        "(%d at self-test length; mode=%s, pseudo-query gate %s)",
+        status.placement, status.ms_per_doc or 0.0, status.max_candidates,
+        "unlimited" if status.token_budget is None else status.token_budget, status.candidates, mode,
         "calibrated" if client.pseudo_query_calibration is not None else "uncalibrated",
     )
     return client, status
@@ -2720,10 +2728,40 @@ async def _build_learn_pillar(
 
     session_answer_gate.bind_debug_logger(debug_logger)
 
+    # 問いが今の会話の窓に結び付くかの判定点 (照応・省略の追い質問、記憶の注入) も字句段だけ。
+    from backend.free.core import context_bound
+
+    context_bound.bind_debug_logger(debug_logger)
+
+    # アシスタント自身への問いかの判定点 (c_17 §3.20、人格注記の帯) も字句段だけ。
+    from backend.free.core import persona_question
+
+    persona_question.bind_debug_logger(debug_logger)
+
+    # 問いの条件の抜き出し (f_03 §7.1.1、c_17 §3.24) は補助タスクの結果を帯にする段だけ。
+    from backend.free.core import answer_conditions
+
+    answer_conditions.bind_debug_logger(debug_logger)
+
     # 訂正候補の帰属の判定点 (c_17 §3.17、学習側の候補判定) も字句段だけ。
     from backend.free.agent import correction_attribution_gate
 
     correction_attribution_gate.bind_debug_logger(debug_logger)
+
+    # 問い分解の影の判定点 (c_17 §3.22、f_01 §8.1 の 7.9) も字句段だけ。
+    from backend.free.memory.pipeline import query_decompose
+
+    query_decompose.bind_debug_logger(debug_logger)
+
+    # 計画のタスクが書込みのタスクかの判定点 (c_17 §3.18、meta 経路) も字句段だけ。
+    from backend.free.agent import task_write_gate
+
+    task_write_gate.bind_debug_logger(debug_logger)
+
+    # 既存ファイルが今の依頼の書込みの対象かの判定点 (c_17 §3.20、書込みゲート) も字句段だけ。
+    from backend.free.agent import overwrite_gate
+
+    overwrite_gate.bind_debug_logger(debug_logger)
 
     # 元利均等の毎月返済額の問いの判定点 (c_17 §3.13、層 5.8) も字句段だけ。
     from backend.free.agent import tool_judge_annuity

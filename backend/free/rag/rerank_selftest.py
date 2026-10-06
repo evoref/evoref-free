@@ -7,7 +7,9 @@
    全部 0 / 同値でない)
 2. 1 件あたりの ms (ウォーム 1 回 + 計測 3 回の中央値)
 3. 締切に収まる候補数 (``min(max_candidates, floor(deadline_ms × CANDIDATE_HEADROOM / ms_per_doc))``、
-   ``min_candidates`` 未満なら無効)
+   ``min_candidates`` 未満なら無効)。自己テストの文書長 (1 組 約 390 トークン) での件数で、有効かどうかを
+   決めるのに使う。実行時に送る件数は文書の長さで変わる — 件数の上限 ``max_candidates`` と
+   トークン予算 (:func:`rerank_token_budget`) の早い方で詰める
 
 を決めて ``cache/rerank_selftest.json`` (volatile、c_05 §0.7.1) に残す。
 
@@ -41,6 +43,7 @@ from backend.free.rag.rerank_llamacpp import (
     build_rerank_payload,
     degenerate_reason,
     parse_rerank_response,
+    rerank_pair_cost,
 )
 from backend.io.codec import codec_for, persisted
 from backend.io.format_registry import FormatSpec, register_format
@@ -66,9 +69,9 @@ MEASURE_RUNS = 3
 #: 1 回の自己テスト要求の HTTP timeout (秒)。CPU 配置の最悪 (20 件 14 秒) より長く取る。
 REQUEST_TIMEOUT_SEC = 60.0
 
-#: 環境起因の失敗 (``server_unhealthy`` / ``http_error:*``) がこの回数続いたら、無効を保存して
-#: 次の起動から測り直さない (手動の --rerank-selftest と PC の変化では測り直す)。埋め込みの
-#: ``embed_placement.GPU_UNHEALTHY_LIMIT`` と同じ考え方・同じ値。
+#: 測り直す失敗 (:func:`is_retryable_failure` — 環境起因の ``server_unhealthy`` / ``http_error:*`` と
+#: ``too_slow``) がこの回数続いたら、無効を確定して次の起動から測り直さない (手動の --rerank-selftest と
+#: PC の変化では測り直す)。埋め込みの ``embed_placement.GPU_UNHEALTHY_LIMIT`` と同じ考え方・同じ値。
 ENVIRONMENTAL_FAILURE_LIMIT = 3
 #: 利用可能な物理メモリが足りなくて自己テストを見送った理由 (保存しない・数えない状態)。
 LOW_MEMORY = "low_memory"
@@ -143,6 +146,11 @@ SELFTEST_DOCUMENTS: tuple[str, ...] = (
     "だけでなく、翌年の住民税も軽くなるので、該当しそうな年は領収書を捨てずにまとめておくとよいでしょう。",
 )
 SELFTEST_RELEVANT_INDEX = 0
+#: 自己テストが送る 1 組 (query + 文書) の平均のコスト (:func:`rerank_pair_cost`、近似トークン + 組の固定費)。
+#: ``ms_per_doc`` をこれで割ると予算の 1 単位あたりの ms になる (1 要求の固定費を分けないので高めに出る)。
+SELFTEST_PAIR_TOKENS = sum(
+    rerank_pair_cost(SELFTEST_QUERY, doc) for doc in SELFTEST_DOCUMENTS
+) / len(SELFTEST_DOCUMENTS)
 
 
 # ── PC の指紋 ─────────────────────────────────────────────
@@ -336,6 +344,17 @@ def decide_candidates(
     return candidates, ""
 
 
+def rerank_token_budget(per_doc_ms: float | None, *, deadline_ms: int) -> int | None:
+    """1 回に送る近似トークンの予算。速度が無ければ ``None`` (件数の上限だけで詰める)。
+
+    ``deadline_ms × CANDIDATE_HEADROOM ÷ (per_doc_ms ÷ SELFTEST_PAIR_TOKENS)``。自己テストの文書長なら
+    :func:`decide_candidates` の件数と同じ量で、短い文書ではそれより多く、長い文書では少なく送る。
+    """
+    if per_doc_ms is None or per_doc_ms <= 0:
+        return None
+    return math.floor(deadline_ms * CANDIDATE_HEADROOM * SELFTEST_PAIR_TOKENS / per_doc_ms)
+
+
 @dataclass
 class Measurement:
     """rerank サーバへの自己テスト要求の生の結果 (HTTP 層の出力)。"""
@@ -410,8 +429,8 @@ class RerankSelftestResult:
     scores: list[float] = field(default_factory=list)
     prompt_tokens: int | None = None
     tested_at: str = ""
-    #: 環境起因の失敗 (:func:`is_environmental_failure`) が同じ PC で続けて起きた回数 (この回を含む)。
-    #: :data:`ENVIRONMENTAL_FAILURE_LIMIT` に届くまで次の起動でまた測り、届いたら無効を確定する。
+    #: 測り直す失敗 (:func:`is_retryable_failure`: 環境起因 + ``too_slow``) が同じ PC で続けて起きた回数
+    #: (この回を含む)。:data:`ENVIRONMENTAL_FAILURE_LIMIT` に届くまで次の起動でまた測り、届いたら無効を確定する。
     environmental_streak: int = 0
     #: 記録だけ (指紋には入れない)。
     model_key: str = ""
@@ -481,7 +500,8 @@ def selftest_needed(
     """自己テストを走らせるか、とその理由。
 
     理由: ``forced`` / ``no_result`` / ``fingerprint_changed`` / ``placement_setting_changed`` /
-    ``environmental_retry`` (環境起因の失敗を数えている途中。上限に届いたら測り直さない)。
+    ``environmental_retry`` (環境起因の失敗を数えている途中) / ``slow_retry`` (``too_slow`` を数えている途中。
+    起動時に本体モデルのロード等と GPU を取り合った一時的な遅さでも出る)。上限に届いたら測り直さない。
     読めない結果 (新しい版・壊れ) は ``saved=None`` で渡る (``no_result``)。
 
     **再テストは PC が変わったときだけ** — 唯一の例外が明示の ``gpu_layers`` (整数) で、
@@ -497,10 +517,10 @@ def selftest_needed(
     if explicit_gpu_layers is not None and saved.gpu_layers != explicit_gpu_layers:
         return True, "placement_setting_changed"
     if (
-        not saved.enabled and is_environmental_failure(saved.reason)
+        not saved.enabled and is_retryable_failure(saved.reason)
         and saved.environmental_streak < ENVIRONMENTAL_FAILURE_LIMIT
     ):
-        return True, "environmental_retry"
+        return True, "environmental_retry" if is_environmental_failure(saved.reason) else "slow_retry"
     return False, ""
 
 
@@ -514,12 +534,22 @@ def is_environmental_failure(reason: str) -> bool:
     return reason in ("server_unhealthy", LOW_MEMORY) or reason.startswith("http_error:")
 
 
+def is_retryable_failure(reason: str) -> bool:
+    """次の起動で測り直す失敗か (環境起因 + ``too_slow``)。
+
+    ``too_slow`` は PC の性質のこともあるが、起動時に GPU を取り合った一時的な遅さでも出る
+    (同じ PC の他の回は 95〜144 ms/件で 367 / 507 ms/件、2026-10-02 実機)。環境起因と同じ連続回数に数え、
+    :data:`ENVIRONMENTAL_FAILURE_LIMIT` 回続いたら確定する (本当に遅い PC で毎起動に測り直し続けない)。
+    """
+    return is_environmental_failure(reason) or reason == "too_slow"
+
+
 def next_environmental_streak(saved: RerankSelftestResult | None, fingerprint: str) -> int:
-    """今回の環境起因の失敗を数えた連続回数 (同じ PC で環境起因の失敗を数えている記録があれば +1)。"""
+    """今回の測り直す失敗を数えた連続回数 (同じ PC で測り直す失敗を数えている記録があれば +1)。"""
     prior = 0
     if (
         saved is not None and saved.fingerprint == fingerprint and not saved.enabled
-        and is_environmental_failure(saved.reason) and saved.reason != LOW_MEMORY
+        and is_retryable_failure(saved.reason) and saved.reason != LOW_MEMORY
     ):
         prior = saved.environmental_streak
     return max(0, prior) + 1
@@ -638,7 +668,12 @@ class RerankStatus:
     enabled: bool = False
     placement: str = ""
     ms_per_doc: float | None = None
+    #: 自己テストの文書長 (1 組 約 390 トークン) で締切に収まる件数 (有効かどうかの判定に使う)。
     candidates: int = 0
+    #: 実行時に 1 回で送る件数の上限 (``rag.rerank.max_candidates``)。無効なら 0。
+    max_candidates: int = 0
+    #: 実行時に 1 回で送る近似トークンの予算 (:func:`rerank_token_budget`)。無効なら ``None``。
+    token_budget: int | None = None
     #: 無効の理由 (``off`` / ``no_model`` (``model_paths.rerank_model`` 未設定) /
     #: ``model_missing`` (設定したファイルが無い) / ``not_tested`` / ``stale_fingerprint`` /
     #: 自己テストの理由 / ``server_unreachable``)。``no_model`` / ``model_missing`` は
@@ -668,7 +703,7 @@ def resolve_rerank_status(
     saved: RerankSelftestResult | None,
     *,
     deadline_ms: int = 1000,
-    max_candidates: int = 20,
+    max_candidates: int = 12,
     min_candidates: int = 3,
     current_pc: PcInfo | None = None,
     current_model_key: str | None = None,
@@ -677,7 +712,8 @@ def resolve_rerank_status(
 
     - 結果が無い / 読めない → **無効** (``not_tested``)。未テストの候補数では動かさない。
     - ``current_pc`` と保存時の PC が食い違う → 無効 (``stale_fingerprint``)。
-    - 候補数は保存済みの ``ms_per_doc`` と現在の締切・候補数の設定で引き直す。
+    - 候補数は保存済みの ``ms_per_doc`` と現在の締切・候補数の設定で引き直す。有効なら実行時の
+      件数の上限 (``max_candidates``) とトークン予算 (``token_budget``) も載せる。
     - モデルが変わっていても再テストはしない (``model_changed_since_selftest`` で知らせる)。
     """
     if mode == "off":
@@ -697,13 +733,21 @@ def resolve_rerank_status(
         saved, deadline_ms=deadline_ms,
         max_candidates=max_candidates, min_candidates=min_candidates,
     )
-    return RerankStatus(enabled=enabled, candidates=candidates, reason=reason, **common)
+    if not enabled:
+        return RerankStatus(enabled=False, candidates=candidates, reason=reason, **common)
+    return RerankStatus(
+        enabled=True, candidates=candidates, reason=reason,
+        max_candidates=max_candidates,
+        token_budget=rerank_token_budget(saved.ms_per_doc, deadline_ms=deadline_ms),
+        **common,
+    )
 
 __all__ = [
     "CANDIDATE_HEADROOM",
     "MIN_MARGIN",
     "RERANK_SELFTEST_FORMAT",
     "SELFTEST_DOCUMENTS",
+    "SELFTEST_PAIR_TOKENS",
     "SELFTEST_QUERY",
     "Measurement",
     "PcInfo",
@@ -719,6 +763,7 @@ __all__ = [
     "LOW_MEMORY",
     "available_physical_memory_mb",
     "is_environmental_failure",
+    "is_retryable_failure",
     "next_environmental_streak",
     "evaluate_measurement",
     "judge_scores",
@@ -727,6 +772,7 @@ __all__ = [
     "ms_per_doc",
     "pc_mismatch",
     "rerank_model_unavailable_reason",
+    "rerank_token_budget",
     "resolve_rerank_status",
     "save_selftest_result",
     "selftest_needed",

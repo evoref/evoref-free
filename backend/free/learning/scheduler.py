@@ -22,6 +22,7 @@ from backend.log_config import get_logger
 from backend.policy_helpers import get_policy_value
 from backend.utils import format_utc, parse_utc, utc_now
 from backend.free.core.session_mode import is_chat_mode, is_create_mode
+from backend.free.core.verifier_events import decided_by_shortcut
 from backend.free.learning.fitness import defect_rate_fitness
 from backend.free.learning.learning_state_store import (
     LearningState,
@@ -3196,7 +3197,11 @@ class LearningScheduler:
             signals = exp.get("signals", {})
             query = exp.get("query", "")
 
-            if signals.get("tool_routing_success"):
+            # 近道 (想起 / 学習済みパターン) が決めた実行の成功は正例に数えない —
+            # 近道が自分の結果で自分を強化する輪になる (不変則 #15)。誤検出の減衰は掛ける。
+            if signals.get("tool_routing_success") and not decided_by_shortcut(
+                signals.get("decided_by"),
+            ):
                 # 成功: マッチしたパターンの重みをブースト
                 matches = store.match(query, category="tool_routing", record_hit=False)
                 for kw, _ in matches:

@@ -42,6 +42,7 @@ from backend.free.agent.tools.calc import (  # noqa: F401
     _SAFE_NAMES,
     _SAFE_NODES,
 )
+from backend.free.agent.tools.calc_ops import CHAR_KINDS
 from backend.free.agent.tools.filesystem import (  # noqa: F401
     apply_diff,
     _block_has_renderable_content,
@@ -108,8 +109,12 @@ from backend.free.agent.tools.web_fetch import (  # noqa: F401
 
 from backend.free.constants import (
     SEARCH_HISTORY_CURRENT_SESSION_HEADER,
+    SEARCH_HISTORY_EMPTY_WINDOW_CURRENT_NOTE,
+    SEARCH_HISTORY_EMPTY_WINDOW_NOTE,
     SEARCH_HISTORY_NO_RESULTS_PREFIX as _SEARCH_HISTORY_NO_RESULTS_PREFIX,
     SEARCH_HISTORY_OTHER_SESSIONS_HEADER,
+    SEARCH_HISTORY_TRUNCATED_LISTING_NOTE,
+    SEARCH_HISTORY_TRUNCATED_RESULTS_NOTE,
 )
 
 
@@ -329,7 +334,8 @@ def _make_search_code(reader_getter: "Callable[[], ProjectMapReader | None]"):
                 blocks = []
             for label, text in blocks:
                 if text:
-                    out += f"\n\n[{label}] (<- called/imported by, -> calls/imports)\n" + text
+                    # 各行が ``called by:`` / ``calls:`` 等の関係を名乗る (c_16 §4.4)
+                    out += f"\n\n[{label}]\n" + text
         return out + "\n\n[grep]\n" + grep_result
 
     return wrapped
@@ -500,8 +506,6 @@ def _local_session_stamp(started_at: str, tz) -> str:
     """
     from datetime import datetime, timezone
 
-    from backend.utils import utc_now_dt
-
     raw = str(started_at or "")
     try:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -513,17 +517,90 @@ def _local_session_stamp(started_at: str, tz) -> str:
         # 1 日ずれる。内部時刻不変則 (UTC 固定) に合わせて明示的に付ける。
         parsed = parsed.replace(tzinfo=timezone.utc)
     local = parsed.astimezone(tz)
-    today = utc_now_dt().astimezone(tz).date()
-    delta = (today - local.date()).days
+    return f"{local.strftime('%Y-%m-%d %H:%M')} {_relative_day_label(local.date(), tz)}"
+
+
+def _relative_day_label(day, tz) -> str:
+    """ローカル日 ``day`` の相対ラベル (今日 / 昨日 / N日前 / 未来日付)。"""
+    from backend.utils import utc_now_dt
+
+    delta = (utc_now_dt().astimezone(tz).date() - day).days
     if delta == 0:
-        label = "今日"
-    elif delta == 1:
-        label = "昨日"
-    elif delta > 1:
-        label = f"{delta}日前"
+        return "今日"
+    if delta == 1:
+        return "昨日"
+    if delta > 1:
+        return f"{delta}日前"
+    return "未来日付"
+
+
+def _parse_window_bound(value: str | None, tz, *, end: bool):
+    """窓の端 (``_local_date_arg`` 後の値) をローカルの日時へ。読めなければ ``None``。
+
+    窓の終わりが翌日の 0 時ちょうど (``history_day_window`` の形) なら前日の終わりとして読む。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local = parsed.astimezone(tz)
+    if end and local.time() == datetime.min.time():
+        local -= timedelta(microseconds=1)
+    return local
+
+
+def _empty_window_note(
+    date_from: str | None, date_to: str | None, tz, *, excluded_current: bool,
+) -> str:
+    """日付の窓で 0 件のときの注記 (窓が無ければ空文字)。期間はローカル日で書く。"""
+    from backend.utils import utc_now_dt
+
+    start = _parse_window_bound(date_from, tz, end=False) if date_from else None
+    end = _parse_window_bound(date_to, tz, end=True) if date_to else None
+    if start is None and end is None:
+        return ""
+
+    def _day(d) -> str:
+        return f"{d.date().isoformat()} ({_relative_day_label(d.date(), tz)})"
+
+    if start is not None and end is not None:
+        period = _day(start) if start.date() == end.date() else f"{_day(start)}〜{_day(end)}"
+    elif start is not None:
+        period = f"{_day(start)} 以降"
     else:
-        label = "未来日付"
-    return f"{local.strftime('%Y-%m-%d %H:%M')} {label}"
+        period = f"{_day(end)} まで"
+    now = utc_now_dt()
+    holds_now = (start is None or start <= now) and (end is None or now <= end)
+    template = (
+        SEARCH_HISTORY_EMPTY_WINDOW_CURRENT_NOTE if excluded_current and holds_now
+        else SEARCH_HISTORY_EMPTY_WINDOW_NOTE
+    )
+    return template.format(period=period)
+
+
+def _local_date_arg(value: str | None, tz, *, end: bool) -> str | None:
+    """ツール引数の日付 (オフセット無し) を ``schedule.local_tz`` の時刻として読む。
+
+    モデルが入れる「2026-10-03」はユーザーの暦の日付 — UTC の日として読むと JST では 9 時間
+    ずれる。日付だけの ``date_to`` はその日の終わりまで含める。オフセット付き・読めない値はそのまま。
+    """
+    from datetime import datetime, timedelta
+
+    text = (value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    if parsed.tzinfo is not None:
+        return value
+    local = parsed.replace(tzinfo=tz)
+    if end and len(text) == 10:
+        local += timedelta(days=1) - timedelta(microseconds=1)
+    return local.isoformat()
 
 
 def _make_search_history(
@@ -563,6 +640,8 @@ def _make_search_history(
         """
         if session_id:
             exclude_session_id = None
+        date_from = _local_date_arg(date_from, local_tz, end=False)
+        date_to = _local_date_arg(date_to, local_tz, end=True)
 
         def _search(*, search_turns: bool) -> list[dict]:
             found = manager.search_sessions(
@@ -580,7 +659,19 @@ def _make_search_history(
             # 結果が少ない場合のみターン検索で再検索
             if len(results) < limit:
                 results = _search(search_turns=True)
-            return _render(results, query, session_id, exclude_session_id)
+            # 件数上限で切れたかもしれないときだけ窓の総件数を数える (切れていなければ
+            # 総件数 = 表示件数で注記は出ない)。session_id 指定は 1 セッションだけ。
+            total = None
+            if not session_id and len(results) >= limit - (1 if exclude_session_id else 0):
+                entries, total = manager.list_sessions(
+                    limit=1000, mode=mode, date_from=date_from, date_to=date_to, query=query,
+                )
+                if exclude_session_id and any(e.session_id == exclude_session_id for e in entries):
+                    total -= 1
+            return _render(
+                results, query, session_id, exclude_session_id, total=total,
+                window=(date_from, date_to),
+            )
         except Exception as e:
             logger.error("search_history tool failed: %s", e)
             return f"Error: {e}"
@@ -588,8 +679,16 @@ def _make_search_history(
     def _render(
         results: list[dict], query: str,
         session_id: str | None, exclude_session_id: str | None,
+        *, total: int | None = None,
+        window: tuple[str | None, str | None] = (None, None),
     ) -> str:
-        """検索結果をツールの戻り文字列にする (再順位の有無で共通)。"""
+        """検索結果をツールの戻り文字列にする (再順位の有無で共通)。
+
+        ``total`` は件数上限で切る前の候補数 (現在のセッションを除く)。渡した結果より
+        多ければ、総件数と表示件数を末尾に 1 行で添える。``window`` は日付の窓
+        (``date_from``, ``date_to``)。窓があって 0 件なら期間と「記録なし」を 2 行目に添える。
+        """
+        truncated = total is not None and total > len(results)
         # summary も matched_turns も無いヒットは **会話の中身を 1 文字も
         # 運んでいない**。``search_sessions`` は ``max(score, 0.1)`` で全件に
         # 下駄を履かせ、``session_id`` 指定時はクエリ絞り込み自体を行わない
@@ -600,9 +699,14 @@ def _make_search_history(
         # ターン19): 「この会話で一番最初に送ったメッセージは？」に対し
         # ``[2026-08-14T04:14:43Z] mode=chat score=0.1`` だけが返り、
         # 実際の 1 通目ではなく窓の先頭 (7 ターン目の質問) を答えた。
+        # 問いが空 (日付の窓だけの一覧、「今日話したこと」) は窓のセッションそのものが答えで、
+        # 索引の最初の発言 (要約前の新しいセッションにもある) を中身として扱う。窓の件数が
+        # limit 以上だとターン照合が走らず、要約の無いセッションが全部落ちていた (2026-10-03)。
+        listing = not (query or "").strip()
         results = [
             r for r in results
             if r.get("summary") or r.get("matched_turns")
+            or (listing and r.get("first_user_preview"))
         ]
         if not results:
             # 位置指定の自己参照 (「この会話の一番最初に言ったこと」) は
@@ -614,7 +718,8 @@ def _make_search_history(
             )
             if boundary:
                 return boundary
-            return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}"
+            note = _empty_window_note(*window, local_tz, excluded_current=bool(exclude_session_id))
+            return f"{SEARCH_HISTORY_NO_RESULTS_PREFIX}{query}" + (f"\n{note}" if note else "")
 
         lines: list[str] = []
         # 由来 (今回の会話 / 別の会話) を本文先頭で必ず宣言する。
@@ -631,7 +736,8 @@ def _make_search_history(
                 f"[{_local_session_stamp(r['started_at'], local_tz)}] "
                 f"mode={r['mode']} score={r['relevance_score']:.1f}"
             )
-            if r.get("summary"):
+            first_message = r.get("summary") or (r.get("first_user_preview") if listing else "")
+            if first_message:
                 # summary はそのセッションの「最初のユーザ発話」そのもの。
                 # 同じ会話の後半で訂正されていてもここには反映されないため、
                 # 裸で出すと現在も有効な事実として読まれ、訂正済みの値へ
@@ -639,10 +745,13 @@ def _make_search_history(
                 # 予約が、過去セッションの要約「来週の火曜日に歯科の予約を
                 # 入れました。」経由で火曜へ戻った)。由来を明示して、
                 # 会話冒頭の発言にすぎないことが読み取れるようにする。
-                header += f" | first_message: {r['summary']}"
+                header += f" | first_message: {first_message}"
             lines.append(header)
             for turn in r.get("matched_turns", []):
                 lines.append(f"  turn#{turn['index']} ({turn['role']}): {turn['content_preview']}")
+        if truncated:
+            note = SEARCH_HISTORY_TRUNCATED_LISTING_NOTE if listing else SEARCH_HISTORY_TRUNCATED_RESULTS_NOTE
+            lines.append(note.format(total=total, shown=len(results)))
         return "\n".join(lines)
 
     if reranker is None:
@@ -650,6 +759,7 @@ def _make_search_history(
 
     def _sync_equivalent(
         all_candidates: list, query: str, limit: int, exclude_session_id: str | None,
+        window: tuple[str | None, str | None],
     ) -> str:
         """同期版 ``search_history`` と同じ結果を、取得済みの候補から組む (縮退した回)。
 
@@ -661,7 +771,8 @@ def _make_search_history(
         results = manager.build_search_results(top, query, search_turns=kept < limit)
         if exclude_session_id:
             results = [r for r in results if r.get("session_id") != exclude_session_id]
-        return _render(results, query, None, exclude_session_id)
+        total = sum(1 for e, _ in all_candidates if not exclude_session_id or e.session_id != exclude_session_id)
+        return _render(results, query, None, exclude_session_id, total=total, window=window)
 
     async def search_history_reranked(
         query: str, mode: str | None = None, limit: int = 10,
@@ -680,12 +791,15 @@ def _make_search_history(
         上位 ``limit`` 件に切ってから外す (現在のセッションが枠を 1 つ使う)、再順位の経路は
         プールを作る前に外す (再順位の枠を使わない)。後者は件数が最大 1 件多くなる。
         """
+        date_from = _local_date_arg(date_from, local_tz, end=False)
+        date_to = _local_date_arg(date_to, local_tz, end=True)
         kwargs = {
             "query": query, "mode": mode, "limit": limit,
             "date_from": date_from, "date_to": date_to,
             "session_id": session_id, "exclude_session_id": exclude_session_id,
         }
-        if session_id:
+        # 問いが空 (日付範囲だけの検索) は並べ替える基準が無い — 新しい順を崩さず、待ちも払わない。
+        if session_id or not (query or "").strip():
             return await asyncio.to_thread(search_history, **kwargs)
         try:
             all_candidates = await asyncio.to_thread(
@@ -700,7 +814,10 @@ def _make_search_history(
                 query, candidates, reranker, limit=limit, debug_logger=debug_logger,
             )
             if ranked is None:
-                return await asyncio.to_thread(_sync_equivalent, all_candidates, query, limit, exclude_session_id)
+                return await asyncio.to_thread(
+                    _sync_equivalent, all_candidates, query, limit, exclude_session_id,
+                    (date_from, date_to),
+                )
             top = ranked[:limit]
             # 同期版と同じく、候補が limit に満たないときだけターンも照合する。
             # 並びは再順位のまま (ターンの一致数で並べ直さない)。
@@ -708,7 +825,10 @@ def _make_search_history(
                 manager.build_search_results, top, query,
                 search_turns=len(top) < limit, keep_order=True,
             )
-            return await asyncio.to_thread(_render, results, query, None, exclude_session_id)
+            return await asyncio.to_thread(
+                _render, results, query, None, exclude_session_id,
+                total=len(candidates), window=(date_from, date_to),
+            )
         except Exception as e:
             logger.error("search_history tool failed: %s", e)
             return f"Error: {e}"
@@ -744,7 +864,9 @@ def register_builtin_tools(
         description=(
             "Evaluate a Python-syntax arithmetic expression safely (numeric "
             "literals + - * / % ** // parentheses, and the allow-listed "
-            "functions and constants below)"
+            "functions and constants below), also durations (dur hms clock), "
+            "character/word counts (chars words count_kind) and dates "
+            "(date_diff day_of_year)"
         ),
         parameters={
             "expression": {
@@ -759,7 +881,20 @@ def register_builtin_tools(
                     "available: " + " ".join(sorted(_SAFE_NAMES)) + ". Any "
                     "other name (or any variable) will error, so inline the "
                     "numeric value instead. A list literal is allowed only as "
-                    "the argument of sum/min/max/len, e.g. sum([12, 25, 8])."
+                    "the argument of sum/min/max/len, e.g. sum([12, 25, 8]); "
+                    "range(start, stop, step) likewise, e.g. sum(range(1, 101, 2)). "
+                    "Generator expressions, comprehensions, imports and other "
+                    "statements are not supported. Durations: dur('2:30:45') is "
+                    "seconds (3 min 45 s is '0:03:45'; '3:45' is rejected as "
+                    "ambiguous), dur('2時間30分', 'min') is 150, hms(seconds) gives "
+                    "H:MM:SS, clock(seconds) gives the time of day, e.g. "
+                    "hms(dur('2:30:45') + dur('1:45:30')). Text: chars('...') "
+                    "counts characters, words('...') counts space-separated "
+                    "words, count_kind('...', 'kanji') counts one kind ("
+                    + " ".join((*CHAR_KINDS, "nonspace")) + "); "
+                    "copy the text verbatim from the conversation. Dates: "
+                    "date_diff('2024-2-28', '2024-3-1') is 2 (negative when the "
+                    "second date is earlier), day_of_year('2024-12-31') is 366."
                 ),
             },
         },

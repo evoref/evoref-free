@@ -2,8 +2,9 @@
 
 ユーザの直近セッションで ``run_command`` が実行されたターンについて、
 コマンド文字列と成否を ``world_fact`` (subject =
-``idx.command.*``) として SemMem に永続化する。次回類似
-クエリで ``ToolCallJudge`` が補助タスク呼出より先に引き当てる (読み取りは A3)。
+``idx.command.*``) として SemMem に永続化する。読み手は ``ToolCallJudge`` の
+層 5.7 で、2026-10-03 から create の shadow (判定は変えず decision ログへ記録)
+だけ。記録するのは create の分類器が決めた実行に限る (不変則 #15)。
 
 CLAUDE.md §6 不変則 #2 より、SemMem への書込は sleep-time に限定される。
 本モジュールは ``SleepTimeWorker.run_full`` の Step 8.6 として呼び出され、
@@ -42,7 +43,7 @@ from backend.free.memory.sleep._curator_common import (
     subject_digest,
     truncate_for_prompt,
 )
-from backend.free.core.session_mode import normalize_session_mode
+from backend.free.core.session_mode import is_create_mode, normalize_session_mode
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.sleep.extraction import write_sleep_facts
 from backend.free.memory.types import SemanticFact
@@ -59,6 +60,10 @@ logger = get_logger("memory.sleep.executable_command_curator")
 #: 接頭辞は _curator_common が SSOT (埋め込み側の定義と同じ場所に置く)。
 _SUBJECT_PREFIX = EXECUTABLE_COMMAND_SUBJECT_PREFIX
 _WS_RE = re.compile(r"\s+")
+
+#: 索引に記録してよい判定層 (``ToolJudgement.source``)。決定論層は毎ターン出し直し、
+#: 近道は自分の結果を正例にしない (不変則 #15)。分類器の決定だけが残す価値を持つ。
+_RECORDABLE_SOURCES = frozenset({"classifier"})
 
 
 def _normalize_command(command: str) -> str:
@@ -228,13 +233,18 @@ async def curate_executable_command_facts(
         command = assistant_note.tool_command or ""
         if not command:
             continue
-        # recall 由来 (層0.5 が過去 fact を引き当てて発火した実行) は学習しない。
-        # 学習すると「誤発火 → exit 0 で成功記録 → success_avg と
-        # last_executed_at が更新され TTL による唯一の排除経路がリセット →
-        # また誤発火」で自己強化する (実測 2026-07-25: 好みの表明・記憶想起の
-        # ターンで発火した datetime コマンドが 2 世代にわたり延命されていた)。
-        # rule / aux が能動的に選んだ実行のみを学習対象にする。
-        if assistant_note.tool_command_source == "recall":
+        # 記録するのは create の、分類器 (層 5.9) が決めた実行だけ (2026-10-03)。
+        # - chat は層 5.7 が読まない (不変則 #15) ので書いても索引が残るだけ。
+        # - 規則表 / cartridge / date_intent (source="rule" 等) は毎ターン同じ答えを
+        #   決定論で出し直すので、索引に写すと規則を直した後も旧版が残る
+        #   (2026-08-06: astimezone() 付きへ直した後も naive 版が再生された)。
+        # - recall / learned は近道自身の結果で、写すと自己強化の輪になる
+        #   (2026-07-25: 誤発火の datetime コマンドが 2 世代にわたり延命された)。
+        # - source の無い実行 (meta 経路・旧形式) は決めた層が分からない。
+        if not (
+            is_create_mode(assistant_note.mode)
+            and assistant_note.tool_command_source in _RECORDABLE_SOURCES
+        ):
             assistant_note.command_curated_at = now_fn()
             continue
         mode = assistant_note.mode or "chat"

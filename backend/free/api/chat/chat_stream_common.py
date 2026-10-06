@@ -19,7 +19,8 @@ from fastapi import HTTPException
 from backend.app_state import AppState
 from backend.trace_context import get_trace_id
 from backend.aux_telemetry import aux_failure_signals, current_aux_failures
-from backend.exceptions import EvorefError
+from backend.exceptions import EvorefError, LLMError
+from backend.free.api.chat.chat_errors import UNKNOWN, classify_chat_error
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.verifier_events import (
     current_grounding,
@@ -354,19 +355,22 @@ async def _emit_stream_error(
     ブロックを写経し、ログの書式 (``%s`` / ``%r``) と timing の tokens が
     揺れていた。型付き例外 (:class:`EvorefError`) は ``code`` 付きフレームで
     送り、ユーザー向け文言は i18n キーが解決できればそれを、できなければ
-    例外メッセージ (英語) を使う。
+    汎用文言 (``error.chat.unknown``) を使う。LLM 系と型なし例外は
+    :func:`classify_chat_error` の分類 (i18n 文言 + ``retryable``) で送り、
+    例外の原文は利用者へ出さない (ログのみ)。
     """
     logger.error("%s stream error: %r", agent_layer, exc, exc_info=True)
     if timer:
         timer.stop("llm_total_ms")
     _emit_timing(state, timer, agent_layer, tokens_generated, mode=mode)
-    if isinstance(exc, EvorefError):
+    info = classify_chat_error(exc)
+    if isinstance(exc, EvorefError) and not isinstance(exc, LLMError):
         text = msg(exc.i18n_key, **{k: v for k, v in exc.context.items() if isinstance(v, str | int | float)})
         if text == exc.i18n_key or "{" in text:
-            text = str(exc) or exc.i18n_key
-        yield sse.error_with_code(exc.code, text)
+            text = UNKNOWN.message
+        yield sse.error_with_code(exc.code, text, retryable=info.retryable)
     else:
-        yield sse.error(str(exc))
+        yield sse.error_with_code(info.code, info.message, retryable=info.retryable)
     yield sse.done()
 
 

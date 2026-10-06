@@ -78,6 +78,15 @@ def _has_defect(signals: "FeedbackSignals") -> bool:
     return any(signal_is_defect(raw, key) for key in DEFECT_WEIGHTS)
 
 
+#: 抑止応答の型 (``signals._extra["rag_abstain_kind"]``、f_04 §3.2)。疑似クエリの
+#: misses (f_01 §6.4) に積むのは ``shown`` と、関連性ゲートを通った ``not_retrieved``。
+RAG_ABSTAIN_NOT_RETRIEVED = "not_retrieved"
+RAG_ABSTAIN_NOT_SHOWN = "not_shown"
+RAG_ABSTAIN_SHOWN = "shown"
+#: ``GenerationConfigRef._extra`` に置く、検索が採用した corpus の件数 (見せる前)。
+RAG_ADOPTED_CORPUS_KEY = "rag_adopted_corpus"
+
+
 def used_corpus_evidence(experience: dict) -> bool:
     """そのターンに corpus 由来の材料を **注入したか** (c_16 §5.5)。
 
@@ -242,7 +251,9 @@ class FeedbackSignals:
     #: 文書を注入した turn で「参考情報には記載が無い」型の抑止応答をしたか
     #: (f_04 §3.2、2026-09-12 (b))。``None`` = 文書を注入していない (判定外)、
     #: ``False`` = 注入して答えた、``True`` = 注入したのに差し控えた =
-    #: 検索の取りこぼしの観測。プロンプト進化の圧には使わない。
+    #: 検索の取りこぼしの観測。プロンプト進化の圧には使わない。注入は実際に
+    #: ``[参考情報]`` に見せた分 (f_01 §8.1 の 7.7)。見せていない turn の差し控えは
+    #: ``_extra["rag_abstain_kind"]`` (``not_shown`` / ``not_retrieved``) にだけ残る。
     rag_abstained: bool | None = None
     #: 注入した turn で応答が ``[参考情報]`` を明示的に引いたか (2026-09-14)。
     #: ``None`` = 検索が何も注入していない。abstained と対で「注入が答えに

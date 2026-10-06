@@ -41,6 +41,8 @@ from backend.aux_telemetry import record_aux_failure
 from backend.exceptions import LLMTimeoutError
 from backend.free.llm.generation_gate import (
     activity_token,
+    chat_is_active,
+    claim_run_to_completion,
     request_token,
     wait_for_chat_request,
     wait_for_idle,
@@ -109,6 +111,8 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "url_relevance_score": 45.0,
     "assertion_naming": 45.0,
     "personal_fact_split": 60.0,
+    # 集合値の属性の要素の追加 / 削除 (Step 8.35、sleep/slot_edit_curator.py)。
+    "slot_edit": 45.0,
     # ── 学習サイクル ─────────────────────────────────────────────────
     "critique_synthesis": 120.0,
     "fewshot_quality_score": 45.0,
@@ -127,6 +131,13 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "retrieval_chunk_gate": 15.0,
     # 日付演算の意図 (パラメータのみ)。チャット応答パスで同期発火するので短い。
     "date_intent": 40.0,
+    # 取得した表の集計のパラメータ (計算はコード、docs/f_03 §4.2.2)。チャット応答
+    # パスで同期発火するので短い。timeout は集計を諦めて従来の答えへ倒す。
+    "table_aggregate": 40.0,
+    # 問いの条件 (限定語・期間・単位・対象) の逐語の抜き出し (docs/f_03 §7.1.1)。
+    # チャット応答パスで検索と並走し、検索の回収までに終わらなければ呼出側が捨てる。
+    # 本値は要求そのものの上限。timeout は注記を付けないだけ (従来の動作)。
+    "answer_conditions": 6.0,
     # 計画 (タスク分解) は create モードの応答パスで発火する。長すぎると
     # ユーザ体感を阻害するため、失敗時は単一タスクへ倒して先へ進む。
     "meta_cognitive_plan": 90.0,
@@ -150,6 +161,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
     "tool_summarize": 180.0,
     "tool_translate": 180.0,
     "tool_draft_document": 180.0,
+    # meta の書込みのうち、このターンの取得を素材にする本文の生成 (書けるかの申告つき
+    # JSON、背景スロット)。本文の生成と同じ尺で、呼出側が content_gen_timeout を明示する。
+    "write_content_from_source": 300.0,
     # ── Pro ──────────────────────────────────────────────────────────
     "cartridge_eval_generation": 120.0,
     # know.* 取得器 (Pro) が 1 item の本文から claim を抜く。sleep-time の
@@ -172,6 +186,7 @@ _DEFAULT_TIMEOUT = 60.0
 # 較正が失敗 1 回のコストを 3 倍にしていた)。
 PURPOSE_TIMEOUT_CALIBRATION_EXEMPT: frozenset[str] = frozenset({
     "retrieval_chunk_gate",  # timeout → prune せず全件通す
+    "answer_conditions",     # timeout → 条件の注記を付けない
 })
 
 # 較正の引き上げ幅と上限 / 下限倍率。生成 POST は ``ReadTimeout`` をリトライ
@@ -214,6 +229,8 @@ _BACKGROUND_TIMEOUT_TOKENS = 512
 CHAT_PATH_PURPOSES: frozenset[str] = frozenset({
     "retrieval_chunk_gate",   # rag/chunk_content_gate (取得直後の関連性判定)
     "date_intent",            # agent/tool_judge_commands (日付演算の意図)
+    "table_aggregate",        # agent/table_aggregate_intent (表の集計のパラメータ)
+    "answer_conditions",      # core/answer_conditions (問いの条件の逐語の抜き出し)
     "meta_cognitive_plan",    # agent/meta_cognitive (create 応答パスの計画)
     "tool_summarize",         # agent/tools/builtin (deliberative のツール実行)
     "tool_translate",
@@ -242,6 +259,7 @@ DEFERRABLE_AUX_PURPOSES: frozenset[str] = frozenset({
     "url_relevance_score",
     "assertion_naming",
     "personal_fact_split",
+    "slot_edit",
     # 学習サイクル
     "critique_synthesis",
     "fewshot_quality_score",
@@ -673,13 +691,34 @@ class AuxClient:
             )
         )
         queued_at = time.monotonic()
-        if self._is_deferrable(purpose, deferrable):
+        deferrable_call = self._is_deferrable(purpose, deferrable)
+        idle_found = True
+        if deferrable_call:
             # ロックの **外** で待つ。ロックを持ったまま待つと、同じスロットの
             # 他の背景タスクまで道連れに直列化される。
             await wait_for_idle(_CHAT_YIELD_MAX_WAIT_SEC, purpose=purpose)
+            # 上限で諦めて出る場合はまだ在圏している (アイドル窓ではない)。
+            idle_found = not chat_is_active()
+        idle_token = request_token()
         gate_token = activity_token()
-        preemptible = self._is_deferrable(purpose, deferrable)
+        preemptible = deferrable_call
         async with self._lock_for(slot):
+            # ``run_to_completion`` の区間 (強制実行の Full の訂正の検証等) でも、
+            # 打ち切らせないのは **アイドル窓で出せた生成だけ**。ロック待ちの間に
+            # チャット要求が届いた (打ち切られた別の背景生成がちょうどユーザーの
+            # prefill でロックを手放した等) ら、従来どおり打ち切り対象のまま出す。
+            if (
+                deferrable_call
+                and idle_found
+                and not chat_is_active()
+                and request_token() == idle_token
+                and claim_run_to_completion()
+            ):
+                preemptible = False
+                logger.info(
+                    "Aux generation dispatched in an idle window will run to "
+                    "completion (purpose=%s)", purpose or "<unspecified>",
+                )
             started = time.monotonic()
             queue_wait = started - queued_at
             if queue_wait >= 1.0:
@@ -784,6 +823,16 @@ class AuxClient:
                     contended=contended,
                     timeout_sec=effective_timeout,
                 ) from e
+            except Exception:
+                # リトライを使い切った HTTP エラー等。最も遅い失敗が記録から消えないよう
+                # 所要時間だけ残して再送出する。
+                self._log_request(
+                    messages, {}, time.monotonic() - started,
+                    purpose=purpose, effective_timeout=effective_timeout,
+                    constrained=resolved is not None, finish_reason="error",
+                    queue_wait=queue_wait, slot=slot,
+                )
+                raise
 
         elapsed = time.monotonic() - started
         # 成功側も同じ理由で競合サンプルを弾く (p95 が競合時の遅さで押し上がる)。

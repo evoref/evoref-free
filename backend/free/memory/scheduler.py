@@ -20,6 +20,7 @@ from backend.liveness import ledger as liveness_ledger
 from backend.free.memory.sleep_update import (
     FULL_COMPLETED_KEY,
     INPUT_SUFFIX,
+    forced_full_scope,
 )
 from backend.log_config import get_logger
 from backend.trace_context import generate_trace_id, trace_id_var
@@ -1249,7 +1250,14 @@ class SleepTimeScheduler:
             # 不変則 (CLAUDE.md §6 #1 / docs/c_14 §1.1) を満たす。未接続なら
             # None を渡し、run_full が Step 5.8-10 をクリーンスキップする。
             llm_for_sleep = self.resolve_sleep_client()
-            with aux_failure_scope() as aux_failures:
+            # 強制実行の Full は短い段 (Step 8.0 / 8.3 / 8.4) をチャットに譲らせない。
+            # ``on_user_input`` がワーカーを止めないだけでは足りず、段の協調 yield と
+            # 補助タスクの打ち切りが毎回同じ候補で効き、訂正が SemMem へ届かなかった
+            # (2026-10-05 実機、sleep_update.forced_full_scope)。
+            with (
+                aux_failure_scope() as aux_failures,
+                forced_full_scope(self._full_forced_run),
+            ):
                 full_result = await self._worker.run_full(llm_for_sleep)
             success = True
             self._rerequest_for_unverified_corrections(full_result)

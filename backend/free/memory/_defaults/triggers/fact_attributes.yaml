@@ -441,6 +441,9 @@ chat:
       # 「<非一人称>の色は」は一致させない。明示の所有格だけを見る (話題語からの
       # 推定をすると「最近は緑より紺色のほうが好き」の「最近」を所有者と読む)。
       requires_self_possessor: explicit
+      # 「景色は」「顔色は」に当てない (直前が漢字の「色は」を一致としない、
+      # docs/f_02 §7.4、2026-10-05)。
+      kanji_left_boundary: true
       triggers:
       - 好きな色
       - 色は
@@ -579,6 +582,9 @@ chat:
       single_valued: true
       # personal_fact 側と同じ所有者ガード (物の色を本人の好きな色にしない)。
       requires_self_possessor: explicit
+      # 「景色は」「顔色は」に当てない (直前が漢字の「色は」を一致としない、
+      # docs/f_02 §7.4、2026-10-05)。
+      kanji_left_boundary: true
       triggers:
       - 好きな色
       - 色は
@@ -625,6 +631,11 @@ chat:
       - アルバム
       - ミュージシャン
     media:
+      # 「元本との差額は」「日本は何位」「基本は」に「本は」(並列形「本と」) を
+      # 当てない (直前が漢字の出現を一致としない、docs/f_02 §7.4、2026-10-05
+      # ライブ監査 trace 22d3d78a7b38)。
+      kanji_left_boundary: true
+      triggers:
       - 映画
       - 本は
       - 読書

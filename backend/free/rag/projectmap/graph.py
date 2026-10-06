@@ -29,8 +29,9 @@
 
 from __future__ import annotations
 
+import sys
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
@@ -99,6 +100,11 @@ class RawCall:
     #: (定義の外側) 場合は抽出器が捨てる。
     caller_id: str
     callee_name: str
+    #: 受け手。``None`` = 素の名前の呼出 (``f()``)、``"self"`` / ``"mod.sub"`` = 名前を
+    #: ``.`` で繋いだ受け手 (``self.f()`` / ``mod.sub.f()``)、``"super"`` = ``super().f()`` /
+    #: ``super.f()``、``""`` = それ以外の受け手 (呼出の結果・添字など)。受け手を記録しない
+    #: 言語は常に ``None`` (c_16 §4.4)。
+    receiver: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +123,13 @@ class ExtractedFile:
     calls: list[RawCall]
     #: ``(クラスノード id, 基底名)``。基底名は未解決 (build_graph 側で解決)。
     inherits: list[tuple[str, str]] = field(default_factory=list)
+    #: Python の ``from M import name`` の ``(M, name)`` (絶対 import のみ)。
+    #: ``M.name`` がプロジェクト内のモジュールなら、そのファイルへも ``imports`` 辺を張る。
+    import_names: list[tuple[str, str]] = field(default_factory=list)
+    #: Python の import が束縛した名前 → ``(モジュール, メンバ or None)``。
+    #: ``import a.b as c`` → ``c: ("a.b", None)``、``import a.b`` → ``a: ("a", None)``、
+    #: ``from m import x as y`` → ``y: ("m", "x")`` (絶対 import のみ)。
+    import_bindings: dict[str, tuple[str, str | None]] = field(default_factory=dict)
 
 
 def _file_node(file: ExtractedFile) -> Node:
@@ -631,9 +644,13 @@ def _resolve_import(
     *,
     pack_import_rules: Mapping[str, ImportRule] | None = None,
     alias_config: AliasConfig | None = None,
+    py_modules: "_PythonModuleIndex | None" = None,
 ) -> list[str]:
     if lang == "python":
-        target = _resolve_python_import(spec, all_paths)
+        if py_modules is not None:
+            target = py_modules.resolve(spec, file_path)
+        else:
+            target = _resolve_python_import(spec, all_paths)
         return [target] if target is not None else []
     if lang in ("javascript", "typescript", "tsx", "svelte", "vue") and alias_config is not None:
         aliased = _resolve_via_alias(file_path, spec, all_paths, alias_config)
@@ -682,7 +699,7 @@ def _resolve_import(
 
 
 def _unique_by_name(
-    candidates: Sequence[Node], name: str,
+    candidates: Iterable[Node], name: str,
 ) -> Node | None:
     matches = [n for n in candidates if n.name == name]
     return matches[0] if len(matches) == 1 else None
@@ -693,29 +710,377 @@ def _unique_by_name(
 #: 型情報を見ない名前一致は、一意に決まっても「たぶんこれ」でしかない。
 NAME_MATCH_WEIGHT = 0.5
 
+#: 名前一致の相手を同じ集合に限る言語ファミリ (c_16 §4.4)。載っていない言語はそれ自身が 1 ファミリ。
+_LANGUAGE_FAMILY: dict[str, str] = {
+    "javascript": "web", "typescript": "web", "tsx": "web", "svelte": "web", "vue": "web",
+    "c": "c", "cpp": "c",
+}
+#: import の解決が揃っていて、import していないファイルの名前を呼べない言語ファミリ。
+#: 同一ファイルの次は import 先だけを見る (同一ディレクトリ・全体で一意の段を使わない)。
+_IMPORT_SCOPED_FAMILIES = frozenset({"python", "web"})
+#: パッケージの入口。ここを import したら、入口が import しているファイルも 1 段だけ見る (再エクスポート)。
+_PACKAGE_ENTRY_NAMES = frozenset({
+    "__init__.py", "index.ts", "index.tsx", "index.js", "index.jsx", "index.mjs",
+})
 
-def _resolve_symbol(
-    caller: Node,
-    name: str,
-    *,
-    by_file: dict[str, list[Node]],
-    by_dir: dict[str, list[Node]],
-    by_name_global: dict[str, list[Node]],
-) -> Node | None:
-    """呼出し名 / 基底名を「同一ファイル → 同一ディレクトリ → 全体で一意」で解決する。
 
-    一意に決まらなければ ``None`` (辺を張らない — 誤った辺は無い辺より害が
-    大きい、c_16 §4.4)。
+def language_family(lang: str) -> str:
+    """名前一致の解決で同じ集合として扱う言語の組 (c_16 §4.4)。"""
+    return _LANGUAGE_FAMILY.get(lang, lang)
+
+
+#: 受け手が「自分のインスタンス / クラス」を指す名前 (``self.m()`` / ``this.m()``)。
+_SELF_RECEIVERS = frozenset({"self", "cls", "this"})
+#: ``super().m()`` / ``super.m()`` の受け手 (抽出器がこの文字列で残す)。
+_SUPER_RECEIVER = "super"
+#: 継承の連鎖を辿る深さの上限 (循環・病的な階層の保険)。
+_MAX_BASE_DEPTH = 8
+
+
+#: SvelteKit が実行時に提供するモジュール (aliases.py と同じく外部扱い)。
+_SVELTEKIT_EXTERNAL_PREFIXES = ("$app/", "$env/", "$service-worker")
+
+
+def _looks_project_local(spec: str) -> bool:
+    """js の import 指定子がプロジェクト内を指す形か (相対・ルート相対・エイリアス)。
+
+    解決できなかったときに「外部パッケージ」と「エイリアスを解けなかったプロジェクト内」
+    を分けるのに使う (後者は全体で一意の名前一致へ縮退する、c_16 §4.4)。
     """
-    same_file = _unique_by_name(by_file.get(caller.path, ()), name)
-    if same_file is not None:
-        return same_file
-    directory = str(PurePosixPath(caller.path).parent)
-    same_dir = _unique_by_name(by_dir.get(directory, ()), name)
-    if same_dir is not None:
-        return same_dir
-    global_matches = by_name_global.get(name, ())
-    return global_matches[0] if len(global_matches) == 1 else None
+    raw = spec.strip().strip("'\"`")
+    if raw.startswith(_SVELTEKIT_EXTERNAL_PREFIXES):
+        return False  # SvelteKit が提供するモジュール (外部)
+    return raw.startswith((".", "/", "$", "~", "@/"))
+
+
+class _PythonModuleIndex:
+    """ドット区切りのモジュール名 → プロジェクト内の path (c_16 §4.4)。
+
+    ルート相対だけでなく、path の末尾が一致するモジュールも候補にする
+    (``src/`` レイアウトや、別の木に写しを持つリポジトリ)。候補のうち接頭辞が
+    呼出元の path の祖先であるものを優先し (最も長いもの)、無ければ候補が 1 つの
+    ドット付きのモジュール名だけ採る。決まらなければ ``None`` (外部とみなす)。
+
+    接頭辞のディレクトリがパッケージ (``__init__.py`` を持つ) なら sys.path の根では
+    ないので候補にしない (``backend/`` の中から ``import io`` を ``backend/io/`` へ
+    解かない)。標準ライブラリの名前はルート相対で一致するときだけ採る。
+    """
+
+    def __init__(self, all_paths: Iterable[str]) -> None:
+        self._by_key: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        paths = sorted(all_paths)
+        packages = {p[: -len("/__init__.py")] for p in paths if p.endswith("/__init__.py")}
+        for path in paths:
+            if not path.endswith(".py"):
+                continue
+            parts = path[:-3].split("/")
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            for i in range(len(parts)):
+                prefix = "/".join(parts[:i])
+                if prefix in packages:
+                    continue  # パッケージの内側は sys.path の根ではない
+                self._by_key[".".join(parts[i:])].append((f"{prefix}/" if prefix else "", path))
+        self._cache: dict[tuple[str, str], str | None] = {}
+
+    def resolve(self, module: str, from_path: str) -> str | None:
+        module = module.strip()
+        if not module:
+            return None
+        key = (module, from_path)
+        if key in self._cache:
+            return self._cache[key]
+        candidates = self._by_key.get(module, [])
+        if module.split(".", 1)[0] in sys.stdlib_module_names:
+            candidates = [(p, path) for p, path in candidates if not p]
+        enclosing = [(p, path) for p, path in candidates if from_path.startswith(p)]
+        if enclosing:
+            longest = max(len(p) for p, _ in enclosing)
+            best = [path for p, path in enclosing if len(p) == longest]
+            # 同じ接頭辞で ``m.py`` と ``m/__init__.py`` が両方あればモジュール本体を採る
+            result = sorted(best, key=lambda p: (p.endswith("__init__.py"), p))[0]
+        elif len(candidates) == 1 and "." in module:
+            result = candidates[0][1]
+        else:
+            result = None
+        self._cache[key] = result
+        return result
+
+
+class _SymbolResolver:
+    """呼出し名 / 基底名を名前一致で解決する (c_16 §4.4)。
+
+    候補は呼出元と同じ言語ファミリに限り、入れ子の定義
+    (関数の中の関数・クラス) は呼出元を囲むスコープにあるときだけ相手にする。
+    一意に決まらなければ ``None`` (辺を張らない — 誤った辺は無い辺より害が大きい)。
+
+    Python / js ファミリ (import を解決できる言語) は呼出の形で相手を分ける:
+
+    - 素の名前 ``f()``: メソッドは相手にしない。同一ファイル → import が束縛した
+      名前ならその import 先 (外部なら張らない) → import 先の全ファイル。
+    - ``self.f()`` / ``this.f()``: 囲みのクラスと、解決済みの基底クラスの連鎖。
+      無ければ import 先のメソッド (別ファイルの mixin)。
+    - ``mod.f()`` / ``C.f()`` (受け手が import したモジュール / クラス): そのファイルの
+      関数 / そのクラスのメソッド。外部なら張らない。
+    - それ以外の受け手 (変数・呼出の結果): 同一ファイル → import 先のメソッドだけ。
+
+    他の言語は同一ファイル → 同一ディレクトリ → 全体の順で一意かを見る。
+    """
+
+    def __init__(
+        self,
+        *,
+        by_file: dict[str, list[Node]],
+        by_dir: dict[str, list[Node]],
+        by_name_global: dict[str, list[Node]],
+        imports_of: Mapping[str, set[str]],
+        spec_targets: Mapping[str, Mapping[str, str | None]],
+        nested_ids: frozenset[str],
+        node_by_id: Mapping[str, Node],
+        bindings: Mapping[str, Mapping[str, tuple[str, str | None]]],
+        py_modules: _PythonModuleIndex,
+    ) -> None:
+        self.by_dir = by_dir
+        self.by_name_global = by_name_global
+        self.imports_of = imports_of
+        self.spec_targets = spec_targets
+        self.nested_ids = nested_ids
+        self.node_by_id = node_by_id
+        self.bindings = bindings
+        self.py_modules = py_modules
+        #: 継承の連鎖 (class id → 解決済みの基底ノード)。inherits を解いた後に入れる。
+        self.bases: dict[str, list[Node]] = defaultdict(list)
+        self._by_name: dict[str, dict[str, list[Node]]] = {}
+        self._by_qualname: dict[str, dict[str, list[Node]]] = {}
+        for path, nodes in by_file.items():
+            names: dict[str, list[Node]] = defaultdict(list)
+            qualnames: dict[str, list[Node]] = defaultdict(list)
+            for n in nodes:
+                names[n.name].append(n)
+                qualnames[n.qualname].append(n)
+            self._by_name[path] = names
+            self._by_qualname[path] = qualnames
+        self._hop_cache: dict[tuple[str, ...], tuple[str, ...]] = {}
+        self._ancestor_cache: dict[str, frozenset[str]] = {}
+        self._owner_cache: dict[str, str] = {}
+
+    # ── 候補の集合 ──
+
+    def _with_entry_hop(self, paths: Iterable[str]) -> tuple[str, ...]:
+        """パッケージの入口なら、入口が import しているファイルも足す (再エクスポート、1 段)。"""
+        key = tuple(sorted(paths))
+        cached = self._hop_cache.get(key)
+        if cached is None:
+            out = set(key)
+            for path in key:
+                if PurePosixPath(path).name in _PACKAGE_ENTRY_NAMES:
+                    out.update(self.imports_of.get(path, ()))
+            cached = self._hop_cache[key] = tuple(sorted(out))
+        return cached
+
+    def _ancestors(self, caller: Node) -> frozenset[str]:
+        """呼出元と、それを囲むノードの id (入れ子の定義が見えるスコープ)。"""
+        cached = self._ancestor_cache.get(caller.id)
+        if cached is None:
+            out: set[str] = set()
+            current: Node | None = caller
+            while current is not None:
+                out.add(current.id)
+                current = self.node_by_id.get(current.parent_id) if current.parent_id else None
+            cached = self._ancestor_cache[caller.id] = frozenset(out)
+        return cached
+
+    def _scope_owner(self, node: Node) -> str | None:
+        """入れ子の定義を囲む最も内側の関数 / メソッド (そこから内側でだけ見える)。"""
+        cached = self._owner_cache.get(node.id)
+        if cached is None:
+            current = self.node_by_id.get(node.parent_id) if node.parent_id else None
+            while current is not None and current.node_type not in ("function", "method"):
+                current = self.node_by_id.get(current.parent_id) if current.parent_id else None
+            cached = self._owner_cache[node.id] = current.id if current is not None else ""
+        return cached or None
+
+    def _eligible(
+        self, caller: Node, nodes: Iterable[Node], *, exclude_caller: bool = False,
+    ) -> list[Node]:
+        """``exclude_caller``: 呼出元自身を除く (``super().f()`` のように受け手が式のとき)。
+
+        自分の名前の呼出 (再帰) は呼出元自身が一意な相手になり、辺を張らずに止まる
+        (自己辺は build_graph が捨てる) — 除くと import 先の同名へ誤って結ぶ。
+        """
+        family = language_family(caller.lang)
+        out = []
+        for n in nodes:
+            if (exclude_caller and n.id == caller.id) or language_family(n.lang) != family:
+                continue
+            if n.id in self.nested_ids and self._scope_owner(n) not in self._ancestors(caller):
+                continue
+            out.append(n)
+        return out
+
+    def _named(self, paths: Iterable[str], name: str) -> Iterator[Node]:
+        for path in paths:
+            yield from self._by_name.get(path, {}).get(name, ())
+
+    def _unique(
+        self, caller: Node, paths: Iterable[str], name: str, *, methods: bool | None,
+        exclude_caller: bool = False,
+    ) -> Node | None:
+        """``methods``: True ならメソッドだけ、False ならメソッド以外、None なら全部。"""
+        pool = [
+            n for n in self._eligible(
+                caller, self._named(paths, name), exclude_caller=exclude_caller,
+            )
+            if methods is None or (n.node_type == "method") is methods
+        ]
+        return pool[0] if len(pool) == 1 else None
+
+    def _unique_qualname(self, caller: Node, paths: Iterable[str], qualname: str) -> Node | None:
+        hits = self._eligible(
+            caller, (n for path in paths for n in self._by_qualname.get(path, {}).get(qualname, ())),
+        )
+        return hits[0] if len(hits) == 1 else None
+
+    def _imported(self, caller: Node) -> tuple[str, ...]:
+        return tuple(
+            p for p in self._with_entry_hop(self.imports_of.get(caller.path, ())) if p != caller.path
+        )
+
+    def _scoped(
+        self, caller: Node, name: str, *, methods: bool | None, exclude_caller: bool = False,
+    ) -> Node | None:
+        """同一ファイル → import 先 (入口の再エクスポートを 1 段) の順で一意か。"""
+        same_file = self._unique(
+            caller, (caller.path,), name, methods=methods, exclude_caller=exclude_caller,
+        )
+        if same_file is not None:
+            return same_file
+        return self._unique(
+            caller, self._imported(caller), name, methods=methods, exclude_caller=exclude_caller,
+        )
+
+    def _binding_path(self, caller: Node, module: str) -> tuple[str | None, bool]:
+        """束縛のモジュールが指すファイルと、解けなかったのがプロジェクト内らしいか。"""
+        if language_family(caller.lang) == "python":
+            return self.py_modules.resolve(module, caller.path), False
+        target = self.spec_targets.get(caller.path, {}).get(module)
+        return target, target is None and _looks_project_local(module)
+
+    # ── 解決 ──
+
+    def resolve(self, caller: Node, name: str, receiver: str | None = None) -> Node | None:
+        if language_family(caller.lang) not in _IMPORT_SCOPED_FAMILIES:
+            return self._resolve_unscoped(caller, name)
+        if receiver is None:
+            return self._resolve_bare(caller, name)
+        if receiver in _SELF_RECEIVERS:
+            return self._resolve_self(caller, name)
+        if receiver == _SUPER_RECEIVER:
+            return self._resolve_self(caller, name, skip_own_class=True)
+        head = receiver.split(".", 1)[0]
+        binding = self.bindings.get(caller.path, {}).get(head) if head else None
+        if binding is not None:
+            return self._resolve_via_import(caller, name, receiver, head, binding)
+        # 受け手のある呼出 (``self`` 以外) は再帰ではない — 呼出元自身を相手にしない
+        return self._scoped(caller, name, methods=True, exclude_caller=True)
+
+    def _resolve_unscoped(self, caller: Node, name: str) -> Node | None:
+        same_file = self._unique(caller, (caller.path,), name, methods=None)
+        if same_file is not None:
+            return same_file
+        directory = str(PurePosixPath(caller.path).parent)
+        same_dir = _unique_by_name(self._eligible(caller, self.by_dir.get(directory, ())), name)
+        if same_dir is not None:
+            return same_dir
+        return _unique_by_name(self._eligible(caller, self.by_name_global.get(name, ())), name)
+
+    def _global_function(self, caller: Node, name: str) -> Node | None:
+        """エイリアスを解けなかった import の縮退: 全体で一意な (メソッド以外の) 名前。"""
+        pool = [
+            n for n in self._eligible(caller, self.by_name_global.get(name, ()))
+            if n.node_type != "method" and n.id not in self.nested_ids
+        ]
+        return pool[0] if len(pool) == 1 else None
+
+    def _resolve_bare(self, caller: Node, name: str) -> Node | None:
+        same_file = self._unique(caller, (caller.path,), name, methods=False)
+        if same_file is not None:
+            return same_file
+        binding = self.bindings.get(caller.path, {}).get(name)
+        if binding is None:
+            return self._scoped(caller, name, methods=False)
+        module, member = binding
+        if member is None:
+            return None  # モジュールそのもの (名前空間) は呼べない
+        if language_family(caller.lang) == "python" and self.py_modules.resolve(
+            f"{module}.{member}", caller.path,
+        ):
+            return None  # ``from pkg import sub`` の sub (モジュール) は呼べない
+        module_path, local_unresolved = self._binding_path(caller, module)
+        if module_path is None:
+            return self._global_function(caller, member) if local_unresolved else None
+        return self._unique_qualname(caller, self._with_entry_hop([module_path]), member)
+
+    def _class_chain(self, cls: Node) -> list[Node]:
+        chain, frontier, seen = [], [cls], {cls.id}
+        for _ in range(_MAX_BASE_DEPTH):
+            if not frontier:
+                break
+            chain.extend(frontier)
+            nxt = []
+            for c in frontier:
+                for base in self.bases.get(c.id, ()):
+                    if base.id not in seen:
+                        seen.add(base.id)
+                        nxt.append(base)
+            frontier = nxt
+        return chain
+
+    def _resolve_self(
+        self, caller: Node, name: str, *, skip_own_class: bool = False,
+    ) -> Node | None:
+        """``self.f()`` は囲みのクラスから、``super().f()`` は基底から連鎖を辿る。"""
+        current: Node | None = caller
+        while current is not None and current.node_type != "class":
+            current = self.node_by_id.get(current.parent_id) if current.parent_id else None
+        if current is not None:
+            chain = self._class_chain(current)
+            for cls in chain[1:] if skip_own_class else chain:
+                own = self._unique_qualname(caller, (cls.path,), f"{cls.qualname}.{name}")
+                if own is not None:
+                    return own
+        # 基底が外部 / 未解決、または別ファイルの mixin が定義している: import 先のメソッド
+        return self._unique(
+            caller, self._imported(caller), name, methods=True, exclude_caller=skip_own_class,
+        )
+
+    def _resolve_via_import(
+        self, caller: Node, name: str, receiver: str, head: str,
+        binding: tuple[str, str | None],
+    ) -> Node | None:
+        module, member = binding
+        rest = receiver[len(head):]  # 受け手が ``head.b.c`` のときの ``.b.c``
+        is_python = language_family(caller.lang) == "python"
+        if member is not None:
+            submodule = f"{module}.{member}"
+            if is_python and self.py_modules.resolve(submodule, caller.path) is not None:
+                module = submodule
+            else:
+                # ``from m import C`` / ``import { C } from 'm'`` の ``C.f()`` (クラスのメソッド)。
+                # ``C.x.f()`` は決めない
+                module_path, _ = self._binding_path(caller, module)
+                if module_path is None or rest:
+                    return None
+                return self._unique_qualname(
+                    caller, self._with_entry_hop([module_path]), f"{member}.{name}",
+                )
+        if is_python:
+            module_path = self.py_modules.resolve(f"{module}{rest}", caller.path)
+        else:
+            module_path = None if rest else self._binding_path(caller, module)[0]
+        if module_path is None:
+            return None  # 外部モジュールの関数 (``json.dumps()`` / ``asyncio.run()``)
+        return self._unique_qualname(caller, self._with_entry_hop([module_path]), name)
 
 
 def build_graph(
@@ -747,8 +1112,17 @@ def build_graph(
     by_file: dict[str, list[Node]] = defaultdict(list)
     by_dir: dict[str, list[Node]] = defaultdict(list)
     by_name_global: dict[str, list[Node]] = defaultdict(list)
-    call_sites: list[tuple[Node, str]] = []
+    call_sites: list[tuple[Node, str, str | None]] = []
     inherit_sites: list[tuple[Node, str]] = []
+    node_by_id: dict[str, Node] = {}
+    bindings: dict[str, dict[str, tuple[str, str | None]]] = {}
+    #: file path → import 指定子 → 解決した path (一意に決まらなければ None)
+    spec_targets: dict[str, dict[str, str | None]] = defaultdict(dict)
+    py_modules = _PythonModuleIndex(all_paths)
+    #: file path → import 辺で結んだ先の path (解決済みのものだけ)
+    imports_of: dict[str, set[str]] = defaultdict(set)
+    #: 親が function / method のノード (入れ子の定義)
+    nested_ids: set[str] = set()
 
     for file in extracted:
         languages[file.lang] += 1
@@ -762,6 +1136,12 @@ def build_graph(
             )
             nodes.append(resolved)
             id_to_node[resolved.id] = resolved
+            node_by_id[resolved.id] = resolved
+            parent = id_to_node.get(resolved.parent_id) if resolved.parent_id else None
+            if parent is not None and (
+                parent.node_type in ("function", "method") or parent.id in nested_ids
+            ):
+                nested_ids.add(resolved.id)
             edges.append(
                 Edge(src=resolved.parent_id, dst=resolved.id, etype="contains", weight=1.0),
             )
@@ -775,48 +1155,73 @@ def build_graph(
                 t for t in _resolve_import(
                     file.path, file.lang, spec, all_paths,
                     pack_import_rules=pack_import_rules, alias_config=alias_config,
+                    py_modules=py_modules,
                 )
                 if t != file.path
             ]
+            spec_targets[file.path][spec] = targets[0] if len(targets) == 1 else None
             if not targets:
                 unresolved.append(spec)
                 continue
             for target_path in targets:
+                if target_path in imports_of[file.path]:
+                    continue
+                imports_of[file.path].add(target_path)
                 target_id = code_node_id(target_path, "file", "")
                 edges.append(
                     Edge(src=file_node.id, dst=target_id, etype="imports", weight=1.0),
                 )
+        # ``from pkg import sub`` の ``sub`` がモジュールなら、そのファイルへも辺を張る
+        # (``pkg/__init__.py`` への辺だけだと、呼出の相手が入口に限られる)。``pkg`` が
+        # 解けなくても (``__init__.py`` の無い名前空間パッケージ) sub が解ければ外部ではない。
+        for module, member in file.import_names:
+            target_path = py_modules.resolve(f"{module}.{member}", file.path)
+            if target_path is None or target_path == file.path:
+                continue
+            if module in unresolved:
+                unresolved.remove(module)
+            if target_path in imports_of[file.path]:
+                continue
+            imports_of[file.path].add(target_path)
+            edges.append(Edge(
+                src=file_node.id, dst=code_node_id(target_path, "file", ""),
+                etype="imports", weight=1.0,
+            ))
         if unresolved:
             external_imports[file.path] = unresolved
 
+        if file.import_bindings:
+            bindings[file.path] = dict(file.import_bindings)
         for call in file.calls:
             caller = id_to_node.get(call.caller_id)
             if caller is not None:
-                call_sites.append((caller, call.callee_name))
+                call_sites.append((caller, call.callee_name, call.receiver))
 
         for class_id, base_name in file.inherits:
             cls_node = id_to_node.get(class_id)
             if cls_node is not None:
                 inherit_sites.append((cls_node, base_name))
 
-    for caller, name in call_sites:
-        target = _resolve_symbol(
-            caller, name,
-            by_file=by_file, by_dir=by_dir, by_name_global=by_name_global,
-        )
+    resolver = _SymbolResolver(
+        by_file=by_file, by_dir=by_dir, by_name_global=by_name_global,
+        imports_of=imports_of, spec_targets=spec_targets, nested_ids=frozenset(nested_ids),
+        node_by_id=node_by_id, bindings=bindings, py_modules=py_modules,
+    )
+
+    # 継承を先に解く — ``self.f()`` が基底クラスの連鎖を辿れるように
+    for cls_node, base_name in inherit_sites:
+        target = resolver.resolve(cls_node, base_name)
+        if target is not None and target.id != cls_node.id:
+            resolver.bases[cls_node.id].append(target)
+            edges.append(
+                Edge(src=cls_node.id, dst=target.id, etype="inherits", weight=NAME_MATCH_WEIGHT),
+            )
+
+    for caller, name, receiver in call_sites:
+        target = resolver.resolve(caller, name, receiver)
         if target is not None and target.id != caller.id:
             edges.append(
                 Edge(src=caller.id, dst=target.id, etype="calls", weight=NAME_MATCH_WEIGHT),
-            )
-
-    for cls_node, base_name in inherit_sites:
-        target = _resolve_symbol(
-            cls_node, base_name,
-            by_file=by_file, by_dir=by_dir, by_name_global=by_name_global,
-        )
-        if target is not None and target.id != cls_node.id:
-            edges.append(
-                Edge(src=cls_node.id, dst=target.id, etype="inherits", weight=NAME_MATCH_WEIGHT),
             )
 
     nodes.sort(key=lambda n: (n.path, n.line_start, n.node_type, n.qualname))

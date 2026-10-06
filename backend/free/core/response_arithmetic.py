@@ -23,6 +23,8 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
+from backend.free.core.temporal_deixis import alternation, previous_period_terms
+
 #: ``A <op> B (= | ≈ | →) C`` 形式の主張。
 #:
 #: 演算子の前後に **空白を要求** する。要求しないと「シャッターを 1/125 秒」の
@@ -196,9 +198,9 @@ _BOLD_RE = re.compile(r"\*\*([^*\n]{1,60})\*\*")
 #: 数字を含む散文が丸ごと「結論の断定」に化ける — 実測では
 #: ``E0133: use of static mut variable`）になります`` と
 #: ``127229.236318）が…単なる数値です`` の 2 件を誤って結論として拾った。
-_ASSERTION_TAIL_RE = re.compile(
-    r"^\s*[^\s。、，,\n]{0,8}?(?:です|となります|になります|でした)",
-)
+_ASSERTION_TAIL_HEAD = r"^\s*[^\s。、，,\n]{0,8}?"
+_ASSERTION_ENDINGS = "です|となります|になります|でした"
+_ASSERTION_TAIL_RE = re.compile(_ASSERTION_TAIL_HEAD + f"(?:{_ASSERTION_ENDINGS})")
 
 #: インラインコード。エラーコードや識別子の数字が結論に化けるのを防ぐため、
 #: 冒頭の走査前に落とす。
@@ -249,6 +251,29 @@ class JaNumber(NamedTuple):
     #: 単位付きの項 (係数の値, 倍率)。「2,850万」→ ``((2850, 1e4),)``、
     #: 「2万6千円」→ ``((6, 1000), (2, 1e4))``。素の数の項は含めない。
     unit_terms: tuple[tuple[float, float], ...] = ()
+    #: 負号が数の直前に付いているか (:func:`_has_negative_sign`)。``value`` は大きさの
+    #: ままで、符号はこの印だけが持つ (既存の読み手は大きさで比べている)。
+    negative: bool = False
+
+
+#: 数の直前に空白を挟まず付く負号 (半角・全角のマイナス、▲ / △ の負の表記)。
+_NEGATIVE_SIGN_CHARS = frozenset("-−－▲△")
+_NEGATIVE_SIGN_WORD = "マイナス"
+
+
+def _has_negative_sign(text: str, start: int) -> bool:
+    """``text[start]`` から始まる数に負号が直接付いているか (純粋関数)。
+
+    負号と数のあいだに空白を許さない (箇条書きの「- 4000円」は負数ではない)。
+    記号の負号は、その直前が英数字なら範囲・日付・識別子の区切りとみなして数えない
+    (「3-5件」「2026-10-20」「A-4000」)。
+    """
+    if start <= 0:
+        return False
+    if text[start - 1] in _NEGATIVE_SIGN_CHARS:
+        before = text[start - 2] if start >= 2 else ""
+        return not (before.isascii() and before.isalnum())
+    return text.endswith(_NEGATIVE_SIGN_WORD, 0, start)
 
 
 def iter_ja_numbers(text: str) -> list[JaNumber]:
@@ -256,11 +281,12 @@ def iter_ja_numbers(text: str) -> list[JaNumber]:
 
     「2 万 4,667」「12万6,667円」「3857万9100」「1億2000万」「561.4 万円」「2万6千円」
     「1万2千3百」はそれぞれ 1 つの数。桁区切り (``1,234``) と小数を読む。全角の数字・
-    小数点・桁区切りもここで読む (位置は元の ``text`` のまま)。符号は読まない
-    (大きさだけ)。
+    小数点・桁区切りもここで読む (位置は元の ``text`` のまま)。``value`` は大きさで、
+    負号は ``negative`` に分けて持つ (:func:`_has_negative_sign`)。
     """
     out: list[JaNumber] = []
-    for m in _JA_NUMBER_RE.finditer(normalize_numerals(text)):
+    normalized = normalize_numerals(text)
+    for m in _JA_NUMBER_RE.finditer(normalized):
         if not m.group(0):
             continue
         terms = _ja_terms(m)
@@ -270,6 +296,7 @@ def iter_ja_numbers(text: str) -> list[JaNumber]:
         out.append(JaNumber(
             m.start(), m.end(), sum(v * mult for _, v, mult in terms),
             _literal_scale(m), bool(unit_terms), unit_terms,
+            _has_negative_sign(normalized, m.start()),
         ))
     return out
 
@@ -344,6 +371,155 @@ def find_conclusion_contradiction(text: str) -> str | None:
         f"reaches that value (computed values include "
         f"{', '.join(f'{v:g}' for v in others[:3])})"
     )
+
+
+#: :func:`find_sign_contradiction` の冒頭の断定の文末。:data:`_ASSERTION_TAIL_RE` の
+#: 断定 (です / となります / でした) に、丁寧の述語の文末「ます / ました」を足した
+#: 閉じた文法の類 (「4000円残ります」「4000円かかりました」)。語彙ではなく活用語尾。
+#: 符号の食い違いは「= 値」の式を要求しないので、冒頭の値の拾い方だけを広げる
+#: (:func:`find_conclusion_contradiction` の拾い方は変えない)。
+_POLITE_ASSERTION_TAIL_RE = re.compile(
+    _ASSERTION_TAIL_HEAD + f"(?:{_ASSERTION_ENDINGS}|ます|ました)",
+)
+
+
+def _find_signed_lead(text: str) -> JaNumber | None:
+    """冒頭で答えとして提示された値 (強調 or 丁寧の述語まで含む断定の文末)。"""
+    raw = (text or "").split("\n\n", 1)[0][:_LEAD_CHARS]
+    if not raw:
+        return None
+    lead = _INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), raw)
+    for m in _BOLD_RE.finditer(lead):
+        nums = iter_ja_numbers(m.group(1))
+        if nums:
+            first = nums[0]
+            return first._replace(
+                start=m.start(1) + first.start, end=m.start(1) + first.end,
+            )
+    for num in iter_ja_numbers(lead):
+        tail = _POLITE_ASSERTION_TAIL_RE.match(lead[num.end:])
+        # 述語までのあいだに別の数があれば、述語が受けるのはそちら (「2人で4000円です」の
+        # 2 は人数で答えの値ではない。2026-10-05 ライブ再監査で -4000 との食い違いを逃した)。
+        if tail is not None and not any(ch.isdigit() for ch in tail.group(0)):
+            return num
+    return None
+
+
+#: 負の向きを語で述べる閉じた類 (超過・赤字・不足・減った・損失・差・マイナス …)。冒頭の
+#: 文がこれを含むなら、符号の無い値はその語が向きを担う大きさで、本文の負の値と矛盾
+#: しない (独立レビュー 2026-10-05: 「4000円の赤字です。…収支: -4000円」「予算を4000円
+#: 超過します」「損失は3000円です」「誤差は2500です」を誤って報告した)。語形を足す
+#: 方向で精度を上げない (不変則 #14) — ここは「報告しない」側に倒すための類。
+_NEGATIVE_POLARITY_RE = re.compile(
+    r"超過|赤字|不足|足りな|減|損|差|マイナス|下回|下落|低下|割れ|割り込|オーバー|負|欠損"
+    r"|deficit|shortfall|loss|over\s*budget|less|fewer|decrease|drop|minus",
+    re.IGNORECASE,
+)
+#: 本文の負の値が **結果の値** として置かれている印 (直前のラベルの区切り)。
+_RESULT_LABEL_TAILS = ("=", "＝", ":", "：", "は")
+#: 結果のラベルのうち、別の量 (前期との増減) を指すもの。
+#: 前の期間の語は時間直示の語彙 (``temporal_deixis``) から組む (不変則 #14(a))。
+_CHANGE_LABEL_RE = re.compile("比|増減|" + alternation(previous_period_terms()))
+#: 文の区切り (冒頭の値を含む文を切り出す)。
+_SENTENCE_END_CHARS = "。！？!?\n"
+
+
+def _lead_sentence(text: str, start: int, end: int) -> str:
+    """``text[start:end]`` を含む文 (純粋関数)。"""
+    head = max(text.rfind(ch, 0, start) for ch in _SENTENCE_END_CHARS) + 1
+    tails = [i for i in (text.find(ch, end) for ch in _SENTENCE_END_CHARS) if i >= 0]
+    return text[head:min(tails) if tails else len(text)]
+
+
+def _signed_result_label(text: str, num: JaNumber) -> str | None:
+    """負の値がラベル付きの結果の値なら、そのラベル (行頭から区切りまで) を返す。
+
+    「差し引き：-4000円」「収支 = -4000円」「残高は-4000円」は結果の値。区切りの無い
+    負の値 (コマンドの引数 ``… -8080``、範囲 ``1000円〜−2000円``、行頭の ▲ の箇条書き)
+    は結果ではない (``None``)。
+    """
+    sign_start = num.start - (
+        len(_NEGATIVE_SIGN_WORD)
+        if text.endswith(_NEGATIVE_SIGN_WORD, 0, num.start) else 1
+    )
+    before = text[:sign_start].rstrip(" \t　*_`")
+    if not before.endswith(_RESULT_LABEL_TAILS):
+        return None
+    line_start = before.rfind("\n") + 1
+    return before[line_start:]
+
+
+def _is_same_quantity_result(text: str, num: JaNumber) -> bool:
+    """負の値がラベル付きの結果で、そのラベルが前期との増減でないか。"""
+    label = _signed_result_label(text, num)
+    return label is not None and not _CHANGE_LABEL_RE.search(label)
+
+
+def find_sign_contradiction(text: str) -> str | None:
+    """冒頭の結論の **符号** が本文と食い違っていれば理由を返す (純粋関数)。
+
+    2026-10-05 ライブ監査: 「2人で4000円残ります。… 差し引き：-4000円（予算を4000円
+    超過しています）」が成功として通った。大きさは一致するので
+    :func:`find_conclusion_contradiction` (大きさの不一致・「= 値」の式が要る) では
+    捕まらない。条件をすべて満たしたときだけ報告する:
+
+    1. 冒頭に答えとして提示された **符号の無い** 値 v がある (強調 or 断定の文末。
+       丁寧の述語「ます / ました」も含める、:data:`_POLITE_ASSERTION_TAIL_RE`)
+    2. v の桁数が :data:`_MIN_CONCLUSION_DIGITS` 以上 (個数・順序を除外)
+    3. 本文 (冒頭の値の外) に負の v (``-v`` / ``−v`` / ``▲v`` / ``マイナスv``) がある
+    4. 本文で v が正のまま現れるのは、負の v と **同じ行** だけ (「-4000円（4000円
+       超過）」は負の値の言い換え)。別の行に正の v があれば、冒頭の値を支える計算が
+       あるとみなして報告しない
+    5. 冒頭の値を含む文が負の向きの語 (:data:`_NEGATIVE_POLARITY_RE`、「赤字」「超過」
+       「減りました」「損失」「差」) を含まない — 含めば語が符号を担っている
+    6. 負の v は **ラベル付きの結果の値** (``差し引き：-4000円`` / ``= -4000``、
+       :func:`_signed_result_label`)。ラベルが前期との増減 (「先月比：▲3000円」) なら
+       別の量なので数えない
+
+    「= 値」の式は要求しない (内訳の「差し引き：-4000円」は式の形を取らない)。
+    """
+    found = sign_contradiction_values(text)
+    if found is None:
+        return None
+    lead, negative = found
+    return (
+        f"lead states {lead} as the answer but the body gives "
+        f"-{negative} (opposite sign)"
+    )
+
+
+def sign_contradiction_values(text: str) -> tuple[str, str] | None:
+    """:func:`find_sign_contradiction` が成り立つときの ``(冒頭の値, 本文の負の値の大きさ)``。
+
+    どちらも本文の表記のまま (前後の空白を除く)。負の値は符号を含まない。開示注記
+    (``core.text_quality.sign_correction_note``) が同じ判定から値を取る。
+    """
+    body = normalize_numerals(text or "")
+    lead = _find_signed_lead(text or "")
+    if lead is None or lead.negative:
+        return None
+    literal = body[lead.start:lead.end]
+    if _digit_count(literal) < _MIN_CONCLUSION_DIGITS:
+        return None
+    if _NEGATIVE_POLARITY_RE.search(_lead_sentence(body, lead.start, lead.end)):
+        return None
+    tolerance = _conclusion_tolerance(literal, lead.value)
+    matches = [
+        n for n in iter_ja_numbers(body)
+        if not (n.start >= lead.start and n.end <= lead.end)
+        and abs(n.value - lead.value) <= tolerance
+    ]
+    negatives = [n for n in matches if n.negative and _is_same_quantity_result(body, n)]
+    if not negatives:
+        return None
+    negative_lines = {body.count("\n", 0, n.start) for n in negatives}
+    if any(
+        not n.negative and body.count("\n", 0, n.start) not in negative_lines
+        for n in matches
+    ):
+        return None
+    first = negatives[0]
+    return literal.strip(), body[first.start:first.end].strip()
 
 
 # ---------------------------------------------------------------------------

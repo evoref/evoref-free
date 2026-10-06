@@ -236,6 +236,17 @@ async def _screen_questions(
             stats[RERANK_DROPPED_KEY] += 1
 
 
+async def _reranker_reachable(reranker: Any) -> bool:
+    """採点を送ってよいか。遮断器が閉じていれば真、開いていれば ``/health`` で確かめる。"""
+    if not getattr(reranker, "breaker_open", False):
+        return True
+    try:
+        return bool(await reranker.health_check())
+    except Exception as e:  # noqa: BLE001 — 確かめられなければ届かないのと同じ
+        logger.info("Step 5.9: reranker health check failed: %s: %s", type(e).__name__, e)
+        return False
+
+
 def _count_questions(generated: list[tuple[str, str, list[str], int | None]]) -> int:
     return sum(1 for item in generated for q in item[2] if q)
 
@@ -490,6 +501,10 @@ async def generate_pseudo_queries(
                         and not _decisions_recorded()
                     ):
                         # 較正前の採点は記録 (較正の材料) だけが目的。記録されない構成では省く。
+                        stats[RERANK_UNSCORED_KEY] += _count_questions(generated)
+                    elif not await _reranker_reachable(reranker):
+                        # 遮断中で /health も通らない (起動時に届かなかった等)。死んだサーバへ
+                        # 1 問ずつ送らない。遮断器の窓・試しの席には触れない (breaker=False と同じ)。
                         stats[RERANK_UNSCORED_KEY] += _count_questions(generated)
                     else:
                         screening = (_count_questions(generated), stats.get(RERANK_SCORED_INPUT_KEY, 0))

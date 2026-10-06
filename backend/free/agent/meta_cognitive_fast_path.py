@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+import re
 from pathlib import Path
 from backend.free.agent.meta_cognitive_tasks import TaskItem
 from backend.free.agent.meta_cognitive_task_exec import (
     execute_tool_with_timeout,
+    fetch_cache_key,
+    retrieval_call_key,
+    search_without_location,
     tool_mode_error,
 )
+from backend.free.constants import SEARCH_NO_LOCATION_ERROR
 from backend.free.agent.output_format import wants_fetched_table
 from backend.free.agent.file_ledger import forget_current_file
 from backend.free.agent.tool_ledger import mark_last_failed
-from backend.free.agent.write_gate import WRITE_DENIED_RE
+from backend.free.agent.write_gate import WRITE_DENIED_RE, request_names_file
 from backend.free.agent.meta_cognitive_utils import (
     call_callback,
     extract_literal_write_content,
@@ -25,21 +32,29 @@ from backend.free.agent.meta_cognitive_utils import (
     strip_prompt_scaffold_lines,
     strip_task_log_scaffold,
     summarize_tool_args,
+    tool_error_kind,
     text_looks_like_code,
     tool_result_succeeded,
 )
 
 from backend.free.agent.meta_cognitive_defs import (
+    ALREADY_WRITTEN,
     _DATA_BEARING_TOOLS,
     resolve_read_path,
 )
-from backend.free.agent.meta_cognitive_content import ExistingContentRefused
+from backend.free.agent.meta_cognitive_content import (
+    ExistingContentRefused,
+    InsufficientSourceRefused,
+)
+from backend.free.agent.meta_cognitive_tool_io import read_file_result_path
 from backend.free.agent.tools.filesystem import append_existing_text
 from backend.free.agent.meta_cognitive_content_gate import is_pure_append_request
 from backend.free.agent.edit_mode_gate import is_append_verdict
 from backend.io.text_file import Unreadable
 
 from backend.free.core.response_dates import fix_weekday_claims
+from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
+from backend.i18n_helper import msg
 from backend.log_config import get_logger
 from backend.free.core.prompt_blocks import local_today
 
@@ -52,6 +67,59 @@ _UNCHANGED_EDIT_RETRY_HINT = (
     "反映されていなかった。次のユーザー指示を必ず反映した内容を出力すること"
     "(既存内容の写しは不可): {instruction}"
 )
+
+
+def _turn_path_key(path: str) -> str:
+    """このターンの書込み記録の鍵 (絶対パスの正規形)。"""
+    try:
+        return os.path.normcase(os.path.abspath(path))
+    except (OSError, ValueError):
+        return os.path.normcase(path)
+
+
+def _content_digest(content: str) -> str:
+    """書いた本文の指紋 (改行の種類と末尾の改行 1 つの差は同じとみなす)。"""
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n").removesuffix("\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+#: 文中のファイル名らしい語 (ASCII の名前 + 拡張子)。素材の名指しの照合に使う (字句の鍵)。
+_FILE_TOKEN_RE = re.compile(r"(?<![\w.\-])[\w\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(?![\w\-])")
+#: 内容語の連なり (漢字・カタカナ・英数字)。ひらがな (助詞・語尾) で切る。
+_CONTENT_RUN_RE = re.compile(rf"[{KANJI}{KANJI_MARKS}{KATAKANA_WORD}A-Za-z0-9]+")
+#: 前の発話が今の依頼に関係するとみなす、内容語の 2 文字の共有数の下限。
+_RELEVANT_BIGRAMS = 2
+
+
+def _content_bigrams(text: str) -> set[str]:
+    """パスとファイル名を除いた内容語の 2 文字の組 (英字は小文字)。"""
+    from backend.free.agent.tool_judge_args import without_drive_paths
+
+    stripped = _FILE_TOKEN_RE.sub(" ", without_drive_paths(text or "", " "))
+    out: set[str] = set()
+    for run in _CONTENT_RUN_RE.findall(stripped):
+        run = run.lower()
+        out.update(run[i:i + 2] for i in range(len(run) - 1))
+    return out
+
+
+def relevant_earlier_turn(query: str, earlier_user_texts: list[str]) -> str:
+    """今の依頼に関係する、ファイルを名指した最も新しい user の発話 (無ければ空)。
+
+    関係の判定は内容語の 2 文字の組の共有 (:data:`_RELEVANT_BIGRAMS` 以上)。「部署ごとの
+    平均給与を…に書き出して」と「staff.csv を読んで、部署ごとの平均給与を計算して」は
+    部署・平均・均給・給与を共有し、「buggy.py のバグを見つけて」とは何も共有しない。
+    ``earlier_user_texts`` は新しい順 (``file_ledger.user_texts``)。今の依頼文自身は飛ばす。
+    """
+    wanted = _content_bigrams(query)
+    if not wanted:
+        return ""
+    for text in earlier_user_texts:
+        if text.strip() == (query or "").strip() or not _FILE_TOKEN_RE.search(text):
+            continue
+        if len(wanted & _content_bigrams(text)) >= _RELEVANT_BIGRAMS:
+            return text
+    return ""
 
 
 class _FastPathMixin:
@@ -92,11 +160,102 @@ class _FastPathMixin:
         )
         return {**tool_args, "file_path": resolved}
 
+    # ── このターンの書込みの記録 ({宛先: 本文の指紋}) ──────────────────
+    #
+    # 2026-10-05 ライブ監査 T5: タスク 2 (救出) が fixed.py を書いた後、タスク 3 が同じ
+    # 本文を生成し、既存 (= タスク 2 が書いた内容) と同じだとして edit_without_change で
+    # 棄却 → 再生成 → 失敗、本文と「書き込みができませんでした」が並んだ。比べる相手は
+    # ターンの開始時のファイルで、このターンの自分の書込みではない。
+
+    def _turn_write_baseline(self, file_path: str, existing: str) -> str:
+        """無変更の検査で比べる既存内容 (このターンに書いた宛先はターン開始時の内容)。"""
+        starts = getattr(self, "_turn_start_contents", None) or {}
+        return starts.get(_turn_path_key(file_path), existing)
+
+    def _written_this_turn(self, file_path: str, content: str) -> bool:
+        """このターンに同じ宛先へ同じ本文を既に書いたか。"""
+        writes = getattr(self, "_turn_writes", None) or {}
+        return writes.get(_turn_path_key(file_path)) == _content_digest(content)
+
+    async def _note_turn_write_start(self, file_path: str) -> None:
+        """宛先のターン開始時の内容を、このターンの最初の書込みの前に 1 回だけ控える。"""
+        starts = getattr(self, "_turn_start_contents", None)
+        if starts is None:
+            starts = self._turn_start_contents = {}
+        key = _turn_path_key(file_path)
+        if key in starts:
+            return
+        loaded = await self._load_existing_for_edit(file_path)
+        if isinstance(loaded, Unreadable):
+            return
+        starts[key] = loaded or ""
+
+    def _note_turn_write_done(self, file_path: str, content: str) -> None:
+        """書けた本文の指紋をこのターンの記録へ積む。"""
+        writes = getattr(self, "_turn_writes", None)
+        if writes is None:
+            writes = self._turn_writes = {}
+        writes[_turn_path_key(file_path)] = _content_digest(content)
+
+    def _already_saved_entry(self, file_path: str, content: str) -> tuple[str, dict]:
+        """同じ本文をこのターンに書き済みの宛先の結果 (書かずに done)。"""
+        logger.info(
+            "Write skipped: this turn already wrote the same content to %s", file_path,
+        )
+        return msg("agent.write_already_saved", path=file_path), {
+            "tool": "write_file",
+            "args": {"file_path": file_path, "content": content},
+            "success": True,
+            "already_written": True,
+        }
+
+    def _has_source_material(self, original_query: str, destination: str = "") -> bool:
+        """このターンの取得に、依頼に関係する素材があるか (``no_source_data`` の門)。
+
+        読込み (``read_file``) の結果を素材に数えるのは、対象を利用者が **この依頼のために**
+        名指したときだけ:
+
+        1. 名前かフルパスが今の依頼文にある
+        2. 「そのファイル」型の暗黙参照が指す直近のファイル
+        3. 今の依頼文が宛先 (``destination``) のほかにファイルを名指さず、前の user の
+           発話のうち **今の依頼に関係する** (:func:`relevant_earlier_turn`) 最も新しいものが
+           名指したファイル — T6「部署ごとの平均給与を …\\summary.md に表で書き出して」の
+           素材は T1「staff.csv を読んで、部署ごとの平均給与を計算して」の staff.csv で、
+           T4「buggy.py のバグを…」の buggy.py ではない
+
+        依頼文が挙げたフォルダ (書込みの宛先の親) の中にあるだけでは数えない。2026-10-05
+        ライブ監査 T6 では計画が無関係な buggy.py を読み、謝罪文を summary.md へ書いて成功と
+        報告した。他の取得 (URL / 検索) は従来どおり素材に数える。
+        """
+        from backend.free.agent.file_ledger import user_texts
+        from backend.free.agent.tool_judge_args import _extract_file_path
+
+        query = original_query or ""
+        # 「そのファイルを要約して…」型の暗黙参照が指すファイル (台帳の直近) も依頼の対象
+        referred = _extract_file_path(query)
+        referred_key = _turn_path_key(referred) if referred else ""
+        dest_name = os.path.basename(destination or "").lower()
+        names_other_source = any(
+            token.lower() != dest_name for token in _FILE_TOKEN_RE.findall(query)
+        )
+        earlier_turn = "" if names_other_source else relevant_earlier_turn(
+            query, user_texts(getattr(self, "_conversation", None)),
+        )
+        for output in getattr(self, "_fetched_tool_outputs", None) or ():
+            path = read_file_result_path(output)
+            if path is None or request_names_file(path, query):
+                return True
+            if referred_key and _turn_path_key(path) == referred_key:
+                return True
+            if earlier_turn and request_names_file(path, earlier_turn):
+                return True
+        return False
+
     async def _execute_tool_fast(
         self,
         tool_name: str,
         tool_args: dict,
-        task: TaskItem,  # noqa: ARG002
+        task: TaskItem,
         tools_registry,
         on_step=None,
         prefix: str = "",
@@ -143,26 +302,69 @@ class _FastPathMixin:
                 "status": "running",
             })
 
-        try:
-            result_text = await execute_tool_with_timeout(
-                tools_registry, tool_name, tool_args,
+        # 同じターンで取得済みの URL は取り直さない (docs/f_03 §4.2.1)
+        cached = self._turn_fetched(tool_name, tool_args)
+        failed_before = None if cached is not None else self._turn_fetch_error(
+            tool_name, tool_args,
+        )
+        if cached is not None:
+            logger.info(
+                "%s served from this turn's retrieval (not fetched again): %s",
+                tool_name, fetch_cache_key(tool_name, tool_args),
             )
-            is_success = tool_result_succeeded(tool_name, result_text)
-        except Exception as e:
-            result_text = f"Error: {e}"
-            is_success = False
-            logger.error("Tool fast path failed: %s - %s", tool_name, e)
+            result_text, is_success = cached, True
+        elif failed_before is not None:
+            # 同じ URL がこのターンで既にエラーを返した (timeout 等だけが違う取り直し、f_03 §4.2.1)
+            logger.info(
+                "%s not fetched again: the same URL failed earlier in this turn: %s",
+                tool_name, fetch_cache_key(tool_name, tool_args),
+            )
+            result_text, is_success = failed_before, False
+        elif search_without_location(tool_name, tool_args):
+            # 場所の無い検索はインストール根を舐めるので撃たない (run23 反証 HIGH-1、f_03 §4.2.1)
+            logger.info("search_code not run: no folder to search (not the CWD): %s", tool_args)
+            result_text, is_success = SEARCH_NO_LOCATION_ERROR, False
+        else:
+            try:
+                result_text = await execute_tool_with_timeout(
+                    tools_registry, tool_name, tool_args,
+                )
+                is_success = tool_result_succeeded(tool_name, result_text)
+            except Exception as e:
+                result_text = f"Error: {e}"
+                is_success = False
+                logger.error("Tool fast path failed: %s - %s", tool_name, e)
+            self._remember_fetch_error(tool_name, tool_args, result_text)
 
         # データ取得結果をタスク横断アキュムレータへ (後続 write タスクの素材に再利用)。
         # ファストパス経由の fetch_url 等もここで蓄積する (ツールループ経路と対称)。
-        if tool_name in _DATA_BEARING_TOOLS and is_success:
-            self._fetched_tool_outputs.append(result_text)
+        # 取り直さなかった結果は既に積んである。
+        task.retrieved = tool_name in _DATA_BEARING_TOOLS and is_success
+        if tool_name in _DATA_BEARING_TOOLS:
+            self._retrieval_attempted = True
+        if task.retrieved and cached is None:
+            self._remember_retrieval(tool_name, tool_args, result_text)
+        if task.retrieved:
+            self._primary_results.append(
+                (retrieval_call_key(tool_name, tool_args), result_text),
+            )
 
         tool_entry = {
             "tool": tool_name,
             "args": tool_args,
             "success": is_success,
         }
+        if cached is not None or failed_before is not None:
+            # 取り直さなかった実行は学習の正例に数えない (不変則 #15、f_03 §4.2.1)
+            tool_entry["cached"] = True
+        if tool_name in _DATA_BEARING_TOOLS:
+            # タスクの主の取得 (判定したツール)。失敗したタスクの素材を残すかを決める
+            tool_entry["fast_path"] = True
+        if is_tool_error(result_text):
+            tool_entry["error"] = True
+            tool_entry["error_kind"] = tool_error_kind(result_text)
+        # 結果はループで同じ呼出しを繰り返したときの打ち切りに使う (f_03 §4.2.1)
+        self._repeated_result(tool_name, tool_args, result_text)
 
         if on_step:
             await call_callback(on_step, {
@@ -226,6 +428,26 @@ class _FastPathMixin:
                     "status": "failed",
                 })
             return f"Error: {content}", []
+
+        if rejection == ALREADY_WRITTEN:
+            text, entry = self._already_saved_entry(file_path, content)
+            if on_step:
+                await call_callback(on_step, {
+                    "type": "tool_call",
+                    "detail": f"{prefix} write_file: {text[:100]}",
+                    "status": "done",
+                })
+            return text, [entry]
+
+        if rejection == "insufficient_source":
+            # 素材に書く内容が無いと生成側が答えた。何が足りないかを利用者へ (書かない)
+            missing = (getattr(self, "_insufficient_source_missing", None) or {}).get(
+                _turn_path_key(file_path), "",
+            )
+            task.failure_note = msg(
+                "agent.write_insufficient_source", path=file_path,
+                missing=missing or msg("agent.write_rejection.insufficient_source"),
+            )
 
         if rejection:
             logger.warning(
@@ -326,37 +548,62 @@ class _FastPathMixin:
             )
             return "", "existing_unreadable"
 
+        # 前のタスクの取得が素材を 1 件も返さなかった (0 件・エラー) なら、本文を
+        # 生成しない。素材の無い生成は依頼文から本文を作話する — 「TODO を探して
+        # 該当行を保存して」で、存在しない TODO 行がファイルに書かれ done で
+        # 終わった (2026-10-04 ライブ監査 run20、不変則 #15、f_03 §4.2.1)。
+        # 上の決定論の素材 (引用・直前の応答) は依頼と会話に在るので先に通す。
+        if (
+            getattr(self, "_earlier_retrieval_attempted", False)
+            and not self._has_source_material(original_query, file_path)
+        ):
+            logger.warning(
+                "Write: refusing to generate content because this turn's "
+                "retrieval returned no data: %s", file_path,
+            )
+            return "", "no_source_data"
+
         if notify_generating:
             await notify_generating()
 
         # 4. 生成 (棄却されたら 1 度だけ再生成)。追記では生成物は追記分だけ。
-        compare_with = "" if append else existing
-        try:
-            content = await self._generate_content(
+        # 無変更の検査はターン開始時の内容と比べる (このターンの自分の書込みと比べない)。
+        compare_with = "" if append else self._turn_write_baseline(file_path, existing)
+        async def _generate(retry_hint: str = "") -> str:
+            return await self._generate_content(
                 original_query, task_description, llm_client, file_path=file_path,
-                existing=existing, append=append,
+                existing=existing, append=append, retry_hint=retry_hint,
             )
-        except ExistingContentRefused as refusal:
-            return "", refusal.code
-        content, rejection = self._validate_generated_content(
-            content, file_path, original_query, existing_content=compare_with,
-        )
-        if rejection and not content.startswith("(Content generation failed:"):
-            logger.warning(
-                "Write: generated content rejected (%s), retrying content "
-                "generation: %r", rejection, content[:120],
-            )
-            content = await self._generate_content(
-                original_query, task_description, llm_client,
-                file_path=file_path, existing=existing, append=append,
-                retry_hint=(
-                    _UNCHANGED_EDIT_RETRY_HINT.format(instruction=original_query)
-                    if rejection == "edit_without_change" else ""
-                ),
-            )
+
+        try:
+            content = await _generate()
             content, rejection = self._validate_generated_content(
                 content, file_path, original_query, existing_content=compare_with,
             )
+            if not append and self._written_this_turn(file_path, content):
+                # このターンに同じ本文を書き済み — 再生成も書込みもしない
+                return content, ALREADY_WRITTEN
+            if rejection and not content.startswith("(Content generation failed:"):
+                logger.warning(
+                    "Write: generated content rejected (%s), retrying content "
+                    "generation: %r", rejection, content[:120],
+                )
+                content = await _generate(
+                    _UNCHANGED_EDIT_RETRY_HINT.format(instruction=original_query)
+                    if rejection == "edit_without_change" else "",
+                )
+                content, rejection = self._validate_generated_content(
+                    content, file_path, original_query, existing_content=compare_with,
+                )
+        except InsufficientSourceRefused as refusal:
+            # 素材に書く内容が無いと生成側が答えた (何が足りないかを控えて書かない)
+            missing = getattr(self, "_insufficient_source_missing", None)
+            if missing is None:
+                missing = self._insufficient_source_missing = {}
+            missing[_turn_path_key(file_path)] = refusal.missing
+            return "", refusal.code
+        except ExistingContentRefused as refusal:
+            return "", refusal.code
 
         # 5. 救済: 生成が失敗と確定した後に限り、緩い引用抽出で本文を拾う。
         #    誤爆リスクは「既に生成が棄却されている」状態に閉じ込めてある。
@@ -454,14 +701,16 @@ class _FastPathMixin:
             return mode_error, [{
                 "tool": "write_file", "args": tool_args, "success": False,
             }]
+        await self._note_turn_write_start(file_path)
         try:
             result_text = await execute_tool_with_timeout(
                 tools_registry, "write_file", tool_args,
             )
             is_success = not is_tool_error(result_text)
-            if WRITE_DENIED_RE.match(result_text):
+            if WRITE_DENIED_RE.match(result_text) and content not in result_text:
                 # 書込みゲートが断った (docs/f_03 §4.y)。生成した本文は捨てずに
-                # 結果へ添え、最終応答が断りの理由と一緒に見せる。
+                # 結果へ添え、最終応答が断りの理由と一緒に見せる (上書きの門の
+                # 断りはレジストリが添え済みなので 2 度添えない)。
                 result_text = f"{result_text}\n\n{content}"
             if is_success:
                 verify_error = self._verify_written_file(file_path, content)
@@ -477,6 +726,8 @@ class _FastPathMixin:
                         "write_file post-verification failed: %s (%s)",
                         file_path, verify_error,
                     )
+                else:
+                    self._note_turn_write_done(file_path, content)
         except Exception as e:
             result_text = f"Error: {e}"
             is_success = False
@@ -590,7 +841,7 @@ class _FastPathMixin:
                 if not defer:
                     validated, rejection = self._validate_generated_content(
                         candidate, file_path, original_query,
-                        existing_content=loaded or "",
+                        existing_content=self._turn_write_baseline(file_path, loaded or ""),
                     )
                     if not rejection:
                         content = validated
@@ -617,12 +868,16 @@ class _FastPathMixin:
             if content.startswith("(Content generation failed:"):
                 logger.warning("Auto-recovery content generation failed: %s", file_path)
                 return None
-            if rejection:
+            if rejection and rejection != ALREADY_WRITTEN:
                 logger.warning(
                     "Auto-recovery: generated content rejected (%s), aborting: %r",
                     rejection, content[:120],
                 )
                 return None
+
+        if self._written_this_turn(file_path, content):
+            text, entry = self._already_saved_entry(file_path, content)
+            return {**entry, "result": text}
 
         if on_step:
             await call_callback(on_step, {
@@ -634,11 +889,14 @@ class _FastPathMixin:
         tool_args = {"file_path": file_path, "content": content}
         if tool_mode_error(tools_registry, "write_file", self._mode) is not None:
             return None
+        await self._note_turn_write_start(file_path)
         try:
             result_text = await execute_tool_with_timeout(
                 tools_registry, "write_file", tool_args,
             )
             is_success = not is_tool_error(result_text)
+            if is_success:
+                self._note_turn_write_done(file_path, content)
             logger.info("Auto-recovery write_file: %s → %s", file_path, result_text[:100])
 
             if on_step:

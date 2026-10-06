@@ -56,6 +56,7 @@ from backend.free.generation.strategy_common import (
     build_seeded_plan,
     generate_seeded_plan_json,
     resolve_generation_order,
+    unit_target_chars,
 )
 from backend.free.generation.strategy_recurrent import RecurrentStrategy
 from backend.free.generation.text_fabrication import find_unit_issues
@@ -1218,6 +1219,12 @@ class LongFormOrchestrator:
         rolling = self._init_rolling_context(
             plan, budget, content_type, existing_content, brief=brief or "",
         )
+        # 見出し・タイトル・区切りの文字数を unit の目標文字数の配分から引かせる
+        # (長さの検証は見出し込みの全文を数える、2026-10-05 実機)。
+        plan.markup_chars = _plan_markup_chars(
+            plan, content_type, long_form_mode,
+            self._target_format, rolling.has_existing_context,
+        )
 
         total_tokens = 0
         units_completed = 0
@@ -1249,6 +1256,32 @@ class LongFormOrchestrator:
                         "status": "done",
                     })
                 break
+
+            # 最後の unit (結び) の前に、分量の不足を本文の最後の unit の続きとして
+            # 埋める。結びの後で足すと「おわりに」の後ろに本文が続き、流した本文の
+            # 順番も入れ替えられない (f_08 §4.3)。結びの分 (目標文字数の配分) を
+            # 見込んで足りない分だけ足し、結びの後もなお足りなければ下の追加生成が拾う。
+            if (
+                i == len(plan.units) - 1 and i > 0
+                and content_type == ContentType.TEXT
+                and long_form_mode != LongFormMode.SPLIT
+                and isinstance(unit, SectionPlan)
+                and len(rolling.generated_units) == i
+            ):
+                async for token in self._extend_to_target(
+                    rolling, instruction, content_type, on_step,
+                    reserve_chars=unit_target_chars(unit, plan), into_last_unit=True,
+                ):
+                    total_tokens += 1
+                    yield token
+                # 追加生成で総時間を使い切ったら結びを書かずに打ち切る (上の境界の判定と同じ)
+                if total_timeout and (time.monotonic() - t_start) > total_timeout:
+                    timed_out = True
+                    logger.warning(
+                        "long_form: total budget %.0fs exceeded after the top-up before "
+                        "the last unit; stopping with partial result", total_timeout,
+                    )
+                    break
 
             label = unit.name if isinstance(unit, CodeUnit) else unit.heading
             if on_step:
@@ -1726,6 +1759,9 @@ class LongFormOrchestrator:
         instruction: str,
         content_type: ContentType,
         on_step: Callable[[dict], Any] | None,
+        *,
+        reserve_chars: int = 0,
+        into_last_unit: bool = False,
     ) -> AsyncIterator[str]:
         """目標文字数に到達するまで追加生成を繰り返す
 
@@ -1735,6 +1771,11 @@ class LongFormOrchestrator:
         戦略の generate_unit は複雑なプロンプトを構築するため
         ローカルLLMが短い応答しか返さない傾向がある。
         この方法では最小限のプロンプトで確実に生成量を確保する。
+
+        ``reserve_chars`` はまだ書いていない unit (結び) の見込みの文字数で、閾値から
+        引く。``into_last_unit`` なら続きを新しい unit にせず直前の unit の末尾へ
+        連ねる — 結びの前で呼ぶとき、``plan.units`` と ``generated_units`` の位置の
+        対応 (改稿・固定文の検査が使う) を崩さない。
         """
         target_chars = extract_target_chars(instruction, default=0)
         if target_chars <= 0 or content_type != ContentType.TEXT:
@@ -1742,7 +1783,7 @@ class LongFormOrchestrator:
 
         total_chars = sum(len(t) for t in rolling.generated_units)
         extend_ratio = self._lf_policy("extend_threshold_ratio", "chat", 0.7)
-        threshold = int(target_chars * extend_ratio)
+        threshold = int(target_chars * extend_ratio) - max(reserve_chars, 0)
         max_rounds = self._lf_policy(
             "max_extend_rounds", "chat",
             self.config.get("long_form", {}).get("max_extend_rounds", 10),
@@ -1751,7 +1792,9 @@ class LongFormOrchestrator:
         extend_count = 0
         while total_chars < threshold and extend_count < max_rounds:
             extend_count += 1
-            remaining = target_chars - total_chars
+            # 結びの前で呼ぶときは、結びの見込みの分を頼む量から引く (引かないと結びの
+            # 分が二重に乗り、目標の 1.25〜1.4 倍になって長さの検証を超えうる)。
+            remaining = max(target_chars - max(reserve_chars, 0) - total_chars, 0)
             tail = self._get_extend_tail(rolling)
 
             if on_step:
@@ -1779,7 +1822,10 @@ class LongFormOrchestrator:
                 )
                 break
 
-            rolling.generated_units.append(ext_text)
+            if into_last_unit and rolling.generated_units:
+                rolling.generated_units[-1] += "\n\n" + ext_text
+            else:
+                rolling.generated_units.append(ext_text)
             rolling.short_term = self._fit_short_term(ext_text)
             total_chars += len(ext_text)
 
@@ -1926,6 +1972,31 @@ def _document_title_markdown(
     if not title:
         return ""
     return f"# {title}\n\n"
+
+
+def _plan_markup_chars(
+    plan: Any,
+    content_type: ContentType,
+    long_form_mode: LongFormMode,
+    target_format: str,
+    has_existing_context: bool,
+) -> int:
+    """orchestrator が本文の外に足す文字数を返す (純粋関数)。
+
+    unit の見出し (:func:`_unit_heading_markdown`)、文書タイトル
+    (:func:`_document_title_markdown`)、検証が unit を連結する区切り
+    (空行 2 文字 × (unit 数 - 1)) の合計。TEXT 以外は 0。
+    """
+    if content_type != ContentType.TEXT or not plan.units:
+        return 0
+    title = _document_title_markdown(
+        plan, content_type, long_form_mode, target_format, has_existing_context,
+    )
+    headings = sum(
+        len(_unit_heading_markdown(u, plan, content_type, long_form_mode))
+        for u in plan.units
+    )
+    return len(title) + headings + 2 * (len(plan.units) - 1)
 
 
 def _chunk_evenly(items: list[str], n: int) -> list[list[str]]:

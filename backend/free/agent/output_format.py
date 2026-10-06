@@ -239,6 +239,27 @@ PRODUCTION_WROTE_RE = re.compile(
 )
 
 
+def written_paths(text: str) -> list[str]:
+    """書込み結果テキストから書込み先パスを重複なく、現れた順に取り出す (純粋関数)。
+
+    ``Written N bytes to X`` と制作ステージの 1 行 (``Wrote N file(s) via production
+    stage: a, b``) を読む。最終応答の組み立てと ``chat_stream_meta`` の要約が共有する。
+    書込みゲートの断りの結果 (本文が添えてある) は何も書いていないので空 (f_03 §4.y)。
+    """
+    from backend.free.agent.write_gate import WRITE_DENIED_RE
+
+    if WRITE_DENIED_RE.match(text or ""):
+        return []
+    found = [m.group(1).strip() for m in WRITTEN_PATH_RE.finditer(text or "")]
+    for match in PRODUCTION_WROTE_RE.finditer(text or ""):
+        found += [p.strip() for p in (match.group("paths") or "").split(", ")]
+    paths: list[str] = []
+    for path in found:
+        if path and path not in paths:
+            paths.append(path)
+    return paths
+
+
 def anchor_relative_output_path(file_path: str) -> str:
     """錨の無い相対パスを既定の出力先 (``local_paths.outputs_dir``) へ寄せる。
 

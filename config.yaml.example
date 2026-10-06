@@ -429,6 +429,12 @@ rag:
     max_chunk_chars: 1200        # 生成プロンプトへ渡す本文の上限文字数
     gate_min_coverage: 0.5       # 疑似クエリの関連性ゲート (拒否) を有効にする充足率 (較正済みの棒は充足率に依らず使う)
     quiet_seconds: 60            # チャットが終わってからこの秒数は生成を始めない (静穏窓)
+  # --- 問い分解の影 (f_01 §8.1 の 7.9) ---
+  # 構文で 2 つに割れる問い (問い符で終わる節が 2 つ / 並列の「と」) を分解の項ごとに検索し、
+  # 元の問いの採用で空いた枠に入る id を decision.jsonl に記録するだけ (応答は変えない)。
+  # shadow では発火したターンに埋め込み +2 回と統合検索 +2 回が応答と並走する。
+  query_decompose:
+    mode: "off"                  # off / shadow
   # --- code グラフ (c_16 §4.4) ---
   # 既存プロジェクトの構造 (file/class/function ノードと contains/imports/calls/inherits 辺) を
   # tree-sitter の決定論抽出で corpus の 1 パッケージとして持つ。書き手は sleep-time Full の
@@ -581,8 +587,8 @@ rag:
       max_per_query: 1            # 1 クエリ内の LLM 判定発火上限 (0 以下で無制限)
 
   # --- 再順位段 (リランカー、c_16 §7.2.1) ---
-  # mode: on で、関連度の床を通った文書 (corpus) の候補を上位 N 件だけ並べ替える
-  # (記憶 (episodic) は並べ替えない。ゲートは cosine のまま)。モデルは model_paths.rerank_model (例:
+  # mode: on で、関連度の床を通った文書 (corpus) と記憶 (episodic) の候補を上位 N 件だけ
+  # ストアごとに並べ替える (ゲートは cosine のまま)。モデルは model_paths.rerank_model (例:
   # japanese-bge-reranker-v2-m3-v1-q8_0.gguf)。既定は on。ただし model_paths.rerank_model のファイルが
   # 無ければ起動しない (並べ替えず cosine 順のまま。モデルは利用者が models/ に置く)。
   # 自己テストは PC が変わったとき (指紋: ホスト名・CPU・コア数・メモリ・GPU 名) だけ
@@ -596,7 +602,7 @@ rag:
     port: 8083                    # rerank 用 llama-server のポート
     gpu_layers: auto              # auto: GPU の空きがモデル + 約 1GB あれば GPU (-ngl 999 -fa on)、無ければ CPU (-ngl 0)。整数なら -ngl
     deadline_ms: 1000             # 1 回の rerank 呼出の締切 (ミリ秒)。超えたら cosine 順のまま
-    max_candidates: 20            # 1 回に並べ替える候補数の上限 (実際の候補数は自己テストの速度で決める)
+    max_candidates: 12            # 1 回に並べ替える候補数の上限 (実際に送る量はこれと自己テストの速度から決まるトークン予算の早い方)
     min_candidates: 3             # 締切に収まる候補数がこれ未満なら無効 (too_slow)
     threads: 0                    # -t (0 = 自動: GPU 配置は 2、CPU 配置は環境調整が決めた物理コアの 1/4 (下限 1)。物理コア数が推定値なら付けない)
 
@@ -1049,6 +1055,7 @@ prompt:
   adoption_min_cases: 3            # 進化・採用に要する評価ケースの最小数 (未満なら進化自体をスキップ)
   adoption_sample_cases: 3         # 一対比較ゲートで成功ターンから足す標本ケース数 (0 = 失敗ケースだけ)
   adoption_min_net_wins: 2         # 一対比較ゲートで採用に要する (候補の勝ち − 現行の勝ち) の最小値
+  answer_conditions: "off"         # 資料を載せたターンで問いの条件 (限定語・期間・単位・対象) を逐語で抜いて注記する (off | on、on で補助タスクを 1 回撃つ。f_03 §7.1.1)
 
 # ===== エージェント設定 =====
 agent:
@@ -1071,6 +1078,16 @@ agent:
   # 落ちた瞬間に記憶へ一度も到達しなかった。重いのは検索であって注入ではない
   # (注入に要るのはクエリ埋め込み 1 回だけ)。false で従来どおり記憶なし。
   reactive_light_memory_enabled: true
+  # reactive に振られた短文でも、挨拶の即答が外れたら検索を投機し、資料 (corpus) の
+  # チャンクが floor / 疑似クエリのゲートを通れば deliberative へ上げる。
+  # on (既定) = 昇格し、投機した検索 (再順位込み) を deliberative がそのまま使う。採否は
+  #   再順位の前に決まる「採用される corpus の有無」で決め、待つのは最大 0.3 秒。
+  # shadow = 判定は変えず decision.jsonl に記録。decision.jsonl が書かれる起動
+  #   (--develop=investigate / evolve) でだけ検索し、注入に使わないので再順位段は省く。
+  #   通常起動の shadow は off と同じ (検索しない)。
+  # off = 検索しない (従来の軽量パス)。昇格を止めたいときは off (または shadow) に戻す。
+  # on / off は引用符無しでもよい (YAML の真偽値は文字列へ戻して読む)。
+  reactive_evidence_escalation: "on"
   # deliberative のツール実行ホップ上限 (1 = 従来どおり 1 ターン 1 ツール)。
   # 2 手目は読み取り専用・1 手目とは別ツール・引数必須に限る。判定材料には
   # ツールの出力本文を渡さない (ファイルの中身に書かれたパスが実行に化けるのを防ぐ)。
@@ -1116,11 +1133,12 @@ tools:
   url_recall_min_record_score: 0.6    # 引き当てに必要な過去採点平均の閾値
   url_recall_record_history_size: 10  # 1 URL fact あたり保持する採点履歴件数
   url_recall_ttl_days: 30             # 最終 fetch から N 日経過で score を半減 (0=TTL 無効)
-  # ── executable command リコール ──
-  # 過去成功した run_command を新規の類似クエリで再利用する。
-  # 書込は sleep-time の executable_command_curator (tool_command_success を記録)、
-  # 引き当ては ToolCallJudge が embedding 類似度 + 過去成功率で決定論的に行う。
-  executable_command_recall_enabled: true            # executable command リコールの有効/無効
+  # ── executable command リコール (create の shadow) ──
+  # create で分類器が決めた run_command を sleep-time の executable_command_curator が
+  # 記録し、ToolCallJudge が類似クエリで引き当てを **評価だけ** する。判定は変えず、
+  # 当たったか・最終判定と一致したかを decision ログ (executable_command_recall_shadow)
+  # に残す。chat は常に読まず記録もしない (この設定に関わらず)。
+  executable_command_recall_enabled: true            # create の shadow 評価と記録の有効/無効
   executable_command_recall_topk: 5                  # 引き当て時に走査する近傍ファクト数
   executable_command_recall_min_score: 0.7           # 引き当てに必要なクエリ embedding 類似度閾値
   executable_command_recall_min_record_score: 0.6    # 引き当てに必要な過去成功率の閾値

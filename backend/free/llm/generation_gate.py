@@ -31,8 +31,8 @@ dispatch 後に始まったチャットは、背景の 1 生成 (実測で最長
 (部分状態は書き戻さない: 生成結果を受け取らないだけ)。
 """
 
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import TypeVar
 import asyncio
@@ -57,6 +57,9 @@ __all__ = [
     "wait_for_idle",
     "wait_for_chat_request",
     "gate_stream",
+    "run_to_completion",
+    "preemption_suspended",
+    "claim_run_to_completion",
 ]
 
 #: チャット生成の入れ子カウント。ツール実行→再生成のように 1 ターンで複数回
@@ -358,6 +361,80 @@ async def run_yielding_to_chat(
                 if not task.done():
                     task.cancel()
     raise AssertionError("unreachable")  # pragma: no cover
+
+
+class _CompletionBudget:
+    """:func:`run_to_completion` の区間が持つ「打ち切らせない生成」の残り回数。
+
+    区間を開いたタスク (``owner``) でだけ効く。contextvar はタスク生成時に
+    コピーされるので、区間内で作った子タスクにも見えてしまう — 持ち主を照合して
+    子タスクの背景生成まで打ち切り対象外に広がらないようにする。
+    """
+
+    __slots__ = ("owner", "remaining")
+
+    def __init__(self, calls: int, owner: object | None) -> None:
+        self.remaining = max(0, int(calls))
+        self.owner = owner
+
+
+def _current_task() -> object | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+#: この区間で出す背景 aux を、dispatch 後はチャット要求の到着で打ち切らない (回数つき)。
+_no_preempt: ContextVar[_CompletionBudget | None] = ContextVar(
+    "evoref_aux_run_to_completion", default=None,
+)
+
+
+@contextmanager
+def run_to_completion(max_calls: int) -> Iterator[None]:
+    """区間内の背景 aux の先頭 ``max_calls`` 回を「出したら最後まで走らせる」にする。
+
+    打ち切り (:func:`wait_for_chat_request`) は 1 生成ごとにはチャットを守るが、
+    ターンの間隔が背景の 1 生成より短い連続利用では、同じ候補が毎回打ち切られて
+    **永久に終わらない** (2026-10-05 実機: 訂正の検証が同じ最古の候補で 4 回
+    打ち切られ、45 分後の別セッションが訂正前の誕生日を答えた)。
+
+    打ち切らせないのは **アイドル窓で出せた生成だけ** で、判定は ``AuxClient``
+    が dispatch の直前に行う (:func:`claim_run_to_completion`): アイドル待ちが
+    上限で諦めた / スロットのロック待ちの間にチャット要求が届いた / dispatch 時に
+    チャットが在圏 のどれかなら、その生成は従来どおり打ち切り対象のまま (回数も
+    消費しない)。チャットと重なるのは、出した後に届いたターンとの 1 生成ずつに限る。
+    スロットは変えない (背景スロットのまま、CLAUDE.md §6 #1)。
+    """
+    token = _no_preempt.set(_CompletionBudget(max_calls, _current_task()))
+    try:
+        yield
+    finally:
+        _no_preempt.reset(token)
+
+
+def _live_budget() -> _CompletionBudget | None:
+    budget = _no_preempt.get()
+    if budget is None or budget.remaining <= 0:
+        return None
+    if budget.owner is not _current_task():
+        return None
+    return budget
+
+
+def preemption_suspended() -> bool:
+    """このタスクで :func:`run_to_completion` の残り回数があるか。"""
+    return _live_budget() is not None
+
+
+def claim_run_to_completion() -> bool:
+    """残り回数を 1 つ使って「この生成は打ち切らせない」とする (無ければ ``False``)。"""
+    budget = _live_budget()
+    if budget is None:
+        return False
+    budget.remaining -= 1
+    return True
 
 
 def gate_stream(agen: AsyncIterator[str]) -> AsyncIterator[str]:

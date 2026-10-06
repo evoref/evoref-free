@@ -231,7 +231,13 @@ def epoch_to_utc(epoch: float | int | None) -> str | None:
         value = float(epoch)
         if not value > 0.0:
             return None
-        return format_utc(_EPOCH_ZERO + timedelta(microseconds=math.floor(value * 1_000_000)))
+        # ``floor(value * 1e6)`` は float の積が整数へ切り上がると元を超え (約 0.6%)、
+        # 有理数で厳密に切り捨てると μs で書かれた値を 1µs 削る。読み戻しと同じ
+        # ``micros / 1e6`` で比べ、元を超えるときだけ 1µs 下げる。
+        micros = round(value * 1_000_000)
+        if micros / 1_000_000 > value:
+            micros -= 1
+        return format_utc(_EPOCH_ZERO + timedelta(microseconds=micros))
     except (OverflowError, OSError, ValueError):
         return None
 

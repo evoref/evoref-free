@@ -111,6 +111,8 @@ export interface ChatStreamEvent {
 	error?: string;
 	/** 構造化エラー (`error_with_code`) のコード。`E0409` は制作中で受け付けなかったターン */
 	error_code?: string;
+	/** 同じ入力での再試行が見込めるか (構造化エラーのみ。無ければ不明) */
+	retryable?: boolean;
 	/** 構造化エラーの付帯情報 (`E0409` なら走っている側の `session_id` / `run_id`) */
 	error_context?: Record<string, unknown>;
 	/** 応答元レイヤー (ストリーム冒頭で 1 度) */
@@ -276,11 +278,16 @@ export function toChatStreamEvent(parsed: Record<string, unknown>): ChatStreamEv
 					? err
 					: String((err as { message?: string } | undefined)?.message ?? 'error');
 			if (err && typeof err === 'object') {
-				const { code, context } = err as { code?: unknown; context?: unknown };
+				const { code, context, retryable } = err as {
+					code?: unknown;
+					context?: unknown;
+					retryable?: unknown;
+				};
 				return {
 					type: 'error',
 					error: message,
 					error_code: typeof code === 'string' ? code : undefined,
+					retryable: typeof retryable === 'boolean' ? retryable : undefined,
 					error_context:
 						context && typeof context === 'object'
 							? (context as Record<string, unknown>)

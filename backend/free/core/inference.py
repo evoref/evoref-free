@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 from backend.free.api.chat.chat_constants import (
@@ -14,14 +14,14 @@ from backend.free.api.chat.chat_types import ChatMessage
 from backend.free.core.intent_vocab import (
     asks_user_profile_summary,
     is_plain_statement,
+    needs_current_datetime,
     refers_to_previous_output,
 )
-from backend.free.core.prompt_blocks import current_datetime_block
-from backend.free.core.response_dates import ISO_DATE_RE, JP_DATE_RE
-from backend.free.core.relative_date import (
-    DAY_OFFSETS as _DAY_OFFSETS,
-    WEEK_OFFSETS as _WEEK_OFFSETS,
+from backend.free.core.persona_question import (
+    persona_question_rule,
+    persona_question_verdict,
 )
+from backend.free.core.prompt_blocks import current_datetime_block
 from backend.free.core.text_quality import (
     carries_no_assertion,
     detect_lang,
@@ -268,61 +268,75 @@ def _output_form_note(history: list[ChatMessage]) -> str:
     return "\n".join(notes)
 
 
-#: 日付の解釈を要するクエリのシグナル。明示日付と相対表現の双方を拾う。
-#: 相対語彙は ``core.relative_date`` (解決の SSOT) から導く。手書きで複製して
-#: いたため「あさって」「らいしゅう」等のかな表記が漏れ、接地注記
-#: (``chat_service._append_relative_date_grounding``) とは別の集合になっていた。
-_RELATIVE_DATE_WORDS = "|".join(
-    re.escape(w) for w in sorted(
-        set(_DAY_OFFSETS) | set(_WEEK_OFFSETS), key=len, reverse=True,
-    )
-)
-#: 明示日付 (和文の月日 / ISO) の読み取りは ``core.response_dates`` が SSOT
-#: (``_has_date_signal``)。ここは相対表現だけを持つ。
-_DATE_CONTEXT_RE = re.compile(
-    _RELATIVE_DATE_WORDS +
-    r"|今月|来月|先月|今年|来年|去年|昨年|何日後|何日前|日後|日前|何曜日"
-    r"|\d\s*(?:週間|か月|ヶ月|カ月|ヵ月|年)\s*(?:後|前)"
-    r"|(?<![A-Za-z])(?:today|tomorrow|yesterday|this\s+(?:week|month|year))"
-    r"(?![A-Za-z])",
-)
+#: :func:`_answer_conditions_note` の本文 (locale 別)。
+_ANSWER_CONDITIONS_NOTES: dict[str, str] = {
+    "ja": (
+        "満たすべき条件 (問いの文言から): {spans}。"
+        "答える対象・期間・単位・時点がこれらの条件をすべて満たすことを、"
+        "資料の記述で確かめてから答えること。"
+    ),
+    "en": (
+        "Conditions the answer must meet (quoted from the question): {spans}. "
+        "Before answering, check against the material that the entity, period, "
+        "unit and point in time you answer with satisfy all of them."
+    ),
+}
 
 
-def _has_date_signal(text: str) -> bool:
-    """明示日付か相対表現を含むか (純粋関数)。"""
-    return bool(
-        JP_DATE_RE.search(text) or ISO_DATE_RE.search(text)
-        or _DATE_CONTEXT_RE.search(text)
-    )
+def _answer_conditions_note(spans: Sequence[str]) -> str:
+    """問いの条件 (判定点 ``answer_conditions`` が逐語の門を通した span) の注記。
+
+    条件を付け足すだけで、資料の証拠を置き換えない (#15)。span は発話からの逐語の
+    抜き出しなので、言い換えた条件は来ない (``core.answer_conditions``)。
+
+    Returns:
+        注記文字列。span が無ければ空文字列 (純粋関数)。
+    """
+    spans = [s for s in spans if s]
+    if not spans:
+        return ""
+    if prompt_locale() == "en":
+        joined = ", ".join(f'"{s}"' for s in spans)
+    else:
+        joined = "".join(f"「{s}」" for s in spans)
+    return _localized(_ANSWER_CONDITIONS_NOTES).format(spans=joined)
 
 
 def _current_date_note(history: list[ChatMessage]) -> str:
-    """日付解釈が要るクエリに、現在日付を基準として与える注記を返す。
+    """現在日時が要りうるクエリに、現在日時 (日付・曜日・時刻・UTC オフセット) を
+    事実として与える注記を返す。
 
     通常のチャット経路 (reactive / deliberative) には現在日付がまったく
     入っておらず、モデルは述べられた日付が過去か未来かを判断できない
     (実インシデント 2026-07-29 ライブ監査:「2026年7月28日の東京の天気を
     教えてください。」に対し、実際には前日であるその日付を
     「現在の日付であるため、未来の天気に関するデータが存在しません」と
-    二重に取り違えた)。``meta_cognitive._generate_content`` には同等の注入が
-    あるが、チャット応答パスには無かった。
+    二重に取り違えた)。
 
-    毎ターン付けるとトークンを浪費するため、日付シグナルを含むクエリに限る。
-    内部時刻不変則に従い ``utc_now_dt()`` を使う (純粋関数ではない)。
+    **現在日時はこの注記だけで渡す** (2026-10-03、不変則 #15)。以前は「今何時?」
+    「今日は何日?」をツール (現在日時だけを返すコマンド) が答え、注記は日付の
+    シグナルにだけ付いていた。ツールの判定は 75% が不要な問いに撃たれ、結果が
+    「唯一の事実根拠」枠で「特定できません」を後押しした。注記なら誤って付いても
+    害は 1 行に留まるので、発火条件は広い 1 本の判定
+    (``intent_vocab.needs_current_datetime``) に揃える。
+
+    位置は最後の user の動的ブロック (区切りの前) — **system には入れない**
+    (分単位で変わるので毎分 KV が全滅する)。内部時刻不変則に従い
+    ``utc_now_dt()`` を使う (純粋関数ではない)。
 
     Returns:
-        注記文字列。日付シグナルが無ければ空文字列。
+        注記文字列。現在日時が要らなければ空文字列。
     """
     last_user = next(
         (t for t in reversed(history) if t.get("role") == "user"), None,
     )
     if last_user is None:
         return ""
-    if not _has_date_signal(str(last_user.get("content") or "")):
+    if not needs_current_datetime(str(last_user.get("content") or "")):
         return ""
     return current_datetime_block(
         "「今日」「明日」等の相対表現の解釈と、文中の日付が過去か未来かの"
-        "判断は、この日付を基準に行うこと。",
+        "判断は、この日時を基準に行うこと。",
     )
 
 
@@ -422,35 +436,6 @@ def _excerpt(text: str, limit: int = _CORRECTION_TARGET_EXCERPT) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
-#: アシスタント自身の好み・感情・体験を尋ねる質問のシグナル。
-#: 主語が相手 (あなた / 君 / you) であることと、感情・嗜好語の共起を要求する。
-_PERSONA_SUBJECT_RE = re.compile(
-    r"あなた|君は|きみは|(?<![A-Za-z])(?:you|your)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-_PERSONA_TOPIC_RE = re.compile(
-    r"好き|嫌い|好み|嬉し|うれし|悲し|楽し|寂し|感情|気持ち|心|感じ(?:ます|る|て)"
-    r"|どう思(?:い|う)|意見|性格|人格|内面"
-    # 雑談での嗜好の訊き方。「猫派？犬派？」「コーヒー派？紅茶派？」
-    # 「最近ハマってるものある？」は日常的だが、どれも従来の語彙に無かった。
-    r"|[^\s、。]派\b|[^\s、。]派[？?]|ハマ(?:って|る|った)"
-    r"|(?<![A-Za-z])(?:feel|feelings|emotion|emotions|favou?rite|enjoy|prefer"
-    r"|like\s+best|opinion|personality)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-#: 一人称の主語。これがある文は「ユーザー自身について」述べている。
-_FIRST_PERSON_RE = re.compile(
-    r"私|僕|俺|自分|うち|(?<![A-Za-z])(?:i|me|my|mine)(?![A-Za-z])",
-    re.IGNORECASE,
-)
-#: 文の切れ目 (人格質問の判定を文単位で行うため)。
-_PERSONA_SENTENCE_RE = re.compile(r"[^。．.!！?？\n]+[。．.!！?？]?")
-#: 主語省略の文を「アシスタントへの問い」と見なすための疑問形。これが無いと
-#: 「今日は嬉しいことがありました」のような **ユーザー自身の報告** まで拾う。
-_PERSONA_QUESTION_TAIL_RE = re.compile(
-    r"[?？]\s*$"
-    r"|(?:です|ます|ました|でしょう|ません)か[。．.]?\s*$",
-)
 #: 「内面が無いのでは」と押し返す形。立場を保つ指示を追加する条件。
 _PERSONA_CHALLENGE_RE = re.compile(
     r"感情を持[たっ]|心が無い|心がない|内面が無い|内面がない"
@@ -461,48 +446,6 @@ _PERSONA_CHALLENGE_RE = re.compile(
     r"(?:feelings?|emotions?)",
     re.IGNORECASE,
 )
-
-
-def _is_persona_question(text: str) -> bool:
-    """自分自身の好み・感情を尋ねる質問か (純粋関数)。
-
-    日本語は二人称を省略するため、``あなた`` を必須にすると雑談での嗜好質問を
-    ほぼ取りこぼす。実インシデント (2026-08-16 ライブ監査):
-
-    - ターン3「最近ハマってる食べ物ってある？私は担々麺にハマってて、週2で食べてる。」
-      → 人格ノートが出ず「私はAIなので食べ物を味わうことはできませんが」と回答。
-      同じ会話のターン4「猫派？犬派？」には「私は猫派です」と人格的に答えており、
-      system プロンプトが禁じている **会話内での態度の不一致** そのものになった。
-    - ターン9「コーヒー派？紅茶派？私はコーヒーを1日3杯は飲んじゃう。」も同型。
-
-    判定は文単位。嗜好の話題を含む文が
-
-    - 二人称の主語を持つ (「あなたは何が好き？」)、または
-    - 主語を持たず、かつ疑問形である (「猫派？犬派？」「ハマってるものある？」)
-
-    ならアシスタントへの質問とみなす。一人称の主語を持つ文
-    (「私は猫派なんだけど」) はユーザー自身についての記述なので数えない。
-    主語省略の側で疑問形を要求しないと「今日は嬉しいことがありました」のような
-    ユーザー自身の報告まで拾う。
-
-    従来の「文章全体に二人称と話題があれば発火」も残す。主語と話題が別の文に
-    分かれる形 (「あなたはただのプログラムでしょう。気持ちなんて無いはずです」)
-    は文単位の判定では拾えないため。
-    """
-    if not text:
-        return False
-    if _PERSONA_SUBJECT_RE.search(text) and _PERSONA_TOPIC_RE.search(text):
-        return True
-    for raw in _PERSONA_SENTENCE_RE.findall(text):
-        sentence = raw.strip()
-        if not sentence or not _PERSONA_TOPIC_RE.search(sentence):
-            continue
-        if (
-            not _FIRST_PERSON_RE.search(sentence)
-            and _PERSONA_QUESTION_TAIL_RE.search(sentence)
-        ):
-            return True
-    return False
 
 
 #: 発話の言語が応答言語 (``i18n.prompt_locale``) と違うターンに付ける注記。
@@ -543,7 +486,7 @@ def _response_language_note(history: list[ChatMessage]) -> str:
     return _RESPONSE_LANGUAGE_NOTES.get(lang, "")
 
 
-def _persona_question_note(history: list[ChatMessage]) -> str:
+def _persona_question_note(history: list[ChatMessage], *, record: bool = False) -> str:
     """自分自身の好み・感情を尋ねる質問に、一貫した人物として答える指示を返す。
 
     同趣旨の制約は system プロンプトの PROTECTED セクションにもあるが、15 項目
@@ -554,8 +497,20 @@ def _persona_question_note(history: list[ChatMessage]) -> str:
     現在日付 / 文字数上限と同じく、該当ターンだけ生クエリ直後へ焦点化した
     1 ブロックとして置く。
 
+    判定点 ``persona_question`` (c_17 §3.20) の帯で注記を変える。発火 (1 つの文に
+    二人称の宛先と話題があり助言の形でない) は言い切りの注記、棄権 (主語の無い
+    疑問文 / 宛先と話題が別の文 / 宛先のある助言の形) は言い切らない注記 — 自分の
+    ことを尋ねているならそう答え、ユーザーのための選択肢・提案なら自分の体験と
+    して語らない、と両方の答え方を書く。棄権の帯に言い切りの注記を付けると、猫を飼っていると述べた
+    ユーザーの「週末に猫と一緒に楽しめることはありますか？」に「猫と一緒に
+    のんびりと読書をするのが好きです。」と答えた (2026-10-05 trace 99abfeaf22d6)。
+
+    Args:
+        record: 判定を ``decision.jsonl`` へ記録するか。ターンに 1 回だけ真にする
+            (``build_messages``)。meta 経路はタスクごとに呼ぶので記録しない。
+
     Returns:
-        注記文字列。人格質問でなければ空文字列 (純粋関数)。
+        注記文字列。人格質問でなければ空文字列。
     """
     last_user = next(
         (t for t in reversed(history) if t.get("role") == "user"), None,
@@ -563,9 +518,12 @@ def _persona_question_note(history: list[ChatMessage]) -> str:
     if last_user is None:
         return ""
     text = str(last_user.get("content") or "")
-    if not _is_persona_question(text):
+    verdict = persona_question_verdict(text) if record else persona_question_rule(text)
+    if verdict.band == "skip":
         return ""
-    note = _localized(_PERSONA_NOTES)
+    note = _localized(
+        _PERSONA_NOTES if verdict.band == "fire" else _PERSONA_UNADDRESSED_NOTES,
+    )
     if _PERSONA_CHALLENGE_RE.search(text):
         # 押し返されると直前までの立場を捨てて相手の枠組みに乗り換える
         # (実測 2026-07-29: 「嬉しくなります」と答えた次のターンで
@@ -591,6 +549,30 @@ _PERSONA_NOTES: dict[str, str] = {
         "Keep the same stance throughout the conversation. Limit yourself to "
         "preferences, attitudes, and their reasons; do not ground your answer "
         "in specific life events or a biography."
+    ),
+}
+#: 宛先が字句で読めない問い (判定点の棄権) の注記。言い切らず、両方の答え方を書く。
+#: 自分への問いの答え方を先に置き、「ユーザーが述べた事柄」へは誘導しない — 自分の
+#: 好みを述べた直後の嗜好の問い (「ハマってる食べ物ってある？私は担々麺に…」) を
+#: ユーザーの話へ倒すと、2026-08-16 の「私は AI なので」に戻る。例文は置かない — 言い切りの注記の例文 (「静かな朝が
+#: 好きです」) はそのまま転記された (2026-10-03 run10)。
+_PERSONA_UNADDRESSED_NOTES: dict[str, str] = {
+    "ja": (
+        "この質問には、誰について尋ねているかが書かれていない。"
+        "あなた自身が何を好むか・どう感じるか・どう考えるかを尋ねているなら、"
+        "一貫した一人の人物として自分の答えを述べ、必要なら理由を一言添え、"
+        "会話を通して同じ態度を保つこと。具体的な経歴や出来事は根拠にしないこと。"
+        "ユーザーのための選択肢・提案・助言を求めているなら、"
+        "ユーザーの状況に沿って答え、自分の体験や好みとして語らないこと。"
+    ),
+    "en": (
+        "This question does not say whom it is about. If it asks what you "
+        "yourself like, feel, or think, answer as one consistent person, adding "
+        "a brief reason if useful, and keep the same stance throughout the "
+        "conversation; do not ground your answer in specific life events or a "
+        "biography. If it asks for options, suggestions, or advice for the user, "
+        "answer for the user's situation and do not describe your own "
+        "experiences or preferences."
     ),
 }
 _PERSONA_CHALLENGE_NOTES: dict[str, str] = {
@@ -909,7 +891,7 @@ _FRAME_LINE_LABEL_RE = re.compile(
 #: 行末に付く訂正済み注記 (``search_pipeline._SUPERSEDED_MARKS`` の ja / en)。
 #: ``[参考情報]`` 側だけに付くため、剥がさないと ``[関連する記憶]`` 側と一致しない。
 _FRAME_TRAILING_MARK_RE = re.compile(
-    r"(?:\s*(?:（訂正済み）|\(superseded by a later correction\)))+\s*$",
+    r"(?:\s*(?:（後に訂正された古い値）|（訂正済み）|\(superseded by a later correction\)))+\s*$",
     re.IGNORECASE,
 )
 
@@ -1088,22 +1070,98 @@ def _rag_frame_overhead(n_candidates: int) -> int:
     return _RAG_ENTRY_FRAME_TOKENS * max(0, n_candidates)
 
 
+#: 出典の 1 節の上限 (文字)。長い見出しで枠が膨らまないよう節ごとに切る。
+_RAG_SOURCE_PART_CHARS = 24
+#: 出典の経路に並べる節の上限。超えたら先頭 (文書題) と末尾 (節) の間を ``…`` に畳む。
+_RAG_SOURCE_MAX_PARTS = 3
+#: 出典 1 行の上限 (トークン)。1 チャンクあたりの増分を 20〜40 トークンに抑える。
+_RAG_SOURCE_MAX_TOKENS = 32
+
+
+def format_rag_source_label(parts: list[str] | tuple[str, ...]) -> str:
+    """見出しの経路 (文書題 → 節) を ``[参考情報 N]`` の見出し行に添える 1 行にする (純粋関数)。
+
+    描画だけの装飾で、埋め込み・索引・チャンク id には入れない (f_01 §5 / §8.1)。
+    経路が空なら空文字列 (従来の表示のまま)。
+    """
+    cleaned = [" ".join(str(p).split()) for p in parts if str(p).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) > _RAG_SOURCE_MAX_PARTS:
+        cleaned = [cleaned[0], "…", cleaned[-1]]
+    limit = _RAG_SOURCE_PART_CHARS
+    while True:
+        label = " › ".join(
+            p if len(p) <= limit else p[: limit - 1] + "…" for p in cleaned
+        )
+        if _estimate_tokens(label) <= _RAG_SOURCE_MAX_TOKENS or limit <= 4:
+            return neutralize_frame_markers(label)
+        limit -= 2
+
+
+def _rag_source_labels(
+    entries: list[tuple[str, float, str]],
+    source_path: Callable[[str], list[str]] | None,
+) -> dict[str, str]:
+    """候補 id → 出典の 1 行。引けない id は載せない (従来の表示)。"""
+    if source_path is None:
+        return {}
+    labels: dict[str, str] = {}
+    for cid, _score, _text in entries:
+        if cid in labels:
+            continue
+        try:
+            label = format_rag_source_label(source_path(cid) or [])
+        except Exception as exc:  # noqa: BLE001 — 出典の装飾で応答を止めない
+            logger.debug("RAG source label skipped for %s: %s", cid, exc)
+            continue
+        if label:
+            labels[cid] = label
+    return labels
+
+
+def _rag_entry(index: int, text: str, label: str = "") -> str:
+    """``[参考情報 N]`` の 1 件 (出典があれば見出し行の後ろへ添える)。"""
+    head = f"{RAG_ENTRY_PREFIX} {index}]"
+    if label:
+        head = f"{head} {label}"
+    return f"{head}\n{neutralize_frame_markers(text)}"
+
+
 def _inject_rag_salience(
     rag_scored_chunks: list[tuple[str, float, str]],
     salience_ranker: SalienceRanker,
     remaining: int,
     total_rag: int,
+    *,
+    source_path: Callable[[str], list[str]] | None = None,
+    shown_ids: list[str] | None = None,
 ) -> tuple[str | None, int, int]:
-    """サリエンスランカーで RAG チャンクを選別し block を返す。"""
-    chunk_budget = remaining - _rag_frame_overhead(len(rag_scored_chunks))
-    ranked_texts = salience_ranker.rank(rag_scored_chunks, chunk_budget)
-    if not ranked_texts:
+    """サリエンスランカーで RAG チャンクを選別し block を返す。
+
+    ``shown_ids`` を渡すと、block に載せたチャンクの id を順に積む (f_01 §8.1 の 7.7)。
+    ``source_path`` は id → 見出しの経路で、引けた分だけ見出し行に出典を添える。
+    出典の分は枠と同じく候補全件ぶんを先に予算から引く (組み上げた block が
+    ``remaining`` を超えないため)。
+    """
+    labels = _rag_source_labels(rag_scored_chunks, source_path)
+    label_overhead = sum(
+        _estimate_tokens(" " + labels[cid])
+        for cid, _score, _text in rag_scored_chunks if cid in labels
+    )
+    chunk_budget = (
+        remaining - _rag_frame_overhead(len(rag_scored_chunks)) - label_overhead
+    )
+    ranked = salience_ranker.rank_entries(rag_scored_chunks, chunk_budget)
+    if not ranked:
         return None, remaining, 0
 
     selected_entries = [
-        f"{RAG_ENTRY_PREFIX} {i + 1}]\n{neutralize_frame_markers(text)}"
-        for i, text in enumerate(ranked_texts)
+        _rag_entry(i + 1, text, labels.get(cid, ""))
+        for i, (cid, _score, text) in enumerate(ranked)
     ]
+    if shown_ids is not None:
+        shown_ids.extend(cid for cid, _score, _text in ranked)
     rag_block = _format_rag_block(selected_entries)
     rag_block_tokens = _estimate_tokens(rag_block)
     remaining -= rag_block_tokens
@@ -1277,11 +1335,15 @@ def _select_rag_block(
     remaining: int,
     total_rag: int,
     current_query: str = "",
+    *,
+    source_path: Callable[[str], list[str]] | None = None,
+    shown_ids: list[str] | None = None,
 ) -> tuple[str | None, int, int]:
     """サリエンス経路 / フォールバック経路を選んで RAG block を返す。
 
     どちらの経路でも、載せる資格の判定 (:func:`_eligible_rag_indices`) は
-    ここで一度だけ掛ける。
+    ここで一度だけ掛ける。``source_path`` / ``shown_ids`` は id を持つ
+    サリエンス経路だけが使う (フォールバックは本文しか持たない)。
     """
     if remaining <= 0:
         return None, remaining, 0
@@ -1294,6 +1356,7 @@ def _select_rag_block(
             return None, remaining, 0
         return _inject_rag_salience(
             scored, salience_ranker, remaining, total_rag,
+            source_path=source_path, shown_ids=shown_ids,
         )
     if rag_chunks:
         filtered = [
@@ -1549,9 +1612,14 @@ class BuiltMessages(list):
             積む前に** 測った「渡した文字数」(末尾の ``...`` を除く)。切り詰めが
             無ければ ``None``。後付け注記の長さが混ざらない
             (:func:`latest_turn_truncation` が UI 表示に使う)。
+        shown_rag_ids: ``[参考情報]`` 枠に **実際に載せた** チャンクの id (載せた順)。
+            サリエンス経路 (id を持つ ``rag_scored_chunks``) を通ったときだけ
+            tuple で、資格判定・重複落とし・予算で落ちた分を含まない (空なら 1 件も
+            載らなかった)。id を持たない経路 (本文だけのフォールバック) は ``None``
+            (= 分からない。呼び手は採用集合のまま扱う、f_01 §8.1 の 7.7)。
     """
 
-    __slots__ = ("numeric_claims", "latest_kept_chars")
+    __slots__ = ("numeric_claims", "latest_kept_chars", "shown_rag_ids")
 
     def __init__(
         self,
@@ -1559,10 +1627,12 @@ class BuiltMessages(list):
         *,
         numeric_claims: dict[str, set[str]] | None = None,
         latest_kept_chars: int | None = None,
+        shown_rag_ids: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(items)
         self.numeric_claims: dict[str, set[str]] = numeric_claims or {}
         self.latest_kept_chars: int | None = latest_kept_chars
+        self.shown_rag_ids: tuple[str, ...] | None = shown_rag_ids
 
 
 #: ``post_append_reserve_tokens`` が残予算に占めてよい上限。小さな context_size
@@ -1608,6 +1678,9 @@ def build_messages(
     artifact_block: str | None = None,
     working_evict_block: int | None = None,
     post_append_reserve_tokens: int = 0,
+    persona_note: bool = True,
+    rag_source_path: Callable[[str], list[str]] | None = None,
+    answer_conditions: Sequence[str] = (),
 ) -> BuiltMessages:
     """
     messages リストを組み立て、トークン予算内に収める。
@@ -1617,6 +1690,10 @@ def build_messages(
     ``working_evict_block`` (``memory.working_evict_block``) は履歴を切り落とす
     ブロック幅の基準。``None`` ならロード済み config から読み、無ければ従来値
     (:data:`_HISTORY_DROP_BLOCK`) に落ちる。
+
+    ``persona_note`` は人格注記 (判定点 ``persona_question``) を評価して付けるか。
+    最後の user が利用者の発話でない経路 (継続パスの継続指示) は ``False`` にする —
+    判定点の記録が利用者の発話でない文で汚れ、注記も要らない。
 
     ``post_append_reserve_tokens`` は **本関数の後で** 最後の user メッセージへ
     積まれる分 (接地注記 / ツール実行結果 — ``turn_text`` のレイアウト契約の
@@ -1653,6 +1730,12 @@ def build_messages(
         rag_scored_chunks: スコア付き検索結果 [(chunk_id, score, text), ...]。
             salience_ranker と同時に指定した場合、rag_chunks より優先される。
         salience_ranker: BudgetMem 式サリエンスランカー。
+        rag_source_path: チャンク id → 見出しの経路 (文書題 → 節)。引けた分だけ
+            ``[参考情報 N]`` の見出し行に出典を添える (描画だけ、f_01 §8.1)。
+            ``None`` / 空の経路なら従来の表示。
+        answer_conditions: 問いの条件の span (判定点 ``answer_conditions`` が逐語の
+            門を通した分、``core.answer_conditions``)。**資料 (``[参考情報]`` /
+            添付ファイル) を載せたターンだけ** 生クエリの直後へ注記する。
         artifact_block: 直前ターンで生成した長文成果物 (:mod:`backend.free.
             api.chat._artifact`)。**動的ブロックの先頭**に置く — 質問が
             直接指している対象なので、few-shot や参考情報より優先する。
@@ -1727,6 +1810,7 @@ def build_messages(
     #    3 つとも別々に組み立てられるため、ここが唯一の合流点になる。
     #    数値言明は後段 (量の接地注記) も使うので一度だけ計算して戻り値に載せる。
     numeric_claims = history_numeric_claims(history)
+    rag_scored_input = bool(rag_scored_chunks)
     semmem_block, rag_chunks, rag_scored_chunks, fewshot_block = (
         _drop_superseded_context(
             history, semmem_block, rag_chunks, rag_scored_chunks, fewshot_block,
@@ -1797,9 +1881,14 @@ def build_messages(
         dyn_parts.append(semmem_part)
 
     # 3. RAG チャンク（サリエンス優先 → フォールバック）
+    # 載せた id は id を持つ経路でだけ分かる (入力の scored を 0. の落としより前で見る)。
+    shown_rag: list[str] | None = (
+        [] if salience_ranker is not None and rag_scored_input else None
+    )
     rag_block, dyn_budget, injected_rag = _select_rag_block(
         rag_chunks, rag_scored_chunks, salience_ranker, dyn_budget, total_rag,
         current_query=str(history[-1].get("content") or "") if history else "",
+        source_path=rag_source_path, shown_ids=shown_rag,
     )
     if rag_block:
         dyn_parts.append(rag_block)
@@ -1917,10 +2006,11 @@ def build_messages(
     # 現在日時の注記は上の動的ブロック (参考枠の内側) に入れてある。
     for note in (
         _response_language_note(history),
-        _persona_question_note(history),
+        _persona_question_note(history, record=True) if persona_note else "",
         _correction_target_note(history),
         _char_limit_note(history),
         _output_form_note(history),
+        _answer_conditions_note(answer_conditions) if (rag_block or fc_block) else "",
         _dropped_history_note(history, trimmed),
     ):
         if note:
@@ -1956,6 +2046,7 @@ def build_messages(
         messages,
         numeric_claims=numeric_claims,
         latest_kept_chars=latest_kept_chars,
+        shown_rag_ids=tuple(shown_rag) if shown_rag is not None else None,
     )
 
 

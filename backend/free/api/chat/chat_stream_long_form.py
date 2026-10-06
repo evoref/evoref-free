@@ -433,7 +433,12 @@ async def _finalize_long_form_stream(
         # 書込み失敗 (``long_form_write_file`` は ``"Error: …"`` を返す) を
         # 「done」で見せない。本文は生成できているので配信は続ける。
         yield sse.step({
-            "type": "task_result", "detail": write_result,
+            # 上書きの門の断りは本文を添えて返る (f_03 §4.y)。ステップには断りの 1 行だけ
+            "type": "task_result",
+            "detail": (
+                write_result.split("\n\n", 1)[0]
+                if WRITE_DENIED_RE.match(write_result) else write_result
+            ),
             "status": "failed" if write_result.startswith("Error") else "done",
         })
         if not file_output_mode and (denied := WRITE_DENIED_RE.match(write_result)):
@@ -445,7 +450,12 @@ async def _finalize_long_form_stream(
             # トークンを流していないので、このままだと応答本文が 0 字で終わる
             # (2026-09-26 監査 C08#2)。書込み先を 1 文で知らせる。履歴 / 記憶は
             # 生成本文のまま (記録は上で済んでいる、f_08 §5.4)。
-            written = WRITTEN_PATH_RE.search(write_result)
+            # 断りの結果は 1 行目だけを読む — 添えた本文の「Written N bytes to X」の行を
+            # 書いた報告と取らない (f_03 §4.y、2 周目レビュー LOW-1)
+            written = (
+                None if WRITE_DENIED_RE.match(write_result)
+                else WRITTEN_PATH_RE.search(write_result)
+            )
             if written:
                 text = msg("agent.files_written", paths=written.group(1).strip())
             elif write_result.startswith(EDIT_REFUSED_UNREADABLE_PREFIX):

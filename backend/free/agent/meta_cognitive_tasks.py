@@ -10,12 +10,20 @@ from backend.free.agent.meta_cognitive_content_gate import (
     is_edit_request,
     looks_like_tool_selector_json,
 )
+from backend.free.agent.meta_cognitive_defs import _DATA_BEARING_TOOLS
 from backend.free.agent.meta_cognitive_utils import is_tool_error
+from backend.free.agent.task_write_gate import (
+    record_task_write_verdict,
+    task_write_verdict,
+)
+from backend.i18n_helper import msg
 from backend.log_config import get_logger
-from backend.free.core.intent_vocab import EXPLICIT_WINDOWS_PATH_RE, WRITE_VERB_RE
+from backend.free.agent.write_gate import WRITE_PATH_TOOLS
+from backend.free.llm.json_schemas import PLAN_TASK_KINDS
 
 if TYPE_CHECKING:
     from backend.free.agent.credit_assigner import StepCredit
+    from backend.free.core.predicate import Band, Verdict
 
 logger = get_logger("agent.meta_cognitive.tasks")
 
@@ -39,6 +47,34 @@ class TaskItem:
     # 何が失敗したか / ファイルが変わっていないか)。meta が失敗の確定後に刻み、
     # 最終応答と chat_stream_meta の要約が読む (docs/f_03 §4.3)。
     failure_note: str = ""
+    # ``result`` が取得系ツール (``_DATA_BEARING_TOOLS``) の出力そのものか。後続タスクの
+    # 素材であって答えではないので、最終応答は全タスクが取得のターンでしか本文に
+    # 出さない (docs/f_03 §4.2.1、2026-10-03 ライブ監査 run15)。
+    retrieved: bool = False
+    # 判定点 ``task_write_intent`` の結果 (判定したときの記述, 判定)。記述が書き換わったら
+    # 判定し直す (``task_write_band``、docs/f_03 §4.3)。
+    write_verdict: tuple[str, Verdict] | None = field(
+        default=None, repr=False, compare=False,
+    )
+    # 計画モデルが付けたタスクの種別のラベル (``PLAN_TASK_KINDS`` の 1 つ、無ければ
+    # ``None``)。読むのは判定点 ``task_write_intent`` の確認票だけ (``process`` /
+    # ``retrieve`` は字句の書込みを棄権へ倒す、task_write_gate)。他の実行の経路は読まない。
+    plan_kind: str | None = None
+    # 答えがコードで集計した表の値と食い違ったときの末尾の注記 (i18n、docs/f_03 §4.2.2)。
+    # 答え (``result``) には混ぜない — 後のタスクの素材になり、最終応答の途中に残ると
+    # 記憶から落とせない。最終応答の末尾にまとめて足す。
+    output_note: str = ""
+
+
+@dataclass
+class PlannerOutput:
+    """計画モデルの出力 (記録のみ、docs/f_03 §4.3)。
+
+    ``tasks`` は正規化 (束ね・集約・生成タスクへの置換) の **前** のタスク (同じ
+    オブジェクト)。``kinds`` は応答の ``tasks`` の位置ごとのラベル (空のタスクの位置も含む)。
+    """
+    tasks: list[TaskItem]
+    kinds: list[str | None]
 
 
 @dataclass
@@ -84,27 +120,150 @@ class MetaCognitiveResponse:
 # タスク状態判定
 # ---------------------------------------------------------------------------
 
-# 書き込み期待パターン（日本語・英語）。
-# 定義は core.intent_vocab が SSOT (meta_cognitive_tools の write_file
-# ルーティングが同一定義を持っていた)。
-_WRITE_PATTERN = WRITE_VERB_RE
+def task_write_band(task: TaskItem) -> Band:
+    """タスクの判定点 ``task_write_intent`` の帯域 (記述ごとに 1 回だけ判定する)。"""
+    return task_write_verdict_of(task).band
 
 
-def task_expects_write(description: str) -> bool:
-    """タスク記述がファイル書き込みを期待しているか判定する
+def task_write_verdict_of(task: TaskItem) -> Verdict:
+    """タスクの判定点 ``task_write_intent`` の判定 (記述ごとに 1 回、計画モデルの種別込み)。"""
+    cached = task.write_verdict
+    if cached is None or cached[0] != task.description:
+        cached = (task.description, task_write_verdict(task.description, task.plan_kind))
+        task.write_verdict = cached
+    return cached[1]
 
-    「作成」「追加」「実装」「修正」などの動詞を含むタスクは
-    write_file の実行が期待される。
-    読み取り専用の記述（"Read foo.py"）は書き込み動詞を含まないため
-    自然に False になる。
 
-    注: ファイルパスの有無は問わない。パスなしでも「書き込み期待」は成立する
-    （determine_task_status でのステータス判定で使用）。
+def task_writes(task: TaskItem) -> bool:
+    """書込みのタスクか (``fire`` だけ、docs/f_03 §4.3)。
+
+    書込みを起こす読み手 (ツールの推論・テキストからの書込みの救出・再試行・計画への
+    宛先の付記・計画の束ね直し) と、状態を ``failed`` にしたり答えを隠したりする帳簿の
+    読み手 (``determine_task_status`` / 失敗の注記 / 本文) が読む。棄権 (動詞が無く
+    宛先の標識だけ) は観察のみ — 「Compare a.txt to b.txt」で b.txt を書いたり、
+    「Go to E:\\…\\README.md and summarize it」の答えを失敗にして隠したりしない。
     """
-    # パス中の語 (``E:\tmp\create_01\DESIGN.md`` の ``create``) を動詞と数えない
-    # (2026-09-19 ライブ監査: 「Read ...create_01_todo_cli\DESIGN.md」が書込み
-    # タスク扱いで production stage を消費し、本来の生成タスクが飛ばされた)。
-    return bool(_WRITE_PATTERN.search(EXPLICIT_WINDOWS_PATH_RE.sub(" ", description)))
+    return task_write_band(task) == "fire"
+
+
+def task_may_write(task: TaskItem) -> bool:
+    """書込みのタスク **かもしれない** か (``fire`` か ``abstain``)。
+
+    書込みを起こさず近道を止めるだけの読み手に限る — 取得済みデータからの答え・
+    取得の後の処理の対象外にする (ツールループへ回す) と、後のタスクへ書込みを委ねる
+    (書込みを止める)。「Save the summary to X」を取得済みデータの答えにして書かずに
+    終えないため (docs/f_03 §4.3)。状態や本文の判定には使わない (:func:`task_writes`)。
+    """
+    return task_write_band(task) != "skip"
+
+
+def record_task_write_verdicts(tasks: list[TaskItem]) -> None:
+    """計画の正規化が済んだタスクを判定点として 1 回ずつ記録し、判定を持たせる。"""
+    for task in tasks:
+        task.write_verdict = (
+            task.description, record_task_write_verdict(task.description, task.plan_kind),
+        )
+
+
+#: 計画のタスク種別のラベルを記録する決定ログの判定点 (記録のみ、docs/f_03 §4.3)。
+PLAN_TASK_KIND_DECISION = "plan_task_kind"
+#: ラベルが無いタスクの ``chosen``。
+NO_PLAN_KIND = "none"
+
+
+def parse_plan_task_kinds(raw_kinds: object, task_count: int) -> list[str | None]:
+    """計画の応答の ``kinds`` を ``tasks`` の位置ごとのラベルにする (純粋関数)。
+
+    位置で対応付けるので、リストでない・長さが ``tasks`` と違うときは全部 ``None``
+    (1 件ずれると全部ずれる)。未知の値はその要素だけ ``None``。どちらも件数を
+    WARNING に出す (計画そのものは落とさない)。
+    """
+    if not isinstance(raw_kinds, list) or len(raw_kinds) != task_count:
+        if task_count:
+            logger.warning(
+                "Plan kinds ignored: expected %d labels, got %s",
+                task_count,
+                len(raw_kinds) if isinstance(raw_kinds, list) else type(raw_kinds).__name__,
+            )
+        return [None] * task_count
+    kinds = [k if isinstance(k, str) and k in PLAN_TASK_KINDS else None for k in raw_kinds]
+    invalid = sum(1 for k in kinds if k is None)
+    if invalid:
+        logger.warning("Plan kinds: %d of %d labels are not known kinds", invalid, task_count)
+    return kinds
+
+
+def log_plan_task_kinds(
+    tasks: list[TaskItem], planner: PlannerOutput, debug_logger: object | None,
+) -> None:
+    """タスクごとに計画のラベルと ``task_write_intent`` の判定・結末を 1 件ずつ記録する。
+
+    実行の済んだ後に呼ぶ (結末を同じ行に並べるため)。判定にも状態にも影響しない。
+    ``reason`` は、ラベルがある (``planner_label``)・計画モデルのタスクのままでラベルが
+    無い (``no_label``)・正規化が作り直したタスク (``rebuilt``) を分ける。計画モデルの
+    ラベル列とタスク数は最初の行の context にだけ載せる (正規化の前後を突き合わせる用)。
+    """
+    if debug_logger is None:
+        return
+    candidates = [*PLAN_TASK_KINDS, NO_PLAN_KIND]
+    planned_ids = {id(t) for t in planner.tasks}
+    for index, task in enumerate(tasks):
+        cached = task.write_verdict
+        verdict = (
+            cached[1] if cached is not None and cached[0] == task.description
+            else task_write_verdict(task.description, task.plan_kind)
+        )
+        if task.plan_kind:
+            reason = "planner_label"
+        elif id(task) in planned_ids:
+            reason = "no_label"
+        else:
+            reason = "rebuilt"
+        context: dict[str, object] = {
+            "task_index": index,
+            "task_count": len(tasks),
+            "write_band": verdict.band,
+            "write_evidence": verdict.evidence,
+            "status": task.status,
+            "retrieved": task.retrieved,
+            "fetch_only": task.fetch_only,
+            "has_failure_note": bool(task.failure_note),
+        }
+        if index == 0:
+            context["planner_kinds"] = [k or NO_PLAN_KIND for k in planner.kinds]
+            context["planner_task_count"] = len(planner.kinds)
+        try:
+            debug_logger.log_decision(  # type: ignore[attr-defined]
+                decision_point=PLAN_TASK_KIND_DECISION,
+                chosen=task.plan_kind or NO_PLAN_KIND,
+                candidates=candidates,
+                reason=reason,
+                context=context,
+                scope="request",
+            )
+        except Exception as e:  # pragma: no cover - ログで実行を落とさない
+            logger.debug("Plan task kind decision log failed: %s", e)
+
+
+def retrieval_failure_note(entry: dict) -> str:
+    """エラーで終えた取得の呼出しの、利用者向けの 1 文 (i18n ``agent.retrieval_failed.*``)。
+
+    対象は呼出しの引数 (URL / パス / フォルダ)、理由はツールのエラーの種別
+    (``error_kind``、``meta_cognitive_tool_io.tool_error_kind``) から引く。生のエラー文は出さない。
+    種別の分からないエラー (``error``) と対象の無い呼出しは空文字 — 注記で答えを上書きせず、
+    モデルの答えを残す (2026-10-04 反証 MED-2)。
+    """
+    kind = entry.get("error_kind") or "error"
+    if kind == "no_location":
+        # 探す場所が無くて撃たなかった検索 (対象は無い、run23 反証 2 周目 LOW-1)
+        return msg("agent.retrieval_failed.no_location")
+    args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
+    target = str(
+        args.get("url") or args.get("file_path") or args.get("directory") or "",
+    ).strip()
+    if kind == "error" or not target:
+        return ""
+    return msg(f"agent.retrieval_failed.{kind}", target=target)
 
 
 def determine_task_status(
@@ -122,6 +281,9 @@ def determine_task_status(
 
     書込み先の有無は呼出側が解決する — タスク文だけでは「同じファイルに」型の
     参照解決ができず、ここで判定すると会話から解決できるケースまで落とす。
+
+    取得がすべてエラーで失敗にしたタスクには、何の取得が何故失敗したかの注記
+    (``retrieval_failure_note``) を ``task.failure_note`` に刻む (既にあれば残す)。
     """
     if is_tool_error(result) or "Step limit reached" in result:
         return "failed"
@@ -134,8 +296,8 @@ def determine_task_status(
         )
         return "failed"
 
-    if destination_known and task_expects_write(task.description) and not any(
-        tc.get("tool") == "write_file" and tc.get("success")
+    if destination_known and task_writes(task) and not any(
+        tc.get("tool") in WRITE_PATH_TOOLS and tc.get("success")
         for tc in tool_calls
     ):
         logger.warning(
@@ -144,12 +306,27 @@ def determine_task_status(
         )
         return "failed"
 
-    fetch_tools = {"fetch_url", "read_file", "search_code", "list_directory"}
-    if any(
-        tc.get("tool") in fetch_tools and tc.get("success")
-        for tc in tool_calls
+    # 取得がすべてエラーなら、モデルの文 (「ファイルを作成します」等) が何でも失敗
+    # (2026-10-04 ライブ監査 run21 F1、f_03 §4.2.1)。0 件 (エラーでない空振り) は答えにできる
+    # 生成系ツール (draft_document 等) の下書きは取得の代わりにならないので成功に数えない
+    # (run23 F2: 取得の拒否の後に draft_document が成功して done になった)
+    from backend.free.agent.deliberative import _GENERATED_DRAFT_TOOLS
+
+    retrievals = [tc for tc in tool_calls if tc.get("tool") in _DATA_BEARING_TOOLS]
+    if (
+        retrievals
+        and all(tc.get("error") for tc in retrievals)
+        and not any(
+            tc.get("success") and tc.get("tool") not in _GENERATED_DRAFT_TOOLS
+            for tc in tool_calls
+        )
     ):
-        return "done"
+        logger.warning(
+            "Task marked failed: every retrieval errored: %s", task.description[:80],
+        )
+        # 何の取得が何故失敗したかを利用者へ (2026-10-04 ライブ監査 run22 F1)
+        task.failure_note = task.failure_note or retrieval_failure_note(retrievals[-1])
+        return "failed"
 
     return "done"
 
@@ -206,10 +383,10 @@ def merge_same_file_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
             for other, (b0, b1) in spans.items()
         )
 
-    def _absorbable(description: str) -> bool:
+    def _absorbable(task: TaskItem) -> bool:
         # 書込みを期待しないか、既存内容の変更依頼だけ。別の成果物を作るパス無し
         # タスク (「Create a new report」) は別ファイルのグループへ取り込まない。
-        return not task_expects_write(description) or is_edit_request(description)
+        return not task_writes(task) or is_edit_request(task.description)
 
     merged_indices: set[int] = set()
     result_items: list[tuple[int, TaskItem]] = []
@@ -217,22 +394,28 @@ def merge_same_file_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
     for key, members in multi.items():
         if _overlaps(key):
             continue
+        # 書込みの無いグループ (同じフォルダの TODO の検索と FIXME の検索) は別々の取得で、
+        # 束ねると 2 つ目の取得がループのモデル任せになる (2026-10-04 run23 X1、f_03 §4.3)
+        if not any(task_writes(tasks[j]) for j in members):
+            continue
         # 読んで → (パス無しの) 変更 → 書き戻す、の区間は 1 件に束ねる。束ねた
         # グループは先頭の位置に置かれるので、挟まる変更タスクを残すと書き戻しの
         # 後に単独で走る (2026-09-26 監査 C08#3、docs/f_03 §4.3)。
         if (
-            not task_expects_write(tasks[members[0]].description)
-            and task_expects_write(tasks[members[-1]].description)
+            not task_writes(tasks[members[0]])
+            and task_writes(tasks[members[-1]])
         ):
             members = sorted({
                 *members,
                 *(j for j in range(members[0] + 1, members[-1])
-                  if not keys[j] and _absorbable(tasks[j].description)),
+                  if not keys[j] and _absorbable(tasks[j])),
             })
         merged_desc = " / ".join(tasks[j].description for j in members)
         result_items.append((members[0], TaskItem(description=merged_desc)))
         merged_indices.update(members)
 
+    if not merged_indices:
+        return tasks
     for i, task in enumerate(tasks):
         if i not in merged_indices:
             result_items.append((i, task))
@@ -257,7 +440,7 @@ def collapse_editor_write_tasks(tasks: list[TaskItem]) -> list[TaskItem]:
     original_query (要求全体) を主体に行うため、残した 1 タスクで完全なファイルになる。
     1 リクエスト=1 生成=1 タブを保証する防御策。
     """
-    write_idx = [i for i, t in enumerate(tasks) if task_expects_write(t.description)]
+    write_idx = [i for i, t in enumerate(tasks) if task_writes(t)]
     if len(write_idx) <= 1:
         return tasks
     drop = set(write_idx[1:])  # 最初の書き込みタスクだけ残す

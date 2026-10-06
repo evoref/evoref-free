@@ -5,7 +5,8 @@ EvorefLoop (ツール判定: 層 5.97 の発火 / 接地の開示) と EvorefLea
 になるので、ここ 1 か所に置く。
 
 **単独の ``何日`` / ``何曜日`` は入れない。** 「今日は何日ですか」は現在日時の
-問いで、日付演算ではない (now-only コマンドが正解)。
+問いで、日付演算ではない (現在日時の注記が答える。2026-10-03 に現在日時だけを返す
+コマンドを廃止した、不変則 #15)。
 """
 
 from __future__ import annotations
@@ -13,6 +14,15 @@ from __future__ import annotations
 import re
 
 from backend.free.core.response_dates import literal_date_count
+from backend.free.core.temporal_deixis import (
+    COUNTDOWN_DAYS_PREFIX,
+    NOW_NOUNS,
+    alternation,
+    present_day_terms,
+)
+
+# 「何日」の前に付いて今からの残り日数を問う前置き (``COUNTDOWN_DAYS_PREFIX``) の
+# 語彙は temporal_deixis が SSOT。
 
 #: 「あと何日」「残り日数」等、**2 点間の日数** を尋ねる語。規則層
 #: (``tool_judge_commands._day_count_command``) と層 5.97 の手掛かり
@@ -21,13 +31,13 @@ from backend.free.core.response_dates import literal_date_count
 #: あと何日ありますか？」を 5.97 が手掛かり無しとして即 return し、日数が
 #: モデルの暗算 (173 日、正 203 日) になった (2026-09-27 ライブ監査 C09#2)。
 #:
-#: 素の ``何日です`` は入れない。「今日は何日ですか」(now-only が正解) と
+#: 素の ``何日です`` は入れない。「今日は何日ですか」(注記が答える現在日時の問い) と
 #: 「何月何日ですか」(日付を訊く問い) を飲み込む — 後者は年なし日付を読むように
 #: なって実害が出た (「9 月 14 日の 3 週間前は何月何日ですか？」が日数カウント側に
 #: 取られ ``days: 20`` を返した)。日数を問う形 (あと / 残り / まで + 何日) だけを採る。
 DAY_COUNT_ASK_RE = re.compile(
     r"何日間|あと何日|残り\s*(?:の)?\s*日数|日数は|何日ある"
-    r"|(?:あと|残り|のこり|まで(?:は|、)?)\s*何日"
+    r"|" + COUNTDOWN_DAYS_PREFIX + r"何日"
     r"|(?<![A-Za-z])how\s+many\s+days(?![A-Za-z])"
     r"|(?<![A-Za-z])days\s+(?:left|remaining|until)(?![A-Za-z])",
     re.IGNORECASE,
@@ -64,7 +74,10 @@ DATE_MATH_CUE_RE = re.compile(
 #: (:func:`asks_day_count`)。
 _BARE_HOW_MANY_DAYS_RE = re.compile(r"(?<!何月)何日")
 #: 起点が今日であることを示す形 (「今日から 12 月 25 日」「4 月 1 日から今日で」)。
-_TODAY_ENDPOINT_RE = re.compile(r"(?:今日|本日|現在)から|から(?:今日|本日|現在)")
+_TODAY_ENDPOINT_TERMS = alternation(present_day_terms(), NOW_NOUNS)
+_TODAY_ENDPOINT_RE = re.compile(
+    f"(?:{_TODAY_ENDPOINT_TERMS})から|から(?:{_TODAY_ENDPOINT_TERMS})",
+)
 
 
 def asks_day_count(query: str) -> bool:
@@ -138,12 +151,24 @@ _ASKS_FOR_DATE_RE = re.compile(
 )
 
 
+def asks_for_date_answer(query: str) -> bool:
+    """発話が日付・曜日・日数そのものを答えとして求めているか (純粋関数)。
+
+    手掛かり語 (:data:`DATE_MATH_CUE_RE`) は「3 日間の旅行プラン」「祝日の由来」
+    「平日の過ごし方」にも当たるので、ツール無しのターンに「日付の計算を検証して
+    いない」印を立てる判定 (``tool_judge_guards._flag_ungrounded_date_math``) は
+    これと組んで、答えが日付・日数になる問いに絞る。
+    """
+    text = query or ""
+    return bool(_ASKS_FOR_DATE_RE.search(text)) or asks_day_count(text)
+
+
 def query_inherits_date_math(query: str, previous_user_query: str) -> bool:
     """手掛かり語を持たない追い質問が、直前のユーザー発話の日付演算を継ぐか。
 
     直前の発話に手掛かり語があり、今回の発話が日付の答えを求めている
     (``_ASKS_FOR_DATE_RE``) ときだけ真。「今日は何日ですか」は直前が日付演算で
-    なければ従来どおり now-only。実インシデント (2026-09-09 検証 V05/2):
+    なければ日付演算ではない (現在日時は注記が答える)。実インシデント (2026-09-09 検証 V05/2):
     「さらに毎週水曜日は…除くと、何月何日になりますか」が層 5.97 に届かず、
     モデルが暗算して 10/13 (正 10/8) を返した。
     """
@@ -185,6 +210,7 @@ __all__ = [
     "DAY_COUNT_ASK_RE",
     "YEAR_REMAINDER_RE",
     "asks_day_count",
+    "asks_for_date_answer",
     "conversation_has_date_math_cue",
     "day_count_closed_in_query",
     "day_count_is_the_only_cue",

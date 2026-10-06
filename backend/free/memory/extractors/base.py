@@ -43,6 +43,7 @@ from backend.free.core.correction_verdict import (
 )
 from backend.free.core.numerals import kanji_number_value
 from backend.free.core.relative_date import annotate_relative_dates
+from backend.free.core.temporal_deixis import DAY_OFFSETS, WEEK_OFFSETS, alternation, kanji_terms
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 from backend.free.core.correction_target import contrast_pair
@@ -153,8 +154,8 @@ _DATE_SHIFT_RE = re.compile(
 )
 #: 言明の中の「<相対表現> (YYYY-MM-DD)」または裸の「(YYYY-MM-DD)」。
 _ANNOTATED_DATE_RE = re.compile(
-    r"(?:(?:先々週|再来週|今週|来週|先週)\s*の?\s*[月火水木金土日]曜日?\s*"
-    r"|(?:一昨日|昨日|今日|本日|明日|明後日)\s*)?"
+    r"(?:(?:" + alternation(kanji_terms(WEEK_OFFSETS)) + r")\s*の?\s*[月火水木金土日]曜日?\s*"
+    r"|(?:" + alternation(kanji_terms(DAY_OFFSETS)) + r")\s*)?"
     r"[(（](?P<date>\d{4}-\d{2}-\d{2})[)）]",
 )
 _WEEKDAY_JA = ("月", "火", "水", "木", "金", "土", "日")

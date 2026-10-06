@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 import weakref
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -39,7 +39,16 @@ from backend.free.core.inference import build_messages
 from backend.free.core.turn_text import append_to_last_user
 from backend.free.llm.llm_client import LLMClient
 from backend.free.memory.notes.note_builder import is_span_only_fold_subject
-from backend.free.memory.pipeline.search_pipeline import unified_search
+from backend.free.memory.pipeline.query_decompose import (
+    decompose_mode,
+    record_decompose_shadow,
+)
+from backend.free.memory.pipeline.search_pipeline import (
+    SearchUsage,
+    adopted_top_k,
+    rerank_active,
+    unified_search,
+)
 from backend.free.memory.semantic.fact import fact_value_update
 from backend.utils import estimate_tokens as _estimate_tokens
 from backend.log_config import get_logger
@@ -209,9 +218,9 @@ class SearchPipelineResult:
     """検索パイプラインの結果（BUG-9: 成功/失敗/スキップの区別を明確化）"""
 
     __slots__ = (
-        "chunks", "corpus_gated", "corpus_starved", "error", "evidence_ids",
-        "lexical_candidate_ids", "pseudo_derived", "query_vec", "rag_top_score",
-        "scored_chunks",
+        "chunks", "corpus_gated", "corpus_starved", "episodic_rejected_ids", "error",
+        "evidence_ids", "lexical_candidate_ids", "pseudo_derived", "query_vec",
+        "rag_top_score", "scored_chunks", "usage",
     )
 
     def __init__(
@@ -226,6 +235,8 @@ class SearchPipelineResult:
         pseudo_derived: int = 0,
         lexical_candidate_ids: list[str] | None = None,
         corpus_starved: bool = False,
+        usage: SearchUsage | None = None,
+        episodic_rejected_ids: list[str] | None = None,
     ):
         self.chunks = chunks
         self.scored_chunks = scored_chunks
@@ -246,6 +257,12 @@ class SearchPipelineResult:
         # (検索が necessity judge で skip されても埋め込み自体は計算済みなので、
         #  ゲートを効かせるために持ち回る)。
         self.query_vec = query_vec
+        # 採用した id の「使った」記録。注入を組んだ消費側が ``commit()`` する
+        # (f_01 §8.1 Step 7.7)。捨てた検索では呼ばれない。
+        self.usage = usage
+        # 関連度の床で落とした episodic の id。記憶の注入が同じノートを低い棒で
+        # 拾い直さないために渡す (``MemoryInjector.inject(rejected_note_ids=)``)。
+        self.episodic_rejected_ids = list(episodic_rejected_ids or [])
 
     @property
     def failed(self) -> bool:
@@ -298,15 +315,57 @@ def _collect_semmem_stats(state: AppState) -> dict | None:
     return stats
 
 
+#: 影の問い分解のタスク (完了まで参照を保つ。捨てると GC で途中終了する)。
+_DECOMPOSE_SHADOW_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_decompose_shadow(
+    query: str, state: AppState, cfg: dict, mode: str, search_result: Any, *,
+    wm: Any, episodic: Any, session_id: str, corpus_mode: str,
+) -> None:
+    """問い分解の影を応答と並走させる (応答には何も足さない、f_01 §8.1 の 7.9)。
+
+    分解の項の検索は本番と同じ ``unified_search`` だが、再順位段・skip の事例確認・
+    計測・``on_corpus_evidence`` を渡さず、``usage`` も積まない (影は採用を確定しない)。
+    """
+    original_ids = [cid for cid, _, _ in (search_result.sources or [])]
+    top_k = adopted_top_k(state.policy_interpreter, cfg.get("rag", {}), mode)
+
+    async def sub_search(part: str) -> list[str]:
+        vec = await state.embedder.embed_query(part, mode=mode)
+        res = await unified_search(
+            query=part, query_vec=vec, working_mem=wm, episodic=episodic,
+            cartridge_mgr=state.cartridge_manager, config=cfg,
+            aux_client=state.aux_client, mode=mode,
+            policy=state.policy_interpreter, session_id=session_id,
+            corpus_mode=corpus_mode,
+            correction_trail=_collect_correction_trail(state),
+        )
+        return [] if res.skipped else [cid for cid, _, _ in res.sources]
+
+    task = asyncio.create_task(record_decompose_shadow(
+        query, original_ids=original_ids, top_k=top_k,
+        sub_search=sub_search, debug_logger=state.debug_logger,
+    ))
+    _DECOMPOSE_SHADOW_TASKS.add(task)
+    task.add_done_callback(_DECOMPOSE_SHADOW_TASKS.discard)
+
+
 async def run_search_pipeline(
     query: str, state: AppState, cfg: dict, mode: str = "chat",
     timer: StageTimer | None = None, *, session_id: str | None = None,
-    corpus_mode: str = "auto",
+    corpus_mode: str = "auto", rerank: bool = True,
+    on_corpus_evidence: Callable[[int], None] | None = None,
 ) -> SearchPipelineResult:
     """統合検索パイプライン: 3層メモリ + Self-RAG
 
     ``session_id`` はこのターンのセッション。WM (窓の完全性判定 / セッション
     自己参照枝) と content gate のセッション上限はその窓で判定する。
+    ``rerank=False`` は再順位段を省く。結果を注入に使わない検索 (reactive の
+    shadow 観測) 用 — 再順位段は各ストアの位置の集合を保つので、採用された
+    corpus の件数は変わらない (c_16 §7.2.1)。
+    ``on_corpus_evidence`` は採用に載る corpus の件数を再順位段の前に受け取る
+    (``unified_search`` の同名引数。reactive の証拠による昇格、docs/f_03 §2.2)。
 
     Returns:
         SearchPipelineResult — チャンクリスト + エラー情報。
@@ -335,7 +394,9 @@ async def run_search_pipeline(
         # legacy 経路では WM の session_id で代用する。
         session_id = session_id or getattr(wm, "session_id", None) or "default"
         # 再順位段 (c_16 §7.2.1)。mode on かつ自己テストを通ったときだけ非 None。
-        reranker = getattr(getattr(state, "gen", None), "reranker", None)
+        reranker = getattr(getattr(state, "gen", None), "reranker", None) if rerank else None
+        if not rerank_active(reranker):
+            reranker = None  # 遮断器の冷却中は再順位段が無いのと同じ (訂正の正順も作らない)
         search_result = await unified_search(
             query=query,
             query_vec=query_vec,
@@ -361,7 +422,14 @@ async def run_search_pipeline(
                 _collect_correction_successors(state) if reranker is not None else None
             ),
             reranker=reranker,
+            on_corpus_evidence=on_corpus_evidence,
         )
+        # 問い分解 (D2) の影 (f_01 §8.1 の 7.9)。注入に使う検索 (rerank=True) だけ。
+        if rerank and not search_result.skipped and decompose_mode(cfg) == "shadow":
+            _schedule_decompose_shadow(
+                query, state, cfg, mode, search_result,
+                wm=wm, episodic=episodic, session_id=session_id, corpus_mode=corpus_mode,
+            )
         if not search_result.skipped and search_result.sources:
             rag_chunks = [content for _, _, content in search_result.sources]
             logger.info(
@@ -378,6 +446,8 @@ async def run_search_pipeline(
                 pseudo_derived=search_result.pseudo_derived,
                 lexical_candidate_ids=search_result.lexical_candidate_ids,
                 corpus_starved=search_result.corpus_starved,
+                usage=search_result.usage,
+                episodic_rejected_ids=search_result.episodic_rejected_ids,
             )
     except Exception as e:
         # 例外の型も書く。``httpx.ReadTimeout()`` / ``asyncio.TimeoutError()``
@@ -401,6 +471,8 @@ async def run_search_pipeline(
         query_vec=query_vec, corpus_gated=search_result.corpus_gated,
         lexical_candidate_ids=search_result.lexical_candidate_ids,
         corpus_starved=search_result.corpus_starved,
+        usage=search_result.usage,
+        episodic_rejected_ids=search_result.episodic_rejected_ids,
     )
 
 
@@ -591,6 +663,35 @@ def _session_user_texts(state: AppState, session_id: str | None) -> list[str]:
         ]
     except Exception:
         return []
+
+
+def _query_context_bound(
+    state: AppState, session_id: str | None, query_text: str,
+) -> bool:
+    """問いが今の会話の窓に結び付く追い質問か (記憶の注入の別の会話の制限用)。
+
+    窓に前のアシスタントの応答が無い (指す対象が無い) ターンは判定点を引かずに
+    偽 — 初回の「どちらがおすすめ？」「それぞれの国の首都は？」は自立した問いで、
+    ここで真にすると別の会話の記憶をすべて落とす (2026-10-05 独立レビュー H2)。
+    棄権は発火として扱わない。
+    """
+    if not query_text or not session_id:
+        return False
+    working = _session_wm(state, session_id)
+    if working is None:
+        return False
+    try:
+        has_referent = any(
+            t.get("role") == "assistant" and str(t.get("content") or "").strip()
+            for t in working.get_context()
+        )
+    except Exception:
+        return False
+    if not has_referent:
+        return False
+    from backend.free.core.context_bound import query_context_bound_verdict
+
+    return query_context_bound_verdict(query_text).fired
 
 
 #: supersede 済みファクトの provenance から求めた retired note id を
@@ -862,6 +963,7 @@ def build_semmem_injection(
     covered_attributes: set[str] | None = None,
     session_id: str | None = None,
     evidence_ids: list[str] | None = None,
+    rejected_note_ids: Iterable[str] | None = None,
 ) -> str | None:
     """SemMem facts + STM notes を MemoryInjector で tier 整形し、
     プロンプト注入用テキストを返す。
@@ -904,6 +1006,13 @@ def build_semmem_injection(
     ``MemoryInjector.inject(retired_note_ids=...)`` へ渡して除外する。
     episodic 本体は不変のまま (履歴検索ツールでは訂正前の値を引ける) で、
     ``[関連する記憶]`` への「(過去の記録)」再注入だけを止める (f_02 §8.3)。
+
+    ``rejected_note_ids`` はこのターンの検索が関連度の床で落とした episodic の id
+    (``SearchPipelineResult.episodic_rejected_ids``)。注入器が同じノートと、それを
+    provenance に持つファクトを低い棒で拾い直さない。問いが今の会話の窓に結び
+    付く (判定点 ``query_context_bound``) ターンは、別の会話の記憶に決定論の
+    結び付き (属性・語彙アンカー・窓の内容語) を求める (2026-10-05 trace
+    8232204694b3)。
     """
     # 要るのは episodic だけだが、session_id 無しの ``get_memory_system()`` は
     # 「最後に触ったセッションの窓」を返す legacy 経路なので、このターンの
@@ -1006,6 +1115,7 @@ def build_semmem_injection(
             )
         stm_notes = list(episodic.short_notes()) if episodic is not None else []
         if facts or stm_notes:
+            context_bound = _query_context_bound(state, session_id, query_text)
             plan = injector.inject(
                 mode=inj_mode,
                 facts=facts,
@@ -1020,6 +1130,9 @@ def build_semmem_injection(
                 fact_rank_scores=fact_ranks or None,
                 previous_values=previous_values or None,
                 embedding_unavailable=embedding_unavailable,
+                rejected_note_ids=rejected_note_ids,
+                current_session_id=session_id,
+                context_bound=context_bound,
             )
             rendered = plan.render() or None
             if covered_attributes is not None:
@@ -1173,6 +1286,9 @@ def build_chat_messages(
     session_id: str = "",
     post_append_reserve_tokens: int = 0,
     referenced_artifact: "LastArtifact | None" = None,
+    persona_note: bool = True,
+    rag_source_path: Callable[[str], list[str]] | None = None,
+    answer_conditions: Sequence[str] = (),
 ) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
@@ -1187,6 +1303,8 @@ def build_chat_messages(
             (接地注記 / deliberative のツール結果) の予約。主経路は
             :func:`deliberative_post_append_reserve_tokens`、ツール結果を持たない
             軽量 / 継続パスは :func:`notes_post_append_reserve_tokens`。
+        persona_note: 人格注記を評価して付けるか (:func:`build_messages` へ渡す)。
+            継続パスは最後の user が継続指示なので ``False``。
     """
     messages = build_messages(
         system_prompt, history,
@@ -1203,6 +1321,9 @@ def build_chat_messages(
         slot_resolver=_attribute_slots,
         artifact_block=artifact_block,
         post_append_reserve_tokens=post_append_reserve_tokens,
+        persona_note=persona_note,
+        rag_source_path=rag_source_path,
+        answer_conditions=answer_conditions,
     )
     apply_grounding_notes(
         messages, history, evicted_turns, session_id,

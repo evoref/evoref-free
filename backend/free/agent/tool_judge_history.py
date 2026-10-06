@@ -11,12 +11,18 @@ import re
 
 from backend.free.agent.tool_judge_args import quoted_spans
 from backend.free.core.intent_vocab import (
+    ASSISTANT_REFERENCE_STEMS,
+    KA_QUESTION_END_RE,
     PAST_RECALL_TAIL_RE,
-    PROXIMAL_RECALL_KEYWORDS,
+    QUESTION_END_RE,
+    USER_REFERENCE_STEMS,
     has_history_recall_keyword,
-    matched_history_keywords,
+    is_request_sentence,
+    split_sentences,
 )
 from backend.free.core.locale_patterns import has_japanese_script
+from backend.free.core.response_dates import literal_date_ranges, nearest_date
+from backend.free.core.temporal_deixis import DAY_OFFSETS, alternation, kanji_terms
 from backend.free.core.script_ranges import (
     HIRAGANA,
     KANJI,
@@ -294,25 +300,6 @@ def _reduce_ordered_history_query(query: str) -> str:
         terms = noun_singles[:1]
     reduced = " ".join(terms).strip()
     return reduced if reduced else query
-#: 進行中の会話を指す近接リコール語。これらは「今のセッションの中」を指すので、
-#: 現在セッションを除外した search_history では構造的に当たらない。
-def _only_proximal_recall_keywords(query: str) -> bool:
-    """履歴参照語が近接リコール語だけか (純粋関数)。
-
-    長距離リコール語 (「以前」「最初に」「覚えて」等) が 1 つでもあれば False。
-
-    語彙は JA / EN 双方を locale に関わらず見る。片側だけだと "just now" が
-    近接語と認識されず、現在セッションを除外した検索が抑止されないまま撃たれる
-    (:data:`PROXIMAL_RECALL_KEYWORDS` は元から日英まとめて持っており、
-    照合側だけが locale で片寄っていた)。照合は
-    ``intent_vocab.matched_history_keywords`` に寄せる — ここは素の
-    ``kw in q_lower`` で、``_keyword_union`` が ASCII に付ける英字境界を
-    持たない食い違った複製だった (``before`` が "beforehand" に当たる)。
-    """
-    matched = matched_history_keywords(query)
-    if not matched:
-        return False
-    return all(kw in PROXIMAL_RECALL_KEYWORDS for kw in matched)
 
 
 #: 「過去の会話について尋ねている」ことの **構造的** な signal。
@@ -341,14 +328,21 @@ def _only_proximal_recall_keywords(query: str) -> bool:
 #: 3 つ目の枝は **「いつ」が先に来る形**。日本語では
 #: 「いつ、どんな話をしましたか。」のように時を先に置くのが自然で、
 #: 1 つ目の枝 (言及動詞 → 問いかけ) の語順では拾えない。
+#:
+#: 発話動詞 (各枝の ``v1`` / ``v2`` / ``v3``) に直に掛かる相手が対話の当事者以外
+#: なら会話の外の出来事 (「今日先生に相談したら何て言われたと思う?」、実機
+#: 2026-10-03 run10)。相手の判定は日付の判定と同じ :func:`_talks_with_someone_else`。
 _PAST_CONVERSATION_ASK_RE = re.compile(
-    r"(?:話|言|伝え|聞|教え|質問|相談|説明)(?:を?し|っ|い)?(?:た|ました)"
+    r"(?P<v1>話|言|伝え|聞|教え|質問|相談|説明)(?:を?し|っ|い)?(?:た|ました)"
     r"[^。？?\n]{0,24}(?:いつ|あります|ありました|ましたか|でしたか|どこ|何)"
     r"|(?:過去|以前|前回|昔|これまで)[^。？?\n]{0,24}"
-    r"(?:話|言っ|聞い|伝え|教え|質問|会話|やり取り|探し|検索)"
-    r"|いつ[^。？?\n]{0,24}(?:話|言っ|聞い|伝え|教え|質問|会話|やり取り)",
+    r"(?P<v2>話|言っ|聞い|伝え|教え|質問|会話|やり取り|探し|検索)"
+    r"|いつ[^。？?\n]{0,24}(?P<v3>話|言っ|聞い|伝え|教え|質問|会話|やり取り)",
 )
 
+
+#: 会話を指す発話動詞の語幹 (相対日 / 具体日付の「その日の会話」で共有する)。
+_SPEECH_VERB_STEMS = r"相談|話|聞|言|質問|依頼|頼|尋ね|伝え|教え"
 
 #: 「今日 / 昨日 / 一昨日 + (私が) + 発話動詞の過去形」— **その日の会話** を
 #: 尋ねる形。日の語は単独では暦の語 (「今日は何日ですか」「昨日見た映画」) なので
@@ -359,10 +353,46 @@ _PAST_CONVERSATION_ASK_RE = re.compile(
 #: 今日と昨日のノートを日付ラベル無しで混在注入したため、「今日の会話履歴には
 #: 技術的な話題が記録されていません」と昨日の話題 3 つを答えた。
 _DAY_SCOPE_RECALL_RE = re.compile(
-    r"(?P<day>今日|本日|昨日|一昨日)(?:は|に|も|の)?[^。！？!?\n]{0,16}?"
-    r"(?:(?:相談|話|聞|言|質問|依頼|頼|尋ね|伝え|教え)(?:を?[しっいん]|ね|え)?"
+    r"(?P<day>" + alternation(kanji_terms(DAY_OFFSETS, where=lambda off: off <= 0))
+    + r")(?:は|に|も|の)?(?P<gap>[^。！？!?\n]{0,16}?)"
+    rf"(?:(?:{_SPEECH_VERB_STEMS})(?:を?[しっいん]|ね|え)?"
     r"(?:た|て|ました|まし)|話題|会話|やり取り)",
 )
+
+#: 発話動詞 (会話の名詞) に **直に** 掛かる相手 — 共格「と」・与格「に」(「友達と話した」
+#: 「上司に話したら」「友達との会話」)。相手のある会話はユーザーの外の出来事で、履歴に無い。
+#: 相手を語で列挙せず、助詞の位置と直前の文字種で取る。相手は名詞なので助詞の直前は
+#: 漢字・カタカナ・英字か、それらに続く敬称 (母さん / 田中くん / 花子ちゃん)。
+#: ひらがなの後の と は引用 (「まとめたいと言った」)、に / と は副詞 (すぐに / ちゃんと /
+#: きちんと)、々と / 的に も副詞 (色々と / 具体的に) なので相手にしない。
+#: 助詞の直後の漢字 1 字は、発話動詞の語幹と合わさった
+#: 漢語 (「母に電話した」の 電+話) で、相手はその漢語に掛かる。
+_SPEECH_PARTNER_END_RE = re.compile(
+    rf"[{KANJI}{KATAKANA_BLOCK}a-zA-Z](?<!的)(?:(?:さ|く|ちゃ)ん)?(?:と|に)(?:の|[{KANJI}])?$",
+)
+#: 漢字で書く **順序・時** の語 + に は相手ではなく副詞句 (「最後に話した」「2番目に
+#: 聞いた」「午後に相談した」)。会話内の位置の想起 (「最後に話したのは何でしたか」)
+#: を相手のある会話として落とさない。「先」は前が漢字なら名詞 (取引先 / 勤務先)。
+_ORDER_TIME_ADVERB_END_RE = re.compile(
+    rf"(?:最初|最後|(?<![{KANJI}])先|前|後|次|(?:番|つ|回)目|時|頃|朝|昼|夜|夕方)に"
+    rf"(?:[{KANJI}])?$",
+)
+#: 相手が対話の当事者 (アシスタント / ユーザー自身) なら履歴の会話そのもの
+#: (「昨日あなたと話した」「昨日私に教えてくれた」)。
+_DIALOG_PARTNER_END_RE = re.compile(
+    rf"(?:{ASSISTANT_REFERENCE_STEMS}|{USER_REFERENCE_STEMS})(?:と|に)(?:の|[{KANJI}])?$",
+    re.IGNORECASE,
+)
+
+
+def _talks_with_someone_else(gap: str) -> bool:
+    """日の語と発話動詞の間 ``gap`` が、対話の当事者以外の相手で終わるか (純粋関数)。"""
+    return (
+        bool(_SPEECH_PARTNER_END_RE.search(gap))
+        and not _DIALOG_PARTNER_END_RE.search(gap)
+        and not _ORDER_TIME_ADVERB_END_RE.search(gap)
+    )
+
 
 _DAY_SCOPE_OFFSETS: dict[str, int] = {
     "今日": 0, "本日": 0, "昨日": 1, "一昨日": 2,
@@ -381,13 +411,120 @@ def history_day_window(days_ago: int, now_local) -> tuple[str, str]:
     """ローカル日の [開始, 終了] を、履歴索引の ``started_at`` と同じ形
     (UTC、``+00:00``) で返す (純粋関数)。
 
-    索引側は文字列比較 (``started_at >= date_from``) なので、同じ書式で渡す。
+    索引側は時刻 (``parse_utc``) で比べるので書式は問わない。
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
 
     day = (now_local - timedelta(days=days_ago)).date()
-    start = datetime(day.year, day.month, day.day, tzinfo=now_local.tzinfo)
-    end = start + timedelta(days=1)
+    return _local_days_window(day, day, now_local.tzinfo)
+
+
+#: 具体日付の直後に続く **その日の会話** の形 (「10月3日の会話」「10月2日から
+#: 10月3日までのやり取り」「10/3 に話したこと」)。日付は暦の語 (「10月3日は何曜日」
+#: 「締切は10月3日」) なので、相対日と同じく会話の名詞か発話動詞の **過去形** と
+#: 組で取る (て形は「10月3日までに相談して」の依頼に当たるので採らない)。
+#: 「履歴」は複合語 (購入履歴 / 変更履歴) に埋もれるので、日付に直接続く形だけ。
+#:
+#: 日付の出来事はアシスタントの外 (会議・電話・友人) のことが多いので、相対日
+#: (:data:`_DAY_SCOPE_RECALL_RE`) より狭く取る — 発話動詞は日付の助詞に **直に**
+#: 続く形だけ (間に置けるのは疑問の「何を / どんな」だけ。「10月3日の会議で話した」
+#: 「10月3日に友達と話した」「電話した」を採らない)、名詞の前に挟めるのは相手・場を表す と / で を含まない短い語だけ、
+#: 名詞は複合語の頭 (会話劇 / チャットログ) を採らない。「話題」は「10月3日の話題の
+#: ニュース」に当たるので名詞に入れない。さらに :func:`dated_conversation_dates` が
+#: 日付以降に依頼か問いの文を要求する。
+#:
+#: 実機 2026-10-03: 「10月2日から10月3日までの会話を一覧にして」が kNN ゲートで
+#: no_tool になり、「10月3日の会話履歴を検索して」は ``query='10月3日'`` の窓なし
+#: 検索になった (日付の窓を付けるのは相対日だけだった)。
+_DATED_CONVERSATION_TAIL_RE = re.compile(
+    r"(?:まで)?(?:の間)?(?:は|に|も|の|で)?\s*"
+    r"(?:(?:チャット)?履歴"
+    r"|[^。！？!?\nとで]{0,8}?(?:会話|やり取り|チャット)(?:履歴)?"
+    rf"(?![{KATAKANA_BLOCK}{KANJI}])"
+    rf"|(?:何を?|どんな)?(?:{_SPEECH_VERB_STEMS})(?:を?[しっいん]|ね|え)?(?:た|ました))",
+)
+
+_YMD = tuple[int | None, int, int]
+
+
+def dated_conversation_dates(query: str) -> tuple[_YMD, _YMD] | None:
+    """具体日付 (または範囲) の会話を尋ねているなら ``(始まり, 終わり)`` を返す (純粋関数)。
+
+    日付の綴りと範囲の読みは ``core.response_dates`` (日付の読み取りの SSOT)。
+    年を書いていない日付は年を ``None`` のまま返す (補うのは :func:`history_dates_window`)。
+    """
+    text = query or ""
+    for end, first, last in literal_date_ranges(text):
+        if _DATED_CONVERSATION_TAIL_RE.match(text, end) and _asks_from(text, end):
+            return first, last
+    return None
+
+
+def _asks_from(text: str, pos: int) -> bool:
+    """``pos`` 以降の文のどれかが依頼か問いか (純粋関数)。
+
+    平叙の報告 (「10月3日に話した」「昨日友達と話した」「10月3日に聞いた講演が
+    よかった」) は履歴を尋ねていない。
+    """
+    return any(
+        is_request_sentence(s) or QUESTION_END_RE.search(s) or KA_QUESTION_END_RE.search(s)
+        for s in split_sentences(text[pos:])
+    )
+
+
+def asks_about_day_scoped_conversation(query: str) -> bool:
+    """**特定の日** の会話を尋ねているか (相対日 / 具体日付、純粋関数)。
+
+    日の語と発話動詞の組に加えて、その後の文が依頼か問いであることを要る
+    (「昨日友達と話した」は報告で、履歴の検索に回すと別の会話が混ざる)。
+    router の層振り分けと、ツール判定の強制発火・抑止ガードが共有する 1 つの判定
+    (片方だけだと「判定は正しいのに経路が外れる」)。
+    """
+    text = query or ""
+    m = _DAY_SCOPE_RECALL_RE.search(text)
+    if (
+        m is not None
+        and not _talks_with_someone_else(m.group("gap"))
+        and _asks_from(text, m.start())
+    ):
+        return True
+    return dated_conversation_dates(text) is not None
+
+
+def history_dates_window(first: _YMD, last: _YMD, now_local) -> tuple[str, str] | None:
+    """具体日付の範囲 (両端を含む) をローカル日の窓にする (純粋関数)。
+
+    年の無い終わりは今日以前で最も近い日、年の無い始まりは終わり以前で最も近い日
+    (「12月30日〜1月2日」は年をまたぐ)。片方だけ年があればもう片方も同じ年。
+    存在しない日付 (2月30日) は ``None``。
+    """
+    from datetime import date
+
+    def _resolve(ymd: _YMD, anchor: date, year: int | None) -> date | None:
+        y, m, d = ymd
+        y = y if y is not None else year
+        if y is None:
+            return nearest_date(m, d, anchor, future_days=0)
+        try:
+            return date(y, m, d)
+        except ValueError:
+            return None
+
+    end = _resolve(last, now_local.date(), first[0])
+    if end is None:
+        return None
+    start = _resolve(first, end, last[0])
+    if start is None or start > end:
+        return None
+    return _local_days_window(start, end, now_local.tzinfo)
+
+
+def _local_days_window(first, last, tz) -> tuple[str, str]:
+    """ローカル日 ``first`` の始まり〜 ``last`` の翌日の始まりを UTC (``+00:00``) で返す。"""
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(first.year, first.month, first.day, tzinfo=tz)
+    end = datetime(last.year, last.month, last.day, tzinfo=tz) + timedelta(days=1)
     fmt = "%Y-%m-%dT%H:%M:%S.%f+00:00"
     return (
         start.astimezone(timezone.utc).strftime(fmt),
@@ -400,14 +537,23 @@ def asks_about_past_conversation(query: str) -> bool:
 
     語彙リスト (:func:`_has_history_recall_keywords`) と構造パターン
     (:data:`_PAST_CONVERSATION_ASK_RE`) の **どちらか** に当たれば真。
+    構造パターンは発話動詞の相手が対話の当事者以外の一致を数えない。
     """
     text = query or ""
     if not text:
         return False
-    return bool(
-        _has_history_recall_keywords(text)
-        or _PAST_CONVERSATION_ASK_RE.search(text),
-    )
+    return _has_history_recall_keywords(text) or _asks_past_conversation_structurally(text)
+
+
+def _asks_past_conversation_structurally(text: str) -> bool:
+    """:data:`_PAST_CONVERSATION_ASK_RE` の一致のうち、発話動詞に他人の相手が
+    掛かっていないものがあるか (純粋関数)。"""
+    pos = 0
+    while (m := _PAST_CONVERSATION_ASK_RE.search(text, pos)) is not None:
+        if not _talks_with_someone_else(text[: m.start(m.lastgroup or "v1")]):
+            return True
+        pos = m.start() + 1
+    return False
 
 
 def _has_history_recall_keywords(query: str) -> bool:

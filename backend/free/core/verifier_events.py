@@ -28,7 +28,18 @@ __all__ = [
     "current_verifier_mode",
     "record_turn_outcome",
     "current_turn_outcome",
+    "SHORTCUT_DECISION_SOURCES",
+    "record_tool_decision",
+    "current_tool_decision",
+    "decided_by_shortcut",
+    "record_table_aggregate",
+    "current_table_aggregate",
 ]
+
+#: ツール判定を確定させた層のうち **近道** (学習・記憶から引いた結論) の ``source``。
+#: ``recall`` は executable command リコール、``learned`` は学習済みパターン。
+#: 近道自身が出した結果を近道の正例に数えない (CLAUDE.md 不変則 #15)。
+SHORTCUT_DECISION_SOURCES: frozenset[str] = frozenset({"recall", "learned"})
 
 #: 既知の検証器 id。規則台帳の ``verifier`` はこの集合の値を取る。
 VERIFIER_IDS: frozenset[str] = frozenset({
@@ -50,6 +61,7 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     # verifier_hits は表面の検証器しか映さない (2026-09-05 ライブ監査 F-11:
     # 100 ターン中 3 件しか失敗と記録されず、Level 2 が恒久的にデータ不足)。
     "content.arithmetic",       # 本文の式の検算が合わない
+    "content.sign",             # 冒頭の結論と本文で値の符号が逆
     "content.broken_text",      # 語間空白 / 中国語混入
     "content.self_retraction",  # 1 つの応答に結論が 2 つ (撤回 / 列挙して否定)
     "content.measured",         # 注入した実測値と別の数を述べた
@@ -58,6 +70,8 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "content.claimed_change",   # 撃てなかったのに完了を述べた
     "content.user_echo",        # ユーザー発話のオウム返し
     "content.fabricated_count", # 本人が言っていない世帯の人数を補って言い直した
+    "content.fabricated_entity",  # 読めていないファイルの問いに、根拠の無い人名で答えた
+    "content.table_aggregate",  # コードで集計した表の値と別の値を述べた (述べなかった)
 })
 
 
@@ -85,6 +99,17 @@ class _Scope:
     #: (``FeedbackCollector.record``) が導出して持ち上げる。無ければ結末 JSONL
     #: は chat_response 全件 success で、RAG の幅 / 棒に fitness が無い。
     rag: dict[str, bool | None] = field(default_factory=dict)
+    #: このターンで実行したツールをどの層が決めたか (``{"source", "reason"}``)。
+    #: 空 = ツール判定器の決定で実行していない。経験の ``signals.decided_by`` へ写す。
+    decided_by: dict[str, str] = field(default_factory=dict)
+    #: ツール無しのターンに「中身を読めたファイル: なし」の確定事実を渡したときの
+    #: 対象のファイル (``deliberative._append_session_files_fact``) と、そのとき
+    #: プロンプトに載っていた assistant 以外の本文 (人名の接地に使う)。空 = 渡していない。
+    unread_files: list[str] = field(default_factory=list)
+    unread_grounding: str = ""
+    #: 取得した表をコードで集計して渡した結果 (``core.table_aggregate.AggregateResult``)。
+    #: ``None`` = 渡していない。出力の検査 (``TableAggregateFilter``) が応答と照合する。
+    table_aggregate: object | None = None
 
 
 _scope: ContextVar[_Scope | None] = ContextVar("verifier_scope", default=None)
@@ -186,9 +211,59 @@ def current_rag_signals() -> dict[str, bool]:
     return dict(scope.rag) if scope else {}
 
 
+def record_unread_session_files(paths: list[str], grounding: str) -> None:
+    """読めていないファイルの確定事実を渡したことを積む。スコープ外は no-op。"""
+    scope = _scope.get()
+    if scope is None or not paths:
+        return
+    scope.unread_files = [str(p) for p in paths]
+    scope.unread_grounding = str(grounding or "")
+
+
+def current_unread_session_files() -> tuple[list[str], str]:
+    """``(ファイル, 接地の本文)``。確定事実を渡していなければ ``([], "")``。"""
+    scope = _scope.get()
+    if scope is None:
+        return [], ""
+    return list(scope.unread_files), scope.unread_grounding
+
+
+def record_table_aggregate(result: object) -> None:
+    """コードで集計してプロンプトへ渡した表の集計結果を積む。スコープ外は no-op。"""
+    scope = _scope.get()
+    if scope is None or result is None:
+        return
+    scope.table_aggregate = result
+
+
+def current_table_aggregate() -> object | None:
+    """このターンにプロンプトへ渡した表の集計結果 (渡していなければ ``None``)。"""
+    scope = _scope.get()
+    return scope.table_aggregate if scope else None
+
+
 def current_turn_outcome() -> tuple[str | None, str | None]:
     """``(outcome, reason)``。スコープが無いか未記録なら ``(None, None)``。"""
     scope = _scope.get()
     if scope is None:
         return None, None
     return scope.turn_outcome, scope.turn_outcome_reason
+
+
+def record_tool_decision(source: str, reason: str = "") -> None:
+    """実行するツールを決めた層 (``ToolJudgement.source`` / ``decided_reason``) を置く。"""
+    scope = _scope.get()
+    if scope is None or not source:
+        return
+    scope.decided_by = {"source": str(source), "reason": str(reason or "")}
+
+
+def current_tool_decision() -> dict[str, str]:
+    """このターンのツール決定の層 (未記録は空)。"""
+    scope = _scope.get()
+    return dict(scope.decided_by) if scope else {}
+
+
+def decided_by_shortcut(decided_by: dict | None) -> bool:
+    """経験の ``decided_by`` が近道 (:data:`SHORTCUT_DECISION_SOURCES`) か。"""
+    return bool(decided_by) and str(decided_by.get("source") or "") in SHORTCUT_DECISION_SOURCES

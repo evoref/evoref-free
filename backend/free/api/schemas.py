@@ -211,12 +211,19 @@ class RerankStatusInfo(BaseModel):
 
     ``reason`` は無効の理由 (``off`` / ``not_tested`` / ``stale_fingerprint`` / ``too_slow`` /
     ``degenerate_flat`` / ``server_unreachable`` 等、英語の識別子)。``tested_at`` は自己テストの時刻 (ISO 8601 UTC)。
+    ``server_unreachable`` だけは ``enabled=True`` と並ぶ — 起動時にサーバへ届かず遮断器を開いて
+    始めた間 (``breaker_open``) で、遮断器が閉じれば (復帰) 空文字に戻る。
     """
     mode: str = "off"
     enabled: bool = False
     placement: str = ""
     ms_per_doc: float | None = None
+    #: 自己テストの文書長 (1 組 約 390 トークン) で締切に収まる件数 (有効かどうかの判定に使う)。
     candidates: int = 0
+    #: 実行時に 1 回で送る件数の上限 (``rag.rerank.max_candidates``)。無効なら 0。
+    max_candidates: int = 0
+    #: 実行時に 1 回で送る近似トークンの予算。件数の上限との早い方で止める。無効なら None。
+    token_budget: int | None = None
     reason: str = "off"
     tested_at: str | None = None
     #: 自己テストの後に ``model_paths.rerank_model`` が変わった (再テストはしない、警告だけ)。

@@ -24,19 +24,28 @@ from backend.free.agent.self_cartridge import (
 from backend.free.agent.meta_cognitive_tasks import (
     EditorArtifact,
     MetaCognitiveResponse,
+    PlannerOutput,
     TaskItem,
     collapse_document_generation_tasks,
     collapse_editor_write_tasks,
     collapse_fetch_save_tasks,
     determine_task_status,
+    log_plan_task_kinds,
     merge_same_file_tasks,
-    task_expects_write,
+    parse_plan_task_kinds,
+    record_task_write_verdicts,
+    task_writes,
 )
 from backend.free.agent.meta_cognitive_tools import infer_tool_from_task
+from backend.free.agent.task_write_gate import task_write_verdict
 from backend.free.agent.meta_cognitive_content_gate import is_edit_request
 from backend.free.agent.edit_mode_gate import resolve_edit_mode
-from backend.free.agent.output_format import WRITTEN_PATH_RE, anchor_relative_output_path
-from backend.free.agent.write_gate import WRITE_DENIED_RE
+from backend.free.agent.output_format import (
+    WRITTEN_PATH_RE,
+    anchor_relative_output_path,
+    written_paths,
+)
+from backend.free.agent.write_gate import WRITE_DENIED_RE, overwrite_exempt
 from backend.io.text_file import decode_text_prefix_for_display
 from backend.io.user_file import record_backups
 from backend.i18n_helper import msg
@@ -48,6 +57,7 @@ from backend.free.agent.meta_cognitive_utils import (
     try_parse_tool_dict,
     call_callback,
     fix_json_backslashes,
+    strip_task_log_scaffold,
     summarize_file_content,
 )
 from backend.free.agent.step_compactor import StepCompactor
@@ -66,6 +76,7 @@ from backend.free.agent.meta_cognitive_content import _ContentGenerationMixin
 from backend.free.agent.meta_cognitive_fast_path import _FastPathMixin
 from backend.free.agent.meta_cognitive_task_exec import (
     _TaskExecutionMixin,
+    _path_key,
     delivery_roots,
     relative_to_roots,
 )
@@ -154,6 +165,61 @@ _PREVIEW_FENCE_LANGUAGES: dict[str, str] = {
 _PLANNED_PATH_MIN_SIMILARITY = 0.8
 #: 同上、basename の長さの差の上限 (文字)。
 _PLANNED_PATH_MAX_LEN_DELTA = 2
+
+
+#: 計画の入力に添えるファイルの状態の英語の表示 (``file_ledger`` の状態の語彙)。
+_PLAN_FILE_STATUS_LABELS: dict[str, str] = {
+    "listed": "seen in a folder listing (content not read)",
+    "read_ok": "content read",
+    "read_failed": "read failed",
+    "written": "written",
+}
+#: 計画の入力に添えるファイルの状態とフォルダの上限 (新しい方を残す)。計画のプロンプト
+#: は短く保つ (計画の時間は応答の待ち時間に直接乗る)。
+_PLAN_FILE_STATUS_MAX = 12
+_PLAN_FOLDER_MAX = 4
+
+
+def _session_files_block(session_id: str) -> str:
+    """計画の入力に添える、この会話のファイルの記録 (台帳から決定論で組む。無ければ空)。
+
+    利用者が名指したフォルダ (依頼文が挙げた / 名指しの記録の親) と、その中のファイル
+    (と裸の名前で読めなかったファイル) のフルパスと状態を並べる。計画モデルはこれを
+    見て、裸の名前ではなくフルパスでタスクを書ける。LLM が自分で一覧した / 読んだ
+    フォルダは載せない。件数は小さく切る。
+    """
+    import os
+
+    from backend.free.agent.file_ledger import file_statuses, ledger_folders
+
+    if not session_id:
+        return ""
+    folders = ledger_folders(session_id, named_only=True)[:_PLAN_FOLDER_MAX]
+    keys = {os.path.normcase(os.path.abspath(f)) for f in folders}
+    statuses = [
+        s for s in file_statuses(session_id)
+        if not os.path.dirname(s.path)
+        or os.path.normcase(os.path.abspath(os.path.dirname(s.path))) in keys
+    ][-_PLAN_FILE_STATUS_MAX:]
+    if not folders and not statuses:
+        return ""
+    lines = [
+        "Files in this conversation (recorded at execution time; "
+        "refer to them by these full paths):",
+    ]
+    lines += [f"- folder: {folder}" for folder in folders]
+    for status in statuses:
+        label = _PLAN_FILE_STATUS_LABELS.get(status.status, status.status)
+        if status.status == "read_failed" and status.error_kind:
+            label = f"{label} ({status.error_kind})"
+        lines.append(f"- {status.path}: {label}")
+    return "\n".join(lines)
+
+
+def _contained_in_any(text: str, blocks: list[str]) -> bool:
+    """空白を畳んだ ``text`` がいずれかのブロックに含まれるか (純粋関数)。"""
+    needle = " ".join(text.split())
+    return bool(needle) and any(needle in " ".join(b.split()) for b in blocks)
 
 
 def _nearest_user_path(planned: str, user_paths: list[str]) -> str | None:
@@ -335,6 +401,18 @@ class MetaCognitiveAgent(
             learning_policy_cfg.get("activation_min_confidence", 0.7),
         )
         self._constants_cache: AgentConstants | None = None
+        # このターンで取得済みの URL → 結果 (同じ URL を取り直さない、f_03 §4.2.1)
+        self._turn_fetches: dict[str, str] = {}
+        # このターンの主の取得 (判定したツールのファストパスが成功した取得) の
+        # (呼出しの鍵, 結果)。ループの繰り返しを書込みの合図にする素材の出所 (f_03 §4.2.1)
+        self._primary_results: list[tuple[str, str]] = []
+        # このターンの取得系の呼出し → 結果 / 実行中のタスクでの同じ結果の繰り返し回数
+        self._turn_call_results: dict[str, str] = {}
+        self._task_repeat_counts: dict[str, int] = {}
+        # 実行中の計画 (後の書込みタスクの宛先を見る、f_03 §4.2.1)
+        self._plan_tasks: list[TaskItem] = []
+        # 計画モデルの出力 (正規化前のタスク, 位置ごとのラベル)。記録のみ (f_03 §4.3)
+        self._planner_output: PlannerOutput | None = None
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -557,6 +635,28 @@ class MetaCognitiveAgent(
         # データ取得系ツール (fetch_url / read_file 等) の生結果をタスク横断で蓄積。
         # 表/ファイル生成タスクが取得済み実データを直接参照し、転記ハルシネーションを防ぐ。
         self._fetched_tool_outputs: list[str] = []
+        # 素材の位置 → 積んだ取得のツール名 (主の取得が空振りしたタスクの付随の読込みを捨てる)
+        self._material_tools: dict[int, str] = {}
+        # このターンでエラーを返した取得の URL の鍵 → 結果 (同じ URL を取りに行き直さない)
+        self._turn_fetch_errors: dict[str, str] = {}
+        # このターンで取得系ツールを撃ったか (成否を問わない)。前のタスクが撃って
+        # 素材が 1 件も積まれなければ、書込みの本文を生成しない
+        # (``_resolve_write_content``)。前のタスクの分はタスクの開始時に写す。
+        self._retrieval_attempted = False
+        self._earlier_retrieval_attempted = False
+        # タスクの位置 → そのタスクの開始時の ``_retrieval_attempted`` (作り直しで写し戻す)
+        self._retrieval_before_task: dict[int, bool] = {}
+        self._turn_fetches = {}
+        # このターンの書込みの記録 ({宛先: 本文の指紋}) と宛先のターン開始時の内容、
+        # 素材不足で書かなかった宛先の「足りないもの」(``_FastPathMixin``)。
+        self._turn_writes = {}
+        self._turn_start_contents = {}
+        self._insufficient_source_missing = {}
+        self._primary_results = []
+        self._turn_call_results = {}
+        self._task_repeat_counts = {}
+        self._plan_tasks = []
+        self._planner_output = None
         # 直近会話。write 全経路 (fast path / tool-loop / auto-recovery) が
         # 合流する _generate_content から参照する。個別に引数を通すと経路ごとの
         # 漏れが出るため、リクエストごとの状態としてここで一括保持する。
@@ -594,6 +694,7 @@ class MetaCognitiveAgent(
             # (f_10 §11。旧経路では 1,000 トークン超の prefill で毎回 15 秒前後かかっていた)。
             recent_write = self._recent_file_write_plan(query)
             deterministic = False
+            planned = False
             if recent_write is not None:
                 tasks = recent_write
             elif getattr(self._production_stage, "deterministic_plan", False):
@@ -601,6 +702,7 @@ class MetaCognitiveAgent(
                 tasks = [TaskItem(description=f"Create the requested deliverable: {query}")]
             else:
                 tasks = await self._plan(query, conversation, llm_client, on_step)
+                planned = bool(tasks)
             if not tasks:
                 tasks = [TaskItem(description=query)]
             # 計画に回した直近ファイルへの書込み (前段・後段・書き換え) は、パスの無い
@@ -624,6 +726,9 @@ class MetaCognitiveAgent(
             # 過分割された書き込みタスクを 1 件へ集約する (1 リクエスト=1 タブ)。
             if self._output_target in ("editor", "chat"):
                 tasks = collapse_editor_write_tasks(tasks)
+            # 正規化の済んだタスク文で書込みのタスクかを 1 回ずつ判定・記録する
+            # (判定点 task_write_intent、docs/f_03 §4.3)
+            record_task_write_verdicts(tasks)
             logger.info(
                 "Plan generated: %d tasks (mode=%s, output=%s)",
                 len(tasks), self._mode, self._output_target,
@@ -659,6 +764,9 @@ class MetaCognitiveAgent(
                 )
             # 書込みに失敗したタスクへ「どのファイルへの何が / 変わっていないか」を刻む
             self._annotate_write_failures(tasks, query, all_tool_calls)
+            # 計画モデルの種別のラベルを判定と結末に並べて記録する (記録のみ、f_03 §4.3)
+            if planned and self._planner_output is not None:
+                log_plan_task_kinds(tasks, self._planner_output, self._debug_logger)
 
         # Step 3: 最終応答を組み立て
         if self._needs_input_question:
@@ -774,7 +882,9 @@ class MetaCognitiveAgent(
                 scope="request",
             )
 
-        user_content = self._build_plan_user_content(query, conversation)
+        user_content = self._build_plan_user_content(
+            query, conversation, session_id=getattr(self, "_session_id", "") or "",
+        )
         prompt = f"{PLAN_SYSTEM_PROMPT}\n\n{user_content}"
 
         try:
@@ -805,7 +915,12 @@ class MetaCognitiveAgent(
 
         tasks_raw = data.get("tasks") if isinstance(data, dict) else None
         if isinstance(tasks_raw, list):
-            tasks = [TaskItem(description=str(t)) for t in tasks_raw if t]
+            kinds = parse_plan_task_kinds(data.get("kinds"), len(tasks_raw))
+            tasks = [
+                TaskItem(description=str(t), plan_kind=k)
+                for t, k in zip(tasks_raw, kinds, strict=True) if t
+            ]
+            self._planner_output = PlannerOutput(tasks=list(tasks), kinds=kinds)
             tasks = self._ensure_build_task(query, tasks)
             return self._normalize_planned_paths(query, tasks)
 
@@ -867,7 +982,7 @@ class MetaCognitiveAgent(
             return
         for task in tasks:
             if (
-                task_expects_write(task.description)
+                task_writes(task)
                 and is_edit_request(task.description)
                 and not extract_write_target_path(task.description)
             ):
@@ -891,7 +1006,9 @@ class MetaCognitiveAgent(
 
         path = extract_write_target_path(task.description) or ""
         if path:
-            return _resolve_referenced_path(path, getattr(self, "_conversation", None)) or path
+            return _resolve_referenced_path(
+                path, getattr(self, "_conversation", None), for_write=True,
+            ) or path
         return self._recent_file_target
 
     def _annotate_write_failures(
@@ -913,10 +1030,17 @@ class MetaCognitiveAgent(
         append = self._pure_append_requested(query)
         wrote_any = any(tc.get("tool") in WRITE_PATH_TOOLS for tc in all_tool_calls)
         for task in tasks:
-            if task.status != "failed" or not task_expects_write(task.description):
-                continue
             result = task.result or ""
+            # 判定が棄権でも書込みの経路を走って断られたタスク (検索と保存を 1 タスクに
+            # 持つタスク、``_write_after_search``) は書込みの失敗として注記する
+            if task.status != "failed" or not (
+                task_writes(task) or _WRITE_REJECTION_RE.search(result)
+            ):
+                continue
             if self._partial_write_note(result) or self._write_denied_note(result):
+                continue
+            if "(insufficient_source)" in result and task.failure_note:
+                # 足りないもの (生成側の申告) つきの注記を書込みの経路が刻み済み
                 continue
             target = self._task_write_target(task)
             reason = self._write_failure_reason(result)
@@ -939,14 +1063,14 @@ class MetaCognitiveAgent(
 
         ユーザーが「作成 / 生成 / create / implement…」等で明確にプログラム生成を求めて
         いるのに、plan が "Design the game structure…" のような設計・分析タスクのみを返すと、
-        codegen 経路 (条件: ``task_expects_write`` が True) に乗らず実ファイルが生成されない
+        codegen 経路 (条件: 書込みのタスク = ``task_writes``) に乗らず実ファイルが生成されない
         (status=done でもテキストの設計文書しか出ない)。その退化時に限り、全体を単一の生成
         タスクへ正規化して codegen に乗せる。実際の生成内容は ``original_query`` 駆動なので、
         タスク記述はルーティング用途で十分。
         """
-        if not tasks or not task_expects_write(query):
+        if not tasks or not task_write_verdict(query).fired:
             return tasks
-        if any(task_expects_write(t.description) for t in tasks):
+        if any(task_writes(t) for t in tasks):
             return tasks
         logger.warning(
             "Plan produced no write task for a build request; normalizing to a "
@@ -1030,7 +1154,7 @@ class MetaCognitiveAgent(
         if any(_EXPLICIT_PATH_RE.search(t.description) for t in tasks):
             return tasks
         for t in tasks:
-            if task_expects_write(t.description):
+            if task_writes(t):
                 logger.warning(
                     "Plan dropped the user's explicit output path; "
                     "re-attaching %s to task: %s",
@@ -1058,25 +1182,30 @@ class MetaCognitiveAgent(
 
     @staticmethod
     def _build_plan_user_content(
-        query: str, conversation: list[dict],
+        query: str, conversation: list[dict], *, session_id: str = "",
     ) -> str:
-        """計画生成用のユーザーメッセージを構築する"""
-        if not conversation:
-            return query
+        """計画生成用のユーザーメッセージを構築する
+
+        直近の会話 (4 発話 × 200 字) に加えて、この会話のファイルの記録 (台帳の
+        フォルダ・フルパス・状態) を決定論で添える。2026-10-05 ライブ監査 T6:
+        計画モデルは直近の会話しか見ず、「部署ごとの平均給与を…」に staff.csv
+        ではなく buggy.py を読む計画を立てた (staff.csv は 4 発話より前にしか無い)。
+        """
         recent_lines: list[str] = []
-        for msg in conversation[-4:]:
-            role = msg.get("role", "")
-            content = msg.get("content", "")[:200]
+        for message in (conversation or [])[-4:]:
+            role = message.get("role", "")
+            content = message.get("content", "")[:200]
             if role in ("user", "assistant"):
                 recent_lines.append(f"{role}: {content}")
-        if not recent_lines:
+        parts: list[str] = []
+        if recent_lines:
+            parts.append("Recent conversation:\n" + "\n".join(recent_lines))
+        files_block = _session_files_block(session_id)
+        if files_block:
+            parts.append(files_block)
+        if not parts:
             return query
-        return (
-            "Recent conversation:\n"
-            + "\n".join(recent_lines)
-            + "\n\nCurrent request: "
-            + query
-        )
+        return "\n\n".join(parts) + "\n\nCurrent request: " + query
 
     async def _run_tasks(
         self,
@@ -1100,6 +1229,7 @@ class MetaCognitiveAgent(
 
         steps = 0
         total_tasks = len(tasks)
+        self._plan_tasks = tasks
 
         for i, task in enumerate(tasks):
             if steps >= self.max_steps:
@@ -1115,12 +1245,16 @@ class MetaCognitiveAgent(
                     "status": "running",
                 })
 
+            self._earlier_retrieval_attempted = self._retrieval_attempted
+            self._retrieval_before_task[i] = self._retrieval_attempted
+            materials_before = (len(self._fetched_tool_outputs), len(self._turn_fetches))
+            self._task_repeat_counts = {}
             if (
                 (
                     self._output_target in ("editor", "chat")
                     or (self._output_target == "file" and self._production_stage is not None)
                 )
-                and task_expects_write(task.description)
+                and task_writes(task)
             ):
                 # 出力先パス未指定 (editor/chat): ディスク書込せずコードを生成し
                 # エディタ/チャットへ。production_stage 設定時は file 出力も同じ
@@ -1146,6 +1280,7 @@ class MetaCognitiveAgent(
                     task, result, tool_calls,
                     destination_known=self._task_destination_known(task),
                 )
+            self._settle_failed_task_materials(task, tool_calls, materials_before)
 
             all_tool_calls.extend(tool_calls)
             context_parts.append(f"[{task.description}]: {result[:200]}")
@@ -1156,15 +1291,18 @@ class MetaCognitiveAgent(
             # MDP トレース: ステップ記録
             tracer = self._agent_tracer
             if tracer is not None and episode_id:
+                # 同じターンで取得済みの結果を返しただけの実行 (``cached``) は
+                # 撃ったツールに数えない — 近道の結果を正例にしない (不変則 #15)
+                executed = [tc for tc in tool_calls if not tc.get("cached")]
                 tool_names = ", ".join(
-                    tc.get("tool", "") for tc in tool_calls
-                ) if tool_calls else "none"
+                    tc.get("tool", "") for tc in executed
+                ) if executed else "none"
                 # タスクが完了扱いでも、使ったツールが軒並み情報ゼロ (0 件検索 /
                 # 非ゼロ終了コマンド) なら reward は 0。「実行できた」を成功として
                 # credit を配ると、空振りするツール選択が正例に化ける。
                 # ツール未使用のタスク (純生成) は従来どおり status のみで判定する。
-                produced_info = not tool_calls or any(
-                    tc.get("success") for tc in tool_calls
+                produced_info = not executed or any(
+                    tc.get("success") for tc in executed
                 )
                 reward = 1.0 if task.status == "done" and produced_info else 0.0
                 tracer.record_step(episode_id, MDPStep(
@@ -1454,7 +1592,10 @@ class MetaCognitiveAgent(
                 continue
             # 中身の違う既存ファイルは、書き手 (backend/io/user_file.py) が上書きの前に
             # bk/overwrite/ へ退避する。退避できなければ書かない (f_11 §5.6)。
-            with record_backups() as backups:
+            # 上書きの門 (§4.y) は掛けない — 退避と delivery の replaced が置き換えを見せるので、
+            # 作り直し・手直し (別のセッションからを含む) は既存の成果物を書き換えてよい。
+            # 門で断るとこのループが理由も中身も無い失敗に畳む (2026-10-05 H1 / 3 周目)
+            with record_backups() as backups, overwrite_exempt():
                 _text, entries = await self._write_file(
                     file_path, art.content, tools_registry, on_step, prefix,
                 )
@@ -1733,7 +1874,7 @@ class MetaCognitiveAgent(
         failed_writes = [
             (i, task) for i, task in enumerate(tasks)
             if task.status == "failed"
-            and task_expects_write(task.description)
+            and task_writes(task)
         ]
         if not failed_writes:
             return steps
@@ -1749,6 +1890,16 @@ class MetaCognitiveAgent(
             if task.result and WRITE_DENIED_RE.match(task.result):
                 # 書込みゲートの判定は作り直しても変わらない (docs/f_03 §4.y)。
                 logger.info("Skipping retry for a denied write: %s", task.description[:80])
+                continue
+            if task.result and (
+                "(no_source_data)" in task.result
+                or "(insufficient_source)" in task.result
+            ):
+                # 前のタスクの取得が素材を返さなかった事実は作り直しても変わらない
+                logger.info(
+                    "Skipping retry for a write without source data: %s",
+                    task.description[:80],
+                )
                 continue
             if task.result and "(edit_without_change)" in task.result:
                 # 差分指示つきの再生成まで済んだ上での棄却。同じ生成を作り直しても
@@ -1773,6 +1924,10 @@ class MetaCognitiveAgent(
                 })
 
             task.status = "pending"
+            # 書込みの門は作り直すタスクの開始時の取得の有無で見る (最後のタスクのものでなく)
+            self._earlier_retrieval_attempted = self._retrieval_before_task.get(i, False)
+            materials_before = (len(self._fetched_tool_outputs), len(self._turn_fetches))
+            self._task_repeat_counts = {}
             result, tool_calls = await self._execute_task(
                 task, query, system_prompt, conversation,
                 llm_client, tools_registry, enriched_context,
@@ -1786,6 +1941,7 @@ class MetaCognitiveAgent(
                 task, result, tool_calls,
                 destination_known=self._task_destination_known(task),
             )
+            self._settle_failed_task_materials(task, tool_calls, materials_before)
             all_tool_calls.extend(tool_calls)
             steps += 1
 
@@ -1823,7 +1979,7 @@ class MetaCognitiveAgent(
         from backend.free.agent.tool_call_judge import _resolve_referenced_path
 
         path = _resolve_referenced_path(
-            query_path, getattr(self, "_conversation", None),
+            query_path, getattr(self, "_conversation", None), for_write=True,
         )
         if path:
             logger.info(
@@ -1864,9 +2020,16 @@ class MetaCognitiveAgent(
         task_description: str,
         tools_registry,
     ):
-        """タスク記述に対してツール判定を行う
+        """タスク記述に対してツール判定を行う (docs/f_03 §4.2.1)
 
-        write 期待タスク (``task_expects_write``) は決定論的な
+        判定器 (``ToolCallJudge``) がツールを選べばそれで確定する。判定器がツール無し
+        を返したとき (大半は棄権 — どの層も当たらない / 分類器の例外・時間切れ) と、
+        判定器が無い・例外で落ちたときは ``infer_tool_from_task`` で埋める
+        (不変則 #15: 近道が埋めてよいのは棄権)。推論の ``search_code`` は依頼文が
+        名指したフォルダの中だけを探す — CWD を補わない (``infer_tool_from_task``)。
+        推論が何も返さなければ、取得済みデータからの答え / ツールループへ委ねる。
+
+        書込みのタスク (判定点 ``task_write_intent`` の ``fire``) は決定論的な
         ``infer_tool_from_task`` を先に試す。``ToolCallJudge.judge()`` の
         Step 0 (URL recall) は mode に依らず無条件・最優先で発火し、ヒットすると
         以降の全判定層を丸ごとスキップして即確定するため、write 期待タスクの
@@ -1874,7 +2037,7 @@ class MetaCognitiveAgent(
         fetch_url 等へハイジャックされてしまう (例: 「docx を出力して」が
         過去の全く無関係な URL fetch 記憶と誤マッチする)。
         """
-        if task_expects_write(task_description):
+        if task_write_verdict(task_description).fired:
             inferred = infer_tool_from_task(task_description)
             if inferred is not None and inferred[0] == "write_file":
                 from backend.free.agent.tool_call_judge import ToolJudgement
@@ -2170,37 +2333,137 @@ class MetaCognitiveAgent(
         tasks: list[TaskItem],
         context_parts: list[str],
     ) -> str:
-        """タスク結果から最終応答を組み立て"""
+        """タスク結果から最終応答を組み立て
+
+        先頭に進捗ノート行 (``- [<status>] <タスク>`` と、行がすべて進捗ノート形式の
+        結果) をまとめ、その後ろに本文を並べる。``chat_stream_meta`` は先頭の
+        ノート行を ``strip_task_log_scaffold`` で落として本文を得る。タスクごとに
+        「ノート行 + 結果」を交互に並べると 2 件目以降のノート行が本文の途中に残り、
+        残骸判定で本文ごと件数の 1 文に置き換わる (2026-10-03 ライブ監査 run15:
+        「取得 → 要約」の要約が捨てられた、docs/f_03 §4.2.1)。
+        """
         if not tasks:
             return "No tasks were generated."
 
-        parts: list[str] = []
-        for task in tasks:
-            parts.append(f"- [{task.status}] {task.description}")
-            partial = (
-                MetaCognitiveAgent._partial_write_note(task.result or "")
-                if task.status == "failed" else ""
+        single = len(tasks) == 1
+        done = sum(1 for t in tasks if t.status == "done")
+        # 取得ツールの生の出力は後続タスクの素材。答えになるのは完了したタスクが
+        # すべて取得のときだけ (失敗・未実行のタスクは数えない)
+        retrieval_only = done > 0 and all(
+            getattr(t, "retrieved", False) for t in tasks if t.status == "done"
+        )
+        # 宛先ごとの最後に書いた完了タスク。提示はそのタスクだけが出す (中身は
+        # ディスクから読み戻すので、前のタスクの分は同じ内容の二重になる)
+        last_writer = {
+            _path_key(path): i
+            for i, t in enumerate(tasks) if t.status == "done"
+            for path in written_paths(t.result or "")
+        }
+        log_lines: list[str] = []
+        # (種別, 文)。種別は answer (完了タスクの答え) / block (書いた内容の提示) /
+        # written (提示できなかった書込み先の 1 文) / note (失敗の注記)
+        body: list[tuple[str, str]] = []
+        unnoted_failures = 0
+        shown_retrievals: set[str] = set()
+        for i, task in enumerate(tasks):
+            log_lines.append(f"- [{task.status}] {task.description}")
+            parts = MetaCognitiveAgent._task_body_parts(task, single, retrieval_only)
+            if task.status == "done" and getattr(task, "retrieved", False):
+                # 同じターンで取得済みの結果 (取り直さずに返した cached) を 2 度出さない
+                if task.result in shown_retrievals:
+                    parts = []
+                shown_retrievals.add(task.result)
+            if task.status == "failed" and not parts:
+                unnoted_failures += 1
+            kind = "answer" if task.status == "done" else "note"
+            for part in parts:
+                if not strip_task_log_scaffold(part).strip():
+                    # ``Written N bytes to …`` 等、行がすべて進捗ノート形式の結果
+                    log_lines.append(f"    {part}")
+                else:
+                    body.append((kind, part.strip("\n").lstrip(" ")))
+            if task.status == "done":
+                body += MetaCognitiveAgent._written_presentation(
+                    task.result or "",
+                    superseded=frozenset(k for k, j in last_writer.items() if j > i),
+                )
+        blocks = [text for kind, text in body if kind == "block"]
+        if blocks:
+            # 「生成 → 保存」の生成した答えを、書いた内容の提示と 2 度出さない
+            body = [
+                (kind, text) for kind, text in body
+                if kind != "answer" or not _contained_in_any(text, blocks)
+            ]
+        if all(kind == "written" for kind, _ in body):
+            # 書込み先だけのターンは chat_stream_meta の 1 文 (失敗の有無を含む) に任せる
+            body = []
+        texts = [text for _, text in body]
+        if texts and unnoted_failures:
+            # 答えだけを出して失敗を伏せない (注記のある失敗は注記が伝える)
+            failed = sum(1 for t in tasks if t.status == "failed")
+            texts.append(
+                msg("agent.tasks_partially_done", done=done, failed=failed)
+                if done else msg("agent.tasks_all_failed")
             )
-            denied = (
-                MetaCognitiveAgent._write_denied_note(task.result or "")
-                if task.status == "failed" else ""
-            )
+        if texts:
+            log_lines.append("\n\n".join(texts))
+        # 表の集計と食い違った答えの注記は最終応答の末尾へ (strip_system_notes が落とせる位置)
+        notes = "".join(dict.fromkeys(
+            t.output_note for t in tasks
+            if t.status == "done" and getattr(t, "output_note", "")
+        ))
+        return "\n".join(log_lines) + (notes if texts else "")
+
+    @staticmethod
+    def _written_presentation(
+        result: str, superseded: frozenset[str] = frozenset(),
+    ) -> list[tuple[str, str]]:
+        """完了した書込みタスクが本文へ出す書いた内容の提示と、提示できなかった書込み先。
+
+        提示ブロック (``_written_content_block``) が組めない書込み (リッチ文書 /
+        読み戻せない / 制作ステージの結果行 / 書式の注記付き) は、書いた先を
+        ``agent.files_written`` の 1 文で添える。添えないと答えのあるターンでは
+        書込み先が本文から消える (docs/f_03 §4.2.1)。``superseded`` (``_path_key``)
+        の宛先は後のタスクがもう一度書いたので、ここでは出さない。
+        """
+        paths = [p for p in written_paths(result) if _path_key(p) not in superseded]
+        if not paths:
+            return []
+        out: list[tuple[str, str]] = []
+        match = WRITTEN_PATH_RE.search(result)
+        block = (
+            MetaCognitiveAgent._written_content_block(result)
+            if match is not None and _path_key(match.group(1).strip()) not in superseded
+            else ""
+        )
+        shown = ""
+        if block:
+            out.append(("block", block))
+            shown = match.group(1).strip()
+        rest = [p for p in paths if p != shown]
+        if rest:
+            out.append(("written", msg("agent.files_written", paths="、".join(rest))))
+        return out
+
+    @staticmethod
+    def _task_body_parts(
+        task: TaskItem, single: bool, retrieval_only: bool,
+    ) -> list[str]:
+        """タスク 1 件が最終応答へ出す結果・注記 (出さなければ空。純粋関数)。"""
+        if task.status == "failed":
+            partial = MetaCognitiveAgent._partial_write_note(task.result or "")
             if partial:
-                parts.append(f"    {partial}")
-            elif denied:
-                parts.append(denied)
-            elif task.status == "failed" and task_expects_write(task.description):
+                return [partial]
+            denied = MetaCognitiveAgent._write_denied_note(task.result or "")
+            if denied:
+                return [denied]
+            if task_writes(task):
                 # write 期待タスクの失敗時、無関係なツール結果 (誤ってハイジャック
                 # された fetch_url の webpage 抽出テキスト等) をそのままユーザーへ
                 # 露出させない。ただし **自前の棄却理由コード** は安全に出せるので
                 # 添える (理由を伏せるとモデルが次のターンで作り話をする。
                 # _WRITE_REJECTION_CODES のコメント参照)。
-                if task.failure_note:
-                    # どのファイルへの何が失敗し、ファイルが無事か (docs/f_03 §4.3)
-                    parts.append(f"    {task.failure_note}")
-                else:
-                    reason = MetaCognitiveAgent._write_failure_reason(task.result or "")
-                    parts.append(f"    (書き込みが実行されませんでした{reason})")
+                #
                 # ここで ``task.result`` を出してはいけない。中身は
                 # 「このタスクが生成した成果物」とは限らず、ハイジャックされた
                 # 別ツールの出力 (fetch_url の webpage 抽出等) でありうる —
@@ -2213,19 +2476,26 @@ class MetaCognitiveAgent(
                 # (chat.py の ``indicates_write_destination``)、
                 # ``_execute_editor_task`` が本文として返す。書込み先が
                 # 分かっているのに書けなかったターンだけがここへ来る。
-            elif task.result:
-                # 本文はここから取り出される (chat_stream_meta._meta_cognitive_body_text)。
-                # 500 文字で切ると回答が計算の途中で終わり、finish_reason=length では
-                # ないので切断の開示も出ない (2026-09-05 ライブ監査 F-09: p 値の
-                # 導出が「= √[ 0.04645 × 0.9」で終わった)。UI の step 見出し側の
-                # 切り詰めは chat_stream_meta に残す。
-                parts.append(f"    {task.result}")
-                # 書込みタスクは「Written N bytes to …」だけでは中身が分から
-                # ない。実ファイルを読み戻して本文も見せる (2026-09-08 F-05)。
-                # 進捗ノート行と違って字下げしない — フェンスを崩さず、
-                # ``strip_task_log_scaffold`` の後に本文として残るため。
-                written = MetaCognitiveAgent._written_content_block(task.result)
-                if written:
-                    parts.append(written)
-
-        return "\n".join(parts)
+                if task.failure_note:
+                    # どのファイルへの何が失敗し、ファイルが無事か (docs/f_03 §4.3)
+                    return [task.failure_note]
+                reason = MetaCognitiveAgent._write_failure_reason(task.result or "")
+                return [f"(書き込みが実行されませんでした{reason})"]
+            if task.failure_note:
+                # 取得の後の処理に失敗した (docs/f_03 §4.2.1)。生の結果は出さない
+                return [task.failure_note]
+            # 注記の無い失敗の結果 (``Error: …`` 等) は、単独タスクなら唯一の手掛かり
+            # なので出す。複数タスクでは件数の 1 文で伝える (呼出側)。
+            return [task.result] if single and task.result else []
+        if not task.result:
+            return []
+        if getattr(task, "retrieved", False) and not retrieval_only:
+            # 後続タスクの素材 (中身は task_result の step で見えている)
+            return []
+        # 500 文字で切ると回答が計算の途中で終わり、finish_reason=length では
+        # ないので切断の開示も出ない (2026-09-05 ライブ監査 F-09: p 値の
+        # 導出が「= √[ 0.04645 × 0.9」で終わった)。UI の step 見出し側の
+        # 切り詰めは chat_stream_meta に残す。
+        # 書込みタスクの書いた内容は ``_written_presentation`` が添える
+        # (「Written N bytes to …」だけでは中身が分からない、2026-09-08 F-05)。
+        return [task.result]

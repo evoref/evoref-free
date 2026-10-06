@@ -27,11 +27,39 @@ def _base_name(expr: ast.expr) -> str | None:
     return None
 
 
-def _call_name(func: ast.expr) -> str | None:
+#: リテラル (とその内包表記) の受け手。メソッドは組込み型のものでプロジェクト内の定義ではない。
+_LITERAL_RECEIVERS = (
+    ast.Constant, ast.JoinedStr, ast.List, ast.Dict, ast.Set, ast.Tuple,
+    ast.ListComp, ast.DictComp, ast.SetComp,
+)
+
+
+def _dotted_receiver(expr: ast.expr) -> str:
+    """``a.b`` のような名前の連なりならその文字列、それ以外の受け手は ``""``。"""
+    parts: list[str] = []
+    while isinstance(expr, ast.Attribute):
+        parts.append(expr.attr)
+        expr = expr.value
+    if not isinstance(expr, ast.Name):
+        return ""
+    parts.append(expr.id)
+    return ".".join(reversed(parts))
+
+
+def _call_name(func: ast.expr) -> tuple[str, str | None] | None:
+    """``(呼出名, 受け手)``。受け手は :class:`RawCall` の ``receiver`` と同じ規約。
+
+    リテラルを受け手にした呼出 (``"a".split()``) は ``None`` (プロジェクト内を呼ばない)。
+    """
     if isinstance(func, ast.Name):
-        return func.id
+        return func.id, None
     if isinstance(func, ast.Attribute):
-        return func.attr
+        if isinstance(func.value, _LITERAL_RECEIVERS):
+            return None
+        value = func.value
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "super":
+            return func.attr, "super"
+        return func.attr, _dotted_receiver(value)
     return None
 
 
@@ -47,6 +75,8 @@ class _Extractor(ast.NodeVisitor):
         self.seen_qualnames: dict[str, int] = {}
         self.nodes: list[Node] = []
         self.imports: list[str] = []
+        self.import_names: list[tuple[str, str]] = []
+        self.import_bindings: dict[str, tuple[str, str | None]] = {}
         self.calls: list[RawCall] = []
         self.inherits: list[tuple[str, str]] = []
 
@@ -106,21 +136,35 @@ class _Extractor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:  # noqa: N802
         self.imports.extend(alias.name for alias in node.names)
+        for alias in node.names:
+            if alias.asname:
+                self.import_bindings[alias.asname] = (alias.name, None)
+            else:
+                top = alias.name.split(".", 1)[0]
+                self.import_bindings[top] = (top, None)
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802
         # 相対 import (``level > 0``) はプロジェクト内解決の規則を持たない
         # ため対象外 (tree-sitter 版と同じ割り切り)。
-        if node.module and node.level == 0:
+        # ``from __future__ import …`` はコンパイラ指示で import ではない (tree-sitter 版も拾わない)
+        if node.module and node.level == 0 and node.module != "__future__":
             self.imports.append(node.module)
+            for alias in node.names:
+                if alias.name != "*":
+                    self.import_names.append((node.module, alias.name))
+                    self.import_bindings[alias.asname or alias.name] = (node.module, alias.name)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
-        callee = _call_name(node.func)
-        if callee and self.stack:
+        called = _call_name(node.func)
+        if called and self.stack:
             parent_info = self.entries.get(id(self.stack[-1]))
             if parent_info is not None:
-                self.calls.append(RawCall(caller_id=parent_info["id"], callee_name=callee))
+                callee, receiver = called
+                self.calls.append(RawCall(
+                    caller_id=parent_info["id"], callee_name=callee, receiver=receiver,
+                ))
         self.generic_visit(node)
 
 
@@ -141,6 +185,7 @@ def extract_file(path: str, source: str) -> ExtractedFile | None:
         path=path, lang="python", line_count=max(line_count, 1),
         nodes=extractor.nodes, imports=extractor.imports,
         calls=extractor.calls, inherits=extractor.inherits,
+        import_names=extractor.import_names, import_bindings=extractor.import_bindings,
     )
 
 

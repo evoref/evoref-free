@@ -21,7 +21,7 @@ from backend.free.api.schemas import (
 )
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.constants import search_history_display_text
-from backend.free.agent.output_format import PRODUCTION_WROTE_RE, WRITTEN_PATH_RE
+from backend.free.agent.output_format import WRITTEN_PATH_RE, written_paths
 from backend.free.agent.meta_cognitive_utils import (
     looks_like_task_log_residue,
     strip_task_log_scaffold,
@@ -313,13 +313,8 @@ def _written_paths(tasks) -> list[str]:
     """
     paths: list[str] = []
     for task in tasks or []:
-        result = str(getattr(task, "result", "") or "")
-        found = [m.group(1).strip() for m in _WRITTEN_PATH_RE.finditer(result)]
-        # 制作ステージは 1 行に書いた先を並べる (``Wrote N file(s) via production stage: a, b``)
-        for match in PRODUCTION_WROTE_RE.finditer(result):
-            found += [p.strip() for p in (match.group("paths") or "").split(", ")]
-        for path in found:
-            if path and path not in paths:
+        for path in written_paths(str(getattr(task, "result", "") or "")):
+            if path not in paths:
                 paths.append(path)
     return paths
 

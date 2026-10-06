@@ -8,19 +8,31 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from backend.free.agent.tool_judge_args import (
     _extract_file_path,
     _extract_file_path_literal,
     _extract_head_line_count,
+    extract_write_target_path,
 )
+from backend.free.agent.router import (
+    _referential_destination,
+    explicit_path_is_topic_only,
+    file_name_cases,
+    filename_is_topic_only,
+    write_intent_probe,
+)
+from backend.free.agent.safety_patterns import strip_command_literals
 from backend.free.agent.tool_judge_types import ToolJudgement
 from backend.free.agent.tools_registry import ToolsRegistry
 from backend.free.core.intent_vocab import (
     REFERENTIAL_WRITE_TARGET_RE,
     strip_file_reference_clauses,
+    write_prohibited,
 )
+from backend.free.core.session_mode import is_create_mode
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -65,16 +77,66 @@ def _path_is_written_in_query(query: str) -> bool:
     return bool(literal and _PATH_SEPARATOR_RE.search(literal))
 
 
+def write_target_is_topic_only(query: str, *, whole_request: bool = False) -> bool:
+    """書込み先の候補が話題・根拠の格にしか立たない、または書込みが禁止されているか (純粋関数)。
+
+    「このファイル**に対する** pytest のテストを書いて」「util_fixed.py **に対する**
+    テストを書いて」の名指しは何について書くかの題材で、書込みの宛先ではない。規則層は
+    宛先かをルータの宛先の証拠と **同じ 1 本・同じ入力** で決める (#14 (a)、docs/f_03 §1.4):
+    格と保存の動詞は依頼節 (``write_intent_probe``、create は ``whole_request``) で見る。
+    本文にパスが無ければ参照表現を ``router._referential_destination`` (参照表現は発話から
+    取る — 説明節の参照表現は依頼節の正規化で消えるため)、裸のファイル名 (相対パス) は
+    ``router.filename_is_topic_only``、ディレクトリ付きのパスは
+    ``router.explicit_path_is_topic_only``。書込みの禁止 (「ファイルには保存しないで」) も真。
+    真なら ``write_file`` の宛先にしない。以前はルータだけが格を見ていたので、ルータが
+    書込みでないとしたターンで規則層が ``write_file`` を選び、chat で降格されて
+    ``action_blocked`` が立ち、応答が「保存するツールが利用できない」と頼まれていない
+    保存を断った (2026-10-05 ライブ監査 T3 / 2026-10-06 独立レビュー HIGH-1・MED-2)。
+    """
+    if write_prohibited(query):
+        return True
+    probe = write_intent_probe(query, whole_request=whole_request)
+    literal = _extract_file_path_literal(query)
+    if literal:
+        if _PATH_SEPARATOR_RE.search(literal):
+            return explicit_path_is_topic_only(probe)
+        return filename_is_topic_only(probe)
+    return bool(_REFERENTIAL_TARGET_RE.search(query)) and not _referential_destination(
+        query, verb_text=probe,
+    )
+
+
+def write_target_path(query: str) -> str:
+    """規則層の書込み先 (``extract_write_target_path``)。話題の格に立つパスは選ばない。
+
+    「E:\\x\\util.py に対するテストを書いて、E:\\x\\t.py を作成して」の util.py は題材。
+    選んだパスが題材で、話題の格に立たないファイル名が他にあれば最初のそれへ替える
+    (docs/f_03 §1.4、2026-10-06 独立レビュー MED-3)。他に無ければそのまま — 題材だけを
+    名指した依頼が書くのは保存の動詞があるときだけで (「util.py に対するテストを書いて
+    保存して」)、その判定は :func:`write_target_is_topic_only` が先に済ませている。
+    暗黙参照 (台帳) で解いたパスは本文に無いのでそのまま返す。
+    """
+    path = extract_write_target_path(query)
+    if not path:
+        return ""
+    cases = [(_extract_file_path_literal(token), topic) for token, topic in file_name_cases(query)]
+    if path not in {p for p, topic in cases if topic}:
+        return path
+    return next((p for p, topic in cases if p and not topic), path)
+
+
 def _resolve_referenced_path(
     query_path: str | None, conversation: list[dict] | None,
+    *, for_write: bool = False,
 ) -> str | None:
-    """書込み/読取の対象パスを会話から解決する (純粋関数)。
+    """書込み/読取の対象パスを会話から解決する。
 
     ``query_path`` の状態で 3 通りに分かれる:
 
     - ディレクトリを含む絶対/相対パス → そのまま採用 (解決不要)
-    - 裸のファイル名 (``notes.txt``) → 会話に **同じ basename** の
-      フルパスがあればそれを採用。無ければ ``None``
+    - 裸のファイル名 (``notes.txt``) → ``file_ledger.resolve_bare_filename``
+      (読み書きの入口が共有する 1 本) で解決する。読みで曖昧なら裸の名前のまま、
+      どこにも無ければ会話の同じ名前のフルパス、それも無ければ ``None``
     - ``None`` / 空 (「そのファイル」型) → 会話で最後に出たパスを採用
 
     裸のファイル名をそのままツールへ渡すとカレントディレクトリに着地して
@@ -84,7 +146,20 @@ def _resolve_referenced_path(
     """
     if query_path and _PATH_SEPARATOR_RE.search(query_path):
         return query_path
-    want = (query_path or "").strip().lower() or None
+    if (query_path or "").strip():
+        from backend.free.agent.file_ledger import resolve_bare_filename
+
+        resolution = resolve_bare_filename(
+            query_path.strip(), conversation=conversation, for_write=for_write,
+        )
+        if resolution.path:
+            return resolution.path
+        # 読みで決められないときも読みは撃たせる — 撃たずに答えると中身を作話する。
+        # 曖昧なら裸の名前のまま (レジストリが候補つきのエラーを返す)、どこにも
+        # 無ければ会話に書かれた同じ名前のフルパス (「見つからない」と答えさせる)。
+        if resolution.ambiguous:
+            return query_path.strip()
+        return resolution.mentioned
     for msg in reversed(list(conversation or [])):
         if not isinstance(msg, dict):
             continue
@@ -93,8 +168,6 @@ def _resolve_referenced_path(
             continue
         path = _extract_file_path(content)
         if not path or not _PATH_SEPARATOR_RE.search(path):
-            continue
-        if want and _PATH_SEPARATOR_RE.split(path)[-1].lower() != want:
             continue
         return path
     return None
@@ -108,12 +181,16 @@ def _query_path_of(query: str, call: "JudgeCall | None") -> str | None:
 
 def _resolve_with_call(
     query_path: str | None, conversation: list[dict] | None,
-    call: "JudgeCall | None",
+    call: "JudgeCall | None", *, for_write: bool = False,
 ) -> str | None:
     """会話からのパス解決。``call`` があれば層 0.9 / 0.95 で 1 度だけ走査する。"""
     if call is None:
-        return _resolve_referenced_path(query_path, conversation)
-    return call.referenced_path(query_path, _resolve_referenced_path)
+        return _resolve_referenced_path(query_path, conversation, for_write=for_write)
+    return call.referenced_path(
+        query_path,
+        lambda qp, conv: _resolve_referenced_path(qp, conv, for_write=for_write),
+        for_write=for_write,
+    )
 
 
 def _referential_rewrite_judgement(
@@ -148,7 +225,11 @@ def _referential_rewrite_judgement(
     query_path = _query_path_of(query, call)
     if not query_path and not _REFERENTIAL_TARGET_RE.search(query):
         return None
-    path = _resolve_with_call(query_path, conversation, call)
+    if write_target_is_topic_only(
+        query, whole_request=call is not None and is_create_mode(call.mode),
+    ):
+        return None
+    path = _resolve_with_call(query_path, conversation, call, for_write=True)
     if not path:
         return None
     logger.info(
@@ -270,6 +351,90 @@ def _referential_read_judgement(
         # ``_infer_tool`` と同じ引数形 (read_file は start/end_line を取る)。
         tool_args["start_line"] = 1
         tool_args["end_line"] = head
+    return ToolJudgement(
+        tool_needed=True,
+        tool_name="read_file",
+        tool_args=tool_args,
+        source="rule",
+    )
+
+
+#: コードを **作る** 依頼の構造 (「〜するコードを書いて」「スクリプトを作って」「write code
+#: that …」)。この形では名前は作るコードが扱う対象で、読む対象ではない (「Python で
+#: config.json を読み込むコードを書いて」の「読み込む」は作るコードの説明)。書込み動詞の
+#: 語彙 (計画のタスク文向け) は使わない — 利用者の発話の「書いてある」に当たる。
+_CODE_CREATION_RE = re.compile(
+    r"(?:コード|スクリプト|プログラム|関数|クラス|処理)\s*(?:を|が)?\s*"
+    r"(?:書いて|書く|書け|作って|作る|作成|生成|実装)"
+    r"|\b(?:write|create|generate|implement)\s+(?:a\s+|an\s+|the\s+|some\s+)?"
+    r"(?:\w+\s+)?(?:code|script|program|function|class)\b",
+    re.IGNORECASE,
+)
+#: ファイルの中身を述べる状態の形 (「何が書いてあるか」「書かれている」)。書込みの依頼では
+#: ないので、ツールの推定 (``_infer_tool`` の書込みの語「書いて」) へ渡す前に中立の語へ置く。
+_STATIVE_WRITTEN_RE = re.compile(r"書(?:いて(?:ある|あり|あっ|る)|かれて)")
+#: ツールの推定へ渡すときに依頼文の裸の名前を置き換える中立の名前。
+_NEUTRAL_FILENAME = "target_file.txt"
+
+
+def _bare_filename_read_judgement(
+    query: str,
+    conversation: list[dict] | None,
+    tools_registry: ToolsRegistry,
+    mode: str,
+    infer: Callable[[str], tuple[str, dict]],
+) -> "ToolJudgement | None":
+    """依頼文の裸のファイル名が利用者の名指したフォルダの **実在のファイル** に解決できたら
+    read_file に確定させる。
+
+    「buggy.py のバグを見つけて直し方を教えて」は区切りの無い名前なので明示パスの
+    信号にならず、知識質問として規則層が否定し、kNN の門も 2/5 で閉じて、読まずに
+    答えた (2026-10-05 ライブ監査 T4)。名前が利用者の名指したフォルダの実在のファイルに
+    解決できること自体が「このファイルの話」という証拠で、近道 (知識質問の字句・kNN の
+    門・「直し方 / 使い方を教えて」の教示の形) はこの証拠を上書きしない (不変則 #15)。
+
+    探すのは利用者が名指したフォルダだけ (``named_only``: 依頼文・台帳の名指し・
+    user の発話。LLM が自分で一覧した / 読んだフォルダと CWD は数えない)。次の
+    ときは棄権して後続へ委ねる:
+
+    - 名前が解決できない (どこにも無い / 曖昧)
+    - コードを作る依頼の構造 (:data:`_CODE_CREATION_RE`)
+    - 読み以外のツール (書込み・検索・実行) を ``infer`` (``ToolCallJudge._infer_tool``)
+      が決めた — 書込みの宛先は書込みの規則で決める。中身を述べる状態の形
+      (「何が書いてあるか」) は書込みと推定させない
+
+    ファイルシステムを見るので、呼出側はイベントループの外 (executor) で呼ぶ。
+    """
+    if not tools_registry.is_available("read_file", mode):
+        return None
+    literal = _extract_file_path_literal(strip_command_literals(query))
+    if not literal or _PATH_SEPARATOR_RE.search(literal):
+        return None
+    if _CODE_CREATION_RE.search(query):
+        logger.debug("Bare filename read abstained (code creation): %s", query[:60])
+        return None
+    from backend.free.agent.file_ledger import resolve_bare_filename
+
+    resolution = resolve_bare_filename(
+        literal, query=query, conversation=conversation, named_only=True,
+    )
+    if not resolution.path:
+        return None
+    # 名前の綴りは依頼の語ではない (「run.py の使い方」の run を実行の語と読まない)。
+    # 名前は中立の名前へ置いて、依頼の形 (書込み・検索・実行) だけを推定させる。
+    neutral = _STATIVE_WRITTEN_RE.sub("記載", query.replace(literal, _NEUTRAL_FILENAME))
+    inferred_tool, _ = infer(neutral)
+    if inferred_tool and inferred_tool != "read_file":
+        return None
+    tool_args: dict = {"file_path": resolution.path}
+    head = _extract_head_line_count(query)
+    if head is not None:
+        tool_args["start_line"] = 1
+        tool_args["end_line"] = head
+    logger.info(
+        "Bare filename in the query resolved to an existing file: %s -> %s",
+        literal, resolution.path,
+    )
     return ToolJudgement(
         tool_needed=True,
         tool_name="read_file",

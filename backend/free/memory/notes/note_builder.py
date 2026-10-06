@@ -28,7 +28,7 @@ import time
 import unicodedata
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import yaml
 
@@ -47,6 +47,8 @@ from backend.io.id_registry import new_id
 from backend.log_config import get_logger
 from backend.free.core.script_ranges import (
     KANJI,
+    KANJI_EXT_A,
+    KANJI_MARKS,
     KATAKANA_BLOCK,
 )
 
@@ -304,6 +306,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
             )
             span_only_fold = False
         person_valued = bool(raw.get("person_valued", False))
+        kanji_left_boundary = bool(raw.get("kanji_left_boundary", False))
         patterns = _coerce_patterns(slug, raw.get("patterns"))
     else:
         words = _coerce_triggers(raw)
@@ -313,6 +316,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         multi_valued = False
         span_only_fold = False
         person_valued = False
+        kanji_left_boundary = False
     if not words and not patterns:
         return None
     return AttributeSpec(
@@ -324,6 +328,7 @@ def _coerce_attribute(slug: str, raw: Any) -> "AttributeSpec | None":
         multi_valued=multi_valued,
         span_only_fold=span_only_fold,
         person_valued=person_valued,
+        kanji_left_boundary=kanji_left_boundary,
         patterns=patterns,
     )
 
@@ -691,6 +696,42 @@ _ACTIVITY_OBJECT_FORMS: tuple[str, ...] = (
 _GENITIVE_PARTICLE = "の"
 
 
+#: 漢字 1 字。:func:`_needs_left_boundary` の語幹と直前の字の判定に使う。
+_IDEOGRAPH_RE = re.compile(f"[{KANJI}{KANJI_EXT_A}{KANJI_MARKS}]")
+
+
+@lru_cache(maxsize=4096)
+def _needs_left_boundary(word: str) -> bool:
+    """trigger ``word`` が **語幹 = 漢字 1 字** の助詞終わりか
+    (:attr:`AttributeSpec.kanji_left_boundary` のスロットで左境界を要するか)。
+
+    照合は部分一致なので、漢字 1 字の語幹は熟語の構成字にも当たる。
+    実インシデント (2026-10-05 ライブ監査 trace 22d3d78a7b38): media の
+    ``本は`` と並列形 ``本と`` が「元本との差額はいくらですか？」に当たり、
+    無関係な ``mem.preference.media`` がコサイン免除で注入された (「日本は」
+    「基本は」も同じ)。熟語の意味は字の意味と一致しないので、直前が漢字の
+    出現は一致としない。語幹の切り出しは :func:`_trigger_variants` と同じ
+    (末尾 1 字が助詞)。語幹 2 字以上 (「映画」→「恋愛映画」) と助詞で終わらない
+    1 字 (「肉」→「牛肉」、「歳です」→「何歳ですか」) は熟語の中で当たること
+    自体が意図なので対象外 (docs/f_02 §7.4)。
+    """
+    return (
+        len(word) == 2
+        and word[-1] in _TOPIC_PARTICLES
+        and _IDEOGRAPH_RE.fullmatch(word[0]) is not None
+    )
+
+
+def _occurrences(haystack: str, variant: str, *, bounded: bool) -> Iterator[int]:
+    """``variant`` の出現位置を返す。``bounded`` なら直前が漢字の出現を除く
+    (:func:`_needs_left_boundary`)。"""
+    start = haystack.find(variant)
+    while start != -1:
+        if not (bounded and start > 0 and _IDEOGRAPH_RE.fullmatch(haystack[start - 1])):
+            yield start
+        start = haystack.find(variant, start + 1)
+
+
 @dataclass(frozen=True, slots=True)
 class AttributeSpec:
     """``fact_attributes.yaml`` の 1 スロット。
@@ -786,6 +827,11 @@ class AttributeSpec:
     #: 「妻と2人で京都へ旅行に行きます」は同行者で家族構成ではない
     #: (2026-09-26 ライブ監査 #15)。棄権した発話は補完ゲートへ回る。
     person_valued: bool = False
+    #: 語幹が漢字 1 字の助詞終わり trigger (``本は`` / ``色は``) を、直前が漢字の
+    #: 出現 (「元本は」「景色は」) に当てない (:func:`_needs_left_boundary`)。
+    #: 熟語が字の意味から離れるスロット (media / color) だけが宣言する。pet は
+    #: 「愛犬を」「子猫を」も熟語でペットなので宣言しない (docs/f_02 §7.4)。
+    kanji_left_boundary: bool = False
 
     def _variants(self, word: str) -> tuple[str, ...]:
         """``word`` と、その **並列形** を返す。
@@ -867,11 +913,14 @@ class AttributeSpec:
         """
         spans: list[tuple[int, int]] = []
         for word in self.triggers:
-            for variant in self._variants(word) if word else ():
-                start = haystack.find(variant)
-                while start != -1:
-                    spans.append((start, start + len(variant)))
-                    start = haystack.find(variant, start + 1)
+            if not word:
+                continue
+            bounded = self.kanji_left_boundary and _needs_left_boundary(word)
+            for variant in self._variants(word):
+                spans.extend(
+                    (start, start + len(variant))
+                    for start in _occurrences(haystack, variant, bounded=bounded)
+                )
         spans.sort()
         head: dict[int, int] = {}
         group_start, group_end = -1, -1
@@ -890,27 +939,24 @@ class AttributeSpec:
         for word in self.triggers:
             if not word:
                 continue
+            bounded = self.kanji_left_boundary and _needs_left_boundary(word)
             for variant in self._variants(word):
                 if not self.requires_self_possessor:
-                    if variant in haystack:
+                    if next(_occurrences(haystack, variant, bounded=bounded), None) is not None:
                         hit.append(variant)
                         break
                     continue
                 # 所有者ガード付きは **出現ごと** に判定する。1 つでも自己所有の
                 # 出現があれば一致 (「猫の名前はソラで、私の名前は小川です」)。
                 # 所有者は重なる出現をまとめた句の先頭で見る (:meth:`_phrase_starts`)。
-                start = haystack.find(variant)
-                matched = False
-                while start != -1:
-                    if _possessor_is_self(
+                if any(
+                    _possessor_is_self(
                         haystack, phrase_head.get(start, start),
                         explicit_only=self.possessor_explicit_only,
-                    ):
-                        hit.append(variant)
-                        matched = True
-                        break
-                    start = haystack.find(variant, start + 1)
-                if matched:
+                    )
+                    for start in _occurrences(haystack, variant, bounded=bounded)
+                ):
+                    hit.append(variant)
                     break
         for pattern in self.patterns:
             for m in pattern.finditer(haystack):
@@ -1883,6 +1929,22 @@ def restated_attribute_slot(text: str) -> str | None:
     if not _CHAT_BUILDER.candidate_fact_tags(text):
         return None
     return single_attribute_slot(text)
+
+
+def note_state_slot(text: str, slot_edit_slot: str | None = None) -> str | None:
+    """利用者のノートが **スロットの最新の状態** を示すならその slug。
+
+    :func:`restated_attribute_slot` (値を述べた自己開示) に加え、sleep-time
+    Step 8.35 (``sleep.slot_edit_curator``) が **検証して適用した編集**
+    (「趣味に写真を加えて、キャンプは外してください。」) も同じスロットの
+    最新の言明に数える。編集の発話は依頼形なので字句では言明に当たらず、
+    注入 (``injector._drop_facts_restated_later``) もエピソード
+    (``search_pipeline._latest_statement_per_slot``) も編集前の言明を最新として
+    出していた (2026-10-05 実機: 別セッションの「私の趣味は？」に「釣りと
+    キャンプです」)。編集後の値は SemMem の新しいファクトが運ぶ。未検証の
+    編集は数えない (不変則 #15 — 字句の近道で現在の状態を決めない)。
+    """
+    return restated_attribute_slot(text) or (slot_edit_slot or None)
 
 
 def get_note_builder(mode: MemoryMode) -> NoteBuilder:

@@ -2065,6 +2065,7 @@ class CorpusStore:
         threshold: float = 0.0,
         now: float | None = None,
         include_private: bool = False,
+        pq_seeds: list[str] | None = None,
     ) -> list[CorpusHit]:
         """ロード済みパッケージ横断検索 (c_16 §6.3 / §7)。
 
@@ -2079,6 +2080,9 @@ class CorpusStore:
             now: 現在時刻の epoch 秒。全パッケージで同じ値を使い、鮮度が
                 パッケージごとにずれないようにする。
             include_private: private セッションでのみ ``True``。
+            pq_seeds: 渡されたら転置索引の上位候補 (疑似クエリの lazy 生成対象の
+                種、f_01 §6.4) を ``pq_hits`` へ積まずにここへ足す。チャット経路は
+                注入を確定してから積む (f_01 §8.1 Step 7.7)。
 
         Returns:
             :class:`CorpusHit` を ``score`` 降順で最大 ``top_k`` 件。
@@ -2106,9 +2110,13 @@ class CorpusStore:
             )
             snapshot = package.store.snapshot
             if query_text and package.pseudo_queries is not None:
-                self._seed_lexical_pq_targets(
+                seeds = self._seed_lexical_pq_targets(
                     package_id, package, query_text, now_epoch, include_private,
                 )
+                if pq_seeds is None:
+                    self.pq_hits.add_many(seeds)
+                else:
+                    pq_seeds.extend(seeds)
             for row, cosine, score in rows:
                 raw = snapshot.raw_at(row) if snapshot is not None else None
                 attrs = (raw or {}).get("attrs") or {}
@@ -2332,8 +2340,8 @@ class CorpusStore:
     def _seed_lexical_pq_targets(
         self, package_id: str, package, query_text: str, now_epoch: float,
         include_private: bool,
-    ) -> None:
-        """転置索引の上位候補を疑似クエリの lazy 生成対象に積む (f_01 §6.4)。
+    ) -> list[str]:
+        """転置索引の上位候補 (疑似クエリの lazy 生成対象の種、f_01 §6.4) を返す。
 
         順位は cosine 1 本なので、固有語で当たったチャンクは cosine が低いと
         採用されず lazy の対象にも入らない。語彙一致は「ユーザーがその語で
@@ -2347,13 +2355,11 @@ class CorpusStore:
             )
         except Exception as e:  # noqa: BLE001 — 種まきで検索を止めない
             logger.debug("lexical pq seeding skipped for %s: %s", package_id, e)
-            return
+            return []
         snapshot = store.snapshot
         if snapshot is None:
-            return
-        ids = [f"{package_id}:{snapshot.id_at(int(r))}" for r in rows[:LEXICAL_SEED_K]]
-        if ids:
-            self.pq_hits.add_many(ids)
+            return []
+        return [f"{package_id}:{snapshot.id_at(int(r))}" for r in rows[:LEXICAL_SEED_K]]
 
     def record_pq_misses(self, chunk_ids: Sequence[str], question: str) -> int:
         """取りこぼした問いの語彙候補を misses に積み、問いをヒントとして添える (f_01 §6.4)。
@@ -2450,10 +2456,35 @@ class CorpusStore:
 
         if _key(str(before.get("heading") or "")) != _key(str(here.get("heading") or "")):
             return None
+        # 表の 2 つ目以降のチャンクは前置き (見出しパス・ヘッダ) を自分で持つ。直前は同じ表の
+        # 途中の行で、ヘッダの無い行を足すだけになる (f_01 §3.1.5)
+        if (
+            here.get("table_index") is not None
+            and before.get("table_index") == here.get("table_index")
+        ):
+            return None
         text = str(prev.get("text") or "").strip()
         if not text:
             return None
         return f"{package_id}:{snapshot.id_at(row - 1)}", text[-tail_chars:]
+
+    def chunk_attrs(self, chunk_id: str) -> dict[str, Any] | None:
+        """``"<pkg>:<ev>"`` のチャンクの ``attrs`` (無ければ ``None``)。
+
+        取得直後の内容精査ゲートが表のチャンクの印を読むために使う (f_01 §3.1.5)。
+        """
+        package_id, sep, evidence_id = chunk_id.partition(":")
+        package = self._packages.get(package_id) if sep else None
+        if package is None:
+            return None
+        snapshot = package.store.snapshot
+        if snapshot is None:
+            return None
+        row = snapshot.row_of(evidence_id)
+        if row is None:
+            return None
+        attrs = (snapshot.raw_at(row) or {}).get("attrs")
+        return attrs if isinstance(attrs, dict) else None
 
     def outdated_package_ids(self) -> list[str]:
         """chunker 版が現行より古いパッケージ id (f_01 §3.3 の 6)。"""

@@ -16,6 +16,7 @@ from backend.free.api.chat._continuation import (
     disarm_continuation,
 )
 from backend.free.api.chat.chat_constants import DEFAULT_KEEPALIVE_INTERVAL_SEC
+from backend.free.api.chat.chat_errors import EMPTY_RESPONSE
 from backend.free.api.chat.chat_recorder import (
     command_tool_calls,
     record_response,
@@ -37,11 +38,15 @@ from backend.free.core.stream_filter import (
     InternalFrameMentionFilter,
     ContinuationRepeatFilter,
     LengthDisclosureFilter,
+    SignCorrectionFilter,
+    TableAggregateFilter,
+    UnreadFileEntityFilter,
     UnwrittenFileClaimFilter,
     QueryEchoFilter,
     RepetitionGuardFilter,
     StreamThinkingFilter,
     WeekdayFilter,
+    disclosure_notes,
 )
 from backend.free.core.stream_pipeline import StreamPipeline
 from backend.free.core.turn_text import user_utterance_text
@@ -173,8 +178,15 @@ def _build_output_pipeline(
         filters.append(LengthDisclosureFilter(query))
         # 「<パス> に書き込みました」と述べたのに実体が無いことを開示する。
         # buffer_only (制約の検証・修復) 中も付けない — 修復生成の入力に注記が
-        # 混ざるため。呼出側が修復後の本文に対して改めて判定する。
+        # 混ざるため。呼出側が修復後の本文に対して改めて判定する
+        # (``_emit_verified_output`` → ``disclosure_notes``。下の 2 つも同じ)。
         filters.append(UnwrittenFileClaimFilter())
+        # 冒頭の値の符号が本文の計算と異なることを注記する (書き換えはしない)。
+        filters.append(SignCorrectionFilter())
+        # 読めていないファイルの問いに根拠の無い人名で答えたことを開示する。
+        filters.append(UnreadFileEntityFilter())
+        # コードで集計した表の値を述べていなければ正しい値を示す 1 行を足す。
+        filters.append(TableAggregateFilter())
     if continuation_tail:
         # 継続生成の冒頭にある直前応答の再掲を落とす。プロンプトの
         # 「繰り返さない」指示は実測で効かない (2026-08-27 T10-3)。
@@ -333,8 +345,12 @@ async def _emit_verified_output(
         if not repair_task.done():
             repair_task.cancel()
     final_text, unresolved = repair_task.result()
+    # 溜めた経路はパイプラインから開示フィルタを外しているので、修復後の本文に対して
+    # 同じ判定で足す (未書込み / 符号 / 読めていないファイルの人名)。
+    notes = disclosure_notes(final_text)
     if unresolved is not None:
         final_text += length_disclosure_note(query, final_text)
+    final_text += notes
     state.emitted_chars += len(final_text)
     state.full_response = final_text
     yield sse.token(final_text)
@@ -404,9 +420,8 @@ async def _retry_zero_tokens_deliberative(
         "Retry also returned 0 content tokens: raw_tokens=%d raw_chars=%d raw_head=%r",
         state.tokens_generated - first_tokens, state.raw_chars, state.raw_head,
     )
-    yield sse.error(
-        "No content generated after retry. "
-        "The model may be stuck in a reasoning loop."
+    yield sse.error_with_code(
+        EMPTY_RESPONSE.code, EMPTY_RESPONSE.message, retryable=EMPTY_RESPONSE.retryable,
     )
 
 
@@ -518,6 +533,7 @@ async def stream_deliberative(
     session_head: str = "",
     answered_attributes: frozenset[str] = frozenset(),
     unanswered_attributes: frozenset[str] = frozenset(),
+    asks_user_attribute: bool = False,
 ):
     """Deliberative 層の SSE ストリーミング
 
@@ -557,6 +573,7 @@ async def stream_deliberative(
             if timer:
                 timer.start("llm_total_ms")
                 timer.start("llm_first_token_ms")
+                timer.start("pre_gen_ms")
 
             process_task = asyncio.create_task(agent.process(
                 query=query,
@@ -576,6 +593,8 @@ async def stream_deliberative(
                 private=private,
                 answered_attributes=answered_attributes,
                 unanswered_attributes=unanswered_attributes,
+                asks_user_attribute=asks_user_attribute,
+                instance_name=instance_name,
                 prompt_capture=sent_messages,
             ))
             # process() はトークンを返す前にツール判定と実行を完了させる。
@@ -595,6 +614,9 @@ async def stream_deliberative(
                 if process_task in done:
                     break
                 yield sse.keepalive()
+            if timer:
+                # process() が本生成のストリームを返すまで = 分類器・ツール判定/実行など
+                timer.stop("pre_gen_ms")
             token_stream = process_task.result()
             stream_state.tool_command = tool_capture.get("command")
             stream_state.tool_command_name = tool_capture.get("command_name")

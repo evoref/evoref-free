@@ -24,13 +24,42 @@ import re
 from dataclasses import dataclass
 
 from backend.free.core.numerals import kanji_number_value
-from backend.free.core.response_dates import YMD_JA_PATTERN, YMD_NUMERIC_PATTERN
+from backend.free.core.response_dates import (
+    ISO_DATE_RE,
+    JP_DATE_RE,
+    YMD_JA_PATTERN,
+    YMD_NUMERIC_PATTERN,
+)
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
     HIRAGANA,
     KANJI,
     KATAKANA,
     KATAKANA_WORD,
+)
+from backend.free.core.date_math_cue import DATE_MATH_CUE_RE, query_has_date_math_cue
+from backend.free.core.relative_date import OFFSET_DIRECTION_PATTERN, PERIOD_UNIT_ALTERNATION
+from backend.free.core.temporal_deixis import (
+    DAY_OFFSETS,
+    EN_NOW,
+    EN_NOW_ADVERBS,
+    EN_RELATIVE_DAYS,
+    EN_THIS_PERIOD_PATTERN,
+    EN_TODAY,
+    MONTH_OFFSETS,
+    NOW_ADVERBS,
+    NOW_BARE,
+    NOW_BARE_STANDALONE_PATTERN,
+    NOW_KANA,
+    NOW_KANA_PATTERN,
+    NOW_NOUNS,
+    TODAY_KANA_PATTERN,
+    WEEK_OFFSETS,
+    YEAR_OFFSETS,
+    alternation,
+    ascii_words,
+    lookbehinds,
+    present_day_terms,
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -50,6 +79,13 @@ EXPLICIT_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'「」()（）]+")
 #: 文中のファイル名 (拡張子付きの 1 語、``sample.csv`` / ``md_toc.py``)。staged v2 の依頼文の照合と、
 #: 生成応答のフェンスの情報文字列・前置きの行からの名前の拾い出しが共有する。
 FILE_NAME_IN_TEXT_RE = re.compile(r"[\w.\-]+\.[A-Za-z][A-Za-z0-9]{0,5}(?![A-Za-z0-9])")
+
+#: 英語で宛先を導く前置詞 (名指しのパス / ファイル名の **直前** の本文の末尾に当てる)。
+#: 「save it to X」「write into the file X」。フォルダの役 (``file_ledger.folder_role``) と
+#: 書込みの対象の判定点 (``agent.overwrite_gate``) が共有する (2026-10-05 2 周目レビュー LOW-4)。
+EN_DESTINATION_BEFORE_RE = re.compile(
+    r"\b(?:to|into|onto)(?:\s+the)?(?:\s+file)?\s*[\"'`]?$", re.IGNORECASE,
+)
 
 #: ホストの絶対パスの形 (ドライブ + 区切り / ``\\`` の UNC / 先頭 ``/`` 1 個)。
 #: ``//host/x`` はプロトコル相対 URL なので含めない (f_10 §11.1-1 / §11.1-4)。
@@ -97,10 +133,47 @@ def is_absolute_path_text(text: str) -> bool:
 #: チャット本文に出た (実ファイルは無変更)。
 #: ``保存`` は「保存場所」「保存されている」のような状態の言及も拾うため、
 #: 連用形の ``保存し`` に限定する。
-WRITE_VERB_RE = re.compile(
+_WRITE_VERBS_JA = (
     r"作成|作って|作る|追加|追記|書き足|書き直|書き換え|上書き|差し替え|保存し"
     r"|実装|修正|変更|書き込|生成|更新|書く|書いて"
-    r"|create|write|append|add|implement|modify|update|generate|fix|refactor",
+)
+_WRITE_VERBS_EN = r"create|write|append|add|implement|modify|update|generate|fix|refactor"
+WRITE_VERB_RE = re.compile(
+    _WRITE_VERBS_JA + "|" + _WRITE_VERBS_EN,
+    re.IGNORECASE,
+)
+
+
+#: :data:`WRITE_VERB_RE` と **同じ語彙** で、英語の語の **境界** だけを定めた形。
+#: 書込み動詞の判定 (``agent.task_write_gate``。計画のタスク文と、meta の
+#: ``_ensure_build_task`` が見る利用者の発話の両方) はこれだけを使う。
+#:
+#: - 部分一致の :data:`WRITE_VERB_RE` は ``address`` / ``additional`` / ``padding``
+#:   (add)・``prefix`` / ``fixture`` (fix) を書込み動詞と数えていた。
+#: - 左の境界は ASCII の語境界。ただし接頭辞 ``re`` / ``over`` (ハイフン可) は語の
+#:   一部として受ける (``rewrite`` / ``overwrite`` / ``re-create`` / ``regenerate``
+#:   — 部分一致の頃は当たっていた語で、新しい語ではない)。``pre`` は受けない
+#:   (``prefix`` が ``fix`` になる)。
+#: - 屈折は語幹のままの後ろに付く ``-s`` / ``-es`` / ``-d`` / ``-ed`` だけ (部分一致が
+#:   当たっていた形: ``creates`` / ``created`` / ``updated`` / ``added``)。``-ing`` と
+#:   語幹の変わる形 (``creating`` / ``writing`` / ``modified``) は受けない —
+#:   「Check the writing quality of X」「Summarize the modified sections of X」の
+#:   ような読むタスクで書込みが発火し、``infer_tool_from_task`` が ToolCallJudge を
+#:   通さずに ``write_file`` で X を上書きしたため (2026-10-03 反証レビュー)。
+#: - ツール名の形 ``write_file`` / ``create_file`` (語 + ``_file``) は受ける。
+#:   ``create_user.py`` のような識別子・ファイル名の中の語は数えない。
+#: - 日本語の語はそのまま。加えて、既存の語幹 ``保存`` の **終止形** ``保存する`` を
+#:   文末 (句読点・空白・閉じ括弧の前) に限って受ける (2026-10-03。計画のタスク文は
+#:   日本語だと「… meeting_minutes.docx に保存する」と終止形で書かれ、連用形の
+#:   ``保存し`` だけでは当たらず ``infer_tool_from_task`` が ``read_file`` を
+#:   返していた)。連体形 (「保存する方法を調べて」) と未然形 (「保存されている」) は
+#:   拾わない。共有の :data:`WRITE_VERB_RE` (他の読み手がいる) は変えない。
+WRITE_VERB_WORD_RE = re.compile(
+    _WRITE_VERBS_JA
+    + r"|保存する(?=$|[\s。．、，,.!！?？」』)）])"
+    + r"|(?<![A-Za-z0-9_])(?:(?:re|over)-?)?(?:"
+    + _WRITE_VERBS_EN
+    + r")(?:s|es|d|ed)?(?:_file(?![A-Za-z0-9_.]))?(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 
@@ -111,6 +184,11 @@ WRITE_VERB_RE = re.compile(
 APPEND_HINT_RE = re.compile(
     r"(?:追記|追加|append|続き.*(?:書|出力|保存|追加))", re.IGNORECASE,
 )
+
+#: 英語の「add X to <file>」の add (``APPEND_HINT_RE`` の「追加」の英語側)。``APPEND_HINT_RE``
+#: に足すと編集の種類 (``edit_mode``) の読み手まで変わるので、書込みの対象の判定点
+#: (``agent.overwrite_gate``) が宛先の前置詞の前を読むときだけ使う (2026-10-05 3 周目 MED-B)。
+EN_ADD_VERB_RE = re.compile(r"(?<![A-Za-z])add(?:s|ed)?(?![A-Za-z])", re.IGNORECASE)
 
 #: 既存内容を **書き換える** 依頼の動詞 (追記・加筆以外の編集: 差し替え / 修正 /
 #: 削除 …)。``EDIT_REQUEST_RE`` (無変更の検出) の材料。追記だけの依頼かの判定には
@@ -215,6 +293,25 @@ _COMMIT_VERBS_TAKING_CONTENT = frozenset({"更新", "上書き"})
 _EN_COMMIT_VERB_RE = re.compile(
     r"\b(update|save|overwrite)\b(?P<rest>[^.!?\n]{0,40})", re.IGNORECASE,
 )
+
+
+def clause_head_is_write_verb(clause: str) -> bool:
+    """英語の節が書込みの命令形で始まるか (純粋関数)。
+
+    頭の語 (``please`` は飛ばす) が書込み動詞 (:data:`WRITE_VERB_WORD_RE`) か書き戻しの
+    動詞 (``save`` / ``overwrite`` / ``update``、:data:`_EN_COMMIT_VERB_RE`) のとき真。
+    「and save the matching lines to R」は真、「I will later save them to R」
+    「draft a report I can paste into R」は偽。語彙は足さない。
+    """
+    # 語はハイフンで続く合成語 (``Save-button`` / ``update-notes``) を含めて 1 語に取る
+    m = re.match(r"\s*(?:please\s+)?([A-Za-z][\w-]*)", clause or "", re.IGNORECASE)
+    if m is None:
+        return False
+    word = m.group(1)
+    commit = _EN_COMMIT_VERB_RE.fullmatch(word)
+    return bool(WRITE_VERB_WORD_RE.fullmatch(word) or (commit and not commit.group("rest")))
+
+
 #: 英語の書き戻しの目的語がファイル (宛先) か、目的語が無いか。
 _EN_FILE_OBJECT_RE = re.compile(
     r"\s*(?:$|,|and\b|(?:it|this|that)\b|the\s+(?:same\s+)?(?:file|document)\b"
@@ -294,6 +391,8 @@ def edit_mode_rule(text: str) -> tuple[str, str]:
 
 #: 追記の依頼を節に切る境界 (読点・て形の「して」・英語の and / then)。
 _APPEND_CLAUSE_BOUNDARY_RE = re.compile(r"[、,，]|して|\b(?:and|then)\b", re.IGNORECASE)
+#: 同じ境界の公開名 (検索の場所・パターンを節で切る、``meta_cognitive_tools``)
+CLAUSE_BOUNDARY_RE = _APPEND_CLAUSE_BOUNDARY_RE
 #: 節に中身があるか (漢字・カタカナ・英字)。「ください」「おいて」だけの節は落とす。
 _CLAUSE_CONTENT_RE = re.compile(f"[{KANJI}{KATAKANA}A-Za-z]")
 #: 書き戻しだけの節 (「同じファイルを更新」「上書き保存」「保存し直」「save the file」)。
@@ -662,15 +761,20 @@ _SESSION_ANSWER_ORDINAL_RE = re.compile(_SESSION_ANSWER_ORDINAL_PATTERN)
 #: 撃つと決まった検索を **絞る** 側だけで使うので、単独の「最初に」を含めても
 #: 誤爆の余地は無い (「最初に私が聞いた営業日数は」は ``最初に聞`` に当たらない
 #: — 主語が割り込む形が実データの大半だった)。
+#: 会話の中の位置を **語だけで** 指す手掛かり (「最初に」)。日常文にも現れる
+#: (「asyncio で最初に終わったタスク」「最後に、息子の誕生日は」) ので、これだけでは
+#: 会話を指しているとは言えない (:func:`recall_form_points_into_conversation`)。
+_SESSION_ORDINAL_BARE = r"一番最初|一番最後|最初に|最後に"
+_SESSION_ORDINAL_BARE_EN = r"at first|in the beginning"
 _SESSION_ORDINAL_CUE_RE = re.compile(
-    r"一番最初|一番最後|最初に|最後に"
+    rf"(?P<bare>{_SESSION_ORDINAL_BARE})"
     # 「最初の計算をやり直して」も会話内の位置を指す (計算の組み直し、
     # tool_call_judge._beyond_window_reason、2026-09-27 監査 C03)。
     r"|(?:最初|最後|冒頭)の(?:質問|問い|発言|依頼|メッセージ|お願い|相談|話題|計算|試算)"
     rf"|{_ORDINAL_NUMERAL}\s*{_ORDINAL_COUNTER}の(?:質問|問い|発言|依頼|メッセージ|計算|試算)"
     # 「2つ目に教えてもらったクエリ」(アシスタントの N 番目の回答、M9)
     rf"|{_SESSION_ANSWER_ORDINAL_PATTERN}"
-    r"|(?<![A-Za-z])(?:at first|in the beginning|the (?:first|last) (?:question|message|thing|request))(?![A-Za-z])",
+    rf"|(?<![A-Za-z])(?:(?P<bare_en>{_SESSION_ORDINAL_BARE_EN})|the (?:first|last) (?:question|message|thing|request))(?![A-Za-z])",
     re.IGNORECASE,
 )
 _TRUE_LONG_RANGE_RECALL_KEYWORD_RE = _keyword_union(
@@ -686,6 +790,92 @@ def has_past_session_keyword(query: str) -> bool:
     としては数えない側が要る (self-session の窓内想起の抑止、H-06)。
     """
     return bool(_TRUE_LONG_RANGE_RECALL_KEYWORD_RE.search(query or ""))
+
+
+#: 「最初に言った」「さっきの」を進行中の会話の中とみなすのに要る、会話の利用者の
+#: 発話数 (**今回の発話を含む**、:func:`session_user_turns`)。1 ターン目 (今回の発話
+#: だけ) では過去セッションを指しうる。ツール判定のガード
+#: (``tool_judge_guards._suppress_ordinal_recall_within_session``) とエピソード検索の
+#: 範囲 (``search_pipeline.episodic_session_scope``) が同じ値・同じ数え方を読む。
+RECALL_IN_SESSION_MIN_USER_TURNS = 2
+
+
+def points_to_past_session(query: str, *, user_turns: int | None = None) -> bool:
+    """今回の問いが **過去の (別の) 会話** を指しているか (純粋関数)。
+
+    会話に先行ターンがある (``user_turns`` が :data:`RECALL_IN_SESSION_MIN_USER_TURNS`
+    以上) か数が分からない (``None``) なら :func:`has_past_session_keyword` — 近接語
+    (「さっき」) と会話内の位置語 (「最初に言った」) は進行中の会話を指す。1 ターン目は
+    指す先が会話の中に無いので、それらも過去の会話を指す (:func:`has_history_recall_keyword`。
+    ``search_pipeline.episodic_session_scope`` と同じ数え方と閾値)。
+    """
+    if user_turns is not None and user_turns < RECALL_IN_SESSION_MIN_USER_TURNS:
+        return has_history_recall_keyword(query)
+    return has_past_session_keyword(query)
+
+
+def session_user_turns(messages) -> int:
+    """会話 (``role`` を持つ dict の列) の利用者の発話数 (純粋関数)。
+
+    今回の発話は応答の前に窓へ積まれるので、窓をそのまま渡せば **今回を含む**。
+    窓から押し出された分は数えない (ガードとエピソード検索の範囲で同じ下限を使う)。
+    """
+    return sum(1 for m in (messages or ()) if str(m.get("role") or "") == "user")
+
+
+#: 会話内の位置語のうち、発話・依頼の動詞を伴う形 (「最初に言」「最初に聞」…) が採る
+#: 語幹。:data:`_HISTORY_KEYWORD_DISTANCE` の ``session_ordinal`` の語から機械的に
+#: 取り出す (語彙を増やさない、不変則 #14(a))。
+_RECALL_SPEECH_STEMS: tuple[str, ...] = tuple(sorted(
+    {
+        kw[len("最初に"):]
+        for kw, distance in _HISTORY_KEYWORD_DISTANCE
+        if distance == "session_ordinal" and kw.startswith("最初に")
+    },
+    key=len, reverse=True,
+))
+_PROXIMAL_RECALL_KEYWORDS_JA: tuple[str, ...] = tuple(
+    kw for kw, distance in _HISTORY_KEYWORD_DISTANCE if distance == "proximal"
+)
+#: 近接語・位置語の後に (主語や目的語を挟んで) 発話の動詞が続く形 (「さっき言った」
+#: 「最初に私が聞いた」)。「今朝娘が熱を出した」「最初に終わったタスク」は当たらない。
+_RECALL_CUE_WITH_SPEECH_RE = re.compile(
+    rf"(?:{'|'.join(map(re.escape, _PROXIMAL_RECALL_KEYWORDS_JA))}|{_SESSION_ORDINAL_BARE})"
+    rf"[^。．？?！!\n]{{0,10}}?(?:{'|'.join(map(re.escape, _RECALL_SPEECH_STEMS))})",
+)
+#: 近接語が名詞を修飾する形 (「さっきの距離」「先ほどの内容」)。
+_PROXIMAL_ADNOMINAL_RE = re.compile(
+    rf"(?:{'|'.join(map(re.escape, _PROXIMAL_RECALL_KEYWORDS_JA))})の",
+)
+
+
+def recall_form_points_into_conversation(query: str) -> bool:
+    """近接語・位置語が **会話の中のもの** を指す形で使われているか (純粋関数)。
+
+    ツール判定のガードは、履歴検索を撃つと決まった問い (履歴参照語か過去の会話を
+    尋ねる構造に当たった問い) にしか掛からない。エピソード検索の範囲
+    (``search_pipeline.episodic_session_scope``) は全ターンで判定するので、同じ述語
+    (:func:`only_proximal_recall` / :func:`only_session_ordinal_recall`) を素の語で
+    発火させると「今朝娘が熱を出した。娘のアレルギーは何？」「最後に、息子の誕生日
+    っていつだっけ？」まで他のセッションを引かなくなる (2026-10-05 レビュー H1)。
+    その前提に当たる形を、語彙を増やさずに構造で取る:
+
+    - 近接語・位置語の後に発話の動詞が続く (:data:`_RECALL_CUE_WITH_SPEECH_RE`)
+    - 近接語が名詞を修飾する (「さっきの距離」)
+    - 位置語が会話の単位を名指す (「最初の質問」「2つ目に教えてもらった」、
+      :data:`_SESSION_ORDINAL_CUE_RE` の素の語以外の枝)
+
+    英語の近接語 ("just now") は形を取らないので偽 (従来どおり別セッションも引く)。
+    """
+    text = query or ""
+    if not text:
+        return False
+    if _RECALL_CUE_WITH_SPEECH_RE.search(text) or _PROXIMAL_ADNOMINAL_RE.search(text):
+        return True
+    return any(
+        m.group("bare") is None and m.group("bare_en") is None
+        for m in _SESSION_ORDINAL_CUE_RE.finditer(text)
+    )
 
 
 def only_session_ordinal_recall(query: str) -> bool:
@@ -1243,6 +1433,12 @@ QUESTION_END_RE = re.compile(
     r"[。．.、,！!\s\"'」』）)]*$",
 )
 
+#: 終助詞「か」で終わる問い (「どんな話をしましたか」「外そうか。」)。
+#: ``QUESTION_END_RE`` は現在形の「ますか」だけで、過去形の「ましたか」を持たない。
+#: 履歴の問いの判定 (``agent.tool_judge_history``) と集合値の編集の門
+#: (``memory.sleep.slot_edit_curator``) が共有する。
+KA_QUESTION_END_RE = re.compile(r"か[。．.！!\s]*$")
+
 #: web リソースを対象にしていることを示す語。**web 意図の唯一の定義** —
 #: ツール要否シグナル (``tool_judge_signals._TOOL_PATTERNS`` / ``_EN``)、
 #: ``_infer_tool`` の fetch_url 分岐、``_query_targets_local_file_only``、
@@ -1289,6 +1485,9 @@ CODE_SEARCH_PATTERNS: tuple["re.Pattern[str]", ...] = (
     re.compile(rf"{_CODE_CONTEXT_TERM}.*{_SEARCH_VERB_TERM}", re.IGNORECASE),
     re.compile(rf"{_SEARCH_VERB_TERM}.*{_CODE_CONTEXT_TERM}", re.IGNORECASE),
 )
+#: 検索動詞の側だけ。依頼文が実在のフォルダを名指すときは、そのフォルダが
+#: ``_CODE_CONTEXT_TERM`` の役 (ファイルの文脈) を担う (``_infer_tool``、f_03 §3.1)。
+SEARCH_VERB_RE = re.compile(_SEARCH_VERB_TERM, re.IGNORECASE)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1387,11 +1586,17 @@ _FILE_REFERENCE_CLAUSE_RE = re.compile(
 #: アシスタントの書込みしか持たないので、主体が user の参照は台帳で解決しない
 #: (c_17 §3.11)。隣接だけを見ると「私が昨日の夜に保存したファイル」「私の PC に
 #: 保存したファイル」を取りこぼした (2026-09-27 レビュー)。
+#: ユーザー自身を指す語。主体の判定と、相対日の会話の相手
+#: (``tool_judge_history``、「昨日私に教えてくれた」) で共有する。
+USER_REFERENCE_STEMS = r"私|わたし|僕|ぼく|俺|おれ|自分|こちら|当方|ユーザー"
 _CLAUSE_SUBJECT_USER_RE = re.compile(
-    r"(?:私|わたし|僕|ぼく|俺|おれ|自分|こちら|当方|ユーザー)(?:が|で|の|は|も)",
+    rf"(?:{USER_REFERENCE_STEMS})(?:が|で|の|は|も)",
 )
+#: アシスタント (対話の相手) を指す語。主体の判定と、相対日の会話の相手
+#: (``tool_judge_history``、「昨日あなたと話した」) で共有する。
+ASSISTANT_REFERENCE_STEMS = r"あなた|君|きみ|evoref|アシスタント"
 _CLAUSE_SUBJECT_ASSISTANT_RE = re.compile(
-    r"(?:あなた|君|きみ|evoref|アシスタント)(?:が|の|は|に)",
+    rf"(?:{ASSISTANT_REFERENCE_STEMS})(?:が|の|は|に)",
     re.IGNORECASE,
 )
 #: 主体を探す範囲の区切り (同じ文の中だけを見る)。
@@ -1677,8 +1882,10 @@ _SELF_OUTPUT_REFERENCE_LOOSE_RE = re.compile(
     re.IGNORECASE,
 )
 #: 産出主体がユーザー自身であることを示す語。あれば assistant の出力ではない。
+#: ユーザーの一人称 (:data:`_USER_POSSESSIVE_RE` と共有する)。
+_USER_SELF_PRONOUN = r"私|わたし|僕|ぼく|俺|おれ"
 _MEASURE_USER_AUTHORED_RE = re.compile(
-    r"(?:私|僕|俺|自分|わたし|ぼく|ユーザー)(?:が|の)"
+    rf"(?:{_USER_SELF_PRONOUN}|自分|ユーザー)(?:が|の)"
     r"|(?<![A-Za-z])(?:i|my|mine)(?![A-Za-z])",
     re.IGNORECASE,
 )
@@ -2013,10 +2220,16 @@ def conversation_turn_count_question(query: str) -> bool:
 #: したか」型。注入した資料はモデルの履歴に残らず (``[参考情報]`` は user
 #: メッセージに一時的に付くだけ)、UI の出典フレームにしか出ない。過去形 /
 #: 根拠の語 + 資料の語を条件にし、「どの資料を読めばよいか」(助言) は拾わない。
+#: 資料・文書を指す名詞 (:data:`_REFERENCED_SOURCES_RE` と
+#: :data:`_SOURCE_PREMISE_RE` が共有する)。
+_SOURCE_DOCUMENT_NOUN = (
+    r"(?:資料|文書|設計書|仕様書|ドキュメント|節|セクション|ソースコード|ソース|出典"
+    r"|ファイル|データ|README)"
+)
 _REFERENCED_SOURCES_RE = re.compile(
     r"(?:参照|参考|根拠|典拠|引用|利用|使用)(?:に)?(?:した|していた|された|しました|なさった)"
-    r"[^。]{0,12}?(?:資料|文書|設計書|ドキュメント|節|セクション|ソース|出典|ファイル)"
-    r"|(?:資料|文書|設計書|ドキュメント|節|セクション)[^。]{0,8}?を?(?:根拠|典拠)に"
+    rf"[^。]{{0,12}}?{_SOURCE_DOCUMENT_NOUN}"
+    rf"|{_SOURCE_DOCUMENT_NOUN}[^。]{{0,8}}?を?(?:根拠|典拠)に"
     r"|(?:出典|典拠|参考文献|参照元|情報源)(?:は|を|も)"
     r"|(?:which|what)\s+(?:documents?|sections?|sources?|files?)\s+(?:did|were|have)\s+you"
     r"|cite\s+your\s+sources?|what\s+sources?\s+did\s+you",
@@ -2342,8 +2555,13 @@ _RESTATE_PRIOR_REPORT_RE = re.compile(
 
 #: 「いま測り直せ」と読める語。再掲要求と重なったらこちらを優先し、
 #: 抑止しない (ユーザーが明示的に最新値を求めている)。
+#: 計算のやり直し (やり直す / 計算し直す / 求め直す / 数え直す) も再掲ではない
+#: (「最初の計算をもう一度やり直して」を再掲と読むと式の合成が止まる、2026-10-05)。
+#: 「出し直す / 表示し直す / 話し直す」は **言い直し** で再掲のままにする — 広く
+#: 「〜し直す」を取ると再掲の計測値を測り直す (2026-08-27 の形)。
 _FRESH_MEASUREMENT_RE = re.compile(
     r"(?:測|計)(?:り|っ)?(?:直|なお)"
+    r"|(?:やり|計算し|求め|数え)(?:直|なお)"
     r"|(?:再度|改めて|もう一度)\s*(?:測|計|確認|調べ|取得)"
     r"|(?:今|現在|最新)\s*の?\s*(?:値|状態|状況)"
     r"|いまいくつ|今いくつ",
@@ -2374,6 +2592,26 @@ def asks_to_restate_prior_report(query: str) -> bool:
     if _FRESH_MEASUREMENT_RE.search(query):
         return False
     return bool(_RESTATE_PRIOR_REPORT_RE.search(query))
+
+
+#: 再掲の言い回しに乗せた **条件の変更 / 計算の依頼**。「さっきの予算計算をもう一度、
+#: 3人の場合で出して」「さっきの計算をもう一度して」は読み上げでなく計算し直し。
+_RECOMPUTE_WITH_CHANGE_RE = re.compile(
+    r"場合|としたら|とすると"
+    r"|計算(?:を)?\s*(?:もう一度|もう1度|もういちど|再度)?\s*して",
+)
+
+
+def restate_changes_condition(query: str) -> bool:
+    """再掲の言い回しでも、条件 (数・場合) を変えるか計算を頼んでいるか (純粋関数)。
+
+    :func:`asks_to_restate_prior_report` が真でも、これが真なら式を組み直す側に倒す
+    (層 5.95 の式合成、docs/f_03 §3.1)。数を含む依頼は新しい条件を持ちうるので
+    読み上げと決めない (「人数を3人にしてもう一度」)。
+    """
+    if not query:
+        return False
+    return bool(NUMBER_LITERAL_RE.search(query) or _RECOMPUTE_WITH_CHANGE_RE.search(query))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -2467,8 +2705,17 @@ def unverified_claim_numbers(query: str, context: str) -> tuple[str, ...]:
     …3,472.2 です」と訂正するようになる (実測)。
 
     確認形でないクエリ (ユーザーが新しい前提を述べているだけ) は対象外。
+
+    確認形でも、値を **この会話のもの** として持ち出していないクエリは対象外
+    (:func:`claim_attributed_to_conversation`。会話に計算済み・既述の値が
+    あれば持ち出しているとみなす)。一般知識の前提に付けると、
+    モデルは「その値は会話に出ていない」と答えて問いに答えなくなる
+    (2026-10-05 ライブ監査: 「富士山の高さは3776mですが、エベレストより高い
+    ですよね？」に「3776という数値はこれまでの会話には一度も出てきていません」)。
     """
     if not PREMISE_CONFIRMATION_RE.search(query.strip()):
+        return ()
+    if not claim_attributed_to_conversation(query, context):
         return ()
     known = _normalized_numbers(context)
     unverified: list[str] = []
@@ -2489,6 +2736,234 @@ def unverified_claim_numbers(query: str, context: str) -> tuple[str, ...]:
         if raw not in known and raw not in unverified:
             unverified.append(raw)
     return tuple(unverified)
+
+
+#: 4 桁の年 (「2025年」)。会話の数値の隣の語としては数えない
+#: (:func:`_shares_quantity_with_context`)。年は話題の日付で、確認形で持ち出す
+#: 値の出所にはならない。
+_YEAR_LITERAL_RE = re.compile(r"(?<![\d,.])\d{4}(?=\s*年)")
+
+#: 量の名前になりうる語 (漢字 2 字以上 / カタカナ語 2 字以上 / 英字 3 字以上)。
+#: 文字種の連なりで切るだけで、語の一覧は持たない。
+_QUANTITY_TOKEN_RE = re.compile(
+    rf"[{KANJI}]{{2,}}|[{KATAKANA_WORD}]{{2,}}|[A-Za-z]{{3,}}",
+)
+
+#: 数値の前後で「同じ量の名前」を探す幅 (字数)。「平均は毎分3472.2リクエスト」の
+#: 平均 / 毎分 / リクエストが入る幅。
+_QUANTITY_WINDOW_CHARS = 12
+
+#: 英語の機能語 (量の名前に数えない)。
+_EN_FUNCTION_WORDS = frozenset({
+    "the", "was", "were", "are", "and", "that", "this", "right", "isn", "aren",
+    "correct", "wasn", "weren", "doesn", "don", "not", "yes", "about", "around",
+})
+
+#: ANAPHORIC_OPERAND_RE と共有する被演算子の数量名詞。
+_OPERAND_QUANTITY_NOUN = (
+    r"(?:差|値|数値|数|合計|総額|金額|件数|回数|結果|平均|割合|時間|人数)"
+)
+
+#: 「計算した値は」「出した結果は」— 過去の産出 (〜た) で限定された数量名詞。
+#: その値は会話の中で出たものを指す。数量名詞は被演算子の照応と共有する。
+_PAST_PRODUCED_QUANTITY_RE = re.compile(
+    rf"た\s*{_OPERAND_QUANTITY_NOUN}\s*(?:は|って|が)",
+)
+
+
+def _query_number_present(query: str) -> bool:
+    """クエリが数値を持ち出しているか (年を除く、純粋関数)。"""
+    return bool(NUMBER_LITERAL_RE.search(_YEAR_LITERAL_RE.sub(" ", query)))
+
+
+def _repeats_context_number(query: str, context: str) -> bool:
+    """クエリの 3 桁以上の数値 (年を除く) が会話にそのまま出ているか (純粋関数)。"""
+    if not context:
+        return False
+    known = _normalized_numbers(_YEAR_LITERAL_RE.sub(" ", context))
+    return any(
+        len(n.replace(".", "")) >= _CLAIM_NUMBER_MIN_DIGITS and n in known
+        for n in _normalized_numbers(_YEAR_LITERAL_RE.sub(" ", query))
+    )
+
+
+def _shares_quantity_with_context(query: str, context: str) -> bool:
+    """クエリの量の名前が、会話の数値の隣に現れるか (純粋関数)。
+
+    「平均のほうの毎分リクエスト数は 5,787 ですよね。」は、会話の
+    「平均は毎分3472.2リクエストです。」の 3472.2 の隣に 平均 / 毎分 / リクエスト
+    がある。会話に数値があるだけでは足りない (2026-10-05 再レビュー:
+    「東京タワーは333mです。」の後の「エベレストは8848mですよね？」は一般知識)。
+    """
+    if not context:
+        return False
+    tokens = {
+        t for t in _QUANTITY_TOKEN_RE.findall(_YEAR_LITERAL_RE.sub(" ", query))
+        if t.casefold() not in _EN_FUNCTION_WORDS
+    }
+    if not tokens:
+        return False
+    text = _YEAR_LITERAL_RE.sub(" ", context)
+    folded = text.casefold()
+    for m in NUMBER_LITERAL_RE.finditer(text):
+        lo = max(0, m.start() - _QUANTITY_WINDOW_CHARS)
+        window = folded[lo:m.end() + _QUANTITY_WINDOW_CHARS]
+        if any(t.casefold() in window for t in tokens):
+            return True
+    return False
+
+
+def claim_attributed_to_conversation(query: str, context: str = "") -> bool:
+    """主張を **この会話で出た値・発言・結果** として持ち出しているか (純粋関数)。
+
+    次のどれかで True:
+
+    - 想起の文末 (「でしたよね」「と言いましたよね」、:data:`PAST_RECALL_TAIL_RE`)
+    - 履歴参照語 (「さっき」「先ほど」、:func:`has_history_recall_keyword`)
+    - 直前の出力への照応 (「先ほどの結果」、:func:`refers_to_previous_output`)
+    - 過去の産出で限定された数量 + 数値 (「前に計算した値は1,234」、
+      :data:`_PAST_PRODUCED_QUANTITY_RE`)
+    - 会話に出た 3 桁以上の値そのものの確認 (「計算結果は3,472.2で合ってますか？」)
+    - 数値・被演算子の照応 (「その合計」、:data:`ANAPHORIC_OPERAND_RE`)・指示語 +
+      名詞 (「この時間は」、:data:`_ESTABLISHED_QUANTITY_REF_RE`) のどれかがあり、
+      かつクエリの量の名前が会話の数値の隣に現れる
+      (:func:`_shares_quantity_with_context`)。3472.2 を計算した会話の
+      「平均のほうの毎分リクエスト数は 5,787 ですよね。」は現在形でも
+      2026-08-10 のインシデントと同じ形
+
+    語彙は既存の判定をそのまま使う (不変則 #14 (a))。数値が会話にあるだけでは
+    数えない — 「ポート8080」の後の「水は100度で沸騰しますよね？」は一般知識。
+    """
+    if (
+        PAST_RECALL_TAIL_RE.search(query)
+        or has_history_recall_keyword(query)
+        or refers_to_previous_output(query)
+    ):
+        return True
+    has_number = _query_number_present(query)
+    if has_number and _PAST_PRODUCED_QUANTITY_RE.search(query):
+        return True
+    # 会話に出た値そのものの確認 (「計算結果は3,472.2で合ってますか？」)
+    if has_number and _repeats_context_number(query, context):
+        return True
+    if not (
+        has_number
+        or ANAPHORIC_OPERAND_RE.search(query)
+        or _ESTABLISHED_QUANTITY_REF_RE.search(query)
+    ):
+        return False
+    return _shares_quantity_with_context(query, context)
+
+
+#: 時点で変わる事実の手掛かり語。直示語は temporal_deixis から組む
+#: (不変則 #14 (a))。「最新」「直近」「latest」は直示語ではないのでここに置く。
+_TIME_SENSITIVE_CUE = (
+    "(?:"
+    + alternation(NOW_NOUNS, present_day_terms(), ("最新", "直近"))
+    + "|" + NOW_BARE + "の|" + NOW_KANA + "の"
+    + "|" + ascii_words(EN_NOW, EN_NOW_ADVERBS, EN_TODAY, ("latest", "newest"))
+    + ")"
+)
+#: 時点で変わる事物の名詞 (価格・版・天気・役職者…)。手掛かり語だけでは
+#: 「現在の日本の首都」「最新の研究では」も拾うので、隣にこれを要求する。
+_VOLATILE_NOUN = (
+    r"(?:価格|値段|料金|相場|株価|為替|レート|版|バージョン|リリース|天気|気温"
+    r"|首相|大統領|社長|順位|ランキング|ニュース|金利"
+    r"|price|prices|version|release|weather|rate|rates|president|ranking)"
+)
+_TIME_SENSITIVE_RE = re.compile(
+    # 手掛かり語の後に名詞 (「今のビットコインの価格」「current price」)
+    rf"{_TIME_SENSITIVE_CUE}[^。．!！?？、,]{{0,10}}?{_VOLATILE_NOUN}"
+    # 名詞の後に手掛かり語 (「価格は今」は採らない — 「の」で結ぶ形だけ)
+    rf"|{_VOLATILE_NOUN}の{_TIME_SENSITIVE_CUE}"
+    # 最新そのものが述語・連体の頭 (「iPhone の最新は」「最新版」「最新の Python」)
+    r"|最新(?:は|です|版|の\s*[A-Za-z])"
+    r"|(?<![A-Za-z])the\s+(?:latest|newest)(?:\s+(?:one|version|release|model))?"
+    r"\s*[,.?!]",
+    re.IGNORECASE,
+)
+
+#: 資料・文書を根拠として名指す形 (「資料では」「設計書には」「README によると」)。
+#: 名詞は :data:`_SOURCE_DOCUMENT_NOUN` を :data:`_REFERENCED_SOURCES_RE` と共有する。
+_SOURCE_PREMISE_RE = re.compile(
+    rf"{_SOURCE_DOCUMENT_NOUN}\s*(?:では|には|に(?:よると|よれば)|で)"
+    r"|(?<![A-Za-z])(?:according\s+to|in)\s+the\s+"
+    r"(?:docs?|documents?|documentation|design\s+docs?|readme|spec|file|code)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+#: 一人称の所有 (ユーザー本人・その所属の事物)。一人称の語は
+#: :data:`_MEASURE_USER_AUTHORED_RE` と共有する (:data:`_USER_SELF_PRONOUN`)。
+#: 「私の考えでは」「my guess」のような意見の枠は本人のデータではないので除く。
+#: 「自分の」は一般論の再帰 (「自分の健康には早寝が大事」)、``our`` は一般論の
+#: 主語 (「our planet」) に立つので採らない。
+_USER_POSSESSIVE_RE = re.compile(
+    rf"(?:{_USER_SELF_PRONOUN}|うち)の(?!考え|意見|印象|感覚|理解|見立て|予想)"
+    r"|(?<![A-Za-z])my\s+"
+    r"(?!guess|opinion|view|understanding|impression|feeling|sense)",
+    re.IGNORECASE,
+)
+
+
+def _names_instance(query: str, instance_name: str) -> bool:
+    """クエリがインスタンス名を名指しているか (純粋関数)。
+
+    英数字の名前は英数字の境界で照合する (「Ai」が「Aim」に、「Sun」が
+    「Sunday」に当たらない)。それ以外の名前 (「アリス」) は部分一致。
+    """
+    name = (instance_name or "").strip()
+    if not name:
+        return False
+    if re.fullmatch(r"[\x20-\x7e]+", name):
+        return bool(re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", query, re.IGNORECASE,
+        ))
+    return name in query
+
+
+def premise_needs_evidence(
+    query: str,
+    context: str = "",
+    *,
+    asks_user_attribute: bool = False,
+    instance_name: str = "",
+) -> bool:
+    """確認形の前提が、一般知識では確かめられない範囲を指しているか (純粋関数)。
+
+    次のどれかを指す前提は、根拠 (会話・注記・ツールの結果) でしか判断できない:
+
+    - この会話の値・発言 (:func:`claim_attributed_to_conversation`)
+    - ユーザー本人・家族・所属 (``asks_user_attribute``: 呼出側が記憶の属性辞書
+      ``fact_attributes.yaml`` で解決した結果。「息子の誕生日」「妻の名前」/
+      一人称の所有「私の〜」「うちの〜」)
+    - この製品・アシスタント自身 (「evoref は〜」「あなたは〜」「このシステム」
+      「このプロジェクト」、インスタンス名 ``instance_name``)
+    - 名指した資料・ファイル・コード (「資料では」「README には」「この関数は」
+      「config.yaml の」)
+    - 時点で変わる事実 (「今のビットコインの価格」「最新の Python」「the latest」)
+
+    それ以外 (「日本の首都は大阪ですよね？」「現在の日本の首都は東京ですよね？」)
+    は一般知識で同意・訂正してよい前提として扱う。
+
+    実インシデント (2026-09-04 ライブ監査): 「evoref は RAG に LangChain を
+    使っていますよね？」を追認した — 製品自身の前提は一般知識 (RAG なら
+    LangChain が多い) で答えてはいけない。
+    """
+    if claim_attributed_to_conversation(query, context):
+        return True
+    if asks_user_attribute or _USER_POSSESSIVE_RE.search(query):
+        return True
+    if _PRODUCT_SELF_NAME_RE.search(query) or _PRODUCT_SELF_PRONOUN_RE.search(query):
+        return True
+    if _names_instance(query, instance_name):
+        return True
+    if (
+        _SOURCE_PREMISE_RE.search(query)
+        or names_file_target(query)
+        or PREVIOUS_ANSWER_REF_RE.search(query)
+    ):
+        return True
+    return bool(_TIME_SENSITIVE_RE.search(query))
 
 
 #: 被演算子が直前ターンにしかないことを示す照応。「その差」「先ほどの合計」等。
@@ -2514,8 +2989,8 @@ def unverified_claim_numbers(query: str, context: str) -> tuple[str, ...]:
 #: 手掛かり語が無いので通らない)。
 ANAPHORIC_OPERAND_RE = re.compile(
     r"(?:その|それ|この|これ|先(?:ほど|程)の|さきほどの|さっきの|上記の|直前の)\s*"
-    r"(?:差|値|数値|数|合計|総額|金額|件数|回数|結果|平均|割合|時間|人数)"
-    r"|(?:最初|当初|もともと|元々|開始時|スタート時|初期|前回|以前)"
+    + _OPERAND_QUANTITY_NOUN
+    + r"|(?:最初|当初|もともと|元々|開始時|スタート時|初期|前回|以前)"
     r"[^。？?\n]{0,12}?(?:から|より|と比[べく]|に比[べく])"
     r"|(?:いくつ|いくら|どれ(?:だけ|くらい|ほど)|何[0-9]*(?:個|円|件|人|枚|台|冊|％|%))"
     r"\s*(?:も|ほど|くらい|ぐらい)?\s*"
@@ -2923,9 +3398,18 @@ def model_identity_question(query: str) -> bool:
 #: 「参照していません」と認める。system プロンプトの規則
 #: (「不確かな内容は『未確認』か『推測』と明示する」) はあるが、守るかどうかが
 #: モデル任せになっている。
+#: 製品・アシスタントの名指し。
+_PRODUCT_SELF_NAME_PATTERN = (
+    r"evoref|アシスタント|この(?:システム|アプリ|ツール|製品|プロジェクト|リポジトリ)"
+    r"|this\s+(?:system|app|tool|product|assistant|project|repo|repository)"
+)
+#: アシスタントへの呼び掛け。:func:`premise_needs_evidence` は英語の裸の
+#: ``you`` を採らない (「Don't you think…」の一般論の主語にも立つ)。
+_PRODUCT_SELF_PRONOUN_PATTERN = r"あなた|君|きみ|お前|(?<![A-Za-z])your\b"
+_PRODUCT_SELF_NAME_RE = re.compile(_PRODUCT_SELF_NAME_PATTERN, re.IGNORECASE)
+_PRODUCT_SELF_PRONOUN_RE = re.compile(_PRODUCT_SELF_PRONOUN_PATTERN, re.IGNORECASE)
 _PRODUCT_SELF_RE = re.compile(
-    r"evoref|あなた|君|きみ|お前|アシスタント|この(?:システム|アプリ|ツール|製品)"
-    r"|(?:you|your)\b|this\s+(?:system|app|tool|product|assistant)",
+    _PRODUCT_SELF_NAME_PATTERN + "|" + _PRODUCT_SELF_PRONOUN_PATTERN + r"|you\b",
     re.IGNORECASE,
 )
 #: 内部の設計・実装を訊いていることの手掛かり。
@@ -3003,8 +3487,13 @@ def tool_inventory_question(query: str) -> bool:
     return bool(_TOOL_INVENTORY_ASK_RE.search(query))
 
 
-#: 現在日時 / 日付を尋ねるクエリ。``agent.tool_call_judge`` (datetime コマンド
-#: 合成) と ``agent.router`` (executable_query 分類) が同じ判定を使う。
+#: 現在日時 / 日付を尋ねるクエリ。現在日時の注記 (:func:`needs_current_datetime`
+#: → ``core.inference._current_date_note``) の発火条件の一部で、
+#: ``agent.tool_judge_commands`` の日付演算ビルダの入口でもある。
+#:
+#: 2026-10-03 に現在日時だけを返すコマンド (now-only) を廃止した (不変則 #15)。
+#: この判定が当たっても **ツールは撃たない** — 演算を組めたときだけ演算コマンドが
+#: 出る。router の executable_query は :data:`DATE_ARITHMETIC_QUESTION_RE` を使う。
 #:
 #: 以前は両モジュールが個別に正規表現を持っており、``(?!間)`` ガードが
 #: tool_call_judge 側にしか無い等の食い違いがあった。ここを SSOT にする。
@@ -3026,17 +3515,23 @@ def tool_inventory_question(query: str) -> bool:
 #: (実インシデント 2026-08-22 ライブ監査 ターン20)。
 #: ``時刻表`` (時刻表アプリ / 列車の時刻表) だけ除外する。
 DATETIME_QUERY_RE = re.compile(
+    # 「何日」は期間・所要の形 (「何日で使えなくなる」「何日後」) も拾う。2026-10-03 に
+    # 一度それらを外した (PR #865: now-only コマンドが不要な問いに撃たれた) が、
+    # now-only コマンドを廃止して現在日時を常に注記で渡す形にしたので、ここで
+    # 広く拾っても害は注記 1 行に留まる (不変則 #15)。日付演算のコマンドは
+    # ``tool_judge_commands._build_datetime_command`` が演算を組めたときだけ返す。
     r"(?:何時(?!間)|何月|何日(?!間)|何曜日"
     # 「更新日時」「作成日付」「開催日時」のような **複合名詞の一部** は現在時刻の
     # 問いではない (2026-09-10 ライブ監査 (g) G-01: 「.log ファイルを更新日時の
     # 新しい順に並べる」で now-only コマンドが撃たれた)。漢字が直前に付く形は
-    # 複合語とみなし、現在 / 本日 / 今 だけを例外にする。同じく「発表の日付」
+    # 複合語とみなし、現在 / 今日 / 本日 / 今 だけを例外にする。同じく「発表の日付」
     # 「締切の日付」のような **所有の「の」** が直前に付く形は、その事柄の
     # 日付であって今日ではない (同 (g): 「発表の日付とテーマを確認させて
     # ください」で now-only コマンドが撃たれ、答えの隣にツール結果が並んだ)。
     # 「今日の / 本日の / 現在の / 今の / いまの」だけを例外にする。
-    f"|(?:(?<![{KANJI}の])|(?<=現在)|(?<=本日)|(?<=今)"
-    r"|(?<=今日の)|(?<=本日の)|(?<=現在の)|(?<=今の)|(?<=いまの)|(?<=todayの)|(?<=today の))"
+    f"|(?:(?<![{KANJI}の])|" + lookbehinds(NOW_NOUNS, present_day_terms(), [NOW_BARE])
+    + "|" + lookbehinds(present_day_terms(), NOW_NOUNS, [NOW_BARE, NOW_KANA], suffix="の")
+    + "|" + lookbehinds(EN_TODAY, suffix="の") + "|" + lookbehinds(EN_TODAY, suffix=" の") + ")"
     r"(?:日時|日付)(?!型|形式|フォーマット|カラム|列)|時刻(?!表)"
     # 「何日間」は ``何日(?!間)`` で意図的に外している (「有給は何日間？」の
     # ような、今日と無関係な期間の問いを拾わないため)。ただし **年つきの
@@ -3052,6 +3547,76 @@ DATETIME_QUERY_RE = re.compile(
     r"|(?<![A-Za-z])day\s+of\s+the\s+week(?![A-Za-z])"
     r"|(?<![A-Za-z])(?:tell|give)\s+me[^.?!\n]{0,20}?"
     r"(?<![A-Za-z])(?:date|time)(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+
+#: 「現在」を指す語 (今日 / 本日 / 現在 / 只今 / 今の / いま / today / now …)。
+#: 現在日時の注記の発火条件 (:func:`needs_current_datetime`) と、過去事実の想起の
+#: 判定 (``tool_judge_commands._is_past_fact_recall``: 現在を指す語があれば想起では
+#: ない) が同じ語を使う。``いま`` / ``きょう`` は 2 文字の部分文字列で無関係な語に
+#: 埋もれる (変わって**いま**せん / 興味) ので後続で除く (語彙は temporal_deixis が SSOT)。
+PRESENT_ANCHOR_RE = re.compile(
+    alternation(present_day_terms(), NOW_NOUNS, NOW_ADVERBS)
+    + "|" + NOW_BARE_STANDALONE_PATTERN
+    + "|" + NOW_KANA_PATTERN + "|" + TODAY_KANA_PATTERN
+    + "|" + ascii_words(EN_NOW, EN_TODAY, EN_NOW_ADVERBS),
+    re.IGNORECASE,
+)
+
+#: 日付の解釈を要する相対表現 (明日 / 来週 / 先月 / 去年 / 3 週間後 / tomorrow …)。
+#: 相対語彙は ``core.temporal_deixis`` (直示の SSOT) から導く。明示日付 (和文の
+#: 月日 / ISO) の読み取りは ``core.response_dates`` が SSOT。
+DATE_CONTEXT_RE = re.compile(
+    alternation(DAY_OFFSETS, WEEK_OFFSETS, MONTH_OFFSETS, YEAR_OFFSETS)
+    + r"|何日後|何日前|日後|日前|何曜日"
+    # 「3 週間後」の単位と向きは core.relative_date が SSOT (不変則 #14(a))。
+    + r"|\d\s*(?:" + PERIOD_UNIT_ALTERNATION + r")\s*" + OFFSET_DIRECTION_PATTERN
+    + r"|(?<![A-Za-z])(?:" + alternation(EN_TODAY, EN_RELATIVE_DAYS) + "|"
+    + EN_THIS_PERIOD_PATTERN + r")(?![A-Za-z])",
+)
+
+
+def needs_current_datetime(text: str) -> bool:
+    """発話の理解・回答に **現在日時** が要りうるか (純粋関数)。
+
+    現在日時の注記 (``core.inference._current_date_note``) を付けるかの **唯一の
+    判定** (不変則 #14(a))。以前は注記の判定 (``_has_date_signal``: 日付と相対
+    表現) とツールの判定 (:data:`DATETIME_QUERY_RE`: 時刻・日付の問い) が別々で、
+    「今何時?」はツールだけが答え、注記は付かなかった。現在日時をツールで取る
+    のをやめたので (不変則 #15)、時刻・日付の問いも注記が答える。
+
+    誤って付いても害は注記 1 行 (参考枠の内側) に留まるので広く取る:
+    時刻・日付の問い / 現在を指す語 / 相対表現 / 明示日付 / 日付演算の手掛かり。
+    """
+    t = text or ""
+    if not t:
+        return False
+    return bool(
+        DATETIME_QUERY_RE.search(t)
+        or PRESENT_ANCHOR_RE.search(t)
+        or DATE_CONTEXT_RE.search(t)
+        or JP_DATE_RE.search(t)
+        or ISO_DATE_RE.search(t)
+        or query_has_date_math_cue(t)
+    )
+
+
+#: 日付 **演算** を求める日時の問い (「今日から 100 日後は何月何日?」「あと何日
+#: で今月が終わる?」)。日時の問い (:data:`DATETIME_QUERY_RE`) かつ日付演算の手掛かり
+#: (``date_math_cue.DATE_MATH_CUE_RE``) の両方を要求する。router の
+#: executable_query と、ツール要否シグナル・``_infer_tool`` のゲートが使う
+#: (:data:`EXECUTABLE_QUERY_TERM_GROUPS_JA`)。
+#:
+#: 以前は :data:`DATETIME_QUERY_RE` そのものを使っていた。現在日時だけの問い
+#: (「今何時?」) は注記が答えるのでツールも deliberative も要らない (2026-10-03、
+#: 不変則 #15)。手掛かり単独 (「3 日間の旅行プラン」の ``日間``) では広すぎるので
+#: 両方を求める。手掛かりを持たない演算 (「2000年1月1日は何曜日?」「来週の金曜日は
+#: 何日?」) はツール判定が演算コマンドを組み、reactive 軽量パスのゲートが
+#: ``tool_needed`` で deliberative へ上げる。
+DATE_ARITHMETIC_QUESTION_RE = re.compile(
+    r"\A(?=[\s\S]*?(?:" + DATETIME_QUERY_RE.pattern + r"))"
+    r"(?=[\s\S]*?(?:" + DATE_MATH_CUE_RE.pattern + r"))",
     re.IGNORECASE,
 )
 
@@ -3114,7 +3679,8 @@ def asks_user_profile_summary(query: str) -> bool:
 #: 「今日の会話」「本日のやり取り」— 日付で区切った会話全体。現在セッション
 #: ではなく **同じ日の全セッション** を指す。
 _TODAY_SCOPE_RE = re.compile(
-    r"(?:今日|本日)の(?:ここまでの|これまでの|全体の)?(?:会話|やり取り|対話|セッション)"
+    r"(?:" + alternation(present_day_terms())
+    + r")の(?:ここまでの|これまでの|全体の)?(?:会話|やり取り|対話|セッション)"
     r"|(?<![A-Za-z])today'?s\s+(?:conversations?|sessions?|chats?)(?![A-Za-z])",
     re.IGNORECASE,
 )
@@ -3189,14 +3755,19 @@ def is_plain_statement(query: str) -> bool:
 #: 部分一致にしないことが安全性の本体で、語形を足しても「全部が定型の発話」が
 #: 増えるだけ — 中身のある発話が巻き添えで落ちる方向へは動かない。この性質が
 #: あるので、他の字句表 (不変則 #12 / #14) と違って語彙の追加が危険側に倒れない。
-_SOCIAL_FORMULA_RE = re.compile(
-    r"(?:"
+#: ただし **誰の発話か** で中身の有無が変わる語 (「他にありますか?」) は
+#: :data:`_SOCIAL_CLOSER_ASSISTANT` に分けて、ユーザー発話の判定から外す。
+#:
+#: 以下は発話者を問わない定型 (挨拶・感謝・相槌・労い・謝罪・単体の依頼)。
+_SOCIAL_FORMULA_COMMON = (
     # 挨拶・出会いと別れ
     r"おはようございます|おはよう|こんにちは|こんばんは|はじめまして|"
     r"さようなら|さよなら|ごきげんよう|お先に失礼(?:します|いたします)|"
     r"お世話になって(?:おります|います)|お世話になります|"
     r"(?:それ)?では(?:また)?|またお願いします|また(?:明日|後で|次回)|"
-    r"(?:今日|本日|今後|引き続き|改めて|こちらこそ)も?"
+    # 「今日は/今日も よろしく」— 係助詞は「も」に限らない (2026-10-05 ライブ:
+    # 「こんにちは。今日はよろしくお願いします。」が被覆されず挨拶に RAG が走った)
+    rf"(?:{alternation(present_day_terms())}|今後|引き続き|改めて|こちらこそ)[はも]?"
     r"(?:どうぞ)?よろしく(?:お願い(?:します|いたします|致します)|"
     r"おねがいします)?|"
     r"(?:どうぞ)?よろしく(?:お願い(?:します|いたします|致します)|おねがいします)|"
@@ -3217,7 +3788,14 @@ _SOCIAL_FORMULA_RE = re.compile(
     r"すみません|すいません|ごめんなさい|ごめん|"
     r"失礼(?:します|しました|いたします|いたしました)|"
     # 単体の依頼定型 (対象が書かれていないもの)
-    r"お願い(?:します|いたします|致します)|おねがいします|"
+    r"お願い(?:します|いたします|致します)|おねがいします"
+)
+
+#: アシスタントの応答の締めにだけ現れる定型 (「用があれば言ってください」型)。
+#: **ユーザー発話の判定には使わない** — ユーザーが言う「他にありますか?」
+#: 「何でしょうか?」は中身を求める問いで、定型として扱うと RAG 要否が skip に
+#: 倒れて記憶を引かずに答える (2026-10-05 レビュー)。
+_SOCIAL_CLOSER_ASSISTANT = (
     # 「用があれば言ってください」型の締め。system プロンプトが名指しで
     # 禁じている定型そのもの (「応答の末尾に … 『他にご質問はありますか?』
     # 等の定型文を追加しない」) で、実機では守られずノートに残る。
@@ -3229,8 +3807,13 @@ _SOCIAL_FORMULA_RE = re.compile(
     r"(?:どうぞ)?(?:お気軽に)?(?:お声がけ|お声掛け|ご連絡|お尋ね|お知らせ|"
     r"仰って|おっしゃって|言って)(?:ください|下さい|くださいね)|"
     r"いつでも|お気軽に"
-    r")",
 )
+
+_SOCIAL_FORMULA_RE = re.compile(
+    rf"(?:{_SOCIAL_FORMULA_COMMON}|{_SOCIAL_CLOSER_ASSISTANT})",
+)
+#: ユーザー発話用 (アシスタント側の締めを含まない)。
+_SOCIAL_FORMULA_USER_RE = re.compile(rf"(?:{_SOCIAL_FORMULA_COMMON})")
 
 #: 英語側。全文被覆で使うので ASCII 語の境界誤爆 (locale union の既知の罠) は
 #: 起きない — 「OK, the port is 8080」は残余が出るので被覆にならない。
@@ -3254,7 +3837,7 @@ _SOCIAL_SEPARATOR_RE = re.compile(
 )
 
 
-def is_contentless_social_formula(text: str) -> bool:
+def is_contentless_social_formula(text: str, *, assistant_closers: bool = True) -> bool:
     """発話全体が社交の定型だけで出来ているか (純粋関数)。
 
     「了解しました。」「お疲れさまです。」「ありがとうございます。助かりました。」
@@ -3272,6 +3855,10 @@ def is_contentless_social_formula(text: str) -> bool:
     True を返す。「こんにちは。今日は水曜ですね。」は ``今日は水曜ですね`` が
     残るので False、「はい、それでお願いします。」も ``それで`` が残るので
     False (承認の宛先という中身があるため、落とさない側に倒す)。
+
+    ``assistant_closers=False`` はユーザー発話用で、アシスタントの締めの定型
+    (「他にご質問はありますか?」「いつでもお声がけください」) を被覆に使わない。
+    ユーザーが言う「他にありますか?」は中身を求める問いだから。
     """
     if not text:
         return False
@@ -3284,7 +3871,8 @@ def is_contentless_social_formula(text: str) -> bool:
         if sep:
             rest = rest[sep.end():]
             continue
-        m = _SOCIAL_FORMULA_RE.match(rest) or _SOCIAL_FORMULA_RE_EN.match(rest)
+        ja_re = _SOCIAL_FORMULA_RE if assistant_closers else _SOCIAL_FORMULA_USER_RE
+        m = ja_re.match(rest) or _SOCIAL_FORMULA_RE_EN.match(rest)
         if not m or m.end() == 0:
             return False
         rest = rest[m.end():]
@@ -3323,7 +3911,7 @@ def has_history_recall_keyword(query: str) -> bool:
 
 
 #: 履歴参照語 1 語ごとの境界付きパターン。どの語に当たったか (= 近接か長距離か)
-#: を知りたい呼出側 (``tool_judge_history._only_proximal_recall_keywords``) 用。
+#: を知りたい呼出側 (:func:`only_proximal_recall`) 用。
 #: 以前あちらは ``kw in query.lower()`` の素の部分一致で、``_keyword_union`` が
 #: ASCII に付けている境界を持たない **食い違った複製** だった。
 _HISTORY_KEYWORD_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
@@ -3339,12 +3927,33 @@ def matched_history_keywords(query: str) -> list[str]:
     return [kw for kw, pattern in _HISTORY_KEYWORD_PATTERNS if pattern.search(text)]
 
 
+def only_proximal_recall(query: str) -> bool:
+    """履歴参照語が近接リコール語 (「さっき」「先ほど」) だけか (純粋関数)。
+
+    長距離リコール語 (「以前」「最初に」「覚えて」等) が 1 つでもあれば False。
+    「進行中の会話を指しているか」の判定点で、ツール判定のガード
+    (``tool_judge_guards._suppress_proximal_recall_cross_session``) とエピソード
+    検索の範囲 (``search_pipeline.episodic_session_scope``) の両方がこれを読む
+    (不変則 #14(a): 片方だけ「窓の中」と結論すると、もう片方が別セッションの
+    答えを「さっきの話」として差し出す。2026-10-05 ライブ監査)。
+
+    語彙は JA / EN 双方を locale に関わらず見る。片側だけだと "just now" が
+    近接語と認識されない。照合は :func:`matched_history_keywords` (ASCII 語に
+    英字境界を付ける) に寄せる。
+    """
+    matched = matched_history_keywords(query)
+    if not matched:
+        return False
+    return all(kw in PROXIMAL_RECALL_KEYWORDS for kw in matched)
+
+
 #: 「(過去に述べられた事実) は何日でしたか？」型の **想起の文末**。
 #:
 #: 2 つの消費側が別々に持っていた語彙の和集合:
 #:
-#: - ``tool_judge_commands._is_past_fact_recall``: now-only の日時コマンドを
-#:   抑止する (「私の誕生日は何日でしたか？」で ``datetime.now()`` を撃たない)。
+#: - ``tool_judge_commands._is_past_fact_recall``: 日付演算を含まない学習済み
+#:   コマンドの想起を抑止する (「私の誕生日は何日でしたか？」で ``datetime.now()``
+#:   を撃たない)。
 #: - ``tool_judge_history.asks_about_prior_conversation_entity``: 既出対象の
 #:   尋ね直しを実行可能クエリから外す (「その打ち合わせは何曜日でしたか？」)。
 #:
@@ -3518,7 +4127,7 @@ def _union_pattern(groups) -> re.Pattern:
 #: 日本語 locale の実行可能クエリ語彙 (グループ順は従来のリスト順を保つ)。
 EXECUTABLE_QUERY_TERM_GROUPS_JA: tuple = (
     HARDWARE_SPEC_TERMS,
-    DATETIME_QUERY_RE,
+    DATE_ARITHMETIC_QUESTION_RE,
     NETWORK_IDENTITY_TERMS,
     OS_QUERY_TERMS,
     PYTHON_VERSION_TERMS,
@@ -3530,7 +4139,7 @@ EXECUTABLE_QUERY_TERM_GROUPS_JA: tuple = (
 #: 英語 locale の実行可能クエリ語彙。
 EXECUTABLE_QUERY_TERM_GROUPS_EN: tuple = (
     HARDWARE_SPEC_TERMS,
-    DATETIME_QUERY_RE,
+    DATE_ARITHMETIC_QUESTION_RE,
     NETWORK_IDENTITY_TERMS,
     OS_QUERY_TERMS,
     PYTHON_VERSION_TERMS,
@@ -3582,3 +4191,18 @@ EXECUTABLE_QUERY_PATTERNS_ALL: list[re.Pattern] = _compile_groups(
     EXECUTABLE_QUERY_TERM_GROUPS_ALL,
 )
 EXECUTABLE_QUERY_RE_ALL = _union_pattern(EXECUTABLE_QUERY_TERM_GROUPS_ALL)
+
+#: 表の集計を問いうる手掛かり。数値計算の手掛かり (:data:`CALCULATION_CUE_RE`) と
+#: データ処理 (集計 / 統計) の語の和で、語は足さない (どちらも既存の SSOT)。読んだ表の
+#: 集計のパラメータの往復 (``agent.table_aggregate_intent``、docs/f_03 §4.2.2) を、
+#: 数の答えを求めない依頼 (要約・列名・説明) で撃たないための安い前段。
+_TABLE_AGGREGATION_TERMS_RE = re.compile(
+    f"(?:{DATA_PROCESSING_TERMS_JA})|(?:{DATA_PROCESSING_TERMS_EN})", re.IGNORECASE,
+)
+
+
+def has_aggregation_cue(text: str) -> bool:
+    """数値の集計・計算を求めうる手掛かりがあるか (純粋関数、前段のゲート専用)。"""
+    return bool(
+        CALCULATION_CUE_RE.search(text or "") or _TABLE_AGGREGATION_TERMS_RE.search(text or ""),
+    )

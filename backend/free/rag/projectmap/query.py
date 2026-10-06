@@ -28,6 +28,22 @@ _ENTRY_STEMS: frozenset[str] = frozenset({"main", "app", "cli", "index", "__main
 #: overview のエントリ候補の上限件数。
 _ENTRY_LIMIT = 5
 
+#: 近傍の各行に付ける関係の名前 ``(辺の種類, 向き) → 名前`` (c_16 §4.4)。向きは
+#: たどった元から見た出辺 (``out``) / 入辺 (``in``)。矢印だけだと「含まれる」「呼ばれる」
+#: 「import される」が区別できず、モデルが呼出元を読み取れなかった (2026-10-03 実機)。
+_RELATION_LABELS: dict[tuple[str, str], str] = {
+    ("calls", "out"): "calls",
+    ("calls", "in"): "called by",
+    ("inherits", "out"): "inherits",
+    ("inherits", "in"): "inherited by",
+    ("imports", "out"): "imports",
+    ("imports", "in"): "imported by",
+    ("contains", "out"): "contains",
+    ("contains", "in"): "defined in",
+}
+#: 同じ 2 ノードを複数の辺が結ぶときに名乗る関係の優先順 (先が強い)。
+_RELATION_PRIORITY: tuple[str, ...] = ("calls", "inherits", "imports", "contains")
+
 
 def _fit_budget(lines: list[str], budget_tokens: int) -> str:
     """行を先頭から足し、予算 (推定トークン数) を超える手前で打ち切る。
@@ -198,25 +214,44 @@ class ProjectMapReader:
         return self._fan_in.get(node_id, 0)
 
     def _neighbors(self, node_id: str) -> list[tuple[str, str]]:
-        """``(neighbor_id, direction)``。direction は ``->`` (出辺) / ``<-`` (入辺)。"""
+        """``(neighbor_id, 関係の名前)``。関係は ``node_id`` から見た :data:`_RELATION_LABELS`。
+
+        同じ相手へ複数の辺があれば :data:`_RELATION_PRIORITY` の強い方を名乗る。
+        """
         row = self._graph.id_to_row.get(node_id)
         if row is None:
             return []
-        out_rows = self._graph.dst[self._graph.src == row]
-        in_rows = self._graph.src[self._graph.dst == row]
-        seen: set[int] = set()
-        out: list[tuple[str, str]] = []
-        for direction, rows in (("->", out_rows.tolist()), ("<-", in_rows.tolist())):
-            for raw_row in rows:
+        out_mask = self._graph.src == row
+        in_mask = self._graph.dst == row
+        best: dict[int, tuple[int, str]] = {}
+        order: list[int] = []
+        for direction, rows, etypes in (
+            ("out", self._graph.dst[out_mask], self._graph.etype[out_mask]),
+            ("in", self._graph.src[in_mask], self._graph.etype[in_mask]),
+        ):
+            for raw_row, raw_etype in zip(rows.tolist(), etypes.tolist(), strict=True):
                 r = int(raw_row)
-                if r == row or r in seen:
+                if r == row or not 0 <= r < len(self._graph.row_to_id) or not self._graph.row_to_id[r]:
                     continue
-                seen.add(r)
-                if 0 <= r < len(self._graph.row_to_id):
-                    node_id_at_row = self._graph.row_to_id[r]
-                    if node_id_at_row:
-                        out.append((node_id_at_row, direction))
-        return out
+                etype = graph_io.ETYPE_NAMES.get(int(raw_etype), "")
+                label = _RELATION_LABELS.get((etype, direction))
+                if label is None:
+                    continue
+                rank = _RELATION_PRIORITY.index(etype)
+                if r not in best:
+                    order.append(r)
+                    best[r] = (rank, label)
+                elif rank < best[r][0]:
+                    best[r] = (rank, label)
+        return [(self._graph.row_to_id[r], best[r][1]) for r in order]
+
+    def _short_name(self, node_id: str) -> str:
+        node = self._nodes.get(node_id)
+        if node is None:
+            return node_id
+        if node.node_type == "file":
+            return node.path.rsplit("/", 1)[-1]
+        return node.qualname or node.name
 
     def _render_line(self, node_id: str) -> str:
         node = self._nodes.get(node_id)
@@ -231,40 +266,43 @@ class ProjectMapReader:
 
         BFS で ``depth`` 段まで広げ、各段は fan-in の高い順 (同点は id 昇順)
         に並べる — 予算で切れても「より参照されているもの」を優先して残す。
+
+        各行には、たどった元との関係を名前で付ける (c_16 §4.4)。1 段目は起点との関係
+        (``called by: …``)、2 段目以降は字下げして、たどった元の名前を添える
+        (``  called by patch_note: …`` = patch_note を呼ぶもの)。
         """
         start_id = self._resolve_target(target)
         if start_id is None:
             return ""
         visited = {start_id}
         frontier = [start_id]
-        # (node_id, 起点から見た向き)。起点は無印、1 段目は ``->`` (呼ぶ / import する)
-        # と ``<-`` (呼ばれる / import される) を付け、2 段目以降は最初に到達した
-        # 向きを引き継ぐ — 「誰が呼ぶか」と「何を呼ぶか」を読み分けられるように。
-        order: list[tuple[str, str]] = [(start_id, "")]
-        direction_of: dict[str, str] = {}
-        for _ in range(max(depth, 0)):
+        #: node_id → (たどった元, 関係の名前, 段)。最初に到達した経路を採る
+        reached: dict[str, tuple[str, str, int]] = {}
+        order: list[str] = [start_id]
+        for level in range(1, max(depth, 0) + 1):
             candidates: dict[str, int] = {}
             for node_id in frontier:
-                for neighbor_id, direction in self._neighbors(node_id):
+                for neighbor_id, label in self._neighbors(node_id):
                     if neighbor_id in visited:
                         continue
                     fan_in = self._fan_in_of(neighbor_id)
                     if neighbor_id not in candidates or fan_in > candidates[neighbor_id]:
                         candidates[neighbor_id] = fan_in
-                    direction_of.setdefault(
-                        neighbor_id, direction_of.get(node_id) or direction,
-                    )
+                    reached.setdefault(neighbor_id, (node_id, label, level))
             if not candidates:
                 break
             ranked = sorted(candidates.items(), key=lambda item: (-item[1], item[0]))
             frontier = [node_id for node_id, _ in ranked]
             visited.update(frontier)
-            order.extend((node_id, direction_of.get(node_id, "")) for node_id in frontier)
+            order.extend(frontier)
 
-        lines = [
-            f"{direction} {self._render_line(node_id)}" if direction else self._render_line(node_id)
-            for node_id, direction in order
-        ]
+        lines = [self._render_line(start_id)]
+        for node_id in order[1:]:
+            via, label, level = reached[node_id]
+            if level == 1:
+                lines.append(f"{label}: {self._render_line(node_id)}")
+            else:
+                lines.append(f"  {label} {self._short_name(via)}: {self._render_line(node_id)}")
         return _fit_budget(lines, budget_tokens)
 
     # ── overview ──
