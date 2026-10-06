@@ -12,6 +12,7 @@
 	"chat": {
 		"data_readonly_banner": "Data is read-only — memory, learning, history and settings are not saved.",
 		"data_readonly_toast": "Started with read-only data (for example, it was written by a newer version). Chat works, but memory, learning, history and settings are not saved.",
+		"syntax_checker_missing_banner": "The syntax checker (tree-sitter-language-pack) is missing. Restart with the .venv Python to enable syntax checks for non-Python files.",
 		"served_model_mismatch_banner": "llama-server is running {served}, not the configured {expected}. Restart llama-server to use the configured model.",
 		"format_health_banner": "{count} data format(s) could not be read or saved (written by a newer version, damaged, save failed, etc.). Run evoref doctor for details.",
 		"reembed_pending_banner": "The embedding model has changed. Memory search is limited for {count} store(s) until they are re-embedded with the new model.",

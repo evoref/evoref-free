@@ -190,6 +190,7 @@ def collect_exemplar_gates(embedder: Any) -> dict[str, Any]:
     from backend.free.agent.edit_mode_gate import EditModeGate
     from backend.free.agent.layer_shadow import LayerClassificationShadow
     from backend.free.agent.statement_gate import StatementGate
+    from backend.free.agent.tool_classifier_skip import ToolClassifierSkipShadow
     from backend.free.agent.write_intent_gate import WriteIntentGate
     from backend.free.learning.context_bound_gate import ContextBoundGate
     from backend.free.memory.notes.attribute_gate import AttributeSlotGate
@@ -205,6 +206,7 @@ def collect_exemplar_gates(embedder: Any) -> dict[str, Any]:
         "gate.fewshot_context_bound": ContextBoundGate(embedder),
         "gate.plain_statement": StatementGate(embedder),
         "gate.edit_mode": EditModeGate(embedder),
+        "gate.tool_classifier_skip": ToolClassifierSkipShadow(embedder),
     }
 
 

@@ -90,3 +90,21 @@ def derive_editor_filename_stem(*, hint: str, language: str) -> str:
         ASCII snake_case の stem。常に非空。拡張子は含まない。
     """
     return _stem_from_hint(hint) or _fallback_stem(language)
+
+
+_URL_RE = re.compile(r"https?://\S+")
+_NAMED_FILE_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\/:-])"
+    r"([A-Za-z0-9_][A-Za-z0-9_.-]{0,60}\.[A-Za-z][A-Za-z0-9]{0,9})"
+    r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+)
+
+
+def named_filename(hint: str) -> str:
+    """依頼文が名指しした拡張子付きの裸のファイル名 (無ければ ``""``)。
+
+    名指しの名前は語から作り直さずそのまま使う (``sales.csv`` が ``sales_csv.md`` に
+    なった、2026-10-06 ライブ監査)。
+    """
+    m = _NAMED_FILE_RE.search(_URL_RE.sub(" ", hint or ""))
+    return m.group(1) if m else ""

@@ -655,6 +655,7 @@ class CogWriterStrategy:
         # コード生成は事前準備として設計仕様 (契約) を先に合成し、plan と
         # 全ユニット生成に注入する。合成失敗 / 無効化時は None で従来挙動。
         code_spec: CodeSpec | None = None
+        short_target = 0
 
         if content_type == ContentType.CODE:
             code_spec = await self._synthesize_code_spec(
@@ -741,6 +742,13 @@ class CogWriterStrategy:
                 brevity_cap = (
                     line_cap if brevity_cap <= 0 else min(brevity_cap, line_cap)
                 )
+            # 短い成果物は計画 (JSON を LLM が数十秒かけて出す) の方が本文より重く、
+            # 単一ユニットで足りる。2026-10-06 ライブ監査: 600 字のリリース文で
+            # 計画 42 秒 + 本文 35 秒。
+            skip_chars = int(self._lf_config.get("short_plan_skip_chars", 800))
+            short_target = user_target or brevity_cap
+            if not 0 < short_target <= skip_chars:
+                short_target = 0
             if brevity_cap > 0:
                 unit_cap = max(1, brevity_cap // BREVITY_CHARS_PER_UNIT)
                 prompt += (
@@ -760,7 +768,7 @@ class CogWriterStrategy:
         max_units = resolve_max_units(self._lf_config, long_form_mode)
         # content_type に応じた schema 選択と例外フォールバックは共通化
         plan_telemetry: dict = {}
-        data = await generate_plan_json(
+        data = None if short_target else await generate_plan_json(
             self.aux_client, prompt, content_type, telemetry=plan_telemetry,
         )
         # max_tokens 切断でユニットが黙って欠落する事象を可視化する
@@ -778,7 +786,10 @@ class CogWriterStrategy:
                     "content_type": content_type.value,
                 })
 
-        if not data or "units" not in data:
+        if short_target:
+            plan = fallback_plan(instruction, content_type, code_spec=code_spec)
+            plan.target_length = short_target
+        elif not data or "units" not in data:
             logger.warning(
                 "Plan JSON parse failed, falling back to single unit"
             )

@@ -376,6 +376,7 @@ def _data_health(state: AppState) -> DataHealthInfo:
     読み手が溜めた current 以外の形式 (:mod:`backend.io.format_health`) を読むだけ。
     """
     from backend.free.api.model.model import evidence_stores
+    from backend.free.core.code_syntax import syntax_checker_installed
     from backend.model_key import model_label
 
     served = getattr(state, "served_model_mismatch", None) or {}
@@ -386,6 +387,7 @@ def _data_health(state: AppState) -> DataHealthInfo:
         "served_model_mismatch": bool(served),
         "served_model": model_label(str(served.get("served_filename") or "")),
         "expected_model": model_label(str(served.get("expected_filename") or "")),
+        "syntax_checker_missing": not syntax_checker_installed(),
     }
     from backend.io import format_health
     from backend.io.writer_thread import default_writer

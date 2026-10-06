@@ -1076,6 +1076,9 @@ def _suppress_ungrounded_read_path(
     )
     if not path:
         return result
+    # 「.」は作業ルートの既定で、でっち上げたパスではない。
+    if result.tool_name == "list_directory" and path.strip() in {".", "./", ".\\"}:
+        return result
     haystack = _normalize_path_text(f"{ctx.query}\n{ctx.dialogue_text}")
     if _normalize_path_text(path) in haystack:
         return result

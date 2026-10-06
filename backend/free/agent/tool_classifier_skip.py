@@ -115,6 +115,9 @@ class ToolClassifierSkipShadow:
             k=k,
             mode="chat",
             fire_ratio=fire_ratio,
+            # 害が出るのは「ツールが要るのに省く」(= none と決める) 向きだけ。反対向きの誤りは
+            # 分類器を撃つだけで安全なので、全体の正解率でなく none の適合率で自己検査する。
+            critical_label=NEGATIVE_LABEL,
         )
         self._cascade = CascadePredicate(
             PREDICATE_NAME,

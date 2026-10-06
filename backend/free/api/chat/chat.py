@@ -1656,7 +1656,8 @@ def _plan_output_target(
       保存して」。判定は chat と同じ ``indicates_write_destination``) → "file"
       (write_file でディスクへ)
     - 否定指示 ("エディタに出さず…") → "chat" (チャット本文にコードブロック)
-    - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ)
+    - 既定 → "editor" (ディスク書込せず editor_code チャネルでエディタペインへ。
+      エディタの無い Free は "chat")
 
     chat モードは **書込み先が特定できるときだけ** file。従来は無条件に
     "file" だったため、パスを一切含まない依頼でも「書き込む」プランが組まれ、
@@ -1678,8 +1679,12 @@ def _plan_output_target(
             target = "file"
         elif detect_editor_route(req.message) == "chat":
             target = "chat"
-        else:
+        elif is_pro():
             target = "editor"
+        else:
+            # Free にはエディタが無い。editor_code を送ると表示先が無く生成物が消えるので、
+            # チャット本文に出す (保存先の証拠があるときだけ上の "file")。
+            target = "chat"
         return target, ("editor" if target == "editor" else "chat")
     if file_reference is not None and file_reference.fired:
         if file_reference.value == RECENT_FILE_WRITE_LABEL:

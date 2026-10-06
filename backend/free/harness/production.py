@@ -60,6 +60,10 @@ class ProductionEvent:
     payload: dict = field(default_factory=dict)
 
 
+#: as-built 文書の配信名 (``loop/staged/harness.py`` が出力フォルダへ書く名前)。
+AS_BUILT_DOC_NAMES = ("SPEC.md", "flowchart.md")
+
+
 @dataclass(frozen=True)
 class ProductionResult:
     """制作ステージの結果。"""

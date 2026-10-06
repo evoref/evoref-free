@@ -198,7 +198,7 @@ def syntax_checker_missing(path: str) -> str | None:
         lang = _TREE_SITTER_LANGUAGES.get(suffix)
         if lang is None and suffix in _LANGUAGE_OVERLAY:
             lang = _LANGUAGE_OVERLAY[suffix][0]
-    if lang is None or _parser(lang) is not None:
+    if lang is None or _parser(lang) is not None or suffix in _STDLIB_CHECKED_SUFFIXES:
         return None
     return SYNTAX_CHECKER_PACKAGE if not syntax_checker_installed() else f"tree-sitter grammar {lang}"
 
@@ -302,6 +302,23 @@ def html_balance_error(code: str) -> str | None:
     return f"line {line}: html {reason}"
 
 
+#: tree-sitter が無くても標準ライブラリで検査できる拡張子 (``_TREE_SITTER_LANGUAGES`` に在るもの)。
+_STDLIB_CHECKED_SUFFIXES = frozenset({".json"})
+
+
+def _stdlib_syntax_error(code: str, suffix: str) -> str | None:
+    """``json`` による構文検査 (誤りが無ければ ``None``)。"""
+    if suffix != ".json":
+        return None
+    import json
+
+    try:
+        json.loads(code)
+    except json.JSONDecodeError as exc:
+        return f"line {exc.lineno}: json syntax error ({exc.msg})"
+    return None
+
+
 def syntax_error_detail(code: str, path: str) -> str | None:
     """``path`` の言語で構文を検査し、誤りがあれば ``line N: 理由`` を返す (無ければ ``None``)。"""
     if is_python_path(path):
@@ -323,7 +340,9 @@ def syntax_error_detail(code: str, path: str) -> str | None:
         return None
     parser = _parser(lang)
     if parser is None:
-        return None
+        # 構文検査器が無くても標準ライブラリで確かめられる形式は確かめる (venv 外の起動でも
+        # 「未検査」にしない、2026-10-06 ライブ監査)。
+        return _stdlib_syntax_error(code, suffix)
     tree = parser.parse(code.encode("utf-8"))
     if not tree.root_node.has_error:
         return None

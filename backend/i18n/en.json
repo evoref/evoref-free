@@ -749,6 +749,9 @@
     }
   },
   "create": {
+    "replaced_existing": "Replaced existing {paths} (originals were backed up under {backup}).",
+    "editor_delivered": "Placed {count} file(s) in the editor: {names}. Not saved yet; use the editor save button, or ask \"save to {example}\".",
+    "chat_delivered": "Showed {count} file(s) in the chat.",
     "needs_input_question": "I couldn't tell what to create. Please tell me what you want (its content or kind) and, if relevant, the language or where to save it.",
     "requested_tests_not_available": "The requested tests ({names}) were not created (this setup does not run the test stage).",
     "requested_tests_not_generated": "The requested tests ({names}) could not be generated.",

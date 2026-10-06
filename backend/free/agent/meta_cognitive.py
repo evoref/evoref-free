@@ -61,7 +61,7 @@ from backend.free.agent.meta_cognitive_utils import (
     summarize_file_content,
 )
 from backend.free.agent.step_compactor import StepCompactor
-from backend.free.llm.editor_filename import derive_editor_filename_stem
+from backend.free.llm.editor_filename import derive_editor_filename_stem, named_filename
 from backend.free.llm.tps_calibration import (
     chat_path_timeout,
     is_explicit_agent_timeout,
@@ -627,6 +627,7 @@ class MetaCognitiveAgent(
         self._session_id = session_id
         self._tool_descriptions_cache = {}
         self._editor_artifacts: list[EditorArtifact] = []
+        self._delivery_notices: list[str] = []
         self._chat_code_parts: list[str] = []
         # production_stage の実行結果キャッシュ (process() 呼出しごとにリセット、
         # §4.4「以後の write タスクは書込み済みとして畳む」)。
@@ -823,7 +824,7 @@ class MetaCognitiveAgent(
             production_notices=(
                 [str(n) for n in (self._production_result.notes or {}).get("notices") or []]
                 if self._production_result is not None else []
-            ),
+            ) + list(self._delivery_notices),
             production_checks=(
                 [dict(c) for c in (self._production_result.notes or {}).get("checks") or []
                  if isinstance(c, dict)]
@@ -1470,6 +1471,9 @@ class MetaCognitiveAgent(
     @staticmethod
     def _fallback_artifact_filename(art: EditorArtifact, query: str) -> str:
         """production_stage の artifact にファイル名が無いときの決定論フォールバック。"""
+        named = named_filename(query)
+        if named:
+            return named
         stem = derive_editor_filename_stem(hint=query, language=art.language)
         ext = _LANGUAGE_EXT_MAP.get(art.language, "txt")
         return f"{stem}.{ext}"
@@ -1555,7 +1559,18 @@ class MetaCognitiveAgent(
                     f"Error: production stage incomplete ({incomplete}); "
                     f"generated {len(artifacts)} file(s)", []
                 )
-            return f"Generated {len(artifacts)} file(s)", []
+            if self._output_target == "editor":
+                # 保存はしていない。件数だけでは「どこに出たか / 保存されたか」が分からない
+                # (2026-10-06 ライブ監査: 「Generated 3 file(s)」だけが最終応答だった)。
+                names = [
+                    a.filename or self._fallback_artifact_filename(a, original_query)
+                    for a in artifacts
+                ]
+                return msg(
+                    "create.editor_delivered", count=len(artifacts),
+                    names=", ".join(names), example=names[0] if names else "file",
+                ), []
+            return msg("create.chat_delivered", count=len(artifacts)), []
 
         # file: 既存の write 経路で 1 ファイルずつ書く (staged 固有の錨付け問題を
         # 構造的に消す、f_03 §4.4)。
@@ -1572,6 +1587,13 @@ class MetaCognitiveAgent(
             self._named_new_file_target(original_query) if len(artifacts) == 1 else ""
         )
         roots = delivery_roots(original_query)
+        from backend.free.harness.production import AS_BUILT_DOC_NAMES
+
+        primary_stem = next(
+            (Path(a.filename).stem for a in artifacts
+             if a.filename and a.filename not in AS_BUILT_DOC_NAMES), "",
+        )
+        shared_root = Path(anchor_relative_output_path("x")).parent
         for art in artifacts:
             filename = art.filename or named_target or self._fallback_artifact_filename(
                 art, original_query,
@@ -1582,6 +1604,13 @@ class MetaCognitiveAgent(
             file_path = anchor_relative_output_path(
                 self._resolve_write_path_from_query(filename, original_query),
             )
+            if (
+                filename in AS_BUILT_DOC_NAMES and primary_stem
+                and Path(file_path).parent == shared_root
+            ):
+                # 共有の出力フォルダに固定名で書くと、前の成果物の SPEC.md を次の run が
+                # 上書きする (2026-10-06 ライブ監査)。成果物の名前を冠して分ける。
+                file_path = str(shared_root / f"{primary_stem}.{filename}")
             if relative_to_roots(file_path, roots) is None:
                 logger.warning(
                     "Production stage: %s is outside the requested folder(s) %s; not written",
@@ -1609,6 +1638,13 @@ class MetaCognitiveAgent(
         self._record_delivery(
             written_paths, failed_paths, result, rejected=rejected_paths, replaced=replaced,
         )
+        if replaced:
+            # 退避したことを利用者にも見せる (events.jsonl だけでは本文に出ない)。
+            self._delivery_notices.append(msg(
+                "create.replaced_existing",
+                paths=", ".join(sorted({Path(r["path"]).name for r in replaced})),
+                backup=str(Path(replaced[0]["backup"]).parent),
+            ))
         if written == 0:
             return "Error: production stage artifacts failed to write", tool_calls
         self._record_write_impact(written_paths, result)

@@ -2712,7 +2712,7 @@ BULLET_FORM_RE = re.compile(
 
 #: 「各 3 つずつ」「3 個挙げて」型の個数指定 (箇条書き指定と併用されたときだけ使う)。
 ITEM_COUNT_RE = re.compile(
-    r"(?:各)?\s*(\d{1,2})\s*(?:つ|個|点|項目)\s*"
+    r"(?:各)?\s*(\d{1,2})\s*(?:つ|個|点|項目|冊|本|人|件|種類|社|曲)\s*"
     r"(?:ずつ|ずつで|挙げ|書|列挙|箇条書き|リスト)"
     r"|(\d{1,2})\s*(?:items?|points?|bullets?)(?![A-Za-z])",
     re.IGNORECASE,
@@ -2742,8 +2742,9 @@ _BULLET_MARKER_RE = re.compile(r"^\s*(?:・\s*|(?:[-*+]|\d{1,2}[.)、])\s+)")
 #: 「数値 + 短い名詞 + を + 列挙動詞」の形だけを採る。列挙動詞を必須にするのは、
 #: 「1387 かける 46 は」「45 日後は」のような数値を含む別種のクエリを
 #: 列挙要求と誤認しないため。
+#: 数値の直後が時間・金額・単位なら個数ではない (「30分歩くことの効果を3つ挙げて」の 30)。
 ENUMERATION_COUNT_RE = re.compile(
-    r"(\d{1,3})\s*[^\s、。0-9]{1,8}?\s*を"
+    r"(\d{1,3})\s*(?!分|秒|時間|日|年|月|週|円|%|％|km|kg|cm|歳|回|度)[^\s、。0-9]{1,8}?\s*を"
     r"[^。]{0,24}?(?:列挙|挙げ|並べ|書き出|リストアップ)",
 )
 
@@ -2872,12 +2873,12 @@ def match_enumeration_count_strict(text: str) -> int:
     **本文が 1 文字も流れない**。緩い判定で真を増やすと、検証の利得が無い
     ターンからストリーミングを奪う (下記の実測を参照)。
     """
-    m = ENUMERATION_COUNT_RE.search(text or "")
-    if m:
-        return int(m.group(1))
     m2 = ITEM_COUNT_RE.search(text or "")
     if m2:
         return int(next(g for g in m2.groups() if g))
+    m = ENUMERATION_COUNT_RE.search(text or "")
+    if m:
+        return int(m.group(1))
     # 箇条書き / リスト形式の指定が立っているなら、個数だけの形も個数指定と読む。
     src = text or ""
     if BULLET_FORM_RE.search(src):

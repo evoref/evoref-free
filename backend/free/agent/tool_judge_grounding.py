@@ -160,6 +160,48 @@ def _conversion_position_constants(expression: str, partners: set[str]) -> set[s
     return explained
 
 
+#: 名指しされた数学定数の桁。クエリが名前で指していれば、式のリテラルはその先頭桁。
+_NAMED_CONSTANTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("円周率", "π", "パイ", "円の面積", "円周", "球の体積", "球の表面積"), "3.14159265358979323846"),
+    (("ネイピア数", "自然対数の底"), "2.71828182845904523536"),
+)
+
+_RANGE_ARGS_RE = re.compile(r"range\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?(?:,\s*(\d+)\s*)?\)")
+
+
+def _named_constant_prefixes(text: str) -> set[str]:
+    """クエリが名指しする数学定数の先頭桁 (3 文字以上) を説明済みの数にする。"""
+    out: set[str] = set()
+    for names, digits in _NAMED_CONSTANTS:
+        if any(n in text for n in names):
+            out.update(digits[:i] for i in range(3, len(digits) + 1))
+    return out
+
+
+def _range_bound_numbers(expression: str, known: set[str]) -> set[str]:
+    """``range(a, b)`` の端点のうち、式の構造が要求する値を説明済みにする。
+
+    「1 から 100 まで」は ``range(1, 101)`` になる。終端の 101 は 100 の
+    半開区間表記で、モデルが持ち込んだ前提ではない。始点 0/1 と刻みも同様。
+    """
+    out: set[str] = set()
+    for m in _RANGE_ARGS_RE.finditer(expression or ""):
+        nums = [g for g in m.groups() if g is not None]
+        if len(nums) == 1:
+            stop = nums[0]
+            if str(int(stop) - 1) in known or stop in known:
+                out.add(stop)
+            continue
+        start, stop = nums[0], nums[1]
+        if start in ("0", "1"):
+            out.add(start)
+        if str(int(stop) - 1) in known or stop in known:
+            out.add(stop)
+        if len(nums) == 3 and nums[2] == "1":
+            out.add("1")
+    return out
+
+
 def _ungrounded_numbers(
     expression: str, query: str, context: str = "",
 ) -> tuple[str, ...]:
@@ -187,6 +229,8 @@ def _ungrounded_numbers(
         _PERCENT_LITERAL_RE.sub(" ", query or ""), include_percent=False,
     ) | _known_numbers(_PERCENT_LITERAL_RE.sub(" ", context or ""), include_percent=False)
     known.update(_conversion_position_constants(expression, partners))
+    known.update(_named_constant_prefixes(text))
+    known.update(_range_bound_numbers(expression, known))
     known.update(_plain_numbers(known))
     seen: list[str] = []
     # 冪の指数 (``x ** 2``) は式の構造が要求する値で、対話の数値ではない
