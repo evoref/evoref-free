@@ -49,6 +49,12 @@ GATE_WINDOW = 200
 #: この件数に満たない判定点は ``degenerate`` にしない (希少事象の判定点を誤報しない)。
 GATE_MIN_DECISIONS = 100
 
+#: 稀な事象だけを拒む判定点 (発話の全体が挨拶のときだけ発火する等)。入力に該当が無い間は
+#: 何百回でも ``none`` のままで正常なので、「いつも否定ラベル」は恒偽として警告しない。
+#: 警告するのは **いつも否定でない** (恒真) とき。2026-10-06 ライブ監査: 91 件の実質的な依頼の
+#: 間 ``none`` だけで退化と出た。名前の実在は test_liveness の検査が固定する。
+RARE_EVENT_GATES = frozenset({"gate.contentless_social_formula"})
+
 FAILURE_CLASSES = ("transient", "unrecoverable")
 _BAND_CODES = {"fire": "f", "abstain": "a", "skip": "s"}
 
@@ -327,7 +333,10 @@ def _alerts_for(stage: str, rec: Mapping[str, Any]) -> list[LivenessAlert]:
         ))
 
     labels = rec.get("labels") or []
-    if len(labels) >= GATE_MIN_DECISIONS and len(set(labels)) == 1:
+    always_negative = (
+        stage in RARE_EVENT_GATES and len(set(labels)) == 1 and labels[0] == "none"
+    )
+    if len(labels) >= GATE_MIN_DECISIONS and len(set(labels)) == 1 and not always_negative:
         bands = str(rec.get("bands") or "")
         out.append(LivenessAlert(
             stage, "degenerate", "",

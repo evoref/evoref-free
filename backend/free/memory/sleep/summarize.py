@@ -252,6 +252,16 @@ async def summarize_unsummarized_sessions(
             )
             summarized += 1
         except Exception as exc:
+            if isinstance(exc, TimeoutError) and getattr(exc, "contended", False):
+                # チャットに打ち切られた。次のセッションも次のターンに打ち切られるだけなので、
+                # 残りは次の窓へ回す (ここで続けると未要約の数だけ毎ターン無駄な dispatch が
+                # 走り、2026-10-06 ライブ監査では 1 サイクルで 5〜6 回の警告になった)。
+                logger.info(
+                    "Step 8-9 summarization preempted by a chat request; "
+                    "%d session(s) left pending for the next window",
+                    pending_total - attempted + 1,
+                )
+                break
             logger.warning(
                 "Failed to summarize session %s: %s", entry.session_id, exc,
             )

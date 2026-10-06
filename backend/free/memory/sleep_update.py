@@ -68,6 +68,10 @@ _FORCED_FULL: ContextVar[bool] = ContextVar("evoref_forced_full", default=False)
 #: チャットと重なる量を抑える。Step 8.0 (訂正の検証) は最古から 2 件、Step 8.3
 #: (属性の分割、趣味の追加・削除のような「私は〜」の言い直し) は 1 件。
 _FORCED_VERIFY_MAX = 2
+#: 強制実行の Full で要約 (Step 8-9) が打ち切られずに出せる回数。連続利用ではターンの間隔が
+#: 要約 1 回 (約 6〜8 秒) より短く、通常の Full は毎回打ち切られて 30〜80 分遅れた
+#: (2026-10-06 ライブ監査)。訂正の検証と同じ「回数で重なる量を抑える」方式 (1 サイクルは包まない)。
+_FORCED_SUMMARY_MAX = 2
 _FORCED_SPLIT_MAX = 1
 #: Step 8.35 (集合値の属性の編集) も 1 件。
 _FORCED_SLOT_EDIT_MAX = 1
@@ -1517,16 +1521,23 @@ class SleepTimeWorker:
             summarize_unsummarized_sessions,
         )
 
+        from backend.free.llm.generation_gate import preemption_suspended
+        from backend.free.memory.sleep.pseudo_query import quiet_seconds
+
         history_cfg = self._cycle_config().get("history") or {}
-        return await summarize_unsummarized_sessions(
-            llm_client,
-            self.embedder,
-            batch_size=int(history_cfg.get("summary_batch_size", 20)),
-            is_cancelled=self._check_cancelled,
-            should_pause=self._chat_in_flight,
-            # 配信モデルが chat のモデルと違う間は chat の要約を作らない (M3)
-            skip_modes=chat_summary_skip_modes(),
-        )
+        quiet = quiet_seconds(self.config)
+        # 静穏窓で譲る (ターンの合間に出すと次のターンに打ち切られる)。強制実行の Full で
+        # 打ち切らせない回数が残る間だけは譲らない。
+        with self._bounded_step_scope(_FORCED_SUMMARY_MAX):
+            return await summarize_unsummarized_sessions(
+                llm_client,
+                self.embedder,
+                batch_size=int(history_cfg.get("summary_batch_size", 20)),
+                is_cancelled=self._check_cancelled,
+                should_pause=lambda: not preemption_suspended() and self._chat_recent(quiet),
+                # 配信モデルが chat のモデルと違う間は chat の要約を作らない (M3)
+                skip_modes=chat_summary_skip_modes(),
+            )
 
     # ── Step 7.5 (MDP トレース → episodic LTM) ─────────
 
@@ -1657,8 +1668,9 @@ class SleepTimeWorker:
 
         強制実行の Full では、区間内の補助タスクの先頭 ``max_calls`` 回を、
         アイドル窓で出せたものに限り打ち切らせない (generation_gate.run_to_completion)。
-        要約 (Step 8-9) や疑似クエリのように 1 サイクルが長い段は包まない — 包むと
-        その間ずっとチャットと GPU を分け合う。通常の Full では打ち切りを数えるだけ。
+        疑似クエリのように 1 サイクルが長い段は包まない — 包むとその間ずっとチャットと
+        GPU を分け合う。要約 (Step 8-9) は回数 (``_FORCED_SUMMARY_MAX``) で重なる量を
+        抑えて包む。通常の Full では打ち切りを数えるだけ。
         区間内でチャットに打ち切られた数は結果辞書の ``bounded_aux_preempted`` へ。
         """
         from backend.aux_telemetry import current_aux_failures

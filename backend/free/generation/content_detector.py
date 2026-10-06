@@ -59,7 +59,7 @@ TEXT_PATTERNS: list[str] = [
 # TEXT_PATTERNS の英語版。detect_content_type() は re.search() を flags 無しで
 # 呼ぶため、大文字小文字を無視するには各パターン先頭に (?i) インライン修飾子を
 # 明示する必要がある (文頭大文字化が頻出する英語の実用性のため)。
-_OUTPUT_EXTENSION_PATTERN = r"(?i)\.(md|txt|csv|docx|pptx|xlsx)\b"
+_OUTPUT_EXTENSION_PATTERN = r"(?i)\.(md|txt|csv|json|ya?ml|toml|ini|xml|docx|pptx|xlsx)\b"
 
 #: プログラミング言語を実装手段として指す言い方 (「Python で」「JavaScript を使って」)。
 #: create モードで、文書拡張子の付いた **添え物** (「サンプルの sales.csv も」) と
@@ -67,7 +67,7 @@ _OUTPUT_EXTENSION_PATTERN = r"(?i)\.(md|txt|csv|docx|pptx|xlsx)\b"
 _IMPLEMENTATION_LANGUAGE_RE = re.compile(
     r"(?i)\b(python|javascript|typescript|java|go|rust|ruby|php|kotlin|swift|c\+\+|c#)"
     # 「Python 標準ライブラリで」のように修飾が挟まる (K10)。句読点は越えない。
-    r"\b[^。、,.\n]{0,12}?(?:で|を使|により|による)",
+    r"(?![A-Za-z0-9_])[^。、,.\n]{0,12}?(?:で|を使|により|による)",
 )
 
 TEXT_PATTERNS_EN: list[str] = [

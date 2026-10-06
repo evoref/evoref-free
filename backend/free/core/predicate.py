@@ -431,9 +431,14 @@ class ExemplarPredicate:
         fire_ratio: float = 0.6,
         sim_floor: float | None = None,
         min_loo_accuracy: float = DEFAULT_MIN_LOO_ACCURACY,
+        critical_label: str | None = None,
     ) -> None:
         self.name = name
         self._embedder = embedder
+        #: 誤って出すと害が出るラベル (例: 分類器を **省く** 側)。指定すると自己検査は
+        #: 全体の正解率でなく、このラベルと決めたもののうち正しかった割合 (適合率) を見る。
+        #: 反対向きの誤り (省かない側に倒れる) は安全側で、棄権が増えるだけなので数えない。
+        self._critical_label = critical_label
         self._exemplars = list(exemplars)
         self._k = max(1, int(k))
         self._mode = mode
@@ -532,14 +537,23 @@ class ExemplarPredicate:
         decided = int(loo.get("decided") or 0)
         acc = float(loo.get("accuracy_decided") or 0.0)
         coverage = round(decided / n, 4) if n else 0.0
+        # 害のあるラベルを指定したゲートは、そのラベルの適合率で合否を決める。
+        measured = acc
+        if self._critical_label is not None:
+            made = int((loo.get("predicted_by_label") or {}).get(self._critical_label, 0))
+            right = int((loo.get("correct_by_label") or {}).get(self._critical_label, 0))
+            measured = right / made if made else 1.0
         out = {
             "accuracy_decided": acc,
             "coverage": coverage,
             "decided": decided,
             "n": n,
             "threshold": self._min_loo_accuracy,
-            "ok": bool(decided == 0 or acc >= self._min_loo_accuracy),
+            "ok": bool(decided == 0 or measured >= self._min_loo_accuracy),
         }
+        if self._critical_label is not None:
+            out["critical_label"] = self._critical_label
+            out["critical_precision"] = round(measured, 4)
         if decided == 0:
             logger.warning(
                 "Exemplar predicate %s self-check: decides nothing "
@@ -548,11 +562,13 @@ class ExemplarPredicate:
             )
         elif not out["ok"]:
             logger.warning(
-                "Exemplar predicate %s self-check FAILED: LOO accuracy %.3f "
+                "Exemplar predicate %s self-check FAILED: LOO %s %.3f "
                 "< %.2f (decided %d/%d). The exemplar set likely regressed - "
                 "run scripts/bench/predicate_gate with --errors and remove the "
                 "records that overlap existing ones.",
-                self.name, acc, self._min_loo_accuracy, decided, n,
+                self.name,
+                f"precision of {self._critical_label!r}" if self._critical_label else "accuracy",
+                measured, self._min_loo_accuracy, decided, n,
             )
         return out
 
@@ -708,6 +724,8 @@ class ExemplarPredicate:
         np.fill_diagonal(sims, -2.0)
         k = min(self._k, mat.shape[0] - 1)
         correct = abstained = 0
+        predicted_by_label: dict[str, int] = {}
+        correct_by_label: dict[str, int] = {}
         errors: list[dict[str, Any]] = []
         for row in range(mat.shape[0]):
             idx = np.argpartition(sims[row], -k)[-k:]
@@ -720,8 +738,10 @@ class ExemplarPredicate:
             if top1 < self.sim_floor or share < self._fire_ratio:
                 abstained += 1
                 continue
+            predicted_by_label[winner] = predicted_by_label.get(winner, 0) + 1
             if winner == self._labels[row]:
                 correct += 1
+                correct_by_label[winner] = correct_by_label.get(winner, 0) + 1
             elif with_errors:
                 errors.append({
                     "text": self._exemplars[row].text,
@@ -740,6 +760,8 @@ class ExemplarPredicate:
             "correct": correct,
             "accuracy_decided": round(correct / decided, 4) if decided else 0.0,
             "accuracy_all": round(correct / n, 4) if n else 0.0,
+            "predicted_by_label": predicted_by_label,
+            "correct_by_label": correct_by_label,
         }
         if with_errors:
             # 誤分類の中身が無いと「事例を足す」判断が勘になる。どのラベルが

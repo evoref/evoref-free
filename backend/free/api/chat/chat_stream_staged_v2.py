@@ -84,6 +84,16 @@ if TYPE_CHECKING:
 
 #: 1 モジュールの本文の最大トークン (規模に比例させず上限だけ置く)。
 _MODULE_MAX_TOKENS = 2048
+#: 1 ファイルが構造上長くなる種別の初回予算。2048 で切れると全体を作り直すため、
+#: 最初から足りる量を渡す (index.html が 145 秒かけて切れ、4096 で最初から再生成された、
+#: 2026-10-06 ライブ監査)。
+_MODULE_MAX_TOKENS_BY_SUFFIX = {".html": 4096, ".htm": 4096, ".svelte": 4096, ".css": 3072}
+
+
+def _module_max_tokens(path: str) -> int:
+    """ファイル種別ごとの初回 max_tokens。"""
+    suffix = "." + path.lower().rsplit(".", 1)[-1] if "." in path else ""
+    return _MODULE_MAX_TOKENS_BY_SUFFIX.get(suffix, _MODULE_MAX_TOKENS)
 #: LLM の参考テスト (Pro) の最大トークン。
 _ADVISORY_TEST_MAX_TOKENS = 1024
 #: 骨組み (JSON) の最大トークン。
@@ -750,8 +760,8 @@ def _module_instruction(
     return f"{shared}{SHARED_CONTEXT_BOUNDARY}{task}"
 
 
-#: as-built 文書の配信名 (``loop/staged/harness.py`` が出力フォルダへ書く名前)。依頼が名指しても未生成とは言わない。
-AS_BUILT_DOC_NAMES = ("SPEC.md", "flowchart.md")
+# as-built 文書の配信名 (``AS_BUILT_DOC_NAMES``)。依頼が名指しても未生成とは言わない。
+from backend.free.harness.production import AS_BUILT_DOC_NAMES  # noqa: E402
 
 
 _DATA_FILE_TASK = """\
@@ -1274,7 +1284,8 @@ async def run_staged_v2_pipeline(
             if _remaining() < _CALL_FLOOR_SEC or _is_cancelled():
                 return ""
             out = await generate_single_file(
-                client, instruction, module["path"], max_tokens=_MODULE_MAX_TOKENS,
+                client, instruction, module["path"],
+                max_tokens=_module_max_tokens(module["path"]),
                 request_timeout=max(_CALL_FLOOR_SEC, _remaining()), id_slot=slot, stats=gen_stats,
             )
             return out.get(module["path"], "")

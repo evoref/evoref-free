@@ -1059,7 +1059,7 @@ _UNEXPLAINED_NUMBERS_NOTES: dict[str, str] = {
         "現れていない値である。それぞれの値が何かを答えの中で明示すること — "
         "公式・単位換算の定義上の定数 (換算率・係数など) か、計算のために置いた前提 "
         "(単価・件数・率など) か。前提の値だけは仮定として断ったうえで、正しい値を"
-        "ユーザーに確認すること。"
+        "ユーザーに確認すること。式やコードそのものは答えに書き写さない。"
     ),
     "en": (
         "However, {listed} in the expression does not appear in the user's "
@@ -1068,7 +1068,7 @@ _UNEXPLAINED_NUMBERS_NOTES: dict[str, str] = {
         "unit conversion (conversion rate, coefficient, etc.), or a premise "
         "assumed for the calculation (unit price, count, rate, etc.). Only for a "
         "premise, present it as an assumption and ask the user to confirm the "
-        "correct value."
+        "correct value. Do not copy the expression or code itself into the answer."
     ),
 }
 
@@ -3169,7 +3169,7 @@ class DeliberativeAgent:
         places = ""
         if items:
             key = "candidates" if kind == "ambiguous" else "searched"
-            places = _localized_map(_TOOL_FAILURE_PLACES)[key].format(items="; ".join(items))
+            places = _localized_map(_TOOL_FAILURE_PLACES)[key].format(items="、".join(f"「{i}」" for i in items))
         return _localized(_TOOL_RAN_AND_FAILED_GUIDANCES).format(
             tool=tool_name,
             kind=_localized_map(_TOOL_FAILURE_KIND_LABELS).get(kind, kind),

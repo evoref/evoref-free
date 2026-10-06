@@ -417,6 +417,8 @@ class LongFormConfig(BaseModel):
     # コード生成の事前準備: 設計仕様 (contract) 合成。各ユニットへ注入 +
     # SPEC.md として出力し、ファイル横断の整合性を担保する。
     code_spec_enabled: bool = True
+    # 目標がこの文字数以下の新規テキストは、計画の LLM 呼出しを省き単一ユニットで書く。0=無効。
+    short_plan_skip_chars: int = Field(default=800, ge=0)
     # 設計仕様から mermaid フローチャートを合成し SPEC.md に埋め込む (既定 OFF)。
     code_flowchart_enabled: bool = False
     # 生成物の import スモークテスト (temp dir でサブプロセス import 検証)。

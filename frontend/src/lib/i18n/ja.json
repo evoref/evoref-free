@@ -12,6 +12,7 @@
 	"chat": {
 		"data_readonly_banner": "データが読み取り専用です — 記憶・学習・履歴・設定は保存されません。",
 		"data_readonly_toast": "データが読み取り専用で起動しました (新しい版のアプリが書いたデータがある等)。チャットはできますが、記憶・学習・履歴・設定は保存されません。",
+		"syntax_checker_missing_banner": "構文検査器 (tree-sitter-language-pack) が見つかりません。.venv の Python で起動し直すと、作成物の構文検査 (Python 以外) が働きます。",
 		"served_model_mismatch_banner": "llama-server が動かしているのは {served} で、設定の {expected} ではありません。設定のモデルを使うには llama-server を再起動してください。",
 		"format_health_banner": "{count} 種類のデータを読み書きできませんでした (新しい版で書かれた / 壊れている / 保存に失敗した等)。詳しくは evoref doctor で確認できます。",
 		"reembed_pending_banner": "埋め込みモデルが変わりました。新しいモデルで埋め直すまで、{count} 件のストアの記憶検索が限られます。",

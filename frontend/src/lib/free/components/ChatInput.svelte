@@ -450,6 +450,9 @@
 			})}
 		</div>
 	{/if}
+	{#if $serverState.dataHealth?.syntax_checker_missing}
+		<div class="readonly-note" role="status">{$t('chat.syntax_checker_missing_banner')}</div>
+	{/if}
 	{#if Object.keys($serverState.dataHealth?.formats ?? {}).length}
 		<div class="readonly-note" role="status">
 			{$t('chat.format_health_banner', {

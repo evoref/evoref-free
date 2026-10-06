@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from backend.free.llm.editor_filename import derive_editor_filename_stem
+from backend.free.llm.editor_filename import derive_editor_filename_stem, named_filename
 from backend.io.id_registry import new_id
 from backend.log_config import get_logger
 from backend.trace_context import get_trace_id
@@ -85,6 +85,9 @@ def _deliverable_path(orchestrator: "LongFormOrchestrator", req: "ProductionRequ
     """
     if getattr(orchestrator, "last_content_type", None) == "code":
         return _CODE_PROGRESS_FILE
+    named = named_filename(req.instruction)
+    if named:
+        return named
     ext = getattr(orchestrator, "_target_format", "") or ".md"
     stem = derive_editor_filename_stem(hint=req.instruction, language="markdown")
     return f"{stem}{ext}"

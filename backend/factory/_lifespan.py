@@ -506,9 +506,10 @@ async def lifespan(app: FastAPI):
         ctx.instance_name, current_edition().name,
     )
     # 起動した Python と任意依存の有無 (無いと create の構文検査が「未検査」になる、f_10 §12.4)
-    from backend.free.core.code_syntax import runtime_environment_line
+    from backend.free.core.code_syntax import runtime_environment_line, syntax_checker_installed
 
-    logger.info(runtime_environment_line())
+    # 欠けていれば WARNING (INFO だと 2026-10-06 のように素の Python での起動に気づけない)
+    (logger.info if syntax_checker_installed() else logger.warning)(runtime_environment_line())
 
     yield
 

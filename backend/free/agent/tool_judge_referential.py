@@ -59,6 +59,25 @@ _REWRITE_VERB_RE = re.compile(
 _PATH_SEPARATOR_RE = re.compile(r"[\\/]")
 
 
+#: 拡張子なしで呼ばれる定番の文書名。
+_WELL_KNOWN_DOC_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(README|CHANGELOG|LICENSE|CONTRIBUTING)(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+#: 文書の種類・書き方を問う質問 (読む依頼ではない)。
+_DOC_KIND_QUESTION_RE = re.compile(
+    r"とは|って何|書き方|作り方|テンプレ|ひな形|雛形|例を|違い|what is|how to write",
+    re.IGNORECASE,
+)
+#: 製品の作業ルート (インストール根) を指す言い方。
+_REPO_REFERENCE_RE = re.compile(
+    r"このリポジトリ|このプロジェクト|このレポ|この repo|this (?:repo|repository|project)",
+    re.IGNORECASE,
+)
+
+
 def _path_is_written_in_query(query: str) -> bool:
     """ディレクトリ付きのパスが **発話の本文に書かれているか** (純粋関数)。
 
@@ -407,18 +426,49 @@ def _bare_filename_read_judgement(
     """
     if not tools_registry.is_available("read_file", mode):
         return None
-    literal = _extract_file_path_literal(strip_command_literals(query))
-    if not literal or _PATH_SEPARATOR_RE.search(literal):
-        return None
+    stripped = strip_command_literals(query)
+    literal = _extract_file_path_literal(stripped)
+    if literal and _PATH_SEPARATOR_RE.search(literal):
+        import os
+
+        # フォルダだけが書かれた依頼 (「X フォルダの README を読んで」) は名前の判定へ進む。
+        if not os.path.isdir(literal):
+            return None
+        literal = ""
     if _CODE_CREATION_RE.search(query):
         logger.debug("Bare filename read abstained (code creation): %s", query[:60])
         return None
     from backend.free.agent.file_ledger import resolve_bare_filename
 
-    resolution = resolve_bare_filename(
-        literal, query=query, conversation=conversation, named_only=True,
-    )
-    if not resolution.path:
+    resolution = None
+    if literal:
+        resolution = resolve_bare_filename(
+            literal, query=query, conversation=conversation, named_only=True,
+        )
+    else:
+        # 拡張子の無い定番の文書名 (「README を読んで」) は、実在する綴りへ解決する。
+        # 拡張子が無いと名前として抽出されず、一覧だけ取って「中身が無い」と答えていた。
+        # 探すのは利用者が名指ししたフォルダだけ (named_only) で、作業ルートは
+        # 「このリポジトリ」と指したときだけ加える — 利用者が README と言うとき、
+        # 製品自身のインストール根の README を指すとは限らない。文書の種類を問う質問
+        # (「README とは」「README の書き方」) は読む依頼ではない。
+        m = _WELL_KNOWN_DOC_RE.search(stripped)
+        if m and not _DOC_KIND_QUESTION_RE.search(stripped):
+            import os
+
+            for ext in (".md", ".txt", ".rst", ""):
+                name = m.group(1) + ext
+                cand = resolve_bare_filename(
+                    name, query=query, conversation=conversation, named_only=True,
+                )
+                if not cand.path and _REPO_REFERENCE_RE.search(stripped):
+                    root = os.path.join(os.getcwd(), name)
+                    if os.path.isfile(root):
+                        cand = type(cand)(path=root)
+                if cand.path:
+                    literal, resolution = name, cand
+                    break
+    if resolution is None or not resolution.path:
         return None
     # 名前の綴りは依頼の語ではない (「run.py の使い方」の run を実行の語と読まない)。
     # 名前は中立の名前へ置いて、依頼の形 (書込み・検索・実行) だけを推定させる。

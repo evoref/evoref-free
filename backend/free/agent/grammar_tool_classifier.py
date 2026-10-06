@@ -111,22 +111,42 @@ def build_classifier_schema(
     names = available_tool_names(tools_registry, mode)
     if not names:
         return None
+    # ``none`` の枝は ``arg`` を持たない。選ぶのは先頭の ``tool`` で、枝の違いは選択の後に
+    # しか効かないので判定は変わらず、``none`` (分類器を撃った回の約半数) の出力が
+    # ``{"tool": "none", "arg": ""}`` から ``{"tool": "none"}`` に縮む (実測: 19→15、
+    # 39→20 トークン = 1 回あたり 0.5〜2.3 秒、ツールを選ぶ回は同一出力)。
     return {
         "type": "json_schema",
         "json_schema": {
             "name": "tool_decision",
             "strict": True,
             "schema": {
-                "type": "object",
-                "properties": {
-                    "tool": {"type": "string", "enum": [*names, NO_TOOL]},
-                    "arg": {"type": "string"},
-                },
-                "required": ["tool", "arg"],
-                "additionalProperties": False,
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "enum": names},
+                            "arg": {"type": "string"},
+                        },
+                        "required": ["tool", "arg"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"tool": {"type": "string", "enum": [NO_TOOL]}},
+                        "required": ["tool"],
+                        "additionalProperties": False,
+                    },
+                ],
             },
         },
     }
+
+
+def classifier_tool_names(schema: dict[str, Any]) -> list[str]:
+    """:func:`build_classifier_schema` が許す ``tool`` の値 (``none`` を含む、読み手用)。"""
+    branches = schema["json_schema"]["schema"]["anyOf"]
+    return [name for br in branches for name in br["properties"]["tool"]["enum"]]
 
 
 #: メニューの locale 依存部分。役割宣言 (``_NATIVE_JUDGE_SYSTEM`` / ``_EN``) と

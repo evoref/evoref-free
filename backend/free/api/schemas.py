@@ -198,6 +198,9 @@ class DataHealthInfo(BaseModel):
     served_model_mismatch: bool = False
     served_model: str = ""
     expected_model: str = ""
+    #: 構文検査器 (tree-sitter-language-pack) が無い (多くは venv 外の Python で起動した)。
+    #: create の Python 以外の構文検査は「未検査」になる。
+    syntax_checker_missing: bool = False
     degraded: list[str] = Field(default_factory=list)
     #: 前回と違うエディションで起動した (世代印の ``last_edition``)。Free → Pro は
     #: Pro の形式を作った、Pro → Free は Pro 専用のデータを残したまま使わない。

@@ -88,6 +88,8 @@ export interface DataHealthInfo {
 	served_model_mismatch: boolean;
 	served_model: string;
 	expected_model: string;
+	/** 構文検査器が無い (多くは venv 外の Python で起動した)。create の Python 以外の構文検査が「未検査」になる */
+	syntax_checker_missing: boolean;
 	degraded: string[];
 	/** 前回と違うエディションで起動した (from → to)。切替が無ければ null */
 	edition_switched_from: string | null;
