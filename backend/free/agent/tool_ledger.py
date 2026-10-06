@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict, deque
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -43,6 +44,14 @@ MAX_SESSIONS = 16
 
 #: プロンプトへ載せる最大件数。これを超える場合は新しい方を残す。
 MAX_RENDERED_ENTRIES = 40
+
+#: 成功したツールの結果の本文を 1 セッションあたり何件・1 件何文字まで持つか
+#: (:func:`record_current_result`)。
+MAX_RESULTS_PER_SESSION = 20
+MAX_RESULT_CHARS = 20_000
+
+#: 結果がモデル自身の生成した下書きのツール (外から取った事実ではない)。
+GENERATED_DRAFT_TOOLS = frozenset({"draft_document", "summarize", "translate"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,25 +118,82 @@ _current_target: ContextVar[tuple[str, str] | None] = ContextVar(
 )
 
 
+#: このリクエストで書いたファイル (正規化した絶対パス)。``set_ledger_target`` /
+#: ``ledger_scope`` がリクエストごとに空の集合を置き、``ToolsRegistry.execute`` が
+#: 書込みの成功を積む。書込みゲートの上書きの規則 (docs/f_03 §4.y) が「計画の前段が
+#: 作り、後段が追記する」ファイルを依頼の対象として扱うのに使う。集合は可変で、
+#: ``create_task`` / ``to_thread`` が写した文脈からも同じ集合に積まれる。
+_request_writes: ContextVar[set[str] | None] = ContextVar(
+    "tool_ledger_request_writes", default=None,
+)
+
+
+def _path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
 def set_ledger_target(session_id: str, query: str) -> None:
     """このリクエスト (asyncio タスク) のツール実行の記録先を設定する。
 
     リクエストハンドラから呼ぶ。ストリーミング応答は関数が返った **後** に
     ジェネレータが回るため ``with`` で囲むと早すぎる時点で解除される。
     contextvar はタスクごとのコピーなので、明示的に解除しなくてもリクエスト
-    タスクの終了とともに破棄される。
+    タスクの終了とともに破棄される。セッションのターン番号もここで 1 つ進める
+    (取得した資料の持ち越しの窓、:func:`recent_observations`)。
     """
     _current_target.set((session_id or "", query or ""))
+    _current_turn.set(_next_turn(session_id))
+    _request_writes.set(set())
 
 
 @contextmanager
 def ledger_scope(session_id: str, query: str) -> Iterator[None]:
-    """スコープ内のツール実行を ``session_id`` の台帳へ記録する (テスト / 同期用)。"""
+    """スコープ内のツール実行を ``session_id`` の台帳へ記録する (テスト / 同期用)。
+
+    :func:`set_ledger_target` と同じく、入るたびにセッションのターン番号を進める。
+    """
     token = _current_target.set((session_id or "", query or ""))
+    turn_token = _current_turn.set(_next_turn(session_id))
+    writes_token = _request_writes.set(set())
     try:
         yield
     finally:
+        _request_writes.reset(writes_token)
+        _current_turn.reset(turn_token)
         _current_target.reset(token)
+
+
+#: 現在のリクエストの、そのセッションでのターン番号 (1 始まり。宛先が無ければ 0)。
+_current_turn: ContextVar[int] = ContextVar("tool_ledger_turn", default=0)
+#: セッションごとに最後に発番したターン番号 (プロセス内のみ)。
+_turn_counters: "OrderedDict[str, int]" = OrderedDict()
+
+
+def _next_turn(session_id: str) -> int:
+    """``session_id`` の次のターン番号を発番する (セッションが空なら 0)。"""
+    if not session_id:
+        return 0
+    turn = _turn_counters.pop(session_id, 0) + 1
+    _turn_counters[session_id] = turn
+    while len(_turn_counters) > MAX_SESSIONS:
+        evicted, _ = _turn_counters.popitem(last=False)
+        # 番号が 1 から振り直されるので、旧番号で積んだ資料も一緒に捨てる
+        # (残すと新しい番号と衝突して、古い資料が直近の取得に見える)。
+        _observations.pop(evicted, None)
+    return turn
+
+
+def record_request_write(path: str) -> None:
+    """このリクエストで ``path`` へ書いたことを記録する (スコープ外は no-op)。"""
+    writes = _request_writes.get()
+    if writes is not None and path:
+        writes.add(_path_key(path))
+
+
+def written_in_request(path: str) -> bool:
+    """``path`` をこのリクエストで既に書いたか。"""
+    writes = _request_writes.get()
+    return bool(writes and path and _path_key(path) in writes)
 
 
 def record_current(tool_name: str | None, success: bool, reason: str = "") -> None:
@@ -253,5 +319,166 @@ def reset(session_id: str | None = None) -> None:
     """テスト用。``session_id`` 指定でそのセッションだけ、無指定で全消去。"""
     if session_id is None:
         _ledger.clear()
+        _results.clear()
+        _observations.clear()
+        _turn_counters.clear()
         return
     _ledger.pop(session_id, None)
+    _results.pop(session_id, None)
+    _observations.pop(session_id, None)
+    _turn_counters.pop(session_id, None)
+
+
+#: セッションごとの成功したツールの結果の本文 (:func:`record_current_result`)。
+_results: "OrderedDict[str, deque[str]]" = OrderedDict()
+
+
+def record_current_result(tool_name: str | None, result: str) -> None:
+    """成功したツールの結果の本文を ``ledger_scope`` の宛先セッションへ積む。
+
+    後のターンの出力検査が「応答の人名はこの会話で取った中身にあるか」を確かめる
+    根拠 (``deliberative._append_session_files_fact``)。積むのはツールの **結果** で、
+    それを受けた答えではない — 答えを根拠にすると、そのターンで作った名前が後の
+    ターンで正当化される。下書きのツール (:data:`GENERATED_DRAFT_TOOLS`) の結果は
+    モデルの生成なので積まない。スコープ外・失敗は呼出側が呼ばない / no-op。
+    """
+    target = _current_target.get()
+    if target is None or not tool_name or tool_name in GENERATED_DRAFT_TOOLS:
+        return
+    session_id = target[0]
+    bucket = _results.get(session_id)
+    if bucket is None:
+        bucket = _results[session_id] = deque(maxlen=MAX_RESULTS_PER_SESSION)
+        while len(_results) > MAX_SESSIONS:
+            _results.popitem(last=False)
+    else:
+        _results.move_to_end(session_id)
+    bucket.append(str(result or "")[:MAX_RESULT_CHARS])
+
+
+def session_results(session_id: str) -> list[str]:
+    """セッションで成功したツールの結果の本文 (古い順)。"""
+    return list(_results.get(session_id, ()))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 取得した資料の持ち越し (ファイル / URL の本文)
+# ─────────────────────────────────────────────────────────────────────
+#
+# 会話履歴には応答の本文しか残らないので、ファイルを読んで答えた次のターンの
+# 「地域別ではどちらが多いですか？」をツール無しで答えると、資料を見ないまま作話する
+# (2026-10-05 ライブ監査: 実在しない North / South の金額を挙げた。実際の地域は
+# 東 / 西)。取った本文を、どの依頼で取ったかと一緒に持ち、後のターンへ持ち越す
+# 材料にする (docs/f_03 §3.5 の ``_append_recent_observations``)。
+
+#: 本文を持ち越す対象のツール (名指しした資料を取るもの)。
+OBSERVATION_TOOLS = frozenset({"read_file", "fetch_url"})
+#: 1 セッションあたり保持する取得の件数 (新しい方を残す)。
+MAX_OBSERVATIONS_PER_SESSION = 8
+#: 取得したターンから何ターン先まで持ち越すか (このセッションのターン番号で数える)。
+RECENT_OBSERVATION_TURNS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class Observation:
+    """取得した資料 1 件。"""
+
+    tool_name: str
+    #: 資料の所在 (ファイルのパス / URL)。
+    source: str
+    #: 本文 (``MAX_RESULT_CHARS`` で切った写し)。
+    content: str
+    #: 取得したターンの番号 (:func:`set_ledger_target` が発番、持ち越しの窓をこれで数える)。
+    turn: int
+    #: 切る前の本文の文字数。
+    total_chars: int = 0
+    #: ファイルの ``(st_mtime_ns, st_size)`` (読む **前** に取った値)。取得後の変更を
+    #: 見分ける。URL・取れなかったときは ``None``。
+    fingerprint: tuple[int, int] | None = None
+    #: private のターンで取ったか。private でないターンへは持ち越さない。
+    private: bool = False
+
+    @property
+    def source_key(self) -> str:
+        """同じ資料を見分ける鍵 (ファイルは大文字小文字を畳む、URL はそのまま)。"""
+        return os.path.normcase(self.source) if self.tool_name == "read_file" else self.source
+
+
+_observations: "OrderedDict[str, deque[Observation]]" = OrderedDict()
+
+
+def record_current_observation(
+    tool_name: str, source: str, content: str,
+    fingerprint: tuple[int, int] | None = None,
+) -> None:
+    """取得した資料を ``ledger_scope`` の宛先セッションへ積む (宛先が無ければ no-op)。"""
+    from backend.trace_context import is_private
+
+    target = _current_target.get()
+    if target is None or not target[0] or tool_name not in OBSERVATION_TOOLS:
+        return
+    if not (source or "").strip():
+        return
+    session_id = target[0]
+    bucket = _observations.get(session_id)
+    if bucket is None:
+        bucket = _observations[session_id] = deque(maxlen=MAX_OBSERVATIONS_PER_SESSION)
+        while len(_observations) > MAX_SESSIONS:
+            _observations.popitem(last=False)
+    else:
+        _observations.move_to_end(session_id)
+    text = str(content or "")
+    bucket.append(Observation(
+        tool_name=tool_name, source=source.strip(),
+        content=text[:MAX_RESULT_CHARS], turn=_current_turn.get(),
+        total_chars=len(text), fingerprint=fingerprint, private=is_private(),
+    ))
+
+
+def recent_observations(
+    session_id: str, *, max_turns: int = RECENT_OBSERVATION_TURNS,
+) -> list[tuple[Observation, int]]:
+    """持ち越す資料と、何ターン前に取得したか (新しい順、資料ごとに最新の 1 件)。
+
+    今のターン (:func:`set_ledger_target` が発番した番号) より前の、``max_turns``
+    ターン以内に取得したものだけを返す。ターンは番号で数える — 依頼文の一致で
+    数えると、同じ文を 2 度送った会話で取り違える。別の会話・再起動前の取得は
+    台帳に無いので持ち越さない。private のターンで取った資料は private でない
+    ターンへ持ち越さない (ログへ本文が出る)。
+    """
+    from backend.trace_context import is_private
+
+    bucket = _observations.get(session_id) if session_id else None
+    current = _current_turn.get()
+    if not bucket or not current:
+        return []
+    private_turn = is_private()
+    out: list[tuple[Observation, int]] = []
+    seen: set[str] = set()
+    # 実行中のツールが別スレッドから積みうるので、写しを走査する。
+    for obs in reversed(list(bucket)):
+        if obs.private and not private_turn:
+            continue
+        if obs.source_key in seen:
+            continue
+        seen.add(obs.source_key)
+        age = current - obs.turn
+        if 1 <= age <= max_turns:
+            out.append((obs, age))
+    return out
+
+
+def file_fingerprint(path: str) -> tuple[int, int] | None:
+    """ファイルの ``(st_mtime_ns, st_size)`` (読めなければ ``None``)。"""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def observation_is_stale(obs: Observation) -> bool:
+    """取得した後にファイルが変わった / 消えたか (URL など指紋の無い取得は偽)。"""
+    if obs.fingerprint is None:
+        return False
+    return file_fingerprint(obs.source) != obs.fingerprint

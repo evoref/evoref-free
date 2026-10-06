@@ -20,6 +20,10 @@ class ToolJudgement:
     #: 除外するために区別する) / ``classifier`` (層 5.9 の文法制約分類・層 5.95 の
     #: 式合成)。
     source: str = "rule"
+    #: 判定を確定させた層の名前 (decision ログの ``reason``、例
+    #: ``executable_command_rule`` / ``tool_classifier``)。``source`` と組で経験の
+    #: ``signals.decided_by`` に載る (近道の実行を学習の正例から外す根拠、不変則 #15)。
+    decided_reason: str = ""
     #: calculate の式に含まれる、対話から辿れない数値リテラル。式を捨てずに
     #: 実行したときだけ入り、回答側でその値の出所を開示させるために使う
     #: (``_suppress_ungrounded_calculate`` 参照)。

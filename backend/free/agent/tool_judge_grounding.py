@@ -10,7 +10,14 @@ from __future__ import annotations
 import ast
 import math
 import re
+import unicodedata
 
+from backend.free.agent.tools.calc_ops import (
+    DATE_OPS,
+    DURATION_OPS,
+    TEXT_COUNT_OPS,
+    date_parts,
+)
 from backend.free.core.intent_vocab import NUMBER_LITERAL_RE
 from backend.free.core.numerals import kanji_number_value
 from backend.free.core.response_arithmetic import JaNumber, iter_ja_numbers
@@ -180,13 +187,92 @@ def _ungrounded_numbers(
         _PERCENT_LITERAL_RE.sub(" ", query or ""), include_percent=False,
     ) | _known_numbers(_PERCENT_LITERAL_RE.sub(" ", context or ""), include_percent=False)
     known.update(_conversion_position_constants(expression, partners))
+    known.update(_plain_numbers(known))
     seen: list[str] = []
     # 冪の指数 (``x ** 2``) は式の構造が要求する値で、対話の数値ではない
     # (BMI = 体重 / 身長 ** 2。2026-09-21 ライブ監査の再検証で棄却されていた)。
-    for n in _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", expression)):
+    for n in _expression_number_literals(expression):
         if n not in known and n not in seen:
             seen.append(n)
     return tuple(seen)
+
+
+def _plain_number(literal: str) -> str:
+    """先頭のゼロを畳んだ数の綴り (``05`` → ``5``、``00`` → ``0``、``07.5`` → ``7.5``)。"""
+    whole, dot, frac = literal.partition(".")
+    return (whole.lstrip("0") or "0") + dot + frac
+
+
+def _plain_numbers(numbers: set[str]) -> set[str]:
+    """会話の数の綴りを :func:`_plain_number` で畳んだもの (純粋関数)。
+
+    式の時間長・日付の文字列は値で数える (:func:`_operand_string_numbers`) ので、
+    会話側も同じ畳みで照合する。会話が ``2024-02-28`` / ``1:05:00`` と書いていると、
+    綴りのままでは ``02`` / ``05`` しか無く、書き写しただけの式が未接地になる
+    (2026-10-06 再レビュー)。
+    """
+    return {_plain_number(n) for n in numbers if n[:1] == "0" and n[1:2].isdigit()}
+
+
+def _operand_string_numbers(func: str, value: str) -> list[str]:
+    """時間長・日付の文字列引数の中の数を **値で** 返す (純粋関数)。
+
+    ``date_diff("2024-02-28", …)`` の ``02`` は「2 月」で、会話の「2月28日」と同じ
+    値。綴りで照合すると会話に無い数として開示させていた (2026-10-06 レビュー)。
+    日付は構造として年月日を取り出し、時間長は先頭のゼロを畳む。時間長の 0 の
+    成分 (``2:30:00`` の ``00``) は値を足さないので数えない。
+    """
+    if func in DATE_OPS:
+        parts = date_parts(value)
+        if parts is not None:
+            return [str(p) for p in parts]
+    numbers = [_plain_number(n) for n in _NUMBER_LITERAL_RE.findall(value)]
+    if func in DURATION_OPS:
+        numbers = [n for n in numbers if float(n) != 0]
+    return numbers
+
+
+def _expression_number_literals(expression: str) -> list[str]:
+    """式の数値リテラルを出現順に返す (冪の指数を除く、純粋関数)。
+
+    ``calculate`` の許可関数の文字列引数は綴りでなく値で数える
+    (:func:`_operand_string_numbers`)。数える文字列 (``chars`` 等の引数) の中の数字は
+    数値ではないので数えない (文字列そのものは :func:`_unquoted_count_texts` が見る)。
+    式として読めなければ従来どおり全体から拾う。
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", expression))
+    ops = DATE_OPS | DURATION_OPS | TEXT_COUNT_OPS
+    encoded = expression.encode("utf-8")
+    line_starts = [0]
+    for line in encoded.splitlines(keepends=True):
+        line_starts.append(line_starts[-1] + len(line))
+    spans: list[tuple[int, int]] = []
+    from_strings: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in ops
+        ):
+            continue
+        for arg in node.args:
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                continue
+            if arg.end_lineno is None or arg.end_col_offset is None:
+                continue
+            # col_offset は UTF-8 のバイト位置
+            spans.append((
+                line_starts[arg.lineno - 1] + arg.col_offset,
+                line_starts[arg.end_lineno - 1] + arg.end_col_offset,
+            ))
+            if node.func.id not in TEXT_COUNT_OPS:
+                from_strings.extend(_operand_string_numbers(node.func.id, arg.value))
+    for start, end in sorted(spans, reverse=True):
+        encoded = encoded[:start] + b'""' + encoded[end:]
+    rest = encoded.decode("utf-8")
+    return _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", rest)) + from_strings
 
 
 def conversation_operands(
@@ -199,9 +285,11 @@ def conversation_operands(
     書かれていれば会話の値として数える (2026-09-26 監査 C03#3)。
     """
     in_query = _known_numbers(query)
+    in_query |= _plain_numbers(in_query)
     in_dialogue = _known_numbers(dialogue)
+    in_dialogue |= _plain_numbers(in_dialogue)
     seen: list[str] = []
-    for n in _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", expression)):
+    for n in _expression_number_literals(expression):
         if n in in_dialogue and n not in in_query and n not in seen:
             seen.append(n)
     return tuple(seen)
@@ -516,6 +604,7 @@ def expression_sanity_issues(
        :func:`_compounding_period_issues`)
     5. 月の複利の冪の指数が会話の期間と合わない (「35年」に ``** -360``、
        :func:`period_exponent_mismatches`)
+    6. 文字数・語数を数える文字列が会話に逐語で無い (:func:`_unquoted_count_texts`)
     """
     expr = expression or ""
     text = f"{query or ''}\n{context or ''}"
@@ -567,19 +656,146 @@ def expression_sanity_issues(
 
     pairs = _myriad_pairs(text)
     if len(pairs) >= 1:
-        used_coefficient = any(
-            re.search(rf"(?<![\d.]){re.escape(c)}(?![\d.])", expr) for c, _ in pairs
-        )
+        def _in_expr(number: str) -> bool:
+            return bool(re.search(rf"(?<![\d.]){re.escape(number)}(?![\d.])", expr))
+
+        # 同じ値の係数と展開値が両方式にある (「8万円」の 8 と 80000) のは混在そのもの。
+        own_mix = any(_in_expr(c) and _in_expr(e) for c, e in pairs)
+        # 別の値の展開値との組では、会話に素の数としても現れる係数 (「2万8千円」の 2 と
+        # 「2人」の 2) は式の 2 がどちらか決められないので係数の使用に数えない。数えると
+        # 人数・泊数を掛けた正しい式が毎回落ち、作り直しても同じ式が返って計 2 往復を
+        # 捨てていた (2026-10-05 ライブ監査: ``(50000 - 28000) * 2 - 12000 * 2 * 2`` が 3 ターン)。
+        plain = {
+            f"{n.value:g}" for n in iter_ja_numbers(text) if not n.has_unit
+        }
+        used_coefficient = any(_in_expr(c) for c, _ in pairs if c not in plain)
         # 展開値そのもの、または万単位では現れない大きな円の値 (10 万以上)
-        used_expanded = any(
-            re.search(rf"(?<![\d.]){re.escape(e)}(?![\d.])", expr) for _, e in pairs
-        ) or any(
+        used_expanded = any(_in_expr(e) for _, e in pairs) or any(
             float(n) >= 100000 and n not in {c for c, _ in pairs}
             for n in _NUMERIC_LITERAL_RE.findall(expr)
         )
-        if used_coefficient and used_expanded:
+        if own_mix or (used_coefficient and used_expanded):
             issues.append("万円の係数 (万単位) と円の展開値が同じ式に混在している (単位を揃える)")
+    for literal in _unquoted_count_texts(expr, text):
+        preview = literal if len(literal) <= 20 else literal[:20] + "…"
+        issues.append(
+            f"数える文字列「{preview}」が会話に逐語で現れない (書き写しで文字が変わると"
+            "数も変わる。会話の原文をそのまま引数にする)"
+        )
     return tuple(issues)
+
+
+#: 引用の括弧 (開き → 閉じ)。``"`` は行を跨がない。
+_QUOTE_PAIRS = {"「": "」", "『": "』", "“": "”", '"': '"'}
+
+
+def _quoted_spans(text: str) -> list[tuple[int, int]]:
+    """引用の区間 ``[開き括弧の直後, 閉じ括弧)`` を左から重ならずに返す (純粋関数)。
+
+    閉じ括弧の位置は右から 1 回走査して表にする。開き括弧ごとに閉じを探し直すと、
+    閉じない ``「`` が続く入力で 2 乗の時間が掛かった (2026-10-06 再レビュー)。
+    """
+    next_pos: dict[str, list[int]] = {}
+    for closer in set(_QUOTE_PAIRS.values()) | {"\n"}:
+        table = [-1] * (len(text) + 1)
+        for i in range(len(text) - 1, -1, -1):
+            table[i] = i if text[i] == closer else table[i + 1]
+        next_pos[closer] = table
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(text):
+        closer = _QUOTE_PAIRS.get(text[i])
+        if closer is None:
+            i += 1
+            continue
+        k = next_pos[closer][i + 1]
+        if closer == '"':
+            newline = next_pos["\n"][i + 1]
+            if newline != -1 and (k == -1 or newline < k):
+                k = -1
+        if k == -1:
+            i += 1
+            continue
+        spans.append((i + 1, k))
+        i = k + 1
+    return spans
+
+
+def _is_boundary(ch: str) -> bool:
+    """区切りの文字か (空白・句読点・括弧。Unicode の Z* / P* / 改行)。"""
+    return ch.isspace() or unicodedata.category(ch)[0] in ("P", "Z")
+
+
+def _count_text_grounded(literal: str, text: str) -> bool:
+    """数える文字列が会話の原文の **ひとまとまり** として現れるか (純粋関数)。
+
+    語彙では決めず、構造 (引用・行・区切り・長さ) だけで決める:
+
+    1. 引用の区間の中身と一致する。
+    2. 行 (発話・段落) の全体、または続いた行の全体と一致する。
+    3. 引用の外に逐語で現れ、前が行頭か区切り、かつ後ろが次のどちらか:
+       行の残りが区切りだけ (``次の文の文字数を数えて: 吾輩は猫である。``)、または
+       文字列自身が区切りで終わり行の半分以上を占める (``吾輩は猫である。の文字数は？``)。
+
+    文の途中で切った書き写し (``吾輩は猫である。名前はまだ無い。`` の前半だけ、
+    引用の中身の一部だけ) は通さない。行末の句読点だけを落とした書き写しは 3 の
+    前半で通る (依頼の ``？`` と原文の ``。`` を語彙なしに区別できないため)。
+    """
+    if not literal.strip():
+        return False
+    spans = _quoted_spans(text)
+    if any(text[a:b] == literal for a, b in spans):
+        return True
+    if f"\n{literal}\n" in f"\n{text}\n":
+        return True
+    if any(line.strip() == literal for line in text.splitlines()):
+        return True
+    if "\n" in literal:
+        return False
+    pos = text.find(literal)
+    while pos != -1:
+        end = pos + len(literal)
+        inside_quote = any(a <= pos and end <= b for a, b in spans)
+        line_start = text.rfind("\n", 0, pos) + 1
+        line_end = text.find("\n", end)
+        line_end = len(text) if line_end == -1 else line_end
+        before_ok = pos == line_start or _is_boundary(text[pos - 1])
+        rest = text[end:line_end]
+        after_ok = all(_is_boundary(c) for c in rest) or (
+            _is_boundary(literal[-1]) and 2 * len(literal) >= line_end - line_start
+        )
+        if not inside_quote and before_ok and after_ok:
+            return True
+        pos = text.find(literal, pos + 1)
+    return False
+
+
+def _unquoted_count_texts(expression: str, text: str) -> list[str]:
+    """文字数・語数を数える関数 (``chars`` / ``words`` / ``count_kind``) の文字列引数の
+    うち、会話の原文のひとまとまりとして現れないものを返す (純粋関数)。
+
+    数値の接地 (:func:`_ungrounded_numbers`) の文字列版。モデルが原文を書き写すときに
+    言い換えたり句読点を落としたりすると、数え上げは正しく計算された誤りになる。
+    部分文字列の包含で認めると、途中で切った文字列 (「吾輩は猫である。名前はまだ
+    無い。」の前半だけ) も通ってしまう (2026-10-06 レビュー)。条件は
+    :func:`_count_text_grounded`。
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return []
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in TEXT_COUNT_OPS and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            literal = node.args[0].value
+            if literal not in found and not _count_text_grounded(literal, text):
+                found.append(literal)
+    return found
 
 
 #: 期間の年数 (「35年」「20 年間」)。「年利」「年率」「年齢」の年は数えない。

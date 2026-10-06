@@ -15,6 +15,7 @@ import numpy as np
 
 from backend.free.core.intent_vocab import (
     ascii_boundary,
+    is_contentless_social_formula,
     session_self_reference_pattern_ja,
 )
 from backend.free.core.locale_patterns import matches_either
@@ -477,6 +478,7 @@ class RetrievalNecessityJudge:
             1. クエリ < 3 文字 → skip
             2. URL 含む or 明示的 fetch 動詞 → fetch (確定)
             3. TRIVIAL (時刻/自己同一性/雑談) → skip
+            3.7. 発話全体が社交の定型だけ (全文被覆) → skip
             4. QUESTION_PATTERNS マッチ:
                 - 長文 (>= 30 char) → retrieve (情報量がある知識質問)
                 - 短文 → uncertain (呼出側のリコール送り)
@@ -569,6 +571,24 @@ class RetrievalNecessityJudge:
             )
             return "skip"
 
+        # 3.7. 発話全体が社交の定型だけ (「こんにちは。今日はよろしくお願いします。」)
+        # → skip。命題を 1 つも運ばないので、検索しても足すものが無い。判定は
+        # sleep-time のノート化ゲートと同じ全文被覆 (定型で始まるだけの発話は
+        # 被覆にならない)。5. の部分一致 + 20 文字未満では、20 文字ちょうどの挨拶が
+        # 落ちて既定の uncertain → retrieve へ流れ、短い問いに対して cosine の高い
+        # 帯に居座る挨拶ノートが [参考情報] に載った (2026-10-05 ライブ、棒では
+        # 分離できない)。QUESTION より先に見る: 「そうですか。」の「ですか」が
+        # 質問マーカーに当たるため。skip は事例ゲートの確認を通る。
+        # アシスタントの締めの定型は被覆に使わない (``assistant_closers=False``):
+        # ユーザーの「他にありますか?」「何でしょうか?」は中身を求める問いで、
+        # skip すると窓が不完全なときに記憶を引かずに答える。
+        if is_contentless_social_formula(query_stripped, assistant_closers=False):
+            logger.debug(
+                "Necessity: skip (whole utterance is a social formula: %r)",
+                query_stripped[:50],
+            )
+            return "skip"
+
         # 4. 質問マーカー (SKIP より優先)
         # 「発売日はいつ」が SKIP の "はい" substring にヒットして誤って
         # skip されないよう、QUESTION を SKIP より先に評価する。
@@ -586,6 +606,9 @@ class RetrievalNecessityJudge:
             return "retrieve"
 
         # 5. スキップパターン (挨拶/相槌) — 短文のみ
+        # 全文が定型の発話 (「そうですか。」を含む) は 3.7 で取り終えている。
+        # 「そうですか」のように質問マーカーを含む相槌は 4. に先に当たるため、
+        # ここへは届かない — ここが拾うのは定型の後に短い残余がある発話だけ。
         if either(SKIP_PATTERNS, SKIP_PATTERNS_EN) and len(query_stripped) < 20:
             logger.debug("Necessity: skip (greeting/simple pattern matched: %r)", query_stripped[:30])
             return "skip"

@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from backend.free.core.session_mode import is_create_mode
 from backend.free.rag.evidence.tokenize import tokenize_ja
@@ -137,6 +138,7 @@ class ChunkContentGate:
     def __init__(self, cfg: GateConfig, *, debug_logger: DebugLogger | None = None):
         self._cfg = cfg
         self._debug_logger = debug_logger
+        self._attrs_of: Callable[[str], dict[str, Any] | None] | None = None
 
     async def filter(
         self,
@@ -147,13 +149,17 @@ class ChunkContentGate:
         aux_client=None,
         tracker: JudgeUsageTracker | None = None,
         session_id: str = "default",
+        attrs_of: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> list[tuple[str, float, str]]:
         """heuristics-first prune + marginal band aux。
 
         ``merged`` は ``(chunk_id, score, text)`` の score 降順リスト。
         pruning 済みリスト (score 降順、``min_keep`` 未満にしない) を返す。
         ゲート無効 / 候補が ``min_keep`` 以下なら無加工で返す。例外は投げない。
+        ``attrs_of`` (chunk id → ``attrs``) を渡すと、表のチャンクを前置きを除いた行で
+        比べる (:meth:`_dedup`)。無ければ全文で比べる。
         """
+        self._attrs_of = attrs_of
         cfg = self._cfg
         if not cfg.enabled or len(merged) <= cfg.min_keep:
             return merged
@@ -238,18 +244,26 @@ class ChunkContentGate:
     def _dedup(
         self, chunks: list[tuple[str, float, str]],
     ) -> tuple[list[tuple[str, float, str]], int]:
-        """token-set Jaccard で近似重複を除去する (score 降順前提、高スコア優先)。"""
+        """token-set Jaccard で近似重複を除去する (score 降順前提、高スコア優先)。
+
+        表のチャンク (``attrs.table_index`` を持つ) は同じ表の中で見出しパス・caption・
+        ヘッダを共有するので、全文で比べると別の行が近似重複として落ちる。表のチャンクは
+        **前置きとヘッダが同じチャンクの間でだけ**、前置きを除いた行 (ヘッダの語も除く)
+        で比べる (f_01 §3.1.5)。前置きが違えば (別の節の同じ行など) 重複にしない。
+        """
         cfg = self._cfg
         if cfg.dedup_jaccard >= 1.0 or len(chunks) <= 1 or len(chunks) > _DEDUP_MAX:
             return list(chunks), 0
         kept: list[tuple[str, float, str]] = []
-        kept_sets: list[frozenset[str]] = []
+        kept_sets: list[tuple[tuple[str, str] | None, frozenset[str]]] = []
         dropped = 0
         for cid, score, text in chunks:
-            tok = frozenset(tokenize_ja(text, split_ascii=True))
+            group, tok = self._dedup_key(cid, text)
             is_dup = False
             if tok:
-                for ks in kept_sets:
+                for kgroup, ks in kept_sets:
+                    if kgroup != group:
+                        continue
                     inter = len(tok & ks)
                     if inter == 0:
                         continue
@@ -261,8 +275,21 @@ class ChunkContentGate:
                 dropped += 1
             else:
                 kept.append((cid, score, text))
-                kept_sets.append(tok)
+                kept_sets.append((group, tok))
         return kept, dropped
+
+    def _dedup_key(
+        self, cid: str, text: str,
+    ) -> tuple[tuple[str, str] | None, frozenset[str]]:
+        """近似重複の比較の ``(組, 語の集合)``。表のチャンクは組 = (前置き, ヘッダ)。"""
+        attrs = self._attrs_of(cid) if self._attrs_of is not None else None
+        if not isinstance(attrs, dict) or attrs.get("table_index") is None:
+            return None, frozenset(tokenize_ja(text, split_ascii=True))
+        cut = int(attrs.get("table_prefix_chars") or 0)
+        header = str(attrs.get("table_header") or "")
+        body = set(tokenize_ja(text[cut:], split_ascii=True))
+        body -= set(tokenize_ja(header, split_ascii=True))
+        return (text[:cut], header), frozenset(body)
 
     async def _judge_marginal(
         self, query, prose_idx, deduped, aux_client, tracker, session_id, result,

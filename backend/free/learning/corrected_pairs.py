@@ -39,6 +39,7 @@ from backend.free.core.correction_target import (
     wrong_side_tokens,
 )
 from backend.free.core.correction_verdict import VERDICT_CODES
+from backend.free.core.context_bound import refers_to_previous_turn
 from backend.free.core.intent_vocab import (
     asks_quantity_without_operands,
     is_plain_statement,
@@ -61,39 +62,9 @@ _ACK_ONLY_RE = re.compile(
     r"|に修正します|で承知しました)[。.!！]?\s*$",
 )
 
-#: 直前ターンへの照応・継続 (「修正版に」「2 案を採用」「その」「続けて」)。
-#:
-#: ``その他`` / ``それぞれ`` は **照応ではない** — 前者は「その他大勢」の
-#: 一語、後者は複数対象への配分を表す副詞で、どちらも直前ターンを指さない。
-#: 素の ``その`` / ``それ`` で拾うと、文脈非依存の問いまで文脈依存に倒れる。
-#: 実測 (2026-09-06): 正しく組めた訂正ペア 4 件のうち 2 件がこの 2 語だけで
-#: 棄却され、eval_core / few-shot への追加が 0 件のままだった (F-01 の宛先を
-#: 直しても受け皿に届かない)。
-#:
-#: やり直しの動詞 (「計算し直して」「書き直して」) と、述べた値の訂正
-#: (「18 kg ではなく 22 kg でした」) も直前ターンを指す — やり直す対象、
-#: 訂正で入れ替わらなかった残りの前提 (積載量 4.5 t / 6 便) は前のターンに
-#: しか無い。実インシデント (2026-09-09 ライブ監査 (d) D-08): 「すみません、
-#: 荷物は 18 kg ではなく 22 kg でした。1 台あたりの個数と 1 日の総個数を
-#: 計算し直してください。」が few-shot に採用され、手本の応答が問いに無い
-#: 4.5 トン・6 便を前提に答える形 (= 無い前提を補う型) を教えていた。
-#: 「見直す」(検討する) は対象を含む新規の問いに現れるので含めない。
-_ANAPHORA_RE = re.compile(
-    r"それ(?!ぞれ)|その(?!他)|これ|この|あれ|あの|さっき|先(?:ほど|程)|直前"
-    r"|(?<![名以事手])前の"
-    r"|(?<!の)上の|上記|同じ|同様|続き|続けて|もう一度|再度|最初の|ここまで|今の"
-    r"|修正版|最終版|改訂版|案を採用|を採用"
-    r"|[しりきぎみびいえけせてねめれ]直(?:し|す|せ|さ)"
-    r"|(?:ではなく|じゃなく)[^。！？!?\n]{0,24}?でした",
-)
-#: **既に述べられたことを思い出させる形** (「何でしたか」「いつでしたっけ」
-#: 「覚えていますか」)。照応語が無くても直前の文脈が無いと答えられないので
-#: 手本にならない。2026-09-10 ライブ監査 (h) H-09: 「娘の学年と習い事は何
-#: でしたか」「要約は何文字でしたか」が決定論ゲートを素通りし、LLM の品質
-#: floor に落ちるまでプールに滞留した。
-_RECALL_FORM_RE = re.compile(
-    r"覚え|記憶|言いました|言ったか|でしたか|でしたっけ|だったか|だっけ",
-)
+#: 照応・想起形・短い継続指示の規則は ``core.context_bound`` が SSOT
+#: (:func:`refers_to_previous_turn`、記憶の注入と同じ 1 実装。不変則 #14 (a))。
+
 #: 記憶・ツール結果を前提にしている手掛かり (照応・想起形に加えて)。
 _MEMORY_OR_TOOL_RE = re.compile(
     r"私|僕|自分|俺"
@@ -112,14 +83,6 @@ _NEGATED_VALUE_RE = re.compile(r"(?:ではなく|じゃなく)")
 #: 「… = 51,148.8 円」の右辺。訂正が式で示されたら、答えの値は必須の期待語。
 _EQUATION_RHS_RE = re.compile(r"[=＝]\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
 _STOP_IDENTIFIERS = STOP_IDENTIFIERS
-#: 短い継続指示 (「表にしてください。」「箇条書きで。」「続けて。」): 対象を
-#: 言わない依頼形の文末で、この長さ以下。「べき等性とは何ですか。」のような
-#: 短い問いは対象を含むので拾わない。
-_MAX_CONTINUATION_CHARS = 14
-_CONTINUATION_TAIL_RE = re.compile(
-    r"(?:にして|で|に|を|も)(?:ください|下さい|お願いします|くれ|ね)?[。.!！]?\s*$"
-    r"|(?:続けて|続きを|もう一度|再度)[。.!！]?\s*$",
-)
 #: ユーザー自身の属性の話 (記憶が要る)。
 _PERSONAL_ATTR_RE = re.compile(
     r"趣味|職業|名前|住ま|住んで|出身|誕生日|好きな|勤め|会社|年齢|家族|ペット"
@@ -185,19 +148,6 @@ def strip_correction_preamble(response: str) -> str:
     if not text or _ACK_ONLY_RE.match(text):
         return ""
     return text
-
-
-def refers_to_previous_turn(query: str) -> bool:
-    """問いが直前ターンへの照応・継続か (純粋関数)。
-
-    照応語 (「その」「修正版に」「2 案を採用」) と、短すぎる継続指示
-    (「表にしてください。」) を拾う。few-shot の入口 (``find_content_rejection``)
-    がこれで単独では意味を成さない問いを手本から外す。
-    """
-    q = (query or "").strip()
-    if len(q) <= _MAX_CONTINUATION_CHARS and _CONTINUATION_TAIL_RE.search(q):
-        return True
-    return bool(_ANAPHORA_RE.search(q) or _RECALL_FORM_RE.search(q))
 
 
 def depends_on_context(query: str) -> bool:

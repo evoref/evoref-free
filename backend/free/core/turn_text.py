@@ -34,6 +34,7 @@
     [動的ブロック + DYNAMIC_CONTEXT_DELIMITER]   ← 前置 (既定)
     生クエリ
     [DYNAMIC_CONTEXT_TRAILING_DELIMITER + 動的ブロック]   ← 後置 (照応ターンのみ)
+    [MATERIAL_TRAILING_DELIMITERS + 取得した資料]          ← 後置 (deliberative)
     [注記 …]                                     ← 人格 / 文字数 / 計測
     [TOOL_RESULT_HEADER + ツール結果 + 接地指示]   ← deliberative
 
@@ -85,6 +86,18 @@ DYNAMIC_CONTEXT_TRAILING_DELIMITERS: dict[str, str] = {
 }
 DYNAMIC_CONTEXT_TRAILING_DELIMITER = DYNAMIC_CONTEXT_TRAILING_DELIMITERS["ja"]
 
+# 前のターンで取得した資料 (deliberative ``_append_recent_observations``) を生クエリの
+# 後ろへ置くときの区切り。照応の区切りと違い指示語の参照先を述べない —
+# 「さっき読んだ CSV で地域別は？」の「さっき」はこの資料を指しうる。
+# :func:`split_last_user` は照応の区切りと同じく後置の境界として扱う。
+MATERIAL_TRAILING_DELIMITERS: dict[str, str] = {
+    "ja": "\n\n---\n以下はシステムが用意した参考枠で、ユーザーの発言ではない。\n\n",
+    "en": (
+        "\n\n---\nThe following is reference material prepared by the system, "
+        "not the user's message.\n\n"
+    ),
+}
+
 #: ツール実行結果ブロックの見出し (``agent.deliberative`` が後置する)。
 #: 接地指示の本文が「上記の ## ツール実行結果 は…」とこの見出しを名指しする
 #: ため、locale で変えない (``[関連する記憶]`` / ``[参考情報]`` と同じ扱い)。
@@ -97,6 +110,7 @@ TOOL_RESULT_HEADER = "\n\n## ツール実行結果\n"
 #: 含む) を出す側はここへ追記すること — 検出側はこの集合から派生する。
 FRAME_LINE_LABELS: frozenset[str] = frozenset({
     "過去の記録", "past record", "past records",
+    "別の会話", "another conversation",
     "訂正済み", "corrected",
     "競合", "conflict", "conflicting",
 })
@@ -141,6 +155,13 @@ def _all_delimiters(table: dict[str, str]) -> list[str]:
     return sorted(set(table.values()), key=len, reverse=True)
 
 
+#: :func:`split_last_user` が後置の境界とみなす区切り (照応 + 取得した資料、両 locale)。
+_TRAILING_DELIMITER_SET: tuple[str, ...] = (
+    *_all_delimiters(DYNAMIC_CONTEXT_TRAILING_DELIMITERS),
+    *_all_delimiters(MATERIAL_TRAILING_DELIMITERS),
+)
+
+
 def split_last_user(content: str) -> tuple[str, str, str]:
     """最後の user メッセージの content を ``(prefix_blocks, raw_query, suffix)`` へ分解する。
 
@@ -160,10 +181,17 @@ def split_last_user(content: str) -> tuple[str, str, str]:
     idx = content.find(TOOL_RESULT_HEADER)
     if idx >= 0:
         head, suffix = content[:idx], content[idx:]
-    for delim in _all_delimiters(DYNAMIC_CONTEXT_TRAILING_DELIMITERS):
-        pos = head.find(delim)
-        if pos >= 0:
-            return "", head[:pos], head[pos:] + suffix
+    # 後置の区切り (照応 / 取得した資料、両 locale) のうち最も手前のもの。
+    trailing = [
+        pos for pos in (head.find(d) for d in _TRAILING_DELIMITER_SET) if pos >= 0
+    ]
+    if trailing:
+        pos = min(trailing)
+        # 前置ブロックと後置ブロックが両方あるターン (前置の参考枠 + 後置の
+        # 取得した資料、deliberative ``_append_recent_observations``) も、前置を
+        # 生クエリに数えない — 数えると送信時ガードが前置を削れない。
+        prefix, raw, mid = split_last_user(head[:pos])
+        return prefix, raw, mid + head[pos:] + suffix
     for delim in _all_delimiters(DYNAMIC_CONTEXT_DELIMITERS):
         pos = head.rfind(delim)
         if pos >= 0:

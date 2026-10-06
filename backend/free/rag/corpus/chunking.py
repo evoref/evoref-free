@@ -31,7 +31,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from backend.free.rag.chunker import SemanticChunker
+from backend.free.rag.chunker import ChunkPiece, SemanticChunker
 from backend.free.rag.evidence.types import (
     Evidence,
     compute_claim_key,
@@ -124,6 +124,23 @@ def _heading_of(text: str, headings: list[str], carried: str) -> str:
     return found
 
 
+def _table_attrs(piece: ChunkPiece) -> dict[str, Any]:
+    """表のチャンクの印: 文書内の表の番号・データ行の範囲・前置きの文字数・ヘッダ行。
+
+    前置きの文字数とヘッダ行は近似重複の比較 (``chunk_content_gate``) が読む (f_01 §3.1.5)。
+    """
+    if piece.table_index is None:
+        return {}
+    attrs: dict[str, Any] = {
+        "table_index": piece.table_index,
+        "table_prefix_chars": piece.table_prefix_chars,
+        "table_header": piece.table_header,
+    }
+    if piece.table_rows is not None:
+        attrs["table_rows"] = list(piece.table_rows)
+    return attrs
+
+
 def _make_chunker(rag_config: Any) -> SemanticChunker:
     """``rag`` 設定 (dict / オブジェクト) から分割器を作る。"""
 
@@ -167,21 +184,22 @@ def list_documents(docs_dir: Path | str) -> list[tuple[str, Path]]:
 
 def extract_chunks(
     doc_path: Path, chunker: SemanticChunker,
-) -> tuple[list[str], str]:
-    """1 ファイルから ``(チャンク本文, 原文)`` を作る。
+) -> tuple[list[ChunkPiece], str]:
+    """1 ファイルから ``(チャンク, 原文)`` を作る。
 
     CSV は行ごとに 1 チャンク (ヘッダー付与)、それ以外は抽出 →
     :class:`SemanticChunker`。読めない / 空のファイルは ``([], "")``。
+    表のチャンクは表の番号と行範囲を持つ (:class:`ChunkPiece`、f_01 §3.1.5)。
 
     原文も返すのは、見出しを **原文の行構造** から拾うため
     (:func:`document_headings` の docstring 参照)。
     """
     if doc_path.suffix.lower() == ".csv":
-        return parse_csv_to_chunks(doc_path), ""
+        return [ChunkPiece(t) for t in parse_csv_to_chunks(doc_path)], ""
     text = extract_text(doc_path)
     if not text.strip():
         return [], ""
-    return chunker.chunk(text), text
+    return chunker.chunk_pieces(text), text
 
 
 def chunk_documents(
@@ -223,7 +241,7 @@ def chunk_documents(
         if on_document is not None:
             on_document(index, total, doc_id)
         try:
-            texts, raw_text = extract_chunks(doc_path, chunker)
+            pieces, raw_text = extract_chunks(doc_path, chunker)
         except (OSError, ValueError, ImportError) as e:
             # 1 ファイルの抽出失敗でパッケージ全体を落とさない (c_05 §0.5.2)。
             logger.warning("skipping document %s: %s", doc_id, e)
@@ -232,8 +250,8 @@ def chunk_documents(
         headings = document_headings(raw_text)
         heading = ""
         occurrences: dict[str, int] = {}
-        for position, text in enumerate(texts):
-            body = text.strip()
+        for position, piece in enumerate(pieces):
+            body = piece.text.strip()
             if not body:
                 continue
             heading = _heading_of(body, headings, heading)
@@ -274,6 +292,7 @@ def chunk_documents(
                         "doc_id": doc_id,
                         "position": position,
                         "heading": heading,
+                        **_table_attrs(piece),
                     },
                 ),
             )

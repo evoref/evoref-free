@@ -53,3 +53,38 @@ def query_anchors(query_text: str) -> tuple[str, ...]:
 def has_anchor(text: str, anchors: tuple[str, ...]) -> bool:
     """``text`` に語彙アンカーのいずれかがそのまま出現するか (純粋関数)。"""
     return bool(anchors) and any(a in text for a in anchors)
+
+
+#: :func:`mentions_anchor` が数える ASCII の語の最短長。2 文字の語 (``it`` / ``km`` /
+#: ``10``) は無関係な本文の語の一部や数値に当たりすぎる。
+MIN_ASCII_ANCHOR_LEN = 3
+
+_ASCII_ANCHOR_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def word_anchors(anchors: tuple[str, ...]) -> tuple[str, ...]:
+    """:func:`mentions_anchor` で照合する語だけを残す (純粋関数)。
+
+    ASCII の語は :data:`MIN_ASCII_ANCHOR_LEN` 文字以上だけ (1〜2 桁の数値も落ちる)。
+    """
+    return tuple(
+        a for a in anchors
+        if not _ASCII_ANCHOR_RE.fullmatch(a) or len(a) >= MIN_ASCII_ANCHOR_LEN
+    )
+
+
+def mentions_anchor(text: str, anchors: tuple[str, ...]) -> bool:
+    """``text`` が語彙アンカーのいずれかを **語として** 含むか (純粋関数)。
+
+    :func:`has_anchor` (素の部分一致) より厳しい照合。ASCII の語は大小を問わず
+    英数字の境界で照合し (``it`` が "with" に当たらない)、短い ASCII の語は
+    数えない (:func:`word_anchors`)。日本語の語は部分一致のまま (語境界が無い)。
+    """
+    for anchor in word_anchors(anchors):
+        if _ASCII_ANCHOR_RE.fullmatch(anchor):
+            pattern = rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])"
+            if re.search(pattern, text or "", re.IGNORECASE):
+                return True
+        elif anchor in (text or ""):
+            return True
+    return False

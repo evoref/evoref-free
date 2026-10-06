@@ -707,13 +707,14 @@ _CONTEXT_SIZE_FALLBACK = 8192
 
 # template family -> reasoning mode の fallback 対応 (プロファイル無宣言時に
 # detect_template_family の結果から推定する)。
-#   toggle = enable_thinking で ON/OFF 可 (Qwen3)
+#   toggle = enable_thinking で ON/OFF 可 (Qwen3 / Gemma 4)
 #   always = 常時 reasoning・OFF 不可 (DeepSeek-R1 / gpt-oss harmony)。enable_thinking は
 #            送らないが reasoning_budget は honor しうる
 #   none   = reasoning 非対応 (Gemma / Llama3 / 素の ChatML)
 # unknown は map に載せず None (= 不明、ゲートしない / 後方互換) とする。
 _TEMPLATE_FAMILY_REASONING_MODE: dict[str, str] = {
     "qwen3_thinking": "toggle",
+    "gemma4": "toggle",
     "deepseek_r1": "always",
     "harmony": "always",
     "gemma": "none",

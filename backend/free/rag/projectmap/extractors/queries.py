@@ -62,6 +62,7 @@ _JAVASCRIPT = LanguageQuery(
 (function_declaration) @function.def
 (method_definition) @method.def
 (import_statement) @import.stmt
+(export_statement source: (string)) @import.stmt
 (call_expression) @call.expr
 """,
 )

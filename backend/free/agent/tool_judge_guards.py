@@ -28,6 +28,7 @@ from backend.free.agent.tool_judge_args import (
 )
 from backend.free.agent.tool_judge_commands import (
     command_lacks_date_arithmetic,
+    reads_clock_without_date_math,
 )
 from backend.free.agent.tool_judge_dialogue import (
     _dialogue_text,
@@ -39,9 +40,8 @@ from backend.free.agent.tool_judge_grounding import (
 )
 from backend.free.agent.tool_judge_history import (
     _has_history_recall_keywords,
-    _only_proximal_recall_keywords,
+    asks_about_day_scoped_conversation,
     asks_about_past_conversation,
-    day_scope_recall,
 )
 from backend.free.agent.tool_judge_signals import (
     _IMMEDIATE_CHILDREN_RE,
@@ -50,13 +50,21 @@ from backend.free.agent.tool_judge_signals import (
 )
 from backend.free.agent.tool_judge_types import ToolJudgement
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
-from backend.free.core.date_math_cue import conversation_has_date_math_cue
+from backend.free.core.date_math_cue import (
+    asks_for_date_answer,
+    conversation_has_date_math_cue,
+)
 from backend.free.core.intent_vocab import (
+    DATETIME_QUERY_RE,
+    RECALL_IN_SESSION_MIN_USER_TURNS,
+    asks_to_restate_prior_report,
     excludes_current_conversation,
     has_long_range_recall_keyword,
     has_past_session_keyword,
     looks_like_numeric_question,
+    only_proximal_recall,
     only_session_ordinal_recall,
+    session_user_turns,
 )
 from backend.free.core.query_anchors import has_anchor, query_anchors
 from backend.log_config import get_logger
@@ -113,6 +121,8 @@ class GuardContext:
     action_blocked: bool = False
     #: 窓内想起のガードが履歴検索を止めた (``ToolJudgement.recall_in_window``)。
     recall_in_window: bool = False
+    #: 直近の ``apply_guards`` で判定を no_tool へ降格させたガードの名前 (空 = 降格なし)。
+    demoted_by: str = ""
     #: 進行中セッションの全ターンが ``conversation`` (窓) に載っているか。
     #: ``WorkingMemory.session_evicted_turns == 0`` を呼出側が写す。不明なら
     #: ``None`` (単体のガードだけを掛ける経路)。
@@ -162,21 +172,50 @@ class JudgeCall(GuardContext):
     """
 
     session_id: str = ""
-    #: 層 5.7 (executable command リコール) の診断値 (sim / min_sim /
-    #: success_avg / 候補数)。``_log_tool_decision`` が decision.jsonl の
+    #: 層 5.6 / 5.7 (URL / executable command リコール) の診断値 (sim / min_sim /
+    #: success_avg / 候補数)。各層の shadow が decision.jsonl の
     #: context に載せる。
     recall_diag: dict[str, Any] = field(default_factory=dict)
+    #: create の層 5.7 shadow の評価 (想起が当たったか・想起したコマンド・診断値)。
+    #: 判定には使わず、``_judge_layers`` の出口で最終判定と突き合わせて記録する。
+    command_recall_shadow: dict[str, Any] | None = None
+    #: 層 3 (学習済み tool_routing) / 層 5.6 (URL リコール) の shadow の評価。
+    #: 層 5.7 と同じく判定には使わず、``_judge_layers`` の出口で記録する。
+    learned_routing_shadow: dict[str, Any] | None = None
+    url_recall_shadow: dict[str, Any] | None = None
+    #: 規則層 (層 1、``_judge_with_rules``) の判定の 3 値。``fire`` = ツールまで
+    #: 決めた / ``skip`` = 知識質問として否定した / ``abstain`` = パターン不一致、
+    #: ツール名を決められなかった、または選んだツールをガードが降格させた (降格は
+    #: 「このツールは使えない」であって「ツールは不要」ではなく、後続層へ落ちる)。
+    #: 空 = 層 1 へ届かなかった。記録だけで、読んで挙動を変える箇所は無い (不変則
+    #: #15 の「近道が埋めてよいのは棄権のときだけ」を decision ログで検証する材料)。
+    rule_verdict: str = ""
+    #: 規則層が選んだツールを降格させたガードの名前 (``rule_verdict="abstain"`` の
+    #: 内訳。空 = 降格していない)。``rule_verdict`` と並べて記録する。
+    rule_demoted_by: str = ""
     #: 分類器ゲート (``_gate_allows``) の判定と kNN 票数。同じく context へ載せ、
     #: ゲートの較正を decision.jsonl だけで事後検証できるようにする。
     gate_diag: dict[str, Any] = field(default_factory=dict)
     #: 規則層が ``calculate`` を選んだが式が取れず降格した (「BMIを計算して」)。
     #: 層 5.95 の式合成が、クエリに数値が無くても会話の数値で式を組む手掛かり。
     calculate_requested: bool = False
+    #: 層 5.95 に「被演算子をすべて会話から取る数量の問い」の入口で入った
+    #: (``_asks_quantity_of_dialogue_values``)。採用の reason を分けるため。
+    implicit_operands: bool = False
+    #: その入口で合成を採らなかった理由 (``implicit_operands_abstained`` /
+    #: ``implicit_operands_not_combined``)。no_tool の reason に載せる (docs/f_03 §3.1)。
+    synthesis_rejection: str = ""
     #: 分類器の ``calculate`` を組み直した理由 (``classifier_expression_invalid`` /
+    #: ``classifier_expression_ungrammatical`` / ``identity_placeholder`` /
     #: ``percent_scale_slip`` / ``recompute_ungrounded`` / ``ordinal_reference`` /
     #: ``classifier_ignores_new_value`` / ``classifier_ignores_query_number``)。decision.jsonl の
     #: reason に載せる (docs/f_03 §3.1)。
     recompose_reason: str = ""
+    #: 計算機の文法に合わない分類器の式 (``classifier_expression_ungrammatical``) の
+    #: ``range(…)`` の引数と ``%`` の右辺の数。組み直しは文法だけを直すので、これらは
+    #: 組み直した式の接地で既知に数える (奇数の和の 101 / 2、docs/f_03 §3.1)。
+    #: 空 = 文法の組み直しではない。
+    recompose_structural_numbers: tuple[str, ...] = ()
     #: 分類器の ``calculate`` が門で落ち、組み直しも回数の置き換えも通らず no_tool に
     #: した (``ToolJudgement.calculation_rejected``、docs/f_03 §3.1)。
     calculation_rejected: bool = False
@@ -184,7 +223,7 @@ class JudgeCall(GuardContext):
     #: 対して呼ばれていた。引数文字列ごとに 1 度だけ引く。
     _file_paths: dict[str, str] = field(default_factory=dict, repr=False)
     #: 会話からのパス解決 (層 0.9 / 0.95 が同じ走査を 2 度していた)。
-    _referenced_paths: dict[str | None, str | None] = field(
+    _referenced_paths: dict[tuple[str | None, bool], str | None] = field(
         default_factory=dict, repr=False,
     )
 
@@ -200,15 +239,18 @@ class JudgeCall(GuardContext):
     def referenced_path(
         self, query_path: str | None,
         resolve: Callable[[str | None, list[dict] | None], str | None],
+        *, for_write: bool = False,
     ) -> str | None:
-        """会話からのパス解決を ``query_path`` ごとに memo する。
+        """会話からのパス解決を ``(query_path, 書込みか)`` ごとに memo する。
 
         ``resolve`` は ``tool_judge_referential._resolve_referenced_path``
-        (循環 import を避けるため呼出側から渡す)。
+        (循環 import を避けるため呼出側から渡す)。読みと書きでは裸の名前の
+        解決規則が違う (``file_ledger.resolve_bare_filename``) ので鍵を分ける。
         """
-        if query_path not in self._referenced_paths:
-            self._referenced_paths[query_path] = resolve(query_path, self.conversation)
-        return self._referenced_paths[query_path]
+        key = (query_path, for_write)
+        if key not in self._referenced_paths:
+            self._referenced_paths[key] = resolve(query_path, self.conversation)
+        return self._referenced_paths[key]
 
     @cached_property
     def has_tool_signal(self) -> bool:
@@ -244,14 +286,16 @@ def _suppress_proximal_recall_cross_session(
     起きている。同責務の抑止は層ごとに書き写さず ``_finalize`` の funnel
     へ集約する (funnel の docstring 参照)。
 
-    ``query`` 未指定 (既定 "") の呼出では ``_only_proximal_recall_keywords``
-    が False を返すため安全に no-op。
+    ``query`` 未指定 (既定 "") の呼出では ``only_proximal_recall``
+    が False を返すため安全に no-op。エピソード検索の範囲
+    (``search_pipeline.episodic_session_scope``) も同じ述語で自セッションに閉じる
+    (不変則 #14(a)、2026-10-05 ライブ監査)。
     """
     if result.tool_name != "search_history" or not result.tool_needed:
         return result
     if not (result.tool_args or {}).get("exclude_session_id"):
         return result
-    if not _only_proximal_recall_keywords(ctx.query):
+    if not only_proximal_recall(ctx.query):
         return result
     logger.debug(
         "Suppressing search_history: proximal recall word refers to the "
@@ -262,11 +306,6 @@ def _suppress_proximal_recall_cross_session(
     # 押し出された窓で言うと、窓に無い発言を捏造させる (2026-09-26 レビュー)。
     ctx.recall_in_window = ctx.window_complete is True
     return ToolJudgement(tool_needed=False, source=result.source)
-
-
-#: 「最初に言った」を進行中の会話の位置とみなすのに要る先行ユーザーターン数。
-#: 1 ターン目 (先行ターン無し) では過去セッションを指しうるので従来どおり撃つ。
-_ORDINAL_RECALL_MIN_PRIOR_USER_TURNS = 2
 
 
 def _suppress_ordinal_recall_within_session(
@@ -294,16 +333,15 @@ def _suppress_ordinal_recall_within_session(
         return result
     if excludes_current_conversation(ctx.query):
         return result
-    prior_user_turns = sum(
-        1 for m in (ctx.conversation or [])
-        if str(m.get("role") or "") == "user"
-    )
-    if prior_user_turns < _ORDINAL_RECALL_MIN_PRIOR_USER_TURNS:
+    # 数え方 (今回の発話を含む) と閾値はエピソード検索の範囲
+    # (``search_pipeline.episodic_session_scope``) と共有する。
+    user_turns = session_user_turns(ctx.conversation)
+    if user_turns < RECALL_IN_SESSION_MIN_USER_TURNS:
         return result
     logger.debug(
         "Suppressing search_history: ordinal recall refers to the ongoing "
-        "session (%d prior user turns), which is excluded from the search: %s",
-        prior_user_turns, ctx.query[:50],
+        "session (%d user turns), which is excluded from the search: %s",
+        user_turns, ctx.query[:50],
     )
     ctx.recall_in_window = ctx.window_complete is True
     return ToolJudgement(tool_needed=False, source=result.source)
@@ -331,7 +369,7 @@ def _suppress_self_session_recall_in_window(
         return result
     if not (result.tool_args or {}).get("session_id"):
         return result
-    if has_past_session_keyword(ctx.query) or day_scope_recall(ctx.query) is not None:
+    if has_past_session_keyword(ctx.query) or asks_about_day_scoped_conversation(ctx.query):
         return result
     # 窓が **セッションの全ターン** を含むなら、語に依らず同セッション限定の
     # 検索は何も足せない (索引にあるのは窓にある本文だけ)。語の照合だけだと
@@ -429,7 +467,7 @@ def _suppress_unjustified_cross_session_search(
         return result
     if asks_about_past_conversation(ctx.query):
         return result
-    if day_scope_recall(ctx.query) is not None:
+    if asks_about_day_scoped_conversation(ctx.query):
         # 「今日 / 昨日話したこと」はその日の他セッションに答えがある。
         return result
     if excludes_current_conversation(ctx.query):
@@ -779,6 +817,40 @@ def _suppress_commandless_run_command(
         source=result.source,
     )
 
+def _suppress_clock_only_command(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """日付演算を含まない **現在日時だけを読む** コマンドを no_tool へ格下げ.
+
+    現在日時を返すだけのコマンド (旧 now-only) は廃止した (2026-10-03、不変則
+    #15)。現在日時は注記 (``core.inference._current_date_note``) が常に渡すので
+    ツールは要らない。実ログでは now-only 20 件中 15 件 (75%) が不要な問い
+    (「メモの公開 URL は何日で使えなくなる?」「歯医者の予約は何時から」) に
+    撃たれ、結果が「唯一の事実根拠」枠に入って「特定できません」を後押しした。
+
+    規則表のビルダは演算を組めたときしか返さないが、学習済みの想起 (5.7)・
+    分類器 (5.9)・学習済みパターンは過去の now-only を出しうるので、層ごとに
+    直さず全 exit が通るここで 1 度だけ落とす。ユーザーがコマンドを **明示** した
+    依頼 (バッククォートで書いて「実行して」) は対象外。
+    """
+    if not result.tool_needed or result.tool_name not in _COMMAND_TOOL_NAMES:
+        return result
+    command = str((result.tool_args or {}).get("command") or "")
+    if not reads_clock_without_date_math(command):
+        return result
+    if command.strip() and command.strip() in (ctx.query or ""):
+        return result
+    logger.info(
+        "Suppressing a clock-only command %r (no date arithmetic); the current "
+        "date and time reach the model through the date note", command[:80],
+    )
+    return ToolJudgement(
+        tool_needed=False,
+        tool_name="",
+        tool_args={},
+        source=result.source,
+    )
+
 def _suppress_hidden_tool_from_aux(
     result: ToolJudgement, ctx: GuardContext,
 ) -> ToolJudgement:
@@ -917,7 +989,7 @@ def _flag_suspicious_calculate(
 def _flag_ungrounded_date_math(
     result: ToolJudgement, ctx: GuardContext,
 ) -> ToolJudgement:
-    """日付演算を求められたのに現在日時しか測らないコマンドへ、印を **立てる**。
+    """日付演算を求められたのに演算を検証できないターンへ、印を **立てる**。
 
     PR#407 の方針 (「暗算へ格下げせず、接地していないことを開示させる」) の
     日付版。``calculate`` の式には ``unexplained_numbers`` /
@@ -932,8 +1004,36 @@ def _flag_ungrounded_date_math(
     で掛けると、その後に走る ``date_intent`` 層 (コマンドを日付演算へ差し替える)
     の結果を先取りして誤った印が残る。``judge()`` が差し替えの **後** に 1 度だけ
     掛ける。
+
+    **ツールを撃たないターンにも立てる** (2026-10-03)。現在日時を返すだけの
+    コマンドを廃止したので、日付演算を組めなかったターンはツール無しで
+    (現在日時の注記だけを根拠に) 答える。印が無いと暗算の日数・目標日が
+    検証済みの口調で出るので、回答側 (deliberative) が開示の注記を足し、
+    reactive 軽量パスのゲートは deliberative へ上げる (``calculation_rejected`` と
+    同じ扱い)。既に述べた値の再掲 (``asks_to_restate_prior_report``) は除く。
     """
-    if not result.tool_needed or result.tool_name not in _COMMAND_TOOL_NAMES:
+    if not result.tool_needed:
+        if not conversation_has_date_math_cue(ctx.query, ctx.conversation):
+            return result
+        # 手掛かり語だけでは立てない (「3 日間の旅行プランを考えて」「祝日の由来」は
+        # 日付演算の答えを求めていない)。答えが日付・曜日・日数になる問いに絞る。
+        # 計算機の文法に合わない calculate を撃たずに落とした回 (``calculation_rejected``、
+        # 2026-10-05 ライブ監査: 営業日の問いに 241 字の式) は、計算を求めた問いと
+        # 分かっているので絞らない。
+        if not (
+            result.calculation_rejected
+            or DATETIME_QUERY_RE.search(ctx.query or "")
+            or asks_for_date_answer(ctx.query or "")
+        ):
+            return result
+        if asks_to_restate_prior_report(ctx.query or ""):
+            return result
+        logger.info(
+            "Date arithmetic has no tool for %r; the answer must disclose it",
+            (ctx.query or "")[:80],
+        )
+        return replace(result, unexplained_date_math=True)
+    if result.tool_name not in _COMMAND_TOOL_NAMES:
         return result
     command = str((result.tool_args or {}).get("command") or "")
     if not command:
@@ -1037,6 +1137,8 @@ class GuardSpec:
 GUARD_PIPELINE: tuple[GuardSpec, ...] = (
     GuardSpec("unfetchable_fetch_url", _suppress_unfetchable_fetch_url),
     GuardSpec("commandless_run_command", _suppress_commandless_run_command),
+    # 現在日時だけを読むコマンドは層を問わず落とす (旧 now-only の廃止、不変則 #15)。
+    GuardSpec("clock_only_command", _suppress_clock_only_command),
     GuardSpec("expressionless_calculate", _suppress_expressionless_calculate),
     # 深さ絞り / 行範囲絞りは抑止ではなく、依頼文から決まる引数の確定なので層を
     # 問わず安全 (対象ツール名が違えば no-op)。aux 限定にしていたため rule 層の
@@ -1085,6 +1187,7 @@ def apply_guards(result: ToolJudgement, ctx: GuardContext) -> ToolJudgement:
     いないと、監査で「なぜツールが撃たれなかったか」を追うのに backend.log の
     DEBUG 行を探すしかなかった (develop=debug 以上でしか出ない)。
     """
+    ctx.demoted_by = ""
     for spec in GUARD_PIPELINE:
         if not spec.applies(ctx):
             continue
@@ -1095,6 +1198,7 @@ def apply_guards(result: ToolJudgement, ctx: GuardContext) -> ToolJudgement:
             logger.debug(
                 "Judge guard %s downgraded the judgement to no_tool", spec.name,
             )
+            ctx.demoted_by = spec.name
             _log_guard_downgrade(ctx, spec.name, before)
             break
     return result

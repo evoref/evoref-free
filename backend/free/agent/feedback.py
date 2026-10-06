@@ -44,11 +44,25 @@ from backend.free.core.correction_verdict import (
 from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
+    find_sign_contradiction,
+    iter_ja_numbers,
 )
-from backend.free.core.response_dates import ignores_date_result
+from backend.free.core.relative_date import (
+    has_non_today_offset_anchor,
+    resolves_today_anchored_span,
+)
+from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
+from backend.free.core.response_dates import (
+    extract_tool_anchor,
+    extract_tool_now_date,
+    extract_tool_target_date,
+    ignores_date_result,
+)
 from backend.free.core.verifier_events import (
     current_grounding,
+    current_tool_decision,
     current_tool_uses,
+    current_unread_session_files,
     record_rag_signals,
     record_turn_outcome,
     record_verifier_hit,
@@ -65,6 +79,7 @@ from backend.free.core.text_quality import (
     ignores_calculate_result,
     misrounded_result_values,
     is_cut_off_answer,
+    ungrounded_answer_names,
     retracts_own_conclusion,
     value_was_adopted,
     VALUE_REJECTION_RE,
@@ -77,6 +92,10 @@ from backend.free.core.text_similarity import (
     content_bigram_cosine,
 )
 from backend.free.learning.level0_instant import (
+    RAG_ABSTAIN_NOT_RETRIEVED,
+    RAG_ABSTAIN_NOT_SHOWN,
+    RAG_ABSTAIN_SHOWN,
+    RAG_ADOPTED_CORPUS_KEY,
     RESPONSE_FULL_CAP,
     RESPONSE_SUMMARY_CAP,
     ExperienceBuffer,
@@ -94,6 +113,14 @@ if TYPE_CHECKING:
     from backend.free.agent.learned_patterns import LearnedPatternStore
 
 logger = get_logger("agent.feedback")
+
+#: 書込みゲートの断りだけで終わったターンの件数 (プロセス内、:func:`guard_denied_turns`)。
+_GUARD_DENIED_TURNS = [0]
+
+
+def guard_denied_turns() -> int:
+    """書込みゲートの断りだけで終わったターンの件数 (このプロセスで数えた分)。"""
+    return _GUARD_DENIED_TURNS[0]
 
 # ユーザー訂正パターン（ハードコード: 高確度）
 # learned correction 機構 (旧・層2) は 2026-07-21 に廃止した。学習される語が
@@ -952,6 +979,7 @@ class _SessionTurnState:
 _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("arithmetic contradiction", "content.arithmetic", "content_contradiction"),
     ("conclusion contradiction", "content.conclusion", "content_contradiction"),
+    ("sign contradiction", "content.sign", "content_contradiction"),
     ("broken JA spacing", "content.broken_text", "output_broken"),
     ("Chinese token leaked", "content.broken_text", "output_broken"),
     ("response retracts", "content.self_retraction", "content_contradiction"),
@@ -961,7 +989,32 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("claimed completion while blocked", "content.claimed_change", "content_contradiction"),
     ("user echo", "content.user_echo", ""),
     ("fabricated count", "content.fabricated_count", "content_contradiction"),
+    ("fabricated entity", "content.fabricated_entity", "content_contradiction"),
 )
+
+
+def rag_abstain_kind(
+    gen_config: GenerationConfigRef | None,
+    abstained_on_shown: bool | None,
+    response: str,
+) -> str | None:
+    """抑止応答の型を決める (決定論。件数と id 集合の関係だけで分ける)。
+
+    - ``shown``: corpus を ``[参考情報]`` に見せたのに差し控えた (``rag_abstained`` が真)
+    - ``not_shown``: 検索は corpus を採用したが、資格判定・重複・予算で 1 件も見せていない
+    - ``not_retrieved``: corpus を 1 件も採用していない (候補 0 / 棒を通らない / ゲート)
+
+    差し控えていない応答と、corpus を見せておらず検索も通っていないターン
+    (``corpus_gated`` が ``None``) は ``None``。
+    """
+    if abstained_on_shown is not None:
+        return RAG_ABSTAIN_SHOWN if abstained_on_shown else None
+    if gen_config is None or gen_config.corpus_gated is None:
+        return None
+    if not abstains_on_reference_material(response):
+        return None
+    adopted = int((gen_config._extra or {}).get(RAG_ADOPTED_CORPUS_KEY) or 0)
+    return RAG_ABSTAIN_NOT_SHOWN if adopted > 0 else RAG_ABSTAIN_NOT_RETRIEVED
 
 
 def _publish_turn_outcome(outcome: str, reason: str | None) -> None:
@@ -978,6 +1031,60 @@ def _publish_turn_outcome(outcome: str, reason: str | None) -> None:
             if kind:
                 record_current_issue(kind, reason)
             return
+
+
+def _target_answers_today_anchored_span(query: str, tool_result_text: str) -> bool:
+    """ツールの ``target`` が問いの今日起点の相対日付のどれかの答えか (純粋関数に近い)。
+
+    「今日から3日後と、10月20日の3日前は？」で今日起点のツールが組んだ ``target``
+    は「今日から3日後」の正しい答えで、起点の食い違いは別の span の話。ツールが
+    今日とした日 (``now:`` 行、無ければ今日) から今日起点の span を解いて照合する。
+    """
+    from backend.free.core.prompt_blocks import local_today
+
+    target = extract_tool_target_date(tool_result_text)
+    if target is None:
+        return False
+    today = extract_tool_now_date(tool_result_text) or local_today()
+    return resolves_today_anchored_span(query, target, today)
+
+
+#: 依頼の内容語 (問われた量の名詞: 「平均給与」「売上」) を取り出す連なり (漢字・カタカナ)。
+_ANSWER_SLOT_RUN_RE = re.compile(rf"[{KANJI}{KANJI_MARKS}{KATAKANA_WORD}]{{2,}}")
+#: 数の直前でこの範囲 (文字) に問われた名詞があれば、その数は答えの位置にある。
+_ANSWER_SLOT_WINDOW = 16
+
+
+def _numbers_not_in(response: str, grounded: str, query: str = "") -> list[str]:
+    """答えの位置にある数のうち、依頼・会話・ツールの結果 (``grounded``) に無い数の表記
+    (出現順、最大 3 件)。
+
+    数えるのは **問われた量の名詞の直後** (:data:`_ANSWER_SLOT_WINDOW` 文字以内) に
+    ある数だけ — 「営業部の平均給与は 520,000 円」の 520,000。見つからないと正しく答えた
+    応答の数 (「HTTP 404 相当」「ポート 8000 のサーバ」「12 個のフォルダを探した」) は
+    答えではないので数えない。パスの中の数字と 1 桁の数も数えない。判断できなければ
+    空 (呼出側はラベル無しのまま)。
+    """
+    from backend.free.agent.tool_judge_args import without_drive_paths
+
+    slots = {run for run in _ANSWER_SLOT_RUN_RE.findall(query or "")}
+    if not slots:
+        return []
+    known = {round(n.value, 6) for n in iter_ja_numbers(grounded or "")}
+    text = without_drive_paths(response or "", " ")
+    out: list[str] = []
+    for number in iter_ja_numbers(text):
+        if number.value < 10 or round(number.value, 6) in known:
+            continue
+        window = text[max(0, number.start - _ANSWER_SLOT_WINDOW):number.start]
+        if not any(slot in window for slot in slots):
+            continue
+        literal = text[number.start:number.end].strip()
+        if literal and literal not in out:
+            out.append(literal)
+        if len(out) >= 3:
+            break
+    return out
 
 
 class FeedbackCollector:
@@ -1190,6 +1297,7 @@ class FeedbackCollector:
         # 先に読む — システムが検出済みの欠けを成否へ反映する (docs/f_04 §2.5)。
         tool_uses = current_tool_uses()
         unexplained_numbers, expression_issues, unexplained_date_math = current_grounding()
+        unread_files, unread_grounding = current_unread_session_files()
         turn_outcome, outcome_reason = self._derive_turn_outcome_with_reason(
             response, step_credits,
             query=query,
@@ -1209,6 +1317,8 @@ class FeedbackCollector:
             unexplained_date_math=unexplained_date_math,
             unchecked_checks=unchecked_checks,
             tool_uses=tool_uses,
+            unread_files=unread_files,
+            unread_grounding=unread_grounding,
         )
         if generation_failed:
             # 本文が届かなかった / error フレームで終わったターン。
@@ -1300,6 +1410,17 @@ class FeedbackCollector:
             truncated=truncated,
             generation_failed=generation_failed,
         )
+        # 実行したツールを決めた層。近道 (recall / learned) の実行を tool_routing の
+        # 正例から外す根拠 (不変則 #15)。宣言フィールドにすると形式 lock が入れ子の
+        # 既定値の変化を版上げ扱いにするので、未知キーの通路 (``_extra``) で運ぶ —
+        # 読み手 (Level 1 は永続形の dict を読む) からは signals の 1 キーに見える。
+        decided_by = current_tool_decision()
+        if decided_by:
+            signals._extra = {**(signals._extra or {}), "decided_by": decided_by}
+        # 抑止応答の型も同じ通路で運ぶ (形式の版を上げない)。
+        abstain_kind = rag_abstain_kind(gen_config, signals.rag_abstained, response)
+        if abstain_kind:
+            signals._extra = {**(signals._extra or {}), "rag_abstain_kind": abstain_kind}
         # RAG の便益を結末 JSONL へ (turn_outcome と同じ通路、2026-09-14)。
         record_rag_signals(
             rag_used=signals.rag_used, rag_abstained=signals.rag_abstained,
@@ -1566,6 +1687,8 @@ class FeedbackCollector:
         unexplained_date_math: bool | None = None,
         unchecked_checks: list[str] | None = None,
         tool_uses: list[dict] | None = None,
+        unread_files: list[str] | None = None,
+        unread_grounding: str = "",
     ) -> tuple[str, str | None]:
         """ターン成否 ("success" | "partial" | "failed" | "unlabeled") と理由を決定論導出する。
 
@@ -1617,6 +1740,14 @@ class FeedbackCollector:
         guard_denied = bool(tool_uses) and all(
             u.get("reason") == "write_denied" for u in tool_uses or ()
         )
+        if guard_denied:
+            # ラベルを付けない代わりに件数を数えて出す — 書込みゲートの誤った断り
+            # (上書きの門、docs/f_03 §4.y) が学習からも監視からも消えないように
+            _GUARD_DENIED_TURNS[0] += 1
+            logger.info(
+                "Turn left unlabeled: every tool use was a write-gate denial "
+                "(%d such turns in this process)", _GUARD_DENIED_TURNS[0],
+            )
         zero_credit = bool(step_credits) and all(
             not (c.get("credit") or 0) for c in step_credits or ()
         )
@@ -1676,9 +1807,27 @@ class FeedbackCollector:
         # 補正 (逆算) を正しく踏んでも、モデルが結果を暗算で差し替える経路は
         # 別に残る (2026-09-08 T19/3: target=2026-11-02 に対し本文は暗算の
         # 10月14日、正しくは向きの修正込みで 10/9)。
+        # ただし問いが起点を会話・具体日付に置いている (「さっきのリリース日の
+        # 1 週間前」) のにツールが今日起点で数えていたら、target の方が誤りで、
+        # 使わなかった回答が正答のことがある (2026-10-05 ライブ監査: target
+        # 9/28 を使わず 10/13 と正答し failed にされた)。calculate の式の疑い
+        # と同じく失敗の証拠にせず、ラベル無しにする。
+        date_unverified: str | None = None
         if ignores_date_result(tool_result_text, text):
-            logger.info("Turn marked failed (date result ignored)")
-            return "failed", "date result ignored: response date does not match target"
+            tool_anchor = extract_tool_anchor(tool_result_text)
+            if (
+                tool_anchor in (None, "today")
+                and has_non_today_offset_anchor(query)
+                and not _target_answers_today_anchored_span(query, tool_result_text)
+            ):
+                date_unverified = (
+                    f"date tool anchored on {tool_anchor or 'unknown'} while the "
+                    "query anchors elsewhere"
+                )
+                logger.info("Date result not counted as ignored (%s)", date_unverified)
+            else:
+                logger.info("Turn marked failed (date result ignored)")
+                return "failed", "date result ignored: response date does not match target"
         # 明示された文字数指定を破っている = 指定は本文にあり長さは数えるだけ
         # なので、これも推定ではなく矛盾。2026-08-22 ライブ監査の
         # 「ちょうど100文字で」→ 86 文字は success として学習に入っていた。
@@ -1703,6 +1852,24 @@ class FeedbackCollector:
         if fabricated is not None:
             logger.info("Turn marked failed (fabricated count: %s)", fabricated)
             return "failed", f"fabricated count: {fabricated}"
+        # 中身を読めたファイルが無いと確定事実で渡したのに、敬称付きの人名で答えた =
+        # 読めていない中身を作った (2026-10-05 ライブ監査 T2「佐藤健太さんです」)。
+        # 答えの位置の人名がプロンプト (assistant 以外と、ツールを使ったターンの答え) にも
+        # ツールの結果にも無いことだけを見る。カタカナだけの名前は読み (サトウ / 佐藤) や
+        # 役割語と区別できないので失敗にせず、ラベル無しにする。
+        unverified_names: str | None = None
+        if unread_files:
+            names, kana_names = ungrounded_answer_names(
+                text, f"{query}\n{stated_context}\n{tool_result_text}\n{unread_grounding}",
+            )
+            if names:
+                logger.info(
+                    "Turn marked failed (fabricated entity while %s unread: %s)",
+                    ", ".join(unread_files), ", ".join(names),
+                )
+                return "failed", f"fabricated entity: {', '.join(names)}"
+            if kana_names:
+                unverified_names = f"unverified names: {', '.join(kana_names)}"
         # 長文の成果物が検証で落ちた。結末 JSONL の success と同じ判定
         # (``judge_long_form_success``) を呼出側から受け取る — 同じターンの成否を
         # 2 か所で決めない (2026-09-27 監査 C07#2: 結末は失敗、経験は成功だった)。
@@ -1723,6 +1890,32 @@ class FeedbackCollector:
         )
         if unlabeled is None and zero_credit and guard_denied:
             unlabeled = "write denied by guard"
+        # このターンのツールが 1 つも役に立つ結果を返さなかった (読みが見つからない等)。
+        # 答えはツールの結果に支えられておらず、成功の手本にしない — 2026-10-05
+        # ライブ監査 T1: read_file が File not found のまま「分かりません」で success
+        # だった。正しく「見つからない」と伝えた応答 (答えでない応答) はラベル無し。
+        # 依頼にも会話にも無い数を述べた応答は、取れなかった中身を作った応答なので
+        # 失敗 (T2 の給与の作話と同じ形。数は字句の鍵、不変則 #14)。
+        if (
+            unlabeled is None and tool_uses and not guard_denied
+            and not any(u.get("success") for u in tool_uses)
+        ):
+            invented = _numbers_not_in(
+                text, f"{query}\n{stated_context}\n{tool_result_text}", query,
+            )
+            if invented:
+                logger.info(
+                    "Turn marked failed (numbers stated after every tool call failed: %s)",
+                    ", ".join(invented),
+                )
+                return "failed", (
+                    "content stated after every tool call failed: " + ", ".join(invented)
+                )
+            unlabeled = "every tool call failed"
+        if date_unverified is not None:
+            unlabeled = f"{unlabeled}; {date_unverified}" if unlabeled else date_unverified
+        if unverified_names is not None:
+            unlabeled = f"{unlabeled}; {unverified_names}" if unlabeled else unverified_names
         if unlabeled is not None:
             if ignored_unverified is not None:
                 unlabeled = f"{unlabeled}; tool result ignored: {ignored_unverified}"
@@ -1774,6 +1967,11 @@ class FeedbackCollector:
         conclusion = find_conclusion_contradiction(text)
         if conclusion is not None:
             return f"conclusion contradiction: {conclusion}"
+        # 大きさは合うのに冒頭が本文と **逆の符号** (「4000円残ります」と本文の
+        # 「差し引き：-4000円」)。上の判定は大きさしか見ない (2026-10-05 ライブ監査)。
+        sign = find_sign_contradiction(text)
+        if sign is not None:
+            return f"sign contradiction: {sign}"
         if has_broken_ja_spacing(text):
             return "broken JA spacing"
         if has_chinese_token_leak(text):

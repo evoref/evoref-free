@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import datetime
+import functools
 import hashlib
 import json
 import math
@@ -19,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from backend.config import get_project_root
+from backend.trace_context import run_in_executor_with_context
 from backend.free.agent.router import (
     asks_directory_listing,
     indicates_write_destination,
@@ -28,13 +32,16 @@ from backend.free.core.intent_vocab import (
     refers_to_ongoing_session,
     refers_to_previous_output,
     asks_to_restate_prior_report,
+    restate_changes_condition,
     ANAPHORIC_OPERAND_RE,
     NUMBER_LITERAL_RE,
+    asks_quantity_without_operands,
     is_plain_statement,
     is_practice_advice_query,
     looks_like_numeric_question,
     mentions_filesystem,
     only_session_ordinal_recall,
+    SEARCH_VERB_RE,
 )
 from backend.free.core.date_math_cue import (
     conversation_has_date_math_cue,
@@ -45,8 +52,8 @@ from backend.free.core.correction_target import (
     contrast_pairs,
     wrong_side_spans,
 )
-from backend.free.core.response_arithmetic import iter_ja_numbers
-from backend.free.agent.tools.calc import calculate, unknown_names, validate_expression
+from backend.free.core.response_arithmetic import LIST_ITEM_RE, iter_ja_numbers
+from backend.free.agent.tools.calc import calculate, expression_gap, validate_expression
 from backend.free.core.locale_patterns import select_locale_variant
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.safety_patterns import (
@@ -62,6 +69,8 @@ from backend.free.agent.tool_judge_annuity import (
 )
 from backend.free.agent.grammar_tool_classifier import (
     CLASSIFY_MAX_TOKENS,
+    EXPRESSION_ABSTAIN,
+    EXPRESSION_ABSTAIN_EN,
     EXPRESSION_RETRY,
     EXPRESSION_RETRY_EN,
     EXPRESSION_SCHEMA,
@@ -90,7 +99,7 @@ from backend.utils import estimate_tokens, utc_now_dt, utc_to_epoch
 # 取り込む。既存の呼出元・テストが ``tool_call_judge.<名前>`` を直接参照しており、
 # ``mock.patch("...tool_call_judge.Path.exists")`` のようなパッチ対象にもなって
 # いるため、名前の見え方は分割前と一致させる。
-from backend.free.core.response_dates import mentions_literal_date
+from backend.free.core.response_dates import extract_tool_anchor, mentions_literal_date
 from backend.free.agent.tool_judge_types import (
     ToolJudgement,
 )
@@ -165,7 +174,6 @@ from backend.free.agent.tool_judge_grounding import (
 )
 from backend.free.agent.tool_judge_commands import (
     _DATE_ARITHMETIC_RE,
-    _DATETIME_NOW_COMMAND,
     _DATETIME_QUERY_RE,
     _DRIVE_LETTER_RE,
     _EXECUTABLE_QUERY_COMMANDS,
@@ -180,6 +188,7 @@ from backend.free.agent.tool_judge_commands import (
     _build_spec_command,
     _command_is_readonly_inspection,
     _infer_executable_command,
+    _is_past_fact_recall,
     _readonly_command_rejected,
     DateIntentParams,
     command_lacks_date_arithmetic,
@@ -194,6 +203,9 @@ from backend.free.agent.tool_judge_commands import (
     command_lacks_business_day_arithmetic,
     offset_date_in_query,
     query_anchors_on_prior_result,
+    referent_anchor_candidates,
+    referent_anchor_nouns,
+    referent_defined_in_query,
     query_has_business_day_cue,
     query_has_anaphoric_start,
     follow_up_holidays_from_query,
@@ -233,6 +245,7 @@ from backend.free.agent.tool_judge_args import (
     extract_write_target_path,
     quoted_spans,
     resolve_listing_directory,
+    without_drive_paths,
 )
 from backend.free.agent.tool_judge_history import (
     _ANAPHORIC_REFERENCE_RE,
@@ -248,12 +261,14 @@ from backend.free.agent.tool_judge_history import (
     _ORDERED_HISTORY_QUERY_RE,
     _RETROSPECTIVE_QUESTION_RE,
     _has_history_recall_keywords,
-    _only_proximal_recall_keywords,
     _reduce_ordered_history_query,
     _strip_stopword_affixes,
+    asks_about_day_scoped_conversation,
     asks_about_past_conversation,
     asks_about_prior_conversation_entity,
+    dated_conversation_dates,
     day_scope_recall,
+    history_dates_window,
     history_day_window,
 )
 from backend.free.agent import tool_judge_guards as guards
@@ -274,9 +289,12 @@ from backend.free.agent.tool_judge_referential import (
     _PATH_SEPARATOR_RE,
     _REFERENTIAL_TARGET_RE,
     _REWRITE_VERB_RE,
+    _bare_filename_read_judgement,
     _referential_read_judgement,
     _referential_rewrite_judgement,
     _resolve_referenced_path,
+    write_target_is_topic_only,
+    write_target_path,
 )
 
 from backend.free.memory.views import (
@@ -397,6 +415,66 @@ def _executable_tool_for_mode(tools_registry: ToolsRegistry, mode: str) -> str:
     return ""
 
 
+#: 近道の shadow で、旧層の出口 (``_finalize``) なら引数欠落で降格していたツールの鍵引数。
+#: 一致判定 (``agrees``) もツール名とこの引数の両方で見る。
+_SHORTCUT_KEY_ARGS: dict[str, str] = {
+    "fetch_url": "url",
+    "run_command": "command",
+    "run_command_readonly": "command",
+}
+
+
+def _shortcut_effective_tool(
+    tool_name: str,
+    tool_args: dict[str, Any] | None,
+    tools_registry: ToolsRegistry,
+    mode: str,
+) -> str:
+    """近道の判定を旧層の出口に通したら撃てたツール名 (撃てなければ ``""``、純粋関数)。
+
+    旧層 3 / 5.6 は ``_finalize`` (ガード列) を通してから判定を確定させていた。
+    ガードは ``call`` に印を立てるので shadow では掛けず、確定を左右した条件だけを
+    写す — 鍵引数の欠落 (``unfetchable_fetch_url`` / ``commandless_run_command``) と
+    mode の可用性 (``tool_availability``、同じ能力の兄弟ツールへの載せ替えを含む)。
+    """
+    if not tool_name:
+        return ""
+    args = tool_args or {}
+    key = _SHORTCUT_KEY_ARGS.get(tool_name)
+    if key and not args.get(key):
+        return ""
+    if tools_registry.is_available(tool_name, mode):
+        return tool_name
+    for sibling in guards._MODE_CAPABILITY_SIBLINGS.get(tool_name, ()):
+        if (
+            tools_registry.is_available(sibling, mode)
+            and tools_registry.required_params(sibling) <= set(args)
+        ):
+            return sibling
+    return ""
+
+
+def _set_rule_verdict(call: JudgeCall | None, verdict: str) -> None:
+    """規則層の判定の 3 値 (``JudgeCall.rule_verdict``) を置く (記録用)。"""
+    if call is not None:
+        call.rule_verdict = verdict
+
+
+def _defers_to_date_intent(query: str, conversation: list[dict] | None) -> bool:
+    """日付演算を求める日時の問いで、層 5.9 を撃たず層 5.97 に任せるか (純粋関数)。
+
+    日時の問い (``DATETIME_QUERY_RE``) で、日付演算の手掛かりを持ち (直前の
+    ユーザー発話から継ぐ追い質問を含む)、過去に述べた日付の想起ではないもの。
+    現在日時だけを返すコマンドを廃止する前は、規則表がこの形で now-only を
+    確定させて分類器を撃っていなかった (層 5.97 の入口 (a))。その往復数を保つ。
+    """
+    return bool(
+        _DATETIME_QUERY_RE.search(query or "")
+        and conversation_has_date_math_cue(query, conversation)
+        and not _is_past_fact_recall(query)
+    )
+
+
 def _first_quoted_span(query: str) -> str | None:
     """クエリ中で最初に括られた 2 文字以上の文字列 (純粋関数)。無ければ None。
 
@@ -423,6 +501,81 @@ def _replaces_dialogue_value(query: str, dialogue: str) -> bool:
         for span in wrong_side_spans(query)
         for n in NUMBER_LITERAL_RE.findall(span)
     )
+
+
+def _without_list_ordinals(text: str) -> str:
+    """箇条書きの行頭の番号・記号 (``1.`` / ``2)`` / ``-``) を落とす (純粋関数)。"""
+    lines = []
+    for line in (text or "").splitlines():
+        m = LIST_ITEM_RE.match(line)
+        lines.append(m.group("body") if m else line)
+    return "\n".join(lines)
+
+
+def _dialogue_values(text: str) -> set[str]:
+    """会話の値として数える数 (純粋関数)。
+
+    接地と同じ読み (:func:`_known_numbers`: 万進・百分率由来) で集め、単位系の定数
+    (``_UNIT_SYSTEM_CONSTANTS``) と箇条書きの行頭の番号を除く。桁区切りは先に落とす —
+    残すと ``4,202,723`` の断片 (4 / 202 / 723) が別の値に数えられる。
+    """
+    text = ungroup_thousands(_without_list_ordinals(text))
+    return _known_numbers(text) - _UNIT_SYSTEM_CONSTANTS
+
+
+def _last_assistant_text(conversation: list[dict] | None) -> str:
+    """会話の最後の assistant の発話 (純粋関数、無ければ空)。"""
+    for turn in reversed(conversation or []):
+        if isinstance(turn, dict) and turn.get("role") == "assistant":
+            return str(turn.get("content") or "")
+    return ""
+
+
+def _arithmetic_operands(expression: str) -> list[str]:
+    """二項演算の被演算子になっている数値リテラルの綴り (純粋関数)。
+
+    冪の指数・関数の引数 (``round(x, 2)`` の x と 2) は数えない。構文として読めない
+    式は空。
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return []
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp):
+            continue
+        sides = [node.left] if isinstance(node.op, ast.Pow) else [node.left, node.right]
+        for side in sides:
+            if isinstance(side, ast.UnaryOp) and isinstance(side.op, (ast.USub, ast.UAdd)):
+                side = side.operand
+            if (
+                isinstance(side, ast.Constant)
+                and isinstance(side.value, (int, float))
+                and not isinstance(side.value, bool)
+            ):
+                literal = ast.get_source_segment(expression, side)
+                if literal:
+                    found.append(literal)
+    return found
+
+
+def _combines_dialogue_operands(
+    expression: str, query: str, dialogue: str, last_answer: str,
+) -> bool:
+    """式が会話の値を 2 つ以上組み合わせ、1 つ以上が直前の答えの値か (純粋関数)。
+
+    ``4202723`` / ``4202723*1`` / ``round(4202723, 2)`` / ``x/100*100`` は値の言い直し。
+    数えるのは二項演算の被演算子 (:func:`_arithmetic_operands`) のうち、問いに無く
+    会話の値 (:func:`_dialogue_values`) にあるもの。
+    """
+    in_query = _known_numbers(query)
+    known = _dialogue_values(dialogue)
+    operands = {
+        n for n in _arithmetic_operands(expression)
+        if n in known and n not in in_query
+    }
+    return len(operands) >= 2 and bool(operands & _dialogue_values(last_answer))
 
 
 def _corrected_new_value_forms(query: str) -> set[str]:
@@ -482,35 +635,37 @@ def _beyond_window_reason(
     return "classifier_ignores_new_value"
 
 
-def _invalid_expression_reason(
+def _expression_gap_reason(
     expression: str, query: str, conversation: list[dict] | None,
-) -> str | None:
-    """分類器の式を ``classifier_expression_invalid`` で組み直す理由 (純粋関数)。
+) -> tuple[str, str] | None:
+    """分類器の式を組み直す理由を ``(種類, 理由)`` で返す (純粋関数、docs/f_03 §3.1)。
 
-    返すのは ``validate_expression`` の理由の文字列。対象は **会話の語を変数名にした
-    式** (``sum(employees_overtime_hours) * 0.9``) と構文エラーだけで、次は対象外
-    (``None``、従来どおり) にする (docs/f_03 §3.1、独立レビュー 2026-10-03):
+    種類は ``tools/calc.expression_gap`` と同じ 3 つ:
+
+    - ``"operand"`` — 会話の語を変数名にした式 (``sum(employees_overtime_hours) * 0.9``)。
+      組み直しが通らなければ被演算子を利用者に確かめる (``classifier_expression_invalid``)。
+    - ``"grammar"`` — 構文エラー・式でない文・許可外のノード (生成式)。理由 (ヒント付き)
+      を添えて 1 回だけ組み直させ、通らなければ「概算と式を示す」注記へ落とす
+      (``classifier_expression_ungrammatical``、2026-10-05 ライブ監査: 構文エラーの式で
+      会話の全ての数を尋ね返し、生成式の失敗で答えを諦めた)。
+    - ``"function"`` — 計算機に無い関数 (``fibonacci(10)``)。同じく 1 回だけ組み直させ、
+      通らなければ分類器の式を残す (従来どおり。知識で答えてよく、概算の注記は付けない)。
+
+    次は対象外 (``None``):
 
     - 占位語・空の式 — ``_suppress_expressionless_calculate`` の格下げに任せる
     - 日付演算の手掛かりがある問い — 層 5.97 が calculate に流れた日付演算を演算
-      コマンドへ差し替える (``date(2026,10,3)+timedelta(days=100)``)
-    - 計算機に無い関数を呼ぶ式 (``fibonacci(10)``) — 数は揃っていて、足りないのは
-      計算機の機能。「数を尋ねる」注記は誤りで、従来は知識で答えていた
-    - 許可外のノード・キーワード引数・コスト上限 — 会話の数の欠落ではない
+      コマンドへ差し替える。差し替えられずに文法の欠けが残った式は、5.97 の後で
+      :meth:`ToolCallJudge._reject_ungrammatical_date_calculate` が落とす
+    - コスト上限だけで落ちる式 — 数の欠落でも文法の誤りでもない
     """
     stripped = (expression or "").strip()
     if not stripped or stripped.lower() in guards._EXPRESSION_PLACEHOLDERS:
         return None
-    invalid = validate_expression(stripped)
-    if invalid is None or conversation_has_date_math_cue(query, conversation):
+    gap = expression_gap(stripped)
+    if gap is None or conversation_has_date_math_cue(query, conversation):
         return None
-    try:
-        variables, functions = unknown_names(stripped)
-    except SyntaxError:
-        return invalid
-    if functions or not variables:
-        return None
-    return invalid
+    return gap
 
 
 #: 「式を組めなかった」回に回答側へ渡す数の上限 (注記を長くしない)。
@@ -520,14 +675,90 @@ _STATED_NUMBERS_LIMIT = 20
 def _stated_numbers(user_text: str) -> tuple[str, ...]:
     """利用者が会話で述べた数を出現順・重複なしで返す (純粋関数、docs/f_03 §3.1)。
 
-    分類器の式も組み直しも calculate の式にならなかった回に、回答側が確認を
-    求めるときに挙げる数。桁区切りは落とす (``1,280`` → ``1280``)。
+    桁区切りは落とす (``1,280`` → ``1280``)。
     """
     seen: list[str] = []
     for n in NUMBER_LITERAL_RE.findall(ungroup_thousands(user_text or "")):
         if n not in seen:
             seen.append(n)
     return tuple(seen[:_STATED_NUMBERS_LIMIT])
+
+
+def _offered_operands(
+    conversation: list[dict] | None, *, include_assistant: bool = False,
+) -> tuple[str, ...]:
+    """被演算子が欠けた回に、確認を求めるときに挙げる数 (純粋関数、docs/f_03 §3.1)。
+
+    式合成の窓 (``_SYNTHESIS_CONTEXT_TURNS``) の利用者の発言の数。被演算子の欠けでは
+    分類器の式は数の代わりに変数名を書くので、式からは被演算子を取れない (独立レビュー
+    2026-10-05: 式の数に絞ると D08 の 12/25/8/31/19 が落ちた)。数を尋ねるのは被演算子の
+    欠けだけで、文法の欠けは尋ねない (「37の階乗の桁数」に前の話題の数の確認を求めたのは
+    文法の欠けを被演算子の欠けとして扱ったため)。``include_assistant`` はアシスタントが
+    述べた数も含める (恒等の占位 ``333 - 0`` の相手 634 はアシスタントの発言にあった)。
+    """
+    roles = ("user", "assistant") if include_assistant else ("user",)
+    window = [
+        m for m in (conversation or [])[-_SYNTHESIS_CONTEXT_TURNS:]
+        if isinstance(m, dict) and m.get("role") in roles
+    ]
+    return _stated_numbers(_dialogue_text(window))
+
+
+#: 文法の組み直しで、分類器の式から接地の既知に数える数の在りか。``range(…)`` の引数と
+#: ``%`` の右辺だけ (奇数の和の 101 と 2)。分類器の式のほかの数は既知に数えない。
+_RANGE_ARGS_RE = re.compile(r"\brange\s*\(([^()]*)\)")
+_MODULO_OPERAND_RE = re.compile(r"%\s*(\d+(?:\.\d+)?)")
+
+
+def _structural_numbers(expression: str) -> tuple[str, ...]:
+    """分類器の式の ``range(…)`` の引数と ``%`` の右辺の数 (純粋関数、docs/f_03 §3.1)。"""
+    found: list[str] = []
+    for args in _RANGE_ARGS_RE.findall(expression or ""):
+        found.extend(NUMBER_LITERAL_RE.findall(args))
+    found.extend(_MODULO_OPERAND_RE.findall(expression or ""))
+    return tuple(dict.fromkeys(found))
+
+
+def _identity_placeholders(
+    expression: str, unexplained: tuple[str, ...],
+) -> tuple[str, ...]:
+    """会話に無い数のうち、恒等の占位 (``x - 0`` / ``x + 0`` / ``x * 1`` / ``x / 1`` /
+    ``0 - x``) になっているものを返す (純粋関数、docs/f_03 §3.1)。
+
+    分類器は窓の外にある被演算子を 0 や 1 で埋める (2026-10-05 ライブ監査:
+    「2つの差は何メートル？」に ``333 - 0``。634 は判定窓の外のアシスタントの発言)。
+    これは仮定ではなく被演算子の欠けで、「0 を仮定した試算」と述べさせてはいけない。
+    """
+    if not unexplained:
+        return ()
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return ()
+    found: list[str] = []
+
+    def _is(node: ast.AST, value: int) -> bool:
+        return (
+            isinstance(node, ast.Constant) and not isinstance(node.value, bool)
+            and isinstance(node.value, (int, float)) and node.value == value
+            and ast.get_source_segment(expression, node) in unexplained
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp):
+            continue
+        hits: list[ast.AST] = []
+        if isinstance(node.op, (ast.Add, ast.Sub)):
+            hits = [n for n in (node.left, node.right) if _is(n, 0)]
+        elif isinstance(node.op, ast.Mult):
+            hits = [n for n in (node.left, node.right) if _is(n, 1)]
+        elif isinstance(node.op, (ast.Div, ast.FloorDiv)):
+            hits = [node.right] if _is(node.right, 1) else []
+        for hit in hits:
+            text = str(ast.get_source_segment(expression, hit))
+            if text not in found:
+                found.append(text)
+    return tuple(found)
 
 
 def _is_recompute_request(query: str, dialogue: str) -> bool:
@@ -752,6 +983,15 @@ class ToolCallJudge:
             self._tool_gate = ToolGateKNN(
                 embedder, k=int(agent_cfg.get("tool_gate_knn_k", DEFAULT_K)),
             )
+        # 分類器を省けるかの shadow (判定は変えない、docs/f_03 §3.1.3)。decision ログが
+        # 書かれる起動でだけ warmup・評価する。
+        self._classifier_skip_shadow: "ToolClassifierSkipShadow | None" = None
+        if self._tool_gate is not None:
+            from backend.free.agent.tool_classifier_skip import ToolClassifierSkipShadow
+
+            self._classifier_skip_shadow = ToolClassifierSkipShadow(
+                embedder, debug_logger=debug_logger,
+            )
         # URL リコールで許容する profile_id (Pro の team 解決を含む)。初回の
         # リコールで 1 度だけ解決する (以前は毎ターン Pro resolver を組み直していた)。
         self._url_recall_profiles: set[str] | None = None
@@ -772,6 +1012,8 @@ class ToolCallJudge:
         self._embedder = embedder
         if self._tool_gate is not None:
             self._tool_gate.reset(embedder)
+        if self._classifier_skip_shadow is not None:
+            self._classifier_skip_shadow.reset(embedder)
 
     def _user_requested_measurement(self, query: str) -> bool:
         """クエリが実測 (環境事実の取得 / コマンド実行) を求めているか。
@@ -862,8 +1104,8 @@ class ToolCallJudge:
         """ツール判定が有効かどうか (``agent.tool_judge_enabled``、既定 True)。
 
         False にすると **ベースモデルへの往復を伴う層** — 層 5.9 の文法制約
-        分類と層 5.95 の式合成 — を撃たなくなる。決定論層と学習済みリコールは
-        本フラグに関係なく常に動く。
+        分類と層 5.95 の式合成 — を撃たなくなる。決定論層は本フラグに関係なく
+        常に動く。
         """
         return self._config.get("agent", {}).get("tool_judge_enabled", True)
 
@@ -942,15 +1184,64 @@ class ToolCallJudge:
         ``judge()`` の await を 1 本に保つためのまとめ役。後処理を ``judge()`` に
         直接書くと「結果へ写す前に await を挟まない」規約に反する。
         """
-        result = await self._judge_inner(call, allow_classifier=allow_classifier)
+        date_intent_allowed = (
+            allow_date_intent if allow_date_intent is not None else allow_classifier
+        )
+        result = await self._judge_inner(
+            call, allow_classifier=allow_classifier,
+            defer_date_math=date_intent_allowed and self.enabled,
+        )
         # 5.97. 日付演算の意図取り。**判定層ではなく後処理** — どの層が
-        # now-only コマンドを確定させたか (ルール / リコール / 分類器) に依らず
-        # 同じ穴が空くため、全 exit の後で 1 度だけ掛ける。
-        if allow_date_intent if allow_date_intent is not None else allow_classifier:
+        # (ルール / リコール / 分類器) 演算を組めずに終わったか、どの層もツールを
+        # 選ばなかったかに依らず同じ穴が空くため、全 exit の後で 1 度だけ掛ける。
+        if date_intent_allowed:
             result = await self._upgrade_date_command_via_intent(result, call)
+        result = self._reject_ungrammatical_date_calculate(result, call)
         # 日付演算が接地できたかの印は **差し替えの後** に立てる (guards の
         # ``_flag_ungrounded_date_math`` を GUARD_PIPELINE に載せない理由)。
-        return guards._flag_ungrounded_date_math(result, call)
+        result = guards._flag_ungrounded_date_math(result, call)
+        self._log_command_recall_shadow(result, call)
+        self._log_shortcut_shadow(
+            "learned_routing_shadow", call.learned_routing_shadow, result, call,
+        )
+        self._log_shortcut_shadow(
+            "url_recall_shadow", call.url_recall_shadow, result, call,
+        )
+        return result
+
+    @staticmethod
+    def _reject_ungrammatical_date_calculate(
+        result: ToolJudgement, call: JudgeCall,
+    ) -> ToolJudgement:
+        """層 5.97 の後も残った、日付演算の問いの文法に合わない calculate を落とす。
+
+        日付演算の手掛かりがある問いでは分類器の式を組み直さない (5.97 が演算
+        コマンドへ差し替える、:func:`_expression_gap_reason`)。差し替えが起きずに
+        計算機の文法に合わない式が残ると、実行して必ず失敗し汎用の失敗注記で答えて
+        いた (2026-10-05 ライブ監査: 営業日の問いに 241 字の式)。実行せずに
+        no_tool + ``calculation_rejected`` にし、後段の
+        ``guards._flag_ungrounded_date_math`` が未検証の日付演算の注記を立てる。
+        被演算子の欠け・受け付ける式・占位語はそのまま返す。
+        """
+        if not (result.tool_needed and result.tool_name == "calculate"):
+            return result
+        expression = str((result.tool_args or {}).get("expression") or "").strip()
+        if not expression or expression.lower() in guards._EXPRESSION_PLACEHOLDERS:
+            return result
+        if not conversation_has_date_math_cue(call.query, call.conversation):
+            return result
+        gap = expression_gap(expression)
+        if gap is None or gap[0] == "operand":
+            return result
+        logger.info(
+            "Classifier calculate(%r) for a date question does not follow the "
+            "calculator's grammar (%s); answering without calculate",
+            expression[:120], gap[1][:160],
+        )
+        call.calculation_rejected = True
+        return ToolJudgement(
+            tool_needed=False, source=result.source, calculation_rejected=True,
+        )
 
     _DATE_INTENT_MEMORY_LIMIT = 64
 
@@ -1046,6 +1337,7 @@ class ToolCallJudge:
                     getattr(client, "background_slot", -1),
                 ),
                 timeout=PURPOSE_TIMEOUT_DEFAULTS.get("date_intent", 20.0),
+                usage_purpose="date_intent",
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("date intent extraction failed: %s", exc)
@@ -1064,14 +1356,29 @@ class ToolCallJudge:
         self._date_intent_extract_cache[cache_key] = (params, payload)
         return params
 
+    @staticmethod
+    def _without_today_anchored_command(
+        result: ToolJudgement, misrouted_to_calculate: bool,
+    ) -> ToolJudgement:
+        """参照名詞の起点を解けず棄権したとき、他の層が組んだ日付コマンドを外す。
+
+        入口 (a) に来た結果は日付演算のコマンドを持つが、起点が参照名詞の問いでは
+        今日起点で組まれている (2026-10-05 ライブ監査: target 9/28、正 10/13)。
+        誤った target を「確かめた事実」として渡さないよう、ツール無しへ倒す。
+        それ以外 (ツール無し / calculate の誤配) はそのまま返す。
+        """
+        if result.tool_needed and not misrouted_to_calculate:
+            return ToolJudgement(tool_needed=False, source=result.source)
+        return result
+
     async def _upgrade_date_command_via_intent(
         self, result: ToolJudgement, call: JudgeCall,
     ) -> ToolJudgement:
-        """now-only コマンドに落ちた日付演算クエリを、**パラメトリックに** 直す。
+        """演算コマンドを組めなかった日付演算クエリを、**パラメトリックに** 直す。
 
         正規表現カスケード (``_build_datetime_command``) は語形ごとの分岐で、
-        新しい言い回しが来るたびに now-only コマンドへ落ちて日付演算がモデルの
-        暗算に戻る (実インシデント 2026-09-08 T19「30 営業日目」5/5 誤答)。
+        新しい言い回しが来るたびに演算を組めず、日付演算がモデルの暗算に戻る
+        (実インシデント 2026-09-08 T19「30 営業日目」5/5 誤答)。
         語形を足し続ける代わりに、**カスケードが落ちたときだけ** 文法制約 JSON
         (``date_intent``) でパラメータを取り、コマンドは
         :func:`date_intent_command_from_payload` が決定論的に組む。
@@ -1081,10 +1388,14 @@ class ToolCallJudge:
         - 往復 1 回 (40 秒上限、``PURPOSE_TIMEOUT_DEFAULTS["date_intent"]``) を
           無関係なターンへ足さないよう、発火条件は
           「日付演算の手掛かりがある」かつ「確定したコマンドが日付演算を
-          していない」に閉じる。
+          していない / どの層もツールを選ばなかった」に閉じる。
         - 失敗 (aux 不達 / タイムアウト / ``kind == "none"`` / 検証落ち) は
-          now-only のまま返し、``_flag_ungrounded_date_math`` が未検証の印を
-          立てる (格下げはしない — 落ち先が暗算になるため)。
+          そのまま返し、``_flag_ungrounded_date_math`` が未検証の印を
+          立てる (ツールが無くても立つ。現在日時は注記が渡す)。
+
+        現在日時だけを返すコマンド (旧 now-only) を廃止した (2026-10-03、不変則
+        #15) ので、入口 (a)「now-only が確定している」は無くなり、日付演算の問いは
+        入口 (b)「どの層もツールを選ばなかった」から届く。
         """
         if not self.enabled:
             return result
@@ -1101,9 +1412,11 @@ class ToolCallJudge:
         # 手掛かり語は直前のユーザー発話からも継ぐ (条件だけを変える追い質問)。
         if not conversation_has_date_math_cue(call.query, call.conversation):
             return result
-        # 2 つの入口: (a) now-only コマンドが確定している、(b) どの層もツールを
-        # 選ばなかった (追い質問「祝日だとすると 30 営業日目はどう変わりますか」は
-        # 分類器が none を返し、日付演算が丸ごと暗算に残った — 2026-09-08 検証)。
+        # 入口: (a) 確定したコマンドが日付演算をしていない (営業日の問いに暦日だけの
+        # 演算等。現在日時だけのコマンドはガード ``clock_only_command`` が先に落とす
+        # ので (b) に来る)、(b) どの層もツールを選ばなかった (追い質問「祝日だと
+        # すると 30 営業日目はどう変わりますか」は分類器が none を返し、日付演算が
+        # 丸ごと暗算に残った — 2026-09-08 検証)。
         # (b) は executable ツールが mode で使えるときだけ組み立てる。
         tool_name = ""
         # (c) 分類器が日付演算を ``calculate`` に流した (「11 月 6 日の 12 営業日前」
@@ -1125,7 +1438,16 @@ class ToolCallJudge:
                 query_has_business_day_cue(call.query or "")
                 and command_lacks_business_day_arithmetic(command)
             )
-            if not command_lacks_date_arithmetic(command) and not partial:
+            # 起点が参照名詞 (「リリース日の 1 週間前」) の演算は、起点の出所を
+            # literal / conversation と印字していないコマンドなら今日起点の疑いが
+            # ある。起点を会話から解くここで組み直す。
+            suspect_anchor = bool(referent_anchor_nouns(call.query or "")) and (
+                extract_tool_anchor(command) not in ("literal", "conversation")
+            )
+            if (
+                not command_lacks_date_arithmetic(command)
+                and not partial and not suspect_anchor
+            ):
                 return result
             tool_name = result.tool_name
         elif misrouted_to_calculate:
@@ -1164,12 +1486,19 @@ class ToolCallJudge:
                     call.conversation, before=call.query or "",
                 )
             # 「来月の営業日数は」は数字を持たないが月そのものが数量 (F-01)。
+            # 「今日から試験日まであと何日」は終点が 2 ターン以上前の「試験日は…」に
+            # あってもコードで閉じる (C09#2)。now-only を廃止する前は入口 (a) から
+            # 数量の条件なしで届いていたので、同じ解決をここでも数量に数える。
             if not NUMERAL_HINT_RE.search(quantity_source) and (
                 month_business_days_from_query(
                     call.query or "", utc_now_dt().astimezone().date(),
                 ) is None
                 and nth_weekday_of_month_from_query(
                     call.query or "", utc_now_dt().astimezone().date(),
+                ) is None
+                and day_count_target_from_conversation(
+                    call.query or "", call.conversation,
+                    utc_now_dt().astimezone().date(),
                 ) is None
             ):
                 return result
@@ -1297,23 +1626,52 @@ class ToolCallJudge:
             and (params.start is None or params.start == utc_now_dt().astimezone().date())
             and query_anchors_on_prior_result(call.query or "")
         ):
-            anchor_date = previous_answer_date(
-                call.conversation, before=call.query or "",
-                today=utc_now_dt().astimezone().date(),
-            )
-            if anchor_date is None:
-                # 起点の名詞が同じ発話で定義されている (「締め切りは今日から
-                # 2 週間後です。締め切りの 3 営業日前は？」)。
-                anchor_date = offset_date_in_query(
-                    call.query or "", utc_now_dt().astimezone().date(),
-                )
-            if anchor_date is not None and params.start != anchor_date:
+            # 参照名詞 (「さっきのリリース日の 1 週間前」) は、会話でその名詞と
+            # 同じ文で結び付いた日付を先に引く — 直前の回答の最後の日付は別の
+            # 話題の日付でありうる (2026-10-05 ライブ監査)。候補が割れたら棄権。
+            referent_nouns = referent_anchor_nouns(call.query or "")
+            referent_dates = referent_anchor_candidates(
+                call.query or "", call.conversation, today_local,
+            ) if referent_nouns else []
+            if len(referent_dates) > 1:
                 logger.info(
-                    "date intent start resolved from the previous answer: %s "
+                    "date intent abstained: referent anchor ambiguous (%s: %s)",
+                    referent_nouns, [d.isoformat() for d in referent_dates],
+                )
+                return self._without_today_anchored_command(result, misrouted_to_calculate)
+            anchor_date = referent_dates[0] if referent_dates else None
+            if anchor_date is None and referent_nouns:
+                # 起点の名詞が同じ発話で定義されている (「締め切りは今日から
+                # 2 週間後です。締め切りの 3 営業日前は？」)。直前の回答の最後の
+                # 日付は使わない — 名詞と結び付いていない (「リリース日はまだ
+                # 未定です。次の定例は10月12日です。」の 10/12、2026-10-05 レビュー)。
+                anchor_date = referent_defined_in_query(call.query or "", today_local)
+            elif anchor_date is None:
+                # 照応 (「その日から」) は直前の回答の日付。
+                anchor_date = previous_answer_date(
+                    call.conversation, before=call.query or "",
+                    today=utc_now_dt().astimezone().date(),
+                )
+                if anchor_date is None:
+                    anchor_date = offset_date_in_query(
+                        call.query or "", utc_now_dt().astimezone().date(),
+                    )
+            if anchor_date is None and referent_nouns:
+                # 起点の名詞の日付が会話のどこにも無い。今日起点で組むと誤った
+                # target を「確かめた事実」として渡すので、コマンドを組まない
+                # (現在日時の注記はそのまま渡る)。
+                logger.info(
+                    "date intent abstained: referent anchor unresolved (%s): %s",
+                    referent_nouns, (call.query or "")[:60],
+                )
+                return self._without_today_anchored_command(result, misrouted_to_calculate)
+            if anchor_date is not None:
+                logger.info(
+                    "date intent start resolved from the conversation: %s "
                     "(extractor said %s)", anchor_date.isoformat(),
                     params.start.isoformat() if params.start else "today",
                 )
-                params = replace(params, start=anchor_date)
+                params = replace(params, start=anchor_date, anchor="conversation")
         # 条件だけを変える追い質問 (自分では手掛かり語を持たない) は、直前の
         # 演算パラメータを継いで除外条件だけ足す。抽出器に同じ会話を読み直させると
         # 起点の数え方が振れる (B-03、``inherit_date_intent`` の docstring)。
@@ -1407,11 +1765,12 @@ class ToolCallJudge:
             )
         return replace(
             result, tool_needed=True, tool_name=tool_name, tool_args=args,
-            source="rule",
+            source="rule", decided_reason="date_intent",
         )
 
     async def _judge_inner(
         self, call: JudgeCall, *, allow_classifier: bool = True,
+        defer_date_math: bool = False,
     ) -> ToolJudgement:
         """ツール呼び出しの要否を判定 (層構成の本体)。
 
@@ -1423,9 +1782,10 @@ class ToolCallJudge:
         1 手目の実行後に初めて解決できる参照 (会話から引くパス等) だけ。
 
         判定は安価な順に実行し、最初に確定した結果を返す:
-        0.6〜3. 決定論層 (専用ツール / 明示式・URL・パス / ルール表 /
-                参照解決 / カートリッジ / 学習済みパターン)
-        5.5〜5.7. 履歴キーワードの安全網 / SemMem リコール
+        0.6〜2. 決定論層 (専用ツール / 明示式・URL・パス / ルール表 /
+                参照解決 / カートリッジ)
+        5.5. 履歴キーワードの安全網
+        (3 / 5.6 / 5.7 の学習済みパターン・SemMem リコールは shadow で、判定を決めない)
         5.9 / 5.95. ベースモデルの文法制約分類 / 式合成 (唯一の推論往復)
 
         各層の exit は ``_finalize`` (ガード列) を通し、**ガードが no_tool へ
@@ -1436,6 +1796,9 @@ class ToolCallJudge:
             call: この呼出の文脈 (クエリ / レジストリ / mode / 会話 /
                 session_id)。ターン固有の副作用 (blocked フラグ / 診断値) も
                 ここへ書く。
+            defer_date_math: 後処理の層 5.97 (日付演算の意図取り) が走るか。
+                走るなら、日付演算を求める日時の問いでは層 5.9 / 5.95 の往復を
+                撃たない (:func:`_defers_to_date_intent`)。
         """
         query = call.query
         tools_registry = call.tools_registry
@@ -1619,8 +1982,14 @@ class ToolCallJudge:
         # 「体重を4.5kgに直して、同じファイルに保存し直して」→ read_file のみ
         # 実行され、ファイルは旧内容のまま「保存し直した」体で回答された)。
         # 会話から直近のパスを引いて write_file に確定させる。
-        rewrite = _referential_rewrite_judgement(
-            query, conversation, tools_registry, call=call,
+        # 0.9 / 0.95 / 0.96 は裸の名前を複数のフォルダで stat する (共有の解決器、
+        # リクエストごとにキャッシュ) ので、イベントループの外で走らせる。
+        loop = asyncio.get_running_loop()
+        rewrite = await run_in_executor_with_context(
+            loop, None, functools.partial(
+                _referential_rewrite_judgement,
+                query, conversation, tools_registry, call=call,
+            ),
         )
         if rewrite is not None:
             rewrite = self._finalize(rewrite, call=call)
@@ -1634,14 +2003,33 @@ class ToolCallJudge:
         # 実ファイルと不一致。明示的に「read_file で読み直して」と言うと正しく
         # 読み「先ほどの内容は記憶に基づくものでした」と自己訂正した = ゲートが
         # 開かないだけだった)。
-        ref_read = _referential_read_judgement(
-            query, conversation, tools_registry, call=call,
+        ref_read = await run_in_executor_with_context(
+            loop, None, functools.partial(
+                _referential_read_judgement,
+                query, conversation, tools_registry, call=call,
+            ),
         )
         if ref_read is not None:
             ref_read = self._finalize(ref_read, call=call)
             if ref_read.tool_needed:
                 self._log_tool_decision(ref_read, "referential_read", call)
                 return ref_read
+
+        # 0.96. 裸のファイル名が利用者の名指したフォルダの実在のファイルに解決できる
+        # (「buggy.py のバグを見つけて」)。区切りの無い名前は明示パスの信号に
+        # ならず、知識質問の字句 (層 1) と kNN の門に否定されて読まずに答えていた
+        # (2026-10-05 ライブ監査 T4)。解決できた実在のファイルは証拠で、近道に
+        # 上書きさせない (不変則 #15)。
+        bare_read = await run_in_executor_with_context(
+            loop, None, _bare_filename_read_judgement,
+            query, conversation, tools_registry, mode,
+            lambda q: self._infer_tool(q, tools_registry, mode, call=call),
+        )
+        if bare_read is not None:
+            bare_read = self._finalize(bare_read, call=call)
+            if bare_read.tool_needed:
+                self._log_tool_decision(bare_read, "bare_filename_read", call)
+                return bare_read
 
         # 1. 組み込みパターン照合（ルールベース）
         # ツール名まで確定したときだけ層1で打ち切る。``tool_needed=True`` かつ
@@ -1665,6 +2053,8 @@ class ToolCallJudge:
             if result.tool_needed:
                 self._log_tool_decision(result, "rule_pattern_matched", call)
                 return result
+            call.rule_verdict = "abstain"
+            call.rule_demoted_by = call.demoted_by
             # 降格 (aux の not-executable 判定 / 引数欠落 / mode 不可) は
             # 「このツールは使えない」であって「ツールは不要」ではない。ここで
             # return すると層2〜5.2 が丸ごと死に、最も救済が要るクエリだけが
@@ -1699,19 +2089,15 @@ class ToolCallJudge:
                 "later layers: %s", query[:50],
             )
 
-        # 3. 学習済みパターン照合
-        result = self._judge_with_learned_patterns(query, tools_registry, mode, call=call)
-        if result.tool_needed:
-            await self._maybe_recall_url(result, query, mode=mode)
-            self._maybe_scope_session_search(result, query, session_id)
-            result = self._finalize(result, call=call)
-            if result.tool_needed:
-                self._log_tool_decision(result, "learned_pattern_matched", call)
-                return result
-            # 層1 と同じ理由で降格時は後続層へ落とす。
-            logger.debug(
-                "Learned layer match downgraded to no_tool; falling through to "
-                "later layers: %s", query[:50],
+        # 3. 学習済みパターン照合 — **判定には使わない** (2026-10-03、不変則 #15)。
+        # 字句一致だけで、規則が知識質問として否定したクエリ (rule_verdict=skip) まで
+        # 撃ち返す構造だった。実発火は全ログで 0 件、益は未計測。層 5.7 と同じく
+        # shadow で評価し、``_judge_layers`` の出口で ``learned_routing_shadow`` として
+        # 記録する。decision ログが書かれない起動では評価もしない。
+        shadow_logged = bool(getattr(self._debug_logger, "log_decisions", False))
+        if shadow_logged:
+            call.learned_routing_shadow = self._shadow_learned_routing(
+                query, tools_registry, mode, call,
             )
 
         # 5.5. 履歴参照キーワードのフォールバック強制発火 (安全網)
@@ -1754,10 +2140,14 @@ class ToolCallJudge:
         # 実インシデント (2026-09-09 ライブ監査 H-08): 「今日私が相談した
         # 技術的な話題を 3 つ挙げてください」がどの層でも検索にならず、
         # 「今日の会話履歴には記録されていません」と昨日の話題を答えた。
-        day_scope = day_scope_recall(query)
+        # 具体日付 (「10月3日の会話」「10月2日から10月3日まで」) も同じく日付窓で
+        # 引く (実機 2026-10-03: kNN ゲートで no_tool / 窓なしの検索になった)。
         if (
             tools_registry.has("search_history")
-            and (asks_about_past_conversation(query) or day_scope is not None)
+            and (
+                asks_about_past_conversation(query)
+                or asks_about_day_scoped_conversation(query)
+            )
         ):
             search_query = _reduce_ordered_history_query(query)
             forced_result = ToolJudgement(
@@ -1767,8 +2157,7 @@ class ToolCallJudge:
                 source="rule",
             )
             self._maybe_scope_session_search(forced_result, query, session_id)
-            if day_scope is not None:
-                self._scope_day_window(forced_result, day_scope)
+            self._scope_day_window(forced_result, query)
             forced_result = self._finalize(forced_result, call=call)
             # 「近接リコール語だけ + 現在セッション除外」の組合せは
             # _finalize の proximal_recall_excluded_session ガードが
@@ -1794,66 +2183,40 @@ class ToolCallJudge:
         #     (2026-08-22、2 セットで再現)。層0.6 の正規表現は当たっていた。
         #
         # 対処として ``dedicated_tool_query`` の除外リストを手で足してきたが、
-        # 語彙を列挙する対処は必ず漏れる。順序そのものを直す。
-        #
-        # **コストは増えない。** 先回りの動機は「aux / 分類器の往復を省く」
-        # ことだったが、層 0.6〜5.5 はすべて純粋な正規表現で、リコールを
-        # それらの後ろへ動かしても増えるのは正規表現の評価だけ。リコールは
-        # 依然として層 5.9 (ベースモデルの文法制約分類 = 唯一の推論往復) より
-        # 前にあるので、学習済みクエリが分類器を撃つことはない。
-        # 5.6. URL リコール (mode / enabled に関係なく実行)
-        # ``_try_recall_url`` は決定論的 (embedding 類似度 + 過去採点平均閾値)
-        # で、補助タスク同期発火やルール正規表現のような副作用がない。早期 return
-        # 経路 (chat モード + tool_judge_enabled=false) で判定がスキップされる
-        # と「過去 URL は SemMem にあるのに fetch されない」という不整合が起きる
-        # ため、ここで先回りで引き当てる。
-        url_recall_result = await self._judge_with_url_recall(
-            query, tools_registry, mode=mode, call=call,
-        )
-        if url_recall_result is not None:
-            url_recall_result = self._finalize(url_recall_result, call=call)
-            if url_recall_result.tool_needed:
-                self._log_tool_decision(url_recall_result, "url_recall_matched", call)
-                return url_recall_result
+        # 語彙を列挙する対処は必ず漏れる。順序そのものを直した後、2026-10-03 に
+        # 両層とも判定から外して shadow にした (不変則 #15)。
+        # 5.6. URL リコール — **判定には使わない** (2026-10-03、不変則 #15)。
+        # 記憶の類似度だけで fetch_url を確定させ、規則の否定 (知識質問) も分類器の門も
+        # 迂回していた。実発火は全ログで 0 件、益は未計測。shadow で評価し、出口で
+        # ``url_recall_shadow`` として記録する。規則が fetch_url を選んで URL が空の
+        # ときの引数補完 (``_maybe_recall_url``、棄権した穴を埋めるだけ) は残す。
+        if shadow_logged:
+            call.url_recall_shadow = await self._shadow_url_recall(
+                query, tools_registry, mode, call,
+            )
 
-        # 5.7. executable command リコール (mode / enabled 非依存)
-        # 過去成功した run_command を SemMem から決定論的に引き当てる。層 5.9
-        # (ベースモデルの文法制約分類 = 唯一の推論往復) より前にあるので、
-        # 学習済みクエリで分類器を撃つことはない。
+        # 5.7. executable command リコール — **判定には使わない** (2026-10-03)。
+        # 不変則 #15 (近道は現在の判定と証拠を上書きしない)。保存コマンドを会話
+        # 文脈なしで再生し、分類器の門 (``_gate_allows``) も model_key も迂回して
+        # いた。益の実測はゼロで、害の実績はすべて旧規則の誤発火から学習した
+        # 現在日時コマンドの再生だった。
         #
-        # URL リコールが「ユーザーが URL を書いた」という決定論的根拠を持つのに
-        # 対し、command recall の根拠は類似度のみ。ツール意図のシグナルが無い
-        # クエリ (好みの表明 / 記憶想起 / 感謝) まで引き当てると、会話履歴で
-        # 答えられる質問が「ツール結果に含まれていません」に化ける
-        # (実測 2026-07-25: 誤発火 6 件中 4 件がこの型)。適用はツールシグナルを
-        # 持つクエリに限定し、かつ記憶想起クエリは除外する。
-        # 「さっき伝えた GPU は何だった？」は 'GPU' が _TOOL_PATTERNS に載るため
-        # ツールシグナル判定を通ってしまうが、答えは会話履歴にある。ここで
-        # コマンドを撃つと、ツール結果が文脈を上書きして
-        # 「ツール結果に GPU 型番は含まれていません」と誤答する (実測 2026-07-25。
-        # 同じ会話の 1 ターン前では Radeon 890M を正しく想起できていた)。
-        # create では run_command が一級のツールで、「依存を入れて」→ 学習済み
-        # `pip install ...` の引き当てが本機能の主目的なのでゲートしない。
-        #
-        # 専用ツール (層 0.6 / 0.6b) やルール表 (層 1) の除外リストはもう要らない。
-        # それらはこの層より前に評価されるため、claim されたクエリはここまで
-        # 降りてこない (以前は逆順で、除外語彙を手で足し続けていた)。
-        recall_allowed = is_create_mode(mode) or (
-            call.has_tool_signal and not _has_history_recall_keywords(query)
-        )
-        if recall_allowed:
-            cmd_recall_result = await self._judge_with_executable_command_recall(
+        # - chat: 読まない (Step 8.6 も chat の実行を記録しない)。
+        # - create: 「依存を入れて」→ 学習済み ``pip install ...`` が本来の主目的
+        #   だったので **shadow** で評価だけする。返すのは以降の層の判定で、
+        #   想起が当たったか・最終判定と一致したかは ``_judge_layers`` の出口で
+        #   ``executable_command_recall_shadow`` として decision ログへ残す。
+        #   decision ログが書かれない起動 (通常 / debug) では評価もしない — 埋め込みと
+        #   SemMem 検索の往復が判定に何も足さずに乗るだけになる。
+        tools_cfg = (self._config or {}).get("tools") or {}
+        if (
+            is_create_mode(mode)
+            and bool(tools_cfg.get("executable_command_recall_enabled", True))
+            and bool(getattr(self._debug_logger, "log_decisions", False))
+        ):
+            call.command_recall_shadow = await self._shadow_executable_command_recall(
                 query, tools_registry, mode=mode, call=call,
             )
-        else:
-            cmd_recall_result = None
-        if cmd_recall_result is not None:
-            cmd_recall_result = self._finalize(cmd_recall_result, call=call)
-            if cmd_recall_result.tool_needed:
-                self._log_tool_decision(
-                    cmd_recall_result, "executable_command_recall_matched", call,
-                )
-                return cmd_recall_result
 
         # 5.8. 元利均等の毎月返済額を決定論で組む (docs/f_03 §3.1、c_17 §3.13)。
         # 9B は理由を添えて作り直させても正しい式を組めなかった (2026-09-29
@@ -1872,6 +2235,19 @@ class ToolCallJudge:
         # ``allow_classifier``) で止める — 以前は分類器だけを止めて式合成は
         # 無条件に走っており、``tool_judge_enabled=false`` でも往復していた。
         model_layers_allowed = self.enabled and allow_classifier
+        if (
+            model_layers_allowed and defer_date_math
+            and _defers_to_date_intent(query, conversation)
+        ):
+            # 日付演算を求める日時の問いは層 5.97 が受ける。分類器は日付演算を
+            # 組めない (calculate に流すか none) ので、往復を 2 回 (分類器 + 抽出器)
+            # 払わない。現在日時だけのコマンドを廃止する前は、規則表の now-only が
+            # ここへ来る前に確定していたので分類器は撃たれていなかった。
+            logger.debug(
+                "Tool classifier skipped: a date arithmetic question is left to "
+                "the date intent layer: %s", query[:50],
+            )
+            model_layers_allowed = False
         classified = (
             await self._judge_with_tool_classifier(
                 query, tools_registry, mode, conversation, session_id, call=call,
@@ -1918,7 +2294,12 @@ class ToolCallJudge:
             if model_layers_allowed else None
         )
         if synthesized is not None:
-            self._log_tool_decision(synthesized, "expression_synthesis", call)
+            self._log_tool_decision(
+                synthesized,
+                "expression_synthesis_implicit_operands"
+                if call.implicit_operands else "expression_synthesis",
+                call,
+            )
             return synthesized
 
         # 6. 全フォールバック失敗時の no_tool 結末を記録
@@ -1927,7 +2308,9 @@ class ToolCallJudge:
             query, tools_registry, mode, call,
         )
         no_tool_result = ToolJudgement(tool_needed=False, source="rule")
-        self._log_tool_decision(no_tool_result, "no_match_in_any_layer", call)
+        self._log_tool_decision(
+            no_tool_result, call.synthesis_rejection or "no_match_in_any_layer", call,
+        )
         return no_tool_result
 
     def _classifier_slot_prefix(self, tools_registry: ToolsRegistry, mode: str) -> str:
@@ -2048,11 +2431,25 @@ class ToolCallJudge:
            変数名にした ``sum(employees_overtime_hours) * 0.9`` の未知の名前 / 構文
            エラー。2026-10-03 再実行 D08#4)。実行しても必ず ``Unsafe expression`` /
            ``invalid syntax`` で落ちるので **実行前に** 判定する (規則は calculate と
-           同じ 1 つなので、実行失敗後に組み直すのと同じ集合を拾う)。占位語・日付演算・
-           計算機に無い関数の呼び出しは対象外 (:func:`_invalid_expression_reason`)。組み直した式が
-           通らなければ **no_tool** にし、``calculation_unbuildable`` と会話で利用者が
-           述べた数 (``stated_numbers``) を載せる — 回答側は「計算ツールが使えない」
-           ではなく「式を組めなかった」と述べ、数を挙げて確認を求める。
+           同じ 1 つなので、実行失敗後に組み直すのと同じ集合を拾う)。占位語・日付演算は
+           対象外 (:func:`_expression_gap_reason`)。欠けの種類で 2 つに分ける:
+
+           - **被演算子の欠け** (``operand``、会話の語を変数名にした式。理由
+             ``classifier_expression_invalid``)。組み直した式が通らなければ **no_tool** に
+             し、``calculation_unbuildable`` と確認を求める数 (:func:`_offered_operands`。
+             式合成の窓の利用者の発言の数) を載せる — 回答側は「式を組めなかった」と
+             述べ、数を挙げて確認を求める。
+           - **文法の欠け** (``grammar``、構文エラー・式でない文・生成式・計算機に無い
+             関数。理由 ``classifier_expression_ungrammatical``、2026-10-05 ライブ監査)。
+             組み直しで文法に合わない式が返れば、計算機の理由 (ヒント付き) を添えて
+             もう 1 回だけ組み直させる (``_checked_synthesis``)。通らなければ
+             **no_tool** + ``calculation_rejected`` (「概算と式を示す」注記)。数は尋ねない。
+           - **計算機に無い関数** (``function``、同じ理由名)。組み直しは同じだが、通らな
+             ければ分類器の式を残す (``None``、従来どおり。概算の注記は付けない)。
+           - **恒等の占位** (``identity_placeholder``、:func:`_identity_placeholders`、
+             2026-10-05 ライブ監査 ``333 - 0``)。会話に無い 0 / 1 で被演算子を埋めた式。
+             通らなければ被演算子の欠けと同じく ``calculation_unbuildable`` (挙げる数には
+             アシスタントが述べた数も含める)。「0 を仮定」とは述べさせない。
         1. **百分率の桁の取り違え** (:func:`percent_scale_slips`、1.2% に対する
            0.12)。分類器の式は採らない (開示で通さない)。組み直した式が通らなければ
            **no_tool** を返す (calculate を使わず「厳密な計算結果」と言わせない)。
@@ -2081,13 +2478,26 @@ class ToolCallJudge:
         if classified.tool_name != "calculate":
             return None
         expression = str((classified.tool_args or {}).get("expression") or "")
-        invalid = _invalid_expression_reason(expression, query, conversation)
-        slips =() if invalid else percent_scale_slips(expression, query, call.dialogue_text)
-        unexplained, period_mismatch = ((), ()) if invalid or slips else _recompute_ungrounded(
-            expression, query, call.dialogue_text, call.user_dialogue_text,
+        gap = _expression_gap_reason(expression, query, conversation)
+        invalid = gap[1] if gap else None
+        placeholders = () if gap else _identity_placeholders(
+            expression, _ungrounded_numbers(expression, query, call.dialogue_text),
         )
-        if invalid:
+        slips = () if invalid or placeholders else percent_scale_slips(
+            expression, query, call.dialogue_text,
+        )
+        unexplained, period_mismatch = (
+            ((), ()) if invalid or placeholders or slips else _recompute_ungrounded(
+                expression, query, call.dialogue_text, call.user_dialogue_text,
+            )
+        )
+        if gap and gap[0] == "operand":
             reason = "classifier_expression_invalid"
+        elif gap:
+            reason = "classifier_expression_ungrammatical"
+            call.recompose_structural_numbers = _structural_numbers(expression)
+        elif placeholders:
+            reason = "identity_placeholder"
         elif slips:
             reason = "percent_scale_slip"
         elif unexplained or period_mismatch:
@@ -2126,8 +2536,42 @@ class ToolCallJudge:
                 reason,
             )
             return synthesized
+        if gap and gap[0] == "function":
+            # 足りないのは計算機の機能で、数は揃っている。従来どおり分類器の式を残す
+            # (実行は失敗し、知識で答えてよい。概算の注記は付けない、独立レビュー M1)。
+            logger.info(
+                "Classifier calculate(%r) calls a function the calculator does not "
+                "have (%s); the re-synthesized expression did not pass, keeping the "
+                "classifier's call",
+                expression[:120], invalid[:160],
+            )
+            return None
+        if gap and gap[0] == "grammar":
+            logger.info(
+                "Classifier calculate(%r) does not follow the calculator's grammar "
+                "(%s); the re-synthesized expression did not pass, answering "
+                "without calculate",
+                expression[:120], invalid[:160],
+            )
+            call.calculation_rejected = True
+            return ToolJudgement(
+                tool_needed=False, source=classified.source, calculation_rejected=True,
+            )
+        if placeholders:
+            stated = _offered_operands(conversation, include_assistant=True)
+            logger.info(
+                "Classifier calculate(%r) fills a missing operand with the identity "
+                "%s; the re-synthesized expression did not pass, asking the user to "
+                "confirm the operands %s",
+                expression[:120], list(placeholders), list(stated),
+            )
+            call.calculation_rejected = True
+            return ToolJudgement(
+                tool_needed=False, source=classified.source, calculation_rejected=True,
+                calculation_unbuildable=True, stated_numbers=stated,
+            )
         if invalid:
-            stated = _stated_numbers(call.user_dialogue_text)
+            stated = _offered_operands(conversation)
             logger.info(
                 "Classifier calculate(%r) is not a calculate expression (%s); the "
                 "re-synthesized expression did not pass, asking the user to confirm "
@@ -2321,6 +2765,23 @@ class ToolCallJudge:
                 tools_registry=tools_registry, mode=mode, query=query,
                 conversation=conversation,
             )
+        # 既に述べた値の **再掲** (「さっきの予算計算をもう一度まとめて表にして」) は
+        # 式を組み直さない。値は会話にあり、組み直すと「さっきと違う」になりうる
+        # (層 5.97 の日付演算・層 0.6 の再計測と同じ扱い)。会話つきの合成は 1 回
+        # 10〜15 秒で、構造の疑いの作り直しを合わせて 22 秒を払っていた
+        # (2026-10-05 ライブ監査 44b8e3b2ecff)。分類器の組み直しは対象外。条件を変える
+        # (数・場合) か計算を頼む言い回し (「3人の場合で」「計算をもう一度して」) は
+        # 読み上げではないので合成する (:func:`restate_changes_condition`)。
+        if (
+            not recompose
+            and asks_to_restate_prior_report(query)
+            and not restate_changes_condition(query)
+        ):
+            logger.info(
+                "Expression synthesis skipped: the query asks to restate a prior "
+                "report: %s", query[:60],
+            )
+            return None
         # 被演算子が **すべて** クエリにあるなら層5.9 で足りる。ここは被演算子の
         # 少なくとも 1 つが会話にしかない形専用。
         #
@@ -2350,10 +2811,21 @@ class ToolCallJudge:
         requested = recompose or (call.calculate_requested and bool(
             NUMBER_LITERAL_RE.search(call.recent_dialogue_text),
         ))
+        # 被演算子をすべて会話から取る数量の問い (「元本との差額はいくらですか？」) は、
+        # 数も指示語も持たない。基準の指し方は語を足しても閉じない (不変則 #14) ので、
+        # 既存の判定の AND で入れ、合成器に棄権を許し、合成した式が直前の答えを含む
+        # 会話の値を組み合わせていることを要求する (2026-10-05 ライブ監査 22d3d78a7b38、
+        # docs/f_03 §3.1)。
+        implicit_operands = False
         if not requested:
             if not query_numbers and not ANAPHORIC_OPERAND_RE.search(query):
-                return None
-            if not looks_like_numeric_question(query, call.recent_dialogue_text):
+                implicit_operands = await self._asks_quantity_of_dialogue_values(
+                    query, conversation, call,
+                )
+                if not implicit_operands:
+                    return None
+                call.implicit_operands = True
+            elif not looks_like_numeric_question(query, call.recent_dialogue_text):
                 return None
         client = self._llm_client
         if client is None or not hasattr(client, "generate_constrained"):
@@ -2365,10 +2837,13 @@ class ToolCallJudge:
             conversation, _SYNTHESIS_CONTEXT_TURNS,
         )
         messages.append({"role": "user", "content": ungroup_thousands(query)})
-        messages[0:0] = self._slot_shared_messages(
-            tools_registry, mode,
-            select_locale_variant(EXPRESSION_SYSTEM, EXPRESSION_SYSTEM_EN),
-        )
+        task_system = select_locale_variant(EXPRESSION_SYSTEM, EXPRESSION_SYSTEM_EN)
+        if implicit_operands:
+            # 共通の system (接頭辞) は変えず、指示の側に棄権を足す。
+            task_system += "\n" + select_locale_variant(
+                EXPRESSION_ABSTAIN, EXPRESSION_ABSTAIN_EN,
+            )
+        messages[0:0] = self._slot_shared_messages(tools_registry, mode, task_system)
         try:
             content = await client.generate_constrained(
                 messages,
@@ -2380,17 +2855,27 @@ class ToolCallJudge:
                     getattr(client, "background_slot", -1),
                 ),
                 timeout=self._classifier_timeout(client, messages, CLASSIFY_MAX_TOKENS),
+                usage_purpose="expression_synthesis",
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("expression synthesis failed: %s", exc)
             return None
 
+        if implicit_operands and not parse_expression_response(content):
+            logger.info(
+                "Expression synthesis abstained: the question is not answerable from "
+                "conversation numbers: %s", query[:60],
+            )
+            call.synthesis_rejection = "implicit_operands_abstained"
+            return None
         expression, issues = self._checked_synthesis(content, query, call)
         if issues:
             # 構造の疑いの文面は正しい組み方を述べている (「月の複利なら底は
             # 1 + 年率/12 …」)。1 回目の続きとして返し、1 回だけ組み直させる
             # (2026-09-29 回帰確認 R27_loan_correction: 9B は同じ誤った構造を
-            # 毎回出した)。接地・構文の不合格では作り直させない (docs/f_03 §3.1)。
+            # 毎回出した)。計算機の文法に合わない式も、計算機の理由 (ヒント付き) を
+            # 疑いとして同じ 1 回で作り直させる (2026-10-05)。接地・被演算子の欠けの
+            # 不合格では作り直させない (docs/f_03 §3.1)。
             messages = [
                 *messages,
                 {"role": "assistant", "content": content},
@@ -2408,6 +2893,7 @@ class ToolCallJudge:
                         getattr(client, "background_slot", -1),
                     ),
                     timeout=self._classifier_timeout(client, messages, CLASSIFY_MAX_TOKENS),
+                    usage_purpose="expression_synthesis",
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.info("expression synthesis retry failed: %s", exc)
@@ -2417,6 +2903,17 @@ class ToolCallJudge:
                 logger.info("Expression synthesis passed on the retry: %s", expression)
         if not expression or issues:
             return None
+        if implicit_operands and not _combines_dialogue_operands(
+            expression, query, call.dialogue_text, _last_assistant_text(conversation),
+        ):
+            # 会話の値 1 つだけの式 (``x`` / ``x*1`` / ``round(x, 2)``) は計算ではなく、
+            # 通すとその値が無関係な問いの「厳密な計算結果」になる。
+            logger.info(
+                "Expression synthesis rejected: %r does not combine conversation values "
+                "including the last answer", expression[:120],
+            )
+            call.synthesis_rejection = "implicit_operands_not_combined"
+            return None
         result = ToolJudgement(
             tool_needed=True,
             tool_name="calculate",
@@ -2425,26 +2922,64 @@ class ToolCallJudge:
         )
         return self._finalize(result, call=call)
 
+    async def _asks_quantity_of_dialogue_values(
+        self,
+        query: str,
+        conversation: list[dict] | None,
+        call: JudgeCall,
+    ) -> bool:
+        """被演算子をすべて会話から取る数量の問いか (層 5.95 の入口、docs/f_03 §3.1)。
+
+        (1) 単位付きで量を問い、問い自身に数詞が無い (``asks_quantity_without_operands``、
+        日本語の問いだけ)、(2) 直近の会話に会話の値 (:func:`_dialogue_values`) が 2 つ以上、
+        (3) 直前の assistant の発話に会話の値がある、(4) 分類器の門がツールが要ると判定した
+        — の AND。門は開く側に倒してあるので、知識の問いを止めるのは合成器の棄権と
+        :func:`_combines_dialogue_operands` の役目。門をまだ撃っていなければここで撃つ。
+        """
+        if not asks_quantity_without_operands(query):
+            return False
+        if len(_dialogue_values(call.recent_dialogue_text)) < 2:
+            return False
+        if not _dialogue_values(_last_assistant_text(conversation)):
+            return False
+        if not call.gate_diag:
+            await self._gate_allows(query, conversation, call=call)
+        return call.gate_diag.get("gate_verdict") is True
+
     @staticmethod
     def _checked_synthesis(
         content: str, query: str, call: JudgeCall,
     ) -> tuple[str, tuple[str, ...]]:
         """合成器の応答から式を取り、構文・接地・式の妥当性を掛ける。
 
-        返すのは ``(式, 構造の疑い)``。構文・接地で落ちたら式は空 (作り直させない)。
-        構造の疑いがあるときだけ式と疑いの両方を返す (呼出側が理由を添えて作り直させる)。
+        返すのは ``(式, 構造の疑い)``。接地・被演算子の欠けで落ちたら式は空 (作り直させ
+        ない)。構造の疑いがあるときは式と疑いの両方を返す (呼出側が理由を添えて作り直
+        させる)。計算機の **文法** に合わない式 (構文エラー・生成式・計算機に無い関数、
+        ``expression_gap`` の ``grammar``) は、式を空にして計算機の理由 (ヒント付き) を
+        疑いとして返す — 同じ 1 回の作り直しで文法を直させる (2026-10-05 ライブ監査:
+        ``len(str(import math; …))`` / 生成式で諦めていた)。
+
+        文法の組み直し (``call.recompose_structural_numbers``) では、分類器の式の
+        ``range(…)`` の引数と ``%`` の右辺の数も接地の既知に数える。組み直しは文法を
+        直すだけで、それらは問いの構造の数だった (``range(1, 101)`` の 101、``% 2`` の 2)。
         """
         expression = parse_expression_response(content)
         if not expression:
             return "", ()
         syntax_error = validate_expression(expression)
         if syntax_error:
+            gap = expression_gap(expression)
             logger.info(
                 "Expression synthesis rejected: %r is not a calculate expression (%s)",
-                expression[:120], syntax_error[:120],
+                expression[:120], syntax_error[:160],
             )
+            if gap is not None and gap[0] in ("grammar", "function"):
+                return "", (syntax_error,)
             return "", ()
-        unexplained = _ungrounded_numbers(expression, query, call.dialogue_text)
+        context = call.dialogue_text
+        if call.recompose_structural_numbers:
+            context = f"{context}\n{' '.join(call.recompose_structural_numbers)}"
+        unexplained = _ungrounded_numbers(expression, query, context)
         if unexplained:
             logger.info(
                 "Expression synthesis rejected: %s uses numbers absent from "
@@ -2544,7 +3079,36 @@ class ToolCallJudge:
         """ツール要否ゲートの exemplar を埋め込む (起動後の背景タスク用)。"""
         if self._tool_gate is None:
             return False
-        return await self._tool_gate.warmup()
+        ready = await self._tool_gate.warmup()
+        if self._classifier_skip_shadow is not None and self._logs_decisions():
+            await self._classifier_skip_shadow.warmup()
+        return ready
+
+    def _logs_decisions(self) -> bool:
+        return bool(getattr(self._debug_logger, "log_decisions", False))
+
+    async def _observe_classifier_skip(self, query: str, call: JudgeCall) -> bool:
+        """分類器を撃つ直前に省略ゲートを影で評価し、``call.gate_diag`` へ足す。
+
+        判定には使わない (分類器は必ず撃つ)。評価できた回だけ ``True`` を返し、
+        呼出側は分類器の実際の結論 (``classifier_raw``) を並べて記録する。
+        """
+        shadow = self._classifier_skip_shadow
+        if shadow is None or not shadow.is_ready() or not self._logs_decisions():
+            return False
+        query_vec = None
+        try:
+            # 門の kNN が同じ (query, mode) で埋め込んだ直後なので LRU に当たる。
+            query_vec = await self._embedder.embed_query(query, mode=call.mode or "chat")
+        except Exception as exc:
+            logger.debug("Tool classifier skip shadow: embed failed: %s", exc)
+        diag = await shadow.observe(
+            query, recent_dialogue=call.recent_dialogue_text, query_vec=query_vec,
+        )
+        if diag is None:
+            return False
+        call.gate_diag.update(diag)
+        return True
 
     async def _judge_with_tool_classifier(
         self,
@@ -2600,6 +3164,7 @@ class ToolCallJudge:
         schema = build_classifier_schema(tools_registry, mode)
         if schema is None:
             return None
+        skip_observed = await self._observe_classifier_skip(query, call)
 
         # 対話窓は **照応のあるクエリだけ** に載せる。
         #
@@ -2651,6 +3216,7 @@ class ToolCallJudge:
                 timeout=self._classifier_timeout(
                     client, messages, self._tool_classifier_max_tokens,
                 ),
+                usage_purpose="tool_classifier",
             )
         except httpx.HTTPStatusError as exc:
             # ``response_format`` 非対応の build。リトライしても回復しないので
@@ -2664,12 +3230,20 @@ class ToolCallJudge:
                 )
             else:
                 logger.info("grammar tool classifier failed: %s", exc)
+            if skip_observed:
+                call.gate_diag["classifier_raw"] = "failed"
             return None
         except Exception as exc:
             logger.info("grammar tool classifier failed: %s", exc)
+            if skip_observed:
+                call.gate_diag["classifier_raw"] = "failed"
             return None
 
         parsed = parse_classifier_response(content, tools_registry, mode)
+        if skip_observed:
+            # 後段のガードで落ちる選択も「分類器がツールを選んだ」に数える (取りこぼしを
+            # 甘く数えない)。
+            call.gate_diag["classifier_raw"] = parsed[0] if parsed is not None else "none"
         if parsed is None:
             return None
         tool_name, tool_args = parsed
@@ -2997,7 +3571,7 @@ class ToolCallJudge:
     async def _maybe_recall_url(
         self, result: "ToolJudgement", query: str, mode: str = "create",
     ) -> None:
-        """rule / learned 層が ``fetch_url`` を返したが URL が空の場合、
+        """rule 層が ``fetch_url`` を返したが URL が空の場合、
         過去質問で正しく fetch できた URL (``idx.url.*``) を引き当てる。
 
         引き当てが成立すると ``result.tool_args["url"]`` に補完して
@@ -3016,12 +3590,13 @@ class ToolCallJudge:
         result.tool_args["url"] = recalled
         logger.debug("URL recall: matched url=%s for query=%s", recalled, query[:50])
 
-    def _scope_day_window(self, result: "ToolJudgement", days_ago: int) -> None:
-        """「今日 / 昨日の会話」を尋ねる検索を **その日** に絞る (in-place)。
+    def _scope_day_window(self, result: "ToolJudgement", query: str) -> None:
+        """「今日 / 昨日 / 10月3日の会話」を尋ねる検索を **その日** に絞る (in-place)。
 
         キーワードは外す — 「今日相談した技術的な話題」の語で索引を引くと
         当たらず、その日のセッション一覧 (各セッションの最初の発言 + 相対日
         ラベル) が答えそのものになる。件数上限は 1 日分に足りる数へ広げる。
+        日の指定が無い / 存在しない日付のときは何もしない。
         """
         if result.tool_name != "search_history":
             return
@@ -3029,7 +3604,16 @@ class ToolCallJudge:
         from backend.config import get_config
 
         tz = _resolve_history_tz(get_config)
-        date_from, date_to = history_day_window(days_ago, utc_now_dt().astimezone(tz))
+        now_local = utc_now_dt().astimezone(tz)
+        days_ago = day_scope_recall(query)
+        if days_ago is not None:
+            window = history_day_window(days_ago, now_local)
+        else:
+            dates = dated_conversation_dates(query)
+            window = history_dates_window(*dates, now_local) if dates else None
+        if window is None:
+            return
+        date_from, date_to = window
         if result.tool_args is None:
             result.tool_args = {}
         result.tool_args.update({
@@ -3039,8 +3623,7 @@ class ToolCallJudge:
             "limit": _HISTORY_DAY_SCOPE_LIMIT,
         })
         logger.debug(
-            "search_history scoped to a day window (%d day(s) ago): %s..%s",
-            days_ago, date_from[:10], date_to[:10],
+            "search_history scoped to a day window: %s..%s", date_from[:10], date_to[:10],
         )
 
     def _maybe_scope_session_search(
@@ -3446,61 +4029,197 @@ class ToolCallJudge:
             )
         return None
 
-    async def _judge_with_executable_command_recall(
+    async def _shadow_executable_command_recall(
         self,
         query: str,
         tools_registry: ToolsRegistry,
-        mode: str = "create",
-        call: JudgeCall | None = None,
-    ) -> "ToolJudgement | None":
-        """SemMem の過去成功コマンド引き当てで executable 判定を返す.
+        mode: str,
+        call: JudgeCall,
+    ) -> dict[str, Any] | None:
+        """層 5.7 の想起を評価だけして、出口で記録する材料を返す (判定は変えない)。
 
-        ``_judge_with_url_recall`` と対称。条件:
-          - 現在の mode で executable ツールが解決できる
-            (create → run_command / chat → run_command_readonly)
-          - ``mem_view`` / ``embedder`` が wired されている
-          - ``_try_recall_executable_command`` が閾値判定でコマンドを返す
-
-        引き当てが成立すれば aux 呼出 (5 層目 / chat early-return) より
-        先に確定するため、学習済みクエリでは LLM コストがゼロになる。
-
-        recall は subject の mode (`idx.command.<mode>.*`) を
-        フィルタしないため、chat では create 学習由来の任意コマンド (書込系
-        等) が引き当たり得る。chat (readonly) のときは
-        ``reject_readonly_violation`` で再検証し、違反コマンドは引き当てを
-        捨てて通常フローへ落とす (実行段の readonly ラッパでも二重に弾かれる
-        が、ここで捨てれば synth 等の後続層が正当なコマンドを合成し直せる)。
-
-        Returns:
-            引き当て成立時は ``ToolJudgement(<exec_tool>, {"command": ...})``、
-            それ以外は ``None`` (通常の判定フローに falling-through する)。
+        ``would_hit`` は想起したコマンドを、この mode の実行ツールで撃てたか
+        (旧層 5.7 が判定を返した条件と同じ)。``call`` の判定用の値
+        (``measurement_blocked`` 等) には触れない — readonly 検証は副作用の無い
+        ``_readonly_command_rejected`` で掛ける。診断値 (類似度 / 閾値) はこの時点で
+        写す (``call.recall_diag`` は後の層が書き換えうる)。評価の失敗は判定を
+        止めず、記録を落とすだけ (``None``)。
         """
-        exec_tool = _executable_tool_for_mode(tools_registry, mode)
-        if not exec_tool:
+        try:
+            exec_tool = _executable_tool_for_mode(tools_registry, mode)
+            if not exec_tool or self._mem_view is None or self._embedder is None:
+                return None
+            recalled = await self._try_recall_executable_command(
+                query, mode=mode, call=call,
+            )
+            if recalled and _readonly_command_rejected(exec_tool, recalled):
+                recalled = None
+            return {
+                "would_hit": bool(recalled),
+                "recalled_command": str(recalled or ""),
+                "recalled_tool": exec_tool if recalled else "",
+                **dict(call.recall_diag),
+            }
+        except Exception as exc:
+            logger.warning("Executable command recall shadow failed: %r", exc)
             return None
-        if self._mem_view is None or self._embedder is None:
-            return None
-        if call is None:
-            call = JudgeCall(tools_registry=tools_registry, mode=mode, query=query)
-        recalled = await self._try_recall_executable_command(
-            query, mode=mode, call=call,
+
+    def _log_command_recall_shadow(
+        self, result: "ToolJudgement", call: JudgeCall,
+    ) -> None:
+        """create の想起 shadow を最終判定と突き合わせて decision ログへ出す。"""
+        shadow = call.command_recall_shadow
+        if shadow is None or self._debug_logger is None:
+            return
+        final_command = str((result.tool_args or {}).get("command") or "")
+        would_hit = bool(shadow.get("would_hit"))
+        agrees = (
+            would_hit and bool(result.tool_needed)
+            and result.tool_name == shadow.get("recalled_tool")
+            and final_command == shadow.get("recalled_command")
         )
-        if not recalled:
-            return None
-        if self._reject_readonly(exec_tool, recalled, call):
-            return None
-        logger.info(
-            "Executable command recall: matched command for query=%s",
-            query[:50],
+        self._debug_logger.log_decision(
+            decision_point="executable_command_recall_shadow",
+            chosen="hit" if would_hit else "miss",
+            candidates=["hit", "miss"],
+            reason=("agree" if agrees else "disagree") if would_hit else "miss",
+            context={
+                **shadow,
+                "agrees": agrees,
+                "final_source": result.source if result.tool_needed else "no_tool",
+                "final_reason": result.decided_reason,
+                "final_tool": result.tool_name or "",
+                "final_command": final_command[:120],
+                "recalled_command": str(shadow.get("recalled_command") or "")[:120],
+            },
+            scope="request",
         )
-        return ToolJudgement(
-            tool_needed=True,
-            tool_name=exec_tool,
-            tool_args={"command": recalled},
-            # "rule" と区別する。recall 由来の実行を curator が再学習すると
-            # 「誤発火 → 成功記録 → fact 延命 → また誤発火」で自己強化するため、
-            # sleep 側 (executable_command_curator) がこの source を見て除外する。
-            source="recall",
+
+    def _shadow_learned_routing(
+        self,
+        query: str,
+        tools_registry: ToolsRegistry,
+        mode: str,
+        call: JudgeCall,
+    ) -> dict[str, Any] | None:
+        """層 3 (学習済み tool_routing) を評価だけして、記録の材料を返す (判定は変えない)。
+
+        ``would_hit`` は旧層 3 なら判定を確定させたか — ツール名まで決まり、旧出口の
+        ``_finalize`` でも降格しない (鍵引数がある・この mode で撃てる、
+        ``_shortcut_effective_tool``)。ツール名まで決まっただけの値は ``would_hit_raw``
+        に残す。ガードそのものは掛けない (``call`` の判定用の値を書き換えるため)。
+        パターンの照合は ``record_hit=False`` で、観測だけで統計を動かさない。
+        """
+        if self._learned_patterns is None:
+            return None
+        try:
+            judged = self._judge_with_learned_patterns(
+                query, tools_registry, mode, call=call,
+            )
+        except Exception as exc:
+            logger.warning("Learned routing shadow failed: %r", exc)
+            return None
+        raw_hit = bool(judged.tool_needed)
+        args = dict(judged.tool_args or {})
+        effective = _shortcut_effective_tool(
+            judged.tool_name if raw_hit else "", args, tools_registry, mode,
+        )
+        return {
+            "would_hit": bool(effective),
+            "would_hit_raw": raw_hit,
+            "would_tool": effective or judged.tool_name or "",
+            "would_args": args,
+        }
+
+    async def _shadow_url_recall(
+        self,
+        query: str,
+        tools_registry: ToolsRegistry,
+        mode: str,
+        call: JudgeCall,
+    ) -> dict[str, Any] | None:
+        """層 5.6 (URL リコール) を評価だけして、記録の材料を返す (判定は変えない)。
+
+        類似度の診断値 (``url_*``) は ``call.recall_diag`` から抜いてここへ写す
+        (層 5.7 の shadow へ混ざらないように。評価が例外で終わっても抜く)。
+        ``would_hit`` / ``would_hit_raw`` の区別は ``_shadow_learned_routing`` と同じ。
+        評価の失敗は記録を落とすだけ。
+        """
+        if (
+            not tools_registry.has("fetch_url")
+            or self._mem_view is None or self._embedder is None
+        ):
+            return None
+        try:
+            judged = await self._judge_with_url_recall(
+                query, tools_registry, mode=mode, call=call,
+            )
+        except Exception as exc:
+            logger.warning("URL recall shadow failed: %r", exc)
+            return None
+        finally:
+            diag = {
+                key: call.recall_diag.pop(key)
+                for key in [k for k in call.recall_diag if k.startswith("url_")]
+            }
+        raw_hit = judged is not None and bool(judged.tool_needed)
+        args = dict(judged.tool_args or {}) if raw_hit else {}
+        effective = _shortcut_effective_tool(
+            "fetch_url" if raw_hit else "", args, tools_registry, mode,
+        )
+        return {
+            "would_hit": bool(effective),
+            "would_hit_raw": raw_hit,
+            "would_tool": effective or ("fetch_url" if raw_hit else ""),
+            "would_args": args,
+            **diag,
+        }
+
+    def _log_shortcut_shadow(
+        self,
+        decision_point: str,
+        shadow: dict[str, Any] | None,
+        result: "ToolJudgement",
+        call: JudgeCall,
+    ) -> None:
+        """層 3 / 5.6 の shadow を最終判定と突き合わせて decision ログへ出す。
+
+        ``agrees`` は近道が選んだツールと最終判定のツールが一致し、鍵引数
+        (``fetch_url`` の url / ``run_command`` の command) も一致したか。
+        ``rule_verdict`` は規則層の 3 値で、近道が埋めてよいのは ``abstain`` の
+        ときだけ (不変則 #15) を事後に検証する材料。
+        """
+        if shadow is None or self._debug_logger is None:
+            return
+        would_hit = bool(shadow.get("would_hit"))
+        would_tool = str(shadow.get("would_tool") or "")
+        key = _SHORTCUT_KEY_ARGS.get(would_tool)
+        agrees = (
+            would_hit and bool(result.tool_needed) and result.tool_name == would_tool
+            and (
+                key is None
+                or str((result.tool_args or {}).get(key) or "")
+                == str((shadow.get("would_args") or {}).get(key) or "")
+            )
+        )
+        self._debug_logger.log_decision(
+            decision_point=decision_point,
+            chosen="hit" if would_hit else "miss",
+            candidates=["hit", "miss"],
+            reason=("agree" if agrees else "disagree") if would_hit else "miss",
+            context={
+                **shadow,
+                "would_args": {
+                    k: str(v)[:120] for k, v in (shadow.get("would_args") or {}).items()
+                },
+                "agrees": agrees,
+                "rule_verdict": call.rule_verdict,
+                "rule_demoted_by": call.rule_demoted_by,
+                "final_source": result.source if result.tool_needed else "no_tool",
+                "final_reason": result.decided_reason,
+                "final_tool": result.tool_name or "",
+            },
+            scope="request",
         )
 
     async def _try_recall_executable_command(
@@ -3509,7 +4228,7 @@ class ToolCallJudge:
         """過去成功した run_command を SemMem から類似クエリで引き当てる.
 
         診断値 (候補数 / sim / 閾値) は ``call.recall_diag`` へ書く
-        (``_log_tool_decision`` が decision.jsonl に載せる)。
+        (層 5.7 の shadow が decision.jsonl に載せる)。
 
         ``_try_recall_url`` と対称。条件:
           - ``mem_view`` / ``embedder`` が両方提供されている
@@ -3663,10 +4382,15 @@ class ToolCallJudge:
         ``chosen`` は ``ToolJudgement.source`` (``rule`` / ``cartridge`` /
         ``learned`` / ``recall`` / ``classifier``) か ``no_tool`` で、多段
         フォールバックのどの層で決着したかを識別する。``reason`` は層名。
-        ``call`` があればリコールの診断値 (類似度 / 閾値) と分類器ゲートの判定
-        (kNN の票数) も context に載せる — どちらも decision.jsonl だけで閾値
-        較正を事後検証するため。``evolve`` レベル限定で実発火、それ以外は no-op。
+        ``call`` があれば規則層の判定の 3 値 (``rule_verdict``) と分類器ゲートの判定
+        (kNN の票数) も context に載せる — ゲートの較正と、近道の shadow が埋めて
+        よい棄権だったかを decision.jsonl だけで事後検証するため。``evolve`` レベル
+        限定で実発火、それ以外は no-op。
+
+        層名はログの有無に関わらず ``result.decided_reason`` へ刻む (経験の
+        ``signals.decided_by`` の源。exit はすべてここを通る)。
         """
+        result.decided_reason = reason
         if self._debug_logger is None:
             return
         chosen = "no_tool" if not result.tool_needed else (result.source or "rule")
@@ -3678,9 +4402,10 @@ class ToolCallJudge:
         if command:
             context["command"] = str(command)[:120]
         if call is not None:
-            # 層 5.6 / 5.7 の採否は類似度が唯一の根拠。
-            if reason.startswith(("executable_command_recall", "url_recall")):
-                context.update(call.recall_diag)
+            if call.rule_verdict:
+                context["rule_verdict"] = call.rule_verdict
+            if call.rule_demoted_by:
+                context["rule_demoted_by"] = call.rule_demoted_by
             # 層 5.9 の門がどう判定したか (kNN なら票数も)。
             context.update(call.gate_diag)
         self._debug_logger.log_decision(
@@ -3713,6 +4438,7 @@ class ToolCallJudge:
         expression = _extract_arithmetic_expression(query)
         if expression and tools_registry.has("calculate"):
             logger.debug("Rule-based: arithmetic expression detected: %s", expression)
+            _set_rule_verdict(call, "fire")
             return ToolJudgement(
                 tool_needed=True,
                 tool_name="calculate",
@@ -3730,6 +4456,7 @@ class ToolCallJudge:
                 logger.debug(
                     "Rule-based: directory listing detected: %s", directory,
                 )
+                _set_rule_verdict(call, "fire")
                 return ToolJudgement(
                     tool_needed=True,
                     tool_name="list_directory",
@@ -3753,6 +4480,7 @@ class ToolCallJudge:
             p.search(query) for p in _KNOWLEDGE_PATTERNS_ALL
         ):
             logger.debug("Rule-based: knowledge query detected, skipping tool: %s", query[:50])
+            _set_rule_verdict(call, "skip")
             return ToolJudgement(tool_needed=False, source="rule")
 
         # 明示パス / URL があり、かつ具体的なツールまで決定論で解決できるなら
@@ -3773,6 +4501,7 @@ class ToolCallJudge:
                     "Rule-based: path/URL signal resolved to %s: %s",
                     signal_name, query[:50],
                 )
+                _set_rule_verdict(call, "fire")
                 return ToolJudgement(
                     tool_needed=True,
                     tool_name=signal_name,
@@ -3781,6 +4510,7 @@ class ToolCallJudge:
                 )
 
         if not any(p.search(query) for p in _TOOL_PATTERNS_ALL):
+            _set_rule_verdict(call, "abstain")
             return ToolJudgement(tool_needed=False, source="rule")
 
         logger.debug("Rule-based: tool pattern matched for query: %s", query[:50])
@@ -3789,6 +4519,8 @@ class ToolCallJudge:
         tool_name, tool_args = inferred if inferred is not None else self._infer_tool(
             query, tools_registry, mode, call=call,
         )
+        # ツール名を決められなければ後続層へ委ねる (``_judge_inner`` の層 1) = 棄権。
+        _set_rule_verdict(call, "fire" if tool_name else "abstain")
 
         return ToolJudgement(
             tool_needed=True,
@@ -3860,7 +4592,9 @@ class ToolCallJudge:
         if self._learned_patterns is None:
             return ToolJudgement(tool_needed=False, source="rule")
 
-        matches = self._learned_patterns.match(query, category="tool_routing")
+        matches = self._learned_patterns.match(
+            query, category="tool_routing", record_hit=False,
+        )
         if not matches:
             return ToolJudgement(tool_needed=False, source="rule")
 
@@ -3910,7 +4644,12 @@ class ToolCallJudge:
         Returns:
             (tool_name, tool_args): 推定結果。推定できない場合は ("", {})。
         """
-        q = query.lower()
+        # 動詞の判定はドライブ付きパスを除いた本文で行う。パスの綴りは場所で
+        # あって依頼の語ではない — ``E:\tmp\live_check_…\todo_scratch`` の
+        # ``check`` が読みの動詞に当たり、「Search for TODO in <フォルダ>」が
+        # list_directory に、「Save the matching lines to <…live_check…>\a.md」が
+        # read_file に化けていた (2026-10-04 ライブ監査 run20、f_03 §3.1)。
+        q = without_drive_paths(query, " ").lower()
         extract_path = call.extract_file_path if call is not None else _extract_file_path
         # ファイルパス抽出用のクエリ。バッククォート内コマンドの引数パスは
         # 読み書きの対象ではないため取り除く (コマンド実行分岐は生の ``query``
@@ -3945,6 +4684,36 @@ class ToolCallJudge:
             ):
                 return "verify_syntax", {"file_path": path}
 
+        # 読込みの動詞 (下の読込み分岐と、検索の分岐が譲るかの判定で使う)
+        reads = re.search(
+            r"(?:読[みむ]込|読んで|開いて|見せて|見て|確認|チェック|確かめ"
+            r"|正し[いく]|合って|内容|中身|何文字|文字数|何行|行数"
+            r"|存在し|ありますか|あるか|残ってい|消えてい"
+            r"|read|show|check|verify|correct|content|view|exists?"
+            r"|how many (?:characters|chars|lines))",
+            q,
+        )
+
+        # 名指したフォルダの中の検索 (「Search for TODO in <フォルダ>」)。検索動詞が
+        # あり、パターンと実在のフォルダが取れたら、そのフォルダを ``directory`` に
+        # search_code を返す。下の読込みパターンより先に見る — フォルダのパスは
+        # 読込み分岐で list_directory になり、検索が一度も走らないまま「TODO は
+        # 見つかりませんでした」と答えていた (2026-10-04 ライブ監査 run20)。
+        # 組み立ては推論 (``infer_tool_from_task``) と同じ関数 (f_03 §4.2.1 (a))。
+        # 読込みの動詞があり、読む対象が実在のファイル (「Read b.txt and search for
+        # TODO in <フォルダ>」の b.txt) なら、下の読込み分岐に譲る。まだ無い保存先
+        # (「… and save the content to r.md」) は読む対象に数えない。
+        if SEARCH_VERB_RE.search(q) and tools_registry.has("search_code"):
+            read_path = extract_path(path_query) if reads else ""
+            if not (read_path and Path(read_path).is_file()):
+                from backend.free.agent.meta_cognitive_tools import (
+                    named_folder_search_args,
+                )
+
+                search_args = named_folder_search_args(query)
+                if search_args is not None:
+                    return "search_code", search_args
+
         # ファイル読込みパターン
         # 「確認」「チェック」「見せて」「内容」等は実質的にファイル読み取りを必要とする。
         # カタカナ「チェック」は日本語で頻出するため明示的に含める (ASCII "check" だけ
@@ -3958,14 +4727,7 @@ class ToolCallJudge:
         # これが無いと「E:\tmp\a.txt はまだありますか」がツール未発火のまま
         # base の記憶で断定される (2026-08-16 監査の「存在しますか」形とは
         # 語尾違いで挙動が割れていた)。
-        if re.search(
-            r"(?:読[みむ]込|読んで|開いて|見せて|見て|確認|チェック|確かめ"
-            r"|正し[いく]|合って|内容|中身|何文字|文字数|何行|行数"
-            r"|存在し|ありますか|あるか|残ってい|消えてい"
-            r"|read|show|check|verify|correct|content|view|exists?"
-            r"|how many (?:characters|chars|lines))",
-            q,
-        ):
+        if reads:
             path = extract_path(path_query)
             if path:
                 # ディレクトリ指定 (配下のファイルを点検する文脈) は read_file だと
@@ -3989,8 +4751,15 @@ class ToolCallJudge:
         # ディレクトリを書込み先に取ると write_file が配下に output_<UTC>.txt を
         # 捏造する (記述的な「出力」誤マッチで read 指示がここへ落ちるケースを含む)。
         # ディレクトリは書込み対象から除外する。
-        if re.search(r"(?:書[きく]込|書いて|出力|保存|生成|作成|write|save|output)", q):
-            path = extract_path(path_query)
+        # 書込み先の候補が話題・根拠の格にしか立たない (「このファイルに対する
+        # テストを書いて」) か書込みの禁止があれば書かない (``write_target_is_topic_only``)。
+        # 宛先は ``write_target_path`` (書込み標識の側を採り、題材のパスは採らない)。
+        if re.search(
+            r"(?:書[きく]込|書いて|出力|保存|生成|作成|write|save|output)", q,
+        ) and not write_target_is_topic_only(
+            path_query, whole_request=is_create_mode(mode),
+        ):
+            path = write_target_path(path_query)
             if path and not Path(path).is_dir() and tools_registry.has("write_file"):
                 return "write_file", {"file_path": path}
 

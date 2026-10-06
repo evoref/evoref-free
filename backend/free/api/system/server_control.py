@@ -669,8 +669,12 @@ async def _try_reconnect(
             logger.warning("server_control: embed reload after start failed: %s", e)
 
     elif name == "rerank":
-        # 死んだサーバへの kept-alive socket を捨てる (次の rerank 呼出で作り直す)
+        # 死んだサーバへの kept-alive socket を捨てる (次の rerank 呼出で作り直す)。
+        # 前のサーバで開いた遮断器も閉じ直す (冷却を待たずに次のターンから使う)
         await _close_reranker_client(state)
+        reranker = getattr(getattr(state, "gen", None), "reranker", None)
+        if reranker is not None:
+            reranker.reset_breaker()
 
 
 async def _close_reranker_client(state: AppState) -> None:

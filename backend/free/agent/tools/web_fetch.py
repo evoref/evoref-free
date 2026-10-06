@@ -11,6 +11,11 @@ import socket
 
 from ipaddress import ip_address
 from urllib.parse import urljoin, urlparse
+from backend.free.constants import (
+    FETCH_BLOCKED_PREFIX,
+    FETCH_ERROR_PREFIX,
+    FETCH_UNRESOLVED_HOST_PREFIX,
+)
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
 
@@ -64,12 +69,12 @@ async def _validate_fetch_url(url: str, *, allow_private_ip: bool) -> str | None
         loop = asyncio.get_running_loop()
         resolved = await loop.getaddrinfo(parsed.hostname, None)
     except socket.gaierror as e:
-        return f"Error: Failed to resolve hostname {parsed.hostname!r}: {e}"
+        return f"{FETCH_UNRESOLVED_HOST_PREFIX} {parsed.hostname!r}: {e}"
     for _, _, _, _, sockaddr in resolved:
         addr = ip_address(sockaddr[0])
         if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
             return (
-                "Error: Access to private/reserved addresses is not allowed "
+                f"{FETCH_BLOCKED_PREFIX} "
                 "(set tools.fetch_url_allow_private_ip: true to override)"
             )
     return None
@@ -144,7 +149,7 @@ async def fetch_url(
                 )
     except Exception as e:
         logger.warning("fetch_url failed: url=%s err=%r", _redact_url_for_log(url), e)
-        return f"Error fetching URL ({type(e).__name__}): {e}"
+        return f"{FETCH_ERROR_PREFIX} ({type(e).__name__}): {e}"
 
     html_text = bytes(body_bytes).decode(encoding, errors="replace")
 

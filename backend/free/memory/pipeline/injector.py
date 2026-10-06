@@ -55,12 +55,18 @@ from backend.free.core.correction_target import (
     split_sentences,
 )
 from backend.free.core.correction_verdict import strip_copula
-from backend.free.core.intent_vocab import asks_user_profile_summary, is_plain_statement
+from backend.free.core.intent_vocab import (
+    asks_user_profile_summary,
+    is_plain_statement,
+    points_to_past_session,
+)
 from backend.free.core.relative_date import absolutize_annotated_dates, annotate_relative_dates
 from backend.free.core.text_quality import (
     carries_no_assertion,
     is_payload_dump,
     looks_like_task_log_residue,
+    mentions_self,
+    poses_only_questions_or_requests,
     states_no_user_value,
 )
 from backend.free.core.session_mode import (
@@ -87,7 +93,7 @@ from backend.free.core.query_anchors import (
     query_anchors,
 )
 from backend.log_config import get_logger
-from backend.utils import estimate_tokens
+from backend.utils import estimate_tokens, parse_utc
 from backend.free.core.script_ranges import (
     KANJI,
     KANJI_MARKS,
@@ -109,10 +115,18 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
         "corrected_aged_was": " (訂正後の記録・{age}日前、以前は「{was}」)",
         "aged": " ({age}日前の記録)",
         "note": "- (過去の記録) {content}",
+        # 今の会話ではない会話のノート (セッションが分かるときだけ)。照応の
+        # 追い質問で別の会話の記録を今の話題と取り違えないための出処
+        # (2026-10-05 trace 8232204694b3)。ラベルは turn_text.FRAME_LINE_LABELS に
+        # 登録してある (枠をまたぐ重複判定で剥がす)。
+        "note_other_session": "- (過去の記録) (別の会話) {content}",
         "as_of": "{date} 時点",
         "source": "{name}",
         "corroboration": "裏取り {n} 件",
         "unverified": "未確認",
+        "past_answer": "過去の応答",
+        "other_session": "別の会話",
+        "answer_to": "「{question}」への回答:",
         # 未検証の訂正候補 (f_02 §5.3、2026-09-26 監査 #14)。値は置換しない。
         "claimed_correction": " (後に「{wrong}ではなく{right}」との申告あり・未確認)",
     },
@@ -123,10 +137,14 @@ _RENDER_LABELS: dict[str, dict[str, str]] = {
         "corrected_aged_was": " (corrected record, {age} days ago, was 「{was}」)",
         "aged": " (recorded {age} days ago)",
         "note": "- (past record) {content}",
+        "note_other_session": "- (past record) (another conversation) {content}",
         "as_of": "as of {date}",
         "source": "{name}",
         "corroboration": "{n} corroborating sources",
         "unverified": "unverified",
+        "past_answer": "our past answer",
+        "other_session": "a different conversation",
+        "answer_to": "Reply to 「{question}」:",
         "claimed_correction": " (later stated as 「{right}」 instead of 「{wrong}」, unverified)",
     },
 }
@@ -460,6 +478,26 @@ def provenance_header(fact: SemanticFact) -> str:
     return "(" + " / ".join(parts) + ")"
 
 
+def past_answer_lead(observed_at: str, question: str, *, other_session: bool = False) -> str:
+    """問いを答えへ差し替えた行 (assistant 由来) の本文の頭 (c_16 §7.6)。
+
+    :func:`provenance_header` と同じ形・同じラベルのヘッダ ``(2026-10-01 時点 / 過去の応答 / 未確認)``
+    に、元の問い ``「Q」への回答:`` を続ける。自分の過去の出力は裏取りされていないので「未確認」は
+    常に付ける。時刻が読めなければ「時点」を省く。``other_session`` なら「別の会話」を添える —
+    進行中の会話の「さっきの」と読み違えさせない (2026-10-05 ライブ監査)。
+    """
+    labels = _render_labels()
+    parts: list[str] = []
+    stamp = parse_utc(observed_at)
+    if stamp is not None:
+        parts.append(labels["as_of"].format(date=stamp.strftime("%Y-%m-%d")))
+    parts.append(labels["past_answer"])
+    if other_session:
+        parts.append(labels["other_session"])
+    parts.append(labels["unverified"])
+    return "(" + " / ".join(parts) + ") " + labels["answer_to"].format(question=question)
+
+
 def _corroboration_count(fact: SemanticFact) -> int:
     """独立出所数 (裏取り件数) を provenance から数える (c_16 §3.1)。
 
@@ -473,6 +511,16 @@ def _corroboration_count(fact: SemanticFact) -> int:
         if key:
             sources.add(key)
     return len(sources)
+
+
+#: 別の会話の制限 (``context_bound``) から外す subject 接頭辞。本人の属性・好みは
+#: 会話の話題ではなく利用者についての記録で、照応の追い質問でも答えの材料になる。
+_USER_PROFILE_SUBJECT_PREFIXES: tuple[str, ...] = ("mem.personal.", "mem.preference.")
+
+
+def _is_topic_subject(subject: str) -> bool:
+    """会話の話題の記憶か (``mem.*`` のうち本人の属性・好み以外、純粋関数)。"""
+    return subject.startswith("mem.") and not subject.startswith(_USER_PROFILE_SUBJECT_PREFIXES)
 
 
 def _add_provenance_note_ids(sink: "set[str] | None", fact: SemanticFact) -> None:
@@ -1038,6 +1086,9 @@ class MemoryInjector:
         fact_rank_scores: "dict[str, float] | None" = None,
         previous_values: "dict[str, str] | None" = None,
         embedding_unavailable: bool = False,
+        rejected_note_ids: "Iterable[str] | None" = None,
+        current_session_id: str | None = None,
+        context_bound: bool = False,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -1092,6 +1143,26 @@ class MemoryInjector:
                 そのまま渡す。埋め込み行列を持っているストア側で 1 回の積を
                 取るのが最も安いため (:meth:`_relevance_scores` の実測)。
                 ``None`` なら従来どおり候補ごとに判定する。
+            rejected_note_ids: このターンの検索 (``unified_search`` の関連度の床、
+                Step 6.5) が **落とした** episodic ノートの id。同じノートを、より低い
+                注入の棒で拾い直さない (棒を 1 本にする)。**ノートにだけ** 掛ける —
+                床は相対 (top1 の割合) なので落ちたノートは惜しかった関連ノートで、
+                それを出処に持つファクトまで落とすと、出処が浮上しなかったファクト
+                だけが残る逆転が起きる (ファクトは自分の棒で決まる)。尋ねられた属性 /
+                語彙アンカーで免除されたノートは通す。実インシデント (2026-10-05
+                trace 8232204694b3): 床 0.670 で落ちた別の会話のノートが注入の棒
+                0.617 で戻り、京都の旅程が東京の会話に載った。
+            current_session_id: 今の会話のセッション id。``context_bound`` の
+                判定と、別の会話のノートへの ``(別の会話)`` の注記に使う。
+            context_bound: このターンの問いが今の会話の窓に結び付いている
+                (判定点 ``query_context_bound`` が発火した、照応・省略の追い質問)。
+                真なら、chat モードで **別の会話だと分かる** (セッションが今と違う)
+                会話の話題の記憶 (ノートと、``mem.personal`` / ``mem.preference``
+                以外の ``mem.*`` ファクト) はコサインだけでは載せず、尋ねられた
+                属性・語彙アンカー・今の会話の窓 (``session_user_texts``) と共有する
+                内容語のいずれかを要る。今の会話・セッション不明の記憶と、本人の
+                属性・好みは影響しない。呼出側は窓に前のアシスタントの応答がある
+                (指す対象がある) ターンでだけ真にする。
             query_embedding: 現在のユーザー発話の埋め込み。与えられた場合、
                 埋め込みを持つ候補は類似度 ``relevance_min_score`` 未満なら
                 注入しない (``pinned`` は明示指定なので常に通す)。``None``
@@ -1165,6 +1236,7 @@ class MemoryInjector:
             query_vec, facts, fact_relevance_scores,
         )
         rank_scores = dict(fact_rank_scores or {})
+        session_user_texts = list(session_user_texts)
         restated = self._restated_slots(session_user_texts, mode)
         asked_attrs = self._asked_attributes(query_text, mode)
         attr_exempt = 0
@@ -1211,6 +1283,24 @@ class MemoryInjector:
         # 訂正直後に「訂正後の内容で改めて箇条書きに」と頼まれると、訂正した
         # スロットこそが答えなのに述べ直し抑止が落としていた (F-05)。
         profile_request = bool(query_text) and asks_user_profile_summary(query_text)
+        # 検索の床で落ちたノート (棒を 1 本にする、``rejected_note_ids`` の説明)。
+        rejected_notes = {str(n) for n in (rejected_note_ids or ()) if n}
+        rejected_dropped = 0
+        # 照応・省略の追い質問で、別の会話の記憶をコサインだけで載せない
+        # (``context_bound`` の説明)。窓の内容語は窓の発話から同じ切り出し
+        # (``query_anchors``) で取る。
+        cross_session_gate = bool(context_bound) and is_chat_mode(mode)
+        window_anchors = (
+            tuple({a for t in session_user_texts for a in query_anchors(t)})
+            if cross_session_gate else ()
+        )
+        cross_session_dropped = 0
+        # 別の会話の、問い・依頼だけのノートは、問いが過去の会話を指すか本人のことを
+        # 尋ねるときだけ載せる (ノートのループの説明)。会話のターン数はここに無いので
+        # 先行ターンがあるものとして読む (``points_to_past_session`` の ``None``)。
+        query_points_to_past = points_to_past_session(query_text)
+        query_mentions_self = mentions_self(query_text)
+        cross_session_question_dropped = 0
 
         for fact in facts:
             if fact.superseded_by:
@@ -1306,6 +1396,24 @@ class MemoryInjector:
             anchored = not asked_this and _has_anchor(
                 str(getattr(fact, "object", "") or ""), anchors,
             )
+            # 検索の床 (``rejected_note_ids``) はノートにだけ掛ける。ファクトは自分の
+            # 棒で決まる — 床は相対 (top1 の割合) なので、落ちたノートは「惜しかった
+            # 関連ノート」で、それを出処に持つ本人の属性まで落とすと、出処のノートが
+            # 浮上しなかったファクトだけが残る逆転が起きる。
+            #
+            # 別の会話の制限 (``context_bound``) は会話の話題の記憶にだけ掛ける。
+            # 本人の属性・好み (``mem.personal`` / ``mem.preference``) は話題ではなく
+            # 利用者についての記録なので対象外。
+            if not (asked_this or anchored):
+                if (
+                    cross_session_gate
+                    and _is_topic_subject(str(fact.subject or ""))
+                    and self._fact_from_other_session(fact, current_session_id)
+                    and not _has_anchor(str(getattr(fact, "object", "") or ""), window_anchors)
+                ):
+                    filtered_out += 1
+                    cross_session_dropped += 1
+                    continue
             if asked_this:
                 attr_exempt += 1
             elif anchored:
@@ -1427,6 +1535,25 @@ class MemoryInjector:
             if states_no_user_value(getattr(note, "content", "")):
                 filtered_out += 1
                 continue
+            # 別の会話の、問い・依頼だけのノートは、問いが過去の会話を指すか
+            # (``points_to_past_session``)、本人のことを尋ねる (一人称がある) ときだけ
+            # 載せる。上の 2 つは問いの前に置いた数量の前提 (「100万円を年利3%で
+            # 10年運用すると…？」) を値と読む (後のセッションの「私が注文した個数は」の
+            # 根拠、E-05) が、試算の前提はその会話の仮定で、別の会話では今の問いの数を
+            # 取り違えさせる (2026-10-05 trace 22d3d78a7b38: 「元本との差額はいくらですか？」
+            # に別の会話の試算の問いが 3 件載った)。E-05 の想起は一人称で本人の値を
+            # 尋ねるので通す。問いの前の節で本人が言明した文 (「私の誕生日は3月14日
+            # なんですけど、あと何日ですか？」) は問いだけと読まない。
+            # pin を例外にしない理由は上の 2 つと同じ。
+            if (
+                not query_points_to_past
+                and not query_mentions_self
+                and self._note_from_other_session(note, current_session_id)
+                and poses_only_questions_or_requests(getattr(note, "content", "") or "")
+            ):
+                filtered_out += 1
+                cross_session_question_dropped += 1
+                continue
             # アシスタント自身の発話は ``(過去の記録)`` の根拠にしない。
             #
             # 派生物であって出典ではない。ユーザーの言明を復唱しただけのものは
@@ -1477,6 +1604,26 @@ class MemoryInjector:
                 if note_form is not None and not set(note_form[1]) & set(query_form[1]):
                     filtered_out += 1
                     continue
+            # 尋ねられた属性 / 語彙アンカーの決定論の根拠があるノートは、検索の床と
+            # 別の会話の扱いから免除する (ファクト側と同じ立て付け)。
+            note_content = getattr(note, "content", "") or ""
+            note_exempt = _has_anchor(note_content, anchors) or bool(
+                asked_attrs
+                and any(slug in asked_attrs for _, slug in _attribute_slots_of(note_content))
+            )
+            if not note_exempt:
+                if note.id in rejected_notes:
+                    filtered_out += 1
+                    rejected_dropped += 1
+                    continue
+                if (
+                    cross_session_gate
+                    and self._note_from_other_session(note, current_session_id)
+                    and not _has_anchor(note_content, window_anchors)
+                ):
+                    filtered_out += 1
+                    cross_session_dropped += 1
+                    continue
             gate_reached += 1
             if not self._passes_gate(
                 query_vec, note,
@@ -1498,7 +1645,10 @@ class MemoryInjector:
             score = self._score_note(
                 note, note_scores.get(id(note)), duplicate_of_live_fact,
             )
-            text = self._render_note(note)
+            text = self._render_note(
+                note,
+                other_session=self._note_from_other_session(note, current_session_id),
+            )
             tokens = estimate_tokens(text)
             buckets[tier].append(
                 InjectedItem(
@@ -1567,6 +1717,21 @@ class MemoryInjector:
             sorted(anchors) or "-", anchor_exempt,
             retired_dropped, topicless_dropped,
         )
+        if rejected_dropped or cross_session_dropped:
+            logger.info(
+                "MemoryInjector: dropped %d item(s) rejected by the search floor "
+                "and %d cross-session item(s) without an anchor for a "
+                "context-bound query (rejected_ids=%d, context_bound=%s)",
+                rejected_dropped, cross_session_dropped, len(rejected_notes),
+                bool(context_bound),
+            )
+        if cross_session_question_dropped:
+            logger.info(
+                "MemoryInjector: dropped %d question/request-only note(s) from other "
+                "conversations; the query neither points to a past conversation nor "
+                "refers to the user",
+                cross_session_question_dropped,
+            )
         if retired_dropped:
             # 訂正が効いているかを実機で追えるようにする (沈黙で落とさない)。
             logger.info(
@@ -1677,6 +1842,28 @@ class MemoryInjector:
             if score is not None:
                 out[id(item)] = score
         return out
+
+    @staticmethod
+    def _fact_from_other_session(fact: SemanticFact, session_id: str | None) -> bool:
+        """ファクトが **別の会話だと分かる** か (出処のセッションが不明なら偽)。
+
+        不明を別の会話と扱わない — 注記 (``(別の会話)``) も不明には付けないので、
+        ゲートと表示で同じ読みにする。
+        """
+        if not session_id:
+            return False
+        sessions = {
+            str(sid) for p in (getattr(fact, "provenances", None) or ())
+            if (sid := getattr(p, "session_id", None))
+        }
+        sessions.update(str(x) for x in (getattr(fact, "session_ids", None) or ()) if x)
+        return bool(sessions) and session_id not in sessions
+
+    @staticmethod
+    def _note_from_other_session(note: MemoryNote, session_id: str | None) -> bool:
+        """ノートが **別の会話だと分かる** か (セッションが不明なら偽)。"""
+        other = str(getattr(note, "session_id", "") or "")
+        return bool(session_id) and bool(other) and other != session_id
 
     def _passes_gate(
         self,
@@ -2399,14 +2586,19 @@ class MemoryInjector:
         比べるのはノートを取り込んだ時刻とファクトを作った時刻 — ファクトより
         前のノートは、そのファクトの抽出で既に考慮済み。アシスタントのノートは
         根拠にしない (古い値を答えた応答が「新しい言い直し」に見えるため)。
+        検証済みの編集 (``slot_edit_slot``) も言い直しに数える — 編集後の値の
+        ファクトは編集の発話時刻で作られるので落ちず、編集前のファクトが落ちる。
         """
-        from backend.free.memory.notes.note_builder import restated_attribute_slot
+        from backend.free.memory.notes.note_builder import note_state_slot
 
         latest: dict[str, float] = {}
         for note in stm_notes:
             if getattr(note, "source", "user") != "user":
                 continue
-            slot = restated_attribute_slot(getattr(note, "content", "") or "")
+            slot = note_state_slot(
+                getattr(note, "content", "") or "",
+                getattr(note, "slot_edit_slot", None),
+            )
             if slot is None:
                 continue
             created = float(getattr(note, "created_at", 0.0) or 0.0)
@@ -2517,7 +2709,7 @@ class MemoryInjector:
         """
         return bool(stale_texts) and _normalize_for_dup(content) in stale_texts
 
-    def _render_note(self, note: MemoryNote) -> str:
+    def _render_note(self, note: MemoryNote, *, other_session: bool = False) -> str:
         """STM ノートを 1 行にレンダリングする。
 
         ノート本文は過去セッションの生の会話テキストで、「先ほど〜と言いました
@@ -2540,7 +2732,8 @@ class MemoryInjector:
                 )
             except (TypeError, ValueError, OverflowError, OSError):
                 pass
-        return _render_labels()["note"].format(content=_absolute_dates(content))
+        label = "note_other_session" if other_session else "note"
+        return _render_labels()[label].format(content=_absolute_dates(content))
 
     # ── パッキング ───────────────────────────────────────────────────
 

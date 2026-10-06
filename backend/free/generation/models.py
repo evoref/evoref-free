@@ -234,3 +234,8 @@ class GenerationPlan:
     # (2026-09-21 実機: 「3 点」の依頼に箇条書きが 13 個)。本文生成が原文を直接
     # 参照できるよう、orchestrator が計画の確定後に入れる。
     instruction: str = ""
+    # orchestrator が本文の外に足す見出し・タイトル・unit 間の区切りの文字数。
+    # 長さの検証は見出し込みの全文を数えるので、unit の目標文字数の配分
+    # (strategy_common.unit_target_chars) はこの分を目標から引く。
+    # orchestrator が unit 生成の前に入れる。
+    markup_chars: int = 0

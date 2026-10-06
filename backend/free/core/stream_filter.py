@@ -1039,6 +1039,137 @@ class UnwrittenFileClaimFilter:
         return unwritten_file_disclosure_note(missing)
 
 
+class SignCorrectionFilter:
+    """冒頭の値の符号が本文の計算と異なることを末尾の注記で示す。
+
+    2026-10-05 ライブ監査: 「2人で4000円です。… 44,000円 - 48,000円 = -4,000円」。
+    ``find_sign_contradiction`` は成否を failed (``content.sign``) にするが、利用者には
+    誤った冒頭がそのまま残っていた。本文は既にストリーミングで送っているので書き換え
+    ず、``UnwrittenFileClaimFilter`` と同じく末尾の注記で示す。注記は「符号が異なる」
+    だけを述べ、どちらが正しいかは言わない (判定は変化量・差の向きでも当たる、
+    ``text_quality.sign_correction_note``)。再生成はしない
+    (iGPU でもう 1 本のフル生成は重く、判定が決定論で確定しているので注記で足りる)。
+
+    検証器の発火の記録は成否の導出 (``FeedbackCollector`` → ``content.sign``) が
+    行う — ここでも積むと同じターンを 2 回数える。
+    """
+
+    def __init__(self) -> None:
+        self._seen: list[str] = []
+
+    def process(self, token: str) -> str:
+        if token:
+            self._seen.append(token)
+        return token
+
+    def flush(self) -> str:
+        from backend.free.core.text_quality import sign_correction_note
+
+        response = "".join(self._seen)
+        self._seen.clear()
+        note = sign_correction_note(response)
+        if note:
+            logger.info("Lead value has the opposite sign of the body; appended a note")
+        return note
+
+
+class UnreadFileEntityFilter:
+    """読めていないファイルの問いに根拠の無い人名で答えたことを末尾で開示する。
+
+    2026-10-05 ライブ監査 T2: staff.csv の読みが失敗した次のツール無しのターンで
+    「一番給与が高い人は、佐藤健太さんです。」と答えた。ツール無しのターンには
+    「中身を読めたファイル: なし」の確定事実を渡す (``deliberative.
+    _append_session_files_fact``) が、モデルが守るとは限らない。その事実を渡した
+    ターン (検証器の台帳 ``current_unread_session_files``) に限り、敬称付きで名指した
+    人名がプロンプトのどこにも無ければ注記する。確定事実を渡していないターンは
+    素通し (一般知識の答えの人名を巻き込まない)。
+    """
+
+    def __init__(self) -> None:
+        self._seen: list[str] = []
+
+    def process(self, token: str) -> str:
+        if token:
+            self._seen.append(token)
+        return token
+
+    def flush(self) -> str:
+        from backend.free.core.text_quality import (
+            ungrounded_answer_names,
+            unread_file_entity_note,
+        )
+        from backend.free.core.verifier_events import current_unread_session_files
+
+        response = "".join(self._seen)
+        self._seen.clear()
+        files, grounding = current_unread_session_files()
+        if not files or not response.strip():
+            return ""
+        # カタカナだけの名前は読み・役割語と区別できないので開示しない。
+        names, _kana = ungrounded_answer_names(response, grounding)
+        if not names:
+            return ""
+        logger.info(
+            "Named people not grounded while no file content was read: %s", names,
+        )
+        return unread_file_entity_note(files, names)
+
+
+class TableAggregateFilter:
+    """コードで集計した表の値を応答が述べていなければ、正しい値を末尾の注記で示す。
+
+    2026-10-05 ライブ監査: sales.csv の月別合計 3 つをモデルが暗算で誤った。集計は
+    ``agent.table_aggregate_intent`` がコードで行い結果をプロンプトへ渡す
+    (``verifier_events.record_table_aggregate``) が、モデルが守るとは限らない。本文は
+    ストリーミングで送り済みなので書き換えず、``SignCorrectionFilter`` と同じく末尾で
+    正す (docs/f_03 §4.2.2)。集計を渡していないターンは素通し。
+    """
+
+    def __init__(self) -> None:
+        self._seen: list[str] = []
+
+    def process(self, token: str) -> str:
+        if token:
+            self._seen.append(token)
+        return token
+
+    def flush(self) -> str:
+        from backend.free.core.table_aggregate import AggregateResult, mismatch_note
+        from backend.free.core.verifier_events import (
+            current_table_aggregate,
+            record_verifier_hit,
+        )
+
+        response = "".join(self._seen)
+        self._seen.clear()
+        result = current_table_aggregate()
+        if not isinstance(result, AggregateResult):
+            return ""
+        note = mismatch_note(response, result)
+        if note:
+            record_verifier_hit("content.table_aggregate")
+            logger.info("Response did not state the table aggregate computed by code")
+        return note
+
+
+def disclosure_notes(text: str) -> str:
+    """本文の後ろへ足す開示注記 (未書込み / 符号 / 読めていないファイルの人名 / 表の集計) を返す。
+
+    ストリーミングではパイプラインの末尾のフィルタが同じ注記を足す。出力制約の検証で
+    本文を溜めて修復した経路 (``chat_stream_deliberative._emit_verified_output``) は
+    パイプラインからこれらのフィルタを外しているので、修復後の本文に対してここで足す。
+    フィルタを 1 本ずつ通すので判定は同じ実装のまま。
+    """
+    notes = ""
+    for filt in (
+        UnwrittenFileClaimFilter(), SignCorrectionFilter(), UnreadFileEntityFilter(),
+        TableAggregateFilter(),
+    ):
+        filt.process(text)
+        notes += filt.flush()
+    return notes
+
+
 #: 未確定の文末に月日が書きかけで残っている (「10」「10 月 1」)。
 _PENDING_DATE_RE = re.compile(r"\d\s*(?:月|$)")
 _SENTENCE_ENDS = "。！？!?\n"

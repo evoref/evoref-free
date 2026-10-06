@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import math
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -15,6 +17,7 @@ from backend.free.agent.meta_cognitive_utils import (
     generated_content_rejection,
     is_tool_error,
     strip_markdown_wrapper,
+    tool_result_lacks_information,
     tool_result_succeeded,
 )
 from backend.free.agent.tool_call_judge import (
@@ -35,7 +38,10 @@ from backend.free.agent.tools.builtin import (
 from backend.free.agent.write_gate import WriteDenial, normalize_write_path
 from backend.free.constants import (
     READ_FILE_META_PREFIX,
+    SEARCH_HISTORY_EMPTY_WINDOW_CURRENT_MARK,
+    SEARCH_HISTORY_EMPTY_WINDOW_LEAD,
     search_history_display_text,
+    search_history_window_note,
 )
 from backend.free.core.date_math_cue import (
     conversation_has_date_math_cue,
@@ -43,7 +49,17 @@ from backend.free.core.date_math_cue import (
 )
 from backend.free.core.markdown_fence import outer_fence
 from backend.free.core.session_mode import is_chat_mode, is_create_mode
-from backend.free.core.verifier_events import record_grounding
+from backend.free.core.table_aggregate import parse_table
+from backend.free.core.table_aggregate import result_block as table_aggregate_block
+from backend.free.core.verifier_events import (
+    current_tool_decision,
+    decided_by_shortcut,
+    record_grounding,
+    record_table_aggregate,
+    record_tool_decision,
+    record_unread_session_files,
+)
+from backend.free.agent.table_aggregate_intent import aggregate_retrieved_table
 from backend.free.agent.issue_ledger import count_kind, format_issues
 from backend.free.agent.file_ledger import (
     last_written_path,
@@ -59,7 +75,16 @@ from backend.free.agent.file_reference_gate import (
     LOCATE_LABEL,
     recent_file_reference_rule,
 )
-from backend.free.agent.tool_ledger import format_ledger, latest_use
+from backend.free.agent.tool_ledger import (
+    GENERATED_DRAFT_TOOLS,
+    OBSERVATION_TOOLS,
+    Observation,
+    format_ledger,
+    latest_use,
+    observation_is_stale,
+    recent_observations,
+    session_results,
+)
 from backend.free.core.intent_vocab import (
     assistant_code_blocks,
     is_today_scope_query,
@@ -72,6 +97,7 @@ from backend.free.core.intent_vocab import (
     own_process_question,
     self_assessment_question,
     PREMISE_CONFIRMATION_RE,
+    premise_needs_evidence,
     persist_request,
     resolve_session_answer,
     resolve_session_position_message,
@@ -84,7 +110,7 @@ from backend.free.core.intent_vocab import (
     unverified_claim_numbers,
 )
 from backend.free.core.inference import messages_carry_evidence
-from backend.free.core.text_quality import misrounded_result_values
+from backend.free.core.text_quality import asks_for_person, misrounded_result_values
 from backend.free.core.turn_text import TOOL_RESULT_HEADER, append_to_last_user
 from backend.config import resolve_context_size_for_mode
 from backend.i18n_helper import prompt_locale
@@ -120,6 +146,11 @@ def _localized(table: dict[str, str]) -> str:
     注記の文言は ``_X_GUIDANCE`` (ja、既存名) と ``_X_GUIDANCES`` (locale 辞書)
     の対で持つ。ja は既存の文字列と同一 (既定出力は不変)。
     """
+    return table.get(prompt_locale(), table["ja"])
+
+
+def _localized_map(table: dict[str, dict[str, str]]) -> dict[str, str]:
+    """:func:`_localized` の表 (ラベルの辞書) 版。"""
     return table.get(prompt_locale(), table["ja"])
 
 
@@ -298,6 +329,191 @@ _TOOL_FAILED_GUIDANCES: dict[str, str] = {
         "do not say it was completed."
     ),
 }
+
+#: 実行環境を測るツール (read_file / list_directory / コマンド …) を **実行して失敗した**
+#: ときの文言 (``_append_tool_error_note``)。以前は「この環境を調べるツールを 1 つも
+#: 実行していない」(``_UNMEASURED_FACT_GUIDANCE``) を付けており、実行して失敗した
+#: ターンで「今回は調べていないので分かりません」と答えた (2026-10-05 ライブ監査 T1)。
+#: ``{tool}`` / ``{kind}`` / ``{target}`` / ``{places}`` は実行の記録から入る。
+_TOOL_RAN_AND_FAILED_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: 上記のツール {tool} は実行したが失敗した (種別: {kind}、"
+        "対象: {target})。{places}結果はエラー文であって、ファイルの中身や求めた値ではない。"
+        "見つからなかった (開けなかった) ことと、探した場所をそのまま伝えること。"
+        "中身・数値・人名・項目を推測して述べないこと。"
+        "「調べていない」「ツールを実行していない」とは述べないこと (実行して失敗した)。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the tool {tool} above was run and failed (kind: {kind}, "
+        "target: {target}). {places}The result is an error message, not the file's "
+        "content or the requested value. Say that it was not found (could not be "
+        "opened) and where it looked, as given. Do not guess or describe any content, "
+        "numbers, names, or items. Do not say it was not checked or that no tool was "
+        "run (it was run and failed)."
+    ),
+}
+#: 失敗の種別の表示名 (``meta_cognitive_tool_io.tool_error_kind`` の値)。
+_TOOL_FAILURE_KIND_LABELS: dict[str, dict[str, str]] = {
+    "ja": {
+        "not_found": "見つからない", "ambiguous": "同じ名前が複数の場所にある",
+        "unresolved_host": "ホスト名を解決できない", "unreachable": "接続できない",
+        "error": "エラー",
+    },
+    "en": {
+        "not_found": "not found", "ambiguous": "the same name exists in several places",
+        "unresolved_host": "host name not resolved", "unreachable": "unreachable",
+        "error": "error",
+    },
+}
+#: 探した場所 / 候補の一文 (``{places}`` の中身)。
+_TOOL_FAILURE_PLACES: dict[str, dict[str, str]] = {
+    "ja": {
+        "searched": "探した場所: {items}。",
+        "candidates": "同じ名前の候補: {items}。どれを指すかユーザーに確かめること。",
+    },
+    "en": {
+        "searched": "Places searched: {items}. ",
+        "candidates": "Candidates with the same name: {items}. Ask the user which one is meant. ",
+    },
+}
+
+#: ファイルを一覧した / 読めなかったが、中身を読めたファイルが無いセッションの
+#: ツール無しのターンに渡す確定事実 (``_append_session_files_fact``)。2026-10-05
+#: ライブ監査 T2: staff.csv の読みが失敗した次のターンの「一番給与が高い人は誰ですか？」
+#: がツール無しで「佐藤健太さん」と作話した。``{files}`` は台帳の状態の一覧。
+_SESSION_FILES_FACTS: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: この会話で中身を読めたファイル: なし。"
+        "ファイルの状態 (実行時に機械的に記録した値):\n{files}"
+        "\nしたがって、これらのファイルの中身 (値・人名・項目・数値) は分からない。"
+        "中身を前提にした答えを述べず、読めていないことと上の状態を伝え、"
+        "必要ならフォルダを含めたパスで読み直すことを提案すること。"
+    ),
+    "en": (
+        "\n\nEstablished fact: files whose content was read in this conversation: none. "
+        "File status (recorded mechanically at execution time):\n{files}"
+        "\nTherefore the content of these files (values, names, items, numbers) is "
+        "unknown. Do not answer as if you knew it; say it has not been read, give the "
+        "status above, and if needed suggest reading it again with the folder in the path."
+    ),
+}
+_SESSION_FILE_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "ja": {
+        "listed": "一覧で見えただけ (中身は読んでいない)",
+        "read_failed": "読込み失敗 ({kind}{places})",
+        "searched": "、探した場所: ",
+        "candidates": "、候補: ",
+    },
+    "en": {
+        "listed": "seen in a listing only (content not read)",
+        "read_failed": "read failed ({kind}{places})",
+        "searched": ", searched: ",
+        "candidates": ", candidates: ",
+    },
+}
+
+#: 前のターンで取得した資料 (read_file / fetch_url の本文) を持ち越すブロック
+#: (``_append_recent_observations``)。2026-10-05 ライブ監査: sales.csv を読んで月別合計を
+#: 答えた次のターンの「地域別ではどちらが多いですか？」がツール無しで、履歴には応答しか
+#: 無く、実在しない North / South の金額を作った (実際の地域は東 / 西)。
+#:
+#: 区切り (``turn_text.MATERIAL_TRAILING_DELIMITERS``) の後ろに置くので、
+#: ``split_last_user`` では後置 (suffix) に入る — 送信時ガード
+#: (``LocalClient._shrink_last_user``) が末尾から削れ、ユーザーの発言
+#: (``user_utterance_text``) にも数えられない。ガードは末尾から削るので、指示を本文の
+#: **前** に置く (削られても指示は残る)。``{items}`` は資料ごとの見出し + 本文。
+_RECENT_OBSERVATION_BLOCKS: dict[str, str] = {
+    "ja": (
+        "[この会話で取得した資料] 前のターンでツールが取得した本文 (取得した時点の写し)。"
+        "今回の問いがこの資料についてなら、下の本文に書かれた値・項目名だけを根拠に答え、"
+        "集計・比較は本文の行から行うこと。本文に無い項目名・区分・数値を作らない。"
+        "今回の問いに関係しなければ、この資料に触れずに答えること。\n"
+        "{items}\n[資料ここまで]"
+    ),
+    "en": (
+        "[Material retrieved in this conversation] Text a tool retrieved in an earlier "
+        "turn (as it was when retrieved). If the current question is about this "
+        "material, answer only from the values and labels written below, and compute "
+        "totals or comparisons from its rows. Do not invent labels, categories or "
+        "numbers that are not in it. If the question is unrelated, answer without "
+        "mentioning this material.\n{items}\n[End of material]"
+    ),
+}
+#: 上の枠の、表の集計結果 (``core.table_aggregate.result_block``) を前に置くときの文面。
+#: 「集計・比較は本文の行から」と集計の枠の「計算し直さない」が食い違わないよう、集計に
+#: ある値はそこから取らせる (docs/f_03 §4.2.2 の 6)。
+_RECENT_OBSERVATION_BLOCKS_WITH_AGGREGATE: dict[str, str] = {
+    "ja": _RECENT_OBSERVATION_BLOCKS["ja"].replace(
+        "集計・比較は本文の行から行うこと。",
+        "上の集計結果にある値はそこから取り、それ以外の集計・比較は本文の行から行うこと。",
+    ),
+    "en": _RECENT_OBSERVATION_BLOCKS["en"].replace(
+        "and compute totals or comparisons from its rows.",
+        "take values that are in the aggregation result above from it, and compute "
+        "other totals or comparisons from its rows.",
+    ),
+}
+_RECENT_OBSERVATION_LABELS: dict[str, dict[str, str]] = {
+    "ja": {
+        "head": "### {source} ({age} ターン前に取得)",
+        "truncated": (
+            "(全 {total} 文字のうち先頭 {shown} 文字だけを載せた。載せていない部分に"
+            "かかる値は分からないと述べること)"
+        ),
+        "stale": (
+            "### {source}: 取得した後に変更されたか、見つからない。以前に取得した中身は"
+            "今の内容と違う可能性があるので、中身に基づく値を述べず、読み直すことを提案すること。"
+        ),
+    },
+    "en": {
+        "head": "### {source} (retrieved {age} turn(s) ago)",
+        "truncated": (
+            "(only the first {shown} of {total} characters are shown; say that values in "
+            "the omitted part are unknown)"
+        ),
+        "stale": (
+            "### {source}: changed or missing since it was retrieved. The earlier content "
+            "may differ from the current one, so do not state values from it; suggest "
+            "reading it again."
+        ),
+    },
+}
+#: ブロックの開きと閉じ (本文の中の同じ文字列は全角の括弧へ崩す)。両 locale。
+_RECENT_OBSERVATION_TAGS = (
+    "[この会話で取得した資料]", "[資料ここまで]",
+    "[Material retrieved in this conversation]", "[End of material]",
+)
+#: 資料ごとの見出しの書き出し。本文の行頭の同じ書き出しは全角へ崩す (見出しを装えない)。
+_RECENT_OBSERVATION_HEAD = "### "
+#: 持ち越す本文の合計の上限 (推定トークン)。deliberative の組立ては最後の user に
+#: ツール結果ぶん (``chat_service.deliberative_post_append_reserve_tokens`` =
+#: ``TOOL_RESULT_MAX_CHARS // 2`` + 注記の定額) を予約しているので、ツールを撃たない
+#: ターンはその枠に収める。ツールを撃ったターンは結果の推定トークンを差し引いた残り。
+RECENT_OBSERVATION_MAX_TOKENS = TOOL_RESULT_MAX_CHARS // 2
+#: 2 ターン以上前の取得に充てる上限は ``RECENT_OBSERVATION_MAX_TOKENS`` のこの分の 1。
+#: 話題が移っている見込みが高いので、無関係なターンに払う量を小さくする。
+_RECENT_OBSERVATION_OLDER_DIVISOR = 4
+#: 残りの枠がこれ未満なら、それより古い取得は載せない (見出しだけの断片を作らない)。
+_RECENT_OBSERVATION_MIN_TOKENS = 64
+#: 往復の前に表の本文が枠に収まるかを見るときに、集計の枠のために取っておく推定トークン。
+_CARRIED_AGGREGATE_LEAD_RESERVE_TOKENS = 256
+#: 撃ったら持ち越した表を集計しないツール (答えの中心は書込み・実行の結果)。
+_NO_CARRIED_AGGREGATE_TOOLS = _STATE_CHANGING_TOOL_NAMES | {"run_command"}
+
+
+def _neutralize_material(text: str) -> str:
+    """持ち越す本文 (と表のセル由来の集計の枠) が、枠の見出し・区切り・このブロックの
+    開閉・資料の見出しを装って枠を抜けないようにする。"""
+    from backend.free.core.turn_text import neutralize_frame_markers
+
+    text = neutralize_frame_markers(text)
+    for tag in _RECENT_OBSERVATION_TAGS:
+        text = text.replace(tag, "［" + tag[1:-1] + "］")
+    return "\n".join(
+        "＃＃＃ " + line[len(_RECENT_OBSERVATION_HEAD):]
+        if line.startswith(_RECENT_OBSERVATION_HEAD) else line
+        for line in text.split("\n")
+    )
 
 #: 窓内想起のガードが履歴検索を止めたターンの文言 (``_append_recall_in_window_note``)。
 #: 対象は進行中の会話の発言で、答えは上の会話履歴にある。
@@ -537,34 +753,52 @@ _SEARCH_HISTORY_RESULT_GUIDANCES: dict[str, str] = {
 # 「約 16,258 リットル」と回答され、さらに「土の比重 1.3 を掛けた結果」という
 # 式に存在しない根拠が創作された)。式を併記したうえで、単位は入力に従うこと・
 # 式に無い係数を語らないことを明示する。
-#: 先頭の「厳密な結果をそのまま使え」。式に会話に無い値があるときは
+#: 先頭の「答えの数値はこの結果から取れ」。式に会話に無い値があるときは
 #: :data:`_CALCULATE_ASSUMED_LEADS` に差し替える (docs/f_03 §3.5)。
+#: 以前は「そのまま使え」で、浮動小数の桁をそのまま写した (2026-10-05 ライブ監査:
+#: 「BMIは24.2214532872です」「1,343,916.37934円」)。値はこの結果から取り、問いと
+#: 単位に合った精度へ丸めて示す。丸めの正誤は ``core/text_quality.misrounded_result_values``
+#: が見る (その桁で丸めて一致すれば通し、合わなければ欠陥) ので、丸め以外の変更は許さない。
 _CALCULATE_EXACT_LEADS: dict[str, str] = {
     "ja": (
         "上記の ## ツール実行結果 は、システムが calculate ツールで実際に評価した式と"
-        "その厳密な計算結果である。数値はこの結果をそのまま使うこと。"
+        "その厳密な計算結果である。答えの数値はこの結果から取ること。示すときは問いと"
+        "単位に合った精度に丸めること (金額は通貨の最小単位、BMI や百分率は小数 1〜2 桁、"
+        "整数の結果はそのまま)。丸め以外に値を変えないこと。"
     ),
     "en": (
         "The ## ツール実行結果 above is the expression the system actually "
-        "evaluated with the calculate tool and its exact result. Use the "
-        "number as is. "
+        "evaluated with the calculate tool and its exact result. Take the "
+        "number in your answer from this result. Present it rounded to a "
+        "precision that fits the question and the unit (money to the smallest "
+        "currency unit, BMI or percentages to 1-2 decimal places, exact "
+        "integers as they are). Do not change the value in any other way. "
     ),
 }
 #: 式に会話に無い値 (``unexplained_numbers``) があるときの先頭。「厳密」と
 #: 後置の「仮定として断れ」が矛盾し、仮定の税率で断定の試算を返した
-#: (2026-09-26 監査 C13#4)。
+#: (2026-09-26 監査 C13#4)。ただし会話に無い値がすべて仮定とは限らない — 公式・
+#: 単位換算の定義上の定数 (華氏→摂氏の 32 と 5/9) まで「仮定した試算」と述べた
+#: (2026-10-05 ライブ監査: 「32、5、9を…仮定した試算では、37度です。」)。値ごとに
+#: 定数か前提かを述べさせ、仮定の宣言は前提だけに求める。
 _CALCULATE_ASSUMED_LEADS: dict[str, str] = {
     "ja": (
         "上記の ## ツール実行結果 は、システムが calculate ツールで実際に評価した式と"
-        "その結果だが、会話に無い値 {listed} を仮定した試算である。"
-        "答えの冒頭で、どの値を仮定した試算かを明示すること。"
+        "その結果である。ただし式中の値 {listed} は会話に現れていない。"
+        "答えでは式を示し、それらの値がそれぞれ何か (公式・単位換算の定義上の定数か、"
+        "計算のために置いた前提か) を述べること。答えの冒頭で仮定だと明示するのは"
+        "前提の値だけでよい。答えの数値はこの結果から取り、問いと単位に合った精度に"
+        "丸めて示すこと。"
     ),
     "en": (
         "The ## ツール実行結果 above is the expression the system actually "
-        "evaluated with the calculate tool and its result, but it is an "
-        "estimate that assumes {listed}, which does not appear in the "
-        "conversation. State at the start of the answer which value was "
-        "assumed. "
+        "evaluated with the calculate tool and its result. However, {listed} in "
+        "the expression does not appear in the conversation. In the answer, show "
+        "the expression and say what each of these values is: a definitional "
+        "constant of a formula or unit conversion, or a premise assumed for the "
+        "calculation. Only a premise needs to be declared as an assumption at the "
+        "start of the answer. Take the number in your answer from this result, "
+        "rounded to a precision that fits the question and the unit. "
     ),
 }
 _CALCULATE_RESULT_GUIDANCE = (
@@ -656,6 +890,149 @@ def _expression_issues_note(issues: tuple[str, ...]) -> str:
     return _localized(_EXPRESSION_ISSUES_NOTES).format(listed=listed)
 
 
+#: calculate の結果が負のときの注記 (``_negative_result_note``)。2026-10-05 ライブ監査:
+#: 「食事と観光に使えるのは2人でいくら残りますか？」に式 ``44000 - 48000 = -4000`` を
+#: 書きながら冒頭は「2人で4000円です。」と符号を落とした。符号を落とすなだけの文言では
+#: 「何パーセント増減しましたか？」(-18.6) に「-18.6%増減しました」と答えた (69d12e1fe681)。
+#: **向きの語は注記が決めない** — 差額の符号は被演算子の順で変わり
+#: (``30000*12*10 - 4202723``)、負の側の語だけを例に挙げると逆向きの答えに寄せる。冒頭が
+#: 負の向きの語を含むと ``find_sign_contradiction`` は報告しないので検出にも掛からない。
+#: 式から引き算 ``A - B`` にたどれれば大小を述べ (``_NEGATIVE_RESULT_SOURCE_NOTES``)、
+#: たどれなければ向きの語を対で示す。問いの語では絞らない (docs/f_03)。
+_NEGATIVE_RESULT_SOURCE_NOTES: dict[str, str] = {
+    "ja": (
+        "計算結果は負の値 ({value}) である。式では {smaller} が {larger} より小さい"
+        " ({larger} の方が大きい) ため負になっている。向きを語で述べるなら、この大小に"
+        "合う語を選び、主語は問いに合わせること (どちらの量を主語にするかで「減少・不足・"
+        "下回る」と「増加・超過・上回る」が入れ替わる)。量そのものが負になりうる値"
+        " (気温など) なら、符号付きのまま述べる。符号付きの値に「増減」「変化」のような"
+        "両向きの語を添えないこと。大きさだけを「{magnitude}」と向き無しで書かない。"
+    ),
+    "en": (
+        "The result is negative ({value}). In the expression, {smaller} is smaller "
+        "than {larger} ({larger} is larger), which is why it is negative. If you state "
+        "the direction in words, pick the word that matches this ordering and phrase it "
+        "from the subject of the question (the subject decides between \"decrease / "
+        "short / below\" and \"increase / over / above\"). If the quantity itself can "
+        "be negative (e.g. a temperature), state the signed value as is. Never pair a "
+        "signed value with a two-way word (\"increase or decrease\", \"change\"), and "
+        "never write only the magnitude \"{magnitude}\" without a direction. "
+    ),
+}
+_NEGATIVE_RESULT_NOTES: dict[str, str] = {
+    "ja": (
+        "計算結果は負の値 ({value}) である。符号がどの値の大小から来るかを式で確かめ、"
+        "向きを語で述べるなら大小に合う語を選ぶこと (「{magnitude} 減少 / {magnitude} 増加」"
+        "「{magnitude} 不足 / {magnitude} 超過」のどちらかを、主語は問いに合わせて選ぶ)。"
+        "量そのものが負になりうる値 (気温など) なら、符号付きのまま述べる。"
+        "符号付きの値に「増減」「変化」のような両向きの語を添えないこと。"
+        "大きさだけを「{magnitude}」と向き無しで書かない。"
+    ),
+    "en": (
+        "The result is negative ({value}). Check in the expression which values make "
+        "it negative, and if you state the direction in words, pick the word that "
+        "matches that ordering (either \"decreased by {magnitude}\" or \"increased by "
+        "{magnitude}\", either \"{magnitude} short\" or \"{magnitude} over\", phrased "
+        "from the subject of the question). If the quantity itself can be negative "
+        "(e.g. a temperature), state the signed value as is. Never pair a signed value "
+        "with a two-way word (\"increase or decrease\", \"change\"), and never write "
+        "only the magnitude \"{magnitude}\" without a direction. "
+    ),
+}
+
+
+def _numeric_value(node: ast.AST) -> float | None:
+    """数値リテラルと四則・冪だけの部分式を評価する (純粋関数、それ以外は ``None``)。"""
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        inner = _numeric_value(node.operand)
+        if inner is None:
+            return None
+        return -inner if isinstance(node.op, ast.USub) else inner
+    if not isinstance(node, ast.BinOp):
+        return None
+    left, right = _numeric_value(node.left), _numeric_value(node.right)
+    if left is None or right is None:
+        return None
+    try:
+        if isinstance(node.op, ast.Add):
+            result = left + right
+        elif isinstance(node.op, ast.Sub):
+            result = left - right
+        elif isinstance(node.op, ast.Mult):
+            result = left * right
+        elif isinstance(node.op, ast.Div):
+            result = left / right
+        elif isinstance(node.op, ast.Pow) and abs(right) <= 1000:
+            result = left ** right
+        else:
+            return None
+    except (ZeroDivisionError, OverflowError):
+        return None
+    if isinstance(result, complex) or not math.isfinite(result):
+        return None
+    return result
+
+
+def _negative_source(expression: str) -> tuple[str, str] | None:
+    """負の結果の出所の引き算 ``A - B`` を ``(A, B)`` の綴りで返す (純粋関数)。
+
+    積・商は他方の項が正のときだけ負の側へたどる (``(791 - 972) / 972 * 100`` →
+    ``("791", "972")``)。引き算に着かない・評価できない式は ``None``。
+    """
+    try:
+        tree = ast.parse(expression or "", mode="eval")
+    except SyntaxError:
+        return None
+    node = tree.body
+    while isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Div)):
+        left, right = _numeric_value(node.left), _numeric_value(node.right)
+        if left is None or right is None:
+            return None
+        if left < 0 < right:
+            node = node.left
+        elif right < 0 < left:
+            node = node.right
+        else:
+            return None
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub)):
+        return None
+    value = _numeric_value(node)
+    if value is None or value >= 0:
+        return None
+    smaller = ast.get_source_segment(expression, node.left)
+    larger = ast.get_source_segment(expression, node.right)
+    if not smaller or not larger:
+        return None
+    return smaller.strip(), larger.strip()
+
+
+def _negative_result_note(result_text: str, expression: str = "") -> str:
+    """calculate の結果が負の有限の数なら、符号の出所と向きの述べ方の注記 (純粋関数)。
+
+    式から引き算 ``A - B`` にたどれれば「A が B より小さい」と大小を述べ、たどれなければ
+    向きの語を対で示す。向きの語 (減少 / 不足 / 増加 / 超過) は決めない。正・非有限なら空。
+    """
+    text = str(result_text or "").strip()
+    try:
+        value = float(text)
+    except ValueError:
+        return ""
+    if not (math.isfinite(value) and value < 0):
+        return ""
+    magnitude = text.lstrip("-")
+    source = _negative_source(expression)
+    if source is not None:
+        return _localized(_NEGATIVE_RESULT_SOURCE_NOTES).format(
+            value=text, magnitude=magnitude, smaller=source[0], larger=source[1],
+        )
+    return _localized(_NEGATIVE_RESULT_NOTES).format(value=text, magnitude=magnitude)
+
+
 _EXPRESSION_ISSUES_NOTES: dict[str, str] = {
     "ja": (
         "ただし上記の式には次の疑いがある: {listed}。"
@@ -673,36 +1050,64 @@ _EXPRESSION_ISSUES_NOTES: dict[str, str] = {
 }
 
 
+#: 先頭 (:data:`_CALCULATE_ASSUMED_LEADS`) と同じ区別で書く — 公式・単位換算の
+#: 定義上の定数は定数だと述べればよく、仮定として断るのは前提の値だけ
+#: (2026-10-05 ライブ監査: 華氏→摂氏の 32 / 5 / 9 を仮定と述べた)。
 _UNEXPLAINED_NUMBERS_NOTES: dict[str, str] = {
     "ja": (
         "ただし式中の {listed} は、ユーザーの依頼文にもここまでの会話にも"
-        "現れていない値である。この値が何を指すのか (単位・1件あたりの量・"
-        "換算率など) を答えの中で明示すること。根拠を示せない場合は、"
-        "その値を仮定として断ったうえで、正しい値をユーザーに確認すること。"
+        "現れていない値である。それぞれの値が何かを答えの中で明示すること — "
+        "公式・単位換算の定義上の定数 (換算率・係数など) か、計算のために置いた前提 "
+        "(単価・件数・率など) か。前提の値だけは仮定として断ったうえで、正しい値を"
+        "ユーザーに確認すること。"
     ),
     "en": (
         "However, {listed} in the expression does not appear in the user's "
         "request or anywhere in the conversation so far. State explicitly in "
-        "the answer what this value stands for (unit, amount per item, "
-        "conversion rate, etc.). If you cannot justify it, present it as an "
-        "assumption and ask the user to confirm the correct value."
+        "the answer what each value is: a definitional constant of a formula or "
+        "unit conversion (conversion rate, coefficient, etc.), or a premise "
+        "assumed for the calculation (unit price, count, rate, etc.). Only for a "
+        "premise, present it as an assumption and ask the user to confirm the "
+        "correct value."
     ),
 }
 
 _UNEXPLAINED_DATE_MATH_NOTES: dict[str, str] = {
     "ja": (
-        "ただし上記のコマンドは現在日時を返しただけで、**質問が求めている日付の"
-        "計算はツールで検証していない**。日数・営業日数・目標日を答える場合は、"
+        "ただし上記のコマンドは質問が求めている日付の計算をしておらず、"
+        "**その計算はツールで検証していない**。日数・営業日数・目標日を答える場合は、"
         "その値がツールで確かめたものではないことを明示し、数え方の前提"
         "(起点の日を 1 日目と数えたか / 土日と祝日を除いたか) を必ず書くこと。"
     ),
     "en": (
-        "However, the command above only returned the current date and time: "
-        "**the date arithmetic the question asks for was not verified by any "
-        "tool**. If you state a number of days, business days, or a target "
+        "However, the command above does not perform the date arithmetic the "
+        "question asks for: **that arithmetic was not verified by any tool**. "
+        "If you state a number of days, business days, or a target "
         "date, say explicitly that the value was not tool-verified and always "
         "state the counting convention you used (whether the start day counts "
         "as day 1, and whether weekends and holidays were excluded)."
+    ),
+}
+
+#: 日付演算を求められたのにツールを撃たなかった (演算コマンドを組めなかった) 回の
+#: 注記 (``ToolJudgement.unexplained_date_math`` が no_tool で立った回)。現在日時
+#: だけを返すコマンドを廃止した (2026-10-03、不変則 #15) ので、こうしたターンは
+#: 現在日時の注記だけを根拠に答える。§3.5 の原則どおり「答えるな」ではなく
+#: 「検証していないと言え」にする。
+_UNGROUNDED_DATE_MATH_NOTES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: このターンの日付の計算 (日数・営業日数・目標日) は"
+        "ツールで検証していない。[現在日時] の値を起点に答えてよいが、"
+        "その値がツールで確かめたものではないことを明示し、数え方の前提"
+        "(起点の日を 1 日目と数えたか / 土日と祝日を除いたか) を必ず書くこと。"
+    ),
+    "en": (
+        "\n\nConfirmed fact: the date arithmetic for this turn (number of "
+        "days, business days, or a target date) was not verified by any tool. "
+        "You may start from the [現在日時] value, but say explicitly that the "
+        "result was not tool-verified and always state the counting convention "
+        "you used (whether the start day counts as day 1, and whether weekends "
+        "and holidays were excluded)."
     ),
 }
 
@@ -953,6 +1358,62 @@ _UNCONFIRMED_PREMISE_NOTES: dict[str, str] = {
     ),
 }
 
+#: :data:`_UNCONFIRMED_PREMISE_NOTES` の一般知識版。前提がこの会話・製品自身・
+#: ユーザー本人を指していない (:func:`premise_needs_evidence` が偽) ときに使う。
+#:
+#: 根拠だけで判断させる版を一般知識の前提にも付けていたため、モデルは定説の
+#: ある問いに答えなくなった (2026-10-05 ライブ監査: 「寝る前にスマホを見るのは
+#: やっぱり良くないですか？」に「この会話の中で具体的な根拠となる情報は確認
+#: できていません」)。一般知識で判断してよい範囲と、時点で変わる事実・個別の
+#: 事実 (確かめられない範囲) を分けて伝える。
+#:
+#: 「注記・参考情報が載ったら根拠だけで判断させる」は採らない — 上の 2 件の
+#: ライブのターンはどちらも ``[関連する記憶]`` / ``[参考情報]`` が載っていた
+#: (無関係な過去の発話)。載ったかどうかでは前提の範囲は決まらない。
+_GENERAL_PREMISE_NOTES: dict[str, str] = {
+    "ja": (
+        "\n\nこの発言は前提への同意を求める形になっている。前提が広く確立した"
+        "一般知識 (地理・科学・歴史・定説のある健康の知見など) で判断できるなら、"
+        "その知識で同意するか、誤りなら正しい事実を示して訂正すること。"
+        "前提をそのまま追認しないこと。この会話で出た値や発言、ユーザー本人・"
+        "家族・所属の事柄、特定のファイル・資料・コードの中身、今日の天気・"
+        "最新の版やリリース・現在の価格や相場・最近の出来事のように時点で変わる"
+        "事実は一般知識では確かめられないので、確認できる根拠 (この会話・注記・"
+        "ツールの結果) が無ければ同意も否定もせず、確認できていない旨を述べること。"
+    ),
+    "en": (
+        "\n\nThis message asks you to agree with a premise. If the premise can "
+        "be judged from well-established general knowledge (geography, "
+        "science, history, settled health findings and the like), agree based "
+        "on that knowledge or, if it is wrong, correct it with the right fact. "
+        "Do not simply go along with the premise. Values or statements from this "
+        "conversation, matters about the user, their family or organization, the "
+        "contents of particular files, documents or code, and facts that change "
+        "over time (today's weather, the latest versions or releases, current "
+        "prices or markets, recent events) cannot be checked from general "
+        "knowledge; without evidence you can confirm (this conversation, the "
+        "notes, tool results), neither agree nor deny — say that you cannot "
+        "confirm it."
+    ),
+}
+
+
+def _prior_dialogue_text(query: str, conversation: list[dict] | None) -> str:
+    """今回の発言を除いた会話本文 (user / assistant) を連結する (純粋関数)。
+
+    今回の発言自身は文脈に含めない。conversation には送信済みの user
+    メッセージが入っており、そのまま数えるとユーザーが持ち込んだ数値が
+    「会話にある」ことになって注記が永久に出ない。
+    """
+    normalized_query = " ".join(query.split())
+    return "\n".join(
+        str(m.get("content") or "")
+        for m in (conversation or [])
+        if isinstance(m, dict)
+        and m.get("role") in ("user", "assistant")
+        and " ".join(str(m.get("content") or "").split()) != normalized_query
+    )
+
 _UNVERIFIED_CLAIM_NOTES: dict[str, str] = {
     "ja": (
         "\n\nこの発言に含まれる数値 {listed} は、ここまでの会話に一度も"
@@ -1160,7 +1621,7 @@ _COMMAND_RESULT_GUIDANCES: dict[str, str] = {
 # 事実を上書きしてしまう (実インシデント 2026-07-27: 8 月 22 日を「(土)」と
 # 正しく答えた次のターンで、draft_document の下書きが「(日)」と書いたため
 # 回答も (日) に化けた)。下書きであることを明示し、会話側の事実を優先させる。
-_GENERATED_DRAFT_TOOLS = frozenset({"draft_document", "summarize", "translate"})
+_GENERATED_DRAFT_TOOLS = GENERATED_DRAFT_TOOLS
 _GENERATED_DRAFT_GUIDANCE = (
     "上記の ## ツール実行結果 は、あなた自身が下書きとして生成した文章であり、"
     "外部から取得した事実データではない。文体・構成の土台としては使ってよいが、"
@@ -1209,6 +1670,23 @@ _ENUMERATION_RESULT_GUIDANCES: dict[str, str] = {
         "The ## ツール実行結果 above is the exact set of items the system "
         "actually enumerated. Quote item names with the spelling that appears "
         "in this result. Do not add item names inferred from typical layouts."
+    ),
+}
+#: 列挙ツールが 0 件を返したときの文言。列挙の文言 (「項目名を綴りのまま引用」) を
+#: 0 件の 1 文に付けると、ツールの出力文 (``No matches found for pattern: TODO``) を
+#: そのまま答えにした (2026-10-04 ライブ監査 run22 Q0)。項目は無いので引用させない。
+_ZERO_HIT_RESULT_GUIDANCE = (
+    "上記の ## ツール実行結果 は、システムが検索を実行し、該当が 0 件だったことを示す。"
+    "ツールの出力文をそのまま繰り返さず、何をどこで探して見つからなかったかを、"
+    "ユーザーの言語の自然な文で伝えること。該当する項目を補わないこと。"
+)
+_ZERO_HIT_RESULT_GUIDANCES: dict[str, str] = {
+    "ja": _ZERO_HIT_RESULT_GUIDANCE,
+    "en": (
+        "The ## ツール実行結果 above shows that the system ran the search and "
+        "found zero matches. Do not repeat the tool's output text verbatim; tell "
+        "the user, in a natural sentence in the user's language, what was searched "
+        "for and where, and that nothing was found. Do not add any items."
     ),
 }
 #: 列挙結果が切り詰められていたときに追加する文言。省略があることを明示しないと
@@ -1764,6 +2242,9 @@ class DeliberativeAgent:
         #: ``process()`` の入口で毎ターン差し替える。
         self._answered_attributes: frozenset[str] = frozenset()
         self._unanswered_attributes: frozenset[str] = frozenset()
+        # 確認形の前提の範囲 (``_append_unconfirmed_premise_note``)。process() が差し替える。
+        self._asks_user_attribute = False
+        self._instance_name = ""
         # _execute_tool の mode ゲートの既定値。process() 呼び出し毎の実際の mode は
         # _judge_and_execute_tool から明示的に渡される (こちらは直接 _execute_tool を
         # 呼ぶ既存テスト等のフォールバック用)。
@@ -1888,6 +2369,17 @@ class DeliberativeAgent:
             )
         if (
             tool_name == "search_history"
+            and tool_result_text.startswith(SEARCH_HISTORY_EMPTY_WINDOW_LEAD)
+        ):
+            # 日付の窓の空振りは注記自体が指示を持つ。下の「会話履歴に該当情報が
+            # あれば答えよ」を添えると、今日の記憶をその日の会話として語る
+            # (実機 2026-10-03 run9)。窓が今を含む版は「今回の会話は会話履歴から
+            # 答えよ」と言うので、「前の話題は無視せよ」の再フォーカスと矛盾させない。
+            grounding = ""
+            if SEARCH_HISTORY_EMPTY_WINDOW_CURRENT_MARK in tool_result_text:
+                refocus = ""
+        elif (
+            tool_name == "search_history"
             and tool_result_text == _localized(_NO_RELEVANT_INFO_MESSAGES)
         ):
             # 空振りに「唯一の事実根拠」枠を付けると直前ターンの内容まで
@@ -1914,10 +2406,17 @@ class DeliberativeAgent:
                 grounding += _unexplained_numbers_note(unexplained_numbers)
             if expression_issues:
                 grounding += _expression_issues_note(expression_issues)
+            grounding += _negative_result_note(
+                tool_result_text, str(args.get("expression") or ""),
+            )
         elif tool_name in _COMMAND_TOOLS:
             grounding = _localized(_COMMAND_RESULT_GUIDANCES)
             if unexplained_date_math:
                 grounding += _unexplained_date_math_note()
+        elif tool_name in _ENUMERATIVE_TOOLS and tool_result_lacks_information(
+            tool_name, tool_result_text,
+        ):
+            grounding = _localized(_ZERO_HIT_RESULT_GUIDANCES)
         elif tool_name in _ENUMERATIVE_TOOLS:
             grounding = _localized(_ENUMERATION_RESULT_GUIDANCES)
             if len(truncated) < len(tool_result_text):
@@ -2624,17 +3123,28 @@ class DeliberativeAgent:
     @staticmethod
     def _append_tool_error_note(
         messages: list[dict], tool_name: str, result_text: str,
+        tool_args: dict | None = None,
     ) -> None:
-        """実行環境を測るツールがエラーを返したら「測れていない」と注記する。
+        """実行環境を測るツールがエラーを返したら「実行して失敗した」と注記する。
+
+        「ツールを 1 つも実行していない」(``_UNMEASURED_FACT_GUIDANCE``) はツールが
+        撃てなかったターンの文言で、実行して失敗したターンに付けると「今回は
+        調べていないので分かりません」と事実と違う答えになる (2026-10-05 ライブ
+        監査 T1)。失敗の種別・対象・探した場所を渡し、中身を述べさせない。
 
         計算・生成ツール (calculate 等) のエラーは環境の実測とは無関係で、
-        「この実行環境を調べないと答えられない」は誤った注記になる
-        (2026-09-26 監査 C13#4、docs/f_03 §3.5)。
+        汎用の失敗注記にする (2026-09-26 監査 C13#4、docs/f_03 §3.5)。
         """
         if not is_tool_error(result_text):
             return
         if tool_name in _ENVIRONMENT_MEASURING_TOOLS:
-            DeliberativeAgent._append_unmeasured_fact_note(messages)
+            append_to_last_user(
+                messages,
+                DeliberativeAgent._tool_ran_and_failed_note(
+                    tool_name, result_text, tool_args,
+                ),
+                separator="",
+            )
         else:
             # 測る以外のツールの失敗は汎用の失敗注記 (docs/f_03 §3.5)
             append_to_last_user(
@@ -2642,10 +3152,351 @@ class DeliberativeAgent:
             )
 
     @staticmethod
+    def _tool_ran_and_failed_note(
+        tool_name: str, result_text: str, tool_args: dict | None,
+    ) -> str:
+        """「実行して失敗した」注記の本文 (種別・対象・探した場所つき)。"""
+        from backend.free.agent.file_ledger import resolution_error_places
+        from backend.free.agent.meta_cognitive_tool_io import tool_error_kind
+
+        kind = tool_error_kind(result_text)
+        args = tool_args if isinstance(tool_args, dict) else {}
+        target = str(
+            args.get("file_path") or args.get("path") or args.get("directory")
+            or args.get("url") or args.get("command") or "-",
+        )
+        items = resolution_error_places(result_text)
+        places = ""
+        if items:
+            key = "candidates" if kind == "ambiguous" else "searched"
+            places = _localized_map(_TOOL_FAILURE_PLACES)[key].format(items="; ".join(items))
+        return _localized(_TOOL_RAN_AND_FAILED_GUIDANCES).format(
+            tool=tool_name,
+            kind=_localized_map(_TOOL_FAILURE_KIND_LABELS).get(kind, kind),
+            target=target,
+            places=places,
+        )
+
+    @staticmethod
+    def _append_session_files_fact(
+        messages: list[dict], session_id: str, query: str = "",
+        conversation: list[dict] | None = None,
+    ) -> bool:
+        """ツール無しのターンに、このセッションのファイルの状態を確定事実として渡す。
+
+        一覧した / 読めなかったファイルがあり、中身を読めたファイルが 1 つも無い
+        ときだけ付ける (読めたファイルがあるなら答えの根拠はある)。さらに、この
+        会話の話題が記録したファイルにあるとき (今の発話かこの会話の user の発話に
+        その名前がある / 「そのファイル」型の暗黙参照) に限る — ツール無しのターン
+        すべてに付けると無関係な雑談にまでファイルの注記が並ぶ。数えるのは台帳
+        (``file_ledger.file_statuses``)、モデルは読み上げるだけ。
+
+        Returns:
+            注記したか。
+        """
+        from backend.free.agent.file_ledger import (
+            FILE_LISTED,
+            FILE_READ_FAILED,
+            FILE_READ_OK,
+            file_statuses,
+            references_recent_file,
+            user_texts,
+        )
+        from backend.free.agent.write_gate import request_names_file
+
+        if not session_id:
+            return False
+        statuses = file_statuses(session_id)
+        if any(s.status == FILE_READ_OK for s in statuses):
+            return False
+        # 中身を読めたファイルがまだ無いので、この会話の user の発話すべてが「最後に
+        # 読めた後」。そのどこかで利用者が名指した、一覧した / 読めなかったファイルがあれば
+        # この話題の続き (T1 で失敗 → T2 雑談 → T3「営業部は？」にも付く)。
+        earlier = tuple(user_texts(conversation))
+        if not (
+            references_recent_file(query)
+            or any(
+                request_names_file(s.path, query, earlier)
+                for s in statuses if s.status in (FILE_LISTED, FILE_READ_FAILED)
+            )
+        ):
+            return False
+        shown = [s for s in statuses if s.status in (FILE_LISTED, FILE_READ_FAILED)]
+        if not shown:
+            return False
+        labels = _localized_map(_SESSION_FILE_STATUS_LABELS)
+        kinds = _localized_map(_TOOL_FAILURE_KIND_LABELS)
+        lines = []
+        for status in shown:
+            if status.status == FILE_LISTED:
+                lines.append(f"- {status.path}: {labels['listed']}")
+                continue
+            places = ""
+            if status.searched:
+                head = "candidates" if status.error_kind == "ambiguous" else "searched"
+                places = labels[head] + "; ".join(status.searched)
+            kind = status.error_kind or "error"
+            lines.append(f"- {status.path}: " + labels["read_failed"].format(
+                kind=kinds.get(kind, kind), places=places,
+            ))
+        append_to_last_user(
+            messages,
+            _localized(_SESSION_FILES_FACTS).format(files="\n".join(lines)),
+            separator="",
+        )
+        # 応答の人名がプロンプトのどこから来たかを出力の検査 (UnreadFileEntityFilter /
+        # 経験の成否) が確かめられるよう、assistant 以外の本文を一緒に積む — 自分の
+        # 前の応答の人名を根拠にすると、一度作った名前がそのまま正当化される。代わりに
+        # この会話で成功したツールの **結果** (web_fetch の本文・読めたファイル等) を
+        # 根拠に含める。検査するのは人を尋ねる問い (「誰」「名前」) だけ — それ以外の
+        # 問いの答えの「〜さんです」は役割・呼称の語が多く、人名と見分けられない。
+        if asks_for_person(query):
+            record_unread_session_files(
+                [s.path for s in shown],
+                "\n".join([
+                    *(
+                        str(m.get("content") or "") for m in messages
+                        if m.get("role") != "assistant"
+                    ),
+                    *session_results(session_id),
+                ]),
+            )
+        logger.info(
+            "Session file status fact pinned (session=%s, files=%d)",
+            session_id[:12], len(lines),
+        )
+        return True
+
+    async def _carry_recent_observations(
+        self, messages: list[dict], session_id: str, tool_result_text: str = "",
+        *, query: str = "", llm_client=None, previous_query: str = "",
+    ) -> bool:
+        """:meth:`_recent_observations_block` をスレッドで呼んで足す (ファイルの指紋の stat)。
+
+        ``tool_result_text`` (このターンのツール結果) があれば、その推定トークンを
+        持ち越しの枠から差し引く — 組立てが予約しているのはツール結果 1 つぶん。
+
+        ``query`` と ``llm_client`` があれば、持ち越す ``read_file`` の表をコードで集計し
+        (:meth:`_carried_aggregate_table`、docs/f_03 §4.2.2 の 6)、確定値を条件付きの文面で
+        資料の枠の前に置く。2026-10-05 再確認 d83dbcccd802: 持ち越した sales.csv の全行が
+        載っていても「地域別ではどちらが多いですか？」の金額を暗算で誤った。続きの問いは
+        省略が多いので手掛かりの語のゲートは掛けず、集計の依頼かは往復の ``kind`` に任せ、
+        省いた量・絞り込みは ``previous_query`` (直前のユーザー発話) から補わせる。
+        集計を渡し照合へ記録するのは、集計した表の本文が切られずに載ったときだけ。
+        count の集計は照合しない (表の形を問う続きの問いで取り違えやすく、小さな整数は
+        答えに別の意味で現れる)。
+        """
+        from backend.utils import estimate_tokens
+
+        budget = RECENT_OBSERVATION_MAX_TOKENS
+        if tool_result_text:
+            budget -= estimate_tokens(tool_result_text[:TOOL_RESULT_MAX_CHARS])
+        aggregate = None
+        lead = ""
+        lead_source = ""
+        if query and llm_client is not None:
+            obs = await asyncio.to_thread(
+                self._carried_aggregate_table, session_id,
+                budget - _CARRIED_AGGREGATE_LEAD_RESERVE_TOKENS,
+            )
+            if obs is not None:
+                aggregate = await aggregate_retrieved_table(
+                    llm_client, query, [obs.content], require_cue=False,
+                    previous=previous_query, carried=True,
+                )
+            if aggregate is not None:
+                lead = table_aggregate_block(aggregate, conditional=True) + "\n\n"
+                lead_source = obs.source_key
+                budget -= estimate_tokens(lead)
+        text, lead_used = await asyncio.to_thread(
+            self._recent_observations_block, session_id, budget, lead, lead_source,
+        )
+        if not text:
+            return False
+        append_to_last_user(messages, text, separator="")
+        if lead_used and aggregate.spec.agg != "count":
+            record_table_aggregate(aggregate)
+        return True
+
+    @staticmethod
+    def _carried_aggregate_table(
+        session_id: str, budget_tokens: int,
+    ) -> Observation | None:
+        """持ち越す資料のうち、集計してよい ``read_file`` の表の取得 (無ければ ``None``)。
+
+        表 (``parse_table``) がただ 1 つのときだけ返す — 別の資料の表が 2 つ以上なら
+        どちらを問われたか決められない (``find_table`` と同じ)。``fetch_url`` のページの表、
+        取得後に変わった資料の表、台帳が切った写しの表 (行の途中で切れるので最後の行を
+        除いて読む) も競合として数える。選ばれた表は、持ち越す資料のうち **最新の取得**
+        で、``read_file`` の、取得後に変わっておらず台帳が切っていない写しで、本文が
+        ``budget_tokens`` の持ち越しの枠に切らずに収まるときだけ返す — 古い中身・一部の
+        行の値を確定値として渡さず、本文の載らない集計に往復を払わない。
+        """
+        from backend.free.core.turn_text import MATERIAL_TRAILING_DELIMITERS
+        from backend.utils import estimate_tokens
+
+        observations = recent_observations(session_id)
+        tables = []
+        for obs, age in observations:
+            truncated = len(obs.content) < obs.total_chars
+            text = obs.content[:obs.content.rfind("\n")] if truncated else obs.content
+            if parse_table(text) is not None:
+                tables.append((obs, age, truncated))
+        if len(tables) != 1:
+            return None
+        obs, age, truncated = tables[0]
+        if obs is not observations[0][0] or obs.tool_name != "read_file":
+            return None
+        if truncated or observation_is_stale(obs):
+            return None
+        labels = _localized_map(_RECENT_OBSERVATION_LABELS)
+        fixed = estimate_tokens(
+            _localized(MATERIAL_TRAILING_DELIMITERS)
+            + _localized(_RECENT_OBSERVATION_BLOCKS_WITH_AGGREGATE).format(items="")
+            + labels["head"].format(source=obs.source, age=age)
+            + labels["truncated"].format(total=10**6, shown=10**6),
+        )
+        allowance = budget_tokens - fixed
+        if age > 1:
+            allowance = min(
+                allowance, RECENT_OBSERVATION_MAX_TOKENS // _RECENT_OBSERVATION_OLDER_DIVISOR,
+            )
+        if estimate_tokens(obs.content) > allowance:
+            return None
+        return obs
+
+    @staticmethod
+    def _append_recent_observations(
+        messages: list[dict], session_id: str,
+        budget_tokens: int = RECENT_OBSERVATION_MAX_TOKENS,
+    ) -> bool:
+        """前のターンで取得した資料の本文を、このターンの最後の user へ持ち越す。
+
+        組立ては :meth:`_recent_observations_block`。
+
+        Returns:
+            ブロックを足したか。
+        """
+        text, _lead_used = DeliberativeAgent._recent_observations_block(
+            session_id, budget_tokens,
+        )
+        if not text:
+            return False
+        append_to_last_user(messages, text, separator="")
+        return True
+
+    @staticmethod
+    def _recent_observations_block(
+        session_id: str, budget_tokens: int = RECENT_OBSERVATION_MAX_TOKENS,
+        lead: str = "", lead_source: str = "",
+    ) -> tuple[str, bool]:
+        """前のターンで取得した資料を持ち越すブロック (区切りから閉じまで) を組む。
+
+        会話履歴には応答しか残らないので、資料に依る続きの問い (「地域別では？」
+        「製品Bだけの推移は？」) を資料なしで答えさせると作話する。持ち越すのは、
+        直近 ``RECENT_OBSERVATION_TURNS`` ターン以内に取得したものだけ
+        (``tool_ledger.recent_observations``)。問いとの関連は判定しない — 続きの問いは
+        指示語を持たないことが多く (「製品Bだけの…」)、関連の判定に頼ると外れた回に
+        そのまま作話する。関係しなければ触れないよう指示して渡す。
+        取得後にファイルが変わった / 消えたときは古い本文を渡さず、その事実を渡す。
+
+        本文は ``budget_tokens`` (推定トークン) まで新しい取得から詰め、2 ターン以上前の
+        取得はその ``_RECENT_OBSERVATION_OLDER_DIVISOR`` 分の 1 までにする。ブロックは
+        後置の区切りの後ろに置く (送信時ガードが末尾から削れる、``_RECENT_OBSERVATION_BLOCKS``)。
+        ``lead`` (表の集計の確定値) は区切りの直後・資料の枠の前に置く (溢れたら資料から
+        削られ、確定値は残る)。置くのは ``lead_source`` の資料の本文が切られずに載った
+        ときだけで、そのときは資料の指示も集計の値を優先する文面に替える
+        (``_RECENT_OBSERVATION_BLOCKS_WITH_AGGREGATE``)。
+
+        Returns:
+            ``(ブロック (載せる資料が無ければ空文字), lead を置いたか)``。
+        """
+        from backend.free.core.turn_text import MATERIAL_TRAILING_DELIMITERS
+        from backend.utils import estimate_tokens
+
+        observations = recent_observations(session_id)
+        if not observations:
+            return "", False
+        labels = _localized_map(_RECENT_OBSERVATION_LABELS)
+        delimiter = _localized(MATERIAL_TRAILING_DELIMITERS)
+        template = _localized(
+            _RECENT_OBSERVATION_BLOCKS_WITH_AGGREGATE if lead else _RECENT_OBSERVATION_BLOCKS,
+        )
+        # 固定部分 (区切り・指示・閉じ) と、資料ごとの見出し・切り詰めの注記は本文の
+        # 枠から先に差し引く (枠は最後の user に積む量全体の見込み)。
+        remaining = budget_tokens - estimate_tokens(delimiter + template.format(items=""))
+        note_tokens = estimate_tokens(labels["truncated"].format(total=10**6, shown=10**6))
+        items: list[str] = []
+        lead_body_carried = False
+        for obs, age in observations:
+            if observation_is_stale(obs):
+                stale = labels["stale"].format(source=obs.source)
+                remaining -= estimate_tokens(stale)
+                items.append(stale)
+                continue
+            head = labels["head"].format(source=obs.source, age=age)
+            remaining -= estimate_tokens(head) + note_tokens
+            allowance = remaining if age <= 1 else min(
+                remaining, RECENT_OBSERVATION_MAX_TOKENS // _RECENT_OBSERVATION_OLDER_DIVISOR,
+            )
+            if allowance < _RECENT_OBSERVATION_MIN_TOKENS:
+                continue
+            body = obs.content
+            note = ""
+            tokens = estimate_tokens(body)
+            if tokens > allowance or len(body) < obs.total_chars:
+                if tokens > allowance:
+                    limit = int(allowance * len(body) / max(1, tokens))
+                    cut = body[:limit]
+                    # 行の途中で切らない (CSV の行が半端な値に化ける)。
+                    if "\n" in cut[limit // 2:]:
+                        cut = cut[:cut.rfind("\n")]
+                    # 推定は文字種の混ざり方で比例しないので、超えた分は行 (無ければ
+                    # 文字) 単位で詰める。
+                    while cut and estimate_tokens(cut) > allowance:
+                        nl = cut.rfind("\n")
+                        cut = cut[:nl] if nl > 0 else cut[: len(cut) * 9 // 10]
+                    body = cut
+                note = "\n" + labels["truncated"].format(
+                    total=obs.total_chars, shown=len(body),
+                )
+            elif lead_source and obs.source_key == lead_source:
+                lead_body_carried = True
+            remaining -= estimate_tokens(body)
+            items.append(head + "\n" + _neutralize_material(body) + note)
+        if not items:
+            return "", False
+        if lead and not lead_body_carried:
+            # 集計した表の本文が載らない (切られた・枠が尽きた) ターンは確定値も渡さない。
+            # 資料の指示も通常の文面へ戻す。
+            lead = ""
+            template = _localized(_RECENT_OBSERVATION_BLOCKS)
+        if lead:
+            # 集計のグループの値は表のセル由来なので、枠の見出しを装えないようにする
+            lead = _neutralize_material(lead)
+        logger.info(
+            "Recent observations carried over (session=%s, items=%d, aggregate=%s)",
+            (session_id or "")[:12], len(items), bool(lead),
+        )
+        return delimiter + lead + template.format(items="\n\n".join(items)), bool(lead)
+
+    @staticmethod
     def _append_unmeasured_fact_note(messages: list[dict]) -> None:
         """最後の user メッセージへ「実測できなかった」注記を追記する。"""
         append_to_last_user(
             messages, _localized(_UNMEASURED_FACT_GUIDANCES), separator="",
+        )
+
+    @staticmethod
+    def _append_ungrounded_date_math_note(messages: list[dict]) -> None:
+        """最後の user メッセージへ「日付の計算をツールで検証していない」注記を追記する。"""
+        record_grounding(unexplained_date_math=True)
+        append_to_last_user(
+            messages, _localized(_UNGROUNDED_DATE_MATH_NOTES), separator="",
+        )
+        logger.info(
+            "Date arithmetic without a tool; asked the model to disclose that the "
+            "value is not tool-verified and to state the counting convention",
         )
 
     @staticmethod
@@ -2862,17 +3713,7 @@ class DeliberativeAgent:
         Returns:
             注記を足したか。
         """
-        # 今回の発言自身は文脈に含めない。conversation には送信済みの user
-        # メッセージが入っており、そのまま数えるとユーザーが持ち込んだ数値が
-        # 「会話にある」ことになって注記が永久に出ない。
-        normalized_query = " ".join(query.split())
-        context = "\n".join(
-            str(m.get("content") or "")
-            for m in (conversation or [])
-            if isinstance(m, dict)
-            and m.get("role") in ("user", "assistant")
-            and " ".join(str(m.get("content") or "").split()) != normalized_query
-        )
+        context = _prior_dialogue_text(query, conversation)
         numbers = unverified_claim_numbers(query, context)
         if not numbers:
             return False
@@ -2890,22 +3731,52 @@ class DeliberativeAgent:
         return True
 
     @staticmethod
-    def _append_unconfirmed_premise_note(messages: list[dict], query: str) -> bool:
+    def _append_unconfirmed_premise_note(
+        messages: list[dict],
+        query: str,
+        conversation: list[dict] | None = None,
+        *,
+        asks_user_attribute: bool = False,
+        instance_name: str = "",
+    ) -> bool:
         """根拠を取りに行けなかった確認形クエリへの注記を追記する。
 
-        詳細は :data:`_UNCONFIRMED_PREMISE_NOTES` を参照。
+        詳細は :data:`_UNCONFIRMED_PREMISE_NOTES` と
+        :data:`_GENERAL_PREMISE_NOTES` を参照。
+
+        Args:
+            conversation: 直近の会話 (今回の発言を含んでよい)。計算済みの値が
+                あれば数値の前提を会話への主張として扱う。
+            asks_user_attribute: 呼出側が記憶の属性辞書で、クエリがユーザー
+                本人・家族の属性を指すと解決したか。
+            instance_name: このインスタンスの名前 (「Alice は〜ですよね？」)。
 
         Returns:
             注記を足したか。
         """
         if not PREMISE_CONFIRMATION_RE.search(query.strip()):
             return False
+        # 根拠だけで判断させるのは、前提がこの会話・ユーザー本人・製品自身・
+        # 名指した資料・時点で変わる事実を指すときに限る。一般知識の前提に
+        # 付けると定説のある問いに答えなくなる (:data:`_GENERAL_PREMISE_NOTES`)。
+        if premise_needs_evidence(
+            query, _prior_dialogue_text(query, conversation),
+            asks_user_attribute=asks_user_attribute, instance_name=instance_name,
+        ):
+            append_to_last_user(
+                messages, _localized(_UNCONFIRMED_PREMISE_NOTES), separator="",
+            )
+            logger.info(
+                "Confirmation-form query with no tool evidence; "
+                "asked the model to answer from evidence instead of agreeing",
+            )
+            return True
         append_to_last_user(
-            messages, _localized(_UNCONFIRMED_PREMISE_NOTES), separator="",
+            messages, _localized(_GENERAL_PREMISE_NOTES), separator="",
         )
         logger.info(
-            "Confirmation-form query with no tool evidence; "
-            "asked the model to answer from evidence instead of agreeing",
+            "Confirmation-form query on a general-knowledge premise; "
+            "asked the model to agree or correct from general knowledge",
         )
         return True
 
@@ -3072,7 +3943,11 @@ class DeliberativeAgent:
             if not self._append_unverified_claim_note(
                 messages, query, conversation,
             ):
-                self._append_unconfirmed_premise_note(messages, query)
+                self._append_unconfirmed_premise_note(
+                    messages, query, conversation,
+                    asks_user_attribute=self._asks_user_attribute,
+                    instance_name=self._instance_name,
+                )
             # 直前の保存依頼に引数だけを与えたターン。宛先は今まさに与えられて
             # いるので「保存先を教えて」ではなく「まだ実行していない」を伝える
             # (_append_pending_write_note の docstring 参照)。
@@ -3108,6 +3983,20 @@ class DeliberativeAgent:
                 # 分類器の式も組み直しも門で落ちた。丸投げすると暗算の値を検証済みの
                 # 口調で述べる (_CALCULATION_REJECTED_GUIDANCES 参照)。
                 self._append_calculation_rejected_note(messages)
+            if judgement.unexplained_date_math:
+                # 日付演算を組めずツール無しで答えるターン。現在日時は注記が渡すが、
+                # 日数・目標日は暗算になる (_UNGROUNDED_DATE_MATH_NOTES 参照)。
+                self._append_ungrounded_date_math_note(messages)
+            # 一覧した / 読めなかったファイルしか無いセッション。丸投げすると読めて
+            # いない中身 (給与・人名) を作話する (_SESSION_FILES_FACTS 参照)。
+            self._append_session_files_fact(messages, session_id, query, conversation)
+            # 前のターンで取得した資料に依る続きの問い。履歴には応答しか無く、
+            # 丸投げすると資料に無い区分・数値を作話する (_RECENT_OBSERVATION_BLOCKS 参照)。
+            # 最後に置く — 送信時ガードは末尾から削るので、溢れたら資料から削られる。
+            await self._carry_recent_observations(
+                messages, session_id, query=query, llm_client=llm_client,
+                previous_query=last_user_query(conversation, before=query),
+            )
             return None, None, None, None, None
 
         command = None
@@ -3125,13 +4014,23 @@ class DeliberativeAgent:
             # 返す。何も走っていないので tool_name / command を返さない。以前は
             # command と success=False を返し、走っていないコマンドが
             # executable_command 学習の失敗例として penalize されていた。
+            # ツールが走らないので、ツール無しのターンと同じく資料を持ち越す。
+            await self._carry_recent_observations(
+                messages, session_id, query=query, llm_client=llm_client,
+                previous_query=last_user_query(conversation, before=query),
+            )
             return None, None, None, None, judgement.source
+        # 実行したツールを決めた層を経験へ (近道の実行を学習の正例から外す、不変則 #15)。
+        record_tool_decision(judgement.source, judgement.decided_reason)
 
         # 空振りと分かっている search_history の結果は、raw をそのまま
         # 「唯一の事実根拠」枠で base に渡すと進行中の会話履歴まで否定させて
         # しまうため、明示的な「関連情報なし」文言へ差し替える。
         if _is_search_history_empty(judgement.tool_name, tool_result_text):
-            prompt_result_text = _localized(_NO_RELEVANT_INFO_MESSAGES)
+            prompt_result_text = (
+                search_history_window_note(tool_result_text)
+                or _localized(_NO_RELEVANT_INFO_MESSAGES)
+            )
             self._append_tool_result_to_last_user(
                 messages, judgement.tool_name, prompt_result_text, query=query,
             )
@@ -3178,18 +4077,58 @@ class DeliberativeAgent:
         # 「存在しません」と断定した。2 ターン前に read_file で存在を確認済みの
         # ファイルだった。judge 段の拒否 (action/measurement blocked) と違い、
         # 実行段の失敗はこれまで何の注記も伴っていなかった。
-        self._append_tool_error_note(messages, judgement.tool_name, tool_result_text)
+        self._append_tool_error_note(
+            messages, judgement.tool_name, tool_result_text, judgement.tool_args,
+        )
         self._append_unperformed_action_note_if_blocked(messages, judgement)
+        # 取得以外のツール (calculate 等) のターンも、答えの値は前のターンの資料に依る
+        # (「地域別の合計の差は？」)。資料はツール結果の **後ろ** に置く — 送信時ガードは
+        # 末尾から削るので、溢れたら資料から削られ、ツール結果は残る。取得のツール
+        # (読み直し) のターンは新しい本文が根拠なので持ち越さない。
+        if judgement.tool_name not in OBSERVATION_TOOLS:
+            await self._carry_recent_observations(
+                messages, session_id, tool_result_text=prompt_result_text,
+                query=query,
+                llm_client=(
+                    None if judgement.tool_name in _NO_CARRIED_AGGREGATE_TOOLS
+                    else llm_client
+                ),
+                previous_query=last_user_query(conversation, before=query),
+            )
         # 「実行できた」ではなく「役に立つ結果が出た」を成否とする (SSOT)。
         # 非ゼロ終了の run_command / 0 件の search_history を成功にすると、
         # executable_command の SemMem 学習と tool_routing の選択圧が汚染される。
         success = tool_result_succeeded(judgement.tool_name, tool_result_text)
+        if success and judgement.tool_name in _FILE_CONTENT_TOOLS:
+            # 読んだ表の数値集計はコードで行い、確定値として渡す (docs/f_03 §4.2.2)
+            await self._append_table_aggregate_fact(
+                messages, query, tool_result_text, llm_client,
+            )
         logger.info(
             "Tool executed: %s, result_length=%d, source=%s, success=%s",
             judgement.tool_name, len(tool_result_text), judgement.source,
             success,
         )
         return tool_result_text, judgement.tool_name, command, success, judgement.source
+
+    @staticmethod
+    async def _append_table_aggregate_fact(
+        messages: list[dict], query: str, tool_result_text: str, llm_client,
+    ) -> bool:
+        """読んだ表を依頼の集計のとおりコードで集計し、結果を最後の user へ足す。
+
+        2026-10-05 ライブ監査: sales.csv の月別合計 3 つをモデルが暗算で誤った (行の
+        数値はすべてプロンプトに載っていた)。パラメータだけを文法制約 JSON で取り、計算は
+        全行に対して決定論で行う (``agent.table_aggregate_intent``)。表でない・集計の
+        依頼でない・パラメータが表と合わないときは何も足さない (従来どおり)。足した結果は
+        出力の検査 (``TableAggregateFilter``) が応答と照合する。
+        """
+        result = await aggregate_retrieved_table(llm_client, query, [tool_result_text])
+        if result is None:
+            return False
+        record_table_aggregate(result)
+        append_to_last_user(messages, "\n\n" + table_aggregate_block(result), separator="")
+        return True
 
     async def _maybe_follow_up_tool(
         self,
@@ -3315,6 +4254,11 @@ class DeliberativeAgent:
         )
         if result_text is None:
             return judgement.tool_name, None
+        # 経験の tool_name は 2 手目に差し替わるので、決めた層も 2 手目へ寄せる。
+        # ただし 1 手目が近道なら残す — ブーストはクエリの一致で掛かるので、
+        # どちらかが近道なら正例に数えない (不変則 #15)。
+        if not decided_by_shortcut(current_tool_decision()):
+            record_tool_decision(judgement.source, judgement.decided_reason)
         self._append_tool_result_to_last_user(
             messages, judgement.tool_name, result_text, query=query,
             tool_args=judgement.tool_args,
@@ -3322,7 +4266,9 @@ class DeliberativeAgent:
                 getattr(judgement, "unexplained_date_math", False),
             ),
         )
-        self._append_tool_error_note(messages, judgement.tool_name, result_text)
+        self._append_tool_error_note(
+            messages, judgement.tool_name, result_text, judgement.tool_args,
+        )
         success = tool_result_succeeded(judgement.tool_name, result_text)
         logger.info(
             "Follow-up tool executed: %s, result_length=%d, success=%s",
@@ -3352,6 +4298,8 @@ class DeliberativeAgent:
         prompt_capture: list[dict] | None = None,
         private: bool = False,
         unanswered_attributes: frozenset[str] = frozenset(),
+        asks_user_attribute: bool = False,
+        instance_name: str = "",
     ) -> DeliberativeResponse | AsyncIterator[str]:
         """Deliberative 層で LLM 推論を実行
 
@@ -3373,6 +4321,10 @@ class DeliberativeAgent:
             unanswered_attributes: クエリが尋ねているのに [関連する記憶] に
                 載らなかった属性 (尋ねた − 注入済み)。空でなければ履歴検索を
                 止めたときの注記を「一部だけ載っている」側にする (独立レビュー H1)。
+            asks_user_attribute: クエリがユーザー本人・家族の属性を指すと記憶の
+                属性辞書で解決したか。確認形の前提を根拠だけで判断させる
+                (``_append_unconfirmed_premise_note``)。
+            instance_name: このインスタンスの名前 (同上、「Alice は〜ですよね？」)。
             prompt_capture: 渡すと、**実際に送信する** メッセージ配列を
                 ここへ書き戻す。呼出側は ``list(messages)`` の浅いコピーを
                 渡してくるため、``## ツール実行結果``・リマインダー・各種注記を
@@ -3396,6 +4348,8 @@ class DeliberativeAgent:
         # セッションを跨いで再利用されない — chat() が毎リクエスト生成する)。
         self._answered_attributes = answered_attributes
         self._unanswered_attributes = unanswered_attributes
+        self._asks_user_attribute = asks_user_attribute
+        self._instance_name = instance_name
 
         state = self._init_deliberative_state(mode)
         (
@@ -3429,7 +4383,7 @@ class DeliberativeAgent:
         # begin→step→end を同期完結できる (生成は応答であり agent action ではない)。
         self._trace_tool_episode(
             session_id, mode, query, tool_name_used, tool_result_text, tool_success,
-            private=private,
+            private=private, decided_by=current_tool_decision(),
         )
 
         # streaming 経路は DeliberativeResponse を返さないため、command を
@@ -3532,6 +4486,7 @@ class DeliberativeAgent:
         tool_success: bool | None,
         *,
         private: bool = False,
+        decided_by: dict | None = None,
     ) -> None:
         """deliberative の tool 実行を 1 step MDP エピソードとして記録する。
 
@@ -3548,13 +4503,17 @@ class DeliberativeAgent:
           ``success`` のままにする。``partial`` にすると SemMem の
           ``mdp_trace`` 抽出が空振りのたびに failure_pattern ファクトを作り、
           ストアが膨張してしまう。
+
+        近道 (``decided_by`` が recall / learned) が決めた実行の成功は報酬 1.0 に
+        しない — 近道自身の結果を近道の正例に数えない (不変則 #15)。
         """
         tracer = self._agent_tracer
         if tracer is None or not session_id or tool_result is None:
             return
         from backend.free.agent.agent_tracer import MDPStep
 
-        reward = 1.0 if tool_success else 0.0
+        shortcut = decided_by_shortcut(decided_by)
+        reward = 1.0 if tool_success and not shortcut else 0.0
         errored = is_tool_error(tool_result)
         try:
             # private は begin に刻む (Step 7.5 / 8 がエピソード記憶と decision
@@ -3563,7 +4522,10 @@ class DeliberativeAgent:
             episode_id = tracer.begin_episode(session_id, mode, private=private)
             tracer.record_step(episode_id, MDPStep(
                 step_index=0,
-                state={"query": query[:200], "agent_layer": "deliberative"},
+                state={
+                    "query": query[:200], "agent_layer": "deliberative",
+                    "decided_by": str((decided_by or {}).get("source") or ""),
+                },
                 action=tool_name or "tool",
                 observation=tool_result[:200],
                 reward=reward,

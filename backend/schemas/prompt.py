@@ -1,6 +1,8 @@
 """`prompt` セクション — system プロンプトと文脈予算の配分 (f_03 §7.1 / c_02 §6.3)"""
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class PromptConfig(BaseModel):
@@ -53,3 +55,15 @@ class PromptConfig(BaseModel):
     #: 一対比較ゲートで採用に要する「候補の勝ち − 現行の勝ち」の最小値
     #: (tie は数えない)。1 だと 1 ケースの判定で反転するので 2。
     adoption_min_net_wins: int = Field(default=2, ge=1)
+    #: 資料を載せたターンで、問いの条件 (限定語・期間・単位・対象) を発話から逐語で
+    #: 抜き出して生クエリの直後へ注記するか (f_03 §7.1.1)。``on`` のときだけ補助タスク
+    #: ``answer_conditions`` を撃つ。A/B で評価するまで既定は ``off``。
+    answer_conditions: Literal["off", "on"] = "off"
+
+    @field_validator("answer_conditions", mode="before")
+    @classmethod
+    def coerce_yaml_bool_answer_conditions(cls, value: object) -> object:
+        """YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す"""
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        return value

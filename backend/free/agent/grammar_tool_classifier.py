@@ -56,16 +56,28 @@ NO_TOOL = "none"
 #: 「一致しました」を捏造した。
 CLASSIFY_MAX_TOKENS = 256
 
+#: 分類器 (層 5.9) の候補に載せないツール。``draft_document`` の出力は回答そのもの
+#: (同じベースモデルが書く下書き) で、取得した事実ではない (deliberative の
+#: ``_GENERATED_DRAFT_TOOLS``)。選ばれると下書きの生成 (max 900 トークン) が 1 回
+#: 余分に走り、回答の段がその下書きを prefill してから書き直すので、生成が 2 回に
+#: なる。2026-10-05 ライブ監査: 「旅行の持ち物リストを作ってください。」で
+#: 下書き 71 秒 + 回答の prefill 1,362 トークン 64 秒、計 150 秒 (2 件とも同じ形)。
+#: 回答の段は下書き無しで同じ文書を書ける (docs/c_14 §1.3)。
+CLASSIFIER_EXCLUDED_TOOLS: frozenset[str] = frozenset({"draft_document"})
+
 
 def available_tool_names(tools_registry: "ToolsRegistry", mode: str) -> list[str]:
-    """``mode`` で実行可能なツール名 (hidden 含む) を返す。
+    """``mode`` で実行可能な、分類器の候補にするツール名 (hidden 含む) を返す。
 
     ``build_oai_tools`` と同じく hidden も候補に載せる。hidden は「プロンプトの
     一覧に出さない」印であって「使わせない」印ではなく、chat の
     ``run_command_readonly`` のようにコード側が注入する前提のツールが該当する。
+    :data:`CLASSIFIER_EXCLUDED_TOOLS` は載せない (メニュー・enum・応答の解釈で同じ集合)。
     """
     names = []
     for name in tools_registry.list_names():
+        if name in CLASSIFIER_EXCLUDED_TOOLS:
+            continue
         if not tools_registry.is_available(name, mode):
             continue
         if tools_registry.get(name) is None:
@@ -222,6 +234,20 @@ EXPRESSION_SYSTEM_EN = (
     "- Use only numbers that actually appear in the conversation.\n"
     "- Never invent a number.\n"
     "- The expression must evaluate as a Python arithmetic expression."
+)
+
+
+#: 問いに数も指示語も無い数量の問い (被演算子をすべて会話から取る入口) にだけ足す棄権。
+#: この入口は門 (取りこぼしを嫌って開く側) に頼るので、知識の問い (「東京までの新幹線は
+#: いくらくらい？」) も届きうる。共通の system は変えず、指示の側に足す (docs/f_03 §3.1)。
+EXPRESSION_ABSTAIN = (
+    "- 会話に出た数の計算で答えられない質問 (一般知識・最新の事実・会話に無い値を問う"
+    "もの) なら、expression を空文字にすること。"
+)
+EXPRESSION_ABSTAIN_EN = (
+    "- If the question cannot be answered by computing with numbers from the "
+    "conversation (general knowledge, current facts, values not in the conversation), "
+    "return an empty string as the expression."
 )
 
 

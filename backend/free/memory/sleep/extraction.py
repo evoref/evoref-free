@@ -156,8 +156,71 @@ def write_sleep_facts(
     foldable = [fact for fact in persisted if _is_foldable(fact)]
     if foldable:
         _supersede_corrected_slots(store, foldable, label)
+        _retire_arrivals_behind_slot_edits(store, foldable, label)
         _retire_assertions_contradicted_by_change(store, foldable, label)
     return persisted
+
+
+def _is_slot_edit(fact: object) -> bool:
+    """Step 8.35 (``slot_edit_curator``) が書いた編集後の値の行か (純粋関数)。"""
+    from backend.free.memory.sleep.slot_edit_curator import EXTRACTOR_NAME
+
+    return any(
+        getattr(prov, "extractor", None) == EXTRACTOR_NAME
+        for prov in getattr(fact, "provenances", None) or ()
+    )
+
+
+def _retire_arrivals_behind_slot_edits(
+    store: "SemanticFactStore", persisted: list, label: str,
+) -> int:
+    """検証済みの編集より **前の発話** の値が後から届いたら、到着時に編集へ畳む。
+
+    Step 8.3 の分割はバックオフで古いノートを後のサイクルに読み直すので、
+    「趣味は釣りとキャンプです。」の行が、その後の編集 (釣り、写真) より後に
+    書かれうる。編集は発話時点の状態を全体として持つので、それより前の発話の値は
+    無効化された世代 — 訂正済みスロットへの到着 (:func:`_retire_stale_arrivals_into_corrected_slots`)
+    と同じ扱い。編集が書かれるスロット (並列多値・単値・``span_only_fold`` 以外) に限る。
+
+    Returns:
+        畳んだ件数。
+    """
+    retired = 0
+    for fact in persisted:
+        subject = str(getattr(fact, "subject", "") or "")
+        if getattr(fact, "superseded_by", None) or _is_slot_edit(fact):
+            continue
+        if _folds_as_multi_valued(subject) or is_single_valued_subject(subject):
+            continue
+        try:
+            siblings = store.search_by_subject(subject, include_superseded=False)
+        except Exception as exc:  # noqa: BLE001 - 読めなければ畳まない
+            logger.warning("Step 8 [%s]: failed to list slot %s: %s", label, subject, exc)
+            continue
+        edits = [
+            other for other in siblings
+            if other.id != fact.id
+            and other.predicate == fact.predicate
+            and _is_slot_edit(other)
+            and getattr(other, "created_at", 0.0) > getattr(fact, "created_at", 0.0)
+        ]
+        if not edits:
+            continue
+        winner = max(edits, key=lambda o: (getattr(o, "created_at", 0.0), str(o.id)))
+        try:
+            store.supersede(fact.id, winner.id)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "Step 8 [%s]: failed to retire %s behind edit %s: %s",
+                label, fact.id, winner.id, exc,
+            )
+            continue
+        retired += 1
+        logger.info(
+            "Step 8 [%s]: %s superseded on arrival — a later verified edit (%s) "
+            "already set %s", label, fact.id, winner.id, subject,
+        )
+    return retired
 
 
 def _inherit_corrected_slot(

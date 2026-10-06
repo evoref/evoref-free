@@ -583,6 +583,21 @@
     "written_content_truncated": "(showing the first {lines} of {total} lines)",
     "tasks_partially_done": "Completed {done} task(s); {failed} failed.",
     "tasks_all_failed": "Task execution failed.",
+    "retrieved_answer_failed": "The data was retrieved, but processing it failed.",
+    "repeated_no_result": "The same search kept returning no results, so the task was stopped.",
+    "repeated_no_match": "I searched, but found no matches.",
+    "repeated_same_result": "The same call kept returning the same result, so the task was stopped.",
+    "step_limit_reached": "The task was stopped because it reached the step limit.",
+    "retrieval_failed": {
+      "unresolved_host": "Could not retrieve {target}: the host name could not be resolved (DNS error).",
+      "unreachable": "Could not retrieve {target}: the host could not be reached or did not respond in time.",
+      "not_found": "{target} was not found.",
+      "blocked": "Could not retrieve {target}: fetching private or reserved network addresses is not allowed for safety.",
+      "no_location": "I did not search because no folder to search was specified. Please name the folder.",
+      "ambiguous": "More than one file named {target} exists, so it could not be decided which one was meant. Please give the folder as well."
+    },
+    "write_already_saved": "The same content was already saved to {path} in this turn.",
+    "write_insufficient_source": "Nothing was written to {path}. The data that was read does not contain what is needed: {missing}",
     "write_rejection": {
       "write_report_echo": "the generated text was a completion report",
       "task_log_echo": "the generated text was a progress note",
@@ -598,9 +613,11 @@
       "edit_without_change": "the content did not change",
       "task_restatement": "the generated text restated the request",
       "no_table_data": "the text to save had no table",
+      "no_source_data": "the earlier steps returned no data to write from",
       "existing_unreadable": "the existing file could not be read without garbling, so its contents could have been lost",
       "existing_too_large": "the existing file is too large to rewrite with its whole content in view",
-      "unencodable": "it contained characters the existing file's encoding cannot represent, which could have corrupted it"
+      "unencodable": "it contained characters the existing file's encoding cannot represent, which could have corrupted it",
+      "insufficient_source": "the data that was read does not contain what to write"
     },
     "write_failed": {
       "append": "Could not append to {path}{reason}.",
@@ -616,7 +633,9 @@
     "write_denied": {
       "outside_request_roots": "{path} is outside the folders named in your request, so nothing was written. Please name the destination folder in your request.",
       "protected_root": "{path} is where evoref keeps its settings, data or runtime, so nothing was written.",
-      "invalid_path": "{path} is not a usable destination path (a \"..\" segment, a path from the drive root, a reserved name, etc.), so nothing was written."
+      "invalid_path": "{path} is not a usable destination path (a \"..\" segment, a path from the drive root, a reserved name, etc.), so nothing was written.",
+      "existing_not_target": "{path} already exists and your request did not name it as the place to write, so it was not overwritten. To save to a file, name the destination file in your request.",
+      "existing_not_kept": "{path} already exists and the new content would replace most of it rather than edit it, so it was not overwritten. To replace it anyway, ask to overwrite {path}; to keep both, name a new file."
     },
     "tool_ledger": {
       "success": "succeeded",
@@ -646,6 +665,12 @@
       "first": "first",
       "last": "last",
       "header": "[{where} {count} user message(s) of this conversation (of {total} turns)]"
+    },
+    "output_note": {
+      "sign_differs": "(System note: the leading \"{lead}\" differs in sign from the result of the calculation in the body (-{magnitude}).)",
+      "unread_file_entity": "(System note: the content of {files} has not been read in this conversation. {names} was not taken from the file.)",
+      "table_aggregate": "(System note: the values of {spec} computed by code from all {rows} rows of {source} are {values}.)",
+      "table_fallback": "the retrieved table"
     }
   },
   "error": {
@@ -696,6 +721,14 @@
     },
     "chat": {
       "stream_failed": "Failed to generate a response. The inference server may have stopped or the stream was cut off. Please wait a moment and try again.",
+      "context_exceeded": "The input is too long for the model. Shorten the message or attached files, or start a new conversation.",
+      "request_rejected": "The inference server rejected the request. Change the input and try again.",
+      "timeout": "The response timed out. Please try again.",
+      "connection": "Cannot reach the inference server. Check that the services are running (evoref serve), then try again.",
+      "model_unavailable": "The model is not available. Check the model file and settings.",
+      "server_error": "The inference server returned an error. Please wait a moment and try again.",
+      "empty_response": "The model returned no text. Please try again.",
+      "unknown": "An unexpected error occurred. Details are in the log.",
       "turn_busy_create": "Another creation is still running, so a new one cannot start. Wait for it to finish or stop it, then send again.",
       "turn_busy_session": "The previous turn in this session is still running. Wait for it to finish, then send again."
     },

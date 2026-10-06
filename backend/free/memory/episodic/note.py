@@ -64,6 +64,11 @@ attrs キー          消費者
 ``command_curated_at``  ``sleep.executable_command_curator`` (Step 8.6)
 ``assertion_curated_at`` / ``assertion_slug`` ``sleep.assertion_curator``
 ``personal_fact_curated_at`` ``sleep.personal_fact_curator`` (Step 8.3)
+``slot_edit_curated_at`` / ``slot_edit_slot``
+                        ``sleep.slot_edit_curator`` (Step 8.35)。``slot_edit_slot`` は
+                        検証済みの編集を適用したスロット — 注入 (``injector``) と
+                        エピソード (``search_pipeline``) が「そのスロットの最新の
+                        言明」に数える
 ``correction_verified_at`` / ``correction_verdict`` /
 ``correction_wrong_claim`` / ``correction_correct_value``
                         ``sleep.correction_curator`` (Step 8.0)
@@ -149,6 +154,8 @@ NOTE_ATTR_FIELDS: tuple[str, ...] = (
     "assertion_curated_at",
     "assertion_slug",
     "personal_fact_curated_at",
+    "slot_edit_curated_at",
+    "slot_edit_slot",
     "correction_verified_at",
     "correction_verdict",
     "correction_wrong_claim",
@@ -191,6 +198,8 @@ _ATTR_DEFAULTS: dict[str, Any] = {
     "assertion_curated_at": None,
     "assertion_slug": None,
     "personal_fact_curated_at": None,
+    "slot_edit_curated_at": None,
+    "slot_edit_slot": None,
     "correction_verified_at": None,
     "correction_verdict": None,
     "correction_wrong_claim": "",
@@ -281,6 +290,17 @@ class MemoryNote:
     読み戻しでそのまま ``None`` になる (封筒の追加キーなので版は上げない)。
     """
 
+    slot_edit_curated_at: float | None = None
+    """``sleep.slot_edit_curator`` (Step 8.35) の冪等マーカー (補助タスクが答えたら立つ)。"""
+
+    slot_edit_slot: str | None = None
+    """検証済みの編集 (要素の追加 / 削除) を適用した属性スロットの slug。
+
+    ``None`` は「編集ではなかった / まだ判定していない」。値は SemMem の新しい
+    ファクトにあり、このノートは **そのスロットの最新の言明** として数える
+    (:func:`~backend.free.memory.notes.note_builder.note_state_slot`)。
+    """
+
     correction_verified_at: float | None = None
     """``sleep.correction_curator`` (Step 8.0) の冪等マーカー。
 
@@ -362,6 +382,7 @@ _TIME_ATTR_FIELDS: frozenset[str] = frozenset({
     "command_curated_at",
     "assertion_curated_at",
     "personal_fact_curated_at",
+    "slot_edit_curated_at",
     "correction_verified_at",
 })
 

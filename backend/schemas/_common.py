@@ -7,7 +7,7 @@ llm) に属さない Config を置く。
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.log_config import get_logger
 
@@ -238,6 +238,23 @@ class AgentConfig(BaseModel):
     # そのものではない。注入に要るのはクエリ埋め込み 1 回だけなので、検索は
     # 落としたまま注入だけ残す。False で従来どおり記憶なし。
     reactive_light_memory_enabled: bool = True
+    # reactive に振られたターンでも挨拶の即答が外れた後に検索を投機し、floor /
+    # pq_gate を通った corpus のチャンクがあれば deliberative へ上げる (不変則 #15:
+    # 字句の近道 (短文 → 軽量パス) は証拠を上書きしない)。off = 従来どおり検索を
+    # 起動しない / shadow = 判定は変えず decision.jsonl に would_escalate を記録
+    # (decision.jsonl が書かれない通常起動では検索しない) / on = 昇格して検索結果を
+    # deliberative で流用 (既定。実機 2026-10-03: 答えのある短問の正答 1/10 → 6/10、
+    # 誤昇格 0、TTFT 悪化なし)。
+    reactive_evidence_escalation: Literal["off", "shadow", "on"] = "on"
+
+    @field_validator("reactive_evidence_escalation", mode="before")
+    @classmethod
+    def coerce_yaml_bool_escalation(cls, value: object) -> object:
+        """YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す"""
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        return value
+
     # deliberative のツール実行ホップ上限。1 = 従来どおり 1 ターン 1 ツール。
     #
     # 1 だと「書いてから読み直して確認する」型の依頼が構造的に完了できず、
@@ -325,11 +342,17 @@ class ToolsConfig(BaseModel):
     # TTL — 最終 fetch から N 日経過した URL は引き当て時に score を半減して
     # min_record_score 閾値判定する (鮮度ペナルティ)。``0`` で無効化。
     url_recall_ttl_days: int = Field(default=30, ge=0, le=365)
-    # ── executable command リコール ──
-    # 過去成功した run_command を新規類似クエリで再利用するための設定。
-    # 書き込みは sleep-time の executable_command_curator が担当し、引き当ては
-    # ToolCallJudge._try_recall_executable_command が決定論的に行う。
-    executable_command_recall_enabled: bool = True
+    # ── executable command リコール (create の shadow) ──
+    # 書き込みは sleep-time の executable_command_curator (create の分類器の決定
+    # だけ)、引き当ては ToolCallJudge._try_recall_executable_command。2026-10-03 から
+    # 判定には使わず、create で評価して decision ログへ残すだけ (不変則 #15)。
+    executable_command_recall_enabled: bool = Field(
+        default=True,
+        description=(
+            "create の executable command リコールを shadow で評価し decision ログへ"
+            "残すか (判定は変えない)。sleep-time の記録も止まる。chat は常に off。"
+        ),
+    )
     executable_command_recall_topk: int = Field(default=5, ge=1, le=20)
     executable_command_recall_min_score: float = Field(default=0.7, ge=0.0, le=1.0)
     executable_command_recall_min_record_score: float = Field(default=0.6, ge=0.0, le=1.0)

@@ -2571,7 +2571,7 @@ def _try_estimate_via_fit_params(
 def _saved_rerank_known_invalid(cfg: dict, project_root: Path, rr: dict, explicit: int) -> bool:
     """明示の ``gpu_layers`` と同じ配置の保存結果が無効で、起動しないと分かっているか (VRAM を足さない)。
 
-    保存結果が無い / 配置が違う (測り直す) / 環境起因の失敗を数えている途中 (また試す) は ``False``。
+    保存結果が無い / 配置が違う (測り直す) / 測り直す失敗 (環境起因・``too_slow``) を数えている途中 (また試す) は ``False``。
     """
     path = rerank_selftest_path(cfg, project_root)
     if path is None:
@@ -2583,7 +2583,7 @@ def _saved_rerank_known_invalid(cfg: dict, project_root: Path, rr: dict, explici
     saved, _status = st.load_selftest_result(path)
     if saved is None or saved.gpu_layers != explicit:
         return False
-    if not saved.enabled and st.is_environmental_failure(saved.reason) and (
+    if not saved.enabled and st.is_retryable_failure(saved.reason) and (
         saved.environmental_streak < st.ENVIRONMENTAL_FAILURE_LIMIT
     ):
         return False
@@ -3247,6 +3247,41 @@ def rerank_selftest_path(cfg: dict, project_root: Path) -> Path | None:
     return _data_path(cfg, project_root, "rerank_selftest_file")
 
 
+#: 起動スクリプトが rerank の起動を断念した印のファイル名 (``run_dir`` の下)。中身は理由 1 行。
+RERANK_ABANDONED_FILE = "rerank_abandoned"
+
+
+def rerank_abandoned_path(cfg: dict, project_root: Path) -> Path | None:
+    """起動断念の印の置き場 (``PathResolver.LAYOUT["run_dir"]`` の下)。ctl の ``--wait-rerank`` が見る。"""
+    run_dir = _data_path(cfg, project_root, "run_dir")
+    return None if run_dir is None else run_dir / RERANK_ABANDONED_FILE
+
+
+def clear_rerank_abandoned(cfg: dict, project_root: Path) -> None:
+    """古い起動断念の印を消す (前回の印で今回の待ちを誤って打ち切らない)。"""
+    path = rerank_abandoned_path(cfg, project_root)
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"[launch] WARNING: failed to remove {path}: {e}", file=sys.stderr)
+
+
+def mark_rerank_abandoned(cfg: dict, project_root: Path, reason: str) -> None:
+    """rerank の起動を断念した印を残す (別プロセスの :func:`wait_rerank_ready` が即 ``disabled`` を返す)。"""
+    path = rerank_abandoned_path(cfg, project_root)
+    if path is None:
+        return
+    try:
+        from backend.io.atomic import atomic_write_text
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, f"{reason or 'not_started'}\n")
+    except (ImportError, OSError) as e:
+        print(f"[launch] WARNING: failed to write {path}: {e}", file=sys.stderr)
+
+
 def _explicit_gpu_layers(rr: dict) -> int | None:
     """``rag.rerank.gpu_layers`` が明示の整数ならその値、``auto`` なら ``None``。"""
     raw = rr.get("gpu_layers", "auto")
@@ -3260,7 +3295,7 @@ def _usable_saved(st, saved, rr: dict) -> tuple[bool, int, str]:
     return st.effective_candidates(
         saved,
         deadline_ms=int(rr.get("deadline_ms", 1000)),
-        max_candidates=int(rr.get("max_candidates", 20)),
+        max_candidates=int(rr.get("max_candidates", 12)),
         min_candidates=int(rr.get("min_candidates", 3)),
     )
 
@@ -3351,7 +3386,32 @@ def _wait_healthy_or_dead(
         sleep(1.0)
 
 
-def start_rerank_server(
+def start_rerank_server(cfg: dict, project_root: Path, **kwargs) -> RerankLaunch:
+    """rerank サーバを起動する (:func:`_start_rerank_server`)。起動を断念した回は印を残す。
+
+    始める時点で古い印を消し、起動対象 (:func:`rerank_launchable`) なのにサーバを残さず返る回
+    (保存結果が無効・起動失敗・自己テスト失敗・確認待ち・メモリ不足 等) は ``run/`` に印を書く。
+    別プロセスの ctl の ``--wait-rerank`` (:func:`wait_rerank_ready`) はそれを見て待ちを打ち切る。
+    """
+    clear_rerank_abandoned(cfg, project_root)
+    try:
+        launched = _start_rerank_server(cfg, project_root, **kwargs)
+    except BaseException:
+        # 例外 (中断を含む) で抜けた回も待ち側を 240 秒待たせない
+        _mark_rerank_abandoned_if_launchable(cfg, project_root, "launcher_error")
+        raise
+    if launched.proc is None:
+        _mark_rerank_abandoned_if_launchable(cfg, project_root, launched.message)
+    return launched
+
+
+def _mark_rerank_abandoned_if_launchable(cfg: dict, project_root: Path, reason: str) -> None:
+    """起動対象 (mode off / モデル無しでない) のときだけ起動断念の印を書く。"""
+    if rerank_launchable(cfg, project_root)[0]:
+        mark_rerank_abandoned(cfg, project_root, reason)
+
+
+def _start_rerank_server(
     cfg: dict,
     project_root: Path,
     *,
@@ -3412,7 +3472,7 @@ def start_rerank_server(
     rr = _rerank_cfg(cfg)
     explicit = _explicit_gpu_layers(rr)
     deadline_ms = int(rr.get("deadline_ms", 1000))
-    max_candidates = int(rr.get("max_candidates", 20))
+    max_candidates = int(rr.get("max_candidates", 12))
     min_candidates = int(rr.get("min_candidates", 3))
     model = resolve_rerank_model_path(cfg, project_root)
     assert model is not None
@@ -3483,7 +3543,8 @@ def start_rerank_server(
             return RerankLaunch(None, saved, False, "server_unhealthy")
         print(
             f"[launch] rerank ready on :{port} ({placement.kind}, "
-            f"{saved.ms_per_doc or 0:.0f} ms/doc, {candidates} candidates; saved self-test)",
+            f"{saved.ms_per_doc or 0:.0f} ms/doc, {candidates} candidates at self-test length, "
+            f"token budget {st.rerank_token_budget(saved.ms_per_doc, deadline_ms=deadline_ms)}; saved self-test)",
         )
         return RerankLaunch(proc, saved, False, "")
 
@@ -3546,7 +3607,8 @@ def start_rerank_server(
                 print(f"[launch] WARNING: failed to save the rerank self-test to {path}", file=sys.stderr)
             print(
                 f"[launch] rerank self-test passed on {placement.kind}: "
-                f"{verdict.ms_per_doc or 0:.0f} ms/doc, {verdict.candidates} candidates, "
+                f"{verdict.ms_per_doc or 0:.0f} ms/doc, {verdict.candidates} candidates at self-test length, "
+                f"token budget {st.rerank_token_budget(verdict.ms_per_doc, deadline_ms=deadline_ms)}, "
                 f"margin {verdict.margin or 0:.2f}",
             )
             return RerankLaunch(proc, last, True, "")
@@ -3559,25 +3621,25 @@ def start_rerank_server(
             break
 
     assert last is not None
-    # 環境起因かは最後の試行の結果で決める (GPU が環境起因でも CPU が too_slow なら PC の性質として保存する)
+    # 環境起因かは最後の試行の結果で決める (GPU が環境起因でも CPU が too_slow なら too_slow として数える)
     if st.is_environmental_failure(last.reason) and saved is not None and saved.fingerprint == fingerprint and saved.enabled:
         print(
             f"[launch] rerank disabled for this run: {last.reason} (environmental; kept the previous result "
             "of this PC, not overwritten)",
         )
-    elif st.is_environmental_failure(last.reason):
+    elif st.is_retryable_failure(last.reason):
         last.environmental_streak = st.next_environmental_streak(saved, fingerprint)
         if not st.save_selftest_result(path, last):
             print(f"[launch] WARNING: failed to save the rerank self-test to {path}", file=sys.stderr)
         if last.environmental_streak >= st.ENVIRONMENTAL_FAILURE_LIMIT:
             print(
-                f"[launch] rerank disabled: {last.reason} ({last.environmental_streak} environmental failures "
+                f"[launch] rerank disabled: {last.reason} ({last.environmental_streak} possibly temporary failures "
                 "in a row; not re-testing until the PC changes or --rerank-selftest)",
             )
         else:
             print(
                 f"[launch] rerank disabled for this run: {last.reason} "
-                f"(environmental failure {last.environmental_streak}/{st.ENVIRONMENTAL_FAILURE_LIMIT}; "
+                f"(possibly temporary failure {last.environmental_streak}/{st.ENVIRONMENTAL_FAILURE_LIMIT}; "
                 "will retry next start)",
             )
     else:
@@ -3596,7 +3658,8 @@ def wait_rerank_ready(
 
     保存結果の指紋がこの PC と一致し、有効なら ``/health`` が 200 になるまで。mode off /
     モデル無しは即座に返る。環境移行の確認待ち (``pending`` / ``declined``、c_16 §7.2.3) で起動スクリプトが
-    測らない回も待たずに ``disabled``。戻り値は状態 (``off`` / ``ready`` / ``disabled`` / ``timeout``)。
+    測らない回も待たずに ``disabled``。起動スクリプトが起動を断念した印 (:func:`mark_rerank_abandoned`) が
+    あれば、その時点で ``disabled`` を返す。戻り値は状態 (``off`` / ``ready`` / ``disabled`` / ``timeout``)。
     """
     ok, _why = rerank_launchable(cfg, project_root)
     path = rerank_selftest_path(cfg, project_root)
@@ -3613,7 +3676,10 @@ def wait_rerank_ready(
     port = rerank_port(cfg)
     deadline = clock() + timeout_sec
     gate_checked = False
+    abandoned = rerank_abandoned_path(cfg, project_root)
     while True:
+        if abandoned is not None and abandoned.exists():
+            return "disabled"
         saved, _status = st.load_selftest_result(path)
         needed, why = st.selftest_needed(saved, fingerprint, explicit_gpu_layers=explicit)
         if needed and not gate_checked:
@@ -4197,6 +4263,14 @@ if __name__ == "__main__":
             "準備できるまで待って終了する (evoref-ctl 用。rerank が off なら即終了)"
         ),
     )
+    parser.add_argument(
+        "--clear-rerank-abandoned",
+        action="store_true",
+        help=(
+            "前回の rerank 起動断念の印 (run/rerank_abandoned) を消して終了する (evoref-ctl 用。"
+            "--all を背後で起こす前に呼び、--wait-rerank が古い印で待ちを打ち切らないようにする)"
+        ),
+    )
     args = parser.parse_args()
 
     cfg_path = Path(args.config)
@@ -4218,6 +4292,10 @@ if __name__ == "__main__":
 
     if args.wait_health is not None:
         _wait_health(health_ports, float(args.wait_health))
+        sys.exit(0)
+
+    if args.clear_rerank_abandoned:
+        clear_rerank_abandoned(cfg, project_root)
         sys.exit(0)
 
     if args.wait_rerank is not None:
@@ -4253,6 +4331,10 @@ if __name__ == "__main__":
         sys.exit(0 if launched.result is not None else 1)
 
     procs: list[subprocess.Popen] = []
+    if args.all:
+        # ctl の --wait-rerank は base / embed の health 待ちの後に始まる。それより前 (base を起こす前) に
+        # 前回の起動断念の印を消し、今回の rerank を始める前に古い印で待ちを打ち切らせない
+        clear_rerank_abandoned(cfg, project_root)
 
     launch_base = not args.embed
     launch_embed = args.embed or args.all
@@ -4268,6 +4350,8 @@ if __name__ == "__main__":
         else:
             print(line)
     if not build_ok:
+        if args.all:
+            _mark_rerank_abandoned_if_launchable(cfg, project_root, "llama_server_build_check_failed")
         sys.exit(3)
 
     # VRAM 予算検査は --all (全モデル一括起動) 時のみ実行する。
@@ -4279,6 +4363,7 @@ if __name__ == "__main__":
         )
         print(message)
         if not ok:
+            _mark_rerank_abandoned_if_launchable(cfg, project_root, "vram_budget_exceeded")
             sys.exit(2)
 
     try:

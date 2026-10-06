@@ -132,6 +132,7 @@ from backend.free.agent.meta_cognitive_tool_io import (
     _TEMPLATE_TOOL_CALL_RE,
     _TOOL_EMPTY_RESULT_PREFIXES,
     TOOL_ERROR_PREFIX,
+    tool_error_kind,
     tool_result_lacks_information,
     tool_result_succeeded,
     try_parse_tool_dict,

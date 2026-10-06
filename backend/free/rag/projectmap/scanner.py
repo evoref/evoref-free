@@ -75,10 +75,18 @@ class ScannedFile:
     lang: str
 
 
-def _is_excluded_dir(name: str, exclude_globs: Sequence[str]) -> bool:
+def _is_excluded_dir(name: str, rel_posix: str, exclude_globs: Sequence[str]) -> bool:
     if name in DEFAULT_EXCLUDED_DIRS:
         return True
-    return any(fnmatch.fnmatch(name, pattern) for pattern in exclude_globs)
+    if any(fnmatch.fnmatch(name, pattern) for pattern in exclude_globs):
+        return True
+    # ``release/**`` のような相対パスの glob で、配下の全パスが一致するディレクトリは
+    # 降りる前に刈る。末尾が ``*`` の glob が ``<dir>/`` に一致するなら、``*`` は
+    # ``/`` も含めて何にでも一致するので配下のどのパスにも一致する。
+    return any(
+        pattern.endswith("*") and fnmatch.fnmatch(f"{rel_posix}/", pattern)
+        for pattern in exclude_globs
+    )
 
 
 def _is_nested_checkout(directory: Path) -> bool:
@@ -142,15 +150,19 @@ def scan_project(
     # 列挙してから捨てるので、2,000 ファイルのリポジトリで 17 秒掛かった。
     # ``os.walk`` で降りる前に刈る (``search_code`` ツールと同じ形)。
     for dirpath, dirnames, filenames in os.walk(base):
+        rel_dir = Path(dirpath).relative_to(base)
         dirnames[:] = sorted(
             d for d in dirnames
-            if not _is_excluded_dir(d, exclude_globs)
+            if not _is_excluded_dir(d, (rel_dir / d).as_posix(), exclude_globs)
             and not _is_nested_checkout(Path(dirpath) / d)
         )
-        rel_dir = Path(dirpath).relative_to(base)
         for filename in filenames:
             rel_posix = (rel_dir / filename).as_posix() if rel_dir.parts else filename
-            if config_paths_out is not None and filename in ALIAS_CONFIG_BASENAMES:
+            if (
+                config_paths_out is not None
+                and filename in ALIAS_CONFIG_BASENAMES
+                and not _matches_exclude_glob(rel_posix, exclude_globs)
+            ):
                 config_paths_out.append(rel_posix)
             suffix = Path(filename).suffix.lower()
             lang = LANGUAGE_EXTENSIONS.get(suffix)

@@ -24,9 +24,14 @@ __all__ = [
     "JP_DATE_RE",
     "YMD_JA_PATTERN",
     "YMD_NUMERIC_PATTERN",
+    "WEEKDAY_SUFFIX_RE",
     "WeekdayClaim",
     "complete_years",
+    "extract_tool_anchor",
+    "extract_tool_now_date",
     "extract_tool_target_date",
+    "literal_date_ranges",
+    "literal_date_spans",
     "literal_dates",
     "fix_weekday_claims",
     "response_dates",
@@ -45,6 +50,13 @@ _ZENKAKU_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
 #: 参照)。``business_days_from`` / ``days_from`` / ``weekday_of`` だけが持つ
 #: (``days_between`` は日数を返すのでこの行を持たない)。
 _TARGET_LINE_RE = re.compile(r"target:\s*(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})")
+#: 生成コマンドが印字する起点の出所 (``anchor: today`` / ``literal`` / ``conversation``)。
+#: コマンド文字列そのもの (``print('anchor:','literal')``) からも読める。
+#: 生成コマンドが印字する実行時刻 (``now: 2026-10-05 12:34:56.789+09:00``)。
+_NOW_LINE_RE = re.compile(r"now:\s*(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})")
+_ANCHOR_LINE_RE = re.compile(
+    r"anchor:\s*(?:['\"]\s*,\s*['\"])?(?P<kind>today|literal|conversation)\b",
+)
 
 #: ISO 形式の日付 (``2026-10-09``)。前後が数字に接していないことを確認し、
 #: より長い数値列の部分一致を避ける。
@@ -60,10 +72,11 @@ JP_DATE_RE = re.compile(
     r"(?:(?P<y>\d{4})\s*年\s*)?(?P<m>\d{1,2})\s*月\s*(?P<d>\d{1,2})\s*日",
 )
 
-#: 月日の直後に添えた曜日 (``（火）`` / ``(火)`` / ``火曜日`` / ``火曜``)。
+#: 月日の直後に添えた曜日 (``（火）`` / ``(火)`` / ``火曜日`` / ``火曜``)。``calculate`` の日付
+#: 引数 (``agent/tools/calc_ops.date_parts``) も同じ添え書きを読み飛ばす。
 #: 曜日は 7 字の閉じた集合 (語を足す保守は起きない)。
 _WEEKDAY_CHARS = "月火水木金土日"
-_WEEKDAY_SUFFIX_RE = re.compile(
+WEEKDAY_SUFFIX_RE = re.compile(
     r"\s*(?:[（(]\s*(?P<p>[月火水木金土日])\s*(?:曜日?)?\s*[）)]"
     r"|(?P<w>[月火水木金土日])曜)",
 )
@@ -103,6 +116,46 @@ def literal_dates(text: str) -> list[tuple[int | None, int, int]]:
     綴りは :func:`mentions_literal_date` と同じ (和文の月日 / 年月日 / ``10/15``)。
     年を書いていない形は年を ``None`` にする (捏造しない)。
     """
+    return [ymd for _start, _end, ymd in literal_date_spans(text)]
+
+
+#: 2 つの日付を範囲に結ぶ語 (「10月2日から10月3日」「10月2日〜3日」)。
+_RANGE_JOIN = r"\s*(?:から|〜|～|~|－|-|–)\s*"
+_RANGE_JOIN_RE = re.compile(_RANGE_JOIN)
+#: 終端の月を省いた範囲 (「10月2日〜3日」の「〜3日」)。月と年は始まりから継ぐ。
+_ABBREVIATED_RANGE_END_RE = re.compile(_RANGE_JOIN + r"(?P<d>\d{1,2})\s*日")
+
+
+def literal_date_ranges(
+    text: str,
+) -> list[tuple[int, tuple[int | None, int, int], tuple[int | None, int, int]]]:
+    """具体日付を範囲にまとめ ``(終端の位置, 始まり, 終わり)`` で出現順に返す (純粋関数)。
+
+    「A から B」「A〜B」は 1 つの範囲、終端の月を省いた「10月2日〜3日」も範囲に読む。
+    単独の日付は始まり = 終わり。位置は ``text`` 上の文字位置 (全角数字の正規化は
+    1 文字 → 1 文字なのでずれない)。
+    """
+    normalized = (text or "").translate(_ZENKAKU_DIGITS)
+    spans = literal_date_spans(normalized)
+    out: list[tuple[int, tuple[int | None, int, int], tuple[int | None, int, int]]] = []
+    i = 0
+    while i < len(spans):
+        _start, end, first = spans[i]
+        if i + 1 < len(spans) and _RANGE_JOIN_RE.fullmatch(normalized, end, spans[i + 1][0]):
+            out.append((spans[i + 1][1], first, spans[i + 1][2]))
+            i += 2
+            continue
+        m = _ABBREVIATED_RANGE_END_RE.match(normalized, end)
+        if m is not None:
+            out.append((m.end(), first, (first[0], first[1], int(m["d"]))))
+        else:
+            out.append((end, first, first))
+        i += 1
+    return out
+
+
+def literal_date_spans(text: str) -> list[tuple[int, int, tuple[int | None, int, int]]]:
+    """:func:`literal_dates` の各日付を ``(開始位置, 終了位置, (年 | None, 月, 日))`` で返す (純粋関数)。"""
     normalized = (text or "").translate(_ZENKAKU_DIGITS)
     found: list[tuple[int, int, tuple[int | None, int, int]]] = []
     for m in _YMD_NUMERIC_RE.finditer(normalized):
@@ -114,12 +167,12 @@ def literal_dates(text: str) -> list[tuple[int | None, int, int]]:
     for m in _SLASH_DATE_RE.finditer(normalized):
         found.append((m.start(), m.end(), (None, int(m["m"]), int(m["d"]))))
     found.sort(key=lambda t: (t[0], t[1]))
-    out: list[tuple[int | None, int, int]] = []
+    out: list[tuple[int, int, tuple[int | None, int, int]]] = []
     last_end = -1
     for start, end, ymd in found:
         if start < last_end:
             continue
-        out.append(ymd)
+        out.append((start, end, ymd))
         last_end = end
     return out
 
@@ -218,6 +271,27 @@ def extract_tool_target_date(text: str) -> date | None:
         return None
 
 
+def extract_tool_now_date(text: str) -> date | None:
+    """コマンド結果ブロックの ``now:`` 行の日付 (ツールが今日とした日)。無ければ ``None``。"""
+    m = _NOW_LINE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        return date(int(m["y"]), int(m["m"]), int(m["d"]))
+    except ValueError:
+        return None
+
+
+def extract_tool_anchor(text: str) -> str | None:
+    """コマンド結果ブロックの ``anchor:`` 行 (起点の出所)。無ければ ``None`` (純粋関数)。
+
+    ``anchor:`` を印字しないコマンド (印字を足す前に学習・想起されたもの) は
+    起点が分からない。実行前のコマンド文字列を渡しても同じ値を読む。
+    """
+    m = _ANCHOR_LINE_RE.search(text or "")
+    return m["kind"] if m else None
+
+
 def _safe_date(year: int, month: int, day: int) -> date | None:
     try:
         return date(year, month, day)
@@ -312,7 +386,7 @@ def weekday_claims(text: str) -> list[WeekdayClaim]:
     normalized = (text or "").translate(_ZENKAKU_DIGITS)
     out: list[WeekdayClaim] = []
     for m in JP_DATE_RE.finditer(normalized):
-        suffix = _WEEKDAY_SUFFIX_RE.match(normalized, m.end())
+        suffix = WEEKDAY_SUFFIX_RE.match(normalized, m.end())
         if suffix is None:
             continue
         group = "p" if suffix["p"] else "w"

@@ -317,6 +317,9 @@ def _rerank_status(state: AppState) -> RerankStatusInfo:
         return RerankStatusInfo()
     reranker = getattr(gen, "reranker", None)
     remaining = getattr(reranker, "breaker_remaining_s", None)
+    reason = status.reason
+    if reason == "server_unreachable" and remaining is None:
+        reason = ""  # 起動時に届かなかったが、試しか再接続で遮断器が閉じた (復帰済み)
     return RerankStatusInfo(
         breaker_open=remaining is not None,
         breaker_remaining_s=round(remaining, 1) if remaining is not None else None,
@@ -325,7 +328,9 @@ def _rerank_status(state: AppState) -> RerankStatusInfo:
         placement=status.placement,
         ms_per_doc=status.ms_per_doc,
         candidates=status.candidates,
-        reason=status.reason,
+        max_candidates=status.max_candidates,
+        token_budget=status.token_budget,
+        reason=reason,
         tested_at=status.tested_at,
         model_changed_since_selftest=status.model_changed_since_selftest,
     )

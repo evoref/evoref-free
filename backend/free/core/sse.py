@@ -236,17 +236,21 @@ class SSEFrameBuilder:
         return _frame("error", {"error": text})
 
     @staticmethod
-    def error_with_code(code: str, message: str, **context) -> str:
+    def error_with_code(
+        code: str, message: str, *, retryable: bool | None = None, **context,
+    ) -> str:
         """構造化エラーフレーム（コード付き）
 
         Args:
             code: エラーコード（例: E0513）
             message: エラーメッセージ
+            retryable: 同じ入力での再試行が見込めるか (None は判定なしでキーを省く)
             **context: 追加のコンテキスト情報
         """
-        return _frame("error", {
-            "error": {"code": code, "message": message, "context": context},
-        })
+        err: dict = {"code": code, "message": message, "context": context}
+        if retryable is not None:
+            err["retryable"] = retryable
+        return _frame("error", {"error": err})
 
     @staticmethod
     def result(payload: dict) -> str:

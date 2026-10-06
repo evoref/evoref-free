@@ -23,6 +23,7 @@ from backend.free.api.chat.chat_constants import (
     DEFAULT_KEEPALIVE_INTERVAL_SEC, DEFAULT_MAX_TOKENS,
     MAX_FILE_CONTEXT_TOTAL_CHARS, MAX_FILE_CONTEXT_TOTAL_CHUNKS,
     MAX_MESSAGE_LENGTH,
+    REACTIVE_EVIDENCE_LATE_WAIT_S,
     REACTIVE_LIGHT_HISTORY_TURNS, REACTIVE_LIGHT_MAX_TOKENS,
     SESSION_ID_MAX_LENGTH, SESSION_ID_MIN_LENGTH,
     DEFAULT_WORKING_MAX_TOKENS,
@@ -60,6 +61,7 @@ from backend.free.api.chat.chat_recorder import (
     set_turn_rag_meta,
     set_turn_fewshot_ids,
 )
+from backend.free.memory.pipeline.search_pipeline import PREVIOUS_CONTEXT_MARK, SearchUsage
 from backend.free.api.chat.chat_service import (
     ConflictTurnContext,
     SearchPipelineResult,
@@ -92,6 +94,13 @@ from backend.free.api.chat._continuation import (
     take_continuation,
 )
 from backend.edition import is_pro
+from backend.free.core.answer_conditions import (
+    ExtractionOutcome as AnswerConditionsOutcome,
+    PendingExtraction as AnswerConditionsPending,
+    answer_conditions_verdict,
+    start_answer_conditions,
+    take_answer_conditions,
+)
 from backend.free.core.inference import latest_turn_truncation
 from backend.free.core.turn_text import append_to_last_user, neutralize_frame_markers
 from backend.free.core.intent_vocab import is_today_scope_query, is_whole_session_scope_query
@@ -118,7 +127,9 @@ from backend.free.agent.router import (
 )
 from backend.free.agent.issue_ledger import issue_ledger_scope
 from backend.free.agent.file_ledger import file_ledger_scope, last_written_path
-from backend.free.agent.tool_ledger import set_ledger_target
+from backend.free.agent.tool_ledger import (
+    current_session_id, recent_observations, set_ledger_target,
+)
 from backend.free.core.stage_timer import StageTimer
 from backend.free.generation.harness import LongFormHarness
 from backend.free.generation.orchestrator import LongFormOrchestrator
@@ -257,8 +268,8 @@ def _llm_unavailable_response(stream: bool) -> StreamingResponse:  # noqa: ARG00
     sse = SSEFrameBuilder()
 
     async def _gen():
-        from backend.i18n_helper import msg
-        yield sse.error(msg('cli.llm_not_connected'))
+        from backend.free.api.chat.chat_errors import LLM_NOT_CONNECTED as info
+        yield sse.error_with_code(info.code, info.message, retryable=info.retryable)
         yield sse.done()
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
@@ -566,6 +577,247 @@ async def _url_recall_hit(req: ChatRequest, state: AppState) -> bool:
     return judgement is not None and judgement.tool_needed
 
 
+async def _shadow_url_recall_escalation(req: ChatRequest, state: AppState) -> None:
+    """URL リコールによる reactive→deliberative の昇格を shadow で記録する (昇格しない)。
+
+    記憶の類似度だけで層を上げる近道で、実発火は全ログで 0 件・益は未計測だった
+    (不変則 #15)。``url_recall_escalation`` に would_escalate を残すだけ。記録が
+    書かれない構成では評価もしない (埋め込みの往復を誰も読まない記録に払わない)。
+    記録だけの経路なので、失敗はターンへ伝えず記録を落とすだけにする。
+    """
+    if not _decisions_recorded(state):
+        return
+    try:
+        would_escalate = await _url_recall_hit(req, state)
+        state.debug_logger.log_decision(
+            decision_point="url_recall_escalation",
+            chosen="no_escalate",
+            candidates=["escalate", "no_escalate"],
+            reason="url_recall_hit_shadow" if would_escalate else "no_url_recall_hit",
+            context={"would_escalate": would_escalate},
+            scope="request",
+        )
+    except Exception as exc:
+        logger.warning("URL recall escalation shadow failed: %r", exc)
+
+
+def _evidence_escalation_policy(cfg: dict) -> str:
+    """``agent.reactive_evidence_escalation`` (``off`` / ``shadow`` / ``on``、既定 on)。
+
+    YAML 1.1 で引用符無しの ``on`` / ``off`` は真偽値で届くので文字列へ戻す。
+    """
+    value = (cfg.get("agent") or {}).get("reactive_evidence_escalation", "on")
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return value
+
+
+#: shadow の投機検索のうち、軽量パスの採否の時点で終わっていなかったもの。
+#: 待たずに軽量パスへ進み、早期シグナルの解決時に記録する (``_reactive_evidence_hit``)。
+#: 参照を握らないと完了前に GC されうるので、完了まで集合で持つ。
+_SHADOW_LATE_SEARCHES: set["asyncio.Task"] = set()
+
+
+def _decisions_recorded(state: AppState) -> bool:
+    """判定の記録 (``decision.jsonl``) が書かれる構成か (通常起動・``debug`` では偽)。"""
+    dl = getattr(state, "debug_logger", None)
+    return (
+        dl is not None
+        and bool(getattr(dl, "enabled", False))
+        and bool(getattr(dl, "log_decisions", False))
+    )
+
+
+def _start_reactive_search(
+    req: ChatRequest, state: AppState, cfg: dict,
+    timer: StageTimer, session_id: str | None,
+) -> "tuple[asyncio.Task | None, asyncio.Future[int] | None]":
+    """reactive の即答が外れたターンで検索を投機する (``off`` では起動しない)。
+
+    呼ぶのは挨拶の即答 (``_try_reactive_layer``) が外れた **後** — 前に置くと
+    挨拶のたびに検索を起こして cancel するのが日常の経路になる (URL リコールを
+    後ろへ置いた 2026-09-02 C1 と同じ理由)。埋め込みはツール判定と共有の
+    キャッシュに乗り、検索はツール判定と並走する。
+
+    ``shadow`` は結果を記録にしか使わないので、記録が書かれない構成では起動
+    しない (誰も読まない検索を毎ターン払うことになる)。起動するときも注入に
+    使わないので再順位段 (単一スロットで sleep-time の採点とも共有) を省き、
+    区間はこのターンの計測 (軽量パスの ``requests`` 行) に混ぜない。
+
+    返すのは ``(検索タスク, 証拠の早期シグナル)``。シグナルは採用に載る corpus の
+    件数で、検索が再順位段の前で決めた時点 (``early_corpus_evidence``) か、検索の
+    完了 / 失敗 / 取消の時点の早い方で解決する (``_evidence_signal``)。採否の判定は
+    検索全体ではなくこのシグナルを待つ — on の再順位 (単一スロット) の待ちを軽量
+    パスの採否に乗せないため。shadow も同じシグナルで記録するので、shadow の
+    ``late`` 率が on の予測になる (shadow が省く再順位はシグナルの後ろにある)。
+    """
+    policy = _evidence_escalation_policy(cfg)
+    if policy == "off":
+        return None, None
+    if policy == "shadow" and not _decisions_recorded(state):
+        return None, None
+    signal: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+
+    def _early(count: int) -> None:
+        if not signal.done():
+            signal.set_result(count)
+
+    if policy == "shadow":
+        coro = _run_search_timed(
+            req, state, cfg, StageTimer(), session_id, rerank=False, on_corpus_evidence=_early,
+        )
+    else:
+        coro = _run_search_timed(req, state, cfg, timer, session_id, on_corpus_evidence=_early)
+    task = asyncio.create_task(coro)
+    return task, _evidence_signal(task, signal)
+
+
+def _evidence_signal(
+    search_task: "asyncio.Task", signal: "asyncio.Future[int] | None" = None,
+) -> "asyncio.Future[int]":
+    """検索の完了でも必ず解決する早期シグナル (待ち手がハングしない)。
+
+    検索が早期シグナルを出さずに終われば最終結果の corpus 件数 (失敗は 0)、
+    取消なら取消で解決する。``signal`` が無ければ作る (検索タスクだけを渡す呼び手用)。
+    """
+    if signal is None:
+        signal = asyncio.get_running_loop().create_future()
+
+    def _settle(task: "asyncio.Task") -> None:
+        if signal.done():
+            return
+        if task.cancelled():
+            signal.cancel()
+            return
+        try:
+            result = task.result()
+        except Exception:  # noqa: BLE001 — 検索の失敗は「証拠なし」
+            signal.set_result(0)
+            return
+        signal.set_result(_corpus_evidence(result)[0])
+
+    if search_task.done():
+        _settle(search_task)
+    else:
+        search_task.add_done_callback(_settle)
+    return signal
+
+
+def _corpus_evidence(result: SearchPipelineResult) -> tuple[int, int, float | None]:
+    """採用された corpus のチャンク数・episodic の件数・採用チャンクの生 cosine の最大値。
+
+    採用 (``evidence_ids``) に載るのは必要性判定が retrieve で、floor / pq_gate を
+    通った行 (転置索引の席も同じ keep floor を通る) と、その随伴 (Step 7.65 の
+    前文脈) だけ。随伴は採用チャンクがあるときしか付かないので件数からだけ除く。
+    episodic は長い会話で常に当たるので昇格の条件に数えない (第 1 段)。
+    cosine は corpus 単独の値を結果が持たないため、全ストアの最大値。
+    """
+    if result.failed or result.corpus_gated:
+        return 0, 0, None
+    corpus = sum(1 for eid in result.evidence_ids if eid.startswith("corpus:"))
+    episodic = sum(1 for eid in result.evidence_ids if eid.startswith("episodic:"))
+    companions = sum(
+        1 for _cid, _score, text in (result.scored_chunks or [])
+        if isinstance(text, str) and text.startswith(PREVIOUS_CONTEXT_MARK)
+    )
+    return max(0, corpus - companions), episodic, result.rag_top_score
+
+
+def _log_evidence_escalation(
+    state: AppState, policy: str, search_task: "asyncio.Task",
+    signal: "asyncio.Future[int]", *, late: bool, waited: bool,
+) -> bool | None:
+    """``evidence_escalation`` を記録し、昇格の条件を満たしたか (未解決なら ``None``) を返す。
+
+    昇格の可否は早期シグナル (``_evidence_signal``) だけで決める。episodic の件数と
+    cosine は検索が終わっていれば添える (再順位を待つ回は不明のまま)。
+    """
+    would_escalate: bool | None = None
+    corpus_hits, episodic_hits, top_cos = 0, 0, None
+    if signal.done() and not signal.cancelled():
+        corpus_hits = signal.result()
+        would_escalate = corpus_hits > 0
+        if search_task.done() and not search_task.cancelled():
+            try:
+                result = search_task.result()
+            except Exception:  # noqa: BLE001 — 検索の失敗は「証拠なし」
+                result = None
+            if result is not None:
+                _, episodic_hits, top_cos = _corpus_evidence(result)
+    if would_escalate is None:
+        reason = "search_late"
+    elif would_escalate:
+        reason = "evidence_hit" if policy == "on" else "evidence_hit_shadow"
+    else:
+        reason = "no_corpus_evidence"
+    dl = getattr(state, "debug_logger", None)
+    if dl is not None:
+        dl.log_decision(
+            decision_point="evidence_escalation",
+            chosen="escalate" if (policy == "on" and would_escalate) else "keep_light",
+            candidates=["escalate", "keep_light"],
+            reason=reason,
+            context={
+                "policy": policy, "would_escalate": would_escalate,
+                "corpus_hits": corpus_hits, "episodic_hits": episodic_hits,
+                "top_cos_any_store": top_cos,
+                "late": late, "waited": waited,
+                # 検索の完了を待たずに早期シグナルで決めた回 (再順位の前)
+                "early": would_escalate is not None and not search_task.done(),
+            },
+            scope="request",
+        )
+    return would_escalate
+
+
+async def _reactive_evidence_hit(
+    state: AppState, policy: str, search_task: "asyncio.Task",
+    timer: "StageTimer | None" = None,
+    signal: "asyncio.Future[int] | None" = None,
+) -> bool:
+    """軽量パスへ落とす直前に、投機した検索の証拠 (早期シグナル) を見る。
+
+    待つのは検索全体ではなく早期シグナル — 採用に載る corpus は再順位段の前に
+    決まるので、on の再順位を待たずに上げられる (上がった後は deliberative が
+    再順位済みの同じ検索を流用する)。``on`` だけ締切 ``REACTIVE_EVIDENCE_LATE_WAIT_S``
+    まで待つ。``shadow`` は待たない — 未解決なら検索を ``_SHADOW_LATE_SEARCHES`` に
+    預け、シグナルの解決時に ``late=True`` で記録する (呼出側は預けた検索を cancel
+    しない)。それ以外の検索タスクはここでは cancel しない (昇格すれば deliberative
+    が流用し、軽量なら呼出側が破棄する。消費されない検索の「使った」記録は積まれない)。
+    判定の記録は ``evidence_escalation`` (decision.jsonl)。
+    """
+    signal = _evidence_signal(search_task, signal)
+    waited = False
+    if not signal.done() and policy == "on":
+        waited = True
+        if timer is not None:
+            timer.start("light_gate_evidence_wait_ms")
+        try:
+            await asyncio.wait({signal}, timeout=REACTIVE_EVIDENCE_LATE_WAIT_S)
+        finally:
+            if timer is not None:
+                timer.stop("light_gate_evidence_wait_ms")
+    if not signal.done() and policy == "shadow":
+        _SHADOW_LATE_SEARCHES.add(search_task)
+        search_task.add_done_callback(_SHADOW_LATE_SEARCHES.discard)
+
+        def _record_late(_signal: "asyncio.Future[int]") -> None:
+            _log_evidence_escalation(state, policy, search_task, signal, late=True, waited=False)
+
+        signal.add_done_callback(_record_late)
+        return False
+    late = not signal.done()
+    return bool(_log_evidence_escalation(
+        state, policy, search_task, signal, late=late, waited=waited,
+    ))
+
+
+def _discard_reactive_search(task: "asyncio.Task | None") -> None:
+    """軽量パスで使わない投機検索を破棄する (shadow の完了待ちの記録分は残す)。"""
+    if task is not None and task not in _SHADOW_LATE_SEARCHES:
+        _cancel_pending_task(task)
+
+
 async def _gate_reactive_light(
     req: ChatRequest,
     state: AppState,
@@ -573,8 +825,18 @@ async def _gate_reactive_light(
     history: list,
     judge_task: "asyncio.Task | None",
     timer: "StageTimer | None" = None,
+    *,
+    search_task: "asyncio.Task | None" = None,
+    evidence_signal: "asyncio.Future[int] | None" = None,
 ) -> tuple[str, "asyncio.Task | None", str]:
     """reactive ルール miss 後、軽量パス採否を判定する。
+
+    ``search_task`` は即答が外れた後に投機した検索 (``_start_reactive_search``)、
+    ``evidence_signal`` はその早期シグナル (再順位の前に決まる corpus の件数)。
+    ツール判定が軽量パスを許したターンでも、floor / pq_gate を通った corpus の
+    チャンクがあれば ``agent.reactive_evidence_escalation`` に従って上げる
+    (``on``) / 記録だけする (``shadow``)。不変則 #15: 字句の近道 (短文 → 軽量
+    パス) は取得できる証拠を上書きしない。
 
     Returns ``(decision, judge_task, reason)``:
       - decision: ``"light"`` (base 1 ターン軽量パス) | ``"deliberative"`` (エスカレート)
@@ -586,6 +848,11 @@ async def _gate_reactive_light(
     # 添付ファイルを無視した軽量応答は品質事故 → deliberative
     if getattr(req, "file_contexts", None):
         return "deliberative", judge_task, "file_context"
+    # 直近のターンでツールが取得した資料 (ファイル / URL の本文) がある会話も同じ。
+    # 軽量パスはそれを持ち越さないので、短い続きの問い (「製品Bは？」) が資料なしで
+    # 答えられて作話する (deliberative の _append_recent_observations、不変則 #15)。
+    if recent_observations(current_session_id()):
+        return "deliberative", judge_task, "recent_observation"
     # judge_task は chat() が分類直後に投機起動する (前処理は常に並列)。None は
     # 判定器が配線されていない構成だけ。
     if (
@@ -660,6 +927,20 @@ async def _gate_reactive_light(
     # (2026-09-28 独立レビュー、docs/f_03 §3.1)。
     if judgement is not None and judgement.calculation_rejected:
         return "deliberative", judge_task, "calculation_rejected"
+    # 日付演算を組めずツール無しで答えるターンも同じ。軽量パスでは「日付の計算を
+    # 検証していない」注記 (deliberative の _UNGROUNDED_DATE_MATH_NOTES) が付かず、
+    # 暗算の日数・目標日が検証済みの口調で出る (現在日時だけを返すコマンドの廃止、
+    # 2026-10-03、docs/f_03 §3.1.2)。
+    if judgement is not None and judgement.unexplained_date_math:
+        return "deliberative", judge_task, "date_math_ungrounded"
+    # 資料に答えがあるのに検索せず作話する短い知識の問い (「共有リンクの有効期限は
+    # 何日?」、2026-10-03 欠陥 C) を、層の分類ではなく検索の結果で拾う。
+    policy = _evidence_escalation_policy(cfg)
+    if search_task is not None and policy != "off":
+        if await _reactive_evidence_hit(state, policy, search_task, timer, evidence_signal):
+            if policy == "on":
+                return "deliberative", judge_task, "evidence_hit"
+            return "light", judge_task, "evidence_hit_shadow"
     return "light", judge_task, "judge_no_tool"
 
 
@@ -767,6 +1048,8 @@ async def _dispatch_continuation(
         session_id=session_id,
         # ツール結果は積まれないが、接地注記は全経路で積まれる。
         post_append_reserve_tokens=notes_post_append_reserve_tokens(),
+        # 最後の user は継続指示 (利用者の発話ではない)。人格の判定点に掛けない。
+        persona_note=False,
     )
     logger.info(
         "Continuation dispatch: resuming %s response (tail=%d chars)",
@@ -892,7 +1175,8 @@ async def _dispatch_reactive_light(
 
 async def _run_search_timed(
     req: ChatRequest, state: AppState, cfg: dict, timer: StageTimer,
-    session_id: str | None = None,
+    session_id: str | None = None, *, rerank: bool = True,
+    on_corpus_evidence: Callable[[int], None] | None = None,
 ) -> SearchPipelineResult:
     """検索パイプラインを ``search_ms`` 計測付きで実行する。
 
@@ -906,6 +1190,8 @@ async def _run_search_timed(
             req.message, state, cfg, mode=req.mode, timer=timer,
             session_id=session_id,
             corpus_mode=getattr(req, "corpus_mode", "auto") or "auto",
+            rerank=rerank,
+            on_corpus_evidence=on_corpus_evidence,
         )
     finally:
         timer.stop("search_ms")
@@ -974,6 +1260,25 @@ def _unanswered_attributes(
     if not asked & covered:
         return frozenset()
     return frozenset(asked - covered)
+
+
+def _asks_user_attribute(query: str, mode: str) -> bool:
+    """クエリがユーザーの家族 (人を値に取る属性) を指しているか (確認形の前提の範囲)。
+
+    記憶の属性辞書 (``fact_attributes.yaml`` の ``person_valued`` スロット) を
+    引く。続柄の語彙を deliberative 側に写さない (不変則 #14 (a))。
+    「息子の誕生日は5月10日ですよね？」は所有の「私の」を伴わないが、
+    ユーザー本人の家族の事実で、一般知識では確かめられない。
+    人以外のスロット (飲み物・健康) は使わない — 「コーヒーは体に悪いですよね？」
+    は飲み物のスロットに当たるが一般知識の前提。
+    """
+    from backend.free.memory.pipeline.injector import (
+        MemoryInjector,
+        _is_person_valued_slot,
+    )
+
+    asked = MemoryInjector._asked_attributes(query, normalize_session_mode(mode))
+    return any(_is_person_valued_slot(slug) for slug in asked)
 
 
 #: 成果物ブロックへ割り当てる文字数の上限。動的ブロック全体の予算は
@@ -1065,13 +1370,21 @@ class TurnContext:
     file_block: str | None
     #: 実際に注入されたファクトの属性スロット (``search_history`` の抑止に使う)。
     covered_attributes: set[str] = field(default_factory=set)
+    #: ``[参考情報]`` に実際に見せたチャンクの id (f_01 §8.1 の 7.7)。``messages`` で
+    #: 見せる層だけが持つ。``None`` = 見せた分が分からない / meta_cognitive (採用集合で数える)。
+    shown_rag_ids: tuple[str, ...] | None = None
 
     @property
     def rag_used(self) -> bool:
+        """``[参考情報]`` に何か見せたか (f_04 §3.2)。全部が予算等で落ちた turn は偽。"""
+        if self.shown_rag_ids is not None and not self.shown_rag_ids:
+            return False
         return rag_signals_from_chunks(self.scored_chunks, self.rag_top_raw)[0]
 
     @property
     def rag_top1_score(self) -> float | None:
+        if self.shown_rag_ids is not None and not self.shown_rag_ids:
+            return None
         return rag_signals_from_chunks(self.scored_chunks, self.rag_top_raw)[1]
 
     @property
@@ -1394,6 +1707,51 @@ def _recent_file_write_target(file_reference: "Verdict | None", session_id: str)
     return last_written_path(session_id)
 
 
+def _take_answer_conditions(
+    pending: AnswerConditionsPending | None,
+    *,
+    has_evidence: bool,
+    timer: StageTimer,
+) -> AnswerConditionsOutcome | None:
+    """並走させた問いの条件の抜き出しを **待たずに** 取る (docs/f_03 §7.1.1)。
+
+    ``pending`` は ``prompt.answer_conditions: on`` のときだけ在る。資料の候補が無い
+    ターンは捨てて ``no_evidence``、検索の回収までに終わっていなければ捨てて
+    ``not_ready``。抜き出しが走った時間を timing の ``answer_conditions_ms`` に残す
+    (組み立ては待たないので待ち時間ではない)。記録は組み立ての後
+    (:func:`_record_answer_conditions`)。
+    """
+    if pending is None:
+        return None
+    if has_evidence:
+        outcome = take_answer_conditions(pending)
+    else:
+        pending.discard()
+        outcome = AnswerConditionsOutcome(
+            status="no_evidence", elapsed_ms=pending.elapsed_ms(),
+        )
+    timer.set("answer_conditions_ms", float(outcome.elapsed_ms))
+    return outcome
+
+
+def _record_answer_conditions(
+    req: ChatRequest,
+    outcome: AnswerConditionsOutcome | None,
+    *,
+    material_shown: bool,
+) -> None:
+    """判定点 ``answer_conditions`` を記録する。資料を実際に見せなかったターンは ``no_evidence``。
+
+    注記の有無は ``build_messages`` が載せた資料ブロックで決まる (予算で全部落ちれば
+    注記も出ない) ので、記録も実際に見せたかで決める。
+    """
+    if outcome is None:
+        return
+    if not material_shown and outcome.status != "no_evidence":
+        outcome = replace(outcome, status="no_evidence")
+    answer_conditions_verdict(req.message, outcome)
+
+
 async def _build_messages_with_search(
     req: ChatRequest,
     state: AppState,
@@ -1410,6 +1768,8 @@ async def _build_messages_with_search(
     fewshot_block: str | None = None,
     covered_attributes: set[str] | None = None,
     session_id: str = "",
+    layer: str = "deliberative",
+    conditions_pending: AnswerConditionsPending | None = None,
 ) -> TurnContext:
     """統合検索を実行し、このターンの文脈 (:class:`TurnContext`) を組む。
 
@@ -1423,7 +1783,16 @@ async def _build_messages_with_search(
     回収する (conflict 判定 / tool 判定との並走)。None の場合はここで直列実行する。
 
     ``system_prompt`` は静的 (query 非依存)、``fewshot_block`` 等の query 依存部は
-    build_messages 内で最後の user メッセージへ前置される (KV キャッシュ対応)。"""
+    build_messages 内で最後の user メッセージへ前置される (KV キャッシュ対応)。
+
+    ``layer`` はこのターンを応答する層。``[参考情報]`` を ``messages`` で見せるのは
+    meta_cognitive 以外なので、そのときだけ記録 (``evidence_ids`` / 使った記録) を
+    実際に見せた分へ絞る (f_01 §8.1 の 7.7)。meta / long_form は ``scored_chunks``
+    を別形で使うため採用集合のまま。
+
+    ``conditions_pending`` は呼出側が検索と並走させた問いの条件の抜き出し
+    (判定点 ``answer_conditions``、docs/f_03 §7.1.1)。資料を載せるターンだけ、検索の
+    回収までに終わった結果を注記に使う。後始末 (捨てる) は呼出側。"""
     if search_task is not None:
         try:
             search_result = await search_task
@@ -1469,7 +1838,9 @@ async def _build_messages_with_search(
     # このターンで実際に注入した Evidence の id (c_16 §5.5)。``[参考情報]`` 枠
     # (corpus / episodic) は検索側が、``[関連する記憶]`` 枠 (semantic /
     # episodic) は注入側が埋める。学習帰属 (``GenerationConfigRef``) の材料。
-    injected_evidence_ids: list[str] = list(search_result.evidence_ids)
+    # 検索側の分は組み立て後に、実際に載せた分へ絞る (下の _narrow_to_shown)。
+    search_evidence_ids: list[str] = list(search_result.evidence_ids)
+    injected_evidence_ids: list[str] = list(search_evidence_ids)
     try:
         semmem_block = build_semmem_injection(
             state, cfg, mode=req.mode, conflict_ctx=conflict_ctx,
@@ -1479,17 +1850,21 @@ async def _build_messages_with_search(
             covered_attributes=covered_attributes,
             session_id=session_id,
             evidence_ids=injected_evidence_ids,
+            # 検索の床で落としたノートを注入の棒で拾い直さない (棒を 1 本にする)。
+            rejected_note_ids=search_result.episodic_rejected_ids,
         )
     finally:
         timer.stop("semmem_ms")
     if session_id:
-        set_turn_evidence_ids(session_id, injected_evidence_ids)
         set_turn_rag_meta(
             session_id,
             corpus_gated=search_result.corpus_gated,
             pseudo_derived=search_result.pseudo_derived,
             lexical_candidate_ids=search_result.lexical_candidate_ids,
             corpus_starved=search_result.corpus_starved,
+            adopted_corpus=sum(
+                1 for eid in search_evidence_ids if eid.startswith("corpus:")
+            ),
         )
 
     # 直前ターンで作った長文成果物が、この発話の対象になっているか。
@@ -1497,6 +1872,12 @@ async def _build_messages_with_search(
     # 「履歴に含まれていない」としか言えない (_artifact の説明を参照)。
     artifact_block, referenced_artifact = _resolve_artifact_reference(
         state, session_id, req.message,
+    )
+
+    conditions_outcome = _take_answer_conditions(
+        conditions_pending,
+        has_evidence=bool(scored_chunks or rag_chunks or file_contexts),
+        timer=timer,
     )
 
     history_min_tokens, working_max_tokens = _history_budget(cfg)
@@ -1519,7 +1900,31 @@ async def _build_messages_with_search(
         # この経路は deliberative へ流れ、ツール結果 (最大 TOOL_RESULT_MAX_CHARS)
         # と各種注記が組み立て後に最後の user へ積まれる。その分を先に予約する。
         post_append_reserve_tokens=deliberative_post_append_reserve_tokens(),
+        rag_source_path=await _corpus_heading_paths(state, scored_chunks),
+        answer_conditions=conditions_outcome.spans if conditions_outcome else (),
     )
+    if conditions_outcome is not None:
+        shown_ids = getattr(messages, "shown_rag_ids", None)
+        rag_shown = (
+            bool(shown_ids) if shown_ids is not None else bool(rag_chunks or scored_chunks)
+        )
+        _record_answer_conditions(
+            req, conditions_outcome, material_shown=rag_shown or bool(file_contexts),
+        )
+    usage = search_result.usage
+    shown_rag_ids = (
+        getattr(messages, "shown_rag_ids", None) if layer != "meta_cognitive" else None
+    )
+    if shown_rag_ids is not None:
+        injected_evidence_ids, usage = _narrow_to_shown(
+            injected_evidence_ids, search_evidence_ids, usage, shown_rag_ids,
+        )
+    if session_id:
+        set_turn_evidence_ids(session_id, injected_evidence_ids)
+    # 注入を組んだので、見せた id を「使った」へ積む (f_01 §8.1 Step 7.7)。
+    # 検索側では積まない — 投機検索を捨てた回 (reactive / 軽量パス) を汚さない。
+    if usage is not None:
+        usage.commit()
     await _append_statement_note(
         state, messages, req.message,
         # create の埋め込みは create 用の instruction で作られており、事例
@@ -1567,7 +1972,99 @@ async def _build_messages_with_search(
         # meta_cognitive / long_form 経路は messages を LLM に渡さないため別途注入する。
         file_block=_format_file_block(file_contexts),
         covered_attributes=covered_attributes if covered_attributes is not None else set(),
+        shown_rag_ids=shown_rag_ids,
     )
+
+
+async def _corpus_heading_paths(
+    state: AppState, scored_chunks: list | None,
+) -> Callable[[str], list[str]] | None:
+    """``[参考情報 N]`` に添える出典 (文書題 → 節) の引き表。corpus が無ければ ``None``。
+
+    ``CorpusStore.heading_path`` は文書ごとに初回だけ原文をディスクから読むので、
+    イベントループを塞がないよう候補の corpus チャンク分をまとめて executor で引く。
+    episodic (``:`` を含まない id) と引けなかった id は空の経路 = 従来の表示。
+    原文に ``#`` の見出し階層が無いと ``heading_path`` は節名 1 つしか返さないので、
+    そのときは ``describe_chunk`` の文書名 (``doc_id`` の拡張子抜き) を先頭に補う。
+    """
+    corpus = getattr(getattr(state, "cartridge_manager", None), "corpus", None)
+    heading_path = getattr(corpus, "heading_path", None)
+    describe_chunk = getattr(corpus, "describe_chunk", None)
+    ids = [
+        cid for cid, _score, _text in (scored_chunks or [])
+        if isinstance(cid, str) and ":" in cid
+    ]
+    if heading_path is None or not ids:
+        return None
+
+    def _lookup() -> dict[str, list[str]]:
+        table: dict[str, list[str]] = {}
+        for cid in ids:
+            package_id, _, evidence_id = cid.partition(":")
+            try:
+                path = [str(p) for p in heading_path(package_id, evidence_id) if str(p).strip()]
+                if len(path) <= 1 and describe_chunk is not None:
+                    described = describe_chunk(package_id, evidence_id) or {}
+                    doc = Path(str(described.get("doc_id") or "")).stem
+                    if doc and doc not in path:
+                        path = [doc, *path]
+                table[cid] = path
+            except Exception as exc:  # noqa: BLE001 — 出典の装飾で応答を止めない
+                logger.debug("heading path lookup skipped for %s: %s", cid, exc)
+        return table
+
+    table = await run_in_executor_with_context(
+        asyncio.get_running_loop(), None, _lookup,
+    )
+    return lambda chunk_id: table.get(chunk_id, [])
+
+
+def _chunk_id_of_evidence(evidence_id: str) -> str:
+    """``evidence_ids`` の参照 (c_16 §5.5) を検索結果のチャンク id へ戻す。
+
+    ``corpus:<pkg>@<ver>:<id>`` → ``<pkg>:<id>``、``episodic:<id>`` → ``<id>``。
+    """
+    store, _, rest = evidence_id.partition(":")
+    if store == "corpus":
+        package_ref, _, ev = rest.partition(":")
+        return f"{package_ref.partition('@')[0]}:{ev}"
+    return rest
+
+
+def _narrow_to_shown(
+    injected_evidence_ids: list[str],
+    search_evidence_ids: list[str],
+    usage: SearchUsage | None,
+    shown_rag_ids: tuple[str, ...],
+) -> tuple[list[str], SearchUsage | None]:
+    """検索の採用のうち ``[参考情報]`` に載らなかった分を記録から外す (f_01 §8.1 の 7.7)。
+
+    資格判定・``[関連する記憶]`` との重複・予算で落ちた id は「見せた」に数えない。
+    ``[関連する記憶]`` 側 (``MemoryInjector``) が同じノートを載せていれば、その id は
+    見せたので残す (重複落としは ``[参考情報]`` 側だけを落とすため)。
+    """
+    shown = set(shown_rag_ids)
+    from_memory = set(injected_evidence_ids[len(search_evidence_ids):])
+    unshown = {
+        eid for eid in search_evidence_ids
+        if _chunk_id_of_evidence(eid) not in shown and eid not in from_memory
+    }
+    if unshown:
+        logger.debug(
+            "Evidence adopted by search but not shown: %d of %d",
+            len(unshown), len(search_evidence_ids),
+        )
+    narrowed = [eid for eid in injected_evidence_ids if eid not in unshown]
+    if usage is not None:
+        memory_notes = {
+            _chunk_id_of_evidence(eid) for eid in from_memory
+            if eid.startswith("episodic:")
+        }
+        usage = replace(usage, sources=tuple(
+            src for src in usage.sources
+            if src[0] in shown or src[0] in memory_notes
+        ))
+    return narrowed, usage
 
 
 #: 出典フレームに載せる本文プレビューの長さ。
@@ -2610,6 +3107,8 @@ async def _dispatch_deliberative(
         unanswered_attributes=_unanswered_attributes(
             req.message, req.mode, ctx.covered_attributes,
         ),
+        # ユーザー本人・家族の属性を指すか。確認形の前提を根拠だけで判断させる。
+        asks_user_attribute=_asks_user_attribute(req.message, req.mode),
     )
     return await _respond(
         req, client, session_id,
@@ -2692,7 +3191,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     # 検証器の発火をこのターンに紐づける (規則台帳の計数、f_03 §3.5.1)。
     open_verifier_scope(req.mode)
     # ファイル台帳も同じ宛先へ (「保存したファイルを読んで」の解決材料)。
-    file_ledger_scope(session_id)
+    file_ledger_scope(session_id, history)
     # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
     # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
     system_prompt = _append_fact_slate(
@@ -2896,11 +3395,14 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     #   - tool 判定 (judge) は preliminary layer が meta_cognitive 以外のときのみ
     #     投機する (meta は task 記述単位で judge するため query 単位の流用不可、
     #     long_form は meta_cognitive 分類配下なので自動的に除外される)。
-    #   - 検索は preliminary layer が reactive 以外のときのみ投機する (reactive
-    #     即応答は検索結果を使わない)。reactive→deliberative にエスカレートした
-    #     場合は search_task=None で _build_messages_with_search が直列実行する。
+    #   - 検索は preliminary layer が reactive 以外のときここで投機する (reactive
+    #     即応答は検索結果を使わない)。reactive は即答が外れた後に
+    #     _start_reactive_search が起動する (agent.reactive_evidence_escalation が
+    #     off、または shadow で decision.jsonl が書かれない起動なら起動せず、
+    #     deliberative へ上がった場合は _build_messages_with_search が直列実行する)。
     judge_task: asyncio.Task | None = None
     search_task: asyncio.Task | None = None
+    evidence_signal: asyncio.Future[int] | None = None
     try:
         conflict_task = asyncio.create_task(
             _collect_conflicts_timed(state, cfg, req.mode, timer),
@@ -2960,34 +3462,34 @@ async def _chat_turn(req: ChatRequest, state: AppState):
                 _cancel_pending_task(search_task)
                 return reactive_response
 
-            # URL recall プリチェック: 過去会話で fetch 済みの URL fact が
-            # クエリに意味的にヒットする場合、軽量パスで前知識のみ応答せず
-            # deliberative にエスカレートして fetch_url を実行させる。
-            # ``recall_url_judgement`` は閾値・TTL・profile match まで判定
-            # 済みのため、ヒット時のみ judgement を返す。
+            # 即答が外れたので検索を投機する (ツール判定と並走、off では起動しない)。
+            # 軽量パスの採否で検索結果を証拠として見る (_gate_reactive_light)。
+            # deliberative へ上がれば _build_messages_with_search がこのタスクを流用する。
+            search_task, evidence_signal = _start_reactive_search(
+                req, state, cfg, timer, session_id,
+            )
+
+            # URL recall プリチェック — **shadow** (2026-10-03、不変則 #15)。過去会話で
+            # fetch 済みの URL fact が意味的に当たっても昇格させず、would_escalate を
+            # 記録するだけ。層の採否は下の ``_gate_reactive_light`` (ツール判定) が決める。
             #
             # ルール即応 (挨拶 / キャッシュ命中) の **後** に置く。クエリ埋め込みの
             # HTTP 往復を伴うため、以前の位置 (即応の手前) では挨拶 1 つごとに
             # 埋め込みを払っていた。URL ファクトが索引に 1 件も無い環境では
             # 何を埋め込んでも当たらないので、件数で先に短絡する
             # (2026-09-02 監査 C1)。
-            if await _url_recall_hit(req, state):
-                plan.escalate(state, "deliberative", "url_recall_hit")
-                logger.info(
-                    "Reactive escalated to deliberative due to URL recall hit: %s",
-                    req.message[:80],
-                )
+            await _shadow_url_recall_escalation(req, state)
 
-        if plan.layer == "reactive":
             # ルールベース miss → 軽量パス gating。tool 判定 (judge) で tool 不要
             # なら base 1 ターンの軽量パス、tool 必要なら deliberative へエスカレート。
             decision, judge_task, gate_reason = await _gate_reactive_light(
                 req, state, cfg, history, judge_task, timer,
+                search_task=search_task, evidence_signal=evidence_signal,
             )
             if decision == "light":
                 # 軽量パスは検索を使わない。judge_task も tool 不要なので破棄。
                 _cancel_pending_task(judge_task)
-                _cancel_pending_task(search_task)
+                _discard_reactive_search(search_task)
                 _log_layer_escalation(
                     state, chosen="reactive_light", reason=gate_reason,
                 )
@@ -3001,16 +3503,28 @@ async def _chat_turn(req: ChatRequest, state: AppState):
             plan.escalate(state, "deliberative", gate_reason)
             logger.info("Reactive escalated to deliberative (%s)", gate_reason)
 
-        ctx = await _build_messages_with_search(
-            req, state, cfg, system_prompt, history, file_contexts,
-            context_size, max_tokens, timer,
-            editor_route=plan.editor_route,
-            conflict_ctx=conflict_ctx,
-            covered_attributes=set(),
-            search_task=search_task,
-            fewshot_block=fewshot_block,
-            session_id=session_id,
+        # 問いの条件の抜き出し (on のときだけ) を検索の回収と並走させる。meta は
+        # messages を使わないので起動しない (docs/f_03 §7.1.1)。
+        conditions_pending = (
+            start_answer_conditions(getattr(state, "aux_client", None), req.message, cfg)
+            if plan.layer != "meta_cognitive" else None
         )
+        try:
+            ctx = await _build_messages_with_search(
+                req, state, cfg, system_prompt, history, file_contexts,
+                context_size, max_tokens, timer,
+                editor_route=plan.editor_route,
+                conflict_ctx=conflict_ctx,
+                covered_attributes=set(),
+                search_task=search_task,
+                fewshot_block=fewshot_block,
+                session_id=session_id,
+                layer=plan.layer,
+                conditions_pending=conditions_pending,
+            )
+        finally:
+            if conditions_pending is not None:
+                conditions_pending.discard()
 
         match plan.layer:
             case "meta_cognitive":

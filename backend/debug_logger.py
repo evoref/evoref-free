@@ -21,10 +21,13 @@ JSONL カテゴリの enabled / max_log_mb / log_retention_days を内部マッ�
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
 from backend.log_config import DevelopLevel, get_logger
+from backend.trace_context import get_trace_id
 from backend.structlog_config import DebugLogSink
 from backend.utils import utc_now as _now
 
@@ -87,6 +90,11 @@ _LEVEL_CONFIGS: dict[DevelopLevel, dict[str, Any]] = {
 _DEBUG_SUBDIR = "debug"
 
 
+#: ターン集計 (``aux_usage``) を保持する trace_id の上限。timing を出さずに終わる
+#: ターン (エラー・バックグラウンド) の分が溜まり続けないよう古い順に捨てる。
+_TURN_AUX_MAX_TRACES = 256
+
+
 class DebugLogger:
     """デバッグ情報を JSONL に記録するロガー (structlog ベース)。
 
@@ -139,6 +147,62 @@ class DebugLogger:
             )
         else:
             self._sink = None
+
+        self._turn_aux: OrderedDict[str, dict[str, list[float]]] = OrderedDict()
+        self._turn_aux_lock = threading.Lock()
+        #: 集計の失敗回数 (チャット応答は失わず、数だけ持つ)。
+        self.turn_aux_errors: int = 0
+
+    def _count_turn_aux_error(self) -> None:
+        with self._turn_aux_lock:
+            self.turn_aux_errors += 1
+
+    def record_turn_aux(
+        self, purpose: str, elapsed_sec: float, queue_wait_sec: float | None = None,
+    ) -> None:
+        """``log_aux_request`` を通らない補助呼出 (分類器の ``generate_constrained``) を集計へ足す。"""
+        if not self.enabled or not self.log_requests:
+            return
+        self._accumulate_turn_aux(purpose, elapsed_sec, queue_wait_sec)
+
+    def _accumulate_turn_aux(
+        self, purpose: str, elapsed_sec: float, queue_wait_sec: float | None,
+    ) -> None:
+        """補助呼出 1 回をそのターン (trace_id) の purpose 別集計へ足す。"""
+        try:
+            trace_id = get_trace_id()
+            if not trace_id:
+                return
+            with self._turn_aux_lock:
+                per_purpose = self._turn_aux.setdefault(trace_id, {})
+                acc = per_purpose.setdefault(purpose or "unknown", [0.0, 0.0, 0.0])
+                acc[0] += 1
+                acc[1] += float(elapsed_sec)
+                acc[2] += float(queue_wait_sec or 0.0)
+                while len(self._turn_aux) > _TURN_AUX_MAX_TRACES:
+                    self._turn_aux.popitem(last=False)
+        except Exception:  # noqa: BLE001 - 計測の失敗でチャット応答を失わない
+            self._count_turn_aux_error()
+
+    def _pop_turn_aux(self) -> dict[str, dict[str, float]]:
+        """現在の trace_id の集計を取り出す (無ければ空)。"""
+        try:
+            trace_id = get_trace_id()
+            if not trace_id:
+                return {}
+            with self._turn_aux_lock:
+                per_purpose = self._turn_aux.pop(trace_id, None)
+            return {
+                purpose: {
+                    "n": int(acc[0]),
+                    "elapsed_sec": round(acc[1], 3),
+                    "queue_wait_sec": round(acc[2], 3),
+                }
+                for purpose, acc in (per_purpose or {}).items()
+            }
+        except Exception:  # noqa: BLE001 - 計測の失敗でチャット応答を失わない
+            self._count_turn_aux_error()
+            return {}
 
     def _emit(self, category: str, payload: Mapping[str, Any]) -> None:
         """``category`` 別 JSONL に書き込む共通ヘルパ。"""
@@ -258,6 +322,7 @@ class DebugLogger:
             entry["queue_wait_sec"] = round(float(queue_wait_sec), 3)
         if slot is not None:
             entry["slot"] = int(slot)
+        self._accumulate_turn_aux(purpose, elapsed_sec, queue_wait_sec)
         self._emit("requests", entry)
 
     def log_retry_attempt(
@@ -364,7 +429,12 @@ class DebugLogger:
         tokens_generated: int = 0,
         mode: str = "",
     ) -> None:
-        """リクエスト処理のステージ別タイミング内訳を記録"""
+        """リクエスト処理のステージ別タイミング内訳を記録
+
+        同じ trace_id の補助呼出 (``log_aux_request``) を purpose 別に集計して
+        ``aux_usage`` (``{purpose: {n, elapsed_sec, queue_wait_sec}}``) として付ける。
+        timing を出した後に終わる補助呼出 (応答後の背景処理) は含まない。
+        """
         if not self.enabled or not self.log_requests:
             return
         entry = {
@@ -376,6 +446,9 @@ class DebugLogger:
         }
         if mode:
             entry["mode"] = mode
+        aux_usage = self._pop_turn_aux()
+        if aux_usage:
+            entry["aux_usage"] = aux_usage
         self._emit("requests", entry)
 
     def log_context_guard(self, op: str, stats: dict) -> None:
@@ -600,12 +673,20 @@ class DebugLogger:
         by_store: dict[str, dict[str, list[str]]],
         correction_swaps: int,
         swapped_pairs: list[tuple[str, str]] | None = None,
+        eligible: dict[str, int] | None = None,
+        sent: dict[str, int] | None = None,
+        sent_tokens: int | None = None,
+        token_budget: int | None = None,
+        max_candidates: int | None = None,
     ) -> None:
         """検索経路が再順位のスコアを当てた結果を ``rag.jsonl`` に記録 (``op="rerank_apply"``、c_16 §7.2.1)。
 
         ``by_store`` はストアごとの ``{"before": 現順位のプール id, "after": 再順位の降順の id}``、
         ``correction_swaps`` は訂正の正順のために入れ替えた組の数、``swapped_pairs`` はその
         ``(訂正前, 訂正後)`` の id。本文は受け取らない (private を含むノートの本文をログへ出さない)。
+        ``eligible`` は件数の上限・トークン予算で切る前のストア別の送る資格のある行数、``sent`` は
+        送った件数、``sent_tokens`` は送った組の近似トークンの合計、``token_budget`` / ``max_candidates`` は
+        その回の予算と件数の上限 (予算が無ければ ``None``)。
         """
         if not self.enabled or not self.log_rag:
             return
@@ -618,6 +699,11 @@ class DebugLogger:
             },
             "correction_swaps": int(correction_swaps),
             "swapped_pairs": [list(pair) for pair in (swapped_pairs or [])],
+            "eligible": dict(eligible or {}),
+            "sent": dict(sent or {}),
+            "sent_tokens": sent_tokens,
+            "token_budget": token_budget,
+            "max_candidates": max_candidates,
         })
 
     def log_content_gate(

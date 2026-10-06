@@ -48,7 +48,9 @@ from backend.free.memory.sleep.curation_backoff import (
     in_cooldown,
     record_transient_failure,
 )
+from backend.free.constants import FETCH_ERROR_PREFIX
 from backend.free.memory.types import SemanticFact
+from backend.i18n_helper import template_line_patterns
 from backend.log_config import get_logger
 from backend.utils import epoch_to_utc
 
@@ -72,18 +74,40 @@ _FAILURE_KEY = "url_relevance_score"
 # 1 つでもマッチすれば「URL は今回有効でなかった」とみなし、
 # 既存 fact の score_history に 0 を追加して penalize する。
 _FETCH_FAILURE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # 旧形式 (2026-10-04 以前の fetch_url の結果) と、現在の先頭 (constants が SSOT)
     re.compile(r"Error fetching URL", re.IGNORECASE),
+    re.compile(re.escape(FETCH_ERROR_PREFIX), re.IGNORECASE),
     re.compile(r"Error: Unsupported content-type", re.IGNORECASE),
     re.compile(r"\bHTTP\s*[45]\d{2}\b", re.IGNORECASE),
     re.compile(r"\b(?:404|403|410|500|502|503|504)\s*(?:Not\s*Found|Forbidden|Error)?", re.IGNORECASE),
 )
 
 
+#: meta の答えが取得の失敗を伝える i18n の注記 (``agent.retrieval_failed.*``、対象は URL)。
+#: エラー文の代わりにこの注記が答えに出るので、注記も失敗の印に数える。文面の SSOT は
+#: i18n — 正規表現は ``template_line_patterns`` が全 locale の定型文から組む (語彙を写さない)。
+_FETCH_FAILURE_NOTE_KEYS: tuple[tuple[str, str], ...] = (
+    ("agent.retrieval_failed.unresolved_host", "target"),
+    ("agent.retrieval_failed.unreachable", "target"),
+)
+
+#: 注記の行の前に付きうる箇条書き・引用の印 (``- `` / ``* `` / ``> `` / ``1. `` / ``2) ``、重ねても)。
+#: 注記の行の照合の前に落とす — 行全体の照合は印の付いた行を外していた (#887 の残件 LOW-3)
+_LEADING_LINE_MARKERS_RE = re.compile(r"^\s*(?:(?:[-*>]|\d+[.)])\s*)+")
+
+
 def _has_fetch_failure(answer: str | None) -> bool:
     """assistant 応答が fetch_url 失敗を示唆しているか。"""
     if not answer:
         return False
-    return any(p.search(answer) for p in _FETCH_FAILURE_PATTERNS)
+    if any(p.search(answer) for p in _FETCH_FAILURE_PATTERNS):
+        return True
+    notes = template_line_patterns(_FETCH_FAILURE_NOTE_KEYS, group="target")
+    return any(
+        p.match(_LEADING_LINE_MARKERS_RE.sub("", line))
+        for line in answer.splitlines() for p in notes
+    )
+
 
 _PROMPT_SYSTEM = (
     "あなたは URL の関連性評価者です。"

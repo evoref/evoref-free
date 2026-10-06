@@ -146,7 +146,7 @@ rem every probe against a server bound to 127.0.0.1, so the wait always ran to i
 echo [start] Waiting for llama-server to be ready (up to 60s, embedding up to 240s)...
 powershell -NoProfile -Command "$pairs=& '%VENV_PYTHON%' scripts\launch_llama.py config.yaml --print-health-ports; foreach ($p in $pairs) { if ($p -notmatch '^(\w+)=(\d+)$') { continue }; $name=$Matches[1]; $port=$Matches[2]; $limit=60; if ($name -eq 'embed') { $limit=240 }; $elapsed=0; do { Start-Sleep 2; $elapsed+=2; $r=0; foreach ($h in '127.0.0.1','localhost') { try { $r=(Invoke-WebRequest \"http://${h}:$port/health\" -TimeoutSec 1 -UseBasicParsing).StatusCode } catch { $r=0 }; if ($r -eq 200) { break } } } while ($r -ne 200 -and $elapsed -lt $limit); if ($r -ne 200) { Write-Host \"[start] WARNING: $name (port $port) health check timed out, proceeding anyway\" } }"
 
-rem The reranker (rag.rerank, off by default) runs its self-test only when the PC
+rem The reranker (rag.rerank, on by default when the model file exists) runs its self-test only when the PC
 rem fingerprint changed; the backend reads that result once at startup, so wait for
 rem it here. Returns at once when rag.rerank.mode is off. The worst case is the GPU start
 rem wait (60s) plus the CPU restart wait (process_manager.health_timeout, 120s) plus the

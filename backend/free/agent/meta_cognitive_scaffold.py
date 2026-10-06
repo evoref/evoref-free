@@ -30,7 +30,7 @@ from backend.free.agent.output_format import PRODUCTION_WROTE_PATTERN
 #: 復唱する退化 (#incident 2026-07-15: 29 ファイル中 10 件が本文なしのログ 1 行)
 #: を書込み前に検出するためのパターン。
 _TASK_LOG_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?\[(?:done|failed|skipped)\]\s"
+    r"^\s*(?:[-*]\s*)?\[(?:done|failed|skipped|pending)\]\s"
     r"|^\s*Written\s+\d+\s+bytes\s+to\s+\S"
     r"|^\s*Content of `[^`]+`\s*:?\s*$"
     # 制作ステージの結果行 (英語の内部文字列が本文に出た、2026-09-26 ライブ監査 #25)

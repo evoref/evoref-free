@@ -15,7 +15,11 @@ from backend.data_root import DEFAULT_DIRNAME, ISOLATED_DIRNAME
 from backend.log_config import get_logger
 from backend.free.agent.write_gate import has_parent_segment
 from backend.free.core.response_arithmetic import LIST_ITEM_RE
-from backend.free.constants import READ_FILE_META_PREFIX
+from backend.free.constants import (
+    DIRECTORY_NOT_FOUND_PREFIX,
+    FILE_NOT_FOUND_PREFIX,
+    READ_FILE_META_PREFIX,
+)
 from backend.free.services.diff_service import DiffServiceError, apply_diff_to_file
 from backend.io.text_file import (
     TextFile,
@@ -153,7 +157,7 @@ def read_file(
         return traversal_error
     p = Path(file_path)
     if not p.exists():
-        return f"Error: File not found: {file_path}"
+        return f"{FILE_NOT_FOUND_PREFIX}: {file_path}"
     if not p.is_file():
         return f"Error: Not a file: {file_path}"
     try:
@@ -524,7 +528,7 @@ def search_code(pattern: str, directory: str = ".", max_results: int = 20) -> st
     results: list[str] = []
     base = Path(directory)
     if not base.exists():
-        return f"Error: Directory not found: {directory}"
+        return f"{DIRECTORY_NOT_FOUND_PREFIX}: {directory}"
 
     for root, dirs, files in os.walk(base):
         # 隠しディレクトリ・一般的な除外 + モデル/ローカルデータ (数十GB級バイナリ/
@@ -568,7 +572,7 @@ def list_directory(directory: str = ".", max_depth: int = 3) -> str:
     """
     base = Path(directory)
     if not base.exists():
-        return f"Error: Directory not found: {directory}"
+        return f"{DIRECTORY_NOT_FOUND_PREFIX}: {directory}"
 
     lines: list[str] = []
     _walk_tree(base, lines, prefix="", depth=0, max_depth=max_depth)
@@ -635,7 +639,7 @@ def apply_diff(file_path: str, diff_text: str) -> str:
         return traversal_error
     p = Path(file_path)
     if not p.exists():
-        return f"Error: File not found: {file_path}"
+        return f"{FILE_NOT_FOUND_PREFIX}: {file_path}"
     if not p.is_file():
         return f"Error: Not a file: {file_path}"
     try:

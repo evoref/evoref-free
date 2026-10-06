@@ -38,7 +38,7 @@ from backend.free.generation.outline_seed import ParsedOutline
 from backend.free.generation.spec_renderer import render_spec_for_prompt
 from backend.free.generation.text_skeleton import TextSkeleton
 from backend.free.llm.json_schemas import CodePlan, TextPlan, TextPlanSeeded
-from backend.i18n_helper import prose_language_name
+from backend.i18n_helper import get_locale, prose_language_name
 
 logger = logging.getLogger("backend.free.generation.strategy_common")
 
@@ -82,7 +82,7 @@ CODE_UNIT_USER = """\
 
 #: 利用者が示していない実務上の固有値を本文・計画で補わせない規則 (本文と計画で共有)。
 #:
-#: 「生成すべき具体的な内容を書く」「短すぎる出力は不可」という圧だけがあると、
+#: 「生成すべき具体的な内容を書く」「短すぎる出力は不可」(当時の分量の指示) という圧だけがあると、
 #: 案内文のような実務文書でモデルは日時・会場・接続先を **それらしく埋める**。
 #: 2026-09-17 監査: 「新人向けセキュリティ研修の案内文」に「来月10日（水）」
 #: (実在しない曜日)・「本社5階の第3会議室」・Zoom が書かれた。チャット経路の
@@ -914,6 +914,54 @@ async def generate_plan_json(
 
 # ── テキストユニットメッセージ構築 ──
 
+#: unit の目標文字数の下限。ただし文書全体の目標を unit 数で割った均等割りより
+#: 大きくはしない — 下限が目標を押し上げると、unit の合計が目標を超える
+#: (実機 2026-10-05: 800 字の依頼が 7 unit × 下限 200 字 = 1400 字の指示になり、
+#: 2066 字 = 2.58 倍で検証エラー)。
+_UNIT_MIN_TARGET_CHARS = 200
+#: unit の分量の指示に添える許容幅 (目標に対する比)。上限を明示しないと
+#: 「目標に近い量を」の指示でモデルは目標を超えて書く (同上の実機で約 1.5 倍)。
+_UNIT_TARGET_LOWER_RATIO = 0.8
+_UNIT_TARGET_UPPER_RATIO = 1.2
+
+
+def unit_target_chars(unit: SectionPlan, plan: GenerationPlan) -> int:
+    """テキスト unit に割り当てる目標文字数を返す。
+
+    文書全体の ``target_length`` から orchestrator が足す見出し・タイトル・unit 間の
+    区切り (``plan.markup_chars``) を引いた本文の分を、各 unit の
+    ``estimated_tokens`` の比で配分する。検証 (目標文字数比) は見出し込みの全文を
+    数えるため、引かないと見出しの分だけ超える。引いた残りが目標の半分を
+    下回るときは半分を本文に充てる (見出しだけの文書にしない)。
+    下限 (``_UNIT_MIN_TARGET_CHARS``) は均等割り (本文 / unit 数) を超えない範囲で
+    だけ掛けるので、配分の合計は本文の分を大きく超えない。``target_length`` が
+    未指定 (0) なら下限を返す。
+    """
+    sections = [u for u in plan.units if isinstance(u, SectionPlan)]
+    if plan.target_length <= 0 or not sections:
+        return _UNIT_MIN_TARGET_CHARS
+    body = max(plan.target_length - plan.markup_chars, plan.target_length // 2)
+    total_estimated = sum(u.estimated_tokens for u in sections) or 1
+    share = int(body * unit.estimated_tokens / total_estimated)
+    floor = min(_UNIT_MIN_TARGET_CHARS, body // len(sections))
+    return max(share, floor, 1)
+
+
+def _has_strict_length_target(plan: GenerationPlan) -> bool:
+    """unit の分量の指示に範囲と上限を付けてよいかを返す。
+
+    付けるのは (a) 依頼の原文が文字数を明示し、それが計画の目標そのもので、
+    (b) 本文が日本語のときだけ。(a) でないと、下振れを拾う orchestrator の
+    追加生成 (``_extend_to_target``、依頼の文字数が基準) が働かないので、
+    上限だけを課すと 0.5 倍を割っても回復しない。(b) 英語などは文字数を
+    数えて書くのが不自然なので目安に留める。
+    """
+    if plan.target_length <= 0 or get_locale() != "ja":
+        return False
+    explicit = extract_target_chars(plan.instruction or "", default=0)
+    return explicit == plan.target_length
+
+
 def build_text_unit_messages(
     unit: SectionPlan,
     rolling: RollingContext,
@@ -941,18 +989,14 @@ def build_text_unit_messages(
     )
     short_term = budget.fit_content("short_term", rolling.short_term)
 
-    total_estimated = sum(
-        u.estimated_tokens for u in plan.units if isinstance(u, SectionPlan)
-    ) or 1
-    unit_ratio = unit.estimated_tokens / total_estimated
-    unit_target_chars = max(int(plan.target_length * unit_ratio), 200)
+    target_chars = unit_target_chars(unit, plan)
 
     system_template = (
         TEXT_UNIT_CONTINUATION_SYSTEM
         if rolling.has_existing_context
         else TEXT_UNIT_SYSTEM
     )
-    # unit_target_chars / 継続指示は unit ごとに値が変わるため system には含め
+    # 目標文字数 / 継続指示は unit ごとに値が変わるため system には含め
     # ない (system は run 中 byte 固定 — f_08 §2.2 / §8 禁則 10)。user 側
     # (_FINAL_INSTRUCTION_MARKER の直前) へ置く。
     system_text = system_template.format(
@@ -990,10 +1034,22 @@ def build_text_unit_messages(
     # 分量指示 (unit ごとに変わる) + 分割続きユニットの再掲禁止。以前は
     # system 側に足していたため unit ごとに system の bytes が変わり、接頭辞
     # KV キャッシュが unit 毎に 0 になっていた (2026-09-18 監査、f_08 §2.2)。
-    unit_instructions = (
-        f"このセクションの目標文字数は約{unit_target_chars}文字です。"
-        "必ずこの文字数に近い量を生成してください。短すぎる出力は不可です。"
-    )
+    # 以前の「必ずこの文字数に近い量を。短すぎる出力は不可」は下振れだけを禁じて
+    # いたため、モデルは目標を超えて書いていた (2026-10-05 実機)。依頼が文字数を
+    # 明示したときは範囲と上限を示す (下振れは orchestrator の追加生成が拾う)。
+    unit_instructions = f"このセクションの目標文字数は約{target_chars}文字です"
+    if plan.target_length > 0:
+        unit_instructions += (
+            f"（文書全体を約{plan.target_length}文字に収めるための配分です）"
+        )
+    if _has_strict_length_target(plan):
+        lower = int(target_chars * _UNIT_TARGET_LOWER_RATIO)
+        upper = int(target_chars * _UNIT_TARGET_UPPER_RATIO)
+        unit_instructions += (
+            f"。{lower}〜{upper}文字の範囲で書き、{upper}文字を超えないでください。"
+        )
+    else:
+        unit_instructions += "。この文字数に近い量を生成してください。"
     if (getattr(plan, "instruction", "") or "").strip():
         # 分量の指示は user の最後に置く最も強い指示なので、依頼が「3 点」と言って
         # いても、モデルは文字数に届かせるために項目を増やす (実機 2026-09-21:

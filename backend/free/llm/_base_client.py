@@ -147,8 +147,8 @@ class BaseHTTPClient:
     シャットダウン時は ``await self.aclose()`` を呼ぶ。
     """
 
-    def __init__(self, *, timeout: float) -> None:
-        self._http_timeout: float = timeout
+    def __init__(self, *, timeout: float | httpx.Timeout) -> None:
+        self._http_timeout: float | httpx.Timeout = timeout
         self._http_client: httpx.AsyncClient | None = None
 
     def _get_http_client(self) -> httpx.AsyncClient:

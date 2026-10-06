@@ -72,6 +72,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from backend.embed_priority import P1_FRESHNESS, embed_priority
+from backend.export.markdown_patterns import RE_LINK
 from backend.free.core.tuning.tuners.embed_params import HTTP_BATCH_MAX, http_batch_of
 from backend.free.rag.evidence.columns import active_mask as columns_active_mask
 from backend.free.rag.evidence.columns import build_columns
@@ -366,14 +367,25 @@ def embed_side_key(is_query: bool, mode: str) -> str:
     return f"q:{mode}" if is_query else "d"
 
 
+def embed_input_text(text: str) -> str:
+    """埋め込みに渡す文字列。Markdown リンク ``[文字](URL)`` は文字だけにする (f_01 §3.1)。
+
+    URL はベクトルを意味の薄いトークンで薄めるだけなので外す。**保存する本文・
+    チャンク id・語彙索引は変えない** (外すのは埋め込み入力だけ)。
+    """
+    return RE_LINK.sub(r"\1", text)
+
+
 def embed_reuse_key(text: str, is_query: bool, mode: str) -> str:
     """増分埋め込みの再利用鍵 (``text_hash``)。
 
     **側を鍵に含める** — 含めないと ``embed_as_query`` を後から立てても本文が
     同じである限り旧い側のベクトルが流用され続け、書く側と読む側の勘定が
-    ずれたまま固定される (2026-09-02 監査 M19 と同じ形)。
+    ずれたまま固定される (2026-09-02 監査 M19 と同じ形)。本文は **埋め込みに
+    渡す形** (:func:`embed_input_text`) で鍵にする — 生の本文で鍵を作ると、入力の
+    作り方を変えたあとも旧い入力のベクトルが流用され続ける。
     """
-    return content_hash(f"{embed_side_key(is_query, mode)}\x00{text}")
+    return content_hash(f"{embed_side_key(is_query, mode)}\x00{embed_input_text(text)}")
 
 
 def _backend_value(backend: object, name: str, default: object) -> object:
@@ -1746,7 +1758,7 @@ class EvidenceStore:
                 window = positions[start:start + step]
                 vectors = np.asarray(
                     await backend.embed(
-                        [items[p][0] for p in window],
+                        [embed_input_text(items[p][0]) for p in window],
                         is_query=is_query,
                         mode=mode,
                     ),
@@ -2814,6 +2826,7 @@ __all__ = [
     "UsageBuffer",
     "embedding_version_name",
     "embedding_version_seq",
+    "embed_input_text",
     "embed_reuse_key",
     "embed_side_key",
     "embed_side_of",

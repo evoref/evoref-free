@@ -14,7 +14,7 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, fields, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -30,7 +30,7 @@ from backend.io.readonly import DataReadonlyError, is_readonly
 from backend.io.versioned import ReadResult, build_envelope, read_versioned
 from backend.io.writer_thread import ChatWriter, default_writer
 from backend.log_config import get_logger
-from backend.utils import utc_now, utc_now_dt
+from backend.utils import parse_utc, utc_now, utc_now_dt
 
 logger = get_logger("history.manager")
 
@@ -975,10 +975,10 @@ class HistoryManager:
         # フィルタ
         if mode:
             entries = [e for e in entries if e.mode == mode]
-        if date_from:
-            entries = [e for e in entries if e.started_at >= date_from]
-        if date_to:
-            entries = [e for e in entries if e.started_at <= date_to]
+        lower = _date_bound(date_from, end=False)
+        upper = _date_bound(date_to, end=True)
+        if lower is not None or upper is not None:
+            entries = [e for e in entries if _in_window(_started(e), lower, upper)]
         if query:
             q_lower = query.lower()
             matched: list[IndexEntry] = []
@@ -995,7 +995,7 @@ class HistoryManager:
             entries = matched
 
         # 新しい順
-        entries.sort(key=lambda e: e.started_at, reverse=True)
+        entries.sort(key=_started, reverse=True)
         total = len(entries)
 
         return entries[offset:offset + limit], total
@@ -1143,6 +1143,7 @@ class HistoryManager:
                 "started_at": entry.started_at,
                 "mode": entry.mode,
                 "summary": entry.summary,
+                "first_user_preview": entry.first_user_preview,
                 "relevance_score": score,
                 "matched_turns": matched_turns,
             })
@@ -1627,7 +1628,7 @@ class HistoryManager:
 
         安全な順序: 削除対象を特定 → インデックス更新 → ファイル削除
         """
-        sorted_entries = sorted(index.sessions, key=lambda e: e.started_at)
+        sorted_entries = sorted(index.sessions, key=_started)
         to_delete: list[IndexEntry] = []
         freed = 0.0
 
@@ -1699,11 +1700,42 @@ def _dedupe_by_session_id(entries: list[IndexEntry]) -> list[IndexEntry]:
     best: dict[str, IndexEntry] = {}
     for e in entries:
         cur = best.get(e.session_id)
-        if cur is None or (e.turn_count, e.started_at) > (
-            cur.turn_count, cur.started_at,
+        if cur is None or (e.turn_count, _started(e)) > (
+            cur.turn_count, _started(cur),
         ):
             best[e.session_id] = e
     return [e for e in entries if best.get(e.session_id) is e]
+
+
+_NO_TIME = datetime.min.replace(tzinfo=UTC)
+_DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _started(entry: IndexEntry) -> datetime:
+    """開始時刻を比べられる形に (読めなければ最古扱い)。"""
+    return parse_utc(entry.started_at) or _NO_TIME
+
+
+def _date_bound(value: str | None, *, end: bool) -> datetime | None:
+    """絞り込みの境界。日付だけの ``date_to`` はその日の終わり (翌日 0 時の直前) まで含む。
+
+    読めない値は絞り込まない (WARNING)。日付だけの値は UTC の日として読む。
+    """
+    if not value:
+        return None
+    bound = parse_utc(value)
+    if bound is None:
+        logger.warning("Ignoring unparseable history date filter: %r", value)
+        return None
+    if end and _DATE_ONLY_RE.fullmatch(value.strip()):
+        bound += timedelta(days=1) - timedelta(microseconds=1)
+    return bound
+
+
+def _in_window(started: datetime, lower: datetime | None, upper: datetime | None) -> bool:
+    if started is _NO_TIME:
+        return False
+    return (lower is None or started >= lower) and (upper is None or started <= upper)
 
 
 def _now_iso() -> str:

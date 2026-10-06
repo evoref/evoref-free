@@ -13,7 +13,16 @@ import re
 from typing import Iterator
 from backend.free.constants import (
     COMMAND_EXIT_CODE_PREFIX,
+    DIRECTORY_NOT_FOUND_PREFIX,
+    FETCH_BLOCKED_PREFIX,
+    FETCH_ERROR_PREFIX,
+    FETCH_UNREACHABLE_ERRORS,
+    FETCH_UNRESOLVED_HOST_PREFIX,
+    FILE_AMBIGUOUS_PREFIX,
+    FILE_NOT_FOUND_PREFIX,
+    READ_FILE_META_PREFIX,
     SEARCH_HISTORY_NO_RESULTS_PREFIX,
+    SEARCH_NO_LOCATION_ERROR,
 )
 
 
@@ -32,6 +41,44 @@ def is_tool_error(text: str) -> bool:
     (マーカー変更時の修正漏れ耐性)。
     """
     return text.startswith(TOOL_ERROR_PREFIX)
+
+
+def fetch_error_type(text: str) -> str:
+    """``fetch_url`` の取得の例外の型名 (``<先頭> (<例外の型>): <理由>``、tools/web_fetch.py)。違えば空文字。"""
+    if not text.startswith(FETCH_ERROR_PREFIX):
+        return ""
+    return text[len(FETCH_ERROR_PREFIX):].lstrip(" (").split(")", 1)[0]
+
+
+def read_file_result_path(text: str) -> str | None:
+    """``read_file`` の結果ならメタ行のパス、それ以外は ``None`` (純粋関数)。
+
+    ``read_file`` は先頭に ``[file: <path> | lines: N | chars: M]`` を付ける
+    (tools/filesystem.py)。自前の形式だけを見る (字句の鍵、不変則 #14)。
+    """
+    if not (text or "").startswith(READ_FILE_META_PREFIX):
+        return None
+    return text[len(READ_FILE_META_PREFIX):].split(" | ", 1)[0].strip() or None
+
+
+def tool_error_kind(text: str) -> str:
+    """ツールのエラー文の種別 (利用者向けの注記の鍵、i18n ``agent.retrieval_failed.<種別>``)。
+
+    自前のツールが出す先頭の形式だけを見る (語彙ではなく字句の鍵、不変則 #14)。
+    """
+    if text.startswith(FETCH_UNRESOLVED_HOST_PREFIX):
+        return "unresolved_host"
+    if text.startswith(FETCH_BLOCKED_PREFIX):
+        return "blocked"
+    if text.startswith(SEARCH_NO_LOCATION_ERROR):
+        return "no_location"
+    if text.startswith((FILE_NOT_FOUND_PREFIX, DIRECTORY_NOT_FOUND_PREFIX)):
+        return "not_found"
+    if text.startswith(FILE_AMBIGUOUS_PREFIX):
+        return "ambiguous"
+    if fetch_error_type(text) in FETCH_UNREACHABLE_ERRORS:
+        return "unreachable"
+    return "error"
 
 
 def command_run_failed(text: str) -> bool:

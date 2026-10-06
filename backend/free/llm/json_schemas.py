@@ -19,7 +19,7 @@ llama-server `/v1/chat/completions` の OAI 互換 ``response_format`` を用い
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -353,15 +353,42 @@ class ReviewIssues(_StrictModel):
 
 # ── meta-cognitive 計画 (meta_cognitive_plan) ──
 
+#: 計画のタスクの種別のラベル (記録のみ、docs/f_03 §4.3)。
+PlanTaskKind = Literal[
+    "retrieve", "retrieve_then_process", "process", "write", "other",
+]
+PLAN_TASK_KINDS: tuple[str, ...] = get_args(PlanTaskKind)
+
+
 class MetaCognitivePlan(_StrictModel):
     """`backend/free/agent/meta_cognitive.py` のタスク計画。
 
     旧仕様は ``["task1", "task2"]`` の裸 JSON 配列だったが、OpenAI strict
     structured outputs / llama.cpp 制約サンプリングは top-level に object
     が必要なため、``tasks`` キーで配列をラップする
+
+    ``kinds`` は ``tasks`` と同じ長さの並列配列で、``tasks`` の **後ろ** に置く
+    (制約サンプリングは宣言の順に出すので、タスク文はラベルより先に生成される)。
     """
 
     tasks: list[str]
+    kinds: list[PlanTaskKind]
+
+
+# ── 素材に依存する書込みの本文 (write_content_from_source) ──
+
+class SourceCheckedWriteContent(_StrictModel):
+    """`backend/free/agent/meta_cognitive_content.py` の素材に依存する書込みの本文。
+
+    このターンの取得 (読んだファイル・取得したページ) を素材に書く本文を、書けるかの
+    申告つきで返させる。``fulfillable`` が偽なら ``content`` は空で、``missing`` に
+    足りないもの (依頼の言語) を入れる。判定を本文より先に生成させるため先頭に置く。
+    2026-10-05 ライブ監査 T6: 無関係なファイルを素材に謝罪文を書いて成功と報告した。
+    """
+
+    fulfillable: bool
+    missing: str
+    content: str
 
 
 # ── カートリッジ eval.json 生成 (cartridge_eval_generation) ──
@@ -546,6 +573,25 @@ class PersonalFactSplit(_StrictModel):
     facts: list[PersonalFactSplitItem] = Field(max_length=8)
 
 
+# ── 集合値の属性の編集 (slot_edit) ──
+
+
+class SlotEdit(_StrictModel):
+    """`backend/free/memory/sleep/slot_edit_curator.py` の編集判定 (Step 8.35)。
+
+    「趣味に写真を加えて、キャンプは外してください。」のように、利用者が属性の
+    現在値の **要素を加える / 外す** 発話は依頼形で Step 8 の抽出に掛からず、
+    編集前の値が SemMem に残っていた (2026-10-05 実機)。現在値と発話を渡し、
+    現在値の要素分け・外す要素・加える要素を返させる。どれも逐語 span で、
+    呼出側が部分文字列・網羅・属性語の混入を検証する (幻覚した要素を書かない)。
+    """
+
+    is_edit: bool
+    current_members: list[str] = Field(max_length=12)
+    removed: list[str] = Field(max_length=12)
+    added: list[str] = Field(max_length=12)
+
+
 # ── 訂正候補の検証 (correction_verify) ──
 
 
@@ -599,6 +645,48 @@ class DateIntent(_StrictModel):
     excluded_weekdays: list[int] = Field(max_length=7)
 
 
+class TableAggregation(_StrictModel):
+    """`backend/free/agent/table_aggregate_intent.py` の表の集計のパラメータ。
+
+    取得した表 (CSV / TSV / GFM) の数値集計を問う依頼から **パラメータだけ** を取る。
+    計算は ``core/table_aggregate.run_aggregate`` が全行に対して決定論で行う (LLM に
+    暗算もコードもさせない、2026-10-05 ライブ監査、docs/f_03 §4.2.2)。``value`` は
+    列名・数・四則演算・括弧だけの式で、検証はコード側 (AST の許可リスト) が行う —
+    この schema は形だけを強制する。``kind == "none"`` は表の集計を問う依頼でない。
+    """
+
+    kind: Literal["aggregate", "none"]
+    value: str = Field(max_length=200)
+    agg: Literal["sum", "mean", "min", "max", "count"]
+    group_by: list[str] = Field(max_length=3)
+    group_date_part: Literal["none", "year", "month"]
+    where_column: str = Field(max_length=80)
+    where_equals: str = Field(max_length=80)
+    #: 集計値の上の派生値 (``core/table_aggregate.DERIVES``)。前月比・差・構成比もコードが
+    #: Decimal で求める (モデルの暗算にしない、2026-10-06 ライブ確認)。
+    derive: Literal["none", "pct_change", "diff", "share_of_total"]
+
+
+# ── 問いの条件 (answer_conditions) ──
+
+
+class AnswerConditionItem(_StrictModel):
+    """問いが答えに課す条件 1 件。``span`` は発話からの逐語の抜き出し。"""
+
+    span: str = Field(max_length=40)
+    kind: Literal["qualifier", "period", "unit", "target", "ref_date"]
+
+
+class AnswerConditions(_StrictModel):
+    """`backend/free/core/answer_conditions.py` の問いの条件の抜き出し (f_03 §7.1.1)。
+
+    逐語かどうかの検査はコード側 (``answer_conditions.gate_conditions``) が行う —
+    この schema は形 (最大 5 件・span 40 字以内) だけを強制する。
+    """
+
+    conditions: list[AnswerConditionItem] = Field(max_length=5)
+
+
 # ── purpose -> schema 自動解決マップ ──
 #
 # 呼出側が ``response_schema`` を明示しない場合、AuxClient が purpose
@@ -618,6 +706,7 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "flow_spec_part_synthesis": FlowSpec,
     "spec_revision_judge": SpecRevisionJudgement,
     "meta_cognitive_plan": MetaCognitivePlan,
+    "write_content_from_source": SourceCheckedWriteContent,
     "cartridge_eval_generation": CartridgeEvalQAList,
     "url_relevance_score": UrlRelevanceJudgement,
     "assertion_naming": AssertionNaming,
@@ -626,8 +715,11 @@ PURPOSE_SCHEMAS: dict[str, type[_StrictModel]] = {
     "knowledge_claim_extract": KnowledgeClaimList,
     "knowledge_passage_select": KnowledgePassageSelection,
     "personal_fact_split": PersonalFactSplit,
+    "slot_edit": SlotEdit,
     "correction_verify": CorrectionVerdict,
     "date_intent": DateIntent,
+    "table_aggregate": TableAggregation,
+    "answer_conditions": AnswerConditions,
 }
 
 
@@ -774,6 +866,7 @@ __all__ = [
     "ReviewIssueItem",
     "ReviewIssues",
     "MetaCognitivePlan",
+    "SourceCheckedWriteContent",
     "CartridgeEvalQAItem",
     "CartridgeEvalQAList",
     "UrlRelevanceJudgement",

@@ -413,28 +413,56 @@ def set_turn_rag_meta(
     session_id: str, *, corpus_gated: bool, pseudo_derived: int,
     lexical_candidate_ids: list[str] | None = None,
     corpus_starved: bool = False,
+    adopted_corpus: int = 0,
 ) -> None:
     """このターンの検索の副情報を置く (``GenerationConfigRef`` へ写す)。
 
     ``lexical_candidate_ids`` は抑止応答の turn で取りこぼした問いの種
-    (f_01 §6.4 の misses) に使う。
+    (f_01 §6.4 の misses) に使う。``adopted_corpus`` は検索が採用した corpus の
+    件数 (``[参考情報]`` に見せる前)。抑止応答の型 (取れていない / 見せていない)
+    を分ける材料 (``feedback.rag_abstain_kind``)。
     """
     _turn(session_id, create=True).rag_meta = {
         "corpus_gated": bool(corpus_gated), "pseudo_derived": int(pseudo_derived),
         "lexical_candidate_ids": list(lexical_candidate_ids or []),
         "corpus_starved": bool(corpus_starved),
+        "adopted_corpus": int(adopted_corpus),
     }
 
 
 def record_pq_misses_if_abstained(
     state: AppState, entry: object, session_id: str, user_query: str,
 ) -> int:
-    """抑止応答 (``signals.rag_abstained``) か、corpus の候補があったのに棒で
-    全部落ちた turn (``corpus_starved``) なら、取りこぼした問いを疑似クエリの
-    種にする (f_01 §6.4 の misses)。積んだチャンク数を返す。"""
+    """抑止応答の turn か、corpus の候補があったのに棒で全部落ちた turn (``corpus_starved``)
+    なら、取りこぼした問いを疑似クエリの種にする (f_01 §6.4 の misses)。積んだチャンク数を返す。
+
+    抑止応答で積むのは 2 型 (f_04 §3.2):
+
+    - ``shown``: 見せたチャンクに答えが無かった = 取りこぼしの典型。語彙候補の上位には
+      採用に届かなかった正解チャンクやその兄弟が入りうる。
+    - ``not_retrieved``: corpus を 1 件も採用できなかった。ただし関連性ゲート (f_01 §6.6) が
+      「話題が無関係」と判定した turn (``corpus_gated``) は積まない (無関係な問いで misses の
+      最優先枠を埋めない)。
+
+    ``not_shown`` (採用したが資格判定・重複・予算で見せていない) は積まない —
+    検索は資料を取れており、種を足しても直らない。
+    """
+    from backend.free.learning.level0_instant import (
+        RAG_ABSTAIN_NOT_RETRIEVED,
+        RAG_ABSTAIN_SHOWN,
+    )
+
     signals = getattr(entry, "signals", None)
     meta = turn_rag_meta(session_id) if session_id else None
-    abstained = bool(signals) and getattr(signals, "rag_abstained", None) is True
+    kind = (getattr(signals, "_extra", None) or {}).get("rag_abstain_kind")
+    abstained = (
+        kind == RAG_ABSTAIN_SHOWN
+        or getattr(signals, "rag_abstained", None) is True
+        or (
+            kind == RAG_ABSTAIN_NOT_RETRIEVED
+            and (meta or {}).get("corpus_gated") is False
+        )
+    )
     starved = bool((meta or {}).get("corpus_starved"))
     if not (abstained or starved):
         return 0
@@ -902,12 +930,15 @@ def tool_routing_signals(
       妥当 (success)、全部失敗なら誤検出 (false_positive)。
     - **long_form**: ツールを撃たないので常に ``(False, False)``。
 
-    ``success is None`` の要素は「実行されなかった」なので数えない。呼ばれた
+    ``success is None`` の要素は「実行されなかった」なので数えない。同じターンで
+    取得済みの結果を返しただけの要素 (``cached``、docs/f_03 §4.2.1) も実行されて
+    いないので数えない (近道の結果を正例にしない、不変則 #15)。呼ばれた
     ツールが 1 件も無ければ両方 False (未使用は誤検出ではない)。
     """
     calls = [
         tc for tc in (tool_calls or [])
         if isinstance(tc, dict) and tc.get("success") is not None
+        and not tc.get("cached")
     ]
     if not calls:
         return False, False
@@ -1062,6 +1093,13 @@ def _active_gen_config(
     if rag_meta is not None:
         ref.corpus_gated = rag_meta["corpus_gated"]
         ref.pseudo_derived_count = rag_meta["pseudo_derived"]
+        # 宣言フィールドにすると形式の版が動くので未知キーの通路で運ぶ (f_04 §3.2)。
+        from backend.free.learning.level0_instant import RAG_ADOPTED_CORPUS_KEY
+
+        ref._extra = {
+            **(ref._extra or {}),
+            RAG_ADOPTED_CORPUS_KEY: int(rag_meta.get("adopted_corpus", 0)),
+        }
     # 体裁の継承 (write_file が WriteResult.metadata へ載せた場合) / 帳票の
     # 穴埋め (書込み成功時) の来歴。session_id を持たないツール境界
     # (write_file) から運ばれるため、TurnRecord ではなく専用 contextvar 経由

@@ -20,6 +20,7 @@ TemplateFamily = Literal[
     "qwen3_thinking",   # Qwen3: <think>...</think> + enable_thinking
     "deepseek_r1",      # DeepSeek-R1: <think>...</think>
     "gemma",            # Gemma 2/3: <start_of_turn> + system ロール非対応
+    "gemma4",           # Gemma 4: <|turn> ... <turn|> + enable_thinking (思考の切替あり)
     "llama3",           # Llama 3 系: <|start_header_id|>
     "chatml",           # ChatML: <|im_start|>
     "unknown",
@@ -80,6 +81,9 @@ def detect_template_family(chat_template: str) -> TemplateFamily:
         return "harmony"
     if "<start_of_turn>" in tmpl:
         return "gemma"
+    # Gemma 4 も enable_thinking を含むため、qwen3_thinking の判定より前に見る
+    if "<|turn>" in tmpl or "<turn|>" in tmpl:
+        return "gemma4"
     if "enable_thinking" in tmpl or ("<think>" in tmpl and "qwen" in tmpl.lower()):
         return "qwen3_thinking"
     if "<think>" in tmpl:

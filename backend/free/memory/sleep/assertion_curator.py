@@ -48,6 +48,7 @@ from backend.free.core.response_dates import complete_years, literal_dates, near
 from backend.free.core.text_quality import (
     contradicts_asserted_value,
     detect_lang,
+    states_own_intention,
     value_was_adopted,
 )
 from backend.free.llm.json_schemas import AssertionNaming
@@ -140,6 +141,35 @@ def assertive_body(content: str) -> str | None:
         if (sentence := raw.strip())
         and not _QUESTION_ENDING_RE.search(sentence)
         and not _REQUEST_ENDING_RE.search(sentence)
+    ]
+    return "".join(kept) or None
+
+
+def world_assertion_body(content: str) -> str | None:
+    """世界の事実として命名に出す文だけを返す (純粋関数)。1 文も無ければ None。
+
+    :func:`assertive_body` (疑問形・依頼形を除いた文) から、さらに **話者自身の
+    願望・意志** で終わる文 (「〜にしたいです」「〜するつもりです」「〜する予定
+    です」「〜しようと思います」、:func:`~backend.free.core.text_quality.states_own_intention`)
+    を除く。本人の予定・希望は世界の事実ではなく、``mem.world.assertion`` に
+    すると subject が本人を指さないまま別の会話へ注入される (本人の属性の
+    取りこぼしは Step 8.3 ``personal_fact_curator`` の担当)。
+
+    実インシデント (2026-10-05 trace 8232204694b3): 「1日目は嵐山、2日目は東山に
+    したいです。それぞれの見どころを3つずつ。」が
+    ``mem.world.assertion.travel_itinerary`` になり、東京の観光の会話へ
+    「(world_fact) … is: 1日目は嵐山、2日目は東山にしたい。」として注入された。
+    判定は文法の閉じた類で、補助タスクへ出す **前に** 決める。
+    """
+    from backend.free.memory.extractors.chat import _SENTENCE_SPLIT_RE
+
+    body = assertive_body(content)
+    if body is None:
+        return None
+    kept = [
+        sentence
+        for raw in _SENTENCE_SPLIT_RE.split(body)
+        if (sentence := raw.strip()) and not states_own_intention(sentence)
     ]
     return "".join(kept) or None
 
@@ -243,8 +273,8 @@ def _is_curatable(note: "MemoryNote", builder) -> bool:
         return False
     if _looks_like_code_fragment(content):
         return False
-    # 言明の文が 1 つも無い (全文が疑問形 / 依頼形) なら対象外。
-    body = assertive_body(content)
+    # 言明の文が 1 つも無い (全文が疑問形 / 依頼形 / 本人の願望・意志) なら対象外。
+    body = world_assertion_body(content)
     if body is None or len(body) < _MIN_CHARS:
         return False
     # Step 8 が型付けできたものは Step 8 に任せる。
@@ -567,7 +597,7 @@ async def curate_assertion_facts(
                 continue
         # 命名には言明の文だけを渡す。「忘れないでください」等の依頼節が
         # 混ざると補助タスクが is_assertion=false に倒れる。
-        body = assertive_body(content) or content
+        body = world_assertion_body(content) or content
         try:
             named = await _name_assertion(aux_client, body)
         except Exception as exc:

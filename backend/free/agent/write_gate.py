@@ -16,12 +16,20 @@
 
 データ根の ``g<N>/store`` / ``g<N>/cache`` / ``run`` とインストール根の ``config.yaml*`` /
 ``.venv`` / ``models`` は名指しされても書かない。
+
+根の中でも、**既に在るファイルの上書き** (``write_file``) は依頼文がそのファイルを書込みの
+対象に挙げたときだけ (判定点 ``overwrite_target``、:mod:`backend.free.agent.overwrite_gate`)。
+題材として挙がっただけのファイルを派生物 (テスト・要約・翻訳) で上書きしない
+(2026-10-05 ライブ監査 T4、docs/f_03 §4.y)。
 """
 
 from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,12 +39,17 @@ logger = get_logger("agent.write_gate")
 
 __all__ = [
     "WRITE_DENIED_RE",
+    "OVERWRITE_DENIAL_CODES",
     "WRITE_PATH_TOOLS",
     "WriteDenial",
+    "check_overwrite_target",
     "check_write_target",
     "has_parent_segment",
     "is_request_named",
     "normalize_write_path",
+    "overwrite_exempt",
+    "request_named_folders",
+    "request_names_file",
     "request_roots",
 ]
 
@@ -49,7 +62,8 @@ WRITE_PATH_TOOLS: dict[str, str] = {
 #: ゲートが断ったときのツール結果 (``Error: write denied (<code>): <path>``)。
 #: 最終応答で i18n ``agent.write_denied.<code>`` に写す側が読む。
 WRITE_DENIED_RE = re.compile(
-    r"^Error: write denied \((?P<code>outside_request_roots|protected_root|invalid_path)\): "
+    r"^Error: write denied \((?P<code>outside_request_roots|protected_root|invalid_path"
+    r"|existing_not_target|existing_not_kept)\): "
     r"(?P<path>.*)$",
     re.MULTILINE,
 )
@@ -215,12 +229,46 @@ def request_roots(query: str) -> list[Path]:
     from backend.free.agent.meta_cognitive_task_exec import delivery_roots
 
     roots = delivery_roots(query or "", implicit=False)
+    _add_unc_roots(query, roots)
+    return roots
+
+
+def request_named_folders(query: str) -> list[Path]:
+    """依頼文が **挙げた** フォルダだけ (:func:`request_roots` から ``outputs_dir`` の既定を除く)。
+
+    裸のファイル名の探し場所 (``file_ledger.resolve_bare_filename``) とフォルダの
+    台帳記録が使う。暗黙参照は根にしない (:func:`request_roots` と同じ)。
+    """
+    from backend.free.agent.meta_cognitive_task_exec import delivery_roots
+
+    roots = delivery_roots(query or "", implicit=False, fallback=False)
+    _add_unc_roots(query, roots)
+    return roots
+
+
+def request_names_file(path: str, query: str, user_texts: tuple[str, ...] | list[str] = ()) -> bool:
+    """``path`` のファイルを利用者が名指したか (今の依頼文か、このセッションの user の発話)。
+
+    書込みの素材の門 (``no_source_data``) が、計画モデルが自分で選んだ読込みを素材に
+    数えないために使う (2026-10-05 ライブ監査 T6)。名前 (basename) かフルパスが文に
+    書かれているときだけ真。依頼文が挙げたフォルダ (書込みの宛先の親を含む) の中に
+    あるだけでは名指しに数えない — 「…\\work\\summary.md に書き出して」で、同じ
+    フォルダの buggy.py を素材に数えていた (2026-10-05 レビュー H1)。名前は区切りの
+    境界で照合する (``a.py`` が ``data.py`` に当たらない)。
+    """
+    name = os.path.basename((path or "").rstrip("\\/"))
+    if not name:
+        return False
+    pattern = re.compile(rf"(?<![\w.\-]){re.escape(name)}(?![\w\-])", re.IGNORECASE)
+    return any(text and pattern.search(text) for text in (query, *user_texts))
+
+
+def _add_unc_roots(query: str, roots: list[Path]) -> None:
     for m in _UNC_PATH_RE.finditer(query or ""):
         candidate = Path(m.group(0).rstrip("。、,.\\/"))
         root = candidate.parent if candidate.suffix else candidate
         if root not in roots:
             roots.append(root)
-    return roots
 
 
 def _current_query() -> str:
@@ -230,10 +278,10 @@ def _current_query() -> str:
 
 
 def _named_ledger_roots(session_id: str | None) -> list[str]:
-    from backend.free.agent.file_ledger import current_named_file_paths, named_file_paths
+    """ファイル台帳の ``named`` の記録のフォルダ (名指しのフォルダ / 名指しのファイルの親)。"""
+    from backend.free.agent.file_ledger import named_folder_paths
 
-    paths = named_file_paths(session_id) if session_id is not None else current_named_file_paths()
-    return [_resolved_key(os.path.dirname(os.path.abspath(p))) for p in paths]
+    return [_resolved_key(os.path.abspath(p)) for p in named_folder_paths(session_id)]
 
 
 def is_request_named(path: str, *, query: str | None = None, session_id: str | None = None) -> bool:
@@ -252,12 +300,16 @@ def is_request_named(path: str, *, query: str | None = None, session_id: str | N
 
 def check_write_target(
     raw: str, *, query: str | None = None, session_id: str | None = None,
+    check_overwrite: bool = False, content: str | None = None,
 ) -> tuple[str, WriteDenial | None]:
     """書込み先を判定する。``(正規化したパス, 断った理由 or None)`` を返す。
 
     ``query`` / ``session_id`` を省くと、このリクエストの依頼文 (``tool_ledger``
     の宛先) とファイル台帳の宛先を使う。許したときは正規化したパス (``~`` 展開・
     ``\\\\?\\`` 除去済み) で書くこと。
+
+    ``check_overwrite`` (``write_file``) なら、根の中の **既に在るファイル** の上書きを
+    :func:`check_overwrite_target` に通す。``content`` は書く本文 (弱い根拠の確かめに使う)。
     """
     from backend.config import resolve_outputs_dir
 
@@ -267,9 +319,104 @@ def check_write_target(
     key = _resolved_key(normalized)
     if _is_protected(key):
         return normalized, WriteDenial("protected_root", normalized)
-    roots = [_resolved_key(r) for r in request_roots(_current_query() if query is None else query)]
+    request = _current_query() if query is None else query
+    roots = [_resolved_key(r) for r in request_roots(request)]
     roots.append(_resolved_key(resolve_outputs_dir()))
     roots += _named_ledger_roots(session_id)
-    if any(_within(key, r) for r in roots):
-        return normalized, None
-    return normalized, WriteDenial("outside_request_roots", normalized)
+    if not any(_within(key, r) for r in roots):
+        return normalized, WriteDenial("outside_request_roots", normalized)
+    if check_overwrite:
+        return normalized, check_overwrite_target(
+            normalized, request, session_id=session_id, content=content,
+        )
+    return normalized, None
+
+
+#: 上書きの門 (:func:`check_overwrite_target`) が断ったときのコード。結果に本文を添える。
+OVERWRITE_DENIAL_CODES = frozenset({"existing_not_target", "existing_not_kept"})
+
+#: 上書きの門を掛けない書込みの区間 (制作ステージの配信、docs/f_03 §4.y)。
+_overwrite_exempt: ContextVar[bool] = ContextVar("write_gate_overwrite_exempt", default=False)
+
+
+@contextmanager
+def overwrite_exempt() -> Iterator[None]:
+    """区間内の ``write_file`` に上書きの門を掛けない (根の検査はそのまま)。
+
+    create の制作ステージの配信 (§4.4) が使う。既存ファイルは書き手が上書きの前に
+    ``bk/overwrite/`` へ退避し、``delivery`` の ``replaced`` と最終応答で利用者に見せるので、
+    上書きが失われも隠れもしない。作り直し・手直し (別のセッションからを含む) は既存の成果物を
+    書き換えるのが仕様 (2026-10-05 独立レビュー H1 / 3 周目)。文脈変数なので区間を抜けた後・
+    並走する別のタスクには効かない。
+    """
+    token = _overwrite_exempt.set(True)
+    try:
+        yield
+    finally:
+        _overwrite_exempt.reset(token)
+
+
+def _same_file(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def check_overwrite_target(
+    path: str, query: str, *, session_id: str | None = None, content: str | None = None,
+) -> WriteDenial | None:
+    """既に在るファイルの上書きを、依頼文がそのファイルを対象に挙げたときだけ許す (docs/f_03 §4.y)。
+
+    - 書込み先が在るファイルでない (新規) / 依頼文が無い (sleep-time・テスト) → 許す
+    - このリクエストで既に書いたファイル (前段のタスクが作った) → 許す
+    - 判定点 ``overwrite_target`` が ``target`` → 許す。``edit`` → 書く本文が既存の本文を
+      引き継いでいれば許す (確かめられなければ許す)、引き継がなければ ``existing_not_kept``。
+      それ以外 → ``existing_not_target``
+    - 制作ステージの配信 (:func:`overwrite_exempt` の区間) → 許す (退避と replaced の開示がある)
+
+    依頼文は **このターンのユーザーの発話** だけ。計画のタスク文・LLM の引数は証拠に
+    数えない (不変則 #15)。
+    """
+    from backend.free.agent.file_ledger import (
+        current_session,
+        last_written_path,
+        session_has_file,
+    )
+    from backend.free.agent.output_format import anchor_relative_output_path
+    from backend.free.agent.overwrite_gate import (
+        EDIT_LABEL,
+        TARGET_LABEL,
+        overwrite_target_verdict,
+        retains_existing,
+    )
+    from backend.free.agent.tool_ledger import written_in_request
+
+    if _overwrite_exempt.get() or not (query or "").strip():
+        return None
+    target = anchor_relative_output_path(path)
+    try:
+        if not os.path.isfile(target):
+            return None
+    except (OSError, ValueError):
+        return None
+    if written_in_request(target):
+        return None
+    session = current_session() if session_id is None else session_id
+    last =last_written_path(session) if session else ""
+    verdict = overwrite_target_verdict(
+        query, target, in_session=session_has_file(session, target),
+        last_written=bool(last) and _same_file(last, target),
+    )
+    if verdict.fired and verdict.value == TARGET_LABEL:
+        return None
+    if verdict.fired and verdict.value == EDIT_LABEL:
+        if retains_existing(target, content) is not False:
+            return None
+        logger.warning(
+            "Overwrite denied: the new content does not keep the existing file (%s): %s",
+            verdict.evidence, target,
+        )
+        return WriteDenial("existing_not_kept", path)
+    logger.warning(
+        "Overwrite denied: the request does not name the existing file as the target (%s): %s",
+        verdict.evidence, target,
+    )
+    return WriteDenial("existing_not_target", path)

@@ -16,7 +16,14 @@ from backend.free.agent.meta_cognitive_tool_io import (
     tool_result_lacks_information,
     tool_result_succeeded,
 )
-from backend.free.agent.tool_ledger import record_current
+from backend.free.agent.tool_ledger import (
+    OBSERVATION_TOOLS,
+    file_fingerprint,
+    record_current,
+    record_current_observation,
+    record_current_result,
+    record_request_write,
+)
 
 logger = get_logger("agent.tools_registry")
 
@@ -85,66 +92,163 @@ def _record_tool_issue(name: str, succeeded: bool, rendered: str) -> None:
 
 #: ファイルを対象にするツールと、そのパス引数の名前。
 #: 台帳へ入れるのは **成功した実行だけ** — 失敗したパスを「直前のファイル」に
-#: すると、次の暗黙参照が存在しないファイルへ向く。
+#: すると、次の暗黙参照が存在しないファイルへ向く。読めなかったパスは状態
+#: (``read_failed``) としてだけ残す。
 _FILE_PATH_ARGS: dict[str, tuple[str, ...]] = {
     "write_file": ("path", "file_path", "filename"),
     "read_file": ("path", "file_path", "filename"),
 }
+#: フォルダを対象にするツールと、そのパス引数の名前。対象のフォルダは裸の
+#: ファイル名の探し場所として台帳へ積む (``file_ledger.resolve_bare_filename``)。
+_DIR_PATH_ARGS: dict[str, tuple[str, ...]] = {
+    "list_directory": ("directory",),
+    "search_code": ("directory",),
+}
 
 
-def _resolve_bare_filename(name: str, kwargs: dict) -> None:
-    """裸のファイル名を、この会話で使っているディレクトリへ寄せる。
+def _resolve_bare_filename(name: str, kwargs: dict) -> str | None:
+    """裸のファイル名を、この会話で確定しているフォルダへ寄せる。
 
-    ``kwargs`` は **その場で書き換える** ので、実行にも台帳の記録にも
-    解決後のパスが載る (台帳が相対パスのままだと、次ターンの突合が
-    できず存在しないパスを「読んだ」と答える)。詳細は
-    ``file_ledger.resolve_against_recent_dir``。
+    解決は ``file_ledger.resolve_bare_filename`` (読み書きの入口が共有する 1 本) に
+    任せる。``kwargs`` は **その場で書き換える** ので、実行にも台帳の記録にも
+    解決後のパスが載る (台帳が相対パスのままだと、次ターンの突合ができず存在
+    しないパスを「読んだ」と答える)。
+
+    読みで決められなければ (どこにも無い / 複数のフォルダにある) ツール結果の
+    エラー文 (探した場所 / 候補つき) を返し、実行しない — CWD を見た
+    ``File not found: staff.csv`` だけでは、どこを探したかがモデルに伝わらない
+    (2026-10-05 ライブ監査)。書込みは決められなければ既定の出力先へ寄せる。
     """
     arg_names = _FILE_PATH_ARGS.get(name)
     if not arg_names:
-        return
-    from backend.free.agent.file_ledger import resolve_current_against_recent_dir
+        return None
+    from backend.free.agent.file_ledger import resolve_bare_filename
 
     for arg in arg_names:
         value = kwargs.get(arg)
-        if isinstance(value, str) and value.strip():
-            # 書込みは名指しの記録の隣にだけ寄せる (LLM が自分で選んで読んだ
-            # ファイルの隣は書込みゲートが断る、docs/f_03 §4.y)。
-            resolved = resolve_current_against_recent_dir(
-                value, named_only=(name == "write_file"),
-            )
-            if name == "write_file":
-                # 会話に寄せる先が無い裸名 / 相対パスはプロセスの CWD (= リポジトリ
-                # 直下) に落ちる。書込みは既定の出力先へ寄せる (F-05 と同じ規則、
-                # meta_cognitive の ``_resolve_write_path`` と揃える)。
-                from backend.free.agent.output_format import anchor_relative_output_path
+        if not (isinstance(value, str) and value.strip()):
+            continue
+        writing = name == "write_file"
+        resolution = resolve_bare_filename(value, for_write=writing)
+        if writing:
+            # 会話に寄せる先が無い裸名 / 相対パスはプロセスの CWD (= リポジトリ
+            # 直下) に落ちる。書込みは既定の出力先へ寄せる (F-05 と同じ規則、
+            # meta_cognitive の ``_resolve_write_path`` と揃える)。
+            from backend.free.agent.output_format import anchor_relative_output_path
 
-                resolved = anchor_relative_output_path(resolved)
-            kwargs[arg] = resolved
-            return
+            kwargs[arg] = anchor_relative_output_path(resolution.path or value)
+            return None
+        if not resolution.bare:
+            return None
+        if resolution.path is None:
+            _record_read_failure(value, resolution)
+            return resolution.error_message(value.strip().strip("\"'"))
+        kwargs[arg] = resolution.path
+        return None
+    return None
 
 
-def _record_touched_file(name: str, succeeded: bool, kwargs: dict) -> None:
-    """ファイル操作のパスを file 台帳へ落とす。
+def _record_read_failure(value: str, resolution) -> None:
+    """裸の名前の読みが決められなかったことを台帳の状態に残す。"""
+    from backend.free.agent.file_ledger import (
+        FILE_READ_FAILED,
+        current_session,
+        record_file_status,
+    )
+
+    record_file_status(
+        current_session(), value, FILE_READ_FAILED,
+        error_kind="ambiguous" if resolution.ambiguous else "not_found",
+        searched=resolution.candidates if resolution.ambiguous else resolution.searched,
+    )
+
+
+def _record_touched_file(name: str, succeeded: bool, kwargs: dict, rendered: str = "") -> None:
+    """ファイル / フォルダ操作のパスを file 台帳へ落とす。
 
     ``named`` (依頼文由来の根の配下か) は記録するこの時点で決める
-    (書込みゲート、docs/f_03 §4.y)。
+    (書込みゲート、docs/f_03 §4.y)。依頼文が挙げた実在のフォルダ、
+    ``list_directory`` / ``search_code`` の対象フォルダも積む (裸のファイル名の
+    探し場所)。ファイルごとの状態 (一覧した / 読めた / 読めなかった / 書いた) も残す。
     """
-    if not succeeded:
+    file_args = _FILE_PATH_ARGS.get(name)
+    dir_args = _DIR_PATH_ARGS.get(name)
+    if not file_args and not dir_args:
         return
-    arg_names = _FILE_PATH_ARGS.get(name)
-    if not arg_names:
-        return
-    from backend.free.agent.file_ledger import record_current_file
-    from backend.free.agent.write_gate import is_request_named
+    import os
 
-    for arg in arg_names:
+    from backend.free.agent import file_ledger as FL
+    from backend.free.agent.meta_cognitive_tool_io import tool_error_kind
+    from backend.free.agent.tool_ledger import current_query
+    from backend.free.agent.write_gate import is_request_named, request_named_folders
+
+    session = FL.current_session()
+    for folder in request_named_folders(current_query()):
+        if folder.is_dir():
+            FL.record_current_dir(str(folder), named=True)
+
+    for arg in dir_args or ():
+        value = kwargs.get(arg)
+        if not (succeeded and isinstance(value, str) and value.strip()):
+            continue
+        if value.strip() in (".", "./") or not os.path.isdir(value):
+            continue
+        FL.record_current_dir(value, named=is_request_named(value))
+        if name == "list_directory":
+            FL.record_listed_folder(session, value)
+        return
+
+    for arg in file_args or ():
+        value = kwargs.get(arg)
+        if not (isinstance(value, str) and value.strip()):
+            continue
+        writing = name == "write_file"
+        if succeeded:
+            FL.record_current_file(value, named=is_request_named(value), written=writing)
+            FL.record_file_status(
+                session, value, FL.FILE_WRITTEN if writing else FL.FILE_READ_OK,
+            )
+        elif not writing:
+            FL.record_file_status(
+                session, value, FL.FILE_READ_FAILED,
+                error_kind=tool_error_kind(rendered),
+                searched=(os.path.dirname(value) or os.getcwd(),),
+            )
+        return
+
+
+def _read_path_fingerprint(name: str, kwargs: dict) -> tuple[int, int] | None:
+    """read_file が読む **前** のファイルの指紋 (それ以外のツールは ``None``)。
+
+    読んだ後に取ると、読む間に書き換わった分を「取得した時点の写し」と取り違える。
+    """
+    if name != "read_file":
+        return None
+    for arg in _FILE_PATH_ARGS["read_file"]:
         value = kwargs.get(arg)
         if isinstance(value, str) and value.strip():
-            record_current_file(
-                value, named=is_request_named(value), written=(name == "write_file"),
-            )
-            return
+            return file_fingerprint(value)
+    return None
+
+
+def _record_observation(
+    name: str, kwargs: dict, rendered: str,
+    fingerprint: tuple[int, int] | None = None,
+) -> None:
+    """成功した取得 (read_file / fetch_url) の本文を所在と指紋つきで台帳へ積む。
+
+    read_file の所在は結果のメタ行のパス (裸の名前を解決した後の実パス)、指紋は
+    読む前に取った値 (:func:`_read_path_fingerprint`)。
+    """
+    from backend.free.agent.meta_cognitive_tool_io import read_file_result_path
+
+    if name == "read_file":
+        source = read_file_result_path(rendered) or ""
+    else:
+        url = kwargs.get("url")
+        source = url if isinstance(url, str) else ""
+        fingerprint = None
+    record_current_observation(name, source, rendered, fingerprint)
 
 
 async def _deny_write(name: str, kwargs: dict) -> str | None:
@@ -155,17 +259,32 @@ async def _deny_write(name: str, kwargs: dict) -> str | None:
     書き換えて ``None``。判定は実在の祖先を解決するのでスレッドで行う
     (contextvar はコピーされて届く)。
     """
-    from backend.free.agent.write_gate import WRITE_PATH_TOOLS, check_write_target
+    from backend.free.agent.write_gate import (
+        OVERWRITE_DENIAL_CODES,
+        WRITE_PATH_TOOLS,
+        check_write_target,
+    )
 
     arg = WRITE_PATH_TOOLS.get(name)
     value = kwargs.get(arg) if arg else None
     if not isinstance(value, str):
         return None
-    normalized, denial = await asyncio.to_thread(check_write_target, value)
+    # 既に在るファイルを丸ごと差し替える ``write_file`` だけ、上書きの対象かを見る
+    # (``apply_diff`` は既存の本文を前提にした差分、docs/f_03 §4.y)
+    content = kwargs.get("content") if name == "write_file" else None
+    normalized, denial = await asyncio.to_thread(
+        check_write_target, value,
+        check_overwrite=name == "write_file",
+        content=content if isinstance(content, str) else None,
+    )
     if denial is None:
         kwargs[arg] = normalized
         return None
     logger.warning("Write denied (%s): %s -> %s", denial.code, name, denial.path)
+    if denial.code in OVERWRITE_DENIAL_CODES and isinstance(content, str) and content.strip():
+        # 上書きの門の断りは生成した本文を結果に添える — どの経路 (meta のファストパス /
+        # ツールループ / 救出、deliberative、長文) でも結果を運ぶだけで本文が残る (f_03 §4.y)
+        return f"{denial.as_tool_result()}\n\n{content}"
     return denial.as_tool_result()
 
 
@@ -445,9 +564,15 @@ class ToolsRegistry:
             _record_tool_issue(name, False, validation_error)
             return f"Error: {validation_error}"
 
-        # 裸のファイル名はプロセスの cwd ではなく「この会話のディレクトリ」へ。
-        # ログにも解決後のパスが出るよう、要約の前に掛ける。
-        _resolve_bare_filename(name, kwargs)
+        # 裸のファイル名はプロセスの cwd ではなく「この会話のフォルダ」へ。
+        # ログにも解決後のパスが出るよう、要約の前に掛ける。読みで決められない
+        # (どこにも無い / 複数ある) ときは探した場所つきのエラーを返して実行しない。
+        unresolved = await asyncio.to_thread(_resolve_bare_filename, name, kwargs)
+        if unresolved is not None:
+            logger.info("Bare filename not resolved: %s -> %s", name, unresolved[:200])
+            record_current(name, False, reason="error")
+            _record_tool_issue(name, False, unresolved)
+            return unresolved
 
         denied = await _deny_write(name, kwargs)
         if denied is not None:
@@ -456,6 +581,10 @@ class ToolsRegistry:
             return denied
 
         logger.info("Executing tool: %s(%s)", name, _summarize_args_for_log(kwargs))
+        pre_read_fingerprint = (
+            await asyncio.to_thread(_read_path_fingerprint, name, kwargs)
+            if name == "read_file" else None
+        )
 
         try:
             if inspect.iscoroutinefunction(tool.func):
@@ -479,7 +608,18 @@ class ToolsRegistry:
         # 分かれているので、記録は **唯一の合流点であるここ** で行う。呼出側に
         # 配ると必ず取りこぼす (詳細は tool_ledger._current_target のコメント)。
         succeeded = tool_result_succeeded(name, str(result))
+        # ツールはファイルを作りうる (run_command 等)。このリクエストの裸の名前の解決の
+        # キャッシュを捨てる (file_ledger.resolve_bare_filename)。
+        from backend.free.agent.file_ledger import invalidate_resolutions
+
+        invalidate_resolutions()
         record_current(name, succeeded)
+        if succeeded and name == "write_file":
+            # 同じリクエストの後段 (追記・書き直し) は自分が作ったファイルへの書込み
+            record_request_write(str(kwargs.get("file_path") or ""))
+        if succeeded:
+            # 後のターンの人名の検査の根拠 (取った中身そのもの、tool_ledger 参照)。
+            record_current_result(name, str(result))
         # 不首尾も同じ合流点で記録する。自己申告の問い (「見つからなかった
         # 項目はありましたか」) に対し、監査では 7 回すべて「ありません」と
         # 答えていた — 会話履歴にツールの成否も空振りも残らないため。
@@ -489,7 +629,13 @@ class ToolsRegistry:
         # パスはクエリの文字列からは取れないので、実行時に覚えておく
         # (file_ledger のモジュール docstring を参照)。``named`` の判定は実在の
         # 祖先を解決する (UNC で待たされうる) のでスレッドで行う。
-        await asyncio.to_thread(_record_touched_file, name, succeeded, kwargs)
+        await asyncio.to_thread(
+            _record_touched_file, name, succeeded, kwargs, str(result),
+        )
+        if succeeded and name in OBSERVATION_TOOLS:
+            # 後のターンへ持ち越す取得した資料 (tool_ledger の「取得した資料の持ち
+            # 越し」)。指紋は読む前に取った値。
+            _record_observation(name, kwargs, str(result), pre_read_fingerprint)
         return result
 
     @staticmethod

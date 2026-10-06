@@ -14,7 +14,8 @@ pillar 非依存の ``core/`` に置くため、``core.inference`` (チャット
 
 from __future__ import annotations
 
-from datetime import date
+import re
+from datetime import date, datetime, tzinfo
 
 #: 現在日時ブロックの角括弧ラベル。チャット応答パス
 #: (``core.inference._current_date_note``) と生成パス
@@ -23,17 +24,46 @@ from datetime import date
 CURRENT_DATETIME_LABEL = "[現在日時]"
 
 
-def local_today() -> date:
-    """日付注記と同じ基準のローカル暦日 (``current_datetime_block`` 参照)。"""
+def _local_tz() -> tzinfo | None:
+    """ローカル時刻へ変換するときのタイムゾーン (``None`` = ホストの設定)。
+
+    テストが JST 等を固定するための差し込み口。
+    """
+    return None
+
+
+def local_now() -> datetime:
+    """日付注記と同じ基準のローカル現在時刻 (tz-aware)。"""
     from backend.utils import utc_now_dt
 
-    return utc_now_dt().astimezone().date()
+    return utc_now_dt().astimezone(_local_tz())
+
+
+def local_today() -> date:
+    """日付注記と同じ基準のローカル暦日 (``current_datetime_block`` 参照)。"""
+    return local_now().date()
+
+
+#: 時間帯の略称として表に出してよい名前 (``JST`` / ``UTC`` / ``PDT``)。Windows の
+#: ``tzname()`` は「東京 (標準時)」「Tokyo Standard Time」のような長い名前を返すので、
+#: その場合は UTC オフセットだけを示す。
+_TZ_ABBREV_RE = re.compile(r"[A-Z]{2,5}")
+
+
+def _clock_stamp(now: datetime) -> str:
+    """``YYYY-MM-DD (X曜) HH:MM [TZ] (UTC±HH:MM)`` を返す (純粋関数)。"""
+    weekday = "月火水木金土日"[now.weekday()]
+    offset = now.strftime("%z")  # "+0900"
+    utc_offset = f"UTC{offset[:3]}:{offset[3:]}" if offset else "UTC"
+    name = now.tzname() or ""
+    zone = f" {name}" if _TZ_ABBREV_RE.fullmatch(name) and name != "UTC" else ""
+    return f"{now:%Y-%m-%d} ({weekday}曜) {now:%H:%M}{zone} ({utc_offset})"
 
 
 def current_datetime_block(guidance: str) -> str:
-    """``[現在日時] YYYY-MM-DD (X曜)。<guidance>`` を返す。
+    """``[現在日時] YYYY-MM-DD (X曜) HH:MM [TZ] (UTC±HH:MM)。<事実の宣言><guidance>`` を返す。
 
-    日付スタンプの体裁 (ラベル / 書式 / 曜日の和名) を 1 箇所に集約する。
+    日時スタンプの体裁 (ラベル / 書式 / 曜日の和名) を 1 箇所に集約する。
     後続の指示文は用途ごとに異なる (チャット応答は「過去か未来かの判断」まで
     求め、成果物生成は「相対表現の解釈」のみ) ため引数で受け取る。
 
@@ -46,21 +76,35 @@ def current_datetime_block(guidance: str) -> str:
     UTC と暦日が食い違う時間帯だけ** (JST なら 00:00-09:00) なので、検証は
     その時間帯か単体テストで行うこと。
 
-    時刻 (HH:MM) やオフセットは載せない。日付の基準を与えるのが役目で、
-    時刻が要る質問はツールが答えるため。旧 UTC 版からの差分をラベルと
-    暦日の基準だけに留める意図もある。
+    **時刻 (HH:MM) と UTC オフセットも常に載せる** (2026-10-03 設計変更、不変則
+    #15)。現在日時はツール (now-only コマンド) で取るのをやめ、この注記だけで
+    渡す — 実ログで now-only の 75% が不要な問い (「公開 URL は何日で使えなく
+    なる?」) に撃たれ、ツール結果が「唯一の事実根拠」枠で「特定できません」を
+    後押しした。時刻が無いと「今の時刻」の問いに答えられず、日付だけの注記を
+    見たモデルは「現在の正確な時刻は確認できていません」と答えた (2026-08-22)。
+    そこで値を **システム時計から取った確認済みの事実** として宣言する。
+
+    この注記は分単位で変わるので **system には絶対に入れない** (毎分 KV が
+    全滅する)。呼出側は最後の user の動的ブロックへ置くこと。
 
     内部時刻不変則 (naive datetime 禁止) は ``utc_now_dt()`` を
     ``astimezone()`` で変換することで保つ (tz-aware のまま。純粋関数ではない)。
     """
-    from backend.utils import utc_now_dt
-
-    now = utc_now_dt().astimezone()
-    weekday = "月火水木金土日"[now.weekday()]
+    stamp = _clock_stamp(local_now())
     return (
-        f"{CURRENT_DATETIME_LABEL} {now:%Y-%m-%d} ({weekday}曜)。{guidance}"
+        f"{CURRENT_DATETIME_LABEL} {stamp}。{_CLOCK_FACT}{guidance}"
         f"{_EXPLICIT_DATE_PRECEDENCE}"
     )
+
+
+#: 注記の値がツールで確かめていない推測と読まれないための宣言 (2026-08-22 の
+#: 「現在の正確な時刻は確認できていません」の再発防止)。
+_CLOCK_FACT = (
+    "これはこの環境のシステム時計から取得した現在の日時で、確認済みの事実である。"
+    "今日の日付・曜日・現在時刻を尋ねられたらこの値で答え、"
+    "それらを確認できない・分からないとは答えないこと"
+    "(この値が保証するのは現在の日時だけで、予定や出来事は保証しない)。"
+)
 
 
 #: **ユーザーが明示した日付を、この基準日で上書きしない。** 実インシデント

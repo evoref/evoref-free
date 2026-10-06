@@ -26,6 +26,20 @@ import numpy as np
 # import するため re-export として保持する。
 from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.free.core.date_math_cue import query_has_date_math_cue
+from backend.free.core.temporal_deixis import (
+    DAY_OFFSETS,
+    EN_NOW,
+    EN_RELATIVE_DAYS,
+    EN_TODAY,
+    MONTH_OFFSETS,
+    NOW_ADVERBS,
+    NOW_NOUNS,
+    WEEK_OFFSETS,
+    YEAR_OFFSETS,
+    alternation,
+    ascii_words,
+    kanji_terms,
+)
 from backend.free.agent.prompt_utils import (
     FewShotExample,
     format_fewshot_section,  # noqa: F401  (re-export for tests)
@@ -62,6 +76,7 @@ from backend.io.versioned import JsonPayload, VersionedJsonFile
 from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
+    find_sign_contradiction,
 )
 from backend.free.llm.json_schemas import FewShotQualityJudgement
 from backend.free.memory.types import make_fact
@@ -196,7 +211,7 @@ _TOPK_MIN_SIM_DENSE_STATIC = 0.35
 # meta_cognitive_utils._TASK_LOG_LINE_RE と同旨だが、pillar 境界
 # (EvorefLearn → EvorefLoop の utils は import 対象外) のため最小実装を持つ。
 _TASK_LOG_LINE_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?\[(?:done|failed|skipped)\]\s"
+    r"^\s*(?:[-*]\s*)?\[(?:done|failed|skipped|pending)\]\s"
     r"|^\s*Written\s+\d+\s+bytes\s+to\s+\S",
 )
 
@@ -257,10 +272,13 @@ _response_has_chinese_token_leak = has_chinese_token_leak
 
 
 #: 発話時点の「いま」を指す語。これを含む問いへの答えは、その日にしか成立しない。
+#: 語彙は temporal_deixis が SSOT。
 _PRESENT_TIME_RE = re.compile(
-    r"今日|本日|昨日|明日|明後日|一昨日|今週|来週|先週|今月|来月|先月"
-    r"|今年|来年|去年|昨年|現在|只今|ただいま"
-    r"|(?<![A-Za-z])(?:today|tomorrow|yesterday|now|current)(?![A-Za-z])",
+    alternation(
+        kanji_terms(DAY_OFFSETS), kanji_terms(WEEK_OFFSETS), MONTH_OFFSETS,
+        YEAR_OFFSETS, NOW_NOUNS, NOW_ADVERBS,
+    )
+    + "|" + ascii_words(EN_TODAY, EN_RELATIVE_DAYS, EN_NOW),
     re.IGNORECASE,
 )
 
@@ -584,6 +602,9 @@ def find_content_rejection(
     conclusion = find_conclusion_contradiction(response)
     if conclusion is not None:
         return f"conclusion contradiction: {conclusion}"
+    sign = find_sign_contradiction(response)
+    if sign is not None:
+        return f"sign contradiction: {sign}"
     # 途中で結論を撤回した応答は、正しい結論に辿り着いていても手本にしない
     # (_SELF_RETRACTION_RE 参照)。
     if retracts_own_conclusion(response):
@@ -660,6 +681,7 @@ _HARMFUL_RATE_FLOOR = 0.2
 FEWSHOT_ATTRIBUTABLE_REASONS: tuple[str, ...] = (
     "arithmetic contradiction",
     "conclusion contradiction",
+    "sign contradiction",
     "broken JA spacing",
     "Chinese token leaked",
     "response retracts",

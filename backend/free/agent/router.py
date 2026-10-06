@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from backend.free.agent.context_budget import resolve_meta_cognitive_loop_budget
 from backend.free.agent.meta_cognitive_text import assigns_file_content
 from backend.free.agent.safety_patterns import strip_command_literals
+from backend.free.agent.tool_judge_history import asks_about_day_scoped_conversation
 from backend.free.core.intent_vocab import (
     COMMAND_EXECUTION_RE,
     TOPIC_REFERENCE_RE,
@@ -41,7 +42,9 @@ from backend.free.core.intent_vocab import (
 )
 from backend.free.agent.file_reference_gate import (
     LOCATE_LABEL,
+    TOPIC_CASE_AFTER_NI,
     WRITE_LABEL,
+    is_topic_case,
     recent_file_reference_rule,
 )
 from backend.free.core.predicate import NEGATIVE_LABEL, Verdict
@@ -361,7 +364,24 @@ _SAVE_VERB_RE = re.compile(
 # ファイル名の **直後** に来る宛先の格助詞。「notes.txt に追記して」の ``に`` は
 # 宛先を、「compose.yaml を書いて」の ``を`` は生成対象を指す。閉じ括弧・
 # 引用符を挟む形 (「（club_plan.txt）に追記して」) も同じ宛先。
-_DESTINATION_PARTICLE_RE = re.compile(r"^[)）」』】\]\"'\s　]*(?:に|へ)")
+#
+# ``に`` で始まる複合の格助詞 (について / における / において / にある / による /
+# によれば / に書かれた / に入っている / に載っている) は宛先ではなく、話題・所在・
+# 出典を表す (2026-10-05 独立レビュー: 「sales.csv について…合計を出して」「notes.txt に
+# ある TODO を一覧に」「E:\tmp\data\ に入っている sales.csv を読んで」が宛先と読まれた)。
+# 語を足すのではなく、``に`` の後に続く形で格の種類を分ける閉じた集合。
+#
+# 話題・根拠の格 (に対する / に関する / に基づ / について / に加えて) は参照表現の
+# 宛先の判定 (``_referential_destination`` → ``is_topic_case``) と **同じ 1 本**
+# (``file_reference_gate.TOPIC_CASE_AFTER_NI``) を読む (#14 (a))。以前はここが ``つい``
+# だけを持つ別の一覧で、「util_fixed.py に対するテストを書いて」「spec.md に基づいて
+# コードを書いて」の裸のファイル名を宛先と読んだ (docs/f_03 §1.4)。
+_NON_DESTINATION_NI = (
+    r"に(?!" + TOPIC_CASE_AFTER_NI + r"|おけ|おい|ある|よる|よれ|書かれ|入って|載って)"
+)
+_DESTINATION_PARTICLE_RE = re.compile(
+    r"^[)）」』】\]\"'\s　]*(?:" + _NON_DESTINATION_NI + r"|へ)",
+)
 # 英語で宛先を示す前置詞 (ファイル名の直前)。"save it to notes.txt" /
 # "write this into out.md"。
 _DESTINATION_PREPOSITION_RE = re.compile(
@@ -373,8 +393,9 @@ _DESTINATION_PREPOSITION_RE = re.compile(
 # フォルダ付きの複数ファイル依頼が本文提示に倒れ、コードがチャットに出るだけで
 # 1 つも保存されなかった (2026-09-25 create ベンチ m2)。
 _FOLDER_DESTINATION_RE = re.compile(
-    r"[\w.-]+[\\/]?[\s　]*(?:フォルダ|ディレクトリ)[\s　]*(?:の中|内|配下|の下)?[\s　]*(?:に|へ)"
-    r"|[\w.-]+[\\/][\s　]*(?:の中|内|配下|の下)?[\s　]*(?:に|へ)"
+    r"[\w.-]+[\\/]?[\s　]*(?:フォルダ|ディレクトリ)[\s　]*(?:の中|内|配下|の下)?[\s　]*"
+    r"(?:" + _NON_DESTINATION_NI + r"|へ)"
+    r"|[\w.-]+[\\/][\s　]*(?:の中|内|配下|の下)?[\s　]*(?:" + _NON_DESTINATION_NI + r"|へ)"
     r"|(?:^|[\s(\[])(?:in|into|under)\s+(?:the\s+)?[\w.-]+[\\/]?\s+(?:folder|directory)\b",
     re.IGNORECASE,
 )
@@ -435,6 +456,101 @@ def _filename_target_is_destination(probe: str) -> bool:
     return False
 
 
+def filename_is_topic_only(probe: str) -> bool:
+    """裸のファイル名 (相対パス) が話題・根拠の格にだけ立ち、宛先の証拠が無いか (純粋関数)。
+
+    「util_fixed.py に対するテストを書いて」は真、「util_fixed.py にテストを書いて」
+    「util_fixed.py に対するテストを書いて保存して」(保存の動詞) は偽。宛先の証拠は
+    :func:`_filename_target_is_destination`、格は ``is_topic_case`` (#14 (a))。
+    ツール判定の規則層が、ルータと同じ規則で ``write_file`` の宛先を決めるために読む。
+    """
+    if _filename_target_is_destination(probe):
+        return False
+    for m in (*_BARE_FILENAME_TARGET_RE.finditer(probe),
+              *_RELATIVE_PATH_TARGET_RE.finditer(probe)):
+        if is_topic_case(probe[m.end():].lstrip(")）」』】]\"'")):
+            return True
+    return False
+
+
+#: 明示パスの範囲の切れ目 (空白・改行・句読点・引用符)。空白を含むパス
+#: (``E:\\My Docs\\a.md``) は範囲が取れず、従来どおり宛先の証拠に倒す。
+_EXPLICIT_PATH_BREAK_RE = re.compile(r"[\s　。、\"'「」『』]")
+
+
+def explicit_path_is_topic_only(probe: str) -> bool:
+    """明示パス (ドライブ / Unix / ``./``) が **すべて** 話題・根拠の格に立つファイルか (純粋関数)。
+
+    「E:\\x\\util.py に対するテストを書いて」は真、「E:\\x\\util.py にテストを追記して」
+    「…に対するテストを書いて保存して」(保存の動詞) は偽。:func:`filename_is_topic_only` /
+    :func:`_referential_destination` と同じ規則 (格は ``is_topic_case``、#14 (a))。
+    ファイル名 (拡張子) で終わらない明示パス (フォルダ) や範囲が取れないパスは偽 —
+    明示パスはそれだけで宛先の証拠という従来の扱いに倒す。
+    """
+    if has_save_verb(probe):
+        return False
+    starts = [m.start() for m in _LOCAL_PATH_RE.finditer(probe)]
+    starts += [m.start() for m in _EXPLICIT_RELATIVE_PATH_RE.finditer(probe)]
+    if not starts:
+        return False
+    for start in starts:
+        # Unix / 相対パスの一致は直前の空白から始まる
+        start += len(probe[start:]) - len(probe[start:].lstrip())
+        # このパスの範囲 (次の切れ目まで) の中でだけ拡張子の終わりを探す
+        brk = _EXPLICIT_PATH_BREAK_RE.search(probe, start)
+        end = _FILE_NAME_END_RE.search(probe, start, brk.start() if brk else len(probe))
+        if end is None:
+            return False
+        if not is_topic_case(probe[end.end():].lstrip(")）」』】]\"'")):
+            return False
+    return True
+
+
+def file_name_cases(probe: str) -> list[tuple[str, bool]]:
+    """本文のファイル名 (明示パス・裸名) と、その直後が話題・根拠の格かの組 (出現順、純粋関数)。
+
+    規則層が書込み先を選ぶとき、題材 (「E:\\x\\util.py **に対する**テスト」) のパスを
+    宛先に取らないために読む (docs/f_03 §1.4)。
+    """
+    cases: list[tuple[str, bool]] = []
+    for m in _FILE_NAME_END_RE.finditer(probe):
+        token = probe[_file_token_start(probe, m.start()):m.end()]
+        cases.append((token, is_topic_case(probe[m.end():].lstrip(")）」』】]\"'"))))
+    return cases
+
+
+def _referential_destination(probe: str, *, verb_text: str | None = None) -> bool:
+    """参照表現 (「同じファイルに」「このファイルを」) のどれかが宛先の証拠になるか。
+
+    直後が話題・根拠の格 (「このファイル**に対する**テスト」「同じファイル**について**」)
+    の参照表現は、何について書くかの題材で宛先ではない (2026-10-05 ライブ監査 T4:
+    テストの本文で題材の util_fixed.py を上書きした)。格の語は ``recent_file_reference``
+    と同じ 1 本 (``file_reference_gate.is_topic_case``、docs/f_03 §1.4)。
+
+    話題の格でも依頼に保存の動詞があれば宛先の証拠 (「このファイルに対して型ヒントを
+    付けて保存して」、2026-10-05 独立レビュー M2)。上書きしてよいかは書込みゲートが
+    書く中身で確かめる (f_03 §4.y)。保存の動詞は **参照表現を除いた** 本文で見る —
+    説明節「保存したファイル」の「保存」は対象の説明で、依頼された動作ではない
+    (2026-10-06 独立レビュー HIGH-1)。``verb_text`` は動詞を見る本文 (既定は ``probe``)。
+    規則層は参照表現を発話から取り、動詞はルータと同じ依頼節 (``write_intent_probe``) で見る。
+    """
+    matches = list(_REFERENTIAL_WRITE_TARGET_RE.finditer(probe))
+    if not matches:
+        return False
+    if any(not is_topic_case(probe[m.end():]) for m in matches):
+        return True
+    text = probe if verb_text is None else verb_text
+    return has_save_verb(_REFERENTIAL_WRITE_TARGET_RE.sub(" ", text))
+
+
+def has_save_verb(text: str) -> bool:
+    """**ディスクへの永続化** を明示する動詞があるか (``_SAVE_VERB_RE``、純粋関数)。
+
+    書込みゲートの判定点 ``overwrite_target`` も同じ 1 本を読む (#14 (a))。
+    """
+    return bool(_SAVE_VERB_RE.search(text or ""))
+
+
 def write_destination_evidence(probe: str) -> bool:
     """正規化済みの依頼文が **書込み先** を示しているか (SSOT、純粋関数)。
 
@@ -453,15 +569,85 @@ def write_destination_evidence(probe: str) -> bool:
     """
     if write_prohibited(probe):
         return False
-    if _LOCAL_PATH_RE.search(probe) or _EXPLICIT_RELATIVE_PATH_RE.search(probe):
+    if (
+        _LOCAL_PATH_RE.search(probe) or _EXPLICIT_RELATIVE_PATH_RE.search(probe)
+    ) and not explicit_path_is_topic_only(probe):
         return True
-    if _REFERENTIAL_WRITE_TARGET_RE.search(probe):
+    if _referential_destination(probe):
         return True
     # 置き場のフォルダだけを名指す形 (「sales_db/ フォルダに SQL を作って」)。ファイル名が
     # 別の文にしか無くても、フォルダを名指した時点でディスク上の宛先がある (2026-09-25 ベンチ q1)
     if _FOLDER_DESTINATION_RE.search(probe):
         return True
     return _filename_target_is_destination(probe)
+
+
+#: ファイル名の末尾 (拡張子)。その直後に宛先の格標識が続くかを見る位置を取る。明示パス
+#: (``E:\\…\\sales.csv``) の末尾要素も裸名・相対パスも、括弧・空白・全角括弧を含む名前
+#: (「report (v2).md」「報告（最終）.docx」) も拾う。拡張子は書込み先の集合
+#: (``_TARGET_FILE_EXTS``) に、事例にある odp / odt を足したもの。
+_FILE_NAME_END_RE = re.compile(
+    r"\.(?:" + _TARGET_FILE_EXTS + r"|odp|odt)(?![A-Za-z0-9])", re.IGNORECASE,
+)
+#: ファイル名のトークンの先頭 (空白・引用符・括弧の直後) を後ろから探す。
+_FILE_TOKEN_TAIL_RE = re.compile(r"[^\s　\"'「」『』（）()]*$")
+#: ドライブ付きパスの先頭。空白を含むパス (``E:\\My Docs\\notes.md``) の先頭まで戻るのに使う。
+_DRIVE_PATH_START_RE = re.compile(r"(?<![A-Za-z])[A-Za-z]:[\\/]")
+#: ドライブ付きパスの中に現れない区切り (改行・句読点・引用符)。
+_PATH_BREAK_RE = re.compile(r"[\n。、\"'「」『』]")
+#: ファイル名の直後の「の末尾に / の先頭に」(ファイルの中の位置を宛先にする形)。
+_POSITION_IN_FILE_RE = re.compile(
+    r"^[)）」』】\]\"'\s　]*の[\s　]*(?:末尾|先頭|最後|冒頭)[\s　]*(?:に|へ)",
+)
+
+
+def _file_token_start(probe: str, end: int) -> int:
+    """``end`` で終わるファイル名の先頭の位置 (ドライブ付きパスならその先頭まで戻る)。"""
+    head = probe[:end]
+    drive = None
+    for drive in _DRIVE_PATH_START_RE.finditer(head):
+        pass
+    if drive is not None and not _PATH_BREAK_RE.search(head[drive.start():]):
+        return drive.start()
+    token = _FILE_TOKEN_TAIL_RE.search(head)
+    return token.start() if token else end
+
+
+def _names_destination_slot(probe: str) -> bool:
+    """ファイル / フォルダが **宛先の格** に置かれているか (純粋関数、構造だけを見る)。
+
+    事例ゲート (``local_write_intent``) に聞くのは書込み動詞が無いターンなので、宛先の
+    証拠は格で取るしかない。``write_destination_evidence`` は明示パスを **それだけで**
+    宛先の証拠にする (書込み動詞と組で使う前提) ため、「E:\\…\\sales.csv を読んで、
+    月ごとの合計を出して」「E:\\…\\notes.txt を要約して」のように **パスが目的語 (を)** の
+    読取・処理の依頼まで事例ゲートへ届いていた。事例は全件が「<ファイル> に …」の形で、
+    陰性は問い・相談だけなので、命令形の読取依頼はモダリティの近さで ``write`` に
+    投票された (2026-10-05 ライブ監査、c_17 §3.5)。
+
+    宛先と認めるのは、ファイル名の直後の ``に`` / ``へ`` (閉じ括弧を挟んでよい。話題・所在・
+    出典の複合の格助詞「について / にある / によると …」は除く)、「の末尾に / の先頭に」、
+    直前の英語の ``to`` / ``into`` …、置き場のフォルダの名指し、参照表現 (「同じファイルに」)。
+    語彙 (動詞) は見ない。
+    """
+    if _REFERENTIAL_WRITE_TARGET_RE.search(probe) or _FOLDER_DESTINATION_RE.search(probe):
+        return True
+    for m in _FILE_NAME_END_RE.finditer(probe):
+        rest = probe[m.end():]
+        if _DESTINATION_PARTICLE_RE.match(rest) or _POSITION_IN_FILE_RE.match(rest):
+            return True
+        start = _file_token_start(probe, m.start())
+        if _DESTINATION_PREPOSITION_RE.search(probe[max(0, start - 16):start]):
+            return True
+    return False
+
+
+def _hint_destination_evidence(probe: str) -> bool:
+    """事例ゲートに聞くターンの宛先の証拠 (``write_destination_evidence`` かつ格の宛先)。
+
+    ``needs_write_intent_hint`` (ゲートに聞くか) とルータのヒントの分岐 (ゲートの
+    ``write`` を採るか) が **同じ 1 本** を見る。
+    """
+    return write_destination_evidence(probe) and _names_destination_slot(probe)
 
 
 def needs_write_intent_hint(query: str, mode: str = "chat") -> bool:
@@ -471,6 +657,8 @@ def needs_write_intent_hint(query: str, mode: str = "chat") -> bool:
     つまり規則が黙って ``deliberative`` へ落ちる形だけ。ここが偽のターンでは
     埋め込みを 1 度も引かないので、ファイル名を含まない通常の会話に
     レイテンシは足されない (c_17 §6 #1 / write_intent_gate の docstring)。
+    宛先は **格で** 立っていること (:func:`_names_destination_slot`) — パスが
+    目的語の読取・処理の依頼は事例の分布の外で、ゲートに聞かない (c_17 §3.5)。
 
     ``_is_local_write_intent`` の前段 (chat モード / URL 無し / how-to 除外 /
     宛先の証拠) と **同じ条件を同じ順で** 見る。片方だけ直すと、ゲートに
@@ -485,7 +673,7 @@ def needs_write_intent_hint(query: str, mode: str = "chat") -> bool:
     probe = write_intent_probe(query)
     if _WRITE_VERB_RE.search(probe) or assigns_file_content(probe):
         return False  # 規則が既に答えを出している
-    return write_destination_evidence(probe)
+    return _hint_destination_evidence(probe)
 
 
 # 学習済み long_form パターン単独発火の抑止床。閾値以上の一致が 1 語のみの
@@ -1207,9 +1395,13 @@ _CLASSIFY_RULES: tuple[_ClassifyRule, ...] = (
         "executable_query", "deliberative",
         lambda c, x: c._contains_executable_query_keywords(x.query),
     ),
+    # 特定の日の会話 (「昨日話したこと」「10月3日の会話」) もツール判定と同じ
+    # 判定で受ける (実機 2026-10-03:「2026年10月3日の会話を探して」が short_query →
+    # reactive に落ち、検索せず「土曜日です」と答えた)。
     _ClassifyRule(
         "history_ref", "deliberative",
-        lambda c, x: c._has_history_keywords(x.query),
+        lambda c, x: c._has_history_keywords(x.query)
+        or asks_about_day_scoped_conversation(x.query),
     ),
     # 進行中の会話への自己参照 (「この会話の計算結果を表にして」) も履歴参照と
     # 同じく窓から答える。``tool_patterns`` (計算 / ツール) に落ちると
@@ -1638,6 +1830,8 @@ class ComplexityClassifier:
             # ヒントが無い / 棄権のときは従来どおり書込みではないと判定する。
             if self._write_intent_hint is not True:
                 return False
+            # ゲートに聞くターンと同じ宛先の証拠 (格の宛先) を要る (c_17 §3.5)
+            return _hint_destination_evidence(probe)
         # 宛先の証拠は ``indicates_write_destination`` (= output_target) と
         # **同じ 1 本** を使う。片方だけが書込みと判断すると、層は書込み
         # プランを組むのに output_target は chat、あるいはその逆になる。

@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -60,7 +61,37 @@ _CORRECTION_VERDICT_FIELDS: tuple[str, ...] = (
     "correction_correct_value", "curation_failures",
 )
 
+#: スケジューラが待たせ続けた末 / 前倒し要求で走らせた Full か (:func:`forced_full_scope`)。
+_FORCED_FULL: ContextVar[bool] = ContextVar("evoref_forced_full", default=False)
+#: 強制実行の Full で、チャットに打ち切らせない補助タスクの回数 (1 サイクルあたり)。
+#: 前倒しは訂正らしい発話のたびに立つので Full の強制実行は珍しくない — 回数で
+#: チャットと重なる量を抑える。Step 8.0 (訂正の検証) は最古から 2 件、Step 8.3
+#: (属性の分割、趣味の追加・削除のような「私は〜」の言い直し) は 1 件。
+_FORCED_VERIFY_MAX = 2
+_FORCED_SPLIT_MAX = 1
+#: Step 8.35 (集合値の属性の編集) も 1 件。
+_FORCED_SLOT_EDIT_MAX = 1
+
 logger = get_logger("memory.sleep_update")
+
+
+@contextmanager
+def forced_full_scope(forced: bool) -> Iterator[None]:
+    """この区間の ``run_full`` を「強制実行の Full」として走らせる (scheduler が張る)。
+
+    強制実行の Full では、Step 8.0 (訂正の検証、最古から ``_FORCED_VERIFY_MAX`` 件) と
+    Step 8.3 (属性の分割、``_FORCED_SPLIT_MAX`` 件) がチャットに譲らない — 静穏窓を
+    待たず、アイドル窓で出した補助タスクを打ち切らせない
+    (:meth:`SleepTimeWorker._bounded_step_scope`)。連続利用ではターンの間隔が
+    背景の 1 生成より短く、譲り続けると訂正の検証と属性の分割が永久に終わらない
+    (2026-10-05 実機)。``run_full`` の引数にしないのは、差し替えのワーカー
+    (テストの偽物) の面を変えないため。
+    """
+    token = _FORCED_FULL.set(bool(forced))
+    try:
+        yield
+    finally:
+        _FORCED_FULL.reset(token)
 
 _T = TypeVar("_T")
 
@@ -860,7 +891,13 @@ class SleepTimeWorker:
             )
         async with self._cycle_lock:
             self._cancelled = False
-            return await self._run_full_locked(llm_client)
+            self._bounded_preempted = 0
+            result = await self._run_full_locked(llm_client)
+        if isinstance(result, dict):
+            # Step 8.0 / 8.3 の補助タスクがチャットに打ち切られた数 (c_07 §7.1)。
+            # 強制実行の Full でも増え続けるなら、短い段が譲り続けて進んでいない。
+            result["bounded_aux_preempted"] = self._bounded_preempted
+        return result
 
     async def _run_full_locked(self, llm_client=None) -> dict:
         """Full 版: LLM あり、Steps 1-10 (サイクルロック保持中に呼ぶこと)。
@@ -1004,6 +1041,20 @@ class SleepTimeWorker:
             llm_client,
         )
         step_durations["step8_3_personal_fact_split"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
+        # Step 8.35: 集合値の属性の要素を足し引きする発話 (「趣味に写真を加えて、
+        # キャンプは外してください」) は依頼形で Step 8 / 8.3 に掛からない。
+        # 補助タスクで編集後の要素集合を出させ、逐語 span と網羅の門を通ったら
+        # 編集後の値を書く (2026-10-05 実機)。Step 8 / 8.3 の後に置くのは、
+        # 同じサイクルで抽出した編集前の値を宛先として読むため。
+        ts = time.monotonic()
+        edits = await self._step8_35_apply_slot_edits(llm_client)
+        result["slot_edits_applied"] = edits["applied"]
+        result["slot_edits_judged"] = edits["judged"]
+        result["slot_edits_rejected"] = edits["rejected"]
+        step_durations["step8_35_slot_edit"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
 
@@ -1519,6 +1570,10 @@ class SleepTimeWorker:
         続くと静穏窓は会話が止まるまで来ず、その間の別セッションが訂正前の値を
         答えた (2026-10-02 監査 #6)。検証は ``background_slot`` の文法制約 JSON で、
         チャットの要求が届けば打ち切られる (``correction_verify`` は preemptible)。
+        **強制実行の Full** (:func:`forced_full_scope`) は静穏窓を待たず、最古から
+        ``_FORCED_VERIFY_MAX`` 件をアイドル窓で出して打ち切らせない — 連投では毎回
+        同じ最古の候補が打ち切られ、検証が永久に終わらなかった (2026-10-05 実機)。
+        それでも打ち切られた候補 (アイドル窓で出せなかった) は飛ばして次へ進む。
 
         刻んだ結果は作業領域ごと先に事象へ落とす (:meth:`_persist_correction_verdicts`)。
 
@@ -1550,11 +1605,23 @@ class SleepTimeWorker:
             return counts
         quiet = quiet_seconds(self.config)
         limit = self._cycle_count(_MAX_PER_CYCLE)
+        forced = _FORCED_FULL.get()
 
         def should_pause() -> bool:
             return self._chat_recent(quiet)
 
-        if self._chat_recent(quiet):
+        if forced:
+            # 強制実行の Full は静穏窓を待たず、最古から _FORCED_VERIFY_MAX 件だけ
+            # 打ち切らせずに検証する (:meth:`_bounded_step_scope`)。
+            should_pause = None  # type: ignore[assignment]
+            limit = min(limit, _FORCED_VERIFY_MAX)
+            if self._chat_recent(quiet):
+                logger.info(
+                    "Step 8.0: forced full; verifying %d correction candidate(s) "
+                    "without waiting for a quiet window", min(limit, len(waiting)),
+                )
+            counts["corrections_deferred"] = max(0, len(waiting) - limit)
+        elif self._chat_recent(quiet):
             if not self._verification_overdue(waiting, quiet):
                 logger.info(
                     "Step 8.0: %d correction candidate(s) wait for a quiet window",
@@ -1570,10 +1637,11 @@ class SleepTimeWorker:
                 "candidate(s) between turns", min(limit, len(waiting)), len(waiting),
             )
         stats: dict[str, int] = {}
-        counts["corrections_verified"] = await curate_corrections(
-            notes, aux_client=llm_client, should_pause=should_pause,
-            max_per_cycle=limit, stats=stats,
-        )
+        with self._bounded_step_scope(_FORCED_VERIFY_MAX):
+            counts["corrections_verified"] = await curate_corrections(
+                notes, aux_client=llm_client, should_pause=should_pause,
+                max_per_cycle=limit, stats=stats, continue_on_preempt=forced,
+            )
         self._persist_correction_verdicts(waiting)
         counts["corrections_preempted"] = stats.get("preempted", 0)
         counts["corrections_failed"] = stats.get("failed", 0)
@@ -1582,6 +1650,42 @@ class SleepTimeWorker:
             len(waiting) - counts["corrections_deferred"] - counts["corrections_preempted"],
         )
         return counts
+
+    @contextmanager
+    def _bounded_step_scope(self, max_calls: int) -> Iterator[None]:
+        """短い段 (Step 8.0 / 8.3) の区間。打ち切りを数え、強制実行の Full なら譲らない。
+
+        強制実行の Full では、区間内の補助タスクの先頭 ``max_calls`` 回を、
+        アイドル窓で出せたものに限り打ち切らせない (generation_gate.run_to_completion)。
+        要約 (Step 8-9) や疑似クエリのように 1 サイクルが長い段は包まない — 包むと
+        その間ずっとチャットと GPU を分け合う。通常の Full では打ち切りを数えるだけ。
+        区間内でチャットに打ち切られた数は結果辞書の ``bounded_aux_preempted`` へ。
+        """
+        from backend.aux_telemetry import current_aux_failures
+
+        before = len(current_aux_failures())
+        try:
+            if not _FORCED_FULL.get():
+                yield
+            else:
+                from backend.free.llm.generation_gate import run_to_completion
+
+                with run_to_completion(max_calls):
+                    yield
+        finally:
+            preempted = sum(
+                1 for e in current_aux_failures()[before:]
+                if e.get("reason") == "preempted_by_chat"
+            )
+            self._bounded_preempted = getattr(self, "_bounded_preempted", 0) + preempted
+
+    def _bounded_step_pause(self) -> "Callable[[], bool] | None":
+        """Step 8.3 の協調 yield。強制実行の Full では打ち切らせない回数が残る間は譲らない。"""
+        if not _FORCED_FULL.get():
+            return self._chat_in_flight
+        from backend.free.llm.generation_gate import preemption_suspended
+
+        return lambda: not preemption_suspended() and self._chat_in_flight()
 
     def _verification_overdue(self, waiting: list, quiet: float) -> bool:
         """生成中でなく、最も古い候補が静穏窓の ``_SHORT_WINDOW_AGE_FACTOR`` 倍より前か。"""
@@ -1741,15 +1845,40 @@ class SleepTimeWorker:
         )
 
         notes = self._curatable_notes()
-        return await curate_personal_facts(
-            notes,
-            store_provider=self._semantic_store_provider,
-            aux_client=llm_client,
-            embedder=self.embedder,
-            profile_id=self._profile_id,
-            should_pause=self._chat_in_flight,
-            max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
+        with self._bounded_step_scope(_FORCED_SPLIT_MAX):
+            return await curate_personal_facts(
+                notes,
+                store_provider=self._semantic_store_provider,
+                aux_client=llm_client,
+                embedder=self.embedder,
+                profile_id=self._profile_id,
+                should_pause=self._bounded_step_pause(),
+                max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
+            )
+
+    async def _step8_35_apply_slot_edits(self, llm_client=None) -> dict[str, int]:
+        """Step 8.35: 集合値の属性の要素の追加 / 削除を編集後の値として書く。
+
+        実ロジックは :mod:`backend.free.memory.sleep.slot_edit_curator`。
+        本メソッドは state を詰め替える薄いラッパ。Step 8.0 / 8.3 と同じく、強制
+        実行の Full では先頭 ``_FORCED_SLOT_EDIT_MAX`` 件をチャットに譲らない
+        (連続利用で永久に打ち切られないため)。
+        """
+        from backend.free.memory.sleep.slot_edit_curator import (
+            _MAX_PER_CYCLE,
+            curate_slot_edits,
         )
+
+        with self._bounded_step_scope(_FORCED_SLOT_EDIT_MAX):
+            return await curate_slot_edits(
+                self._curatable_notes(),
+                store_provider=self._semantic_store_provider,
+                aux_client=llm_client,
+                embedder=self.embedder,
+                profile_id=self._profile_id,
+                should_pause=self._bounded_step_pause(),
+                max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
+            )
 
     # ── Step 8.4 (assertion curator) ───────────────────
 

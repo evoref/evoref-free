@@ -315,6 +315,7 @@ class CartridgeManager:
         rescore_candidates: int = 0,  # noqa: ARG002 — 呼出面の互換のため受ける
         *,
         query_text: str = "",
+        pq_seeds: list[str] | None = None,
     ) -> list[tuple[str, float, float, str]]:
         """ロード済みパッケージ横断検索 (素の cosine と順位式スコアを分けて返す)。
 
@@ -337,12 +338,15 @@ class CartridgeManager:
                 空ならベクトル候補だけ。チャット経路は長らく空で呼んでいて、
                 固有語の問い (「Step 5.9」) が本体 cosine だけでは上位に来なかった
                 (2026-09-12 (b): golden で recall@5 0.550 → 0.640)。
+            pq_seeds: :meth:`CorpusStore.search` へそのまま渡す (疑似クエリの
+                lazy 生成対象の種を消費側が積むための受け皿)。
         """
         loaded = self._corpus.loaded_ids
         if not loaded:
             return []
         hits = self._corpus.search(
             query_text or "", query_vec, top_k=top_k * len(loaded), per_package_k=top_k,
+            pq_seeds=pq_seeds,
         )
         return [
             (
@@ -391,6 +395,10 @@ class CartridgeManager:
     ) -> tuple[str, str] | None:
         """直前チャンク (同文書・同大節) の末尾 (f_01 §8.1 の 7.65)。"""
         return self._corpus.previous_chunk_context(chunk_id, tail_chars)
+
+    def chunk_attrs(self, chunk_id: str) -> dict | None:
+        """corpus チャンクの ``attrs`` (内容精査ゲートが表の印を読む、f_01 §3.1.5)。"""
+        return self._corpus.chunk_attrs(chunk_id)
 
     def outdated_package_ids(self) -> list[str]:
         """chunker 版が古いパッケージ id (f_01 §3.3 の 6)。"""

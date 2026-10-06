@@ -286,6 +286,35 @@ def iter_drive_dir_paths(query: str) -> list[DrivePath]:
         found.append(DrivePath(m.start(), m.end(), path, ambiguous))
     return sorted(found)
 
+
+def drive_path_spans(query: str) -> list[tuple[int, int]]:
+    """依頼文のドライブ付きパスが占める区間 (:func:`iter_drive_dir_paths` の出現順)。
+
+    括り無しの一致の ``end`` は境界で切る前の終わり (後ろの英文を含む) なので、
+    パスが文字どおり始まる一致は切った後のパスの長さで閉じる (括りは ``end`` のまま)。
+    """
+    text = query or ""
+    spans: list[tuple[int, int]] = []
+    for p in iter_drive_dir_paths(text):
+        literal = text[p.start:p.start + len(p.path)]
+        if literal.replace("/", "\\") == p.path.replace("/", "\\"):
+            spans.append((p.start, p.start + len(p.path)))
+        else:
+            spans.append((p.start, p.end))
+    return spans
+
+
+def without_drive_paths(query: str, replacement: str = "") -> str:
+    """依頼文からドライブ付きパスを除いた本文 (各パスを ``replacement`` に置き換える)。
+
+    パスの綴りは場所であって依頼の語ではない — ``live_check_…`` の ``check`` を
+    読みの動詞に数えない (f_03 §3.1)。
+    """
+    text = query or ""
+    for start, end in reversed(drive_path_spans(text)):
+        text = text[:start] + replacement + text[end:]
+    return text
+
 #: 括られた文字列 / 空白を含みうるドライブパス (Pattern 1b) がファイル名と言えるための拡張子 (末尾)。
 _QUOTED_FILENAME_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,10}$")
 
@@ -576,7 +605,19 @@ def extract_write_target_path(text: str) -> str:
     3. どちらも無ければ従来どおり ``_extract_file_path`` (先頭一致)
 
     3 を残すのは、マーカーが無い普通の依頼 (「E:\\tmp\\a.txt に書いて」) で
-    挙動を変えないため。
+    挙動を変えないため。1 と 2 は :func:`extract_marked_write_target` が SSOT。
+    """
+    return extract_marked_write_target(text) or _extract_file_path(text or "")
+
+
+def extract_marked_write_target(text: str) -> str:
+    """宛先の標識が導くファイルパスを返す (無ければ空文字列。純粋関数)。
+
+    :func:`extract_write_target_path` の 1 と 2 の段だけ — 英語の後置マーカー
+    (``to`` / ``into`` / ``onto``) の **後ろ**、日本語の前置マーカー (``に追記`` /
+    ``の末尾に書き`` / ``へ保存`` …) の **手前**。標識の無い先頭一致 (3 の段) は
+    含めない。タスク文が書込み先を名指しているかの構造の証拠に使う
+    (``agent.task_write_gate``、docs/f_03 §4.3)。
     """
     body = text or ""
     if not body:
@@ -593,7 +634,7 @@ def extract_write_target_path(text: str) -> str:
         found = _extract_last_file_path(body[:m.start()])
         if found:
             return found
-    return _extract_file_path(body)
+    return ""
 
 
 # --- 算術式抽出 (calculate ツールの決定論的ルーティング) ---------------------

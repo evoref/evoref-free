@@ -85,14 +85,21 @@
 	let renderSource = $state(untrack(() => content) ?? '');
 	let pendingFrame = 0;
 
-	const schedule =
-		typeof requestAnimationFrame === 'function'
-			? requestAnimationFrame
-			: (cb: FrameRequestCallback) => setTimeout(() => cb(0), 16) as unknown as number;
-	const unschedule =
-		typeof cancelAnimationFrame === 'function'
-			? cancelAnimationFrame
-			: (id: number) => clearTimeout(id);
+	// 背面のタブでは requestAnimationFrame が止まるため、生成中に背面へ回すと
+	// 応答の末尾が描かれないまま残る (2026-10-05 ライブ再監査: 箇条書きの手前で
+	// 本文が途切れて見えた)。背面のあいだはタイマーで合流させる。
+	let pendingIsTimer = false;
+	function schedule(cb: () => void): number {
+		const hidden = typeof document !== 'undefined' && document.hidden;
+		pendingIsTimer = hidden || typeof requestAnimationFrame !== 'function';
+		return pendingIsTimer
+			? (setTimeout(cb, 16) as unknown as number)
+			: requestAnimationFrame(() => cb());
+	}
+	function unschedule(id: number): void {
+		if (pendingIsTimer) clearTimeout(id);
+		else cancelAnimationFrame(id);
+	}
 
 	$effect(() => {
 		const next = content ?? '';

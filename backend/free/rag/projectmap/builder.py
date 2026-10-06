@@ -65,8 +65,10 @@ logger = get_logger("rag.projectmap.builder")
 #: 食い違えば ``update()`` が old_fingerprints を空とみなして強制的に全再抽出
 #: する (2 → HTML/CSS/SCSS/Svelte/Vue の追加、3 → $lib / tsconfig・jsconfig
 #: paths のエイリアス解決の追加、4 → svelte.config.js/.ts の kit.alias
-#: (文字列リテラルのみ、tree-sitter で静的に読む) の追加、c_16 §4.4)。
-EXTRACTOR_VERSION = 4
+#: (文字列リテラルのみ、tree-sitter で静的に読む) の追加、5 → calls の候補を
+#: 言語ファミリ・入れ子・import 先で絞り、``from pkg import sub`` の辺と SFC の
+#: 定義外の呼出の component への帰属を追加、c_16 §4.4)。
+EXTRACTOR_VERSION = 5
 
 #: 対応する ``update_kind`` (c_16 §4.4)。
 UPDATE_INITIAL = "initial"
