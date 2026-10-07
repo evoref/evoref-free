@@ -88,6 +88,7 @@
     "prompt_manager_not_initialized": "Prompt manager not initialized",
     "prompt_locale_unsupported": "Unsupported prompt locale: {locale}",
     "prompt_locale_learning_running": "Cannot switch locale while learning is running",
+    "prompt_edit_learning_running": "Cannot edit or roll back the prompt while learning is running. Try again after learning finishes",
     "config_capability_key_protected": "These settings cannot be changed through the API: {keys}. Edit config.yaml directly.",
     "config_unknown_runtime": "Unknown runtime: {name}",
     "runtime_path_invalid": {
@@ -588,6 +589,7 @@
     "repeated_no_match": "I searched, but found no matches.",
     "repeated_same_result": "The same call kept returning the same result, so the task was stopped.",
     "step_limit_reached": "The task was stopped because it reached the step limit.",
+    "tool_call_unparsed": "The task was stopped because the tool call could not be interpreted.",
     "retrieval_failed": {
       "unresolved_host": "Could not retrieve {target}: the host name could not be resolved (DNS error).",
       "unreachable": "Could not retrieve {target}: the host could not be reached or did not respond in time.",

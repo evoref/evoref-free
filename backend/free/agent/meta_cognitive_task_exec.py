@@ -32,7 +32,10 @@ from backend.free.agent.output_format import (
     resolve_dir_output_path,
 )
 from backend.free.agent.meta_cognitive_content import note_stream_truncation
-from backend.free.agent.meta_cognitive_content_gate import looks_like_tool_selector_json
+from backend.free.agent.meta_cognitive_content_gate import (
+    looks_like_tool_call_syntax,
+    looks_like_tool_selector_json,
+)
 from backend.free.agent.meta_cognitive_utils import (
     call_callback,
     content_language_directive,
@@ -1497,6 +1500,14 @@ class _TaskExecutionMixin:
                 )
                 if recovered is not None:
                     return recovered
+                if looks_like_tool_call_syntax(text):
+                    # 解析できなかったツール呼び出しの構文を結果 (利用者への答え) にしない
+                    logger.warning(
+                        "Unparsed tool-call syntax ended the loop; task failed: %s",
+                        task.description[:80],
+                    )
+                    task.failure_note = task.failure_note or msg("agent.tool_call_unparsed")
+                    return "Error: the tool call could not be parsed", tool_calls
                 return text, tool_calls
 
             loop_result = await self._execute_loop_tool_call(

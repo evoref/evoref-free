@@ -805,18 +805,48 @@ _CORRECTION_GENERATION_CACHE: "weakref.WeakKeyDictionary[Any, dict[str, tuple[in
 )
 
 
+def _final_winner(by_id: dict[str, Any], fact: Any) -> Any | None:
+    """``fact`` を畳んだ最終世代 (連鎖 A ← B ← C では A も B も C)。"""
+    winner = by_id.get(fact.superseded_by)
+    seen: set[str] = {fact.id}
+    while winner is not None and winner.superseded_by and winner.id not in seen:
+        seen.add(winner.id)
+        winner = by_id.get(winner.superseded_by)
+    return winner
+
+
 def _final_correction_winner(by_id: dict[str, Any], fact: Any) -> Any | None:
     """``fact`` を畳んだ最終世代を返す (訂正で畳まれたものだけ、それ以外は None)。
 
     連鎖 A ← B ← C では A も B も C に解決する。単なる値の再言明や要約への
     吸収 (``from_correction`` が立たない) は「訂正済み」ではない。
     """
-    winner = by_id.get(fact.superseded_by)
-    seen: set[str] = {fact.id}
-    while winner is not None and winner.superseded_by and winner.id not in seen:
-        seen.add(winner.id)
-        winner = by_id.get(winner.superseded_by)
+    winner = _final_winner(by_id, fact)
     if winner is None or not getattr(winner, "from_correction", False):
+        return None
+    return winner
+
+
+def _final_slot_edit_winner(by_id: dict[str, Any], fact: Any) -> Any | None:
+    """``fact`` を畳んだ最終世代が、sleep-time が検証して適用した集合値の編集なら返す。
+
+    「趣味に写真を加えて、キャンプは外してください。」の編集 (Step 8.35) は
+    ``from_correction`` を立てないので訂正の台帳に載らず、編集の発話が検索で当たら
+    ないターンは編集前の言明 (「趣味は釣りとキャンプです。」) だけが ``[参考情報]``
+    に素のまま載り、モデルが SemMem の現在値と混ぜた (2026-10-07 audit_replay:
+    「釣り、写真、そしてキャンプ」)。編集は門 (``check_slot_edit``) を通った値だけ
+    なので検証済みの更新として宛先台帳と後継台帳に載せる。訂正前の値 (以前は「…」)
+    には載せない — 編集で外した値を注入へ戻すことになる。
+    """
+    from backend.free.memory.sleep.slot_edit_curator import EXTRACTOR_NAME
+
+    winner = _final_winner(by_id, fact)
+    if winner is None or getattr(winner, "from_correction", False):
+        return None
+    if not any(
+        getattr(prov, "extractor", None) == EXTRACTOR_NAME
+        for prov in getattr(winner, "provenances", None) or ()
+    ):
         return None
     return winner
 
@@ -838,7 +868,13 @@ def _compute_correction_generations(store: Any) -> _CorrectionGenerations:
         and (winner := _final_correction_winner(by_id, fact)) is not None
     ]
     pairs += _span_only_fold_generations(by_id.values())
-    for fact, winner in pairs:
+    edits = [
+        (fact, winner) for fact in by_id.values()
+        if fact.superseded_by
+        and (winner := _final_slot_edit_winner(by_id, fact)) is not None
+    ]
+    edited = {id(fact) for fact, _winner in edits}
+    for fact, winner in pairs + edits:
         before_notes = [p.note_id for p in fact.provenances if p.note_id]
         before_notes += [str(n) for n in getattr(fact, "retired_note_ids", None) or ()]
         after_notes = tuple(
@@ -854,7 +890,7 @@ def _compute_correction_generations(store: Any) -> _CorrectionGenerations:
             for note_id in before_notes:
                 trail[note_id] = current
         old = str(getattr(fact, "object", "") or "").strip()
-        if not old or old == current:
+        if id(fact) in edited or not old or old == current:
             continue
         at = float(getattr(fact, "created_at", 0.0) or 0.0)
         prev = oldest.get(winner.id)
@@ -934,7 +970,8 @@ def _correction_trail_for_store(store: Any) -> dict[str, str]:
     SemMem の世代 (``superseded_by`` + ``from_correction``) はセッションに
     依存せず、``correction_verdict`` の門を通った検証済みの訂正だけが立てる
     (CLAUDE.md 不変則 #12)。既にある確かな証拠を注記へ流すだけで、新しい判定は
-    増やさない。
+    増やさない。sleep-time が検証して適用した集合値の編集
+    (:func:`_final_slot_edit_winner`) も同じ台帳に載せる。
 
     Returns:
         ``{被訂正ノート id: 現在値の言明テキスト}``。現在値へ辿れないものは

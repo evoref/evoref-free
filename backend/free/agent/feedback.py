@@ -47,6 +47,11 @@ from backend.free.core.response_arithmetic import (
     find_sign_contradiction,
     iter_ja_numbers,
 )
+from backend.free.core.response_verifiers import (
+    declared_count_mismatch,
+    false_tool_unavailability,
+    misstated_change_rate,
+)
 from backend.free.core.relative_date import (
     has_non_today_offset_anchor,
     resolves_today_anchored_span,
@@ -980,6 +985,7 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("arithmetic contradiction", "content.arithmetic", "content_contradiction"),
     ("conclusion contradiction", "content.conclusion", "content_contradiction"),
     ("sign contradiction", "content.sign", "content_contradiction"),
+    ("change rate contradiction", "content.arithmetic", "content_contradiction"),
     ("broken JA spacing", "content.broken_text", "output_broken"),
     ("Chinese token leaked", "content.broken_text", "output_broken"),
     ("response retracts", "content.self_retraction", "content_contradiction"),
@@ -990,6 +996,8 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("user echo", "content.user_echo", ""),
     ("fabricated count", "content.fabricated_count", "content_contradiction"),
     ("fabricated entity", "content.fabricated_entity", "content_contradiction"),
+    ("declared count mismatch", "content.declared_count", "content_contradiction"),
+    ("false tool unavailability", "content.tool_unavailable", "content_contradiction"),
 )
 
 
@@ -1921,7 +1929,36 @@ class FeedbackCollector:
                 unlabeled = f"{unlabeled}; tool result ignored: {ignored_unverified}"
             logger.info("Turn left unlabeled (%s)", unlabeled)
             return "unlabeled", unlabeled
+        # 既存の検証器がどれも印を付けなかったターンにだけ掛ける追加の検証器
+        # (2026-10-07)。既存の結果と優先順位は変えない。
+        extra = FeedbackCollector._find_additional_failure_reason(
+            text, mode=mode, tool_uses=tool_uses,
+        )
+        if extra is not None:
+            logger.info("Turn marked failed (%s)", extra)
+            return "failed", extra
         return "success", None
+
+    @staticmethod
+    def _find_additional_failure_reason(
+        text: str, *, mode: str = "chat", tool_uses: list[dict] | None = None,
+    ) -> str | None:
+        """既存の検証器で無印だったターンの決定論の破綻を返す (無ければ ``None``)。
+
+        判定器は ``core.response_verifiers`` の純関数で、どれも例外を外へ出さない。
+        """
+        rate = misstated_change_rate(text)
+        if rate is not None:
+            return f"change rate contradiction: {rate}"
+        # create の応答は計画の報告 (「2 件のタスクを…」) で、宣言と一覧の形が違う
+        if not is_create_mode(mode):
+            count = declared_count_mismatch(text)
+            if count is not None:
+                return f"declared count mismatch: {count}"
+        unavailable = false_tool_unavailability(text, tool_uses)
+        if unavailable is not None:
+            return f"false tool unavailability: {unavailable}"
+        return None
 
     @staticmethod
     def _unlabeled_reason(

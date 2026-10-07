@@ -686,7 +686,7 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
 _attribute_key = attribute_key
 
 
-def _correction_form_topics(text: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+def correction_form_topics(text: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     """平叙文の「X ではなく Y」を持つなら ``(対比の値, 話題語)``、無ければ None (純粋関数)。
 
     話題語は :func:`query_anchors` の内容語のうち対比の値と重ならないもの
@@ -1242,7 +1242,7 @@ class MemoryInjector:
         attr_exempt = 0
         anchors = query_anchors(query_text)
         anchor_exempt = 0
-        query_form = _correction_form_topics(query_text)
+        query_form = correction_form_topics(query_text)
         # **話題を持たない継続指示には記憶を注入しない。**
         #
         # 「表にしてください。」「もう一度お願いします。」のように内容語を
@@ -1600,7 +1600,7 @@ class MemoryInjector:
             # (年利 / 犬の年齢 / Python の版) が 7 件 cosine の棒を越えていた
             # (2026-09-27 再監査)。対比の値以外の話題語を共有するものだけ残す。
             if query_form is not None:
-                note_form = _correction_form_topics(getattr(note, "content", "") or "")
+                note_form = correction_form_topics(getattr(note, "content", "") or "")
                 if note_form is not None and not set(note_form[1]) & set(query_form[1]):
                     filtered_out += 1
                     continue
@@ -2275,7 +2275,7 @@ class MemoryInjector:
                 continue
             at = float(getattr(note, "created_at", 0.0) or 0.0)
             content = getattr(note, "content", "") or ""
-            form = _correction_form_topics(content)
+            form = correction_form_topics(content)
             if form is None:
                 continue
             values, topics = form

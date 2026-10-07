@@ -306,6 +306,18 @@ def _resolve_anchor(editable: list[tuple[int, str]], anchor: str) -> int | None:
     return best_index if best_ratio >= _ANCHOR_FUZZY_THRESHOLD else None
 
 
+def _anchor_line(current: str, anchor: str) -> str | None:
+    """アンカーが指す編集可能な行 (解決できなければ ``None``)。"""
+    _, editable = _editable_view(current)
+    index = _resolve_anchor(editable, anchor)
+    return None if index is None else current.split("\n")[index]
+
+
+def _as_bullet(text: str) -> str:
+    """台帳が箇条と読む ``- `` 形へ揃える (``*`` / ``1.`` は台帳では段落になる)。"""
+    return "- " + _BULLET_RE.sub("", text.strip()).strip()
+
+
 def _apply_prompt_edit(current: str, op: str, anchor: str, text: str) -> str | None:
     """1 行編集を適用する。適用できなければ ``None`` (呼出側で再試行)。"""
     _, editable = _editable_view(current)
@@ -331,10 +343,17 @@ def _apply_prompt_edit(current: str, op: str, anchor: str, text: str) -> str | N
             # 追加は必ず箇条として書く。段落 (intro) として入ると台帳で計数も
             # delete もされない行になり、進化が計数外で伸びる (実機 2026-09-03:
             # 段落アンカーへの insert_after が 5 件、全て intro 扱いだった)。
-            if not _BULLET_RE.match(new_text) and not _HEADING_RE.match(new_text):
-                new_text = "- " + new_text
+            if not _HEADING_RE.match(new_text):
+                new_text = _as_bullet(new_text)
             lines.insert(index + 1, new_text)
         case "replace":
+            if _BULLET_RE.match(lines[index]):
+                # 箇条の置換は「旧規則の削除 + 新規則の追加」(id が変わり計数が
+                # 0 に戻る)。新しい行も箇条として書く — 段落や見出しに化けると
+                # 計数も delete もできない台帳の外の行になる。
+                if _HEADING_RE.match(new_text):
+                    return None
+                new_text = _as_bullet(new_text)
             lines[index] = new_text
         case _:
             return None
@@ -675,7 +694,15 @@ class PromptEvolver:
             logger.warning("Prompt edit missing op/anchor/text; rejecting")
             return None
 
-        if op == "delete" and not self._delete_allowed(current, anchor):
+        # 箇条の replace は旧規則を消す (id が変わり計数が失われる) ので delete と
+        # 同じゲートと回あたり上限を通す。通らなければ変異ごと却下する。
+        # 見出し・段落の置換は計数を持つ規則を消さないので対象外。
+        anchor_line = _anchor_line(current, anchor)
+        removes_rule = op == "delete" or (
+            op == "replace" and anchor_line is not None
+            and bool(_BULLET_RE.match(anchor_line))
+        )
+        if removes_rule and not self._delete_allowed(anchor_line):
             return None
         mutated = _apply_prompt_edit(current, op, anchor, text)
         if mutated is None:
@@ -684,11 +711,18 @@ class PromptEvolver:
                 "or edit was a no-op", op, anchor,
             )
             return None
+        if removes_rule:
+            # 上限は成立した削除だけを数える (適用できなかった編集で枠を使わない)。
+            self._deletes_this_run += 1
         logger.info("Prompt edit applied: op=%s anchor=%.40r", op, anchor)
         return mutated
 
-    def _delete_allowed(self, current: str, anchor: str) -> bool:
-        """delete は台帳の証拠と回あたり上限の両方を通ったときだけ許す。"""
+    def _delete_allowed(self, line: str | None) -> bool:
+        """規則 ``line`` の削除 (delete / 箇条の replace) を許すか。
+
+        台帳の証拠と回あたり上限の両方を通ったときだけ許す。枠の消費は
+        呼出側が編集の成立後に行う。
+        """
         if self._deletes_this_run >= self.max_deletes_per_run:
             logger.info("Prompt edit rejected: delete budget for this run is spent")
             return False
@@ -696,11 +730,8 @@ class PromptEvolver:
         if gate is None:
             logger.info("Prompt edit rejected: delete has no evidence gate")
             return False
-        _, editable = _editable_view(current)
-        index = _resolve_anchor(editable, anchor)
-        if index is None:
+        if line is None:
             return False
-        line = current.split("\n")[index]
         try:
             allowed = bool(gate(line))
         except Exception as e:
@@ -709,7 +740,6 @@ class PromptEvolver:
         if not allowed:
             logger.info("Prompt edit rejected: ledger counts do not justify deleting %.40r", line)
             return False
-        self._deletes_this_run += 1
         return True
 
     async def _mutate_prompt(
@@ -793,7 +823,9 @@ class PromptEvolver:
         n_add = int(rng.integers(1, min(3, len(novel_additions)) + 1))
         selected = rng.choice(len(novel_additions), size=n_add, replace=False)
 
-        extra_rules = "\n".join(novel_additions[i] for i in selected)
+        # 追記も箇条として書く (平文だと台帳で段落になり、計数外のままタイトル
+        # 直下へ移る)。
+        extra_rules = "\n".join(_as_bullet(novel_additions[i]) for i in selected)
         return f"{current}\n\n{extra_rules}"
 
     def _crossover(self, parent1: str, parent2: str) -> str:

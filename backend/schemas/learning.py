@@ -198,7 +198,9 @@ class LearningConfig(BaseModel):
     cvector_pca_iter: int = Field(default=1000, ge=1)
     # 空 = arch の block_count から全層自動。"START END" / "START,END" 指定可。
     cvector_layer_range: str = ""
-    cvector_scale: float = Field(default=1.0)  # --control-vector-scaled FNAME:SCALE
+    # --control-vector-scaled FNAME:SCALE。実測 (2026-10-06、4B) で 1.0 は応答が反復で崩壊し、
+    # 0.3 から崩れ始めた。採用前の応答の健全性確認 (cvector/health.py) もこの値で行う。
+    cvector_scale: float = Field(default=0.2)
     # キュレーション種ペア JSON のパス (空 = 組込デフォルト軸)。HYBRID 対照例の種。
     cvector_seed_pairs_file: str = ""
     cvector_min_experiences: int = Field(default=40, ge=1)  # HYBRID 対照例の最小数

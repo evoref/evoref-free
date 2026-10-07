@@ -171,9 +171,13 @@ def try_parse_tool_dict(text: str) -> dict | None:
 
 # テンプレート由来のツールコール (OAI JSON でない生テキスト) 抽出。
 # gemma 系: <|tool_call>call:NAME(k: "v", k2: "v2")<tool_call|>
+# 引数を波括弧で囲む形 (call:NAME{k: 'v'}) も書く (2026-10-07 audit_replay R10:
+# 解析できず、構文のままタスクの結果として利用者に出た)。
 # マーカーの揺れ (<|tool_call|> / <tool_call> / </tool_call>) を寛容に許容する。
 _TEMPLATE_TOOL_CALL_RE = re.compile(
-    r"<\|?tool_call\|?>\s*call:\s*(?P<name>\w+)\s*\((?P<args>.*?)\)\s*</?\|?tool_call\|?>",
+    r"<\|?tool_call\|?>\s*call:\s*(?P<name>\w+)\s*"
+    r"(?:\((?P<args>.*?)\)|\{(?P<brace_args>.*?)\})"
+    r"\s*</?\|?tool_call\|?>",
     re.DOTALL,
 )
 # タグ内が JSON の Qwen 系: <tool_call>{...}</tool_call>
@@ -223,11 +227,14 @@ def parse_template_tool_call(text: str) -> dict | None:
         parsed = try_parse_tool_dict(m_json.group(1))
         if parsed is not None:
             return parsed
-    # gemma 系: call:NAME(args)
+    # gemma 系: call:NAME(args) / call:NAME{args}
     m = _TEMPLATE_TOOL_CALL_RE.search(text)
     if m is None:
         return None
-    return {"tool": m.group("name"), "args": _parse_template_args(m.group("args"))}
+    args = m.group("args")
+    if args is None:
+        args = m.group("brace_args")
+    return {"tool": m.group("name"), "args": _parse_template_args(args)}
 
 
 def iter_balanced_brace_substrings(text: str) -> Iterator[str]:

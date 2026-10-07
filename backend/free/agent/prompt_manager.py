@@ -638,9 +638,12 @@ class SystemPromptManager:
         """規則 1 行の削除を台帳の計数が正当化するか (f_04 §4.5.2)。
 
         条件: どこかの台帳に同じ箇条があり、その全てで protected でなく、
-        観測ターン数 (helpful + harmful) が ``min_turns`` 以上、かつ harmful が 0
-        (= 検証器が一度も違反を捕まえていない規則は、無くても質が落ちない見込み)。
-        台帳に無い行は消せない。
+        ``verifier`` を持ち、観測ターン数 (helpful + harmful) が ``min_turns``
+        以上、かつ harmful が 0 (= 検証器が一度も違反を捕まえていない規則は、
+        無くても質が落ちない見込み)。台帳に無い行は消せない。
+
+        検証器の無い規則は計数が付かない (``record_rule_outcome``) ので消せない。
+        旧計数 (全箇条に毎ターン +1) が残った台帳でも、それを証拠に数えない。
         """
         # 進化側の行は箇条書き記号付きで来る。台帳の text は記号なし。
         key = normalize_text(line.strip().lstrip("-*+ ").strip())
@@ -652,7 +655,7 @@ class SystemPromptManager:
                 if rule.kind != "bullet" or normalize_text(rule.text) != key:
                     continue
                 found = True
-                if rule.protected or rule.harmful > 0:
+                if rule.protected or not rule.verifier or rule.harmful > 0:
                     return False
                 if rule.helpful + rule.harmful < min_turns:
                     return False
@@ -796,6 +799,8 @@ class SystemPromptManager:
                         "rendering without the budget", mode, e,
                     )
                 body, dropped = render_markdown(ledger, hoist_shared=shared or None)
+            # 載らなかった規則はターンの計数から外す (record_rule_outcome)
+            ledger.unrendered = set(dropped)
             if dropped:
                 logger.warning(
                     "System prompt for mode=%s exceeds its budget; dropped %d "
@@ -1107,3 +1112,31 @@ class SystemPromptManager:
     def _save_meta(self, mode: str) -> None:
         """メタ情報を JSON ファイルに保存 (infra 層 `_prompt_store_helpers` に委譲)"""
         write_meta(self.prompt_dir, mode, self.metas[mode], spec=PROMPT_META_FORMAT)
+
+    def render_static_for(self, mode: str, content: str) -> str:
+        """``content`` をこのモードの本文として採用したときの静的 system (Level 1 の採用ゲート用)。
+
+        :meth:`update_evolved` と同じ正規化 (名前プレフィックス除去・段落の重複除去・
+        保護セクションの復元) を掛けて台帳へ分解し、:meth:`_render_static` と同じ
+        レンダ (前置き・共通箇条の寄せ・予算による削り込み・末尾の固定指示) を通す。
+        ``content`` が現行の本文なら :meth:`get_active_prompt_static` と同じ文面。
+        本文・台帳・凍結・ファイルは変えない。
+        """
+        if mode not in self.contents:
+            raise ValueError(f"Unknown mode: {mode}")
+        current = self.contents[mode]
+        if content == current:
+            return self._render_static(mode)
+        body = dedupe_paragraphs(_strip_name_prefix(content))
+        if not validate_protected_sections(current, body):
+            body = dedupe_paragraphs(restore_protected_sections(current, body))
+        ledger = parse_markdown(
+            body, mode=mode, locale=self._get_prompt_locale(mode),
+            existing=self.ledgers.get(mode),
+        )
+        # 自分の状態を書き換えずに同じレンダを通すため、辞書だけ差し替えた写しで描く
+        probe = copy.copy(self)
+        probe.contents = {**self.contents, mode: self._render_like(ledger, body)}
+        probe.ledgers = {**self.ledgers, mode: ledger}
+        probe._budget_warned = set(self._budget_warned)
+        return probe._render_static(mode)

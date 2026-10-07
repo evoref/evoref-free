@@ -891,7 +891,8 @@ _FRAME_LINE_LABEL_RE = re.compile(
 #: 行末に付く訂正済み注記 (``search_pipeline._SUPERSEDED_MARKS`` の ja / en)。
 #: ``[参考情報]`` 側だけに付くため、剥がさないと ``[関連する記憶]`` 側と一致しない。
 _FRAME_TRAILING_MARK_RE = re.compile(
-    r"(?:\s*(?:（後に訂正された古い値）|（訂正済み）|\(superseded by a later correction\)))+\s*$",
+    r"(?:\s*(?:（後に訂正された古い値）|（後に更新された古い値）|（訂正済み）"
+    r"|\(superseded by a later (?:correction|update)\)))+\s*$",
     re.IGNORECASE,
 )
 

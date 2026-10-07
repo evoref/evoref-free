@@ -10,6 +10,7 @@ from backend.free.api.model._prompt_helpers import (
     learning_running_error,
     manager_for_mode,
     prompt_detail_dict,
+    prompt_error,
     prompt_file_not_found_error,
     prompt_partition_dict,
     prompt_summary_dict,
@@ -35,6 +36,20 @@ class RollbackRequest(BaseModel):
 
 class PromptLocaleRequest(BaseModel):
     locale: str  # "ja" | "en"
+
+
+def _reject_edit_while_learning(state: AppState) -> None:
+    """Level 1 の実行中は本文の手編集 / rollback を 409 で拒否する。
+
+    進化の finalize (``update_evolved``) は編集前の本文から作った候補で
+    本文を上書きするので、実行中に入れた手編集は黙って失われる。
+    """
+    scheduler = state.learning_scheduler
+    if scheduler is not None and scheduler.running:
+        raise prompt_error(
+            409, "E0409", "Cannot edit or roll back the prompt while learning is running",
+            "api.prompt_edit_learning_running",
+        )
 
 
 # --- locale エンドポイント（/{mode} より前に定義して FastAPI のルート優先順位を確保） ---
@@ -136,6 +151,7 @@ async def update_prompt(mode: str, body: PromptUpdateRequest, state: AppState = 
     """プロンプト更新 (そのモードのターンが読むパーティションへ、f_04 §1.2.0)"""
     logger.debug("PUT /api/prompts/%s: content_len=%d", mode, len(body.content))
     mgr = manager_for_mode(require_prompt_manager(state), mode)
+    _reject_edit_while_learning(state)
 
     try:
         mgr.update_manual(mode, body.content)
@@ -178,6 +194,7 @@ async def rollback(mode: str, body: RollbackRequest, state: AppState = Depends(g
     """過去バージョンへのロールバック"""
     logger.debug("POST /api/prompts/%s/rollback: version=%d", mode, body.version)
     mgr = manager_for_mode(require_prompt_manager(state), mode)
+    _reject_edit_while_learning(state)
 
     try:
         mgr.rollback(mode, body.version)

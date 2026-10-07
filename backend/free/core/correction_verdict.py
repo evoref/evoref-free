@@ -205,16 +205,18 @@ def claims_equivalent(wrong_claim: str, correct_value: str) -> bool:
 def response_already_states(correct_value: str, prev_response: str) -> bool:
     """訂正が示す正しい値を、相手の応答が既に述べているか (純粋関数)。
 
-    数値だけの値 (「100 m」) は応答内の **数値集合** に含まれるかで見る —
-    「100 m」を「100」と書いた応答は同じ値を述べている。文字列の値は正規化
-    包含。空なら False。
+    数値を 1 つだけ持つ値 (「100 m」) は応答内の **数値集合** に含まれるかで
+    見る — 「100 m」を「100」と書いた応答は同じ値を述べている。数値を 2 つ
+    以上持つ値 (「1泊2日」) は数値の並びと単位が値そのものなので正規化包含で
+    見る (集合で見ると「2人」「1人往復」の {1, 2} が既述になる)。文字列の値は
+    正規化包含。空なら False。
     """
     c = norm_span(correct_value)
     r = norm_span(prev_response)
     if not c or not r:
         return False
     cn = claim_numbers(correct_value)
-    if cn:
+    if len(cn) == 1:
         rn = set(claim_numbers(prev_response))
         residue = re.sub(r"[\d.,]+", "", c)
         # 数値以外の残りが単位程度 (3 文字以下) なら数値だけで判定する。

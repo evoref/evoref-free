@@ -88,6 +88,7 @@
     "prompt_manager_not_initialized": "プロンプトマネージャーが初期化されていません",
     "prompt_locale_unsupported": "非対応のプロンプトロケールです: {locale}",
     "prompt_locale_learning_running": "学習実行中はプロンプト言語を切り替えられません",
+    "prompt_edit_learning_running": "学習実行中はプロンプトを編集・ロールバックできません。学習の完了後にやり直してください",
     "config_capability_key_protected": "設定 API からは変更できない項目です: {keys}。config.yaml を直接編集してください。",
     "config_unknown_runtime": "不明な実行環境です: {name}",
     "runtime_path_invalid": {
@@ -588,6 +589,7 @@
     "repeated_no_match": "検索しましたが、該当するものは見つかりませんでした。",
     "repeated_same_result": "同じ呼び出しが同じ結果を繰り返したため、処理を打ち切りました。",
     "step_limit_reached": "手順の上限に達したため、処理を打ち切りました。",
+    "tool_call_unparsed": "ツールの呼び出しを解釈できなかったため、処理を打ち切りました。",
     "retrieval_failed": {
       "unresolved_host": "{target} を取得できませんでした: ホスト名を名前解決できなかったため (DNS エラー)。",
       "unreachable": "{target} を取得できませんでした: 接続できなかったか、応答が時間内に返らなかったため。",
