@@ -60,7 +60,8 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     # 無いと、成否の判定は経験 (turn_outcome) にしか残らず、outcome JSONL の
     # verifier_hits は表面の検証器しか映さない (2026-09-05 ライブ監査 F-11:
     # 100 ターン中 3 件しか失敗と記録されず、Level 2 が恒久的にデータ不足)。
-    "content.arithmetic",       # 本文の式の検算が合わない
+    "content.arithmetic",       # 本文の式の検算が合わない (増減率の再計算もここ)
+    "content.conclusion",       # 冒頭の結論が本文の計算結果と別の数
     "content.sign",             # 冒頭の結論と本文で値の符号が逆
     "content.broken_text",      # 語間空白 / 中国語混入
     "content.self_retraction",  # 1 つの応答に結論が 2 つ (撤回 / 列挙して否定)
@@ -72,6 +73,8 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "content.fabricated_count", # 本人が言っていない世帯の人数を補って言い直した
     "content.fabricated_entity",  # 読めていないファイルの問いに、根拠の無い人名で答えた
     "content.table_aggregate",  # コードで集計した表の値と別の値を述べた (述べなかった)
+    "content.declared_count",   # 「以下の N つ」と宣言した直後の一覧が N 項目でない
+    "content.tool_unavailable",  # 常に登録されているツールを「使えない」と述べて断った
 })
 
 

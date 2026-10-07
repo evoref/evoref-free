@@ -972,7 +972,7 @@ learning:
   cvector_pca_batch: 100               # --pca-batch
   cvector_pca_iter: 1000               # --pca-iter
   cvector_layer_range: ""              # 空=block_count から全層自動 / "START END" 指定可
-  cvector_scale: 1.0                   # --control-vector-scaled FNAME:SCALE
+  cvector_scale: 0.2                   # --control-vector-scaled FNAME:SCALE（1.0 は応答が崩壊しやすい。0.3 以上は要確認）
   cvector_seed_pairs_file: ""          # キュレーション種ペア JSON（空=組込デフォルト軸）
   cvector_min_experiences: 40          # HYBRID 対照例（種＋経験）の最小数
   # パターン検出キーワード学習

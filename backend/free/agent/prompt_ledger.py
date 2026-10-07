@@ -82,6 +82,9 @@ class Ledger:
     locale: str
     rules: list[Rule] = field(default_factory=list)
     _extra: dict[str, Any] | None = None
+    #: 直近のレンダで予算超過により落とした箇条の id (プロセス内だけ・保存しない)。
+    #: 載っていない規則はそのターンの結末に関与しないので計数しない (§3.5.1)。
+    unrendered: set[str] = field(default_factory=set, compare=False, repr=False)
 
     def by_id(self, rule_id: str) -> Rule | None:
         for rule in self.rules:
@@ -186,6 +189,9 @@ def parse_markdown(
         if stripped == PROTECTED_CLOSE:
             flush_intro()
             protected = False
+            # 区間内の見出しは区間で閉じる。引き継ぐと、直後に追記された箇条が
+            # protected カテゴリに入り、レンダで保護区間の中へ吸い込まれる。
+            category = ""
             continue
         if stripped.startswith("# ") and not seen_heading and not rules:
             rules.append(_make_rule("title", "title", stripped[2:].strip(), False, carry, base_priority=2000))
@@ -315,7 +321,9 @@ def render_markdown(
             parts.append(f"{PROTECTED_OPEN}\n{block}\n{PROTECTED_CLOSE}")
         for c in other_cats:
             rendered = _render_category(body_rules, c, ledger.locale)
-            if rendered.strip() and "\n- " in rendered + "\n":
+            # 見出しの無いカテゴリ ("") は "- " で始まるので行頭で見る
+            # (旧条件 "\n- " は箇条 1 つの見出し無しカテゴリを落としていた)。
+            if any(line.startswith("- ") for line in rendered.splitlines()):
                 parts.append(rendered)
         # 末尾改行は足さない: 手編集 / テストが本文をそのまま突き合わせる。
         return "\n\n".join(p for p in parts if p)
@@ -376,6 +384,9 @@ DEFAULT_RULE_VERIFIERS: dict[str, str] = {
     # (2026-09-16 監査: 規則だけでは両ランで守られなかった)。
     "補って言い直さない": "content.fabricated_count",
     "Do not add counts the user did not state": "content.fabricated_count",
+    # 「〜するツールが利用できない」等の道具立ての説明を理由にしない。検証器は
+    # 常に登録されているツール (calculate) の名指しだけを見る (規則より狭い)。
+    "自分の道具立てについての説明は根拠を持たない": "content.tool_unavailable",
 }
 
 
@@ -425,10 +436,17 @@ def sync_protected(ledger: Ledger, default: Ledger) -> Ledger:
 def record_rule_outcome(ledger: Ledger, violated_ids: set[str], *, fired_at: str) -> None:
     """ターンの結末を計数へ反映する (f_03 §3.5.1)。
 
-    ``violated_ids`` に入る規則は harmful += 1、それ以外の箇条は helpful += 1。
+    計数するのは **そのターンの prompt に載り、かつ検証できた** 箇条だけ:
+    ``verifier`` を持ち、直近のレンダで落とされていない (``ledger.unrendered``
+    に無い) 規則。``violated_ids`` に入る規則は harmful += 1、それ以外は
+    helpful += 1。
+
+    検証器の無い規則は守られたかを判定できないので計数しない。以前は全箇条に
+    helpful += 1 していたため helpful が「経過ターン数」になり、検証器の無い
+    規則が ``rule_stats_min_turns`` ターンで必ず削除ゲートを通っていた。
     """
     for rule in ledger.rules:
-        if rule.kind != "bullet":
+        if rule.kind != "bullet" or not rule.verifier or rule.id in ledger.unrendered:
             continue
         if rule.id in violated_ids:
             rule.harmful += 1

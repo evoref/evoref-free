@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from backend.free.agent.tools.history_rerank import (
@@ -296,11 +297,25 @@ def _make_search_code(reader_getter: "Callable[[], ProjectMapReader | None]"):
         grep_result = search_code(pattern, directory, max_results)
         if reader is None:
             return grep_result
+        # シンボルは指定 directory の配下に在るものだけ出す。外の (本体ソースの)
+        # シンボルを付け足すと、利用者のフォルダを探した結果として書き込まれる
+        # (audit_replay R10: 本体のテストの行が利用者のファイルへ書かれた)。
+        base = Path(directory).resolve()
+        nodes: list[Any] = []
+        owner: dict[int, Any] = {}
         try:
-            nodes = reader.lookup(pattern)
+            for sub in getattr(reader, "readers", None) or [reader]:
+                root = Path(sub.root).resolve()
+                if not (base.is_relative_to(root) or root.is_relative_to(base)):
+                    continue
+                for n in sub.lookup(pattern):
+                    if (root / n.path).resolve().is_relative_to(base):
+                        nodes.append(n)
+                        owner[id(n)] = sub
         except Exception as e:  # noqa: BLE001 — reader 障害で search_code 全体を止めない
             logger.warning("ProjectMap lookup failed for %r: %s", pattern, e)
             return grep_result
+        nodes = nodes[:10]
         if not nodes:
             return grep_result
         symbol_lines = [
@@ -313,6 +328,7 @@ def _make_search_code(reader_getter: "Callable[[], ProjectMapReader | None]"):
         # は規則層が search_code を選ぶ (project_map までは降りない) ので、grep の
         # 前にグラフ側の答えを置く。前方一致しか無いときは足さない (雑音)。
         top = nodes[0]
+        top_reader = owner[id(top)]
         needle = pattern.strip()
         exact = (
             top.name == needle or top.qualname == needle or top.path == needle
@@ -322,13 +338,13 @@ def _make_search_code(reader_getter: "Callable[[], ProjectMapReader | None]"):
             blocks: list[tuple[str, str]] = []
             try:
                 if top.node_type == "file":
-                    blocks.append(("structure", reader.neighborhood(top.path, depth=1, budget_tokens=400)))
+                    blocks.append(("structure", top_reader.neighborhood(top.path, depth=1, budget_tokens=400)))
                 else:
                     # シンボルの近傍 (呼ぶ / 呼ばれる / 含む) と、それを定義する
                     # ファイルの import 関係の両方を出す — 「どのモジュールに依存
                     # しているか」は file ノードの辺にしか無い (2026-09-18 実機)。
-                    blocks.append(("structure", reader.neighborhood(top.qualname, depth=1, budget_tokens=300)))
-                    blocks.append(("file structure", reader.neighborhood(top.path, depth=1, budget_tokens=300)))
+                    blocks.append(("structure", top_reader.neighborhood(top.qualname, depth=1, budget_tokens=300)))
+                    blocks.append(("file structure", top_reader.neighborhood(top.path, depth=1, budget_tokens=300)))
             except Exception as e:  # noqa: BLE001
                 logger.warning("ProjectMap neighborhood failed for %r: %s", pattern, e)
                 blocks = []

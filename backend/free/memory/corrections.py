@@ -140,26 +140,205 @@ def correction_target(correction: Any, notes: list) -> Any | None:
     return best
 
 
-def corrections_by_target(notes: list) -> dict[str, Any]:
-    """``被訂正 note_id -> その現在値を持つ訂正ノート`` を返す (純粋関数)。
+def span_correction_target(correction: Any, notes: list) -> Any | None:
+    """**検証済みの訂正** の旧値 span を逐語で含む前のユーザーノート (純粋関数)。
+
+    訂正は話題語を落として言うので keyword が重ならないことがある (2026-10-07
+    audit_replay R26: 訂正「2泊3日ではなく1泊2日に変更になりました」の keyword
+    [変更, 行程] は旧ノート「…京都へ2泊3日の旅行…」の [京都, 旅行, …] と 0 語)。
+    検証器の ``wrong_claim`` は門 (``core.correction_verdict``) を通った逐語 span
+    なので、それを含む同じセッションの前のユーザーノートが **ちょうど 1 件** の
+    ときだけ宛先にする。複数なら ``None`` — 「18日」は試験日にも給料日にも在る
+    (2026-09-27 H2)。字句の候補だけの訂正 (未検証) は対象外 (不変則 #12)。
+    """
+    from backend.free.core.correction_verdict import norm_span, strip_copula
+    from backend.free.memory.extractors.base import note_is_verified_correction
+
+    if not note_is_verified_correction(correction):
+        return None
+    needle = norm_span(
+        strip_copula(str(getattr(correction, "correction_wrong_claim", "") or "")),
+    )
+    if not needle:
+        return None
+    corr_at = _created_at(correction)
+    corr_sess = getattr(correction, "session_id", None)
+    found = [
+        note for note in notes
+        if note is not correction
+        and _is_user_note(note)
+        and getattr(note, "session_id", None) == corr_sess
+        and _created_at(note) < corr_at
+        and needle in norm_span(str(getattr(note, "content", "") or ""))
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _contains_value(content: str, needle: str) -> bool:
+    """``needle`` (``norm_span`` 済み) が ``content`` に数字の境界を守って在るか。
+
+    値が数字で始まる / 終わるなら、出現の前 / 後ろが数字の箇所は数えない
+    (「3歳」が「13歳」、「8日」が「18日」に当たらない)。
+    """
+    from backend.free.core.correction_verdict import norm_span
+
+    hay = norm_span(content)
+    if not needle:
+        return False
+    start = hay.find(needle)
+    while start >= 0:
+        end = start + len(needle)
+        head_ok = not (needle[0].isdigit() and start > 0 and hay[start - 1].isdigit())
+        tail_ok = not (needle[-1].isdigit() and end < len(hay) and hay[end].isdigit())
+        if head_ok and tail_ok:
+            return True
+        start = hay.find(needle, start + 1)
+    return False
+
+
+def _structural_old_values(correction: Any) -> list[tuple[str, tuple[str, ...]]]:
+    """訂正発話の平叙文の「X ではなく Y」から ``(旧値 X, X より前の話題語)`` を取る。
+
+    分解は :func:`~backend.free.core.correction_target.contrast_pairs`、話題語は
+    :func:`~backend.free.memory.pipeline.injector.correction_form_topics` の 1 実装
+    (不変則 #14a)。引用の内側は落とし、問い・依頼の文 (「…にしたら費用は？」) は見ない。
+    """
+    from backend.free.core.correction_target import contrast_pairs, split_sentences
+    from backend.free.core.correction_verdict import (
+        mask_quoted_speech,
+        norm_span,
+        strip_copula,
+    )
+    from backend.free.core.intent_vocab import is_plain_statement
+    from backend.free.memory.pipeline.injector import correction_form_topics
+
+    out: list[tuple[str, tuple[str, ...]]] = []
+    masked = mask_quoted_speech(str(getattr(correction, "content", "") or ""))
+    for sentence in split_sentences(masked):
+        if not is_plain_statement(sentence):
+            continue
+        form = correction_form_topics(sentence)
+        topics = form[1] if form is not None else ()
+        for old, _new in contrast_pairs(sentence):
+            old = strip_copula(old)
+            at = sentence.find(old)
+            before = tuple(t for t in topics if 0 <= sentence.find(t) < at)
+            if norm_span(old):
+                out.append((old, before))
+    return out
+
+
+def structural_correction_target(correction: Any, notes: list) -> Any | None:
+    """**前提の変更** と判定された訂正候補の宛先を、発話の構造だけで探す (純粋関数・読むだけ)。
+
+    検証器が ``premise_change`` と答えると ``wrong_claim`` が空で
+    :func:`span_correction_target` が解けず、話題語を落とした訂正
+    (「2泊3日ではなく1泊2日に変更になりました」) は keyword でも結べない
+    (2026-10-07 audit_replay R26 #2)。書き込み側 (J-03、
+    ``extractors.base.value_update_spans``) は同じ発話を本人の値の更新として
+    既に扱っているので、**注入の随伴** (:func:`correction_links_by_target`) に
+    限って同じ旧値で宛先を探す。SemMem の supersede や ``assertion_curator`` の
+    slug 継承には使わない (不変則 #12 / #13)。
+
+    次のすべてを満たすときだけ宛先を返す (それ以外は ``None`` = 棄権):
+
+    - 検証済み (``correction_verified_at`` が在る — 検証前の候補は注入側の未検証の
+      注記が受け持つ) で、本人の値更新として消費してよい (``note_may_update_own_value``) 平叙文で、
+      仮定・時間の対比・伝聞の標識 (``marks_not_own_restatement``) が無い
+    - 旧値 X を (数字の境界を守って) 含む、同じセッション・ユーザー発話・
+      訂正より前のノートが **ちょうど 1 件**
+    - X より前の話題語 (「給料日」「次男」「去年」「友人」) が宛先にすべて在る
+    - 訂正より後のユーザーノートが X を含まない (A→B→A の戻し)。ただしその
+      ノート自身がこの訂正を構造で言い直している連鎖 (A ← B ← C) は除く
+    """
+    from backend.free.core.correction_target import old_value_core
+    from backend.free.core.correction_verdict import marks_not_own_restatement, norm_span
+    from backend.free.memory.extractors.base import note_may_update_own_value
+
+    # 検証前の字句の候補は対象外 — 注入側の未検証の注記が受け持つ (不変則 #12)。
+    if getattr(correction, "correction_verified_at", None) is None:
+        return None
+    if not _is_user_note(correction) or not note_may_update_own_value(correction):
+        return None
+    if marks_not_own_restatement(str(getattr(correction, "content", "") or "")):
+        return None
+    corr_at = _created_at(correction)
+    corr_sess = getattr(correction, "session_id", None)
+    same_session = [
+        note for note in notes
+        if note is not correction
+        and _is_user_note(note)
+        and getattr(note, "session_id", None) == corr_sess
+    ]
+    earlier = [n for n in same_session if _created_at(n) < corr_at]
+    later = [n for n in same_session if _created_at(n) > corr_at]
+    for old, topics in _structural_old_values(correction):
+        for value in dict.fromkeys((old, old_value_core(old))):
+            needle = norm_span(value)
+            found = [
+                n for n in earlier
+                if _contains_value(str(getattr(n, "content", "") or ""), needle)
+            ]
+            if not found:
+                continue
+            found = [
+                n for n in found
+                if all(
+                    norm_span(t) in norm_span(str(getattr(n, "content", "") or ""))
+                    for t in topics
+                )
+            ]
+            if len(found) != 1:
+                return None
+            for n in later:
+                if not _contains_value(str(getattr(n, "content", "") or ""), needle):
+                    continue
+                if structural_correction_target(n, notes) is not correction:
+                    return None
+            return found[0]
+    return None
+
+
+#: 随伴の種別。``correction`` は検証済みの訂正 / 従来の経路、``update`` は
+#: :func:`structural_correction_target` だけで結んだ未検証の値の更新 (注記の文言を分ける)。
+LINK_CORRECTION = "correction"
+LINK_UPDATE = "update"
+
+
+def correction_links_by_target(notes: list) -> dict[str, tuple[Any, str]]:
+    """``被訂正 note_id -> (現在値を持つ訂正ノート, 随伴の種別)`` を返す (純粋関数)。
 
     同じ対象を複数回訂正している場合は **最後の訂正** が現在値。訂正が
     さらに訂正されている連鎖 (A ← B ← C) では、A も B も **終端の C** に
     解決する — B は「訂正済み」の印が付く側であって現在値ではない。
+
+    宛先は検証済みの訂正なら旧値の span (:func:`span_correction_target`) を先に、
+    解けなければ keyword の重なり (:func:`correction_target`)、それでも解けなければ
+    発話の構造 (:func:`structural_correction_target`) で探す。種別は対象を **直接**
+    言い直した訂正の結び方で決める (構造だけで結び、検証済みの訂正でなければ
+    :data:`LINK_UPDATE`)。読み手は注入の随伴
+    (``search_pipeline.attach_superseding_corrections``) だけ。
     """
-    direct: dict[str, Any] = {}
+    from backend.free.memory.extractors.base import note_is_verified_correction
+
+    direct: dict[str, tuple[Any, str]] = {}
     for note in notes:
         if not getattr(note, "is_correction", False):
             continue
-        target = correction_target(note, notes)
+        kind = LINK_CORRECTION
+        target = span_correction_target(note, notes) or correction_target(note, notes)
+        if target is None:
+            target = structural_correction_target(note, notes)
+            if target is not None and not note_is_verified_correction(note):
+                kind = LINK_UPDATE
         if target is None:
             continue
         target_id = getattr(target, "id", None)
         if not target_id:
             continue
         prev = direct.get(target_id)
-        if prev is None or _created_at(note) > _created_at(prev):
-            direct[target_id] = note
+        if prev is None or _created_at(note) > _created_at(prev[0]):
+            direct[target_id] = (note, kind)
 
     def _terminal(corr: Any) -> Any:
         seen: set[str] = set()
@@ -169,6 +348,17 @@ def corrections_by_target(notes: list) -> dict[str, Any]:
             if nxt is None or cid in seen:
                 return corr
             seen.add(cid)
-            corr = nxt
+            corr = nxt[0]
 
-    return {target_id: _terminal(corr) for target_id, corr in direct.items()}
+    return {
+        target_id: (_terminal(corr), kind)
+        for target_id, (corr, kind) in direct.items()
+    }
+
+
+def corrections_by_target(notes: list) -> dict[str, Any]:
+    """``被訂正 note_id -> その現在値を持つ訂正ノート`` (:func:`correction_links_by_target` の値だけ)。"""
+    return {
+        target_id: corr
+        for target_id, (corr, _kind) in correction_links_by_target(notes).items()
+    }

@@ -80,7 +80,8 @@ from backend.free.core.response_arithmetic import (
 )
 from backend.free.llm.json_schemas import FewShotQualityJudgement
 from backend.free.memory.types import make_fact
-from backend.free.learning.level0_instant import teaches_success, used_corpus_evidence
+from backend.free.learning.case_filters import grounding_reason
+from backend.free.learning.level0_instant import teaches_success
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -677,11 +678,14 @@ _HARMFUL_RATE_FLOOR = 0.2
 #: ``turn_outcome_reason`` のうち **手本に帰属できる** 失敗 (前方一致)。出力の
 #: 破綻・形式違反・自己撤回は手本が教えた形の可能性がある。生成失敗 / 打ち切り /
 #: ルーティング誤り / ツール・日付結果の無視 / 計測値矛盾は例と無関係な失敗なので
-#: 帰属しない (良い例を殺さない)。
+#: 帰属しない (良い例を殺さない)。ツールを「使えない」と述べた断り
+#: (``false tool unavailability``) もツールを撃たなかった判定の側の失敗で帰属しない。
 FEWSHOT_ATTRIBUTABLE_REASONS: tuple[str, ...] = (
     "arithmetic contradiction",
     "conclusion contradiction",
     "sign contradiction",
+    "change rate contradiction",
+    "declared count mismatch",
     "broken JA spacing",
     "Chinese token leaked",
     "response retracts",
@@ -1566,14 +1570,13 @@ class FewShotPool(VersionedJsonFile):
             # 撃たず手本の値を復唱する (2026-09-10 (f) F-09: calculate 由来の
             # 「45 km」が採用されていた。日付演算だけを問いの語形で弾いていた
             # ``_find_volatile_reason`` を、ツール種別に依らない印で一般化)。
-            if signals.get("tool_grounded", False):
-                continue
             # 文書チャンク (corpus) を根拠にした応答も同じ理由で手本にしない。
             # 資料の値・固有名はその問いのものであって文体ではなく、手本に
             # 載ると同じ形の問いに資料を引かず手本の値を復唱する。疑似クエリ
             # 索引 (f_01 §6) で注入率が 28% → 95% に上がったので実害が大きい。
             # 印は ``gen_config.evidence_ids`` の ``corpus:`` (注入した材料の id)。
-            if used_corpus_evidence(exp):
+            # 判定は採用ゲートの評価ケースと同じ述語 (learning.case_filters)。
+            if grounding_reason(exp) is not None:
                 continue
 
             query = exp.get("query", "").strip()

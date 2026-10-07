@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
 from contextvars import ContextVar
@@ -1078,6 +1080,22 @@ def _active_gen_config(
             ref.prompt_version = int(version)
         except Exception:
             pass
+    # 版番号はモード内で閉じるので、レンダの内容と生成パラメータのデルタも刻む。
+    # 宣言フィールドにすると形式の版が動くので未知キーの通路で運ぶ (f_04 §3.2)。
+    from backend.free.learning.level0_instant import (
+        GENERATION_DELTA_VERSION_KEY,
+        RULES_HASH_KEY,
+    )
+
+    attribution: dict[str, str] = {}
+    rules_hash = _rules_hash(pm, mode, session_id) if pm is not None else None
+    if rules_hash is not None:
+        attribution[RULES_HASH_KEY] = rules_hash
+    delta_version = _generation_delta_version(mode)
+    if delta_version is not None:
+        attribution[GENERATION_DELTA_VERSION_KEY] = delta_version
+    if attribution:
+        ref._extra = {**(ref._extra or {}), **attribution}
     # 実際に注入した例だけを刻む (以前はプール全体で、読み手は無かった)。
     ref.fewshot_ids = turn_fewshot_ids(session_id) if session_id else []
     sched = getattr(state, "learning_scheduler", None)
@@ -1110,6 +1128,54 @@ def _active_gen_config(
 
     ref.template = applied_template_key()
     return ref
+
+
+def _content_hash(value: object) -> str:
+    """帰属用の決定論の短いハッシュ (sha1 先頭 12 桁、``Ledger.content_hash`` と同じ幅)。"""
+    text = value if isinstance(value, str) else json.dumps(
+        value, ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _rules_hash(pm: object, mode: str, session_id: str) -> str | None:
+    """このターンの静的 system (セッションが凍結したレンダ) の内容ハッシュ。
+
+    凍結があればその文面 (``prompt_version`` と同じ根拠)、無ければ現行のレンダ。
+    凍結の無いセッションを ``session_id`` 付きで引くと記録の時点で凍結が作られて
+    しまうので、その場合は session 無しで引く。取れなければ ``None``。
+    """
+    try:
+        frozen = getattr(pm, "frozen_version", None)
+        is_frozen = bool(session_id) and callable(frozen) and isinstance(
+            frozen(mode, session_id), int,
+        )
+        text = pm.get_prompt_static(mode, session_id if is_frozen else None)
+    except Exception as exc:  # noqa: BLE001 - 帰属の素性が取れなくても記録は続ける
+        logger.debug("rules hash unavailable (mode=%s): %s", mode, exc)
+        return None
+    return _content_hash(text) if isinstance(text, str) else None
+
+
+def _generation_delta_version(mode: str) -> str | None:
+    """そのモードに当てた生成パラメータのデルタの版 (内容ハッシュ)。
+
+    置き場の解決は ``get_mode_generation_params`` と同じ (いま生成するモデルの
+    パーティション)。デルタが無ければ空のデルタのハッシュ。取れなければ ``None``。
+    """
+    try:
+        from backend.config import get_path_resolver
+        from backend.free.learning.generation_delta_store import GenerationDeltaStore
+
+        resolver = get_path_resolver()
+        path = resolver.learning_path_for(
+            "generation_deltas_file", resolver.generating_model_key(mode),
+        )
+        deltas = GenerationDeltaStore.load_mode(path, mode)
+    except Exception as exc:  # noqa: BLE001 - 帰属の素性が取れなくても記録は続ける
+        logger.debug("generation delta version unavailable (mode=%s): %s", mode, exc)
+        return None
+    return _content_hash(deltas)
 
 
 def _gen_config_with_template(

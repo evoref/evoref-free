@@ -85,6 +85,13 @@ RAG_ABSTAIN_NOT_SHOWN = "not_shown"
 RAG_ABSTAIN_SHOWN = "shown"
 #: ``GenerationConfigRef._extra`` に置く、検索が採用した corpus の件数 (見せる前)。
 RAG_ADOPTED_CORPUS_KEY = "rag_adopted_corpus"
+#: ``GenerationConfigRef._extra`` に置く、そのターンの静的 system (最終レンダ) の
+#: 内容ハッシュ。``prompt_version`` はモード内の通番なので、もう一方のモードの採用で
+#: 共通箇条の寄せや予算の削り込みが変わってもレンダの変化を刻めない (f_04 §4.5)。
+RULES_HASH_KEY = "rules_hash"
+#: ``GenerationConfigRef._extra`` に置く、そのモードに当てた生成パラメータのデルタ
+#: (``generation_deltas.json``) の版。ファイルが版を持たないのでデルタの内容ハッシュ。
+GENERATION_DELTA_VERSION_KEY = "generation_delta_version"
 
 
 def used_corpus_evidence(experience: dict) -> bool:

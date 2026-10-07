@@ -25,7 +25,7 @@ from backend.free.learning.corrected_pairs import (
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from backend.free.learning.level0_instant import used_corpus_evidence
+from backend.free.learning.case_filters import regeneration_mismatch_reason
 from backend.log_config import get_logger
 
 logger = get_logger("optimizer.prompt_eval")
@@ -138,6 +138,9 @@ def select_prompt_eval_cases(
       新しい順にその件数まで標本ケース (``CASE_KIND_SAMPLE``、ヒント無し) を
       足す。絶対採点では意味を持たないが、一対比較 (現行 vs 候補) の
       ゲートなら成功ターンでも選択圧になる (f_04 §4.5)。
+    - ツール結果・文書チャンクを根拠にしたターンと長文の経路を通ったターンは
+      種別を問わず外す (:func:`~backend.free.learning.case_filters.
+      regeneration_mismatch_reason`。根拠の判定は few-shot と同じ述語)。
 
     同一 query は最新 1 件に畳む。``limit <= 0`` なら空。
     """
@@ -148,7 +151,8 @@ def select_prompt_eval_cases(
     mode_exp = [e for e in experiences if e.get("mode") == mode]
     # 訂正された側を引くため、時系列順 (snapshot は append 順 = 時系列) を保つ
     picked: dict[str, PromptEvalCase] = {}
-    grounded_dropped = 0
+    #: 再生成で同じ入力にならないので外したターンの件数 (理由 → 件数)
+    mismatched: dict[str, int] = {}
     for index, exp in enumerate(mode_exp):
         signals = exp.get("signals") or {}
         query = str(exp.get("query") or "").strip()
@@ -156,12 +160,13 @@ def select_prompt_eval_cases(
         if correction:
             corrected = resolve_corrected_turn(mode_exp, index)
             pq = str((corrected or {}).get("query") or "").strip()
-            # 文書チャンク ([参考情報]) を根拠に答えたターンは、system prompt
-            # だけで再生成するゲートでは資料が無く、どの候補でも同じ点になる
-            # (記憶依存の問いと同じ、f_04 §4.5)。疑似クエリ索引で注入率が
-            # 上がったので、印 (gen_config.evidence_ids の corpus:) で外す。
-            if pq and used_corpus_evidence(corrected or {}):
-                grounded_dropped += 1
+            # 文書チャンク ([参考情報]) やツール結果を根拠に答えたターン、長文の
+            # 経路を通ったターンは、system prompt だけで短く再生成するゲートでは
+            # 根拠も経路も無く、どの候補でも同じ点になる (記憶依存の問いと同じ、
+            # f_04 §4.5)。判定は few-shot と同じ述語 (learning.case_filters)。
+            mismatch = regeneration_mismatch_reason(corrected or {}) if pq else None
+            if mismatch is not None:
+                mismatched[mismatch] = mismatched.get(mismatch, 0) + 1
                 continue
             if pq:
                 correct_value = str(
@@ -187,8 +192,12 @@ def select_prompt_eval_cases(
                 )
             continue
         if query:
-            if used_corpus_evidence(exp):
-                grounded_dropped += 1
+            mismatch = regeneration_mismatch_reason(exp)
+            if mismatch is not None:
+                # 長文の失敗 (検証落ち等) も、system prompt だけで短く再生成する
+                # このゲートでは再現できず枠を無駄にする (docs/f_04 §2.5)。以前は
+                # failed のときだけ外し、👎・言い直しの長文はケースにしていた。
+                mismatched[mismatch] = mismatched.get(mismatch, 0) + 1
                 continue
             if signals.get("user_negative") is True:
                 picked[_case_id(query)] = PromptEvalCase(
@@ -196,9 +205,7 @@ def select_prompt_eval_cases(
                     kind=CASE_KIND_USER_NEGATIVE,
                     hint=str(signals.get("user_note") or "").strip(), mode=mode,
                 )
-            elif signals.get("turn_outcome") == "failed" and not signals.get("long_form_used"):
-                # 長文の失敗 (検証落ち等) は、system prompt だけで短く再生成するこの
-                # ゲートでは再現できず枠を無駄にする (docs/f_04 §2.5)。
+            elif signals.get("turn_outcome") == "failed":
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query, kind=CASE_KIND_FAILED, mode=mode,
                 )
@@ -228,7 +235,8 @@ def select_prompt_eval_cases(
                 or signals.get("user_correction")
                 or signals.get("correction_candidate")
                 or signals.get("turn_outcome") == "failed"
-                or used_corpus_evidence(exp) or depends_on_context(query)
+                or regeneration_mismatch_reason(exp) is not None
+                or depends_on_context(query)
             ):
                 continue
             taken.add(_case_id(query))
@@ -237,11 +245,11 @@ def select_prompt_eval_cases(
             ))
         # 標本は古い側に置く (limit で切るとき失敗の証拠がある側を残す)
         cases = list(reversed(samples)) + cases
-    if dropped or grounded_dropped:
+    if dropped or mismatched:
         logger.info(
-            "prompt eval: %d context-bound / %d corpus-grounded case(s) excluded "
-            "from the adoption gate",
-            dropped, grounded_dropped,
+            "prompt eval: %d context-bound case(s) / not-reproducible turns %s "
+            "excluded from the adoption gate",
+            dropped, dict(sorted(mismatched.items())),
         )
     # dict は挿入順 = 古い順。最新側から limit 件
     return cases[-limit:] if len(cases) > limit else cases

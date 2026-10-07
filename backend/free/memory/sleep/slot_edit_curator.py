@@ -365,6 +365,7 @@ def check_slot_edit(
     fact_type: str,
     slot_words: tuple[str, ...] = (),
     slot_named: bool = True,
+    slug: str | None = None,
     triggers_dir: str | Path | None = None,
 ) -> SlotEditCheck:
     """補助タスクの答えを検証し、編集後の要素集合を返す (純粋関数に近い)。
@@ -374,13 +375,41 @@ def check_slot_edit(
     照合は引用の内側を落とした形で行う (伝聞は本人の編集ではない)。
     ``slot_named`` が偽 (発話が属性を名指さず、要素からスロットを引いた) なら、
     加える要素を持つ編集は却下する — 何の属性に足すのかを発話が言っていない。
+
+    ``slug`` (編集するスロット) を渡すと、要素が属性語を含むかの検査で **その
+    スロット自身の trigger は使わず**、発話がスロットを名指した語 (``slot_words``)
+    で見る。food の trigger には値そのもの (ラーメン / パン / 肉) が並ぶので、
+    trigger で見ると「ラーメン」という要素が属性語を含むことになる。名指した語の
+    うち、要素に助詞を続けて現れるもの (「趣味に写真」「食べ物は」) と、外す /
+    加える要素の span の外で発話に現れるもの (「好きな食べ物に」の 食べ物) を
+    属性名とみなす — 外す要素そのもの (「ラーメンを外して」の ラーメン) は値。
+    他のスロットの trigger は従来どおり見る。
     """
     from backend.free.memory.notes.note_builder import resolve_fact_attribute_matches
 
+    said = norm_span(mask_quoted_speech(utterance or ""))
+    outside = said
+    for raw in (*removed, *added):
+        key = norm_span(str(raw or ""))
+        if key:
+            outside = outside.replace(key, "\n")
+    own_words = tuple(
+        w for w in (norm_span(word) for word in slot_words) if w
+    ) if slot_named else ()
+    name_words = tuple(w for w in own_words if w in outside)
+
     def names_slot(text: str) -> bool:
-        return bool(resolve_fact_attribute_matches(
+        matches = resolve_fact_attribute_matches(
             text, fact_type, mode="chat", triggers_dir=triggers_dir,
-        ))
+        )
+        if slug is None:
+            return bool(matches)
+        if any(s != slug for s, _ in matches):
+            return True
+        key = norm_span(text)
+        return any(w in key for w in name_words) or any(
+            re.search(f"{re.escape(w)}[{HIRAGANA}]", key) for w in own_words
+        )
 
     if not is_edit:
         return _reject("not_an_edit")
@@ -399,7 +428,6 @@ def check_slot_edit(
         members.append(member)
     if not members_cover(current_text, members):
         return _reject("members_do_not_cover_current_value")
-    said = norm_span(mask_quoted_speech(utterance or ""))
     dropped: list[str] = []
     spans: list[str] = []
     for raw in removed:
@@ -792,6 +820,7 @@ async def curate_slot_edits(
             fact_type=target.fact_type,
             slot_words=target.slot_words,
             slot_named=not target.by_member,
+            slug=target.slug,
             triggers_dir=triggers_dir,
         )
         stats["judged"] += 1

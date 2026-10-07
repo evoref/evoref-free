@@ -45,6 +45,9 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     ("arithmetic contradiction", "outcome_contradiction"),
     ("conclusion contradiction", "outcome_contradiction"),
     ("sign contradiction", "outcome_contradiction"),
+    ("change rate contradiction", "outcome_contradiction"),
+    ("declared count mismatch", "outcome_contradiction"),
+    ("false tool unavailability", "outcome_contradiction"),
     ("response retracts", "outcome_contradiction"),
     ("retracted by assistant", "outcome_contradiction"),
     ("measured value contradiction", "outcome_contradiction"),
@@ -53,6 +56,8 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     ("claimed completion while blocked", "outcome_contradiction"),
     ("fabricated count", "outcome_contradiction"),
     ("fabricated entity", "outcome_contradiction"),
+    # ツールが 1 つも結果を返さなかったのに、依頼にも会話にも無い数を述べた。
+    ("content stated after every tool call failed", "outcome_contradiction"),
     # (3) 明示された指示を守っていない。プロンプトの寄与が大きい。
     ("length constraint", "outcome_instruction"),
     ("output form", "outcome_instruction"),
@@ -61,6 +66,8 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     ("all tasks failed", "outcome_execution"),
     ("no step credit", "outcome_execution"),
     ("routing false positive", "outcome_execution"),
+    # 本文が届かなかった / error で終わった (``FeedbackCollector.record`` の観測)。
+    ("generation failed", "outcome_execution"),
 )
 
 #: 別の欠陥キーが同じ事象を数えている ``failed`` の理由 (前方一致)。チャネルにも

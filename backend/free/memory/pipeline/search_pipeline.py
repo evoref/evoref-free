@@ -33,7 +33,7 @@ from backend.free.core.intent_vocab import (
     session_user_turns,
 )
 from backend.free.core.session_mode import is_create_mode
-from backend.free.memory.corrections import corrections_by_target
+from backend.free.memory.corrections import LINK_UPDATE, correction_links_by_target
 from backend.free.memory.episodic.note import record_mode
 from backend.trace_context import run_in_executor_with_context
 from backend.utils import utc_now_dt
@@ -301,9 +301,19 @@ _SUPERSEDED_MARKS: dict[str, str] = {
 _SUPERSEDED_MARK = _SUPERSEDED_MARKS["ja"]
 
 
-def _superseded_mark() -> str:
-    """prompt_locale に応じた訂正済み注記 (未知 locale は ja)。"""
-    return _SUPERSEDED_MARKS.get(prompt_locale(), _SUPERSEDED_MARKS["ja"])
+#: 構造だけで結んだ未検証の値の更新 (計画の変更「2泊3日ではなく1泊2日に変更」) の注記。
+#: 前の値が誤っていたのではないので「訂正」と書かない。
+#: en 側を変えるときは ``core.inference._normalize_for_frame_dedup`` も揃える。
+_UPDATED_MARKS: dict[str, str] = {
+    "ja": "（後に更新された古い値）",
+    "en": " (superseded by a later update)",
+}
+
+
+def _superseded_mark(kind: str = "correction") -> str:
+    """prompt_locale に応じた訂正済み (``kind="update"`` なら更新済み) 注記 (未知 locale は ja)。"""
+    marks = _UPDATED_MARKS if kind == LINK_UPDATE else _SUPERSEDED_MARKS
+    return marks.get(prompt_locale(), marks["ja"])
 
 
 #: 前チャンクの文脈の見出し語 (f_01 §8.1 の 7.65)。
@@ -375,8 +385,9 @@ def attach_superseding_corrections(
 
     宛先は 2 つの情報源の **和** で決める:
 
-    1. ``corrections.corrections_by_target`` — 同一セッションの user ノート
-       同士を語の重なりで結ぶ。短期シャードのノートだけを見る。
+    1. ``corrections.correction_links_by_target`` — 同一セッションの user ノート
+       同士を旧値の span・語の重なり・発話の構造で結ぶ。短期シャードのノートだけを
+       見る。構造だけで結んだ未検証の値の更新は「更新された」の注記にする。
     2. ``correction_trail`` — SemMem の世代 (``superseded_by`` +
        ``from_correction``) から引いた ``{被訂正ノート id: 現在値}``。
        **セッションにも短期 / 長期の別にも依存しない。**
@@ -395,11 +406,13 @@ def attach_superseding_corrections(
     except Exception:
         notes = []
     kept_ids = {cid for cid, _, _ in sources}
+    resolved_links = correction_links_by_target(notes)
     links = [
         (target_id, getattr(corr, "id", ""), getattr(corr, "content", "") or "")
-        for target_id, corr in corrections_by_target(notes).items()
+        for target_id, (corr, _kind) in resolved_links.items()
         if target_id in kept_ids
     ]
+    kinds = {target_id: kind for target_id, (_corr, kind) in resolved_links.items()}
     # SemMem 由来の宛先を足す (同一セッションで解けた分は上書きしない —
     # そちらは訂正発話の本文を随伴でき、文脈が濃い)。
     resolved = {target_id for target_id, _, _ in links}
@@ -413,9 +426,9 @@ def attach_superseding_corrections(
 
     marked = {sid for sid, _, _ in links}
     present = {cid for cid, _, _ in sources}
-    mark = _superseded_mark()
     out: list[tuple[str, float, str]] = []
     for chunk_id, score, text in sources:
+        mark = _superseded_mark(kinds.get(chunk_id, "correction"))
         if chunk_id in marked and not (text or "").rstrip().endswith(mark):
             text = f"{(text or '').rstrip()}{mark}"
         out.append((chunk_id, score, text))

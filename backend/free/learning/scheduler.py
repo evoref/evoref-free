@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.i18n_helper import msg
@@ -604,6 +604,9 @@ class LearningScheduler:
         """
         prompt_dir = self.prompt_manager.prompt_dir
         self._bind_partition_paths(prompt_dir)
+        # 候補アーカイブも新パーティションへ (初期化時にしか設定しておらず、
+        # 切替後も旧モデルの candidates.jsonl へ書き続けていた)
+        self._evolver.candidates_archive = Path(prompt_dir) / CANDIDATES_FILE
 
         # learning_state: 永続化対象フィールドを初期値へ戻してから新パスを読む
         self._last_run = 0.0
@@ -1640,6 +1643,22 @@ class LearningScheduler:
             if self._cancelled or self.should_yield():
                 verdict["reason"] = "gate_interrupted"
                 continue
+            # 本番でこのモードの system に入る最終レンダで測る (前置き・共通箇条の
+            # 寄せ・予算による削り込み・固定指示込み)。raw 本文で測ると、予算で
+            # 落ちる規則を足した候補を、本番に出ない文面で採点してしまう。
+            try:
+                current, candidate = self._gate_system_texts(mode, current, candidate)
+            except Exception as exc:  # noqa: BLE001 - 測る文面が作れなければ採用しない
+                logger.warning(
+                    "Level 1 %s: adoption gate could not render the system prompt: %r",
+                    mode, exc, exc_info=True,
+                )
+                verdict["reason"] = "render_error"
+                continue
+            if candidate == current:
+                # 違いが予算の削り込みで消えた (本番に出る文面は現行と同じ)
+                verdict["reason"] = "rendered_identical"
+                continue
             if self._pairwise_gate_available():
                 await self._measure_pairwise(
                     mode, current, candidate, cases, min_cases, verdict,
@@ -1700,6 +1719,22 @@ class LearningScheduler:
                 })
         return verdicts
 
+    def _gate_system_texts(
+        self, mode: str, current: str, candidate: str,
+    ) -> tuple[str, str]:
+        """採用ゲートが system に置く (現行, 候補) の文面 = 本番の最終レンダ。
+
+        ``prompt_manager.render_static_for`` が無い / 文字列を返さないダブルでは
+        渡された本文のまま (テスト用)。レンダの失敗は呼出側へ送出する。
+        """
+        render = getattr(self.prompt_manager, "render_static_for", None)
+        if not callable(render):
+            return current, candidate
+        rendered = (render(mode, current), render(mode, candidate))
+        if not all(isinstance(text, str) for text in rendered):
+            return current, candidate
+        return rendered
+
     # ── 採用プロンプトの事後監視 (L-A7) ──
 
     def _record_prompt_adoption(
@@ -1720,6 +1755,27 @@ class LearningScheduler:
             "windows": [],
         }
 
+    def _adoption_superseded(self, mode: str, adopted: Any) -> str:
+        """採用した版が現行でなくなっていれば理由を返す (現行のままなら空)。
+
+        ``meta.json`` の ``version`` / ``source`` だけを見る。手編集 (``manual``) /
+        ディスクからの再読込 / rollback / 別の採用で版か出所が変わっていたら、
+        その本文は監視の対象ではない。``adopted_version`` の無い旧レコードは
+        ``source`` だけで判定する。読めない値 (型が違う) は判定に使わない。
+        """
+        try:
+            meta = self.prompt_manager.get_meta(mode)
+        except Exception as exc:  # noqa: BLE001 - メタが読めなければ従来どおり監視する
+            logger.debug("prompt meta unavailable for %s: %s", mode, exc)
+            return ""
+        version = getattr(meta, "version", None)
+        source = getattr(meta, "source", None)
+        if isinstance(adopted, int) and isinstance(version, int) and version != adopted:
+            return f"version v{version} != adopted v{adopted}"
+        if isinstance(source, str) and source and source != "evolution":
+            return f"source={source}"
+        return ""
+
     def _check_prompt_adoptions(self, experiences: list[dict]) -> set[str]:
         """採用済みプロンプトの事後監視。悪化していれば rollback する。
 
@@ -1738,6 +1794,15 @@ class LearningScheduler:
         for mode, rec in list(self._prompt_adoptions.items()):
             since = _parsed_time(rec.get("window_since"))
             adopted = rec.get("adopted_version")
+            superseded = self._adoption_superseded(mode, adopted)
+            if superseded:
+                # 手編集・別の採用・rollback で本文が採用した版から変わった。
+                # 監査の結果で巻き戻すと利用者の編集を消すので、監視を打ち切る。
+                logger.info(
+                    "Level 1 %s: post-adoption check abandoned (%s)", mode, superseded,
+                )
+                del self._prompt_adoptions[mode]
+                continue
             new_exp = [
                 e for e in experiences
                 if e.get("mode") == mode and _parsed_time(e.get("timestamp")) > since
