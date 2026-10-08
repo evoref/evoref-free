@@ -559,6 +559,9 @@ rag:
     # top1 は定義上必ず越えるため、相対の棒は検索結果を空にしない。
     # 0.0 で無効化 (絶対の棒だけに戻る)。
     relative_keep_ratio: 0.75
+    # 別セッションのエピソード記憶が棒を通るのに要る上乗せ (cosine)。一般名詞の重なりだけで
+    # 今の話に混ざるのを防ぐ。過去の会話を指す問いには掛けない。0.0 で無効化。
+    other_session_margin: 0.10
     # 品質3閾値 (rag.relevance_threshold / support_threshold / confidence_threshold)
     # の決め方。
     #   auto   : 実ストアのスコア分布から較正した値を使う (既定)。較正結果は

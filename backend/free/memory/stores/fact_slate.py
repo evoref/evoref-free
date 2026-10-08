@@ -34,6 +34,15 @@ _FACT_TYPES: tuple[str, ...] = ("personal_fact", "preference", "emotion", "opini
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．.!?！？\n])")
 
+#: 数量の型付き抽出 (構造の抽出であって意味の分類ではない、不変則 #14)。属性辞書に載らない
+#: 計画の数量 (旅行の日数・人数・金額) を、押し出し後も「最初に言った〜」で引けるようにする。
+#: 2026-10-08 監査: 「京都に2泊3日で…」が窓から出た後の「最初に言った日数は」に答えられなかった。
+_QUANTITY_KINDS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("日数", re.compile(r"\d+泊\d+日|\d+日間")),
+    ("人数", re.compile(r"\d+(?:人|名)(?!分)")),
+    ("金額", re.compile(r"\d[\d,]*(?:\.\d+)?(?:万|億)?円")),
+)
+
 #: プロンプトに描くときの見出し (locale 別)。
 _HEADINGS: dict[str, str] = {
     "ja": "[会話の要点] (窓から外れた発話の要点。今回の会話で言い直されていればそちらが優先)",
@@ -80,6 +89,14 @@ class SessionFactSlate:
                     self._entries.pop(key, None)
                     self._entries[key] = value
                     added += 1
+                # 数量は値ごとに別の行 (同じ種類でも言い直しの前後を両方残し、時系列で読める)。
+                for label, pattern in _QUANTITY_KINDS:
+                    for token in pattern.findall(sentence):
+                        key = f"quantity.{label}:{token}"
+                        if key in self._entries:
+                            continue
+                        self._entries[key] = sentence[:_VALUE_MAX_CHARS]
+                        added += 1
         if added:
             self.version += 1
             logger.debug("fact slate absorbed %d entr(y/ies), total=%d", added, len(self._entries))

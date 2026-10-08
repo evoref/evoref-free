@@ -36,6 +36,13 @@ _CALCULATE_CONTEXT_TURNS = 4
 #: 長い会話でもプロンプトは有界に収まる。層5.95 は分類器が no_tool を返した
 #: 差分クエリでしか走らないため、prefix キャッシュへの影響も限定的。
 _SYNTHESIS_CONTEXT_TURNS = 120
+
+#: 被演算子をすべて会話から取る問い (層 5.95 の implicit_operands) の窓。この入口は
+#: 一般知識の量の問い (「睡眠時間は何時間が目安」) でも開き、合成器が棄権して終わる回が多い。
+#: 全会話を載せると棄権の 1 往復が prefill で 10 秒を超える (2026-10-08 実ログ: 20 メッセージの
+#: 会話で pre_gen 16〜20 秒、分類器 + 合成の 2 往復)。直前の答えを含む直近だけで足りる
+#: 形に限った入口なので、窓だけ狭める。
+_IMPLICIT_SYNTHESIS_CONTEXT_TURNS = 12
 def _dialogue_text(
     conversation: list[dict] | None, turns: int | None = None,
 ) -> str:
