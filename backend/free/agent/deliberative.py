@@ -2291,15 +2291,28 @@ class DeliberativeAgent:
         system ロールを assistant の後に挿入すると Qwen3.5 等の ChatML
         テンプレートで 400 エラーになるため、必ず user に統合する。
         """
+        args = tool_args if isinstance(tool_args, dict) else {}
+        expression = (
+            str(args.get("expression") or "") if tool_name == "calculate" else ""
+        )
+        dialogue = "\n".join(
+            str(m.get("content") or "") for m in messages[:-1]
+            if m.get("role") in ("user", "assistant")
+        )
         # 根拠台帳 (f_04 §2.2): 判定の結果を経験へ刻めるよう request scope へ積む。
-        # 応答は変えない (受動記録)。
+        # 応答は変えない (受動記録)。式の被演算子が履歴から来ていれば、結果は問いの
+        # 計算として信頼できない — 採用ゲートが「結果の無視」を欠陥に数えるかの根拠
+        # (f_04 §4.5、2026-10-08)。
         record_grounding(
             unexplained_numbers=unexplained_numbers,
             expression_issues=expression_issues,
             unexplained_date_math=unexplained_date_math,
+            calculate_history_operands=(
+                conversation_operands(expression, query, dialogue)
+                if expression and query else None
+            ),
         )
         truncated = _truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS)
-        args = tool_args if isinstance(tool_args, dict) else {}
         if tool_name == "calculate":
             expression = str(args.get("expression") or "").strip()
             if expression:
@@ -2347,13 +2360,6 @@ class DeliberativeAgent:
             person_note = (
                 _localized(_REFOCUS_PERSON_NOTES)
                 if _FIRST_PERSON_RE.search(q) else ""
-            )
-            expression = (
-                str(args.get("expression") or "") if tool_name == "calculate" else ""
-            )
-            dialogue = "\n".join(
-                str(m.get("content") or "") for m in messages[:-1]
-                if m.get("role") in ("user", "assistant")
             )
             # 訂正のターン (会話の値を差し替える) だけ。訂正でないターンで
             # 「/12」のような定数が会話の数値と偶然一致しても切り替えない。

@@ -97,6 +97,10 @@ class _Scope:
     unexplained_numbers: list[str] | None = None
     expression_issues: list[str] | None = None
     unexplained_date_math: bool | None = None
+    #: calculate の式の数値のうち、問いに無く会話の履歴にだけあったもの
+    #: (``tool_judge_grounding.conversation_operands``)。``None`` = calculate を
+    #: 判定していない。空 = 被演算子は問いの中だけ (結果を問いの計算として信頼できる)。
+    calculate_history_operands: list[str] | None = None
     #: RAG の便益の観測 (2026-09-14)。``rag_used`` = 検索が何か注入したか、
     #: ``rag_abstained`` = 注入したのに「参考情報には無い」と差し控えたか、
     #: ``rag_cited`` = 応答が ``[参考情報]`` を引用したか。経験記録
@@ -166,15 +170,22 @@ def record_grounding(
     unexplained_numbers: tuple[str, ...] | list[str] = (),
     expression_issues: tuple[str, ...] | list[str] = (),
     unexplained_date_math: bool = False,
+    calculate_history_operands: tuple[str, ...] | list[str] | None = None,
 ) -> None:
     """ツール判定が出した接地の疑義を積む (同一ターンに複数回なら和を取る)。
 
     呼ばれた時点で「判定を通った」ことになるので、疑義が無くても ``None`` から
     ``[]`` / ``False`` へ変わる (未判定とクリーンを区別する、c_05 §0.5)。
+    ``calculate_history_operands`` は calculate を判定したときだけ渡す (``None`` は
+    積まない)。
     """
     scope = _scope.get()
     if scope is None:
         return
+    if calculate_history_operands is not None:
+        scope.calculate_history_operands = list(
+            scope.calculate_history_operands or [],
+        ) + [str(n) for n in calculate_history_operands]
     scope.unexplained_numbers = list(scope.unexplained_numbers or []) + [
         str(n) for n in unexplained_numbers
     ]
@@ -197,6 +208,14 @@ def current_grounding() -> tuple[list[str] | None, list[str] | None, bool | None
     if scope is None:
         return None, None, None
     return scope.unexplained_numbers, scope.expression_issues, scope.unexplained_date_math
+
+
+def current_calculate_history_operands() -> list[str] | None:
+    """calculate の式の被演算子のうち履歴にだけあったもの。calculate 未判定は None。"""
+    scope = _scope.get()
+    if scope is None or scope.calculate_history_operands is None:
+        return None
+    return list(scope.calculate_history_operands)
 
 
 def record_rag_signals(**signals: bool | None) -> None:

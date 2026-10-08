@@ -60,6 +60,7 @@ from backend.free.core.relative_date import (
 from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
 from backend.free.core.response_dates import extract_tool_anchor
 from backend.free.core.verifier_events import (
+    current_calculate_history_operands,
     current_grounding,
     current_tool_decision,
     current_tool_uses,
@@ -1418,6 +1419,13 @@ class FeedbackCollector:
         abstain_kind = rag_abstain_kind(gen_config, signals.rag_abstained, response)
         if abstain_kind:
             signals._extra = {**(signals._extra or {}), "rag_abstain_kind": abstain_kind}
+        # calculate の式の被演算子のうち履歴にだけあったもの (空 = 問いの中だけ)。
+        # 採用ゲートは空のときだけ「結果の無視」を欠陥に数える (f_04 §4.5)。
+        history_operands = current_calculate_history_operands()
+        if history_operands is not None:
+            signals._extra = {
+                **(signals._extra or {}), "calculate_history_operands": history_operands,
+            }
         # RAG の便益を結末 JSONL へ (turn_outcome と同じ通路、2026-09-14)。
         record_rag_signals(
             rag_used=signals.rag_used, rag_abstained=signals.rag_abstained,
