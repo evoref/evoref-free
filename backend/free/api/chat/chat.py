@@ -48,7 +48,12 @@ from backend.free.agent.file_reference_gate import (
     recent_file_context,
     recent_file_reference_verdict,
 )
-from backend.free.agent.router import indicates_write_destination
+from backend.free.agent.router import (
+    indicates_write_destination,
+    names_binary_office_deliverable,
+    names_spreadsheet_deliverable,
+    names_structured_data_deliverable,
+)
 from backend.free.core.predicate import Verdict
 from backend.free.agent.tool_call_judge import (
     _extract_file_path,
@@ -1675,7 +1680,10 @@ def _plan_output_target(
         # 「add.py に保存せず」まで file に倒す、の両方が起きていた (2026-09-25)。
         # create は依頼文全体が成果物の仕様なので依頼節に絞らない (ルータの
         # ``create_write_destination`` と同じ本文を見る)
-        if indicates_write_destination(req.message, whole_request=True):
+        if (
+            indicates_write_destination(req.message, whole_request=True)
+            or names_binary_office_deliverable(req.message)
+        ):
             target = "file"
         elif detect_editor_route(req.message) == "chat":
             target = "chat"
@@ -3576,6 +3584,14 @@ async def _chat_turn(req: ChatRequest, state: AppState):
                             and selected_template.outline_path is not None
                         ),
                     )
+                    if (
+                        names_spreadsheet_deliverable(req.message)
+                        or names_structured_data_deliverable(req.message)
+                    ):
+                        # 表計算 / 構造化データの成果物は長文の散文生成では作れない (表が無く Writer が
+                        # no_table_data で落ちる / 解説文が .yaml で書かれる)。制作ステージを使わず
+                        # write-fast と同じ単発生成へ落とす。
+                        production_stage = None
                 elif plan.is_long_form:
                     return await _dispatch_long_form(
                         req, client, state, cfg, gen_params, session_id,

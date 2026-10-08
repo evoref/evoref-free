@@ -306,6 +306,13 @@ def is_table_output(file_path: str) -> bool:
 #: 画像 / 図形を実体化できる出力形式 (docs/f_11_file_export.md §3.1)。
 #: ``RICH_TABLE_OUTPUT_EXTS`` は「取得済みテーブルを決定論的に書く」対象の
 #: 集合なので ODF を含まない。画像・図形の案内はそれとは別の軸で決める。
+#: エディタに表示できないバイナリの Office 形式。create の依頼がこの名前の成果物を
+#: 名指したら、保存動詞が無くても保存先として扱う (エディタには本文が出るだけで、
+#: 実ファイルが作られず「まだ保存していません」のまま終わる)。
+BINARY_OFFICE_EXTS: frozenset[str] = frozenset(
+    {".xlsx", ".xls", ".ods", ".docx", ".pptx", ".odt", ".odp"},
+)
+
 MEDIA_CAPABLE_OUTPUT_EXTS: frozenset[str] = frozenset(
     {".docx", ".pptx", ".odt", ".odp"},
 )

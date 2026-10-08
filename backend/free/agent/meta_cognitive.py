@@ -15,6 +15,11 @@ from backend.free.agent.context_budget import (
 )
 from backend.free.core.session_mode import is_create_mode
 from backend.free.agent.event_reminder import EventReminderSystem
+from backend.free.agent.router import named_deliverable_names
+from backend.free.harness.delivery_contract import (
+    missing_named_deliverables,
+    structured_parse_error,
+)
 from backend.free.agent.self_cartridge import (
     AgentConstants,
     contains_self_reference,
@@ -1594,6 +1599,15 @@ class MetaCognitiveAgent(
              if a.filename and a.filename not in AS_BUILT_DOC_NAMES), "",
         )
         shared_root = Path(anchor_relative_output_path("x")).parent
+        # 納品契約 (harness/delivery_contract.py): 依頼が名指した新規ファイルが成果物に
+        # 在るか、.yaml/.json が形式として読めるか。違反は成功と報告しない
+        expected_names = [
+            n for n in named_deliverable_names(original_query)
+            if not Path(anchor_relative_output_path(
+                self._resolve_write_path_from_query(n, original_query),
+            )).exists()
+        ]
+        format_errors: list[str] = []
         for art in artifacts:
             filename = art.filename or named_target or self._fallback_artifact_filename(
                 art, original_query,
@@ -1624,6 +1638,9 @@ class MetaCognitiveAgent(
             # 上書きの門 (§4.y) は掛けない — 退避と delivery の replaced が置き換えを見せるので、
             # 作り直し・手直し (別のセッションからを含む) は既存の成果物を書き換えてよい。
             # 門で断るとこのループが理由も中身も無い失敗に畳む (2026-10-05 H1 / 3 周目)
+            format_error = structured_parse_error(filename, art.content)
+            if format_error:
+                format_errors.append(format_error)
             with record_backups() as backups, overwrite_exempt():
                 _text, entries = await self._write_file(
                     file_path, art.content, tools_registry, on_step, prefix,
@@ -1656,6 +1673,13 @@ class MetaCognitiveAgent(
                 f"{len(failed_paths)} file(s) failed to write: {', '.join(failed_paths)}"
             )
             incomplete = f"{incomplete}, {write_reason}" if incomplete else write_reason
+        contract = [
+            f"named file not produced: {n}"
+            for n in missing_named_deliverables(expected_names, written_paths)
+        ] + format_errors
+        if contract:
+            contract_reason = "; ".join(contract)
+            incomplete = f"{incomplete}, {contract_reason}" if incomplete else contract_reason
         if incomplete:
             # 書けた分は残すが、タスクは失敗として数える (成功と報告しない)。
             # 書いたパスは結果に残す — 最終応答が「書き込みが実行されません

@@ -159,6 +159,30 @@ def _extension_only_on_bare_names(hits: list[str], text: str) -> bool:
     )
 
 
+#: 文書として書く宛先の拡張子。コードの拡張子を同時に名指していなければ、成果物は文書。
+_DOCUMENT_DESTINATION_EXTS = frozenset({".md", ".markdown", ".txt", ".rst"})
+
+
+def _writes_document_destination(instruction: str) -> bool:
+    """依頼が文書 (.md / .txt) だけを **保存先** として名指しているか。
+
+    「ER図とテーブル定義書を reservation_er.md に保存して」は「ER図」「テーブル」の語で
+    コード生成に倒れ、Python 5 本が出て指名の .md が作られなかった (2026-10-08 実機)。
+    宛先が文書なら成果物は文書。コードの拡張子や実装言語が一緒に名指されていれば従来の判定へ。
+    """
+    from backend.free.agent.router import indicates_write_destination, named_deliverable_exts
+
+    if _IMPLEMENTATION_LANGUAGE_RE.search(instruction):
+        # 実装言語が名指されていれば、文書は作るプログラムの出力先 (「…集計し、結果を report.md に書く」)
+        return False
+    exts = named_deliverable_exts(instruction)
+    return (
+        bool(exts)
+        and exts <= _DOCUMENT_DESTINATION_EXTS
+        and indicates_write_destination(instruction, whole_request=True)
+    )
+
+
 def detect_content_type(instruction: str, mode: str) -> ContentType:
     """コンテンツ種別を判定
 
@@ -176,6 +200,8 @@ def detect_content_type(instruction: str, mode: str) -> ContentType:
         return ContentType.TEXT
 
     if is_create_mode(mode):
+        if _writes_document_destination(instruction):
+            return ContentType.TEXT
         text_view = _mask_input_file_paths(instruction)
         hits = [p for p in TEXT_PATTERNS_ALL if re.search(p, text_view)]
         if hits and not _extension_only_on_bare_names(hits, text_view):

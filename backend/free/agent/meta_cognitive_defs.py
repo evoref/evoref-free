@@ -59,7 +59,7 @@ Plan a SINGLE write task that writes the content to the file. Do NOT plan to "ge
 Python/openpyxl/VBA script" and do NOT plan to "run/execute" a script — the system renders \
 the content into the real .xlsx/.docx/.pptx automatically.
   BAD  (user asked for an Excel calendar): {"tasks": ["Generate a Python script that creates the Excel file", "Execute the generated script"]}
-  GOOD (user asked for an Excel calendar): {"tasks": ["Write this month's calendar to the user's specified path"]}
+  GOOD (user asked for an Excel calendar): {"tasks": ["Write the <calendar the user asked for> to the file the user named"]}
 - Only split into multiple tasks when genuinely different files or operations are needed.
 - Each task should have a SINGLE action type. Do NOT combine "fetch/read" and "write/create" \
 in one task.
@@ -72,8 +72,8 @@ as the task — do NOT plan to create files.
 - Fetching a URL and saving its data to a file is exactly TWO tasks: fetch, then write. \
 Do NOT add separate "extract", "generate the file", or "save" steps — extracting the data \
 and creating the file both happen inside the single write task.
-  BAD:  {"tasks": ["Fetch the URL", "Extract the results", "Generate the Excel file", "Save it to <path>"]}
-  GOOD: {"tasks": ["Fetch the URL content", "Write the results to the user's specified path"]}
+  BAD:  {"tasks": ["Fetch the URL", "Extract the results", "Generate the Excel file", "Save it to the file the user named"]}
+  GOOD: {"tasks": ["Fetch the URL content", "Write the <results> to the file the user named"]}
 - Each task should be self-contained and produce a concrete result.
 
 Example: {"tasks": ["Read foo.py", "Generate refactored code", "Run tests"], "kinds": ["retrieve", "write", "other"]}
