@@ -102,6 +102,9 @@ runtime:
 # |      16,384 | q8_0/q4_1 |      ~1280 MB  |    ~4.0 GB   |  ← K/V非対称
 # |      32,768 | q4_0/q4_0 |      ~2048 MB  |    ~4.7 GB   |  ← slots:1推奨
 #
+# ※ slots: 1 では自己学習 (Level 1 / Level 2) は停止する (背景生成が chat を塞ぐため。記憶は動く)。
+#    学習を使うなら slots >= 2。
+#
 # --- 長コンテキスト設定レシピ ---
 # ■ 8K コンテキスト（VRAM 4GB〜）:
 #   context_size: 8192, cache_type_k: q8_0, cache_type_v: q8_0
@@ -986,7 +989,6 @@ learning:
   tool_pattern_boost_success: 0.03    # 成功時のブースト量
   tool_pattern_decay_false_pos: 0.1   # 誤検出時の減衰量
   tool_pattern_match_threshold: 0.4   # マッチ閾値（通常パターンより高め）
-  long_form_pattern_boost_success: 0.03   # long_form 成功時のブースト量
   long_form_pattern_decay_false_pos: 0.1  # long_form 誤検出時の減衰量
   long_form_pattern_match_threshold: 0.4  # 学習済み long_form パターンの一致閾値 (router)
   # Few-shot プール

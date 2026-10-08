@@ -542,8 +542,8 @@ class CritiqueSynthesizer:
     ) -> CritiqueResult:
         """SemMem の ``failure_pattern`` ファクト群から共通失敗要因を合成する。
 
-        疑似経験レコード (``signals.user_correction`` に failure summary、
-        ``mode="create"``) に変換し、既存 ``critique()`` を再利用する。
+        疑似経験レコード (``turn_outcome="failed"`` と ``turn_outcome_reason`` に
+        failure summary、``mode="create"``) に変換し、既存 ``critique()`` を再利用する。
 
         Args:
             cluster_facts: ``failure_pattern`` を 1 クラスタ分解して dict
@@ -580,11 +580,17 @@ class CritiqueSynthesizer:
                 if isinstance(last_actions, (list, tuple))
                 else str(last_actions)
             )
+            # 失敗要約は検証器の理由の通路 (turn_outcome_reason) で運ぶ。
+            # ``user_correction`` に入れると、ユーザーが訂正していないのに
+            # 訂正として数えられる (不変則 #12。「High correction rate」の誤報)。
             pseudo_experiences.append({
                 "mode": "create",
                 "query": str(obj.get("title") or fact.get("subject", ""))[:200],
                 "signals": {
-                    "user_correction": f"{outcome}: {last_actions_text}"[:300],
+                    "turn_outcome": "failed",
+                    "turn_outcome_reason": (
+                        f"failure_pattern: {outcome}: {last_actions_text}"[:300]
+                    ),
                     "agent_loops": int(obj.get("occurrences", 1)),
                 },
             })

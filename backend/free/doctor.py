@@ -59,6 +59,7 @@ _HISTORY_SESSION = "history.session"
 _HISTORY_TURNS = "history.turns"
 _EXPERIENCE = "learning.experience"
 _ADAPTER_META = "pro.adapter_versions"
+_PROMPT_ADOPTION = "learning.prompt_adoption"
 _TURNS_SUFFIX = ".turns.jsonl"
 
 
@@ -208,6 +209,7 @@ def _check_jsonl(
     stats = report.stats(spec)
     torn = newer = unversioned = 0
     experience = spec.format_id == _EXPERIENCE
+    adoption = spec.format_id == _PROMPT_ADOPTION
     ids: Counter[str] = Counter()
     try:
         f = path.open("rb")
@@ -237,6 +239,8 @@ def _check_jsonl(
                 newer += 1
             if experience and obj.get("op") != "patch" and obj.get("id"):
                 ids[str(obj["id"])] += 1
+            if adoption and version is not None and version <= spec.version:
+                _collect_adoption_refs(obj, collected)
     stats.torn += torn
     stats.newer_rows += newer
     stats.unversioned_rows += unversioned
@@ -460,6 +464,27 @@ def _check_history(report: _Report, collected: dict[str, Any]) -> None:
     }
 
 
+def _collect_adoption_refs(row: dict[str, Any], collected: dict[str, Any]) -> None:
+    """採用台帳の 1 行が指す経験 ID を集める (経験はローテーションするので弱い参照)。"""
+    collected["adoption_rows"] += 1
+    cases = row.get("cases")
+    for case in cases if isinstance(cases, list) else ():
+        refs = case.get("experience_ids") if isinstance(case, dict) else None
+        if isinstance(refs, list):
+            collected["adoption_experience_refs"].extend(str(i) for i in refs if i)
+
+
+def _check_adoption_refs(report: _Report, collected: dict[str, Any]) -> None:
+    """採用台帳の経験 ID のうち経験ファイルに無いものを数える (宙に浮いても誤りではない)。"""
+    refs = collected["adoption_experience_refs"]
+    missing = sum(1 for ref in refs if ref not in collected["experience_ids"])
+    report.sections["adoption_references"] = {
+        "rows": collected["adoption_rows"], "checked": len(refs), "missing": missing,
+    }
+    if missing:
+        report.add("info", "adoption_reference_missing", format_id=_PROMPT_ADOPTION, count=missing)
+
+
 def _check_weak_refs(report: _Report, collected: dict[str, Any]) -> None:
     refs = collected["weak_experience_refs"]
     missing = sum(1 for ref in refs if ref not in collected["experience_ids"])
@@ -544,8 +569,13 @@ def _app_section(edition: str) -> dict[str, Any]:
 # ── 入口 ──
 
 
-def run_doctor(data_root: Path, *, edition: str | None = None) -> dict[str, Any]:
+def run_doctor(
+    data_root: Path, *, edition: str | None = None, active_model_key: str | None = None,
+) -> dict[str, Any]:
     """データ根を検査して報告 (JSON にできる dict) を返す。``store/`` には書かない。
+
+    ``active_model_key`` は Level 1 が学習するパーティション (``learning_health`` の
+    ``unlearned_partitions`` に使う。分からなければ空)。
 
     Raises:
         DoctorError: データ根が無い。
@@ -572,6 +602,8 @@ def run_doctor(data_root: Path, *, edition: str | None = None) -> dict[str, Any]
         "experience_ids": Counter(),
         "experience": {"files": 0, "records": 0, "ignored": 0},
         "weak_experience_refs": [],
+        "adoption_rows": 0,
+        "adoption_experience_refs": [],
     }
     with _no_store_writes(store_dir):
         _check_location(report, data_root)
@@ -597,8 +629,20 @@ def run_doctor(data_root: Path, *, edition: str | None = None) -> dict[str, Any]
         _check_evidence(report, data_root, memory_manifests)
     _check_history(report, collected)
     report.sections["experience"] = collected["experience"]
+    report.sections["learning_health"] = _learning_health(data_root, active_model_key)
     _check_weak_refs(report, collected)
+    _check_adoption_refs(report, collected)
     return report.to_dict()
+
+
+def _learning_health(data_root: Path, active_model_key: str | None) -> dict[str, Any]:
+    """自己学習の信号の量と判定 (``health_report``)。読めなければ空 (表示しない)。"""
+    from backend.free.learning.health_report import health_snapshot
+
+    try:
+        return health_snapshot(data_root, active_model_key=active_model_key)
+    except Exception:  # noqa: BLE001 — 点検の補助情報。失敗で doctor を止めない
+        return {}
 
 
 def exit_code(report: dict[str, Any]) -> int:

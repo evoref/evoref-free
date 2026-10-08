@@ -121,6 +121,12 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
                 full_outcome = "failed"
                 # Full が失敗しても Level 1 は要求として積む
 
+    if scheduler.single_slot is True:
+        raise api_error(
+            409, "E0409", "Self-learning is stopped on a single llama slot",
+            "api.learning_single_slot",
+        )
+
     # 優先キューに manual 要求を push（LLM 未接続でも OK）
     req_obj = PriorityRequest(
         reason="manual",
@@ -232,6 +238,9 @@ def _annotate_level1_gate(
     if status.is_disabled:
         status.level1_blocked_reason = "learning_disabled"
         return
+    if status.single_slot:
+        status.level1_blocked_reason = "single_slot"
+        return
     if status.running:
         status.level1_blocked_reason = "already_running"
         return
@@ -239,7 +248,9 @@ def _annotate_level1_gate(
     gate_fn = getattr(sleep_scheduler, "level1_gate_status", None)
     if gate_fn is None:
         # ゲートが読めない構成では従来どおり経験件数だけで答える。
-        if not status.conditions_met:
+        if status.deferred_reason:
+            status.level1_blocked_reason = status.deferred_reason
+        elif not status.conditions_met:
             status.level1_blocked_reason = "insufficient_experiences"
         return
     gate = gate_fn()
@@ -255,6 +266,9 @@ def _annotate_level1_gate(
         status.level1_blocked_reason = "deferred_by_full_cycle"
     elif gate.get("user_active"):
         status.level1_blocked_reason = "user_active"
+    elif status.deferred_reason:
+        # run_or_resume_level1 の入口で止まる。resume / 優先キューの経路も同じ入口を通る。
+        status.level1_blocked_reason = status.deferred_reason
     elif has_pending_work:
         # 次 tick で走る。止まってはいない。
         status.level1_blocked_reason = None
@@ -332,6 +346,9 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
     return SchedulerStatusModel(
         running=raw.get("running", False),
         is_disabled=raw.get("is_disabled", False),
+        single_slot=raw.get("single_slot", False),
+        deferred_reason=raw.get("deferred_reason"),
+        deferred_since=raw.get("deferred_since"),
         experience_count=raw.get("experience_count", 0),
         new_experience_count=raw.get("new_experience_count", 0),
         min_experiences=raw.get("min_experiences", 0),

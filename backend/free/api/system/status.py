@@ -19,6 +19,7 @@ from backend.free.api.schemas import (
     DebugStatusInfo,
     EmbedPlacementInfo,
     LivenessAlertModel,
+    LearningHealthInfo,
     LlamaServerInfo,
     MemoryStats,
     ModelInfo,
@@ -278,6 +279,7 @@ async def get_status(state: AppState = Depends(get_app_state)):
 
     cart_mgr = getattr(state, "cartridge_manager", None)
     cartridges_loaded = cart_mgr.loaded_count if cart_mgr is not None else 0
+    learning_health = await _learning_health()
     return StatusResponse(
         status=status,
         edition=current_edition().name.lower(),
@@ -306,7 +308,31 @@ async def get_status(state: AppState = Depends(get_app_state)):
         rerank=_rerank_status(state),
         embed_placement=_embed_placement(state),
         auto_tune=_auto_tune(state),
+        learning_health=learning_health,
     )
+
+
+async def _learning_health() -> LearningHealthInfo:
+    """経験の全走査 (5 分メモ化) を executor で回す。読めなければ既定 (保留) を返す。"""
+    import asyncio
+    import functools
+
+    from backend.config import get_path_resolver
+    from backend.free.learning.health_report import cached_health_snapshot
+    from backend.trace_context import run_in_executor_with_context
+
+    try:
+        resolver = get_path_resolver()
+        snap = await run_in_executor_with_context(
+            asyncio.get_running_loop(), None, functools.partial(
+                cached_health_snapshot, resolver.data_root,
+                active_model_key=resolver.active_model_key,
+            ),
+        )
+        return LearningHealthInfo(**snap)
+    except Exception as e:  # noqa: BLE001 — 観測の失敗で /api/status を落とさない
+        logger.debug("learning_health unavailable: %s", e)
+        return LearningHealthInfo()
 
 
 def _rerank_status(state: AppState) -> RerankStatusInfo:

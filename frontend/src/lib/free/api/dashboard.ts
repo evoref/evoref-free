@@ -22,6 +22,19 @@ export interface Level1ResultEntry {
 	/** base prompt 採用ゲートの実測値 (現行 / 候補の judge 平均) */
 	measured_before?: number | null;
 	measured_after?: number | null;
+	/** 採用ゲートの種類 (pairwise のとき measured_* は null で、勝敗が下に載る) */
+	gate?: string | null;
+	wins?: number | null;
+	losses?: number | null;
+	ties?: number | null;
+	/** 現行 vs 現行 (カナリア) の |純勝ち| */
+	noise_floor?: number | null;
+	/** 一対比較で採用候補になったときだけ測る標本 (成功ターン) の勝敗 */
+	sample_wins?: number | null;
+	sample_losses?: number | null;
+	sample_ties?: number | null;
+	/** 失敗の証拠があったのに評価ケースにしなかった件数 (除外理由 → 件数) */
+	excluded?: Record<string, number> | null;
 }
 
 /** ポリシー進化ドメインの状態（Pro） */
@@ -70,6 +83,8 @@ export interface Level2TargetStatus {
 	version: number;
 	/** 蓄積中の発火データ数（失敗数） */
 	experiences_current: number;
+	/** 総経験数 */
+	experiences_total?: number;
 	bootstrap_min: number;
 	spsa_min: number;
 	cvector_min: number;
@@ -113,6 +128,7 @@ export interface SchedulerStatus {
 	running: boolean;
 	/** `--no-learning` 起動中かどうか (true の間は Level 1/2 が no-op) */
 	is_disabled?: boolean;
+	single_slot?: boolean;
 	experience_count: number;
 	new_experience_count: number;
 	min_experiences: number;
@@ -126,6 +142,10 @@ export interface SchedulerStatus {
 	level1_blocked_reason: string | null;
 	/** waiting_for_idle のとき、アイドル成立までの残り秒数 */
 	level1_seconds_until_idle: number | null;
+	/** Level 1 を延期している理由 (serving_another_partition = create_model 等が載っている) */
+	deferred_reason?: string | null;
+	/** 延期が始まった時刻 (ISO 8601 UTC)。延期していなければ null */
+	deferred_since?: string | null;
 	last_level1_run: string | null;
 	last_level2_run: string | null;
 	/** 実行中の Level 2 対象（"base"/null） */
@@ -180,6 +200,8 @@ export interface DashboardLearningData {
 	running_target: string | null;
 	/** Level 2 (LoRA) の状態（Pro のみ非 null） */
 	level2: Level2Status | null;
+	/** `--no-learning` 起動中 (true の間は学習が no-op) */
+	is_disabled: boolean;
 	lora_version: number;
 	lora_adapter_exists: boolean;
 	eval_cases_count: number;

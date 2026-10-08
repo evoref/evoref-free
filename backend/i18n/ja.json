@@ -22,6 +22,7 @@
     "learning_full_deferred": "Full sleep-time 更新は予約済みです (このまま裏で実行されます)。",
     "learning_full_skipped": "今回は Full sleep-time 更新を見送りました。",
     "learning_disabled": "自己学習は無効化されています",
+    "learning_single_slot": "自己学習 (Level 1/2) は llama.slots が 1 のため停止しています (2 以上にすると有効)",
     "learning_not_enough_experiences": "経験が不足しています: {available} < {required}",
     "learning_level1_queued": "Level 1 を手動要求としてキューに登録しました (経験 {count} 件, 順位={position})",
     "optimize_level2_requires_pro": "Level 2 最適化は Pro エディション限定です",
@@ -304,6 +305,8 @@
     "doctor_scanned": "{formats} 種類の形式・{files} ファイルを検査しました。",
     "doctor_evidence": "記憶 {store}: {total} 件 (有効 {live} / 取り消し {retracted} / 置き換え済み {superseded} / 未知の値 {ignored})",
     "doctor_history": "履歴: 閉じたセッション {sessions} 件 / 進行中 {active} 件、経験 {experience} 件",
+    "doctor_learning_health": "学習の信号: 判定 {verdict} (ターン {turns} 件、検出された失敗 {failures} 件、検証済み訂正 {corrections} 件、期間 {span} 日 / 利用のあった日 {active} 日)",
+    "doctor_learning_unlearned": "Level 1 は active のパーティションだけを学習する。{model_key} の経験 {experiences} 件は学習されない",
     "doctor_summary": "エラー {errors} 件 / 警告 {warnings} 件 / 情報 {info} 件",
     "doctor_failed": "検査を実行できませんでした: {detail}",
     "doctor_bundle_written": "不具合報告の束を書きました: {path} (記憶・履歴の本文は含みません)",
@@ -340,6 +343,7 @@
       "experience_ignored": "未知の値を持つ経験が {count} 件あります (保持したまま使っていません)",
       "experience_foreign_model_key": "別のモデル ({detail}) が生成した経験が {count} 件、このパーティションに入っています (移送はしません。このパーティションの学習の入力になります)",
       "weak_reference_missing": "{format_id}: 共有データへの弱い参照 {count} 件の宛先がありません (動作には影響しません)",
+      "adoption_reference_missing": "{format_id}: プロンプト採用の根拠の経験 {count} 件が経験ファイルにありません (ローテーション済み。動作には影響しません)",
       "location_unsafe": "データ根がネットワークドライブ / OneDrive の下にあります ({detail})",
       "location_weak_fs": "データ根のファイルシステム ({detail}) はジャーナルが無く、書き込みの順序保証が弱いです",
       "other_generations": "このバージョン以外のデータ世代のフォルダがあります ({detail})。このバージョンは使いません"
@@ -635,7 +639,8 @@
     "write_denied": {
       "outside_request_roots": "{path} は依頼で挙げられたフォルダの外なので、書き込みませんでした。保存先のフォルダを依頼の中で指定してください。",
       "protected_root": "{path} は evoref の設定・データ・実行環境の置き場なので、書き込みませんでした。",
-      "invalid_path": "{path} は保存先として使えない形のパスなので、書き込みませんでした (相対の .. ・ドライブ直下からのパス・予約名など)。",
+      "invalid_path": "{path} は保存先として使えない形のパスなので、書き込みませんでした (相対の .. ・ドライブ直下からのパス・予約名など)。"
+,
       "existing_not_target": "既にある {path} は、依頼の中で書き込み先として挙げられていないので、上書きしませんでした。ファイルに保存するときは、保存先のファイル名を依頼の中で指定してください。",
       "existing_not_kept": "既にある {path} は、書こうとした内容が元の内容をほとんど引き継いでいない (別の内容で置き換えることになる) ので、上書きしませんでした。このファイルを置き換えてよければ「{path} に上書きして」のように指定し、別に保存するときは新しいファイル名を指定してください。"
     },

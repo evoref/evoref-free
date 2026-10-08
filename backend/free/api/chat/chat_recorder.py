@@ -1165,7 +1165,10 @@ def _generation_delta_version(mode: str) -> str | None:
     """
     try:
         from backend.config import get_path_resolver
-        from backend.free.learning.generation_delta_store import GenerationDeltaStore
+        from backend.free.learning.generation_delta_store import (
+            GenerationDeltaStore,
+            delta_version,
+        )
 
         resolver = get_path_resolver()
         path = resolver.learning_path_for(
@@ -1175,7 +1178,8 @@ def _generation_delta_version(mode: str) -> str | None:
     except Exception as exc:  # noqa: BLE001 - 帰属の素性が取れなくても記録は続ける
         logger.debug("generation delta version unavailable (mode=%s): %s", mode, exc)
         return None
-    return _content_hash(deltas)
+    # 採用後監視 (scheduler) が同じ関数で版を引き、窓を切る
+    return delta_version(deltas)
 
 
 def _gen_config_with_template(
@@ -1435,6 +1439,9 @@ def _record_turn(
                 stated_context=_stated_context(messages, tool_result_text),
                 calculate_result=_calculate_result_in_prompt(sent),
                 tool_result_text=tool_result_text,
+                # 採用ゲートがツール根拠のターンを同じ入力で再生する (f_04 §4.5)。
+                # ブロックがプロンプトに無いターン (空文字) は残らない。
+                tool_context=tool_result_text,
                 truncated=truncated,
                 generation_failed=generation_failed or not body.strip(),
                 session_id=session_id,

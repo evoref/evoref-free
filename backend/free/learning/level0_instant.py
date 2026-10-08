@@ -92,6 +92,14 @@ RULES_HASH_KEY = "rules_hash"
 #: ``GenerationConfigRef._extra`` に置く、そのモードに当てた生成パラメータのデルタ
 #: (``generation_deltas.json``) の版。ファイルが版を持たないのでデルタの内容ハッシュ。
 GENERATION_DELTA_VERSION_KEY = "generation_delta_version"
+#: ``GenerationConfigRef._extra`` に置く、プロンプトへ注入したツール結果ブロック
+#: (``## ツール実行結果`` 以降)。採用ゲートがツール根拠のターンを同じ入力で再生する
+#: (f_04 §4.5、``learning.case_filters.replay_context``)。
+TOOL_CONTEXT_KEY = "tool_context"
+#: ``tool_context`` を :data:`TOOL_CONTEXT_CAP` で切ったときに立てる印 (再生しない)。
+TOOL_CONTEXT_TRUNCATED_KEY = "tool_context_truncated"
+#: ``tool_context`` に残す最大文字数。
+TOOL_CONTEXT_CAP = 1500
 
 
 def used_corpus_evidence(experience: dict) -> bool:
@@ -713,6 +721,9 @@ class ExperienceBuffer:
         # 差分の計算と enqueue を 1 つにする (sleep-time の executor とループの
         # 両方から来る。先に差分を取った方が後から enqueue すると古い値が勝つ)。
         self._persist_lock = threading.RLock()
+        #: 中身を書き換えるたびに増やす世代 (読み手のメモ化キー)。件数と末尾の
+        #: 時刻はその場の書き換え (👎・訂正の格下げ) では変わらないので足りない。
+        self.revision = 0
 
     @property
     def writer(self) -> ChatWriter:
@@ -743,6 +754,7 @@ class ExperienceBuffer:
         target = Path(path)
         parsed, ignored, stats = self._read_file(target)
         with self._persist_lock:
+            self.revision += 1
             self.entries = parsed
             self.bound_path = target
             self._reset_tracking()
@@ -817,6 +829,7 @@ class ExperienceBuffer:
             return
         parsed, _ignored, stats = self._read_file(target)
         with self._persist_lock:
+            self.revision += 1
             key = self._norm(target)
             self._partitions[key] = _PartitionFile(
                 target, lines=stats["lines"], newer=bool(stats["newer"]),
@@ -880,6 +893,7 @@ class ExperienceBuffer:
         エントリでそのファイルを書き直す (他のパーティションのエントリは混ぜない)。
         """
         target = Path(path)
+        self.revision += 1
         if self.bound_path is not None and self._same(target, self.bound_path):
             self.flush()
             if self._lines > self._record_count:
@@ -963,6 +977,7 @@ class ExperienceBuffer:
 
     def touch(self, *entries: ExperienceEntry) -> None:
         """エントリを書き換えたことを知らせる (次の保存で patch 行を出す)。"""
+        self.revision += 1
         for entry in entries:
             self._touched[id(entry)] = entry
 
@@ -976,6 +991,8 @@ class ExperienceBuffer:
         self._persist([] if touched_only else self.entries)
 
     def _persist(self, candidates: list[ExperienceEntry]) -> None:
+        # 書き換えの知らせは保存の可否 (autosave / 未束縛) と無関係に数える。
+        self.revision += 1
         if not self.autosave or self.bound_path is None or self._newer_on_disk:
             return
         with self._persist_lock:

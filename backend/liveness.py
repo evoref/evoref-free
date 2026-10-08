@@ -186,6 +186,14 @@ class LivenessLedger(VersionedJsonFile):
         with self._lock:
             self._stages.pop(stage, None)
 
+    def forget_prefix(self, prefix: str) -> int:
+        """接頭辞に合う段をすべて台帳から消す (``evoref reset --learning`` 用)。消した件数を返す。"""
+        with self._lock:
+            names = [name for name in self._stages if name.startswith(prefix)]
+        for name in names:
+            self.forget(name)
+        return len(names)
+
     def record_error(
         self, stage: str, *, code: str, failure_class: str = "transient",
     ) -> None:

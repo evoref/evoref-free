@@ -341,6 +341,18 @@ def _split_key(key: str) -> tuple[str, str] | None:
     return (domain, mode) if sep else None
 
 
+def _policy_generation_of(experience: dict) -> int | None:
+    """経験を生んだ params の世代 (``gen_config.policy_generation``。無ければ ``None``)。"""
+    gen_config = experience.get("gen_config")
+    if isinstance(gen_config, dict):
+        value = gen_config.get("policy_generation")
+    else:
+        value = getattr(gen_config, "policy_generation", None)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 class PolicyParamEvolver(VersionedJsonFile):
     """ポリシーパラメータのモード別自動進化
 
@@ -430,6 +442,10 @@ class PolicyParamEvolver(VersionedJsonFile):
         # ``gen_config.policy_generation`` に刻み、どの params の下で得た経験かを
         # 記録する (帰属の読み手はまだ無い、記録のみ)。
         self._generation: int = 0
+        # 評価窓が照合する世代。``evolve_all`` は 1 回の走査の間、走査開始時の世代に
+        # 固定する (走査の途中で別の (domain, mode) が params を動かして世代を
+        # 進めると、後続の (domain, mode) の経験が全て「古い世代」になり hold し続ける)。
+        self._window_generation: int | None = None
 
         # 読んだファイルのトップの未知キー (書き戻しで戻す、c_05 §0.5.2)。
         self._payload_extra: dict[str, Any] | None = None
@@ -1018,14 +1034,28 @@ class PolicyParamEvolver(VersionedJsonFile):
     ) -> list[dict]:
         """直近の params 変更以降に記録された経験だけを返す。
 
-        ``timestamp`` を持たないエントリは新規扱いで残す (テスト用の合成経験 /
-        旧フォーマット。実データは FeedbackCollector が必ず刻む)。
+        ``gen_config.policy_generation`` が整数の経験は、それが今の世代
+        (``evolve_all`` の走査中は走査開始時の世代) と一致するものだけを残す。
+        時刻だけで切ると、params を動かした後もセッション単位で凍結された旧
+        params のターンが「新しい経験」として窓に入っていた。世代を持たない
+        経験 (旧フォーマット) は従来どおり時刻で切る。``timestamp`` も持たない
+        エントリは新規扱いで残す (テスト用の合成経験。実データは
+        FeedbackCollector が必ず刻む)。
         """
         since = parse_utc(self._last_evolved_at.get(key))
         if since is None:
             return experiences
+        generation = (
+            self._generation if self._window_generation is None
+            else self._window_generation
+        )
         out = []
         for e in experiences:
+            stamped = _policy_generation_of(e)
+            if stamped is not None:
+                if stamped == generation:
+                    out.append(e)
+                continue
             stamp = parse_utc(e.get("timestamp"))
             if stamp is None or stamp > since:
                 out.append(e)
@@ -1056,13 +1086,17 @@ class PolicyParamEvolver(VersionedJsonFile):
 
         results: dict[str, dict] = {}
 
-        for domain in EVOLVABLE_DOMAINS:
-            for mode in modes:
-                mode_exp = [e for e in experiences if e.get("mode") == mode]
-                if not mode_exp:
-                    continue
-                result = self.evolve(domain, mode, mode_exp)
-                results[f"{domain}_{mode}"] = result
+        self._window_generation = self._generation
+        try:
+            for domain in EVOLVABLE_DOMAINS:
+                for mode in modes:
+                    mode_exp = [e for e in experiences if e.get("mode") == mode]
+                    if not mode_exp:
+                        continue
+                    result = self.evolve(domain, mode, mode_exp)
+                    results[f"{domain}_{mode}"] = result
+        finally:
+            self._window_generation = None
 
         return results
 

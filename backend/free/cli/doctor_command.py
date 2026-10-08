@@ -77,12 +77,38 @@ def render_human(report: dict[str, Any], data_root: Path) -> list[str]:
         "cli.doctor_history", sessions=history.get("sessions", 0), active=history.get("active", 0),
         experience=experience.get("records", 0),
     ))
+    health = report.get("learning_health") or {}
+    if health:
+        lines.append(msg(
+            "cli.doctor_learning_health", verdict=health["verdict"], turns=health["turns"],
+            failures=health["detected_failures"], corrections=health["verified_corrections"],
+            span=health["span_days"], active=health["active_days"],
+        ))
+        lines.extend(f"  - {reason}" for reason in health["reasons"])
+        lines.extend(
+            "  - " + msg("cli.doctor_learning_unlearned", model_key=key, experiences=part.get("experiences", 0))
+            for key, part in (health.get("unlearned_partitions") or {}).items()
+        )
     lines.extend(_finding_line(f) for f in report["findings"])
     lines.append(msg(
         "cli.doctor_summary",
         errors=summary["errors"], warnings=summary["warnings"], info=summary["info"],
     ))
     return lines
+
+
+def _active_model_key(project_root: Path, data_root: Path) -> str | None:
+    """config.yaml の ``model_paths.base_model`` の ``model_key`` (起動時に束ねる active)。
+
+    serve 中にモデルを切り替えていれば、そちらは反映しない。base_model が無ければ ``None``。
+    """
+    from backend.config import PathResolver
+    from backend.free.cli.config_loader import _load_yaml_section
+
+    model_paths = _load_yaml_section(project_root, "model_paths")
+    if not isinstance(model_paths, dict) or not model_paths.get("base_model"):
+        return None
+    return PathResolver({"model_paths": model_paths}, project_root, data_root=data_root).active_model_key
 
 
 def run_doctor_command(argv: list[str]) -> int:
@@ -103,7 +129,7 @@ def run_doctor_command(argv: list[str]) -> int:
     # 読み手の WARNING (退避・readonly) は報告の指摘と重複するので出さない。
     logging.disable(logging.ERROR)
     try:
-        report = run_doctor(data_root)
+        report = run_doctor(data_root, active_model_key=_active_model_key(project_root, data_root))
         bundle = write_bundle(report, data_root, Path(args.bundle)) if args.bundle else None
     except DoctorError as e:
         print(msg("cli.doctor_failed", detail=str(e)), file=sys.stderr)

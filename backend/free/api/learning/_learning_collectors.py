@@ -109,6 +109,10 @@ def map_level1_results(raw_l1: dict | None) -> dict[str, Level1ResultEntry]:
             losses=val.get("losses"),
             ties=val.get("ties"),
             noise_floor=val.get("noise_floor"),
+            sample_wins=val.get("sample_wins"),
+            sample_losses=val.get("sample_losses"),
+            sample_ties=val.get("sample_ties"),
+            excluded=val.get("excluded") or None,
         )
     return result
 

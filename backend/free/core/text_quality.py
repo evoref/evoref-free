@@ -27,6 +27,10 @@ from backend.free.core.response_arithmetic import (
     iter_ja_numbers,
     normalize_numerals,
 )
+from backend.free.core.response_verifiers import (
+    declared_count_mismatch,
+    misstated_change_rate,
+)
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
@@ -2337,6 +2341,25 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
     return out
 
 
+def calculate_result_contradiction(response: str, result: float | None) -> str | None:
+    """calculate の結果を回答が使っていない (大外れ / 丸め違い) なら理由を返す (純粋関数)。
+
+    経験の成否ラベル (``FeedbackCollector``) と採用ゲートの再生
+    (``PromptCandidateEval``) が同じ判定を使う (不変則 #14(a))。式が会話から
+    辿れないときに数えないかは呼出側が決める。
+    """
+    if result is None:
+        return None
+    ignored = ignores_calculate_result(response, result)
+    if ignored is None:
+        # 5% の幅では「約27.8」(結果 27.7177) が「使った」扱いになる。丸め違いの
+        # 値は前ターンの暗算の複写で、成功として学習させない (2026-09-22)。
+        misrounded = misrounded_result_values(response, result)
+        if misrounded:
+            ignored = f"{', '.join(misrounded)} does not round from {result:g}"
+    return ignored
+
+
 def degenerate_correction(text: str) -> str | None:
     """「A と答えたが正しくは A」型の **成立していない訂正** を検出する。
 
@@ -3400,6 +3423,12 @@ def count_response_defects(
         "arithmetic_contradiction": int(bool(find_arithmetic_contradictions(text))),
         "conclusion_contradiction": int(find_conclusion_contradiction(text) is not None),
         "sign_contradiction": int(find_sign_contradiction(text) is not None),
+        # 失敗ラベル側 (FeedbackCollector) の応答検証器のうち問いと応答だけで
+        # 決まるもの。宣言した項目数は create では見ない (ラベル側と同じ除外)。
+        "misstated_change_rate": int(misstated_change_rate(text) is not None),
+        "declared_count_mismatch": int(
+            not is_create_mode(mode) and declared_count_mismatch(text) is not None,
+        ),
     }
 
 

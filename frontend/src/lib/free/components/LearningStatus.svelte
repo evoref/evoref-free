@@ -38,6 +38,8 @@
 		policyEvolverStatus?: Record<string, PolicyEvolverDomainStatus>;
 		runningTarget?: string | null;
 		level2?: Level2Status | null;
+		/** `--no-learning` 起動中 (常時バナーを出す) */
+		isDisabled?: boolean;
 	}
 
 	let {
@@ -60,6 +62,7 @@
 		policyEvolverStatus = {},
 		runningTarget = null,
 		level2 = null,
+		isDisabled = false,
 		..._ // experienceCount, lastLevel0Record, executedPhases: API互換のため受容
 	}: LearningStatusProps = $props();
 
@@ -123,12 +126,17 @@
 			'no_llm_client',
 			'loop_not_started',
 			'already_running',
-			'learning_disabled'
+			'learning_disabled',
+			'single_slot',
+			'deferred_by_full_cycle',
+			'serving_another_partition',
+			'insufficient_experiences'
 		];
 		if (known.includes(level1BlockedReason)) {
 			return $t(`dashboard.level1_blocked_${level1BlockedReason}`);
 		}
-		return '';
+		// 未知の理由コードは握り潰さず、そのまま見せる
+		return level1BlockedReason;
 	});
 
 	// ── 次の学習セクション ──
@@ -282,6 +290,9 @@
 </script>
 
 <DashboardCard title={$t('dashboard.learning_status')}>
+	{#if isDisabled}
+		<p class="disabled-banner">{$t('dashboard.learning_disabled_banner')}</p>
+	{/if}
 	<div class="status-grid">
 		<!-- セクション 1: 次の学習 -->
 		<StatusSection label={$t('dashboard.next_learning')}>
@@ -469,6 +480,15 @@
 </DashboardCard>
 
 <style>
+	.disabled-banner {
+		margin: 0 0 12px;
+		padding: 8px 12px;
+		border-radius: 6px;
+		font-size: 0.8125rem;
+		color: var(--color-warning, var(--text-secondary));
+		border: 1px solid var(--color-warning, var(--border-color, currentColor));
+	}
+
 	.status-grid {
 		display: flex;
 		flex-direction: column;

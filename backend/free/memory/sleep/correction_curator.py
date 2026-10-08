@@ -45,6 +45,7 @@ from backend.free.core.correction_verdict import (
     answer_disputes_value,
     build_correction_verify_prompt,
     check_verdict,
+    put_shared_verdict,
 )
 from backend.free.llm.json_schemas import CorrectionVerdict
 # 候補の判定は注入の注記と共有する 1 実装 (不変則 #14(a))。本モジュールからも
@@ -354,6 +355,10 @@ async def curate_corrections(
             correct_value=check.correct_value,
             now=now_fn(),
         )
+        # 学習側 (``learning.correction_verifier``) は同じ候補をこの生の出力で
+        # 判定する (補助タスクを 2 度払わない)。記憶側は複数ターンの文脈で
+        # 問うているので、共有の書き手はこちらだけにする。
+        put_shared_verdict(_session_of(note), content, parsed, verdict=verdict)
         marked += 1
         logger.debug(
             "correction_curator: note=%s verdict=%s wrong=%r correct=%r",

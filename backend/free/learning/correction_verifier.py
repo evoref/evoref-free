@@ -9,8 +9,9 @@ Level 1 採用ゲートの唯一の評価ケースになった (15 分のプロ�
 そこで役割を分ける:
 
 - **記録時** = 候補 (``signals.correction_candidate``)。recall 重視で、精度の
-  責任を負わない。チャット応答パスの軽い用途 (遡及 false_negative マーク /
-  数値の保留 / few-shot 除外) はここを見る。
+  責任を負わない。チャット応答パスの軽い用途 (数値の保留 / few-shot 除外) は
+  ここを見る。前ターンへの遡及 false_negative は検証の後
+  (:func:`reconcile_false_negatives`) で付け外しする。
 - **消費前** = 検証 (本モジュール)。Level 1 / Level 2 が読み始める前に、
   (直前アシスタント応答, 訂正発話) の組を補助タスク (``correction_verify``、
   ``background_slot``) へ渡して帰属を判定し、``assistant`` のものだけを
@@ -45,6 +46,7 @@ from backend.free.core.correction_verdict import (
     build_correction_verify_prompt,
     check_verdict,
     claims_equivalent,
+    get_shared_verdict,
     response_already_states,
     reversed_restatement,
 )
@@ -106,31 +108,126 @@ def has_pending_candidates(experience_buf) -> bool:
     )
 
 
-def _resolve_previous_context(
+def _resolve_previous_entry(
     entries: list["ExperienceEntry"], index: int,
-) -> tuple[str, str]:
-    """``entries[index]`` の訂正候補が指す **直前アシスタント応答とその質問** を返す。
+) -> "ExperienceEntry | None":
+    """``entries[index]`` の訂正候補が指す **宛先のエントリ** を返す。
 
     優先順は ``corrected_entry_id`` (記録時に本文の重なりで確定した宛先) →
-    同一セッションの直前ターン。どちらも取れなければ空文字の組。``query`` は
-    ``target=self`` (ユーザー自身の過去の発言を訂正) の ``wrong_claim`` 検証に
-    使う — アシスタント応答ではなく、その応答を引き出したユーザー発話の側に
-    誤りがあったケースなので、span の照合元が異なる。
+    同一セッションの直前ターン (訂正候補のターンは飛ばす)。取れなければ ``None``。
     """
     entry = entries[index]
     target_id = getattr(entry.signals, "corrected_entry_id", None)
     if target_id:
         for cand in entries:
             if cand.id == target_id:
-                return (cand.response_full or cand.response_summary or "", cand.query or "")
+                return cand
     session_id = entry.session_id
     for cand in reversed(entries[:index]):
         if cand.session_id != session_id:
             continue
         if getattr(cand.signals, "correction_candidate", None) is not None:
             continue
-        return (cand.response_full or cand.response_summary or "", cand.query or "")
-    return ("", "")
+        return cand
+    return None
+
+
+def _resolve_previous_context(
+    entries: list["ExperienceEntry"], index: int,
+) -> tuple[str, str]:
+    """``entries[index]`` の訂正候補が指す **直前アシスタント応答とその質問** を返す。
+
+    宛先は :func:`_resolve_previous_entry`。取れなければ空文字の組。``query`` は
+    ``target=self`` (ユーザー自身の過去の発言を訂正) の ``wrong_claim`` 検証に
+    使う — アシスタント応答ではなく、その応答を引き出したユーザー発話の側に
+    誤りがあったケースなので、span の照合元が異なる。
+    """
+    target = _resolve_previous_entry(entries, index)
+    if target is None:
+        return ("", "")
+    return (target.response_full or target.response_summary or "", target.query or "")
+
+
+def _routed_tool(signals) -> bool:
+    return bool(
+        getattr(signals, "tool_routing_success", False)
+        or getattr(signals, "tool_routing_false_positive", False)
+    )
+
+
+#: (宛先の見逃しフラグ, 学習カテゴリ, 訂正ターンが capability を使ったか,
+#: 宛先が capability を使ったか)。
+_FALSE_NEGATIVE_KINDS: tuple[tuple[str, str, Callable, Callable], ...] = (
+    (
+        "tool_routing_false_negative", "tool_routing",
+        _routed_tool, _routed_tool,
+    ),
+    (
+        "long_form_false_negative", "long_form",
+        lambda s: bool(getattr(s, "long_form_used", False)),
+        lambda s: bool(getattr(s, "long_form_used", False)),
+    ),
+)
+
+
+def reconcile_false_negatives(
+    entries: list["ExperienceEntry"],
+) -> list[tuple[str, str, int]]:
+    """検証済みの訂正から、宛先ターンの見逃し (false_negative) の印を付け外しする。
+
+    「宛先ターンは capability (ツール / 長文) を使わず、訂正ターンが使った」は
+    宛先ターンが capability を要した証拠だが、**訂正が本物のときだけ** 成り立つ
+    (不変則 #12)。そこで記録時ではなく検証の後にここで印を決める:
+
+    - 訂正の判定が ``assistant`` (昇格中) で宛先のフラグが ``False`` → ``True`` にして +1。
+    - 訂正が検証済みで判定が ``assistant`` 以外 (却下・再チェックでの格下げ) で、
+      宛先のフラグが ``True`` → ``False`` にして -1。ただし同じ宛先・同じ種別を
+      昇格中の別の訂正が支えているなら外さない。
+    - capability の遷移が無い訂正 (= 証拠にならない) のフラグには触らない。
+
+    冪等: 付け終えた印は再度数えない。
+
+    Returns:
+        ``[(宛先の query, "tool_routing" | "long_form", +1 | -1), ...]``。
+        +1 は学習語の追加、-1 は取り消し (減衰) を呼出側に求める。
+    """
+    supported: set[tuple[str, str]] = set()
+    revoke: list[tuple["ExperienceEntry", str, str]] = []
+    out: list[tuple[str, str, int]] = []
+    for index, entry in enumerate(entries):
+        signals = entry.signals
+        if not getattr(signals, "correction_verified_at", None):
+            continue
+        target = _resolve_previous_entry(entries, index)
+        if target is None:
+            continue
+        promoted = (
+            getattr(signals, "correction_verdict", None) == _PROMOTED_TARGET
+            and getattr(signals, "user_correction", None) is not None
+        )
+        for flag, category, used_now, used_before in _FALSE_NEGATIVE_KINDS:
+            if not used_now(signals) or used_before(target.signals):
+                continue
+            if promoted:
+                supported.add((target.id, flag))
+                if not getattr(target.signals, flag, False):
+                    setattr(target.signals, flag, True)
+                    out.append((target.query or "", category, +1))
+            else:
+                revoke.append((target, flag, category))
+    for target, flag, category in revoke:
+        if (target.id, flag) in supported:
+            continue
+        if getattr(target.signals, flag, False):
+            setattr(target.signals, flag, False)
+            out.append((target.query or "", category, -1))
+    for query, category, delta in out:
+        logger.info(
+            "Correction verifier: %s false_negative on the corrected turn "
+            "(category=%s, query=%r)",
+            "marked" if delta > 0 else "revoked", category, query[:40],
+        )
+    return out
 
 
 def _apply_verdict(
@@ -148,6 +245,21 @@ def _apply_verdict(
     signals.correction_correct_value = correct_value or None
     if verdict == _PROMOTED_TARGET:
         signals.user_correction = signals.correction_candidate
+
+
+def _log_split(entry_id: str, memory_label: str, promoted: bool) -> None:
+    """記憶側と同じ生の出力から、帰属 (assistant か否か) が割れたら記録する。
+
+    門は各側の入力 (記憶側はノートの複数ターン、学習側は経験の直前応答) で
+    当てるので、同じ出力でも結論が割れうる (不変則 #14(c) の記録)。
+    """
+    if (memory_label == _PROMOTED_TARGET) == promoted:
+        return
+    logger.info(
+        "Correction verdict split between memory and learning sides "
+        "(entry=%s, memory=%s, learning_promoted=%s)",
+        entry_id, memory_label, promoted,
+    )
 
 
 def recheck_promoted(entries: list["ExperienceEntry"]) -> int:
@@ -217,13 +329,15 @@ async def verify_pending_corrections(
 
     Returns:
         ``{"checked": int, "promoted": int, "rejected": int, "pending": int,
-        "skipped": str | None, "demoted": int, "unanswered": int}`` —
+        "skipped": str | None, "demoted": int, "unanswered": int,
+        "false_negatives": list[tuple[str, str, int]]}`` —
         ``demoted`` は :func:`recheck_promoted` が候補へ戻した昇格済みエントリ数、
-        ``unanswered`` は答えが取れず次回へ回した数。
+        ``unanswered`` は答えが取れず次回へ回した数、``false_negatives`` は
+        :func:`reconcile_false_negatives` の結果 (呼出側が学習語へ適用する)。
     """
     out: dict = {
         "checked": 0, "promoted": 0, "rejected": 0, "pending": 0, "skipped": None,
-        "unanswered": 0,
+        "unanswered": 0, "false_negatives": [],
     }
     if unanswered is None:
         unanswered = {}
@@ -239,7 +353,8 @@ async def verify_pending_corrections(
     pending = [i for i, e in enumerate(entries) if _is_pending(e.signals)]
     out["pending"] = len(pending)
     if not pending:
-        if demoted:
+        out["false_negatives"] = reconcile_false_negatives(entries)
+        if demoted or out["false_negatives"]:
             flush = getattr(experience_buf, "flush", None)
             if callable(flush):
                 flush()
@@ -265,7 +380,8 @@ async def verify_pending_corrections(
             "Correction verifier degraded: no aux client; %d candidates left "
             "unverified", len(pending),
         )
-        if legacy:
+        out["false_negatives"] = reconcile_false_negatives(entries)
+        if legacy or demoted or out["false_negatives"]:
             flush = getattr(experience_buf, "flush", None)
             if callable(flush):
                 flush()
@@ -287,16 +403,23 @@ async def verify_pending_corrections(
             out["checked"] += 1
             out["rejected"] += 1
             continue
+        # 記憶側 (Step 8.0) が同じ候補を既に問うていれば、その生の出力を使う。
+        # 門は下でこちらの入力に当て直す (決定論の SSOT は correction_verdict)。
+        shared = get_shared_verdict(entry.session_id, candidate)
+        shared_label = shared[1] if shared is not None else None
         try:
-            parsed = await aux_client.generate_json(
-                build_correction_verify_prompt(
-                    prev_response, candidate, prev_user=prev_query,
-                ),
-                purpose="correction_verify",
-                max_tokens=384,
-                temperature=0.1,
-                response_schema=CorrectionVerdict,
-            )
+            if shared is not None:
+                parsed = shared[0]
+            else:
+                parsed = await aux_client.generate_json(
+                    build_correction_verify_prompt(
+                        prev_response, candidate, prev_user=prev_query,
+                    ),
+                    purpose="correction_verify",
+                    max_tokens=384,
+                    temperature=0.1,
+                    response_schema=CorrectionVerdict,
+                )
         except Exception as exc:  # noqa: BLE001 - 検証失敗で学習を止めない
             logger.warning(
                 "Correction verification failed (entry=%s): %r", entry.id, exc,
@@ -335,9 +458,15 @@ async def verify_pending_corrections(
         # (:func:`answer_disputes_value`、2026-09-11 (j) J-04: 「302 は恒久的な
         # 移転」という誤った訂正がアシスタントに退けられたのに assistant と
         # 判定され、訂正ペアの素材になりかけた)。
-        if check.ok and answer_disputes_value(
+        disputed = check.ok and answer_disputes_value(
             entry.response_full or entry.response_summary or "", check.correct_value,
-        ):
+        )
+        if shared_label is not None:
+            _log_split(
+                entry.id, shared_label,
+                check.ok and not disputed and check.target == _PROMOTED_TARGET,
+            )
+        if disputed:
             logger.info(
                 "Correction verdict disputed by the reply (entry=%s, value=%r)",
                 entry.id, check.correct_value[:40],
@@ -370,6 +499,7 @@ async def verify_pending_corrections(
         )
         out["rejected"] += 1
 
+    out["false_negatives"] = reconcile_false_negatives(entries)
     flush = getattr(experience_buf, "flush", None)
     if callable(flush):
         flush()
@@ -386,5 +516,6 @@ __all__ = [
     "MAX_UNANSWERED_ATTEMPTS",
     "has_pending_candidates",
     "recheck_promoted",
+    "reconcile_false_negatives",
     "verify_pending_corrections",
 ]

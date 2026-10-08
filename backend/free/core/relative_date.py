@@ -19,6 +19,12 @@ from datetime import date, datetime, timedelta
 
 # 「今週 / 来週 …」「昨日 / 明日 …」→ オフセットの表 (WEEK_OFFSETS / DAY_OFFSETS) は
 # 直示の語彙の SSOT (temporal_deixis) が持つ。ここは解決だけを持つ。
+from backend.free.core.response_dates import (
+    extract_tool_anchor,
+    extract_tool_now_date,
+    extract_tool_target_date,
+    ignores_date_result,
+)
 from backend.free.core.script_ranges import KANJI, KATAKANA
 from backend.free.core.temporal_deixis import (
     DAY_OFFSETS,
@@ -396,3 +402,49 @@ def absolutize_annotated_dates(text: str) -> str:
 
     return _ANNOTATED_RELATIVE_RE.sub(_sub, text or "")
 
+
+
+#: :func:`date_result_use` の戻り: 回答が日付ツールの ``target`` を使っていない (矛盾)。
+DATE_RESULT_IGNORED = "ignored"
+#: :func:`date_result_use` の戻り: 使っていないが、ツールが今日起点で数え問いは起点を
+#: 別に置いている — ``target`` の方が誤りでありうるので失敗の証拠にしない。
+DATE_RESULT_ANCHOR_MISMATCH = "anchor_mismatch"
+
+
+def _target_answers_today_anchored_span(query: str, tool_result_text: str) -> bool:
+    """ツールの ``target`` が問いの今日起点の相対日付のどれかの答えか (純粋関数に近い)。
+
+    「今日から3日後と、10月20日の3日前は？」で今日起点のツールが組んだ ``target``
+    は「今日から3日後」の正しい答えで、起点の食い違いは別の span の話。ツールが
+    今日とした日 (``now:`` 行、無ければ今日) から今日起点の span を解いて照合する。
+    """
+    from backend.free.core.prompt_blocks import local_today
+
+    target = extract_tool_target_date(tool_result_text)
+    if target is None:
+        return False
+    today = extract_tool_now_date(tool_result_text) or local_today()
+    return resolves_today_anchored_span(query, target, today)
+
+
+def date_result_use(query: str, tool_result_text: str, response: str) -> str | None:
+    """日付ツールの結果 (``target:``) を回答が使ったかを判定する。
+
+    経験の成否ラベル (``FeedbackCollector``) と採用ゲートの再生
+    (``PromptCandidateEval``) が同じ判定を使う (不変則 #14(a))。
+
+    Returns:
+        使った / 日付ツールの結果が無いなら ``None``、矛盾なら
+        :data:`DATE_RESULT_IGNORED`、起点の食い違いで数えないなら
+        :data:`DATE_RESULT_ANCHOR_MISMATCH`。
+    """
+    if not ignores_date_result(tool_result_text, response):
+        return None
+    tool_anchor = extract_tool_anchor(tool_result_text)
+    if (
+        tool_anchor in (None, "today")
+        and has_non_today_offset_anchor(query)
+        and not _target_answers_today_anchored_span(query, tool_result_text)
+    ):
+        return DATE_RESULT_ANCHOR_MISMATCH
+    return DATE_RESULT_IGNORED

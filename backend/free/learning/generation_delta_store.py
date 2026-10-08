@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Mapping
 from pathlib import Path
 
 from backend.io.format_registry import FormatSpec, register_format
@@ -44,6 +47,20 @@ def _deltas_file(path: str | Path) -> VersionedPayloadFile:
 
 # モード -> {param_delta: float} の入れ子辞書型エイリアス
 type DeltaMap = dict[str, dict[str, float]]
+
+
+def delta_version(mode_deltas: Mapping[str, float]) -> str:
+    """1 モードのデルタの版 (内容ハッシュ、sha1 先頭 12 桁)。
+
+    経験の ``gen_config._extra.generation_delta_version`` (書き手は
+    ``chat_recorder._generation_delta_version``) と採用後監視 (f_04 §4.7) が
+    同じ値を使う。値はファイルから読んだ形 (``float``) に揃えてから数える —
+    書き手側のメモリでは ``top_k_delta`` が ``int`` のままなので、揃えないと
+    同じデルタが別の版になる。
+    """
+    normalized = {str(k): float(v) for k, v in mode_deltas.items()}
+    text = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 class GenerationDeltaStore:

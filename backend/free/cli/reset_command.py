@@ -201,6 +201,25 @@ def retract_learning_facts(data_root: Path) -> int:
         store.close()
 
 
+def forget_learning_liveness(data_root: Path) -> int:
+    """``logs/liveness.json`` から ``learn.*`` の段だけを消して保存する (記憶の段は残す)。
+
+    学習を初期化したのに「効果ゼロが続く」警告だけが残るのを防ぐ。台帳が無ければ何もしない。
+    """
+    from backend.liveness import LivenessLedger
+
+    path = PathResolver.layout_path(data_root, "liveness_file")
+    if not path.is_file():
+        return 0
+    ledger = LivenessLedger(path)
+    if not ledger.load(path):
+        return 0
+    removed = ledger.forget_prefix("learn.")
+    if removed:
+        ledger.save(path)
+    return removed
+
+
 def take_learning_facts(data_root: Path) -> list:
     """semantic ストアの取り消されていない ``learn.*`` ファクトを取り出す (ストアは変えない)。"""
     store = _open_semantic_store(data_root)
@@ -277,6 +296,11 @@ def reset_data_root(
             report.retracted = retract_learning_facts(data_root)
         except Exception as e:  # noqa: BLE001 — 報告して続ける (ファイルの削除は進める)
             report.errors.append(f"learn.* facts: {e}")
+    if learning:
+        try:
+            forget_learning_liveness(data_root)
+        except Exception as e:  # noqa: BLE001 — 観測の台帳なので報告して続ける
+            report.errors.append(f"liveness ledger: {e}")
     kept_learning: list = []
     if memory and not learning:
         try:

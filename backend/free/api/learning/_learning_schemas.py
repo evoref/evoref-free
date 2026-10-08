@@ -50,6 +50,13 @@ class Level1ResultEntry(BaseModel):
     ties: int | None = None
     #: 現行 vs 現行 (カナリア) の |純勝ち|。候補の純勝ちがこれを超えないと採用しない。
     noise_floor: int | None = None
+    #: 一対比較で採用候補になったときだけ測る標本 (成功ターン) の勝敗。
+    #: 1 敗でもあれば ``reason == "sample_regression"`` で不採用。
+    sample_wins: int | None = None
+    sample_losses: int | None = None
+    sample_ties: int | None = None
+    #: 失敗の証拠があったのに評価ケースにしなかった件数 (除外理由 → 件数)。
+    excluded: dict[str, int] | None = None
 
 
 class PolicyEvolverDomainStatus(BaseModel):
@@ -144,6 +151,8 @@ class SchedulerStatusModel(BaseModel):
     # --no-learning (自己学習 OFF) で起動中かどうか。GUI/CLI が学習無効状態を
     # 観測できるように surface する (scheduler.get_status の is_disabled を伝播)。
     is_disabled: bool = False
+    #: ``llama.slots < 2`` で Level 1 / Level 2 を止めているか (f_04 §10.1 #15)。
+    single_slot: bool = False
     experience_count: int = 0
     new_experience_count: int = 0
     min_experiences: int = 0
@@ -153,9 +162,10 @@ class SchedulerStatusModel(BaseModel):
     #: 止まっているかは ``level1_blocked_reason`` を見る。
     conditions_met: bool = False
     #: Level 1 が「今」走れない理由。走れる状態なら None。
-    #: ``learning_disabled`` / ``already_running`` / ``no_llm_client`` /
+    #: ``learning_disabled`` / ``single_slot`` / ``already_running`` / ``no_llm_client`` /
     #: ``loop_not_started`` / ``deferred_by_full_cycle`` / ``user_active`` /
-    #: ``insufficient_experiences`` / ``waiting_for_idle`` のいずれか。
+    #: ``serving_another_partition`` / ``insufficient_experiences`` /
+    #: ``waiting_for_idle`` のいずれか。
     #:
     #: 判定順は常駐ループ (``SleepTimeScheduler._schedule_level1_loop``) と
     #: 同じ。**予約済みの仕事 (``active_session`` / ``priority_queue``) がある
@@ -165,6 +175,12 @@ class SchedulerStatusModel(BaseModel):
     level1_blocked_reason: str | None = None
     #: ``waiting_for_idle`` のとき、アイドル成立までの残り秒数。
     level1_seconds_until_idle: float | None = None
+    #: Level 1 を延期している理由。``serving_another_partition`` = 載っているモデル
+    #: (create_model 等) が束ねた active パーティションのモデルと違う (chat に戻るまで続く)。
+    #: このとき ``level1_blocked_reason`` も同じ値になる (ユーザー活動等の手前の理由が無ければ)。
+    deferred_reason: str | None = None
+    #: 延期が始まった時刻 (ISO 8601 UTC)。延期していなければ None。
+    deferred_since: str | None = None
     last_level1_run: str | None = None
     last_level2_run: str | None = None
     # 実行中の Level 2 対象 ("base"/None)

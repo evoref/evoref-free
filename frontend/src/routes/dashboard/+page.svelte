@@ -78,6 +78,7 @@
 				lastLevel2Run={learningData.last_level2_run}
 				runningTarget={learningData.running_target}
 				level2={learningData.level2}
+				isDisabled={learningData.is_disabled}
 				lastLevel0Record={learningData.last_level0_record}
 				experienceByMode={learningData.experience_by_mode}
 				correctionRate={learningData.correction_rate}
