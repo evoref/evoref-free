@@ -365,6 +365,23 @@ def truncate_repetition(content: str, min_repeat: int = 4) -> str:
     return _truncate_block_repetition("\n".join(result))
 
 
+#: ストリーム生成中の退化検査の間隔 (チャンク数) と、検査を始める最小文字数。
+STREAM_DEGENERATION_CHECK_EVERY = 256
+STREAM_DEGENERATION_MIN_CHARS = 1500
+
+
+def stream_has_degenerated(text: str) -> bool:
+    """生成途中の本文が退化 (同一行 / ブロックの反復) に入っているか。
+
+    ``truncate_repetition`` で切り詰めると本文が 4 割以上縮むなら、残りは反復の
+    続きでしかない。生成後の切除だけでは、反復が ctx 満杯 (数千トークン) まで
+    続く間ずっと待たされる (2026-10-08 実機: 30 行の表が 9,500 トークンで未完)。
+    """
+    if len(text) < STREAM_DEGENERATION_MIN_CHARS:
+        return False
+    return len(truncate_repetition(text)) < len(text) * 0.6
+
+
 def _truncate_block_repetition(
     content: str, min_cycle_repeats: int = 3, max_period: int = 32,
 ) -> str:

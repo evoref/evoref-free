@@ -2035,6 +2035,57 @@ def _can_use_meta_cognitive(
     return loop_budget >= min_budget
 
 
+def named_deliverable_names(query: str) -> list[str]:
+    """依頼が成果物として名指したファイル名 (裸名 / 相対パス、出現順、重複なし、純粋関数)。
+
+    書込みの禁止 (「保存せず」) があれば空 (``write_intent_probe`` が空を返す)。
+    """
+    probe = write_intent_probe(query, whole_request=True)
+    seen: dict[str, None] = {}
+    for m in (
+        *_BARE_FILENAME_TARGET_RE.finditer(probe),
+        *_RELATIVE_PATH_TARGET_RE.finditer(probe),
+    ):
+        seen.setdefault(m.group(0), None)
+    return list(seen)
+
+
+def named_deliverable_exts(query: str) -> set[str]:
+    """依頼が成果物として名指したファイル名の拡張子 (小文字、``.`` 付き、純粋関数)。"""
+    from pathlib import PurePath
+
+    return {PurePath(n).suffix.lower() for n in named_deliverable_names(query)}
+
+
+def names_binary_office_deliverable(query: str) -> bool:
+    """依頼が Office 形式 (xlsx / docx / pptx 等) のファイル名を成果物として名指しているか。
+
+    Office 形式はエディタに表示できないので、保存動詞が無くても (「kakeibo.xlsx を
+    作ってください」) 宛先は保存先しかない。
+    """
+    from backend.free.agent.output_format import BINARY_OFFICE_EXTS
+
+    return bool(named_deliverable_exts(query) & BINARY_OFFICE_EXTS)
+
+
+def names_structured_data_deliverable(query: str) -> bool:
+    """依頼が構造化データ形式 (yaml / json / toml) を成果物として名指しているか。
+
+    散文のユニット分割 (long_form) は構文を持つデータを作れず、日本語の解説文が
+    ``.yaml`` で書かれる (2026-10-08 実機: library_api.yaml)。単発の生成へ落とす。
+    """
+    return bool(named_deliverable_exts(query) & {".yaml", ".yml", ".json", ".toml"})
+
+
+def names_spreadsheet_deliverable(query: str) -> bool:
+    """依頼が表計算形式 (xlsx / xls / ods) を成果物として名指しているか。
+
+    散文のユニット分割 (long_form) は表を作れず Writer が ``no_table_data`` で落ちる
+    (f_03 §1.6 の表形式出力先の除外と同じ理由)。
+    """
+    return bool(named_deliverable_exts(query) & {".xlsx", ".xls", ".ods"})
+
+
 def indicates_write_destination(query: str, *, whole_request: bool = False) -> bool:
     """発話が **書込み先** を指しているか (純粋関数)。
 

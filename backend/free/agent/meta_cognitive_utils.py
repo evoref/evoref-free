@@ -33,6 +33,8 @@ from backend.free.agent.meta_cognitive_text import (
     strip_leading_narration_headings,
     strip_leading_path_comment,
     strip_markdown_wrapper,
+    STREAM_DEGENERATION_CHECK_EVERY,
+    stream_has_degenerated,
     summarize_file_content,
     summarize_tool_args,
     _truncate_block_repetition,

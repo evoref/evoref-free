@@ -22,6 +22,8 @@ from backend.free.agent.meta_cognitive_utils import (
     fewshot_seems_relevant,
     looks_like_task_log_residue,
     strip_markdown_wrapper,
+    STREAM_DEGENERATION_CHECK_EVERY,
+    stream_has_degenerated,
     truncate_repetition,
     unwrap_sole_code_fence,
 )
@@ -711,6 +713,15 @@ class _ContentGenerationMixin:
                     )
                 first_token = False
                 chunks.append(token)
+                if (
+                    len(chunks) % STREAM_DEGENERATION_CHECK_EVERY == 0
+                    and stream_has_degenerated("".join(chunks))
+                ):
+                    logger.warning(
+                        "Content generation degenerated into repetition after %d "
+                        "chunks; stopping the stream", len(chunks),
+                    )
+                    break
                 if time.monotonic() - start > total_cap:
                     logger.warning(
                         "Content generation exceeded total cap %ds", total_cap,

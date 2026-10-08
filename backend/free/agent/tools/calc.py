@@ -379,6 +379,7 @@ def _check_allowlist(tree: ast.AST) -> str | None:
     # 直接の引数の列 (と range の呼び出し) を許可に積めば、それ自身の検査に間に合う。
     allowed_sequences: set[int] = set()
     allowed_ranges: set[int] = set()
+    called_funcs = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     for node in ast.walk(tree):
         node_name = type(node).__name__
         if isinstance(node, _SEQUENCE_NODES) and id(node) in allowed_sequences:
@@ -393,6 +394,16 @@ def _check_allowlist(tree: ast.AST) -> str | None:
             return (
                 f"Error: Unsafe expression (unknown name: {node.id})"
                 f" -- {_DISALLOWED_NODE_HINTS['Name']}"
+            )
+        if (
+            isinstance(node, ast.Name) and callable(_SAFE_NAMES[node.id])
+            and node.id != _RANGE_FUNC and id(node) not in called_funcs
+        ):
+            # 関数名だけの式は値ではなく関数オブジェクトを返す (「今日は何日」で
+            # ``date_diff`` が関数 repr のまま「厳密な計算結果」になった、2026-10-08)
+            return (
+                f"Error: Unsafe expression (function used without a call: {node.id})"
+                f" -- call it with arguments, e.g. {node.id}(...)"
             )
         if (
             isinstance(node, ast.Name) and node.id == _RANGE_FUNC
