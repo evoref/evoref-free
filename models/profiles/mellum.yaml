@@ -1,0 +1,39 @@
+# JetBrains Mellum2.1-12B-A2.5B-Thinking (arch "mellum"・MoE・reasoning)。
+# GGUF の general.architecture が "mellum" を報告する (2026-10-09 実測)ためファイル名も mellum。
+# 64 experts / 8 active、28 層、総 12B / アクティブ 2.5B。
+#
+# 推奨 sampling はモデルカード準拠: temperature 0.6 / top_p 0.95 / top_k 20。
+# min_p / repetition_penalty は推奨が無いため設定しない (mode 既定値がそのまま使われる)。
+#
+# MoE オフロードは既定で付けない (n_cpu_moe: null)。VRAM が厳しい場合は
+# <data_root>/profiles/by-model/<GGUF stem>.yaml で moe.n_cpu_moe を整数指定する。
+launch_flags:
+  - "--jinja"
+  - "--reasoning-format"
+  - "auto"
+# context_size (-c)。**モデルの上限ではなく VRAM 都合の保守既定**。
+# GGUF の n_ctx_train (mellum.context_length、2026-10-09 実測) は 131072 (YaRN factor 16 / 元 8192)。
+# 28 層中 3/4 は sliding window 1024 の層で、KV は同規模の全層 full attention より軽い。
+# 解決順: config 明示 > profile > 8192。
+context_size: 32768
+moe:
+  enabled: true
+  n_cpu_moe: null
+sampling:
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+# reasoning (thinking)。chat_template は Qwen3 系と同形で enable_thinking=false のとき
+# '<think>\n\n</think>' を前置する (toggle)。既定は Thinking モデルなので ON。
+# generation prompt は '<think>' を開かず本体が出力するため、llama.cpp 側の reasoning 認識
+# (thinking != 0) は未確認 → server_control: false とし、思考はクライアント側
+# (_ReasoningFilter) で除去する。実機で認識が確認できたら true + reasoning_format: auto に変える。
+reasoning:
+  mode: toggle
+  enable_thinking: true
+  server_control: false
+  client_handling: strip
+  marker_style: think_tags
+  client_think_budget: 4096
+  on_runaway: fallback
+  exclude_from_history: true
