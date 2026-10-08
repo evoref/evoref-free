@@ -1241,6 +1241,8 @@ create:
   staged_enabled: true                # staged のキルスイッチ (pipeline と独立。false で即無効化)
   turn_timeout_sec: 3600.0            # create 1 ターン全体のウォールクロック上限 (予算の 3 層の最終防衛線、f_10 §3)。staged.total_timeout_sec はこの値-300秒にクランプされる
   runs_keep: 20                       # staged クリエイトの run レコード (f_10 §7) の保持件数
+  edit_import_smoke_enabled: true     # 既存 .py の apply_diff 成功後、編集で新しく生じた import エラーだけを警告 (警告のみ、f_10 §8.1-3)
+  edit_import_smoke_timeout_sec: 10.0 # その import 検査の時間上限 (0 超 60 以下)。超えたら見送る
   staged:
     profile: v2                      # v2 = 骨組み → 同時生成 → smoke → (Pro) 契約テスト → as-built 文書 (f_10 §11) / v1 = 旧工程 (Pro だけ)
     parallel_generation: 3           # v2 の同時生成数の上限 (チャット以外のスロット数と小さい方)
@@ -1250,6 +1252,12 @@ create:
     flowchart_enabled: true          # spec 工程でフロー構造を合成し flowchart.md (mermaid) と spec.md の Processing flow 節を同一データから描画
     flow_part_synthesis_enabled: false # flow_spec_synthesis が2回とも検証不合格の場合、Component/モジュール単位で部分合成→決定論結合するエスカレーション (既定OFF、fallback_flow へ直接縮退)
     max_repair_rounds: 2              # test 失敗時のリペア最大回数 (0-5)
+    revert_if_worse: true             # v2 の作り直しで検査結果が悪化した版を検証済みの最良の版へ戻す (同点は先の版、f_10 §11.1-3/-4)
+    runtime_probe_enabled: true       # v2 の実行時プローブ (観測のみ): argparse 等の入口を空の CWD で --help 1 回走らせ notes にだけ記録 (作り直し・採点には流さない、f_10 §11.1-3)
+    runtime_probe_timeout_sec: 15.0   # 実行時プローブの時間上限 (秒、0 超 120 以下)
+    sibling_api_sheet_enabled: true   # 同時生成の 2 段目以降へ、書き上がった兄弟の実 API (AST 抽出のシグネチャ) を添える。骨組みと食い違えば骨組みが優先 (f_10 §11.1-2)
+    sibling_sheet_chars: 3000         # 兄弟 API 一覧の文字数の上限 (500-12000、ファイル単位で切り捨て)
+    entry_last: false                 # 入口モジュールを最後の段で単独に生成 (3 段になりうるので既定 OFF、§11.4 の実測待ち)
     max_test_regen_rounds: 2         # test が src の実 API に不整合な時 test のみ再生成 (src 不変・準ゲート, 0-5)
     entry_smoke_exec_enabled: true   # エントリ有界実行スモーク (advisory)。false で静的検査のみ
     entry_smoke_timeout_sec: 10.0    # エントリ有界実行スモークのタイムアウト

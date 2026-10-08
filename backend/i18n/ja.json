@@ -783,6 +783,9 @@
     "contract_repair_reverted": "契約テスト後の修正を取り消し (smoke 不合格): {paths}",
     "contract_repair_worse": "契約テスト後の修正を取り消し (失敗が {before} 件から {after} 件に増えた): {paths}",
     "contract_repair_unchecked": "契約テスト後の修正を取り消し (修正版を検査できなかった): {paths}",
+    "contract_repair_broke_usage": "契約テスト後の修正を取り消し (使い方の実行が悪化した): {paths}",
+    "contract_repair_usage_unchecked": "契約テスト後の修正を取り消し (修正版で使い方の実行を検査できなかった): {paths}",
+    "smoke_repair_worse": "検査エラーの修正を取り消し (修正版の検査結果が悪化した): {paths}",
     "checks_not_run": "作業フォルダの外へ書き込もうとしたため検査できませんでした: {lines}",
     "incomplete": {
       "written": "{paths} に書き込みましたが、制作は完了していません ({reasons})。",
@@ -827,6 +830,7 @@
         "lint_dropped": "生成したテストを lint が全件除外: {detail} 件",
         "needs_input": "入力か画面が要る: {detail}",
         "side_effects": "外部への作用の恐れ: {detail}",
+        "prerequisite_failed": "前の検査が不合格のため実行しなかった: {detail}",
         "not_run": "実行できなかった"
       },
       "reason_by_check": {

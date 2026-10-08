@@ -147,6 +147,36 @@ class CreateStagedConfig(BaseModel):
         default=2, ge=0, le=5,
         description="test 工程の失敗リペア最大回数",
     )
+    revert_if_worse: bool = Field(
+        default=True,
+        description="v2 の作り直し (smoke・契約テスト) で検査結果が厳密に悪化した版を検証済みの"
+                    "最良の版へ戻す (f_10 §11.1-3 / §11.1-4)。同点は先の版を残す。false でこの方針の"
+                    "前の挙動 (smoke の作り直しは無条件に上書き)",
+    )
+    runtime_probe_enabled: bool = Field(
+        default=True,
+        description="v2 の実行時プローブ (観測のみ)。入口が argparse / click / typer の Python を空の CWD で "
+                    "--help 1 回走らせ、静的所見 (os.makedirs の dirname 空文字) と合わせて notes にだけ記録する。"
+                    "作り直し・採点・tasks_failed・checks には流さない (f_10 §11.1-3)。false で走らせない",
+    )
+    runtime_probe_timeout_sec: float = Field(
+        default=15.0, gt=0.0, le=120.0,
+        description="実行時プローブの時間上限 (秒)",
+    )
+    sibling_api_sheet_enabled: bool = Field(
+        default=True,
+        description="v2 の同時生成で、前の段で書き上がった兄弟モジュールの実在する公開シグネチャ (AST 抽出) を"
+                    "各モジュールの課題部分へ添える。骨組みの signature が優先 (f_10 §11.1-2)",
+    )
+    sibling_sheet_chars: int = Field(
+        default=3000, ge=500, le=12000,
+        description="兄弟 API 一覧の文字数の上限 (見出し込み。ファイル単位で切り捨てる)",
+    )
+    entry_last: bool = Field(
+        default=False,
+        description="v2 の入口モジュールを最後の段で単独に生成し、全兄弟の実 API を見せる。3 段になりうるので"
+                    "既定 OFF (f_10 §11.1-2 の最大 2 段は §11.4 の実測まで維持)",
+    )
     max_test_regen_rounds: int = Field(
         default=2, ge=0, le=5,
         description="生成テストが src の実 API (arity/属性) に整合しない時に "
@@ -178,7 +208,10 @@ class CreateStagedConfig(BaseModel):
         default=True,
         description="spec 宣言契約 (Signature/メソッド/arity) と生成コードの"
                     "決定論照合を test 工程の smoke gate に合流させる。"
-                    "false で観測記録のみに縮退 (誤検知時の運用弁)",
+                    "false で観測記録のみに縮退 (誤検知時の運用弁)。"
+                    "staged v2 では骨組みのシグネチャとの照合を観測だけ行い "
+                    "(notes の conformance_violations / conformance_observed、"
+                    "作り直しには使わない)、false で照合しない",
     )
     code_max_tokens: int = Field(
         default=4096, ge=512, le=16384,
@@ -315,6 +348,15 @@ class CreateConfig(BaseModel):
     runs_keep: int = Field(
         default=20, ge=1,
         description="staged クリエイトの run レコード (f_10 §7) の保持件数",
+    )
+    edit_import_smoke_enabled: bool = Field(
+        default=True,
+        description="既存 .py の apply_diff 成功後に、編集で新しく生じた import エラーだけをツール結果へ警告する"
+                    " (警告のみ・差分のみ、f_10 §8.1-3)",
+    )
+    edit_import_smoke_timeout_sec: float = Field(
+        default=10.0, gt=0.0, le=60.0,
+        description="apply_diff 後の import 検査の時間上限 (編集前後の各 1 回)。超えたら警告にせず見送る",
     )
     staged: CreateStagedConfig = Field(default_factory=CreateStagedConfig)
     runtimes: CreateRuntimesConfig = Field(default_factory=CreateRuntimesConfig)

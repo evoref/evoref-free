@@ -241,6 +241,40 @@ def _make_draft_document(client: LocalClient, aux_client: AuxClient | None = Non
     return draft_document
 
 
+def _make_apply_diff(config: dict):
+    """apply_diff ハンドラを生成 (成功した .py の編集後 import 警告を足す、docs/f_10 §8.1-3)
+
+    警告は ``create.edit_import_smoke_enabled`` が真のときだけ。成功文言
+    (``Diff applied successfully to ...``) は警告が無いかぎり不変で、警告の算出が
+    失敗しても編集結果は変えない。
+    """
+    create_cfg = config.get("create") or {}
+    enabled = bool(create_cfg.get("edit_import_smoke_enabled", True))
+    timeout_sec = float(create_cfg.get("edit_import_smoke_timeout_sec", 10.0))
+
+    def apply_diff_with_import_check(file_path: str, diff_text: str) -> str:
+        target = Path(file_path)
+        before = None
+        if enabled and target.suffix == ".py":
+            try:
+                before = target.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                before = None
+        result = apply_diff(file_path, diff_text)
+        if before is None or result != f"Diff applied successfully to {file_path}":
+            return result
+        try:
+            from backend.free.agent.tools.edit_import_check import edit_import_warning
+
+            after = target.read_text(encoding="utf-8", errors="replace")
+            return result + edit_import_warning(file_path, before, after, timeout_sec=timeout_sec)
+        except Exception as e:
+            logger.warning("edit import check failed for %s: %s", file_path, e)
+            return result
+
+    return apply_diff_with_import_check
+
+
 def _make_run_command(config: dict):
     """run_command ハンドラを生成（config をクロージャでバインド）
 
@@ -1033,7 +1067,7 @@ def register_builtin_tools(
 
     registry.register(
         name="apply_diff",
-        func=apply_diff,
+        func=_make_apply_diff(cfg),
         description="Apply a unified diff to a file",
         parameters={
             "file_path": {"type": "string", "description": "Path to the file to patch"},
