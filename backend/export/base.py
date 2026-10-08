@@ -147,15 +147,82 @@ def coerce_cell_value(value: object) -> object:
     return float(value) if "." in value else int(value)
 
 
-def assign_xlsx_cell(cell: Any, value: object) -> None:
+#: 同一シート内の集計だけに使える関数 (外部参照・文字列・ハイパーリンクを作れない)。
+_SAFE_FORMULA_FUNCS = frozenset({
+    "SUM", "AVERAGE", "MIN", "MAX", "COUNT", "ROUND", "ABS", "PRODUCT",
+})
+_CELL = r"\$?[A-Za-z]{1,3}\$?[1-9][0-9]{0,6}"
+_COL = r"\$?[A-Za-z]{1,3}"
+_OPERAND_RE = re.compile(
+    rf"(?P<func>[A-Za-z]+)\("  # 関数名 + 開き括弧
+    rf"|(?P<ref>{_CELL}(?::{_CELL})?|{_COL}:{_COL})"
+    r"|(?P<num>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)%?)"
+    r"|(?P<lp>\()"
+    r"|(?P<sign>[-+])",
+    re.ASCII,
+)
+_OPERATOR_RE = re.compile(r"(?P<bin>[-+*/^])|(?P<comma>,)|(?P<rp>\))|(?P<pct>%)", re.ASCII)
+
+
+def is_safe_formula(text: str) -> bool:
+    """``=`` 始まりの文字列が、同一シートの算術・集計だけの式かを返す (f_11 §3.1)。
+
+    許すのは数値・セル参照 (範囲・列範囲可)・四則と ``^``・括弧・``_SAFE_FORMULA_FUNCS`` の
+    関数だけ。オペランドと演算子が交互に並ぶ文法も検査する (Excel が修復を求める式を作らない)。
+    ``!`` ``[`` ``"`` ``&`` ``@`` や未知の関数名は 1 つでもあれば偽 (HYPERLINK / 外部参照を弾く)。
+    """
+    if not text.startswith("=") or len(text) > 255:
+        return False
+    pos, depth, n = 1, 0, len(text)
+    expect_operand = True
+    while True:
+        while pos < n and text[pos] == " ":
+            pos += 1
+        if pos >= n:
+            return depth == 0 and not expect_operand
+        if expect_operand:
+            m = _OPERAND_RE.match(text, pos)
+            if m is None:
+                return False
+            if m.group("func") is not None:
+                if m.group("func").upper() not in _SAFE_FORMULA_FUNCS or depth >= 20:
+                    return False
+                depth += 1
+            elif m.group("lp") is not None:
+                if depth >= 20:
+                    return False
+                depth += 1
+            elif m.group("ref") is not None or m.group("num") is not None:
+                expect_operand = False
+            # sign / func / lp は次もオペランド
+        else:
+            m = _OPERATOR_RE.match(text, pos)
+            if m is None:
+                return False
+            if m.group("bin") is not None or (m.group("comma") is not None and depth > 0):
+                expect_operand = True
+            elif m.group("comma") is not None:
+                return False
+            elif m.group("rp") is not None:
+                depth -= 1
+                if depth < 0:
+                    return False
+        pos = m.end()
+
+
+def assign_xlsx_cell(cell: Any, value: object, *, allow_safe_formula: bool = False) -> None:
     """openpyxl のセルへ値を入れる。``=`` 始まりの文字列を数式にしない (f_11 §3.1)。
 
     openpyxl は ``=`` で始まる str を数式セルにするので、LLM の出力や差し込み値が
     ``=HYPERLINK(...)`` なら開いた人の Excel で評価される。文字列セルへ戻し、Excel が
     ``'`` 付きで入力されたセルに付けるのと同じ ``quotePrefix`` を立てる。
+    ``allow_safe_formula`` のときだけ :func:`is_safe_formula` を通った式を数式のまま残す
+    (表の「合計を数式で」。帳票の穴埋めなど差し込み値は常に文字列)。
     """
     cell.value = value
     if isinstance(value, str) and value.startswith("="):
+        if allow_safe_formula and is_safe_formula(value):
+            return
         cell.data_type = "s"
         cell.quotePrefix = True
 

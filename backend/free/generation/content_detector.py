@@ -163,6 +163,27 @@ def _extension_only_on_bare_names(hits: list[str], text: str) -> bool:
 _DOCUMENT_DESTINATION_EXTS = frozenset({".md", ".markdown", ".txt", ".rst"})
 
 
+#: 作る対象のプログラムを直接目的語に取る形 (「CLI ツールを作って」)。「ツールの README を作って」の
+#: ように「の」で文書へ掛かる形は含めない — 作るのは文書で、プログラムは文書の主題。
+_BUILT_PROGRAM_RE = re.compile(
+    r"(?:CLI|ツール|アプリ(?:ケーション)?|スクリプト|プログラム|ライブラリ|API|サーバ|ボット|bot)"
+    r"[^。、,.\n]{0,8}?を?(?:作(?:成|っ|り|ら)|つく(?:っ|り)|実装|開発|書い|書き)",
+    re.IGNORECASE,
+)
+
+
+def _builds_program_with_language(instruction: str) -> bool:
+    """実装言語を名指してプログラムを作らせ、README 等は添え物の依頼か。
+
+    「Python で CLI ツールを作って README.md も書いて」は README の語と「書いて」で TEXT に
+    倒れ、プログラムが作られなかった。作る対象はプログラムで、文書は同梱物。
+    """
+    return bool(
+        _IMPLEMENTATION_LANGUAGE_RE.search(instruction)
+        and _BUILT_PROGRAM_RE.search(instruction)
+    )
+
+
 def _writes_document_destination(instruction: str) -> bool:
     """依頼が文書 (.md / .txt) だけを **保存先** として名指しているか。
 
@@ -202,6 +223,8 @@ def detect_content_type(instruction: str, mode: str) -> ContentType:
     if is_create_mode(mode):
         if _writes_document_destination(instruction):
             return ContentType.TEXT
+        if _builds_program_with_language(instruction):
+            return ContentType.CODE
         text_view = _mask_input_file_paths(instruction)
         hits = [p for p in TEXT_PATTERNS_ALL if re.search(p, text_view)]
         if hits and not _extension_only_on_bare_names(hits, text_view):

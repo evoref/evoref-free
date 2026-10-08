@@ -1,0 +1,40 @@
+# Underdog-Saluki-27B-1.0 (IQ2-mix / ConwayResearch) 固有のプロファイル。
+# 出典: https://huggingface.co/ConwayResearch/Underdog-Saluki-27B-1.0
+# ベースは Qwen3.8-27B (ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF から量子化)。モデルカードによれば
+# GGUF の architecture は "qwen35" なので models/profiles/qwen35.yaml が土台になり、本ファイルの
+# 宣言だけが差分上書きされる (dict は再帰マージ、list とスカラーは置換)。ファイル名は
+# GGUF ファイル名の拡張子なし部分と完全一致させること。反映は llama-server / backend の
+# 再起動時のみ。
+#
+# 未実測: GGUF メタデータ (block_count / context_length / nextn_predict_layers 等) は
+# このファイルを書いた時点では読んでいない。Qwen3.8-27B-Q4_K_M.yaml の実測値
+# (context_length=262144 / MTP ヘッド内蔵 / full_attention_interval=4) が同じ重み系統として
+# 成り立つ前提で、量子化後も保たれているかは起動して確認すること。
+#
+# 量子化: IQ2-mix (7.89 GB、フル精度は約 54 GB)。テキスト専用で、vision は別 mmproj
+# (F16 928 MB / Q8_0 629 MB) が要るが本リポジトリは未配線。
+# カード記載の弱点: 文字単位の指示パズルが苦手 / 並列ツール呼び出しの約 2 割で書式の小さな崩れ。
+#
+# launch_flags (--jinja / --reasoning-format auto) / moe / reasoning / context_size は
+# arch 層のままで正しい (カードの起動例も --jinja -c 32768) ので宣言しない。
+
+# ── サンプリング ────────────────────────────────────────
+# カード推奨: thinking = temperature 0.6 / top_p 0.95 / top_k 20、thinking off の
+# 直接ツール呼び出しは temperature 0。min_p / repeat penalty の指定は無い。
+# profile.sampling はモード横断で modes.* を上書きし、chat (temp 0.7) と create (temp 0.3) の
+# モード別チューニングを潰すため、temperature / top_p は宣言しない。
+# top_k 20 だけが thinking / non-thinking 共通でモード別値と衝突しないので宣言する
+# (Qwen3.8-27B-Q4_K_M.yaml と同じ理由)。
+sampling:
+  top_k: 20
+
+# ── thinking ────────────────────────────────────────────
+# Qwen3.8 テンプレートで既定 ON・リクエスト単位で切替可
+# (chat_template_kwargs.enable_thinking=false で OFF)。カードは ON のとき長く考えると注記。
+# arch 層の reasoning.mode=toggle / enable_thinking=false (速度優先) がそのまま効くので
+# 上書きしない。2-bit 級量子化では長い思考が崩れやすい可能性があるため OFF 運用が無難。
+
+# ── MTP ────────────────────────────────────────────────
+# MTP の SSOT は config.yaml の llama.mtp (Qwen3.8-27B-Q4_K_M.yaml 参照)。
+# この GGUF が NextN ヘッドを残しているかは未確認なので、有効化する前に
+# nextn_predict_layers を確認すること。

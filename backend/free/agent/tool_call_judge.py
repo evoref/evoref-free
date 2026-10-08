@@ -106,6 +106,7 @@ from backend.free.agent.tool_judge_types import (
 from backend.free.agent.tool_judge_dialogue import (
     _CALCULATE_CONTEXT_TURNS,
     _dialogue_text,
+    _IMPLICIT_SYNTHESIS_CONTEXT_TURNS,
     _SYNTHESIS_CONTEXT_TURNS,
     _recent_dialogue_messages,
     _recent_dialogue_text,
@@ -2834,7 +2835,8 @@ class ToolCallJudge:
         # ⚠ 判定用の 4 ターン窓を渡してはいけない。基準値 (「最初の〜」) が
         # 窓の外にあると、窓内の最古の値で式を作って必ず間違える。
         messages = _recent_dialogue_messages(
-            conversation, _SYNTHESIS_CONTEXT_TURNS,
+            conversation,
+            _IMPLICIT_SYNTHESIS_CONTEXT_TURNS if implicit_operands else _SYNTHESIS_CONTEXT_TURNS,
         )
         messages.append({"role": "user", "content": ungroup_thousands(query)})
         task_system = select_locale_variant(EXPRESSION_SYSTEM, EXPRESSION_SYSTEM_EN)

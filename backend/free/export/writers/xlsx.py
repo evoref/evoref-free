@@ -72,7 +72,7 @@ def _build_xlsx(content: ExportContent) -> bytes:
         for row_idx, row_data in enumerate(rows, 1):
             for col_idx, value in enumerate(row_data, 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
-                assign_xlsx_cell(cell, _coerce_value(value))
+                assign_xlsx_cell(cell, _coerce_value(value), allow_safe_formula=True)
                 # ヘッダー行のスタイル
                 if row_idx == 1:
                     cell.font = Font(bold=True)

@@ -455,8 +455,12 @@ async def _search_episodic_layer(
     swapped_sink: set[str] | None = None,
     session_id: str | None = None,
     user_turns: int | None = None,
+    other_session_sink: set[str] | None = None,
 ) -> list[StoreEntry]:
     """エピソード記憶 (``short`` → ``long``) を 1 回で引く。
+
+    ``other_session_sink`` が与えられたら、``session_id`` と違うセッションのノートの id を
+    足す (棒に上乗せを掛ける側が使う、``rag.self_rag.other_session_margin``)。
 
     ``create_session`` (create モードのターンのセッション id) が与えられたら、
     別セッションの create ターンのノートを外す (:func:`_drop_other_create_sessions`)。
@@ -553,6 +557,10 @@ async def _search_episodic_layer(
         if cleaned != text:
             n_cleaned += 1
         entries.append((hit.id, hit.cosine, hit.score, cleaned))
+        if other_session_sink is not None and session_id:
+            hit_session = _hit_session(hit)
+            if hit_session and hit_session != session_id:
+                other_session_sink.add(hit.id)
     if n_cleaned or n_dropped:
         logger.info(
             "Episodic: stripped internal ids from %d note(s), dropped %d "
@@ -1917,6 +1925,7 @@ async def unified_search(
     pq_seeds: list[str] = []
     widen_episodic = episodic_fetch_k > fetch_k and episodic is not None
     swapped_answer_ids: set[str] = set()
+    other_session_ids: set[str] = set()
     (
         epi_entries, corpus_entries, (pseudo_entries, hinted_pq_ids), wide_corpus, wide_episodic,
     ) = await asyncio.gather(
@@ -1925,7 +1934,7 @@ async def unified_search(
             threshold=store_gate, own_session=own_session,
             create_session=session_id if is_create_mode(mode) else None,
             mode=mode, swapped_sink=swapped_answer_ids, session_id=session_id,
-            user_turns=user_turns,
+            user_turns=user_turns, other_session_sink=other_session_ids,
         ),
         _empty_corpus_layer() if skip_corpus else _search_corpus_layer(
             cartridge_mgr, query_vec, fetch_k, timeout_ms=cart_timeout_ms,
@@ -1943,7 +1952,7 @@ async def unified_search(
             threshold=store_gate, own_session=own_session,
             create_session=session_id if is_create_mode(mode) else None,
             mode=mode, swapped_sink=swapped_answer_ids, session_id=session_id,
-            user_turns=user_turns,
+            user_turns=user_turns, other_session_sink=other_session_ids,
         ) if widen_episodic else _empty_corpus_layer(),
     )
     if timer is not None:
@@ -2187,10 +2196,20 @@ async def unified_search(
         ),
     )
 
+    # 別セッションのノートは一般名詞の重なりで棒をわずかに越えやすい。今の会話の外の記録を
+    # 差し出すのは、棒を明確に越えるか、問いが過去の会話を指すときだけにする。
+    other_margin = (
+        float((rag_cfg.get("self_rag") or {}).get("other_session_margin", 0.0) or 0.0)
+        if other_session_ids and not points_to_past_session(query, user_turns=user_turns)
+        else 0.0
+    )
+
     def _floor_for(cid: str) -> float:
         if cid in pseudo_ids:
             return floor_pseudo
-        return floor_corpus if cid in corpus_ids else floor_epi
+        if cid in corpus_ids:
+            return floor_corpus
+        return floor_epi + (other_margin if cid in other_session_ids else 0.0)
 
     # 記録する棒は **候補が居るストアのもの** だけにする。候補ゼロのストアの棒
     # (``top_raw_score=0`` から導かれるので常に静的値) まで max() に入れると、
