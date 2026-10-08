@@ -83,8 +83,9 @@ class PromptEvalCase:
     #: 矛盾 (calculate / 日付の結果の無視) を経験のラベルと同じ関数で数える。
     tool_context: str = ""
     #: 元のターンの calculate の式が会話から辿れなかった / 組み方に疑いがあった
-    #: (``unexplained_numbers`` / ``expression_issues``)。ラベルと同じく、この
-    #: ケースでは結果の無視を欠陥に数えない。
+    #: (``unexplained_numbers`` / ``expression_issues``)、または被演算子が問いの中
+    #: だけと確かめられない (``calculate_history_operands`` が空でない / 無い)。
+    #: このケースでは結果の無視を欠陥に数えない。
     calculate_unverified: bool = False
     #: 根拠になった経験の ID (メモリ上だけ。採用台帳 ``learning.prompt_adoption`` が
     #: 書く)。訂正は (宛先, 訂正した発話)、それ以外はそのターン自身。同じ
@@ -184,10 +185,15 @@ def _replay_fields(exp: dict) -> tuple[dict, str | None]:
     if not context:
         return {}, None
     signals = exp.get("signals") or {}
+    # 式の被演算子が今回の問いの中だけ (記録時の判定が空) のときだけ、結果を問いの
+    # 計算として信頼できる。履歴の値で組んだ式の結果は誤りうる (実データ 3 問中 2 問で
+    # 応答のほうが正しかった) — 旗の無い旧経験も信頼しない側に倒す (2026-10-08)。
+    history_operands = signals.get("calculate_history_operands")
     return {
         "tool_context": context,
         "calculate_unverified": bool(
-            signals.get("unexplained_numbers") or signals.get("expression_issues"),
+            signals.get("unexplained_numbers") or signals.get("expression_issues")
+            or not isinstance(history_operands, list) or history_operands
         ),
     }, None
 
@@ -343,8 +349,12 @@ def select_prompt_eval_case_sets(
     # 実測 (2026-09-10 ライブ監査 (i) I-17): 6/6 ケースが「私が今の会社に
     # 入った年は」「私の出身地は」型で、現行・候補とも全ケース 0.0 (1 件だけ
     # 「不明」と答えた候補が 0.9) → 0.150 → 0.150 で不採用。eval_core の
-    # 足切りと同じ ``depends_on_context`` で落とす。
-    cases = [c for c in picked.values() if not depends_on_context(c.query)]
+    # 足切りと同じ ``depends_on_context`` で落とす。ツール結果ブロックを添えて
+    # 再生するケースは、道具語と被演算子の欠けでは落とさない (ブロックが運ぶ)。
+    cases = [
+        c for c in picked.values()
+        if not depends_on_context(c.query, tool_supplied=bool(c.tool_context))
+    ]
     dropped = len(picked) - len(cases)
     samples: list[PromptEvalCase] = []
     if sample_cases > 0:

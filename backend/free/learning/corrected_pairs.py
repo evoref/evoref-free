@@ -65,10 +65,12 @@ _ACK_ONLY_RE = re.compile(
 #: 照応・想起形・短い継続指示の規則は ``core.context_bound`` が SSOT
 #: (:func:`refers_to_previous_turn`、記憶の注入と同じ 1 実装。不変則 #14 (a))。
 
-#: 記憶・ツール結果を前提にしている手掛かり (照応・想起形に加えて)。
-_MEMORY_OR_TOOL_RE = re.compile(
-    r"私|僕|自分|俺"
-    r"|ファイル|保存|読んで|読み|実行|検索|コマンド|ディレクトリ|フォルダ",
+#: 記憶を前提にしている手掛かり (照応・想起形に加えて)。
+_FIRST_PERSON_RE = re.compile(r"私|僕|自分|俺")
+#: ツール結果を前提にしている手掛かり。ツール結果ブロックを添えて再生する
+#: ケース (``tool_supplied``) では除外理由にしない。
+_TOOL_WORD_RE = re.compile(
+    r"ファイル|保存|読んで|読み|実行|検索|コマンド|ディレクトリ|フォルダ",
 )
 
 #: 訂正文から期待キーワードを拾う正規表現。**``core.correction_target`` が
@@ -150,12 +152,17 @@ def strip_correction_preamble(response: str) -> str:
     return text
 
 
-def depends_on_context(query: str) -> bool:
+def depends_on_context(query: str, *, tool_supplied: bool = False) -> bool:
     """元の問いが直前ターン・記憶・ツール結果を前提にしているか (純粋関数)。
 
     :func:`refers_to_previous_turn` に加えて、一人称 / ユーザー属性の話 (記憶が
     要る) とファイル操作語 (ツール結果が要る) も文脈依存とみなす。eval_core の
     候補 (文脈無しで再生成・再評価するケース) の足切りに使う。
+
+    ``tool_supplied`` は再生成が記録したツール結果ブロックを問いに添えるケース
+    (採用ゲートの失敗ケース、f_04 §4.5)。ブロックがファイルの中身・換算率を運ぶ
+    ので、道具語と「被演算子が問いに無い」は除外理由にしない。照応・平叙文・
+    一人称・個人属性は引き続き外す — ブロックは直前ターンも記憶も運ばない。
     """
     q = (query or "").strip()
     if refers_to_previous_turn(q):
@@ -166,9 +173,13 @@ def depends_on_context(query: str) -> bool:
     # 答えが決まらない。どちらも単独再生成では現行・候補が必ず同点で、
     # 採用ゲートの標本にすると測定の席を潰す (2026-09-14 ライブ監査: 標本
     # 3 件が全てこの形で 3 引き分け)。判定は few-shot 入口と共有する。
-    if is_plain_statement(q) or asks_quantity_without_operands(q):
+    if is_plain_statement(q):
         return True
-    return bool(_MEMORY_OR_TOOL_RE.search(q) or _PERSONAL_ATTR_RE.search(q))
+    if not tool_supplied and (
+        asks_quantity_without_operands(q) or _TOOL_WORD_RE.search(q)
+    ):
+        return True
+    return bool(_FIRST_PERSON_RE.search(q) or _PERSONAL_ATTR_RE.search(q))
 
 
 def expected_keywords_from_correction(
