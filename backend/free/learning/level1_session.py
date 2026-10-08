@@ -16,7 +16,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from backend.free.learning.level0_instant import FeedbackSignals, GenerationConfigRef
+from backend.free.learning.case_filters import case_eligible_ids
+from backend.free.learning.level0_instant import (
+    RESPONSE_FULL_CAP,
+    TOOL_CONTEXT_KEY,
+    TOOL_CONTEXT_TRUNCATED_KEY,
+    FeedbackSignals,
+    GenerationConfigRef,
+)
 from backend.io.codec import codec_for, decode_skipping, persisted
 from backend.io.format_registry import FormatSpec, register_format
 from backend.io.versioned import VersionedPayloadFile
@@ -96,7 +103,7 @@ LEVEL1_HISTORY_FORMAT = register_format(FormatSpec(
 SNAPSHOT_QUERY_CHARS = 200
 
 
-def compact_experience(exp: dict) -> dict:
+def compact_experience(exp: dict, *, keep_full: bool = False) -> dict:
     """session へ保存する経験の圧縮射影。
 
     Level 1 が session snapshot から読むのは id / session_id / timestamp / mode /
@@ -110,21 +117,38 @@ def compact_experience(exp: dict) -> dict:
     **参照先の ``id`` が snapshot に無いと解決が丸ごと無効化** され、位置での
     代用 = 別会話のターンとのペアに戻る。2 つとも短い文字列なので L-D3 の
     サイズ懸念には当たらない。
+
+    ``keep_full`` の行 (採用ゲートの失敗ケースになりうる行、
+    :func:`~backend.free.learning.case_filters.case_eligible_ids`) は問いを
+    :data:`RESPONSE_FULL_CAP` まで残す — ゲートは snapshot の問いで再生成するので、
+    切った問いでは文字数・形式の指定が欠けた別の問いを測ってしまう。問いを切った
+    行には ``query_truncated: True`` を付け (行の ``_extra``、形式の版は変えない)、
+    標本に使わない。
     """
     query = str(exp.get("query", "") or "")
-    return {
+    kept = query[:RESPONSE_FULL_CAP] if keep_full else query[:SNAPSHOT_QUERY_CHARS]
+    gen_config = dict(exp.get("gen_config", {}) or {})
+    if not keep_full:
+        # ツール結果ブロックは再生する失敗ケースにだけ要る (標本にツールのターンは
+        # 使わない)。ほかの行に残すと snapshot が膨らむだけ。
+        gen_config.pop(TOOL_CONTEXT_KEY, None)
+        gen_config.pop(TOOL_CONTEXT_TRUNCATED_KEY, None)
+    row = {
         "id": exp.get("id", ""),
         "session_id": exp.get("session_id", ""),
         "timestamp": exp.get("timestamp", ""),
         "mode": exp.get("mode", ""),
-        "query": query[:SNAPSHOT_QUERY_CHARS],
+        "query": kept,
         "base_model": exp.get("base_model", ""),
         "model_key": exp.get("model_key"),
         # ``rag_usage_rate`` (c_16 §5.5) が ``evidence_ids`` の ``corpus:``
         # を数えるので、gen_config も snapshot に残す。
-        "gen_config": dict(exp.get("gen_config", {}) or {}),
+        "gen_config": gen_config,
         "signals": dict(exp.get("signals", {}) or {}),
     }
+    if len(kept) < len(query):
+        row["query_truncated"] = True
+    return row
 
 
 # ── PriorityRequest（f_04 §4.2）─────────────────────────────
@@ -212,12 +236,16 @@ class Level1Session:
         reason: str = "idle",
         experience_cutoff: float = 0.0,
     ) -> "Level1Session":
+        eligible = case_eligible_ids(experiences)
         return cls(
             session_id=str(uuid.uuid4()),
             # 永続形 (μs) と同じ精度で持つ — 保存 → 読み戻しで値が変わらない
             started_at=utc_to_epoch(utc_now(), time.time()),
             cartridge_snapshot=sorted(cartridge_ids),
-            experience_snapshot=[compact_experience(e) for e in experiences],
+            experience_snapshot=[
+                compact_experience(e, keep_full=str(e.get("id") or "") in eligible)
+                for e in experiences
+            ],
             completed_phases=[],
             phase_state={},
             reason=reason,

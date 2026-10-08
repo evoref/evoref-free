@@ -55,7 +55,8 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "constraint.words",  # 語数指定の違反
     "constraint.banned", # 禁止語 / 禁止文字種の違反
     "constraint.form",   # 出力形式 (箇条書き等) の違反
-    "user_correction",   # ユーザーが値を訂正した (陳腐値を答えた)
+    # ``user_correction`` は 2026-10-08 に外した — 字句の訂正候補は検証前の
+    # 候補で、検証器の発火として数えると不変則 #12 に反する。
     # 本文の決定論的な破綻 (FeedbackCollector._derive_turn_outcome)。これらが
     # 無いと、成否の判定は経験 (turn_outcome) にしか残らず、outcome JSONL の
     # verifier_hits は表面の検証器しか映さない (2026-09-05 ライブ監査 F-11:

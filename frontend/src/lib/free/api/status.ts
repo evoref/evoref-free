@@ -139,6 +139,31 @@ export interface EmbedPlacementInfo {
 	cosine_min: number | null;
 }
 
+/** 自己学習の信号の量と追加開発の判定。verdict は hold / continue / stop */
+export interface LearningHealthInfo {
+	verdict: string;
+	reasons: string[];
+	detected_failures: number;
+	verified_corrections: number;
+	active_days: number;
+	span_days: number;
+	turns: number;
+	/** 経験の始まりから今までの日数 */
+	history_days: number;
+	/** 直近 30 日の窓のターン数 */
+	window_turns: number;
+	/** 直近 30 日の自然な利用日 (3 ターン以上でバーストでない日) */
+	natural_days: number;
+	/** 直近 30 日のバーストの日 (60 分に 30 ターン以上。判定から除く) */
+	burst_days: number;
+	natural_failures: number;
+	natural_corrections: number;
+	/** Level 1 の学習範囲 (active_only = 束ねた active パーティションだけ) */
+	level1_scope: string;
+	/** Level 1 が学習しない (active 以外の) パーティションの経験の件数 */
+	unlearned_partitions: Record<string, { experiences: number; modes: Record<string, number> }>;
+}
+
 /** 環境調整 (auto-tune) の状態 (c_16 §7.2.3)。state は fresh / ok / pending / declined / accepted / unchanged / unknown */
 export interface AutoTuneInfo {
 	state: string;
@@ -177,6 +202,8 @@ export interface StatusResponse {
 	embed_placement?: EmbedPlacementInfo;
 	/** 環境調整 (auto-tune) の状態 */
 	auto_tune?: AutoTuneInfo;
+	/** 自己学習の信号の量と判定 */
+	learning_health?: LearningHealthInfo;
 }
 
 /** ステータス取得 */

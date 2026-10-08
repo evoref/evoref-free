@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.free.agent.prompt_utils import PROTECTED_CLOSE, PROTECTED_OPEN
+from backend.free.core.verifier_events import VERIFIER_IDS
 from backend.io.codec import codec_for, decode_skipping, persisted
 from backend.io.format_registry import FormatSpec, register_format
 from backend.io.versioned import VersionedPayloadFile
@@ -377,7 +378,6 @@ DEFAULT_RULE_VERIFIERS: dict[str, str] = {
     "自体を話題にしない": "internal_frame",
     "自分自身の過去の発言をそのまま繰り返さない": "repetition",
     "Do not repeat your own past reply verbatim": "repetition",
-    "今回の会話で述べられた方を採用する": "user_correction",
     # 「本人が言っていない人数・件数・数量・順序を補って言い直さない」。
     # 検証器は世帯の人数だけを見る (`fabricated_household_count`) — 規則の
     # 射程より狭いが、狭い検証器は誤検知を出さないので計数の材料になる
@@ -444,9 +444,14 @@ def record_rule_outcome(ledger: Ledger, violated_ids: set[str], *, fired_at: str
     検証器の無い規則は守られたかを判定できないので計数しない。以前は全箇条に
     helpful += 1 していたため helpful が「経過ターン数」になり、検証器の無い
     規則が ``rule_stats_min_turns`` ターンで必ず削除ゲートを通っていた。
+    保存済みの台帳が既知でない検証器 (撤去した ``user_correction`` 等) を
+    持っていても、その規則は計数しない (発火し得ないので helpful だけが積もる)。
     """
     for rule in ledger.rules:
-        if rule.kind != "bullet" or not rule.verifier or rule.id in ledger.unrendered:
+        if (
+            rule.kind != "bullet" or rule.verifier not in VERIFIER_IDS
+            or rule.id in ledger.unrendered
+        ):
             continue
         if rule.id in violated_ids:
             rule.harmful += 1

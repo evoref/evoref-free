@@ -23,7 +23,7 @@
 	/** Pro 機能を含むタブ (バッジ表示対象)
 	 *
 	 * - `editor`: エディタ機能自体が Pro ワークモード専用 (config.yaml の "Pro ワークモード" 区画 / CodeMirrorEditor 等は lib/pro/)
-	 * - `learning`: level1_idle_minutes_pro / 上位オプティマイザが Pro 限定
+	 * - `learning`: 上位オプティマイザが Pro 限定
 	 * - `integration`: external_api / widget_proxy が Pro 限定
 	 * - `generation`: modes.create (クリエイトモードの生成パラメータ) が Pro 限定
 	 * - `prompts`: create システムプロンプトが Pro 限定

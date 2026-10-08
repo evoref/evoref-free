@@ -30,7 +30,6 @@ from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from backend.free.core.verifier_events import record_verifier_hit
 from backend.log_config import get_logger
 
 logger = get_logger("agent.issue_ledger")
@@ -145,8 +144,8 @@ def record_correction(session_id: str, query: str) -> None:
     ケースだった (主体が逆)。
     """
     record_issue(session_id, "user_correction", (query or "")[:120], query)
-    # 陳腐値を答えた = 「今回の会話を採用する」規則の harmful (f_03 §3.5.1)
-    record_verifier_hit("user_correction")
+    # 検証器の発火としては数えない — 字句の訂正候補は検証前で、規則台帳の
+    # harmful に載せると #12 違反になる (自己申告用の件数だけ残す)。
 
 
 def format_issues(session_id: str) -> str:

@@ -71,6 +71,7 @@ ID_PREFIXES: tuple[IdPrefix, ...] = (
     IdPrefix("ks_", "knowledge source"),
     IdPrefix("ki_", "knowledge item"),
     IdPrefix("pc_", "prompt candidate"),
+    IdPrefix("pad_", "prompt adoption ledger row (adopt / rollback)"),
     IdPrefix("file_", "uploaded session file"),
     IdPrefix("pq_", "corpus pseudo query (target chunk + position + text)", random=False, derived=True),
     IdPrefix("mk_", "model key (compat + weight sample digest)", random=False, derived=True),

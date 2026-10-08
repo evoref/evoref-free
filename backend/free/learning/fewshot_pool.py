@@ -1578,6 +1578,10 @@ class FewShotPool(VersionedJsonFile):
             # 判定は採用ゲートの評価ケースと同じ述語 (learning.case_filters)。
             if grounding_reason(exp) is not None:
                 continue
+            # 手本を注入して生成した経験は新しい手本に採らない — 手本が自分の
+            # 結果で自分を増やす輪になる (不変則 #15)。
+            if (exp.get("gen_config") or {}).get("fewshot_ids"):
+                continue
 
             query = exp.get("query", "").strip()
             # few-shot 例には切り詰めていない全文を優先採用 (採用例の途中切れ防止)。

@@ -34,6 +34,7 @@ DECLARING_MODULES: tuple[str, ...] = (
     "backend.free.learning.level0_instant",
     "backend.free.learning.level1_session",
     "backend.free.learning.policy_evolver",
+    "backend.free.learning.prompt_adoption_ledger",
     "backend.free.llm.aux_calibration_store",
     "backend.free.llm.quality_probe",
     "backend.free.llm.tps_calibration",

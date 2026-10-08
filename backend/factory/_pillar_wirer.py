@@ -1350,6 +1350,12 @@ def _init_learning_scheduler(
         disabled=state.learning_disabled,
         resolver=resolver,
     )
+    # slots < 2 では Level 1 / 2 を止める (背景生成が chat を塞ぐ)。遅延接続でも
+    # 引き直せるよう、値でなく取得関数を渡す
+    learning_scheduler.set_slots_provider(
+        lambda: getattr(state.local_client, "_slots", None),
+    )
+    _ = learning_scheduler.single_slot  # 確定していれば起動時に WARNING 1 回
     learning_scheduler.set_learned_patterns(learned_patterns_store)
 
     # 7f-1b. EmbedInstructionEvolver (Level 1 phase3, f_04 §4.2)

@@ -22,7 +22,13 @@ from typing import TYPE_CHECKING, Any
 
 from backend.free.llm.aux_client import AuxClient
 from backend.free.llm.json_extract import extract_json_object
-from backend.free.core.text_quality import response_defect_total
+from backend.free.core.correction_verdict import response_already_states
+from backend.free.core.relative_date import DATE_RESULT_IGNORED, date_result_use
+from backend.free.core.text_quality import (
+    calculate_result_contradiction,
+    extract_calculate_result,
+    response_defect_total,
+)
 from backend.free.llm.json_schemas import PromptCandidateJudgement
 from backend.free.llm.utils import extract_content
 from backend.log_config import get_logger
@@ -76,6 +82,31 @@ _KIND_HINT_TEMPLATES: dict[str, str] = {
 }
 
 _BARE_SCORE_RE = re.compile(r"(?<![\d.])(?:0(?:\.\d+)?|1(?:\.0+)?)(?![\d.])")
+
+
+def _tool_result_defects(case: Any, response: str) -> int:
+    """再生したツール結果ブロックと応答の矛盾の件数 (ブロックが無ければ 0)。
+
+    経験の成否ラベル (``FeedbackCollector._derive_turn_outcome_with_reason``) と
+    同じ関数で数える (不変則 #14(a))。ラベルが失敗にしない条件 — calculate の式が
+    会話から辿れない (``calculate_unverified``)・日付の起点の食い違い — は数えない。
+    """
+    context = getattr(case, "tool_context", "") or ""
+    if not context:
+        return 0
+    defects = 0
+    if not getattr(case, "calculate_unverified", False) and calculate_result_contradiction(
+        response, extract_calculate_result(context),
+    ) is not None:
+        defects += 1
+    if date_result_use(case.query, context, response) == DATE_RESULT_IGNORED:
+        defects += 1
+    return defects
+
+
+def _sampled(*params: dict[str, float] | None) -> bool:
+    """どれかの構成の温度が 0 より大きいか (``_regenerate`` の既定は greedy)。"""
+    return any(float((p or {}).get("temperature") or 0.0) > 0.0 for p in params)
 
 
 class PromptCandidateEval:
@@ -134,7 +165,10 @@ class PromptCandidateEval:
         for case in cases:
             if self._aborted(len(responses), len(cases), "regenerate"):
                 break
-            response = await self._regenerate(prompt_text, case.query)
+            response = await self._regenerate(
+                prompt_text, case.query,
+                tool_context=getattr(case, "tool_context", "") or "",
+            )
             if response is not None:
                 responses.append((case, response))
         scores: dict[str, float] = {}
@@ -164,6 +198,7 @@ class PromptCandidateEval:
         if not cases or not current_text.strip() or not candidate_text.strip():
             return {}
         cur_outs = await self._regenerate_all(current_text, cases, "regenerate:current")
+        self._log_replay_reproduction(cases, cur_outs)
         cand_outs = await self._regenerate_all(candidate_text, cases, "regenerate:candidate")
         return self._verdicts(cases, cur_outs, cand_outs)
 
@@ -184,6 +219,7 @@ class PromptCandidateEval:
         if not cases or not current_text.strip() or not candidate_text.strip():
             return {}, {}
         cur_a = await self._regenerate_all(current_text, cases, "regenerate:current")
+        self._log_replay_reproduction(cases, cur_a)
         cur_b = await self._regenerate_all(current_text, cases, "regenerate:canary")
         cand = await self._regenerate_all(candidate_text, cases, "regenerate:candidate")
         return self._verdicts(cases, cur_a, cand), self._verdicts(cases, cur_a, cur_b)
@@ -194,7 +230,13 @@ class PromptCandidateEval:
         current_params: dict[str, float],
         candidate_params: dict[str, float],
         cases: list[Any],
-    ) -> tuple[dict[str, int], dict[str, int]]:
+        *,
+        measure_second_draw: (
+            Callable[[dict[str, int], dict[str, int]], bool] | None
+        ) = None,
+    ) -> tuple[
+        dict[str, int], dict[str, int] | None, dict[str, int], dict[str, int] | None,
+    ]:
         """**同じ system prompt** を sampling パラメータだけ変えて比べる。
 
         ``compare_with_noise_floor`` の姉妹で、変数が prompt ではなく
@@ -203,31 +245,79 @@ class PromptCandidateEval:
         fitness を当てにせず **その場で両方生成して**比べられる
         (docs/f_04 §4.7 の L-A2 が候補生成を止めていた理由がここで解ける)。
 
-        雑音フロアは **現行パラメータ同士** で採る。temperature > 0 の現行なら
-        分岐は大きく、そのぶんフロアも高く出る — 候補がその揺れを超えたときだけ
-        採用する、という不等式が温度に依らず成立する。
+        雑音フロアは **現行パラメータ同士** (現行 A / 現行 B) で採る。現行か候補の
+        どちらかの温度が 0 より大きいときは **候補も 2 回引き** (候補 B)、
+        現行 B 対 候補 B の勝敗と候補同士 (候補 A / 候補 B) の勝敗も返す — 1 回の
+        引きの当たり外れで採否が決まらないよう、呼出側は 2 回の純勝ちの小さい方と
+        2 つの雑音フロアの大きい方で判定する。両方 greedy なら候補 B は引かない
+        (同じ入力で同じ出力になるので、従来の 3 バッチ)。
+
+        Args:
+            measure_second_draw: 候補 B を引く前に ``(候補 A の勝敗, 現行同士の勝敗)``
+                で呼ぶ判定。False なら候補 B を引かない (1 回目で不採用が決まる候補に
+                生成コストを払わない短絡評価)。省略時は温度だけで決める。
 
         Returns:
-            ``(候補の勝敗, カナリアの勝敗)``。``compare_prompts`` と同じ形。
+            ``(候補 A の勝敗, 候補 B の勝敗, 現行同士の勝敗, 候補同士の勝敗)``。
+            どれも ``compare_prompts`` と同じ形。候補 B を引かなかったときは
+            2 番目と 4 番目が ``None``。
         """
         if not cases or not prompt_text.strip():
-            return {}, {}
+            return {}, None, {}, None
         cur_a = await self._regenerate_all(
             prompt_text, cases, "regenerate:current", params=current_params,
         )
         cur_b = await self._regenerate_all(
             prompt_text, cases, "regenerate:canary", params=current_params,
         )
-        cand = await self._regenerate_all(
+        cand_a = await self._regenerate_all(
             prompt_text, cases, "regenerate:candidate", params=candidate_params,
         )
-        return self._verdicts(cases, cur_a, cand), self._verdicts(cases, cur_a, cur_b)
+        outcomes_a = self._verdicts(cases, cur_a, cand_a)
+        canary_cur = self._verdicts(cases, cur_a, cur_b)
+        if not _sampled(current_params, candidate_params) or (
+            measure_second_draw is not None
+            and not measure_second_draw(outcomes_a, canary_cur)
+        ):
+            return outcomes_a, None, canary_cur, None
+        cand_b = await self._regenerate_all(
+            prompt_text, cases, "regenerate:candidate_b", params=candidate_params,
+        )
+        return (
+            outcomes_a, self._verdicts(cases, cur_b, cand_b),
+            canary_cur, self._verdicts(cases, cand_a, cand_b),
+        )
 
     @staticmethod
+    def _rank(case: Any, response: str) -> tuple[int, int, int]:
+        """応答の順位キー ``(誤値, -正値, 欠陥数)``。小さいほうが良い (辞書式)。
+
+        検証済みの訂正があるケース (``expected_value`` / ``wrong_value``) では、
+        正しい値を述べたか・誤った値を言い直したかを欠陥数より先に見る。欠陥数
+        だけだと、値を落とした短い応答が勝ち、誤値の言い直しは引き分けになる
+        (f_04 §10.1 #2)。値の既述判定は訂正の門と同じ関数を使う (不変則 #14(a))。
+        値が無いケースは従来どおり欠陥数だけで決まる。
+
+        ツール根拠のケース (``tool_context``) では、再生したツール結果との矛盾
+        (:func:`_tool_result_defects`) も欠陥数に足す。
+        """
+        expected = getattr(case, "expected_value", "") or ""
+        wrong_value = getattr(case, "wrong_value", "") or ""
+        correct = bool(expected) and response_already_states(expected, response)
+        wrong = (
+            bool(wrong_value) and not correct
+            and response_already_states(wrong_value, response)
+        )
+        defects = response_defect_total(
+            response, case.query, mode=getattr(case, "mode", "chat"),
+        ) + _tool_result_defects(case, response)
+        return int(wrong), -int(correct), defects
+
+    @classmethod
     def _verdicts(
-        cases: list[Any], base: dict[str, str | None], other: dict[str, str | None],
+        cls, cases: list[Any], base: dict[str, str | None], other: dict[str, str | None],
     ) -> dict[str, int]:
-        """``other`` が ``base`` より欠陥が少なければ +1、多ければ -1、同数 / 同文なら 0。"""
+        """``other`` の順位キーが ``base`` より小さければ +1、大きければ -1、同じ / 同文なら 0。"""
         verdicts: dict[str, int] = {}
         for case in cases:
             a = base.get(case.case_id)
@@ -237,10 +327,9 @@ class PromptCandidateEval:
             if a.strip() == b.strip():
                 verdicts[case.case_id] = 0
                 continue
-            mode = getattr(case, "mode", "chat")
-            da = response_defect_total(a, case.query, mode=mode)
-            db = response_defect_total(b, case.query, mode=mode)
-            verdicts[case.case_id] = 1 if db < da else (-1 if db > da else 0)
+            ra = cls._rank(case, a)
+            rb = cls._rank(case, b)
+            verdicts[case.case_id] = 1 if rb < ra else (-1 if rb > ra else 0)
         return verdicts
 
     def _aborted(self, done: int, total: int, stage: str) -> bool:
@@ -275,8 +364,33 @@ class PromptCandidateEval:
                 break
             outs[case.case_id] = await self._regenerate(
                 prompt_text, case.query, params=params,
+                tool_context=getattr(case, "tool_context", "") or "",
             )
         return outs
+
+    @staticmethod
+    def _log_replay_reproduction(
+        cases: list[Any], current: dict[str, str | None],
+    ) -> None:
+        """ツール根拠のケースで、現行の再生成が記録された失敗を再現した率を出す。
+
+        再生が元の失敗 (ツール結果の無視) を再現しなければ、ブロックを添えた
+        再生 (f_04 §4.5、案 A1) は規則の効き目を測れていない — その観測。
+        """
+        replayed = [
+            c for c in cases
+            if getattr(c, "tool_context", "") and current.get(c.case_id) is not None
+        ]
+        if not replayed:
+            return
+        reproduced = sum(
+            1 for c in replayed if _tool_result_defects(c, current[c.case_id] or "") > 0
+        )
+        logger.info(
+            "prompt candidate eval: current prompt reproduced the tool-result "
+            "contradiction in %d/%d replayed tool-grounded case(s)",
+            reproduced, len(replayed),
+        )
 
     async def _regenerate(
         self,
@@ -284,8 +398,13 @@ class PromptCandidateEval:
         query: str,
         *,
         params: dict[str, float] | None = None,
+        tool_context: str = "",
     ) -> str | None:
-        """``prompt_text`` で query を再生成する (既定は greedy、背景スロット)。"""
+        """``prompt_text`` で query を再生成する (既定は greedy、背景スロット)。
+
+        ``tool_context`` (記録したツール結果ブロック) があれば、本番と同じく
+        user の末尾に連ねる (``turn_text.append_to_last_user`` の区切り無し)。
+        """
         sampling: dict[str, float] = {"temperature": 0.0}
         if params:
             sampling = {
@@ -297,7 +416,7 @@ class PromptCandidateEval:
             result = await self._llm_client.generate(
                 messages=[
                     {"role": "system", "content": prompt_text},
-                    {"role": "user", "content": query},
+                    {"role": "user", "content": query + tool_context},
                 ],
                 stream=False,
                 max_tokens=_RESPONSE_MAX_TOKENS,

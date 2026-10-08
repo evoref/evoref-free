@@ -1,6 +1,6 @@
 """Pydantic リクエスト/レスポンスモデル"""
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -271,6 +271,36 @@ class AutoTuneInfo(BaseModel):
     measured_at: str | None = None
 
 
+class LearningHealthInfo(BaseModel):
+    """自己学習の信号の量と追加開発の判定 (``health_report.health_snapshot``、5 分メモ化)。
+
+    ``verdict`` は ``hold`` (判定保留) / ``continue`` / ``stop``。``reasons`` は判定の理由 (日本語)。
+    ``span_days`` は経験の暦スパン、``active_days`` は利用のあった日数。判定に使うのは
+    ``history_days`` (経験の始まりから今まで) と直近 30 日の窓の ``natural_days`` (3 ターン
+    以上でバーストでない日) / ``burst_days`` (60 分に 30 ターン以上の日) と、自然な利用日の
+    ターンだけの ``natural_failures`` / ``natural_corrections``。
+
+    ``level1_scope`` は Level 1 の学習範囲 (``active_only`` = 束ねた active パーティションだけ)。
+    ``unlearned_partitions`` は active 以外のパーティション (create_model 等) の
+    ``{model_key: {"experiences": n, "modes": {mode: n}}}`` で、Level 1 は学習しない。
+    """
+    verdict: str = "hold"
+    reasons: list[str] = Field(default_factory=list)
+    detected_failures: int = 0
+    verified_corrections: int = 0
+    active_days: int = 0
+    span_days: float = 0.0
+    turns: int = 0
+    history_days: float = 0.0
+    window_turns: int = 0
+    natural_days: int = 0
+    burst_days: int = 0
+    natural_failures: int = 0
+    natural_corrections: int = 0
+    level1_scope: str = "active_only"
+    unlearned_partitions: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
 class StatusResponse(BaseModel):
     status: str = "ok"
     edition: str = "free"
@@ -293,6 +323,7 @@ class StatusResponse(BaseModel):
     rerank: RerankStatusInfo = Field(default_factory=RerankStatusInfo)
     embed_placement: EmbedPlacementInfo = Field(default_factory=EmbedPlacementInfo)
     auto_tune: AutoTuneInfo = Field(default_factory=AutoTuneInfo)
+    learning_health: LearningHealthInfo = Field(default_factory=LearningHealthInfo)
 
 
 # ===== RAG =====

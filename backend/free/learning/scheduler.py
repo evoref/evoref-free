@@ -8,6 +8,7 @@ Level 2: 夜間 SPSA による LoRA 微調整（Pro 専用、Level2Runner で注
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 from collections.abc import Callable
@@ -37,6 +38,7 @@ from backend.free.learning.level1_session import (
     load_active_session,
     save_active_session,
 )
+from backend.free.learning.prompt_adoption_ledger import append_adoption, case_refs
 from backend.free.optimizer.prompt_evolver import (
     CANDIDATES_FILE,
     PROMPT_DEFECT_WEIGHTS,
@@ -71,6 +73,22 @@ def _prompt_version_of(experience: dict) -> int | None:
     else:
         version = getattr(gen_config, "prompt_version", None)
     return version if isinstance(version, int) else None
+
+
+#: ``improved`` / ``skipped`` を持たない Level 1 の付随記録のうち、件数 (int) を
+#: 返す段と、その効果として足し合わせるキー (``_record_level1_liveness``)。
+_LEVEL1_COUNT_KEYS: dict[str, tuple[str, ...]] = {
+    "fewshot_gc": ("removed_total",),
+    "tool_routing_patterns": ("boosted", "decayed"),
+    "long_form_patterns": ("decayed",),
+}
+
+
+def _schema_default(key: str) -> Any:
+    """``learning.<key>`` のスキーマ既定値 (config 未指定時の fallback を SSOT に揃える)。"""
+    from backend.schemas.learning import LearningConfig
+
+    return LearningConfig.model_fields[key].default
 
 
 #: 後方互換の別名 (実体は ``level0_instant.used_corpus_evidence``)。
@@ -116,6 +134,12 @@ MAX_SESSION_YIELDS = 5
 #: 欠陥率 fitness の悪化幅 (採用時基準との差)。
 PROMPT_ROLLBACK_WINDOWS = 2
 PROMPT_ROLLBACK_EPSILON = 0.02
+
+#: 採用した生成デルタの事後監視の置き場 (``learning_state`` の ``_extra`` のキー)。
+#: ``LearningStateFile`` に宣言すると形式の版が動くので未知キーの通路で運ぶ。
+#: 窓・悪化幅はプロンプトと同じ (:data:`PROMPT_ROLLBACK_WINDOWS` /
+#: :data:`PROMPT_ROLLBACK_EPSILON`)。
+GENERATION_ADOPTIONS_KEY = "generation_adoptions"
 
 
 def _aggregate_mutation_health(results: dict) -> tuple[int, int]:
@@ -183,10 +207,14 @@ class LearningScheduler:
     def _init_level1_params(self, learning: dict) -> None:
         """Level 1 学習サイクル関連パラメータをポリシー優先で設定する。"""
         self.min_experiences: int = self._lp(
-            "level1_min_experiences", learning.get("level1_min_experiences", 20),
+            "level1_min_experiences",
+            learning.get(
+                "level1_min_experiences", _schema_default("level1_min_experiences"),
+            ),
         )
         self.generations: int = self._lp(
-            "level1_generations", learning.get("level1_generations", 10),
+            "level1_generations",
+            learning.get("level1_generations", _schema_default("level1_generations")),
         )
         self.population_size: int = self._lp(
             "level1_population_size", learning.get("level1_population_size", 5),
@@ -204,7 +232,9 @@ class LearningScheduler:
 
     def _init_level2_params(self, learning: dict) -> None:
         """Level 2 (ベースモデル §7.5.1) パラメータを設定する。"""
-        self.min_failures: int = learning.get("level2_min_failures", 50)
+        self.min_failures: int = learning.get(
+            "level2_min_failures", _schema_default("level2_min_failures"),
+        )
         # モード別の発火閾値 (未指定モードは min_failures にフォールバック)。
         # create は経験が溜まりにくく、chat と同じ閾値だと永久に発火しないか、
         # chat が回るたび無駄に評価されるかのどちらかになる。
@@ -316,6 +346,9 @@ class LearningScheduler:
 
     def _init_lazy_injected_slots(self) -> None:
         """`lifespan` / Pro プラグインから後注入されるコンポーネントの初期値を設定。"""
+        # llama.slots の取得元 (``set_slots_provider``)。未注入 / 未解決 (None) では止めない
+        self._slots_provider = None
+        self._single_slot_warned = False
         # エンベッド検索指示プロンプト進化
         self._embedder = None
         self._embed_instruction_evolver = None
@@ -398,6 +431,8 @@ class LearningScheduler:
         self._model_change_warned = False
         #: 載っているモデルが active と違う間の Level 1 延期を 1 回だけ記録する。
         self._serving_other_warned = False
+        #: 載っているモデルが active と違って Level 1 を延期し始めた時刻 (ISO UTC。延期していなければ None)。
+        self._level1_deferred_since: str | None = None
         # ランタイム切替を検知したときの自己修復 (新モデル GGUF 名 → rebind 結果)。
         # ``_learning_rebind.install_rebind_hook`` が注入。None なら従来どおり
         # Level 1 を止めるだけ。
@@ -471,6 +506,34 @@ class LearningScheduler:
 
         # 永続化済み状態の復元 (state_file が必要なため runtime_state 後)
         self._load_state()
+
+    def set_slots_provider(self, provider) -> None:
+        """``llama.slots`` の現在値を返す呼び出し可能物を注入する (遅延接続でも毎回引き直す)。"""
+        self._slots_provider = provider
+
+    @property
+    def single_slot(self) -> bool:
+        """``slots < 2`` が確定しているか (未解決・未注入は False = 止めない)。
+
+        背景の生成が chat と同じスロットを塞ぐため、Level 1 / Level 2 はここで止める
+        (sleep-time は待ち・打ち切りが効くので止めない、f_04 §10.1 #15)。
+        """
+        if self._slots_provider is None:
+            return False
+        try:
+            n = self._slots_provider()
+        except Exception:
+            return False
+        if isinstance(n, bool) or not isinstance(n, int) or n >= 2:
+            return False
+        if not self._single_slot_warned:
+            self._single_slot_warned = True
+            logger.warning(
+                "llama.slots=%d: Level 1 / Level 2 self-learning is stopped because "
+                "background generation would block chat on the single slot "
+                "(set llama.slots >= 2 to enable it)", n,
+            )
+        return True
 
     def _lp(self, key: str, default: int | float) -> int | float:
         """learning ポリシーからパラメータ取得（フォールバック付き）"""
@@ -955,34 +1018,101 @@ class LearningScheduler:
         few-shot / 訂正ペア / eval_core / Level 2 の失敗プールが読む
         ``user_correction`` はここでしか立たない。
 
-        ``--no-learning`` 中と補助クライアント不在時は no-op (候補は候補の
-        まま残り、次サイクルで再試行される)。
+        ``--no-learning`` 中は no-op。補助クライアント不在時は候補は候補の
+        まま残り、次サイクルで再試行される。
+
+        候補が 0 件でも ``verify_pending_corrections`` は通す — 昇格済み訂正への
+        門の掛け直し (``recheck_promoted``) と見逃しの印の付け外し
+        (``reconcile_false_negatives``) は決定論で、候補の有無と無関係に要る
+        (候補 0 件で即 return していた間、格下げが事実上止まっていた)。
+        補助クライアントは候補があるときだけ組み立てる。見逃しの印の付け外しは
+        :meth:`_apply_false_negatives` で学習語へ反映する (適用はここだけ)。
         """
         from backend.free.learning.correction_verifier import (
             has_pending_candidates,
             verify_pending_corrections,
         )
 
-        if self._disabled or not has_pending_candidates(self.experience_buf):
-            # 候補が無いなら補助クライアントを組み立てない (ほぼ全 tick がここ)。
+        if self._disabled:
             return {
                 "checked": 0, "promoted": 0, "rejected": 0, "pending": 0,
-                "skipped": "learning_disabled" if self._disabled else None,
+                "skipped": "learning_disabled",
             }
+        aux_client = (
+            self.resolve_idle_task_client(llm_client)
+            if has_pending_candidates(self.experience_buf) else None
+        )
         result = await verify_pending_corrections(
             self.experience_buf,
-            self.resolve_idle_task_client(llm_client),
+            aux_client,
             learning_disabled=self._disabled,
             unanswered=self._correction_unanswered,
             should_pause=self.should_yield,
         )
+        self._apply_false_negatives(result.get("false_negatives") or [])
         # 検証は signals を **その場で** 書き換える (件数も末尾 timestamp も
         # 変わらない) ので、``_get_filtered_experiences`` のメモ化キーでは
         # 検知できない。昇格を Level 1 の snapshot に届かせるため明示的に落とす
         # (2026-09-08 検証: 昇格後も snapshot が検証前の signals のままだった)。
-        if result.get("checked") or result.get("pending"):
+        if (
+            result.get("checked") or result.get("pending")
+            or result.get("demoted") or result.get("false_negatives")
+        ):
             self._exp_cache_key = None
         return result
+
+    def _apply_false_negatives(
+        self, changes: list[tuple[str, str, int]],
+    ) -> int:
+        """検証済み訂正から決まった見逃しの付け外しを学習語へ反映する。
+
+        ``changes`` は ``correction_verifier.reconcile_false_negatives`` の結果。
+        +1 は宛先の query から語を ``add_pattern`` し、-1 は同じ語を取り消す
+        (初回の追加なら初期重みぶん、既存語の強化なら強化ぶんを減衰)。語の抽出は
+        カテゴリ別に記録時と同じゲート (tool: ``extract_tool_routing_keywords`` /
+        long_form: ``is_long_form_learnable``) を通す。
+
+        Returns:
+            追加・取り消しした語の延べ数。
+        """
+        store = self._learned_patterns
+        if store is None or not changes:
+            return 0
+        touched = 0
+        for query, category, delta in changes:
+            if category == "tool_routing":
+                keywords = store.extract_tool_routing_keywords(query)
+            else:
+                keywords = [
+                    kw for kw in store.extract_intent_keywords(query)
+                    if store.is_long_form_learnable(kw)
+                ]
+            for kw in keywords:
+                if delta > 0:
+                    store.add_pattern(kw, category=category)
+                    touched += 1
+                    continue
+                pattern = store.patterns.get(kw.lower())
+                if pattern is None or pattern.category != category:
+                    continue
+                amount = (
+                    store.initial_weight if pattern.source_count <= 1
+                    else store.boost_amount
+                )
+                pattern.source_count = max(0, pattern.source_count - 1)
+                store.decay_one(kw, amount=amount)
+                touched += 1
+        if touched:
+            try:
+                from backend.config import get_path_resolver
+                store.save(get_path_resolver().resolve_local("learned_patterns_file"))
+            except Exception:
+                logger.warning("false_negative pattern persistence failed")
+            logger.info(
+                "Applied verified false_negative changes to learned patterns: "
+                "%d keyword updates from %d changes", touched, len(changes),
+            )
+        return touched
 
     def cancel(self, *, graceful: bool = True) -> None:
         """学習を中断する（f_04 §7.1）
@@ -1232,16 +1362,16 @@ class LearningScheduler:
         だけで、それで version を bump し続けると本文が単調に膨らむ (2026-09-04
         監査: v1→v6 で 5633→6890 字、実測品質は下降)。
 
-        採用したプロンプトは ``_prompt_adoptions`` に基準 (採用時の欠陥率 fitness と
-        rollback 先 version) を記録し、以後の Level 1 完了時に
-        :meth:`_check_prompt_adoptions` が事後監視する (L-A7)。
+        採用したプロンプトは ``_prompt_adoptions`` に基準 (旧版で生まれた経験の欠陥率
+        fitness と rollback 先 version) を記録し、以後の Level 1 の入口で
+        :meth:`_check_prompt_adoptions` が事後監視する (L-A7)。``update_evolved`` が
+        正規化後に現行と同一だとして書かなかった候補は採用扱いにしない。
 
         ``skipped_phases`` (cancel で飛ばした extra phase) が残っていれば
         ``_last_run`` を進めない — 同じ経験でもう一度 phase を回す機会を残す (L-A15)。
         """
         experiences = experiences or []
         verdicts = adoption_verdicts or {}
-        rolled_back = self._check_prompt_adoptions(experiences)
         for mode, result in results.items():
             verdict = verdicts.get(mode) or {}
             if not verdict.get("adopt"):
@@ -1252,23 +1382,39 @@ class LearningScheduler:
                     result.initial_fitness, result.final_fitness,
                 )
                 continue
-            if mode in rolled_back:
-                # 直前に rollback した mode の候補は rollback 対象から派生した
-                # ものなので、このサイクルでは採用しない。
-                logger.info(
-                    "Level 1 %s: adoption skipped (prompt rolled back this cycle)",
-                    mode,
-                )
-                continue
             try:
                 rollback_to = self.prompt_manager.get_meta(mode).version
-                self.prompt_manager.update_evolved(
+                written = self.prompt_manager.update_evolved(
                     mode,
                     result.best_candidate.text,
                     result.final_fitness,
                     eval_set_version=self._eval_set_version(),
                 )
-                self._record_prompt_adoption(mode, rollback_to, experiences)
+                if not written:
+                    # 正規化 (名前プレフィックス除去・段落の重複除去・保護節の復元)
+                    # の後で現行と同一だった。版は上がっておらず、採用の記録・
+                    # 事後監視・improved を立てると「採用した」と偽ることになる。
+                    verdict["adopt"] = False
+                    verdict["reason"] = "identical_after_normalization"
+                    logger.info(
+                        "Level 1 %s: no adoption (identical_after_normalization; %s, "
+                        "heuristic %.4f → %.4f)",
+                        mode, _fmt_adoption_measure(verdict),
+                        result.initial_fitness, result.final_fitness,
+                    )
+                    continue
+                self._record_prompt_adoption(
+                    mode, rollback_to, experiences, case_ids=verdict.get("case_ids"),
+                )
+                self._append_adoption_ledger(
+                    op="adopt", mode=mode,
+                    version=self.prompt_manager.get_meta(mode).version,
+                    parent_version=rollback_to,
+                    level1_session_id=session.session_id,
+                    cases=verdict.get("case_refs"),
+                    wins=verdict.get("wins"), losses=verdict.get("losses"),
+                    ties=verdict.get("ties"),
+                )
                 # 一対比較ゲート (f_04 §4.5) は ``measured_before/after`` を
                 # 持たない (勝敗しか測らない)。以前はここが ``%.3f`` で
                 # ``None`` を整形しようとして TypeError を投げ、下の except が
@@ -1301,6 +1447,11 @@ class LearningScheduler:
                 "losses": verdict.get("losses"),
                 "ties": verdict.get("ties"),
                 "noise_floor": verdict.get("noise_floor"),
+                # 標本 (成功ターン) での無退行の検査と、除外した失敗の内訳
+                "sample_wins": verdict.get("sample_wins"),
+                "sample_losses": verdict.get("sample_losses"),
+                "sample_ties": verdict.get("sample_ties"),
+                "excluded": verdict.get("excluded"),
                 "gate": "pairwise" if verdict.get("wins") is not None else "absolute",
                 "reason": verdict.get("reason"),
                 "mutation_attempts": getattr(result, "mutation_attempts", 0),
@@ -1393,8 +1544,9 @@ class LearningScheduler:
             self._step12_policy_evolver(live_experiences, side_results, durations)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Step 12 policy evolver failed (no-pressure skip): %r", exc)
+        fewshot_saved = False
         try:
-            self._step14_fewshot_gc(side_results, durations)
+            fewshot_saved = bool(self._step14_fewshot_gc(side_results, durations))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Step 14 few-shot GC failed (no-pressure skip): %r", exc)
         self.discard_active_session()
@@ -1420,11 +1572,20 @@ class LearningScheduler:
                 **{k: v for k, v in side_results.items() if k == "policy_params"},
             },
         )
+        # 「更新した」と書くのは実際に保存したときだけ (以前は Step 14 が
+        # ``_cancelled`` で黙って抜けても常に "few-shot pool updated" と出ていた)。
+        gc_summary = side_results.get("fewshot_gc")
+        if fewshot_saved:
+            fewshot_state = "few-shot pool saved"
+        elif isinstance(gc_summary, dict) and gc_summary.get("delegated_to_semmem"):
+            fewshot_state = "few-shot pool GC delegated to SemMem"
+        else:
+            fewshot_state = "few-shot pool not saved"
         logger.info(
             "Level 1 skipped: no selection pressure in any mode (%s); "
-            "%d experience(s) consumed, few-shot pool updated",
+            "%d experience(s) consumed, %s",
             ", ".join(f"{m}={v.get('reason')}" for m, v in skipped.items()),
-            len(session.experience_snapshot),
+            len(session.experience_snapshot), fewshot_state,
         )
         return dict(self._last_level1_results)
 
@@ -1469,8 +1630,17 @@ class LearningScheduler:
         下限 3 を満たして走り、``min_net_wins=2`` に対し上限 1 の勝負を
         **10.3 分** かけて ``wins=0 losses=0 ties=4`` で終えた。到達可能性は
         件数ではなく **採用条件そのもの** と比べる。
+
+        **失敗はあったが全部除外されたモードは ``unreachable_net_wins``**
+        (2026-10-08 監査、f_04 §10.1 #4)。自動検出される失敗の多くはツール根拠の
+        ターンで評価ケースから外れる。失敗が無いモード (``no_selection_pressure``)
+        と区別し、除外理由別の件数を ``skipped[mode]["excluded"]`` に残す。
+
+        **一対比較で標本が 0 件のモードは ``no_regression_samples``** (2026-10-08)。
+        採用ゲートは無退行を測れない候補を必ず不採用にするので、走らせても
+        採用され得ない。絶対採点の評価器は標本を使わないので外さない。
         """
-        from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
+        from backend.free.optimizer.prompt_eval import select_prompt_eval_case_sets
 
         threshold = max(1, self.min_experiences // 2)
         max_cases, _, min_cases = self._prompt_gate_config()
@@ -1489,27 +1659,30 @@ class LearningScheduler:
             # 圧の有無は失敗由来のケースだけで決める (標本は除く)。件数の枠は
             # 採用ゲートと同じ ``adoption_eval_cases`` にする — ここで狭い枠を
             # 使うと、ゲートが実際に見る失敗ケース数を過小に数えてしまう。
-            pressure_cases = select_prompt_eval_cases(
-                mode_exp, mode, max(1, max_cases), sample_cases=0,
-            )
-            # 実際に採用ゲートへ渡る件数 (標本込み) は下限判定にだけ使う。
-            cases = select_prompt_eval_cases(
+            selection = select_prompt_eval_case_sets(
                 mode_exp, mode, max(1, max_cases), sample_cases=self._sample_cases(),
             )
+            pressure_cases = selection.failures
             if len(mode_exp) < threshold:
                 reason = "insufficient_experiences"
-            elif not pressure_cases:
+            elif not pressure_cases and not selection.excluded:
                 reason = "no_selection_pressure"
-            elif len(pressure_cases) < min_net_wins:
+            elif len(pressure_cases) < max(1, min_net_wins):
                 reason = "unreachable_net_wins"
-            elif len(cases) < min_cases:
+            # 一対比較のゲートは標本 0 件なら必ず ``no_regression_samples`` で
+            # 落とす (``_check_sample_regression``) — 同じ選定で先に外す。
+            elif min_net_wins and not selection.samples:
+                reason = "no_regression_samples"
+            # 実際に採用ゲートへ渡る件数 (標本込み) は下限判定にだけ使う。
+            elif len(selection.cases) < min_cases:
                 reason = "insufficient_cases"
             else:
                 kept[mode] = text
                 continue
             logger.info(
-                "Level 1 %s: prompt evolution skipped (%s, %d experiences)",
-                mode, reason, len(mode_exp),
+                "Level 1 %s: prompt evolution skipped (%s, %d experiences, "
+                "excluded failures %s)",
+                mode, reason, len(mode_exp), dict(sorted(selection.excluded.items())),
             )
             skipped[mode] = {
                 "improved": False, "skipped": True, "reason": reason,
@@ -1517,33 +1690,48 @@ class LearningScheduler:
                 # 入れると、経験 0 件のモード (create を使わない利用者) まで
                 # 「入力があるのに効果ゼロ」に数えて stalled を誤報する。
                 "experiences": len(mode_exp),
+                # 失敗の証拠があったのに評価ケースにしなかった件数 (理由別)
+                "excluded": dict(selection.excluded),
             }
         return kept, skipped
 
     async def _measure_pairwise(
-        self, mode: str, current: str, candidate: str, cases: list,
-        min_cases: int, verdict: dict,
+        self, mode: str, current: str, candidate: str, failures: list,
+        samples: list, min_cases: int, verdict: dict,
     ) -> None:
-        """一対比較ゲート (f_04 §4.5): 候補の純勝ちが下限 **かつ雑音フロア** を超えたら採用。
+        """一対比較ゲート (f_04 §4.5): 候補の純勝ちが下限 **かつ雑音フロア** を超え、
+        標本で 1 敗もしなければ採用。
 
         勝敗は評価器の決定論の欠陥数 (``compare_prompts``)。評価器が
         ``compare_with_noise_floor`` を持てば、現行 vs 現行 (カナリア) の
         |純勝ち| を雑音フロアとして受け取り、候補の純勝ちがそれを **超えない**
         かぎり採用しない。長文の再生成は temperature=0 でも分岐するので、
         同一 prompt でも差が出うる (2026-09-14 監査 A)。
+
+        純勝ちは **失敗ケースだけ** で数え、標本 (成功ターン) は無退行の検査に
+        使う (f_04 §10.1 #2 後半)。標本の再生成は失敗側で採用候補になったとき
+        だけ行う (短絡評価 — 落ちる候補に標本の生成コストを払わない)。標本が
+        0 件なら無退行を測れないので採用しない (``no_regression_samples``、
+        f_04 §8 禁則 7)。標本で 1 敗でもすれば ``sample_regression``。
         """
+        from backend.free.learning.pairwise_gate import (
+            PAIRWISE_NET_WINS,
+            noise_floor,
+            pairwise_verdict,
+            tally,
+        )
+
         min_net = self._min_net_wins()
         noise = 0
         try:
             with_canary = getattr(self._prompt_eval, "compare_with_noise_floor", None)
             if callable(with_canary):
-                outcomes, canary = await with_canary(current, candidate, cases)
-                noise = abs(
-                    sum(1 for v in canary.values() if v > 0)
-                    - sum(1 for v in canary.values() if v < 0)
-                )
+                outcomes, canary = await with_canary(current, candidate, failures)
+                noise = noise_floor(canary)
             else:
-                outcomes = await self._prompt_eval.compare_prompts(current, candidate, cases)
+                outcomes = await self._prompt_eval.compare_prompts(
+                    current, candidate, failures,
+                )
         except Exception as exc:  # noqa: BLE001 - 実測失敗は不採用で継続
             logger.warning(
                 "Level 1 %s: pairwise adoption gate failed: %r", mode, exc, exc_info=True,
@@ -1553,40 +1741,96 @@ class LearningScheduler:
         measured = len(outcomes)
         verdict["cases"] = measured
         verdict["noise_floor"] = noise
-        if measured < max(1, (len(cases) + 1) // 2) or measured < min_cases:
+        # 下限 ``min_cases`` は標本込みの件数で見る (選択圧の前検査と同じ数え方)。
+        # ここでは失敗側の半数規則と、標本を足しても届かない場合だけ落とす。
+        if (
+            measured < max(1, (len(failures) + 1) // 2)
+            or measured + len(samples) < min_cases
+        ):
             verdict["reason"] = "insufficient_measured_cases"
             return
-        wins = sum(1 for v in outcomes.values() if v > 0)
-        losses = sum(1 for v in outcomes.values() if v < 0)
-        ties = measured - wins - losses
+        wins, losses, ties = tally(outcomes)
         verdict.update({"wins": wins, "losses": losses, "ties": ties})
-        net = wins - losses
-        if net >= min_net and net > noise:
-            verdict["adopt"] = True
-            verdict["reason"] = "pairwise_net_wins"
-        elif net >= min_net:
-            verdict["reason"] = "within_noise_floor"
-        else:
-            verdict["reason"] = "no_pairwise_gain"
+        sample_outcomes: dict[str, int] = {}
+        verdict["reason"] = pairwise_verdict(wins - losses, noise, min_net)
+        if verdict["reason"] == PAIRWISE_NET_WINS:
+            verdict["reason"] = await self._check_sample_regression(
+                mode, current, candidate, samples, measured, min_cases,
+                verdict, sample_outcomes,
+            )
+            verdict["adopt"] = verdict["reason"] == PAIRWISE_NET_WINS
         logger.info(
             "Level 1 %s: pairwise adoption gate wins=%d losses=%d ties=%d "
-            "noise_floor=%d on %d/%d cases (%s)",
-            mode, wins, losses, ties, noise, measured, len(cases), verdict["reason"],
+            "noise_floor=%d on %d/%d cases, samples %s (%s)",
+            mode, wins, losses, ties, noise, measured, len(failures),
+            (
+                f"wins={verdict['sample_wins']} losses={verdict['sample_losses']} "
+                f"ties={verdict['sample_ties']}"
+                if "sample_wins" in verdict else "not measured"
+            ),
+            verdict["reason"],
         )
         dl = self._debug_logger
         if dl is not None:
             dl.log_learning_cycle(cycle_num=1, data={
                 "level": 1, "phase": 2, "component": "prompt_adoption_gate",
-                "mode": mode, "gate": "pairwise", "cases_selected": len(cases),
+                "mode": mode, "gate": "pairwise", "cases_selected": len(failures),
                 "cases_measured": measured, "wins": wins, "losses": losses,
                 "ties": ties, "noise_floor": noise, "min_net_wins": min_net,
+                "samples_selected": len(samples),
+                "sample_wins": verdict.get("sample_wins"),
+                "sample_losses": verdict.get("sample_losses"),
+                "sample_ties": verdict.get("sample_ties"),
+                "excluded": verdict.get("excluded", {}),
                 "adopt": verdict["adopt"], "reason": verdict["reason"],
                 "cases": [
                     {"case_id": c.case_id, "kind": c.kind, "query": c.query[:80],
                      "verdict": outcomes.get(c.case_id)}
-                    for c in cases
+                    for c in failures
+                ] + [
+                    {"case_id": c.case_id, "kind": c.kind, "query": c.query[:80],
+                     "verdict": sample_outcomes.get(c.case_id)}
+                    for c in samples
                 ],
             })
+
+    async def _check_sample_regression(
+        self, mode: str, current: str, candidate: str, samples: list,
+        measured: int, min_cases: int, verdict: dict, sample_outcomes: dict,
+    ) -> str:
+        """失敗側で採用候補になった候補を標本で再生成し、無退行かを判定する。
+
+        Returns:
+            ``pairwise_net_wins`` (採用) か不採用の理由。標本の勝敗は
+            ``verdict["sample_*"]``、ケース別の結果は ``sample_outcomes`` に入れる。
+        """
+        if not samples:
+            return "no_regression_samples"
+        try:
+            sample_outcomes.update(
+                await self._prompt_eval.compare_prompts(current, candidate, samples),
+            )
+        except Exception as exc:  # noqa: BLE001 - 実測失敗は不採用で継続
+            logger.warning(
+                "Level 1 %s: regression samples failed: %r", mode, exc, exc_info=True,
+            )
+            return "gate_error"
+        sample_measured = len(sample_outcomes)
+        sample_wins = sum(1 for v in sample_outcomes.values() if v > 0)
+        sample_losses = sum(1 for v in sample_outcomes.values() if v < 0)
+        verdict.update({
+            "sample_wins": sample_wins,
+            "sample_losses": sample_losses,
+            "sample_ties": sample_measured - sample_wins - sample_losses,
+        })
+        if (
+            sample_measured < max(1, (len(samples) + 1) // 2)
+            or measured + sample_measured < min_cases
+        ):
+            return "insufficient_measured_cases"
+        if sample_losses > 0:
+            return "sample_regression"
+        return "pairwise_net_wins"
 
     async def _measure_prompt_adoptions(
         self,
@@ -1606,7 +1850,7 @@ class LearningScheduler:
         ケース 0 件 / ケース不足 / 採点不足 / 候補が現行と同文 は全て不採用
         (実測できないものは採用しない — f_04 §8 禁則 7)。
         """
-        from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
+        from backend.free.optimizer.prompt_eval import select_prompt_eval_case_sets
 
         max_cases, min_gain, min_cases = self._prompt_gate_config()
         verdicts: dict[str, dict] = {}
@@ -1627,12 +1871,21 @@ class LearningScheduler:
             if max_cases <= 0:
                 verdict["reason"] = "gate_disabled"
                 continue
-            cases = select_prompt_eval_cases(
+            selection = select_prompt_eval_case_sets(
                 experiences, mode, max_cases, sample_cases=self._sample_cases(),
             )
-            if not cases:
+            verdict["excluded"] = dict(selection.excluded)
+            cases = selection.cases
+            # 純勝ちは失敗ケースでしか数えないので、失敗ケースが無ければ測らない
+            # (標本だけでは引き分けか負けしか起こらない)。
+            if not selection.failures:
                 verdict["reason"] = "no_eval_cases"
                 continue
+            # 採用後監視の基準値からゲートの題材を除く (採用の契機になった失敗を
+            # 基準に含めると、旧版の欠陥率が実際より悪く見え巻き戻しが鈍る)。
+            verdict["case_ids"] = [c.case_id for c in cases]
+            # 採用台帳 (版 → 根拠になった経験、c_05 §0.6) へ渡すケースの参照
+            verdict["case_refs"] = case_refs(cases)
             if len(cases) < min_cases:
                 # 少数ケースの平均は 1 件の judge 採点で符号が反転する。
                 # ``insufficient_cases`` は「測れなかった」ではなく
@@ -1661,7 +1914,8 @@ class LearningScheduler:
                 continue
             if self._pairwise_gate_available():
                 await self._measure_pairwise(
-                    mode, current, candidate, cases, min_cases, verdict,
+                    mode, current, candidate, selection.failures, selection.samples,
+                    min_cases, verdict,
                 )
                 continue
             try:
@@ -1703,7 +1957,7 @@ class LearningScheduler:
                     "cases_measured": len(common),
                     "measured_before": round(mb, 4), "measured_after": round(ma, 4),
                     "min_gain": min_gain, "adopt": verdict["adopt"],
-                    "reason": verdict["reason"],
+                    "reason": verdict["reason"], "excluded": verdict["excluded"],
                     # ケース別の内訳。平均だけだと「どの失敗ケースで候補が
                     # 負けたか」が追えず、ゲートの妥当性を後から検証できない
                     # (2026-09-05 実機: 0.400 → 0.350 の内訳が読めなかった)。
@@ -1739,10 +1993,38 @@ class LearningScheduler:
 
     def _record_prompt_adoption(
         self, mode: str, rollback_to: int, experiences: list[dict],
+        *, case_ids: list[str] | None = None,
     ) -> None:
-        """採用直後の基準を記録する (欠陥率 fitness と rollback 先 version)。"""
-        mode_exp = [e for e in experiences if e.get("mode") == mode]
-        baseline = defect_rate_fitness(mode_exp, weights=PROMPT_DEFECT_WEIGHTS)
+        """採用直後の基準を記録する (欠陥率 fitness と rollback 先 version)。
+
+        基準は **旧版 (``rollback_to``) で生まれた経験** だけで測る。新版の経験や
+        版の分からない経験を混ぜると、採用後の窓と別の母集団を比べることになる。
+        採用ゲートのケース (``case_ids``、``prompt_eval._case_id(query)``) に当たる
+        経験も除く — 採用の契機になった失敗で基準を下げると巻き戻しが鈍る。
+        残りが ``min_experiences // 2`` 件未満なら基準なし (``None``) とし、
+        監視は巻き戻さない。
+        """
+        from backend.free.optimizer.prompt_eval import _case_id
+
+        excluded = set(case_ids or ())
+        mode_exp = [
+            e for e in experiences
+            if e.get("mode") == mode
+            and _prompt_version_of(e) == rollback_to
+            and _case_id(str(e.get("query", "") or "")) not in excluded
+        ]
+        min_samples = max(1, self.min_experiences // 2)
+        baseline = (
+            defect_rate_fitness(mode_exp, weights=PROMPT_DEFECT_WEIGHTS)
+            if len(mode_exp) >= min_samples else None
+        )
+        if baseline is None:
+            logger.info(
+                "Level 1 %s: no baseline for the post-adoption check "
+                "(%d experience(s) on v%03d outside the gate cases, need %d); "
+                "the adopted prompt will not be rolled back automatically",
+                mode, len(mode_exp), int(rollback_to), min_samples,
+            )
         now = utc_now()
         self._prompt_adoptions[mode] = {
             "rollback_to": int(rollback_to),
@@ -1754,6 +2036,20 @@ class LearningScheduler:
             "window_since": now,
             "windows": [],
         }
+
+    def _append_adoption_ledger(self, **row: Any) -> None:
+        """採用台帳 (``learning.prompt_adoption``) へ 1 行追記する。
+
+        版は既に上がっている / 戻っているので、台帳に書けなくても (readonly・
+        版が新しい行・I/O) 採用・巻き戻しは取り消さず WARNING に留める。
+        """
+        try:
+            append_adoption(Path(self.prompt_manager.prompt_dir), **row)
+        except Exception as exc:  # noqa: BLE001 - 台帳の失敗で採用を巻き戻さない
+            logger.warning(
+                "Level 1 %s: failed to append the prompt adoption ledger (%s): %s",
+                row.get("mode"), row.get("op"), exc,
+            )
 
     def _adoption_superseded(self, mode: str, adopted: Any) -> str:
         """採用した版が現行でなくなっていれば理由を返す (現行のままなら空)。
@@ -1826,6 +2122,11 @@ class LearningScheduler:
                 try:
                     self.prompt_manager.rollback(mode, int(rec["rollback_to"]))
                     rolled_back.add(mode)
+                    self._append_adoption_ledger(
+                        op="rollback", mode=mode,
+                        version=self.prompt_manager.get_meta(mode).version,
+                        parent_version=int(rec["rollback_to"]),
+                    )
                     logger.warning(
                         "Level 1 %s: evolved prompt rolled back to v%03d "
                         "(post-adoption fitness %.4f < baseline %.4f - %.2f)",
@@ -1836,6 +2137,12 @@ class LearningScheduler:
                     logger.warning(
                         "Level 1 %s: prompt rollback failed: %s", mode, e, exc_info=True,
                     )
+            elif baseline is None:
+                logger.info(
+                    "Level 1 %s: post-adoption check ended with no baseline "
+                    "(fitness %.4f); not rolled back",
+                    mode, mean,
+                )
             else:
                 logger.info(
                     "Level 1 %s: adopted prompt passed post-adoption check "
@@ -1844,6 +2151,44 @@ class LearningScheduler:
                 )
             del self._prompt_adoptions[mode]
         return rolled_back
+
+    def _run_post_adoption_check(self) -> None:
+        """採用後監視を Level 1 の入口で回す (完走・skip・中断・再開の全経路)。
+
+        以前は完走時の finalize の中でしか回らず、選択圧なしの skip や yield が
+        続くと悪化した採用版が監視されないまま残った。監視の記録が変われば状態を
+        保存し、巻き戻しが起きたら継続中の session (巻き戻し前の本文から作った
+        候補を持つ) を捨てる。採用した生成デルタの監視
+        (:meth:`_check_generation_adoptions`) も同じ入口で回す。
+        """
+        def _snapshot() -> str:
+            # 生成デルタの監視記録は learning_state の ``_extra`` に入っている
+            return json.dumps(
+                [self._prompt_adoptions, self._state_extra], sort_keys=True, default=str,
+            )
+
+        before = _snapshot()
+        try:
+            experiences = self._get_filtered_experiences()
+            rolled_back = self._check_prompt_adoptions(experiences)
+        except Exception as exc:  # noqa: BLE001 - 監視の失敗で学習を止めない
+            logger.warning("Post-adoption check failed: %r", exc, exc_info=True)
+            return
+        try:
+            # 生成デルタの巻き戻しは継続中の session (プロンプト候補) に影響しない
+            self._check_generation_adoptions(experiences)
+        except Exception as exc:  # noqa: BLE001 - 監視の失敗で学習を止めない
+            logger.warning(
+                "Generation delta post-adoption check failed: %r", exc, exc_info=True,
+            )
+        if _snapshot() != before:
+            self._save_state()
+        if rolled_back and self.has_active_session():
+            logger.info(
+                "Level 1 active session discarded: prompt rolled back (%s)",
+                ", ".join(sorted(rolled_back)),
+            )
+            self.discard_active_session()
 
     async def _run_extra_optimizations(
         self,
@@ -1932,6 +2277,8 @@ class LearningScheduler:
         """
         if self._disabled:
             return {"skipped": True, "reason": "learning_disabled"}
+        if self.single_slot:
+            return {"skipped": True, "reason": "single_slot"}
         if llm_client is None:
             return {"skipped": True, "reason": "no_llm_client"}
         if self._running:
@@ -1971,6 +2318,7 @@ class LearningScheduler:
             logger.warning(
                 "Correction verification failed before Level 1: %r", exc,
             )
+        self._run_post_adoption_check()
 
         session_or_skip = self._load_or_create_level1_session(reason, relax_threshold)
         if isinstance(session_or_skip, dict):
@@ -2194,16 +2542,25 @@ class LearningScheduler:
         create_model が載っている間に走ると、active の候補を別モデルで評価して
         active へ書き戻す (f_04 §1.2.0、2026-09-28 レビュー L4)。載っているモデルが
         分からないときは止めない。
+
+        延期の開始時刻を ``_level1_deferred_since`` に残す (``get_status`` の
+        ``deferred_since``)。``/api/mode/switch`` で create へ切り替えると chat に戻るまで
+        create_model が載ったままなので、最後に使ったのが create だと chat の Level 1 も
+        止まり続ける。
         """
         from backend.config import PathResolver
 
         resolver = self._resolver
         if not isinstance(resolver, PathResolver) or not resolver.served_model_path():
+            self._level1_deferred_since = None
             return False
         serving = resolver.generating_model_key()
         if serving == resolver.active_model_key:
             self._serving_other_warned = False
+            self._level1_deferred_since = None
             return False
+        if self._level1_deferred_since is None:
+            self._level1_deferred_since = utc_now()
         if not self._serving_other_warned:
             self._serving_other_warned = True
             logger.info(
@@ -2306,9 +2663,10 @@ class LearningScheduler:
         """経験バッファを dict リストに変換する。
 
         1 tick に 3〜4 回呼ばれ、毎回 1000 件規模の dataclass → dict 変換を
-        繰り返していた (L-D1)。バッファ長 / 末尾 timestamp をキーにメモ化する
-        (ExperienceBuffer は世代カウンタを持たないため、この 2 つ組を安価な
-        代替キーとする)。
+        繰り返していた (L-D1)。バッファの世代 (``ExperienceBuffer.revision``) /
+        バッファ長 / 末尾 timestamp をキーにメモ化する。長さと末尾だけでは、
+        その場の書き換え (👎 の ``mark_user_feedback``、訂正の格下げ) で
+        古い snapshot を返し続けていた。
 
         カートリッジ依存の経験を落とすフィルタは廃止した (c_16 §5.5)。判定に
         使っていた ``ExperienceEntry.cartridge_ids`` は「そのとき **ロードされて
@@ -2321,7 +2679,10 @@ class LearningScheduler:
         """
         buf = self.experience_buf
         entries = buf.partition_entries() if isinstance(buf, ExperienceBuffer) else buf.entries
-        key = (len(entries), entries[-1].timestamp if entries else None)
+        key = (
+            id(buf), getattr(buf, "revision", None),
+            len(entries), entries[-1].timestamp if entries else None,
+        )
         if key == self._exp_cache_key:
             return list(self._exp_cache)
         # **キーを手で列挙しない** (c_05 §0.5 / .claude/rules/backend.md)。以前は
@@ -2435,9 +2796,15 @@ class LearningScheduler:
                 "experience_count": len(active.experience_snapshot),
             }
 
+        # 載っているモデルが active と違う間の Level 1 の延期 (tick を待たずに今の状態で答える)
+        deferred = self._serving_another_partition()
+
         return {
             "running": self._running,
             "is_disabled": self._disabled,
+            "single_slot": self.single_slot,
+            "deferred_reason": "serving_another_partition" if deferred else None,
+            "deferred_since": self._level1_deferred_since,
             "experience_count": total,
             "new_experience_count": new_count,
             "min_experiences": self.min_experiences,
@@ -2525,10 +2892,18 @@ class LearningScheduler:
             # ``last_level1_results`` / API に「improved と reason だけ」が残り、
             # 何勝何敗・雑音フロアいくつで決まったかが追えない (2026-09-14
             # 実機: stats には載せたのにサマリが白名単で捨てていた)。
-            for mk in ("gate", "wins", "losses", "ties", "noise_floor"):
+            for mk in (
+                "gate", "wins", "losses", "ties", "noise_floor",
+                "sample_wins", "sample_losses", "sample_ties",
+            ):
                 mv = val.get(mk)
                 if mv is not None:
                     entry[mk] = mv
+            # 失敗の証拠があったのに評価ケースにしなかった件数 (理由別、
+            # f_04 §10.1 #4)。空なら載せない。
+            excluded = val.get("excluded")
+            if isinstance(excluded, dict) and excluded:
+                entry["excluded"] = dict(excluded)
             summary[key] = entry
             (noop_phases if skipped else executed_phases).append(key)
         summary["_executed_phases"] = executed_phases
@@ -2587,6 +2962,9 @@ class LearningScheduler:
         if self._disabled:
             # --no-learning 中は手動トリガーでも副作用 (プロンプト書戻し等) を起こさない。
             return False, msg("api.learning_disabled")
+
+        if self.single_slot:
+            return False, msg("api.learning_single_slot")
 
         if self._running:
             return False, msg("api.learning_cycle_running")
@@ -2835,7 +3213,7 @@ class LearningScheduler:
         """
         if self._cancelled or self._generation_param_evolver is None:
             return
-        from backend.free.optimizer.prompt_eval import select_prompt_eval_cases
+        from backend.free.optimizer.prompt_eval import select_prompt_eval_case_sets
 
         def _base_generation_params(mode: str) -> dict:
             """config の既定 sampling (学習デルタ適用 **前**)。未ロードなら空。"""
@@ -2863,19 +3241,28 @@ class LearningScheduler:
                 continue
             if measured:
                 max_cases, _, _ = self._prompt_gate_config()
-                cases = select_prompt_eval_cases(
+                # 純勝ちは失敗ケースだけで数え、標本は無退行の検査に回す
+                # (プロンプト側のゲートと同じ分け方、f_04 §10.1 #2 後半)。
+                selection = select_prompt_eval_case_sets(
                     mode_exp, mode, max(1, max_cases),
                     sample_cases=self._sample_cases(),
                 )
+                previous = self._generation_param_evolver.get_deltas(mode)
                 gen_result = await self._generation_param_evolver.evolve_measured(
                     mode,
                     mode_exp,
                     base_params=_base_generation_params(mode),
                     prompt_text=self._active_prompt_static(mode),
                     evaluator=self._prompt_eval,
-                    cases=cases,
+                    cases=selection.failures,
+                    samples=selection.samples,
                     min_net_wins=self._min_net_wins(),
                 )
+                if gen_result.get("improved"):
+                    self._record_generation_adoption(
+                        mode, previous, gen_result["deltas"], mode_exp,
+                        case_ids=[c.case_id for c in selection.cases],
+                    )
             else:
                 gen_result = self._generation_param_evolver.evolve(
                     mode=mode,
@@ -2884,6 +3271,166 @@ class LearningScheduler:
                 )
             results[f"generation_params_{mode}"] = gen_result
         phase_durations["phase6_generation_params"] = round(time.monotonic() - tp, 3)
+
+    # ── 採用した生成デルタの事後監視 (f_04 §4.7、案 R1) ──
+
+    @staticmethod
+    def _generation_delta_version_of(experience: dict) -> str | None:
+        """経験を生んだ生成デルタの版 (``gen_config._extra.generation_delta_version``)。"""
+        from backend.free.learning.level0_instant import GENERATION_DELTA_VERSION_KEY
+
+        gen_config = experience.get("gen_config")
+        if isinstance(gen_config, dict):
+            version = gen_config.get(GENERATION_DELTA_VERSION_KEY)
+        else:
+            version = (getattr(gen_config, "_extra", None) or {}).get(
+                GENERATION_DELTA_VERSION_KEY,
+            )
+        return version if isinstance(version, str) else None
+
+    def _generation_adoptions(self) -> dict[str, dict]:
+        """監視中の生成デルタの採用記録 (``learning_state._extra`` の中、無ければ空)。"""
+        records = (self._state_extra or {}).get(GENERATION_ADOPTIONS_KEY)
+        return records if isinstance(records, dict) else {}
+
+    def _record_generation_adoption(
+        self, mode: str, rollback_to: dict, adopted: dict, experiences: list[dict],
+        *, case_ids: list[str] | None = None,
+    ) -> None:
+        """採用直後の基準を記録する (プロンプトの :meth:`_record_prompt_adoption` と同じ考え方)。
+
+        基準は **旧デルタ (``rollback_to``) の版で生まれた経験** だけで測り、採用
+        ゲートのケースに当たる経験は除く。残りが ``min_experiences // 2`` 件未満なら
+        基準なし (``None``) とし、監視は巻き戻さない。記録は ``learning_state`` の
+        ``_extra["generation_adoptions"][mode]`` に置き、すぐ保存する
+        (``generation_deltas.json`` は採用の時点で書かれているので、記録が遅れると
+        クラッシュで監視だけが消える)。
+        """
+        from backend.free.learning.fitness import GENERATION_DEFECT_WEIGHTS
+        from backend.free.learning.generation_delta_store import delta_version
+        from backend.free.optimizer.prompt_eval import _case_id
+
+        old_version = delta_version(rollback_to)
+        excluded = set(case_ids or ())
+        mode_exp = [
+            e for e in experiences
+            if e.get("mode") == mode
+            and self._generation_delta_version_of(e) == old_version
+            and _case_id(str(e.get("query", "") or "")) not in excluded
+        ]
+        min_samples = max(1, self.min_experiences // 2)
+        baseline = (
+            defect_rate_fitness(mode_exp, weights=GENERATION_DEFECT_WEIGHTS)
+            if len(mode_exp) >= min_samples else None
+        )
+        if baseline is None:
+            logger.info(
+                "Level 1 %s: no baseline for the generation delta post-adoption check "
+                "(%d experience(s) on delta %s outside the gate cases, need %d); "
+                "the adopted delta will not be rolled back automatically",
+                mode, len(mode_exp), old_version, min_samples,
+            )
+        now = utc_now()
+        extra = dict(self._state_extra or {})
+        records = dict(self._generation_adoptions())
+        records[mode] = {
+            "rollback_to": dict(rollback_to),
+            "adopted_version": delta_version(adopted),
+            "baseline": round(baseline, 4) if baseline is not None else None,
+            "adopted_at": now,
+            "window_since": now,
+            "windows": [],
+        }
+        extra[GENERATION_ADOPTIONS_KEY] = records
+        self._state_extra = extra
+        self._save_state()
+
+    def _check_generation_adoptions(self, experiences: list[dict]) -> set[str]:
+        """採用した生成デルタの事後監視。悪化していれば旧デルタへ巻き戻す。
+
+        窓は **採用した版で生まれた経験** (``gen_config._extra.generation_delta_version
+        == adopted_version``、``window_since`` より新しいもの) が ``min_experiences
+        // 2`` 件以上溜まった回を 1 窓と数え、:data:`PROMPT_ROLLBACK_WINDOWS` 窓の
+        欠陥率 fitness 平均が基準を :data:`PROMPT_ROLLBACK_EPSILON` 超悪化していたら
+        ``generation_deltas.json`` のそのモードを ``rollback_to`` に戻す。ディスク上の
+        デルタが採用した版でなくなっていたら (手編集・別の採用) 監視を打ち切る。
+
+        Returns:
+            このサイクルで巻き戻した mode の集合。
+        """
+        from backend.free.learning.fitness import GENERATION_DEFECT_WEIGHTS
+        from backend.free.learning.generation_delta_store import delta_version
+
+        records = self._generation_adoptions()
+        evolver = self._generation_param_evolver
+        if not records or evolver is None:
+            return set()
+        records = dict(records)
+        rolled_back: set[str] = set()
+        min_samples = max(1, self.min_experiences // 2)
+        for mode, rec in list(records.items()):
+            adopted = rec.get("adopted_version") if isinstance(rec, dict) else None
+            if not isinstance(adopted, str):
+                del records[mode]
+                continue
+            current = delta_version(evolver.persisted_deltas(mode))
+            if current != adopted:
+                logger.info(
+                    "Level 1 %s: generation delta post-adoption check abandoned "
+                    "(delta %s != adopted %s)", mode, current, adopted,
+                )
+                del records[mode]
+                continue
+            since = _parsed_time(rec.get("window_since"))
+            new_exp = [
+                e for e in experiences
+                if e.get("mode") == mode
+                and _parsed_time(e.get("timestamp")) > since
+                and self._generation_delta_version_of(e) == adopted
+            ]
+            if len(new_exp) < min_samples:
+                continue
+            fitness = defect_rate_fitness(new_exp, weights=GENERATION_DEFECT_WEIGHTS)
+            if fitness is None:
+                continue
+            rec = dict(rec)
+            windows = [*(rec.get("windows") or []), round(fitness, 4)]
+            rec["windows"] = windows
+            rec["window_since"] = format_utc(
+                max(_parsed_time(e.get("timestamp")) for e in new_exp),
+            )
+            records[mode] = rec
+            if len(windows) < PROMPT_ROLLBACK_WINDOWS:
+                continue
+            baseline = rec.get("baseline")
+            mean = sum(windows) / len(windows)
+            if baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON:
+                evolver.restore_deltas(mode, dict(rec.get("rollback_to") or {}))
+                rolled_back.add(mode)
+                logger.warning(
+                    "Level 1 %s: generation delta rolled back to %s "
+                    "(post-adoption fitness %.4f < baseline %.4f - %.2f)",
+                    mode, rec.get("rollback_to"), mean, baseline,
+                    PROMPT_ROLLBACK_EPSILON,
+                )
+            elif baseline is None:
+                logger.info(
+                    "Level 1 %s: generation delta post-adoption check ended with no "
+                    "baseline (fitness %.4f); not rolled back", mode, mean,
+                )
+            else:
+                logger.info(
+                    "Level 1 %s: adopted generation delta passed post-adoption check "
+                    "(fitness %.4f vs baseline %s)", mode, mean, baseline,
+                )
+            del records[mode]
+        extra = dict(self._state_extra or {})
+        if records:
+            extra[GENERATION_ADOPTIONS_KEY] = records
+        else:
+            extra.pop(GENERATION_ADOPTIONS_KEY, None)
+        self._state_extra = extra or None
+        return rolled_back
 
     def _level1_phase7_tool_routing(
         self,
@@ -2906,19 +3453,18 @@ class LearningScheduler:
         tool_exp = [
             e for e in experiences
             if (e.get("signals", {}).get("tool_routing_success")
-                or e.get("signals", {}).get("tool_routing_false_positive")
-                or e.get("signals", {}).get("tool_routing_false_negative"))
+                or e.get("signals", {}).get("tool_routing_false_positive"))
         ]
         if tool_exp:
             tool_result = self._evolve_tool_routing_patterns(tool_exp)
             if tool_result:
                 results["tool_routing_patterns"] = tool_result
 
+        # 未検出 (false_negative) の語は検証済み訂正の適用
+        # (``verify_correction_candidates`` → ``_apply_false_negatives``) だけが足す。
         long_form_exp = [
             e for e in experiences
-            if (e.get("signals", {}).get("long_form_success")
-                or e.get("signals", {}).get("long_form_false_positive")
-                or e.get("signals", {}).get("long_form_false_negative"))
+            if e.get("signals", {}).get("long_form_false_positive")
         ]
         if long_form_exp:
             lf_result = self._evolve_long_form_patterns(long_form_exp)
@@ -2999,8 +3545,13 @@ class LearningScheduler:
         evolve_writeback=semmem の場合は SemMem に新規 ``policy`` ファクト
         を書き戻す。yaml モードでは
         ``policy_evolver_state.json`` への永続化を行う。
+
+        ``_cancelled`` は見ない。全体経路では ``_run_extra_optimizations`` の
+        ``_phase`` が同じ判定を済ませており、LLM を使わない CPU 処理なので
+        選択圧なしの skip 経路でユーザー入力の残した ``_cancelled`` に黙って
+        飛ばされると、state が保存されないまま ``_last_run`` だけ進んでいた。
         """
-        if self._cancelled or self._policy_param_evolver is None:
+        if self._policy_param_evolver is None:
             return
         tp = time.monotonic()
         min_for_policy = max(1, self.min_experiences // 2)
@@ -3034,7 +3585,7 @@ class LearningScheduler:
         self,
         results: dict[str, dict],
         phase_durations: dict[str, float],
-    ) -> None:
+    ) -> bool:
         """Step 14: Few-shot プール GC
 
         ``FewShotPool.garbage_collect()`` を呼ぶ。SemMem writeback モード
@@ -3045,10 +3596,16 @@ class LearningScheduler:
 
         GC 実行後、yaml モードでは fewshot プールを ``fewshot_pool.json``
         へ保存する (旧 ``_level1_finalize`` で行っていた永続化を移動)。
+        ``_cancelled`` を見ない理由は :meth:`_step12_policy_evolver` と同じ
+        (few-shot プールの保存はここだけなので、飛ばすと補充分が失われる)。
+
+        Returns:
+            ``fewshot_pool.json`` へ保存したか (SemMem 委譲・保存失敗・プール無しは False)。
         """
-        if self._cancelled or self._fewshot_pool is None:
-            return
+        if self._fewshot_pool is None:
+            return False
         tp = time.monotonic()
+        saved = False
         # 使用実績の集計と stale / archived の遷移 (f_04 §3.2.2)。経験の
         # ``gen_config.fewshot_ids`` から導くので live バッファを読む。
         curate_summary = self._fewshot_pool.curate(self._get_filtered_experiences())
@@ -3060,6 +3617,7 @@ class LearningScheduler:
                 self._fewshot_pool.save(
                     self.prompt_manager.prompt_dir / "fewshot_pool.json",
                 )
+                saved = True
             except OSError as exc:
                 logger.warning(
                     "Step 14 fewshot pool save failed: %s", exc,
@@ -3068,6 +3626,7 @@ class LearningScheduler:
             time.monotonic() - tp, 3,
         )
         results["fewshot_gc"] = gc_summary
+        return saved
 
     def _level1_finalize(
         self,
@@ -3105,13 +3664,25 @@ class LearningScheduler:
         入力 = 経験件数、効果 = 改善を採用したか。``skipped`` (対象が無くて何も
         していない) も効果 0 として数える — 2026-09-21 に generation param 進化が
         経験 161 件で一度も発火していなかったのは、毎回 skipped だったから。
-        ``_`` で始まるキーと、``improved`` / ``skipped`` を持たない付随記録
-        (``fewshot_gc`` 等) はフェーズではないので数えない。``policy_params`` の
-        ようにドメイン別に 1 段入れ子になった結果は、ドメインごとの段にする。
+        ``_`` で始まるキーは数えない。``improved`` / ``skipped`` を持たない
+        付随記録は、件数 (int) を返す段 (:data:`_LEVEL1_COUNT_KEYS`) だけを効果 =
+        件数で台帳化する。これらは効果 0 が正常 (GC で消す手本が無い等) なので
+        入力件数を渡さず ``stalled`` へは数えない — 到達と効果の累計だけを見る。
+        件数を持たない段 (``critique_synthesis`` 等) は台帳化しない (到達しか
+        分からず、誤アラートの元になる)。``policy_params`` のように
+        ドメイン別に 1 段入れ子になった結果は、ドメインごとの段にする。
         """
         ledger = liveness_ledger()
         for phase, val in results.items():
             if phase.startswith("_") or not isinstance(val, dict):
+                continue
+            count_keys = _LEVEL1_COUNT_KEYS.get(phase)
+            if count_keys is not None:
+                counts = [val.get(k) for k in count_keys]
+                if all(isinstance(c, int) and not isinstance(c, bool) for c in counts):
+                    ledger.record_run(
+                        f"learn.level1.{phase}", effect=sum(counts),
+                    )
                 continue
             if "improved" in val or val.get("skipped"):
                 entries = {f"learn.level1.{phase}": val}
@@ -3240,11 +3811,11 @@ class LearningScheduler:
     ) -> dict | None:
         """ツール誘導パターンの重みをフィードバックに基づいて進化させる
 
-        成功時: パターンをブースト、誤検出時: 減衰、未検出時: 新パターン追加。
-        LLM 不要。
+        成功時: パターンをブースト、誤検出時: 減衰。未検出からの追加は
+        :meth:`_apply_false_negatives` (検証済み訂正) だけが行う。LLM 不要。
 
         Returns:
-            {"boosted": int, "decayed": int, "added": int, "total": int} or None
+            {"boosted": int, "decayed": int, "total": int} or None
         """
         if self._learned_patterns is None:
             return None
@@ -3256,7 +3827,6 @@ class LearningScheduler:
 
         boosted = 0
         decayed = 0
-        added = 0
 
         for exp in experiences:
             signals = exp.get("signals", {})
@@ -3280,20 +3850,6 @@ class LearningScheduler:
                     store.decay_one(kw, amount=decay_amount)
                     decayed += 1
 
-            if signals.get("tool_routing_false_negative"):
-                # 未検出: クエリからキーワードを抽出して追加。
-                # extract_tool_routing_keywords がツールシグナル無しクエリ /
-                # 話題名詞 / 言語タスク語 (「説明」等) を除外する
-                # (FeedbackCollector._learn_tool_routing_from_false_negative
-                # と同一ゲート。従来ここは無ゲートの extract_intent_keywords
-                # で、feedback 側 2026-07-18 ガードで弾いた経験からも Level 1
-                # バッチで再学習される穴があり、「コーヒー」「天気」等の
-                # 話題名詞 62 件が tool_routing に蓄積していた)
-                keywords = store.extract_tool_routing_keywords(query)
-                for kw in keywords:
-                    store.add_pattern(kw, category="tool_routing")
-                    added += 1
-
         # 永続化
         try:
             from backend.config import get_path_resolver
@@ -3304,13 +3860,12 @@ class LearningScheduler:
             logger.warning("tool routing pattern persistence failed")
 
         logger.info(
-            "tool routing evolution: boosted=%d, decayed=%d, added=%d, total=%d",
-            boosted, decayed, added, store.count,
+            "tool routing evolution: boosted=%d, decayed=%d, total=%d",
+            boosted, decayed, store.count,
         )
         return {
             "boosted": boosted,
             "decayed": decayed,
-            "added": added,
             "total": store.count,
         }
 
@@ -3319,51 +3874,34 @@ class LearningScheduler:
     ) -> dict | None:
         """長文ルーティングパターンの重みをフィードバックに基づいて進化させる
 
-        ``_evolve_tool_routing_patterns`` のロジックを ``category="long_form"``
-        に置換した同型実装。ハードコード regex (LONG_FORM_PATTERNS) と並列に
+        ハードコード regex (LONG_FORM_PATTERNS) と並列に
         ``ComplexityClassifier._detect_long_form_learned()`` で OR 評価される
-        学習語彙を更新する。
+        学習語彙を、誤検出 (false_positive) で減衰させる。success による強化は
+        しない — 長文経路が自分で選んだ結果を自分の正例に数えると自己強化の輪に
+        なる (不変則 #15)。未検出からの追加は :meth:`_apply_false_negatives`
+        (検証済み訂正) だけが行う。
 
         Returns:
-            {"boosted": int, "decayed": int, "added": int, "total": int} or None
+            {"decayed": int, "total": int} or None
         """
         if self._learned_patterns is None:
             return None
 
         store = self._learned_patterns
         learning_cfg = self._config.get("learning", {})
-        boost_amount = learning_cfg.get("long_form_pattern_boost_success", 0.03)
         decay_amount = learning_cfg.get("long_form_pattern_decay_false_pos", 0.1)
 
-        boosted = 0
         decayed = 0
-        added = 0
 
         for exp in experiences:
             signals = exp.get("signals", {})
             query = exp.get("query", "")
-
-            if signals.get("long_form_success"):
-                matches = store.match(query, category="long_form", record_hit=False)
-                for kw, _ in matches:
-                    store.boost(kw, amount=boost_amount)
-                    boosted += 1
 
             if signals.get("long_form_false_positive"):
                 matches = store.match(query, category="long_form", record_hit=False)
                 for kw, _ in matches:
                     store.decay_one(kw, amount=decay_amount)
                     decayed += 1
-
-            if signals.get("long_form_false_negative"):
-                # パス片 / URL 片 / 汎用ファイル操作語は文書種別シグナルでないため除外
-                keywords = [
-                    kw for kw in store.extract_intent_keywords(query)
-                    if store.is_long_form_learnable(kw)
-                ]
-                for kw in keywords:
-                    store.add_pattern(kw, category="long_form")
-                    added += 1
 
         try:
             from backend.config import get_path_resolver
@@ -3374,13 +3912,11 @@ class LearningScheduler:
             logger.warning("long_form pattern persistence failed")
 
         logger.info(
-            "long_form pattern evolution: boosted=%d, decayed=%d, added=%d, total=%d",
-            boosted, decayed, added, store.count,
+            "long_form pattern evolution: decayed=%d, total=%d",
+            decayed, store.count,
         )
         return {
-            "boosted": boosted,
             "decayed": decayed,
-            "added": added,
             "total": store.count,
         }
 
@@ -3409,7 +3945,7 @@ class LearningScheduler:
         Returns:
             学習を開始したかどうか
         """
-        if self._disabled:
+        if self._disabled or self.single_slot:
             return False
         if self._level2_runner is None:
             logger.debug("Level 2 runner not set (Free edition)")

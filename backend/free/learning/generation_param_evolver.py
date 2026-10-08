@@ -12,6 +12,13 @@ from backend.free.learning.fitness import (
     defect_rate_fitness,
 )
 from backend.free.learning.generation_delta_store import GenerationDeltaStore
+from backend.free.learning.pairwise_gate import (
+    PAIRWISE_NET_WINS,
+    net_wins,
+    noise_floor,
+    pairwise_verdict,
+    tally,
+)
 from backend.log_config import get_logger
 
 logger = get_logger("learning.generation_param_evolver")
@@ -72,6 +79,23 @@ class GenerationParamEvolver:
     def get_deltas(self, mode: str) -> dict[str, float]:
         """指定モードのデルタを取得"""
         return dict(self._deltas.get(mode, {}))
+
+    def persisted_deltas(self, mode: str) -> dict[str, float]:
+        """ディスク上 (本番の生成が読む側) のそのモードのデルタ。
+
+        ファイルを持たない構成ではメモリ上のデルタ。採用後監視が「採用した版が
+        まだ効いているか」を見るのに使う (手で書き換えられていたら監視を打ち切る)。
+        """
+        if self._delta_file is None:
+            return self.get_deltas(mode)
+        # load_mode の mtime キャッシュは粗い時刻の FS で直後の書込みを見逃しうる
+        loaded = GenerationDeltaStore.load(self._delta_file)
+        return dict((loaded or {}).get(mode, {}))
+
+    def restore_deltas(self, mode: str, deltas: dict[str, float]) -> None:
+        """そのモードのデルタを ``deltas`` に戻して永続化する (採用後監視の巻き戻し)。"""
+        self._deltas[mode] = dict(deltas)
+        self.save_deltas()
 
     def evolve(
         self,
@@ -180,6 +204,7 @@ class GenerationParamEvolver:
         prompt_text: str,
         evaluator,
         cases: list,
+        samples: list | None = None,
         min_net_wins: int = 1,
         rng: random.Random | None = None,
     ) -> dict:
@@ -191,13 +216,22 @@ class GenerationParamEvolver:
         記録を当てにせず現行 / 候補の両方をその場で生成して比べればよい。
 
         採用条件は prompt 側の一対比較ゲートと同じ不等式 —
-        ``純勝ち >= min_net_wins`` かつ ``純勝ち > 雑音フロア``。フロアは
+        ``純勝ち >= min_net_wins`` かつ ``純勝ち > 雑音フロア``
+        (:func:`~backend.free.learning.pairwise_gate.pairwise_verdict`)。フロアは
         **現行パラメータ同士** のカナリアで採るので、温度が高くて揺れる構成
-        ほど自動的に高い要求になる。
+        ほど自動的に高い要求になる。温度 > 0 なら候補も 2 回引き、純勝ちは
+        2 回の小さい方、フロアは現行同士と候補同士の大きい方で見る (候補側の
+        揺れ。2 回目は 1 回目が条件を満たしたときだけ引く)。
+
+        純勝ちは ``cases`` (**失敗ケースだけ**) で数え、``samples`` (成功ターンの
+        標本) は無退行の検査に使う (プロンプト側と同じ、f_04 §10.1 #2 後半)。
+        標本が 0 件なら ``no_regression_samples``、標本で 1 敗なら
+        ``sample_regression`` で採用しない。
 
         Returns:
             ``{"improved": bool, "skipped": bool, "reason": str, "deltas": dict,
-            "candidate": dict, "wins"/"losses"/"ties"/"noise_floor": int}``
+            "candidate": dict, "wins"/"losses"/"ties"/"noise_floor"/"net_wins": int,
+            "second_draw": bool}`` (wins/losses/ties は 1 回目の引き)
         """
         current = dict(self._deltas.get(mode, {}))
         out: dict = {
@@ -228,9 +262,24 @@ class GenerationParamEvolver:
             out["reason"] = "candidate_not_measurable"
             return out
         out["candidate"] = candidate
+        if not samples:
+            # 無退行を測れない候補は採用しない (プロンプト側と同じ、f_04 §8
+            # 禁則 7)。失敗ケースの生成コストを払う前に止める。
+            out["reason"] = "no_regression_samples"
+            return out
+
+        def _first_draw_passes(outcomes: dict, canary: dict) -> bool:
+            # 1 回目で不採用が決まる候補には 2 回目の生成コストを払わない
+            return pairwise_verdict(
+                net_wins(outcomes), noise_floor(canary), min_net_wins,
+            ) == PAIRWISE_NET_WINS
+
         try:
-            outcomes, canary = await evaluator.compare_generation_params(
-                prompt_text, current_params, candidate_params, cases,
+            outcomes, outcomes_b, canary, canary_cand = (
+                await evaluator.compare_generation_params(
+                    prompt_text, current_params, candidate_params, cases,
+                    measure_second_draw=_first_draw_passes,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - 実測失敗は不採用で継続
             logger.warning(
@@ -241,16 +290,17 @@ class GenerationParamEvolver:
         if not outcomes:
             out["reason"] = "insufficient_measured_cases"
             return out
-        wins = sum(1 for v in outcomes.values() if v > 0)
-        losses = sum(1 for v in outcomes.values() if v < 0)
-        noise = abs(
-            sum(1 for v in canary.values() if v > 0)
-            - sum(1 for v in canary.values() if v < 0)
-        )
+        wins, losses, ties = tally(outcomes)
         net = wins - losses
+        noise = noise_floor(canary)
+        if outcomes_b is not None:
+            # 候補も 2 回引いた (温度 > 0): 純勝ちは小さい方、雑音は現行同士と
+            # 候補同士の大きい方。1 回の引きの当たりで採用しない (f_04 §4.7)。
+            net = min(net, net_wins(outcomes_b))
+            noise = max(noise, noise_floor(canary_cand or {}))
         out.update({
-            "wins": wins, "losses": losses,
-            "ties": len(outcomes) - wins - losses, "noise_floor": noise,
+            "wins": wins, "losses": losses, "ties": ties, "noise_floor": noise,
+            "net_wins": net, "second_draw": outcomes_b is not None,
             # ここまで来たら **実測は走っている**。採用しなくても skipped では
             # ない — scheduler は `_executed_phases` (実行して改善なし) と
             # `_noop_phases` (対象が無く実行していない) をこのフラグで分ける
@@ -258,23 +308,54 @@ class GenerationParamEvolver:
             # 実行していないことになる」(2026-09-21 実機で発覚)。
             "skipped": False,
         })
-        if net >= min_net_wins and net > noise:
+        out["reason"] = pairwise_verdict(net, noise, min_net_wins)
+        if out["reason"] == PAIRWISE_NET_WINS:
+            out["reason"] = await self._check_sample_regression(
+                mode, evaluator, prompt_text, current_params, candidate_params,
+                samples, out,
+            )
+        if out["reason"] == PAIRWISE_NET_WINS:
             self._deltas[mode] = candidate
             self.save_deltas()
-            out.update({
-                "improved": True,
-                "reason": "pairwise_net_wins", "deltas": candidate,
-            })
-        else:
-            out["reason"] = (
-                "within_noise_floor" if net >= min_net_wins else "no_pairwise_gain"
-            )
+            out.update({"improved": True, "deltas": candidate})
         logger.info(
-            "Mode %s generation params: wins=%d losses=%d noise_floor=%d "
-            "candidate=%s (%s)",
-            mode, wins, losses, noise, candidate, out["reason"],
+            "Mode %s generation params: wins=%d losses=%d net=%d noise_floor=%d "
+            "second_draw=%s candidate=%s (%s)",
+            mode, wins, losses, net, noise, outcomes_b is not None, candidate,
+            out["reason"],
         )
         return out
+
+    @staticmethod
+    async def _check_sample_regression(
+        mode: str, evaluator, prompt_text: str, current_params: dict,
+        candidate_params: dict, samples: list, out: dict,
+    ) -> str:
+        """失敗側で採用候補になった候補を標本で再生成し、無退行かを判定する。
+
+        プロンプト側 (``LearningScheduler._check_sample_regression``) と同じ規則
+        — 半数以上を測れなければ ``insufficient_measured_cases``、1 敗でもあれば
+        ``sample_regression``。候補を 2 回引いたときは、どちらかの引きでの負けを
+        数える (負けの多い方)。標本の勝敗は ``out["sample_*"]`` に入れる。
+        """
+        try:
+            first, second, _, _ = await evaluator.compare_generation_params(
+                prompt_text, current_params, candidate_params, samples,
+            )
+        except Exception as exc:  # noqa: BLE001 - 実測失敗は不採用で継続
+            logger.warning(
+                "Mode %s generation params: regression samples failed: %r", mode, exc,
+            )
+            return "gate_error"
+        wins, losses, ties = tally(first)
+        if second is not None:
+            losses = max(losses, tally(second)[1])
+        out.update({"sample_wins": wins, "sample_losses": losses, "sample_ties": ties})
+        if len(first) < max(1, (len(samples) + 1) // 2):
+            return "insufficient_measured_cases"
+        if losses > 0:
+            return "sample_regression"
+        return PAIRWISE_NET_WINS
 
 
 def apply_deltas(params: dict, deltas: dict[str, float]) -> dict:

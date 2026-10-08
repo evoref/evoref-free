@@ -925,7 +925,7 @@ class SystemPromptManager:
         fitness: float,
         *,
         eval_set_version: str = "",
-    ) -> None:
+    ) -> bool:
         """Level 1 進化: 最良候補 (instruction) を本番に採用
 
         保護セクション（<!-- PROTECTED --> マーカー）が現在のプロンプトに含まれている場合、
@@ -939,6 +939,9 @@ class SystemPromptManager:
             mode: 対象モード
             content: 進化後のプロンプト本文
             fitness: 最終 fitness スコア
+
+        Returns:
+            採用して版を上げたら True。正規化後に現行と同一なら False (何も書かない)。
         """
         if mode not in self.MODES:
             raise ValueError(f"Unknown mode: {mode}")
@@ -968,7 +971,7 @@ class SystemPromptManager:
                 "(fitness=%.3f), skipping update to avoid no-op version bump",
                 mode, fitness,
             )
-            return
+            return False
 
         self._archive_current(mode)
         self._adopt_content(mode, content)
@@ -989,6 +992,7 @@ class SystemPromptManager:
             "Evolved update: mode=%s, version=%d, fitness=%.3f",
             mode, meta.version, fitness,
         )
+        return True
 
     def reload(self, mode: str) -> None:
         """ディスクからプロンプトを再読込み"""

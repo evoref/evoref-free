@@ -53,16 +53,12 @@ from backend.free.core.response_verifiers import (
     misstated_change_rate,
 )
 from backend.free.core.relative_date import (
-    has_non_today_offset_anchor,
-    resolves_today_anchored_span,
+    DATE_RESULT_ANCHOR_MISMATCH,
+    DATE_RESULT_IGNORED,
+    date_result_use,
 )
 from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
-from backend.free.core.response_dates import (
-    extract_tool_anchor,
-    extract_tool_now_date,
-    extract_tool_target_date,
-    ignores_date_result,
-)
+from backend.free.core.response_dates import extract_tool_anchor
 from backend.free.core.verifier_events import (
     current_grounding,
     current_tool_decision,
@@ -75,14 +71,13 @@ from backend.free.core.verifier_events import (
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
     abstains_on_reference_material,
+    calculate_result_contradiction,
     cites_reference_material,
     claims_completed_state_change,
     contradicts_measured_values,
     fabricated_household_count,
     has_broken_ja_spacing,
     has_chinese_token_leak,
-    ignores_calculate_result,
-    misrounded_result_values,
     is_cut_off_answer,
     ungrounded_answer_names,
     retracts_own_conclusion,
@@ -103,6 +98,9 @@ from backend.free.learning.level0_instant import (
     RAG_ADOPTED_CORPUS_KEY,
     RESPONSE_FULL_CAP,
     RESPONSE_SUMMARY_CAP,
+    TOOL_CONTEXT_CAP,
+    TOOL_CONTEXT_KEY,
+    TOOL_CONTEXT_TRUNCATED_KEY,
     ExperienceBuffer,
     ExperienceEntry,
     FeedbackSignals,
@@ -1041,22 +1039,6 @@ def _publish_turn_outcome(outcome: str, reason: str | None) -> None:
             return
 
 
-def _target_answers_today_anchored_span(query: str, tool_result_text: str) -> bool:
-    """ツールの ``target`` が問いの今日起点の相対日付のどれかの答えか (純粋関数に近い)。
-
-    「今日から3日後と、10月20日の3日前は？」で今日起点のツールが組んだ ``target``
-    は「今日から3日後」の正しい答えで、起点の食い違いは別の span の話。ツールが
-    今日とした日 (``now:`` 行、無ければ今日) から今日起点の span を解いて照合する。
-    """
-    from backend.free.core.prompt_blocks import local_today
-
-    target = extract_tool_target_date(tool_result_text)
-    if target is None:
-        return False
-    today = extract_tool_now_date(tool_result_text) or local_today()
-    return resolves_today_anchored_span(query, target, today)
-
-
 #: 依頼の内容語 (問われた量の名詞: 「平均給与」「売上」) を取り出す連なり (漢字・カタカナ)。
 _ANSWER_SLOT_RUN_RE = re.compile(rf"[{KANJI}{KANJI_MARKS}{KATAKANA_WORD}]{{2,}}")
 #: 数の直前でこの範囲 (文字) に問われた名詞があれば、その数は答えの位置にある。
@@ -1245,6 +1227,7 @@ class FeedbackCollector:
         measured_values: dict[str, set[int]] | None = None,
         calculate_result: float | None = None,
         tool_result_text: str = "",
+        tool_context: str = "",
         stated_context: str = "",
         truncated: bool = False,
         generation_failed: bool = False,
@@ -1272,6 +1255,12 @@ class FeedbackCollector:
         (:func:`backend.free.core.response_dates.ignores_date_result`、
         2026-09-09 監査 G-06)。``calculate_result`` と同じく呼出側がプロンプト
         から読み戻して渡す。
+
+        ``tool_context`` は採用ゲートがツール根拠のターンを再生するために残す
+        ツール結果ブロック (f_04 §4.5)。プロンプトにブロックがあったターンだけ
+        呼出側が渡し、``gen_config._extra["tool_context"]`` に
+        :data:`TOOL_CONTEXT_CAP` 字まで入れる (超えたら先頭だけ残し
+        ``tool_context_truncated`` を立てる。形式の版は変えない)。
 
         ``unchecked_checks`` は create の制作ステージで未検査に終わった主要な検査
         (``"contract:no_examples"`` の形、``core.check_outcome.unchecked_labels``)。
@@ -1434,6 +1423,12 @@ class FeedbackCollector:
             rag_used=signals.rag_used, rag_abstained=signals.rag_abstained,
             rag_cited=signals.rag_cited,
         )
+        if tool_context:
+            gen_config = gen_config or GenerationConfigRef()
+            extra = {**(gen_config._extra or {}), TOOL_CONTEXT_KEY: tool_context[:TOOL_CONTEXT_CAP]}
+            if len(tool_context) > TOOL_CONTEXT_CAP:
+                extra[TOOL_CONTEXT_TRUNCATED_KEY] = True
+            gen_config._extra = extra
 
         entry = ExperienceEntry(
             id=ExperienceEntry.new_id(),
@@ -1453,32 +1448,10 @@ class FeedbackCollector:
             signals=signals,
         )
 
-        # false_negative 事後検出 (訂正ゲート + capability 弁別):
-        # 「前ターンが capability 未使用 → 当ターンで明示訂正 → 当ターンで capability
-        # 使用」= 前ターンは capability を要すべきだった、という低ノイズの強い証拠。
-        # 前 entry へ遡及マーク (Level 1 バッチ消費側が前クエリから学習: 正しい帰属) し、
-        # 即時にも前クエリから学習する。前ターンが既に capability を使っていたケースは
-        # 同一ターン false_positive (chat_recorder で検出) の領分なので扱わない。
-        # ``prev_failed`` は「直前ターンが失敗した」だけで、当ターンが訂正だとは
-        # 限らない (話題を変えただけでも立つ)。これを訂正として遡及学習すると、
-        # 無関係な前クエリの語彙が long_form / tool_routing として学習される
-        # (実測 2026-07-25: platform.cpu_count のツールエラーの次ターンで、
-        # 前クエリ「CPU のコア数と Python のバージョン」から
-        # [マシン, コア, バージョン] が long_form として学習された)。
-        # 遡及学習は明示訂正 (hardcoded / same_target) に限定する。
-        explicit_correction = (
-            correction_text is not None and detected_by != "prev_failed"
-        )
+        # 前ターンへの false_negative の遡及は、ここ (字句の訂正候補の時点) では
+        # 立てない (不変則 #12)。訂正が検証で ``assistant`` に昇格した時に
+        # ``correction_verifier.reconcile_false_negatives`` が立て、格下げで外す。
         current_routed_tool = tool_routing_success or tool_routing_false_positive
-        if explicit_correction and self._prev_entry is not None:
-            if current_routed_tool and not self._prev_routed_tool:
-                self._prev_entry.signals.tool_routing_false_negative = True
-                self._touch(self._prev_entry)
-                self._learn_tool_routing_from_false_negative(self._prev_entry.query)
-            if long_form_used and not self._prev_used_long_form:
-                self._prev_entry.signals.long_form_false_negative = True
-                self._touch(self._prev_entry)
-                self._learn_long_form_from_signal(self._prev_entry.query)
 
         # 訂正・言い直し検出からのパターン学習は行わない (2026-07-21 廃止)。
         # correction: 話題語学習による偽陽性増殖 (_detect_correction の
@@ -1489,10 +1462,11 @@ class FeedbackCollector:
         if tool_routing_false_negative:
             self._learn_tool_routing_from_false_negative(query)
 
-        # 長文ルーティング 成功 / false_negative 時: クエリからキーワードを
-        # ``category="long_form"`` として学習する。
-        # success 時はクエリ全体が長文分類のヒントになるため正例として学習。
-        if long_form_success or long_form_false_negative:
+        # 長文ルーティング false_negative 時: クエリからキーワードを
+        # ``category="long_form"`` として学習する。success は学習しない —
+        # 長文経路が自分で選んだ結果を自分の正例に数えると自己強化の輪になる
+        # (不変則 #15)。
+        if long_form_false_negative:
             self._learn_long_form_from_signal(query)
 
         self._apply_self_retraction(signals, response)
@@ -1790,15 +1764,8 @@ class FeedbackCollector:
         # 述べた。ツール結果は「確かめた事実」なので、これも推定ではなく矛盾
         # (2026-09-05 ライブ監査 F-03: 結果 17,305,634 が本文に 1 つも現れず、
         # 手数料を 10 倍に誤った結論が reward=1.0 で成功経験になっていた)。
-        ignored = ignores_calculate_result(text, calculate_result)
-        if ignored is None:
-            # 5% の幅では「約27.8」(結果 27.7177) が「使った」扱いになる。丸め違いの
-            # 値は前ターンの暗算の複写で、成功として学習させない (2026-09-22)。
-            misrounded = misrounded_result_values(text, calculate_result)
-            if misrounded:
-                ignored = (
-                    f"{', '.join(misrounded)} does not round from {calculate_result:g}"
-                )
+        # 判定は採用ゲートの再生と同じ関数 (丸め違いも含む、不変則 #14(a))。
+        ignored = calculate_result_contradiction(text, calculate_result)
         # 式が会話から辿れない / 組み方に疑いがある calculate は、結果そのものが
         # 誤っている疑いがあり、無視した回答が正しいこともある (2026-09-26 C01#3:
         # ``100000 - 26000`` の 100000 は会話に無く、結果を使わない「2万8千円」が
@@ -1820,22 +1787,19 @@ class FeedbackCollector:
         # 使わなかった回答が正答のことがある (2026-10-05 ライブ監査: target
         # 9/28 を使わず 10/13 と正答し failed にされた)。calculate の式の疑い
         # と同じく失敗の証拠にせず、ラベル無しにする。
+        # 判定は採用ゲートの再生と同じ関数 (``relative_date.date_result_use``)。
         date_unverified: str | None = None
-        if ignores_date_result(tool_result_text, text):
+        date_use = date_result_use(query, tool_result_text, text)
+        if date_use == DATE_RESULT_ANCHOR_MISMATCH:
             tool_anchor = extract_tool_anchor(tool_result_text)
-            if (
-                tool_anchor in (None, "today")
-                and has_non_today_offset_anchor(query)
-                and not _target_answers_today_anchored_span(query, tool_result_text)
-            ):
-                date_unverified = (
-                    f"date tool anchored on {tool_anchor or 'unknown'} while the "
-                    "query anchors elsewhere"
-                )
-                logger.info("Date result not counted as ignored (%s)", date_unverified)
-            else:
-                logger.info("Turn marked failed (date result ignored)")
-                return "failed", "date result ignored: response date does not match target"
+            date_unverified = (
+                f"date tool anchored on {tool_anchor or 'unknown'} while the "
+                "query anchors elsewhere"
+            )
+            logger.info("Date result not counted as ignored (%s)", date_unverified)
+        elif date_use == DATE_RESULT_IGNORED:
+            logger.info("Turn marked failed (date result ignored)")
+            return "failed", "date result ignored: response date does not match target"
         # 明示された文字数指定を破っている = 指定は本文にあり長さは数えるだけ
         # なので、これも推定ではなく矛盾。2026-08-22 ライブ監査の
         # 「ちょうど100文字で」→ 86 文字は success として学習に入っていた。

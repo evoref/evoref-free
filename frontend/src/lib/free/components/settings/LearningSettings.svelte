@@ -2,7 +2,6 @@
 	import { configData } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import SettingsSection from './SettingsSection.svelte';
-	import ProSection from './ProSection.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import NumberField from './fields/NumberField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
@@ -50,11 +49,4 @@
 		<ToggleField label="settings.agent.meta_cognitive_enabled" value={Boolean(agent.meta_cognitive_enabled ?? true)} onchange={fieldUpdater('agent', 'meta_cognitive_enabled')} />
 		<NumberField label="settings.agent.meta_cognitive_min_budget" value={Number(agent.meta_cognitive_min_budget ?? 512)} min={0} onchange={fieldUpdater('agent', 'meta_cognitive_min_budget')} />
 	</FieldGroup>
-
-	<!-- Pro: Learning extensions -->
-	<ProSection>
-		<FieldGroup label="settings.group_learning_pro">
-			<NumberField label="settings.learning.level1_idle_minutes_pro" value={Number(learning.level1_idle_minutes_pro ?? 10)} min={1} onchange={fieldUpdater('learning', 'level1_idle_minutes_pro')} />
-		</FieldGroup>
-	</ProSection>
 </SettingsSection>

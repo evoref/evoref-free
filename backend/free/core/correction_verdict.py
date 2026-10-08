@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 from backend.free.core.correction_target import restatement_pairs, split_sentences
@@ -574,3 +575,63 @@ def check_verdict(
     if response_already_states(correct_value, source):
         return _check(False, "already_stated")
     return _check(True, None)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 補助タスクの生の出力の共有 (記憶側 → 学習側)
+# ──────────────────────────────────────────────────────────────────────────
+
+#: 共有する生の出力の上限 (プロセス内 LRU)。再起動をまたいでは共有しない。
+SHARED_VERDICT_CAP = 256
+
+#: 同じ鍵に別のノートの出力が来た印。どちらの出力か決められないので引かせない。
+_AMBIGUOUS = object()
+
+_shared_verdicts: "OrderedDict[tuple[str, str], object]" = OrderedDict()
+
+
+def _shared_key(session_id: str, candidate: str) -> tuple[str, str]:
+    return (session_id or "", norm_span(candidate))
+
+
+def put_shared_verdict(
+    session_id: str, candidate: str, parsed: dict, *, verdict: str,
+) -> None:
+    """記憶側 (``correction_curator``) が得た ``correction_verify`` の生の出力を置く。
+
+    門 (:func:`check_verdict`) は各側が自分の入力で当てるので、共有するのは
+    **生の出力** と、記憶側が付けた帰属 (``verdict``、割れの記録用) だけ。
+    空の出力とセッションの無い候補は置かない。同じ鍵に 2 度目が来たら
+    (同じセッションで同じ文面の訂正が 2 回) どちらの出力か決められないので、
+    その鍵は引けなくする。
+    """
+    if not session_id or not isinstance(parsed, dict) or not parsed:
+        return
+    key = _shared_key(session_id, candidate)
+    if not key[1]:
+        return
+    if key in _shared_verdicts:
+        _shared_verdicts[key] = _AMBIGUOUS
+    else:
+        _shared_verdicts[key] = (dict(parsed), verdict)
+    _shared_verdicts.move_to_end(key)
+    while len(_shared_verdicts) > SHARED_VERDICT_CAP:
+        _shared_verdicts.popitem(last=False)
+
+
+def get_shared_verdict(
+    session_id: str, candidate: str,
+) -> tuple[dict, str] | None:
+    """記憶側が置いた ``(生の出力, 記憶側の帰属)`` を引く。無ければ ``None``。"""
+    if not session_id:
+        return None
+    hit = _shared_verdicts.get(_shared_key(session_id, candidate))
+    if hit is None or hit is _AMBIGUOUS:
+        return None
+    parsed, verdict = hit  # type: ignore[misc]
+    return dict(parsed), verdict
+
+
+def clear_shared_verdicts() -> None:
+    """共有の出力を全て捨てる (テスト用)。"""
+    _shared_verdicts.clear()
