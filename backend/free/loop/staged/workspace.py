@@ -267,6 +267,17 @@ class WorkspaceManager:
         self._update_manifest(_mut)
         return wf
 
+    def remove_file(self, logical_path: str, *, kind: FileKind) -> None:
+        """ファイルと manifest の記録を消す (無ければ何もしない)。作り直しを戻すとき、戻した版に無いファイルを残さない。"""
+        rel = _safe_rel(logical_path)
+        ws_rel = f"{_KIND_SUBDIR[kind]}/{rel}" if kind != "spec" else rel
+        (self.root / ws_rel).unlink(missing_ok=True)
+
+        def _mut(m: dict) -> None:
+            m["files"].pop(rel, None)
+
+        self._update_manifest(_mut)
+
     def read_file(self, logical_path: str, *, kind: FileKind) -> str | None:
         rel = _safe_rel(logical_path)
         ws_rel = f"{_KIND_SUBDIR[kind]}/{rel}" if kind != "spec" else rel

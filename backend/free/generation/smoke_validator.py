@@ -21,8 +21,10 @@ import json
 import logging
 import os
 import posixpath
+import re
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -31,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from backend.free.core import fs_sandbox
+from backend.free.generation import package_layout as pl
 from backend.free.generation.api_contract import (
     bind_local_instances,
     build_src_api,
@@ -84,23 +87,25 @@ def _eval_dir(prefix: str) -> Iterator[str]:
 
 def _run_sandboxed(
     tmp: Path, py_files: dict[str, str], runner: str, args: list[str], exe: str, timeout_sec: float,
-    *, stdin=None, base_env: dict[str, str] | None = None,
+    *, stdin=None, base_env: dict[str, str] | None = None, isolated_cwd: bool = False,
 ) -> subprocess.CompletedProcess:
     """生成物を ``tmp/src`` に書き、``runner`` をスクリプトとして隔離下で実行する (f_10 §11.1-4)。
 
     ``-c`` で起動すると audit hook を入れられない (入れると import が壊れる) ので、入口を
     ``.sandbox/`` のファイルに書いてから起動する。書込みを許すのは ``src/`` と ``.sandbox`` の
     home / tmp / cwd だけ (違反の記録は許す根の外)。モジュールは CWD (``src/``) から import する。
+    ``isolated_cwd`` なら CWD は空の ``.sandbox/cwd`` で、``src/`` は ``sys.path`` にだけ置く (実行時プローブ、f_10 §11.1-3)。
     """
     src = tmp / "src"
     _write_py_files(str(src), py_files)
+    path_entry = repr(str(src)) if isolated_cwd else "os.getcwd()"
     script = fs_sandbox.write_script(
-        tmp, "_evoref_runner.py", "import os, sys\nsys.path.insert(0, os.getcwd())\n" + runner,
+        tmp, "_evoref_runner.py", f"import os, sys\nsys.path.insert(0, {path_entry})\n" + runner,
     )
     # 出力は一時ファイルで受け、終わったら子孫ごと止める (孫が出力を掴むと時間上限が効かなかった)
     return fs_sandbox.run_bounded(
         [exe, str(script), *args],
-        cwd=str(src), timeout=timeout_sec, stdin=stdin,
+        cwd=str(fs_sandbox.sandbox_cwd(tmp) if isolated_cwd else src), timeout=timeout_sec, stdin=stdin,
         env=fs_sandbox.sandbox_env(tmp, base_env, write_dirs=[src]),
     )
 
@@ -778,6 +783,9 @@ class SmokeResult:
     #: 記録が無ければモジュール名、f_10 §11.1-4)。不合格ではない (``errors`` に入れない)。
     #: 説明の文は ``warnings`` にも入る。
     unchecked: list[str] = field(default_factory=list)
+    #: import スモークが最後まで走ったか (時間切れ・起動できない・出力を読めないときは False。
+    #: そのとき ``errors`` が空でも合格ではなく未検査、f_10 §11.1-4)
+    completed: bool = True
 
 
 # サブプロセス内で各モジュールを import し、失敗を JSON で報告する runner。
@@ -940,9 +948,11 @@ def run_import_smoke(
             f"import スモークテストが {timeout_sec:.0f}s でタイムアウト "
             "(top-level 副作用の可能性)"
         )
+        result.completed = False
         return result
     except Exception as e:
         result.warnings.append(f"import スモークテスト実行不可: {e}")
+        result.completed = False
         return result
 
     try:
@@ -952,6 +962,7 @@ def run_import_smoke(
             "import スモークテスト出力を解析できません: "
             f"{decode_process_output(proc.stderr)[:200]}"
         )
+        result.completed = False
         return result
 
     seen: set[str] = set()
@@ -1196,6 +1207,8 @@ class UsageRun:
     error: str = ""
     #: 時間上限 (秒、時間切れの文面に出す)。
     timeout_sec: float = 0.0
+    #: 空の CWD (``isolated_cwd``) に実行が作ったファイル (``/`` 区切りの相対パス。空のフォルダは末尾 ``/``)。
+    cwd_writes: list[str] = field(default_factory=list)
 
 
 # ``python -m <module> <args>`` と同じ形で起こす入口。``-m`` で起動すると audit hook が入らない
@@ -1223,16 +1236,30 @@ def usage_env(environ: dict[str, str] | None = None) -> dict[str, str]:
     return {k: v for k, v in source.items() if k.upper() in _USAGE_ENV_KEYS or k.upper().startswith("PYTHON")}
 
 
+def _cwd_listing(root: Path) -> list[str]:
+    """``.sandbox/cwd`` に作られたファイルと空のフォルダ (新しい空のフォルダの中の一覧なので mtime は使わない)。"""
+    base = fs_sandbox.sandbox_cwd(root)
+    out: list[str] = []
+    for dirpath, dirnames, names in os.walk(base):
+        here = Path(dirpath)
+        out.extend((here / n).relative_to(base).as_posix() for n in names)
+        out.extend(
+            (here / d).relative_to(base).as_posix() + "/" for d in dirnames if not any((here / d).iterdir())
+        )
+    return sorted(out)[:50]
+
+
 def run_usage(
     files: dict[str, str], module: str, args: list[str], timeout_sec: float = 30.0,
-    python_exe: str | None = None,
+    python_exe: str | None = None, *, isolated_cwd: bool = False,
 ) -> UsageRun:
     """配信形 (``units/__init__.py`` … と依頼されたデータファイル) を一時フォルダに置き、その親を CWD にして
     ``python -m <module> <args>`` を隔離の下で 1 回実行する (f_10 §11.1-3 / §11.1-4)。
 
     stdin は空。書込みを許すのは一時フォルダの中だけで、止めた書込みは ``unchecked`` に入る。環境変数は
     :func:`usage_env` の最小の組だけを渡す。シェル・別プロセス・ソケット等は隔離が止めないので、呼出側が
-    ``package_layout.usage_side_effect`` で実行前に外す。
+    ``package_layout.usage_side_effect`` で実行前に外す。``isolated_cwd`` は CWD を空の ``.sandbox/cwd`` にし、
+    実行後の一覧を ``cwd_writes`` に入れる (:func:`run_probe`)。
     """
     exe = python_exe or sys.executable
     try:
@@ -1240,7 +1267,7 @@ def run_usage(
             try:
                 proc = _run_sandboxed(
                     Path(tmp), files, _USAGE_RUNNER, [module, json.dumps(list(args))], exe, timeout_sec,
-                    stdin=subprocess.DEVNULL, base_env=usage_env(),
+                    stdin=subprocess.DEVNULL, base_env=usage_env(), isolated_cwd=isolated_cwd,
                 )
             except subprocess.TimeoutExpired as expired:
                 return UsageRun(
@@ -1248,8 +1275,10 @@ def run_usage(
                     stderr=decode_process_output(expired.stderr), timed_out=True,
                     unchecked=fs_sandbox.violation_paths(fs_sandbox.read_violations(Path(tmp))),
                     timeout_sec=timeout_sec,
+                    cwd_writes=_cwd_listing(Path(tmp)) if isolated_cwd else [],
                 )
             violations = fs_sandbox.violation_paths(fs_sandbox.read_violations(Path(tmp)))
+            cwd_writes = _cwd_listing(Path(tmp)) if isolated_cwd else []
     except Exception as e:  # noqa: BLE001 - 起動できないのはコードの誤りの証拠ではない (未検査)
         return UsageRun(returncode=None, stdout="", stderr="", error=str(e), timeout_sec=timeout_sec)
     return UsageRun(
@@ -1258,7 +1287,134 @@ def run_usage(
         stderr=decode_process_output(proc.stderr),
         unchecked=violations,
         timeout_sec=timeout_sec,
+        cwd_writes=cwd_writes,
     )
+
+
+#: 実行時プローブが「所見」にする例外の閉じた一覧 (f_10 §11.1-3)。これ以外は見送り。
+_PROBE_FINDING_EXCEPTIONS = frozenset({"TypeError", "NameError", "AttributeError", "ImportError"})
+_PROBE_CLI_MODULES = frozenset({"argparse", "click", "typer"})
+_TRACE_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+_EMPTY_PATH_TAIL_RE = re.compile(r""": ['"]{2}$""")
+
+
+@dataclass
+class ProbeResult:
+    """実行時プローブの結果 (観測のみ。作り直し・採点・checks には流さない、f_10 §11.1-3)。"""
+
+    #: 走らせた回数 (事前ゲートで見送った回は 0)。
+    runs: int = 0
+    #: 所見 (``<例外の行> [<ファイル>:<行>]``)。
+    findings: list[str] = field(default_factory=list)
+    #: 見送りの理由。
+    skipped: list[str] = field(default_factory=list)
+    #: 空の CWD に作られたファイル。
+    cwd_writes: list[str] = field(default_factory=list)
+
+
+def _uses_cli_parser(source: str) -> bool:
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(a.name.split(".")[0] in _PROBE_CLI_MODULES for a in node.names):
+            return True
+        if (
+            isinstance(node, ast.ImportFrom) and not node.level
+            and (node.module or "").split(".")[0] in _PROBE_CLI_MODULES
+        ):
+            return True
+    return False
+
+
+def _probe_gate(files: dict[str, str], module: str) -> str:
+    """プローブを走らせない理由 (走らせてよければ空)。"""
+    py = {p: c for p, c in files.items() if p.endswith(".py")}
+    base = module.replace(".", "/")
+    entry = next((c for c in (py.get(f"{base}.py"), py.get(f"{base}/__main__.py")) if c is not None), None)
+    if entry is None:
+        return f"entry not found: {module}"
+    if not _uses_cli_parser(entry):
+        return "entry does not use argparse/click/typer"
+    effect = pl.usage_side_effect(py)
+    if effect:
+        return f"side effects: {effect}"
+    blocker = pl.usage_blocker(["--help"], py, set())
+    if blocker:
+        return f"blocked: {blocker}"
+    dependency = pl.usage_missing_dependency(py)
+    if dependency:
+        return f"missing dependency: {dependency}"
+    return ""
+
+
+def _in_stdlib(path: str) -> bool:
+    """トレースバックのフレームが標準ライブラリ (凍結モジュールを含む) か、隔離の本体 (``.sandbox/``) のもの。"""
+    if path.startswith("<frozen") or f"/{fs_sandbox.SANDBOX_DIR}/" in path:
+        return True
+    norm = os.path.normcase(path)
+    stdlib = os.path.normcase(sysconfig.get_path("stdlib")).replace("\\", "/")
+    return norm.replace("\\", "/").startswith(stdlib + "/") and "site-packages" not in norm
+
+
+def _probe_verdict(run: UsageRun, files: dict[str, str]) -> tuple[str, str]:
+    """``(所見, 見送りの理由)`` — どちらか一方だけ (どちらも空なら異常なし)。"""
+    outcome, _ = pl.usage_outcome(run, "", args=["--help"], stems=set())
+    if outcome.is_unchecked:
+        reason = outcome.reason.value if outcome.reason else "unchecked"
+        return "", f"{reason}: {outcome.detail}"[:200]
+    if not outcome.is_failure:
+        return "", ""
+    summary = outcome.failures[0] if outcome.failures else ""
+    if summary.startswith("exit code"):
+        return "", f"non-zero exit without a traceback: {summary}"[:200]
+    # 呼出し元は「生成ファイルの最後のフレーム」。そのあとが標準ライブラリだけなら生成コードの呼び方の誤り
+    # (``os.makedirs('')`` は ``os.py`` の中で落ちる)。第三者のパッケージが挟まるなら見送る
+    frames = [(path.replace("\\", "/"), line) for path, line in _TRACE_FRAME_RE.findall(run.stderr or "")]
+    generated = [p for p in files if p.endswith(".py")]
+    owners = [next((p for p in generated if path.endswith("/src/" + p)), "") for path, _ in frames]
+    last = max((i for i, owner in enumerate(owners) if owner), default=-1)
+    if last < 0:
+        return "", f"last frame is outside the generated files: {summary}"[:200]
+    if not all(_in_stdlib(path) for path, _ in frames[last + 1:]):
+        return "", f"raised outside the generated files and the standard library: {summary}"[:200]
+    owner, line = owners[last], frames[last][1]
+    name = summary.partition(":")[0].rsplit(".", 1)[-1]
+    closed = name in _PROBE_FINDING_EXCEPTIONS or (
+        name == "FileNotFoundError" and _EMPTY_PATH_TAIL_RE.search(summary) is not None
+    )
+    if not closed:
+        return "", f"{name} is not in the closed list"
+    return f"{summary} [{owner}:{line}]"[:300], ""
+
+
+def run_probe(
+    files: dict[str, str], module: str, timeout_sec: float = 15.0, python_exe: str | None = None,
+) -> ProbeResult:
+    """入口を空の CWD で ``--help`` 1 回だけ走らせ、実行時のバグの所見と CWD に作られたファイルを返す (観測のみ)。
+
+    :func:`run_usage` / ``package_layout.usage_outcome`` を再利用する (第二のランナーは作らない)。所見にするのは
+    トレースバックの最後のフレームが生成ファイルの中で、例外が閉じた一覧のときだけ (f_10 §11.1-3)。
+    それ以外は理由を ``skipped`` に残す。例外は握り潰して ``skipped`` に残す。
+    """
+    result = ProbeResult()
+    try:
+        gate = _probe_gate(files, module)
+        if gate:
+            result.skipped.append(gate)
+            return result
+        run = run_usage(files, module, ["--help"], timeout_sec, python_exe, isolated_cwd=True)
+        result.runs = 1
+        result.cwd_writes = run.cwd_writes
+        finding, skipped = _probe_verdict(run, files)
+        if finding:
+            result.findings.append(finding)
+        if skipped:
+            result.skipped.append(skipped)
+    except Exception as e:  # noqa: BLE001 - 観測が本流を落とさない
+        result.skipped.append(f"probe error: {e}"[:200])
+    return result
 
 
 def _signature_of(func: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:

@@ -77,7 +77,7 @@ def _slice_paren_group(text: str, open_idx: int) -> str | None:
     return None
 
 
-def _sig_dict(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
+def sig_dict(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> dict:
     """def ノードから両解釈 (self 除外/込み) の位置引数レンジを構築する。"""
     a = fn.args
     all_pos = list(a.posonlyargs) + list(a.args)
@@ -108,7 +108,7 @@ def _parse_def_text(name: str, args_group: str) -> dict | None:
     node = tree.body[0]
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return None
-    return _sig_dict(node)
+    return sig_dict(node)
 
 
 def _parse_candidate(

@@ -71,6 +71,9 @@ class UncheckedReason(StrEnum):
     #: 使い方の実行が隔離の外へ作用する恐れ (シェル・別プロセス・ソケット・ブラウザ等) があるので実行しなかった
     #: (detail はその書き方、f_10 §11.1-3)。
     SIDE_EFFECTS = "side_effects"
+    #: 前の検査 (import / 静的検査) が不合格だったので、この検査は飛ばした (detail は不合格だった検査、f_10 §12.4)。
+    #: こちらの検査の不合格ではないので ``tasks_failed`` には数えない。
+    PREREQUISITE_FAILED = "prerequisite_failed"
     #: テストを実行できなかった (その他)。
     NOT_RUN = "not_run"
 

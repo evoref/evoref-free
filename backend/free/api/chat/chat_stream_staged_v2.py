@@ -23,11 +23,20 @@ import json
 import posixpath
 import re
 import time
+from dataclasses import replace
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, AsyncIterator, Callable
 
 from backend.free.api.chat import staged_v2_languages as languages
 from backend.free.api.chat.chat_stream_common import cancel_requested, logger
+from backend.free.api.chat.staged_v2_conformance import skeleton_declared_contract
+from backend.free.api.chat.staged_v2_state import (
+    RepairHistory,
+    VerifiedState,
+    compare,
+    compile_error_count,
+    lost_checks,
+)
 from backend.free.api.chat.chat_stream_staged import (
     _REFERENCE_DOC_MAX_CHARS,
     _STAGE_BUDGET_FLOOR_SEC,
@@ -60,6 +69,7 @@ from backend.free.generation.package_layout import (
     SUBCOMMAND_ENTRY_NAMES,
     SUBCOMMAND_ENTRY_SIGNATURE,
     choose_entry,
+    empty_dirname_makedirs,
     package_code_map,
     package_from_usage,
     script_command,
@@ -74,8 +84,10 @@ from backend.free.generation.package_layout import (
     usage_outcome,
     usage_side_effect,
 )
-from backend.free.generation.smoke_validator import check_call_arity, run_usage
+from backend.free.generation.smoke_validator import check_call_arity, run_probe, run_usage
+from backend.free.generation.spec_conformance import check_spec_conformance
 from backend.free.core.prompt_blocks import SHARED_CONTEXT_BOUNDARY
+from backend.free.generation.as_built import public_symbols
 from backend.trace_context import get_trace_id, run_in_executor_with_context
 from backend.utils import estimate_tokens as _estimate_tokens
 
@@ -546,6 +558,49 @@ def package_of(modules: list[dict], usage: str, folder: str) -> str:
     return package_from_usage(usage, folder)
 
 
+#: 実行時プローブの notes に載せる一覧の上限 (f_10 §11.1-3)。
+_PROBE_NOTES_LIMIT = 20
+
+
+def _empty_probe_notes() -> dict:
+    """実行時プローブの notes (観測のみ。整数は常に 0 から)。"""
+    return {
+        "probe_runs": 0, "probe_findings": [], "probe_findings_count": 0, "probe_skipped": [],
+        "probe_cwd_writes": [], "static_findings_count": 0,
+    }
+
+
+def _observe_runtime(
+    py: dict[str, str], files: dict[str, str], module: str, skip_reason: str, timeout_sec: float,
+) -> dict:
+    """静的所見 (``os.makedirs(os.path.dirname(X))``) と動的プローブを notes の形にする。観測のみ (f_10 §11.1-3)。
+
+    ``module`` が空なら動的プローブは走らせず ``skip_reason`` を残す。例外は握り潰して ``probe_skipped`` に残す。
+    """
+    notes = _empty_probe_notes()
+    static: list[str] = []
+    try:
+        static = empty_dirname_makedirs(py)
+        notes["static_findings_count"] = len(static)
+        if module:
+            probe = run_probe(files, module, timeout_sec)
+            notes["probe_runs"] = probe.runs
+            notes["probe_findings"] = probe.findings[:_PROBE_NOTES_LIMIT]
+            notes["probe_findings_count"] = len(probe.findings)
+            notes["probe_skipped"] = probe.skipped[:_PROBE_NOTES_LIMIT]
+            notes["probe_cwd_writes"] = probe.cwd_writes[:_PROBE_NOTES_LIMIT]
+        else:
+            notes["probe_skipped"] = [skip_reason]
+    except Exception as exc:  # noqa: BLE001 - 観測が本流を落とさない
+        notes["probe_skipped"] = [f"probe error: {exc}"[:200]]
+    logger.info(
+        "staged v2 runtime probe: runs=%d findings=%s static=%s cwd_writes=%s skipped=%s",
+        notes["probe_runs"], notes["probe_findings"], static[:5], notes["probe_cwd_writes"],
+        notes["probe_skipped"],
+    )
+    return notes
+
+
 def _flat_usage_command(skeleton: dict) -> tuple[str, list[str]] | None:
     """平置きの Python の使い方を ``(起動するモジュール, 引数)`` にする (f_10 §11.1-3)。その形でなければ ``None``。
 
@@ -714,7 +769,7 @@ def render_skeleton_context(skeleton: dict, request: str) -> str:
 
 def _module_instruction(
     skeleton: dict, module: dict, *, request: str, brief: str, locale: str,
-    written: dict[str, str] | None = None,
+    written: dict[str, str] | None = None, sibling_sheet: str = "",
 ) -> str:
     components = "\n".join(
         f"- `{c.get('signature', '')}` — {c.get('summary', '')}" for c in module.get("components") or []
@@ -757,7 +812,41 @@ def _module_instruction(
         task += "\nAlready written files this file uses (use exactly their API / ids / paths):\n" + "\n".join(
             f"```{languages.fence_language(d)}\n# {d}\n{written[d][:6000]}\n```" for d in deps
         ) + "\n"
+    task += sibling_sheet
     return f"{shared}{SHARED_CONTEXT_BOUNDARY}{task}"
+
+
+_SIBLING_SHEET_HEADER = (
+    "\nPublic API of the other files as written so far (read-only reference; if it conflicts with the design's "
+    "signatures above, the design's signature wins):\n"
+)
+
+
+def sibling_api_sheet(module: dict, written: dict[str, str], *, max_chars: int) -> tuple[str, int]:
+    """書き上がった兄弟モジュールの実在する公開シグネチャの一覧 (決定論、f_10 §11.1-2)。
+
+    ``as_built.public_symbols`` (クラスの公開メソッドと ``__init__`` を含む) で AST から抜く。自分自身・本文を
+    丸ごと添える依存先・構文エラーのファイル・Python 以外・公開要素の無いファイルは載せない。パス順、
+    1 ファイル単位で ``max_chars`` (見出し込み) に収まる分だけ。返り値は (文面, 載せたファイル数)。
+    """
+    deps = set(module.get("imports_from") or [])
+    out = _SIBLING_SHEET_HEADER
+    count = 0
+    for path in sorted(written):
+        if path == module["path"] or path in deps or not path.endswith(".py"):
+            continue
+        lines = []
+        for sym in public_symbols(written[path]):
+            lines.append(sym.signature)
+            lines.extend(f"    {m.signature}" for m in sym.methods)
+        if not lines:
+            continue
+        entry = f"# {path}\n" + "\n".join(lines) + "\n"
+        if len(out) + len(entry) > max_chars:
+            break
+        out += entry
+        count += 1
+    return (out, count) if count else ("", 0)
 
 
 # as-built 文書の配信名 (``AS_BUILT_DOC_NAMES``)。依頼が名指しても未生成とは言わない。
@@ -832,14 +921,21 @@ def _data_file_instruction(
     )
 
 
-def generation_waves(modules: list[dict]) -> list[list[dict]]:
+def generation_waves(
+    modules: list[dict], *, entry: str = "", entry_last: bool = False,
+) -> list[list[dict]]:
     """生成の段 (最大 2 段)。依存の無いモジュールを先に同時生成し、残りは
     書き上がった依存先のコードを見て同時生成する。
 
     全部を同時に書くと、モジュール間の取り決め (``Todo.to_dict`` の有無など) が
     骨組みに無い部分で食い違う (2026-09-25 create ベンチ m1)。段を依存の深さ
     ぶん積むと鎖状の依頼で直列になるので 2 段で止める。
+
+    ``entry_last`` (既定 OFF、f_10 §11.1-2) は入口モジュールだけを最後の段で単独に生成する (3 段になりうる)。
     """
+    if entry_last and entry and len(modules) > 1 and any(m["path"] == entry for m in modules):
+        others = [m for m in modules if m["path"] != entry]
+        return [*generation_waves(others), [m for m in modules if m["path"] == entry]]
     names = {m["path"] for m in modules}
     leaves = [m for m in modules if not [d for d in m.get("imports_from") or [] if d in names]]
     rest = [m for m in modules if m not in leaves]
@@ -1025,6 +1121,26 @@ def _test_files_named_in(query: str) -> list[str]:
     return list(dict.fromkeys(m.group(1) for m in _NAMED_TEST_FILE_RE.finditer(query or "")))
 
 _EXAMPLE_TEST_RE = re.compile(r"test_example_(\d+)\b")
+
+
+def _contract_revert_line(
+    decided_by: str | None, paths: list[str], *, before: int, after: int,
+    contract_unchecked: bool, usage_unchecked: bool,
+) -> str:
+    """契約テストの作り直しを戻した理由の 1 行 (悪化を決めた項目から選ぶ、f_10 §11.1-4)。"""
+    from backend.i18n_helper import msg
+
+    names = ", ".join(paths)
+    if decided_by == "contract":
+        if contract_unchecked:
+            return msg("create.contract_repair_unchecked", paths=names)
+        return msg("create.contract_repair_worse", before=before, after=after, paths=names)
+    if decided_by == "usage":
+        key = "create.contract_repair_usage_unchecked" if usage_unchecked else "create.contract_repair_broke_usage"
+        return msg(key, paths=names)
+    if decided_by == "smoke":
+        return msg("create.contract_repair_unchecked", paths=names)
+    return msg("create.contract_repair_reverted", paths=names)
 
 
 def _failed_example_cases(cases: list, failures: list[str]) -> list:
@@ -1291,7 +1407,12 @@ async def run_staged_v2_pipeline(
             return out.get(module["path"], "")
         return _job
 
-    waves = generation_waves(modules)
+    waves = generation_waves(
+        modules, entry=skeleton.get("entry_module", ""), entry_last=bool(staged_cfg.get("entry_last", False)),
+    )
+    sibling_sheet_on = bool(staged_cfg.get("sibling_api_sheet_enabled", True))
+    sibling_sheet_chars = int(staged_cfg.get("sibling_sheet_chars", 3000))
+    sibling_sheet_modules = 0
     advisory_path = ""
     py_modules = [m for m in modules if m["path"].endswith(".py")]
     advisory = tests_enabled and bool(py_modules)
@@ -1320,13 +1441,18 @@ async def run_staged_v2_pipeline(
     advisory_done = not advisory
     # 既定引数に焼き込んだ置き場を書き換えた ``<ファイル>: <関数>(<引数>)`` (notes / finalize に残す、R17)
     unbaked_defaults: list[str] = []
+    # 作り直しの停滞の判定 (試した本文・見たエラーの集合、f_10 §11.1-3)。生成した本文から覚える
+    repair_history = RepairHistory()
     for i, wave in enumerate(waves):
-        jobs = [
-            _module_job(m, _module_instruction(
-                skeleton, m, request=query, brief=brief, locale=locale, written=code_map,
-            ))
-            for m in wave
-        ]
+        jobs = []
+        for m in wave:
+            sheet, sheet_count = (
+                sibling_api_sheet(m, code_map, max_chars=sibling_sheet_chars) if sibling_sheet_on else ("", 0)
+            )
+            sibling_sheet_modules += sheet_count
+            jobs.append(_module_job(m, _module_instruction(
+                skeleton, m, request=query, brief=brief, locale=locale, written=code_map, sibling_sheet=sheet,
+            )))
         # 参考テストの置き場所 (f_10 §11.1-2): 段が 1 つなら本文と同時、最後の段より前の本文に置き場の定数が
         # あれば最後の段と同時、無ければ全段の後 (置き場が最後の段にあっても名前を渡す、独立レビュー P3-1)
         together = not advisory_done and i == len(waves) - 1 and (
@@ -1340,6 +1466,7 @@ async def run_staged_v2_pipeline(
             if content or allows_empty_content(m["path"]):
                 code_map[m["path"]] = content
                 landed.append(m["path"])
+                repair_history.remember(m["path"], content)
         # 受け取った直後に直す — 参考テストのプロンプトに差し替えられる定数の名前を渡すため (R17)
         code_map.update(_unbake(code_map, landed, unbaked_defaults))
         if together:
@@ -1413,16 +1540,39 @@ async def run_staged_v2_pipeline(
             name = PurePosixPath(entry).stem
         return f"{name}{sep}{rest}"
 
+    # 直前の _check の検査ごとの件数 (悪化の判定に使う、f_10 §11.1-4)
+    check_counts: dict[str, int] = {"smoke": 0, "arity": 0, "static": 0, "smoke_not_run": 0}
+
+    # 骨組みのシグネチャとの照合 (観測だけ — 作り直しのエラーにも悪化の判定にも入れない、f_10 §11.1-3)
+    conformance_on = bool(staged_cfg.get("spec_conformance_enabled", True))
+    declared_contract = skeleton_declared_contract(modules) if conformance_on else []
+    conformance_seen: dict[str, object] = {"code": None, "messages": []}
+
+    def _conformance(cmap: dict[str, str]) -> list[str]:
+        py = {p: c for p, c in cmap.items() if p.endswith(".py")}
+        found: list[str] = []
+        try:
+            for m in py_modules:
+                declared = [d for d in declared_contract if d["path"] == m["path"]]
+                if declared and m["path"] in py:
+                    found.extend(
+                        v for v in check_spec_conformance(declared, py, primary_path=m["path"]) if v not in found
+                    )
+        except Exception as exc:  # noqa: BLE001 - 観測の失敗で制作は止めない
+            logger.warning("staged v2: skeleton conformance check failed: %s", exc)
+        return found
+
     async def _check(cmap: dict[str, str]) -> tuple[dict[str, str], list[str], list[str]]:
         # 循環の検出は配線の後 (``from .cli import`` / ``from todo_app.cli import`` が
         # 兄弟の bare import に揃ってから見る)
         wired, issues, _ = _staged_postprocess(_rebase(cmap))
         wired, cycle_errors = break_undeclared_cycles(wired, skeleton)
         smoke_unchecked.clear()
+        smoke_not_run: list[str] = []
         # パッケージ形は配信形 (``<tmp>/units/…``) で import する (f_10 §11.1-3)
         errors = await _staged_import_smoke(
             _package_files(wired) if package else wired, smoke_timeout,
-            internal_names=internal, unchecked_out=smoke_unchecked,
+            internal_names=internal, unchecked_out=smoke_unchecked, not_run_out=smoke_not_run,
         )
         if package:
             errors = [_flat_error(e, _entry(wired)) for e in errors]
@@ -1431,23 +1581,69 @@ async def run_staged_v2_pipeline(
             errors = cycle_errors + [
                 e for e in errors if "cannot import name" not in e and "partially initialized" not in e
             ]
+        smoke_count = len(errors)
         # モジュール間呼び出しの引数の数 (実行すれば必ず TypeError になる確定的な欠陥。
         # 呼び出し側のモジュールを作り直しに回す、2026-09-27 残件)
-        errors += check_call_arity(
+        arity_errors = check_call_arity(
             {p: c for p, c in wired.items() if p.endswith(".py")},
             declared=_declared_signatures(modules),
         )
         # Python 以外: 構文・参照の整合・実行環境による構文検査 (f_10 §12.3 / §12.4)
-        errors += await run_in_executor_with_context(
+        language_errors = await run_in_executor_with_context(
             asyncio.get_running_loop(), None,
             lambda: languages.check(wired, cfg=cfg, skeleton=skeleton, query=query),
         )
+        errors += [*arity_errors, *language_errors]
+        check_counts.update(
+            smoke=smoke_count, arity=len(arity_errors), static=len(language_errors),
+            smoke_not_run=len(smoke_not_run),
+        )
         syntax_unchecked.clear()
         syntax_unchecked.update(languages.syntax_unchecked(wired, cfg=cfg))
+        if conformance_on:
+            observed = _conformance(wired)
+            conformance_seen.update(code=dict(wired), messages=observed)
+            if observed:
+                logger.info(
+                    "staged v2: %d skeleton conformance violation(s) observed (not enforced): %s",
+                    len(observed), observed[:3],
+                )
         return wired, errors, issues
 
+    def _verified(cmap: dict[str, str], missing_paths: list[str], round_no: int) -> VerifiedState:
+        # 直前の _check (cmap はその戻り値) の結果を写す。未検査は「走らなかった」と「隔離が止めたものの集合」で
+        # 持つ (件数が 0 になったことからは決めない — 別のモジュールの誤りを直した版を未検査扱いで戻していた)
+        return VerifiedState(
+            code_map=dict(cmap), missing=tuple(missing_paths),
+            static_errors=compile_error_count(cmap) + check_counts["static"],
+            smoke_errors=check_counts["smoke"], smoke_ran=not check_counts["smoke_not_run"],
+            smoke_unchecked=frozenset(smoke_unchecked),
+            arity_errors=check_counts["arity"], round=round_no,
+        )
+
+    # 作り直しで悪化した版を検証済みの最良の版へ戻す (f_10 §11.1-3 / §11.1-4)
+    revert_if_worse = bool(staged_cfg.get("revert_if_worse", True))
+    repair_reverts = 0
+    # LLM を呼んだ作り直しの回数 (smoke と契約の合計、f_10 §11.1-3)
+    repair_rounds_run = 0
+
+    def _repair_errors(path: str, errors: list[str]) -> list[str]:
+        # 作り直しの宛先のエラー: そのモジュール自身のもの。どのモジュールにも帰属しないときは全部 (全員を作り直す回)
+        own = _errors_for(path, errors)
+        if own or any(_errors_for(m["path"], errors) for m in modules):
+            return own
+        return list(errors)
+
+    smoke_reverted: list[str] = []
     missing = [m["path"] for m in modules if m["path"] not in code_map]
     code_map, smoke_errors, static_issues = await _check(code_map)
+    best = _verified(code_map, missing, 0)
+    best_detail = (list(smoke_errors), list(static_issues), list(smoke_unchecked), dict(syntax_unchecked))
+    best_state_round = 0
+    # 作り直しの停滞 (同じ本文・往復・同じエラーの集合) で外したモジュール (f_10 §11.1-3)
+    for m in modules:
+        if m["path"] in code_map:
+            repair_history.errors_verdict(m["path"], _repair_errors(m["path"], smoke_errors))
     max_repair = int(staged_cfg.get("max_repair_rounds", 1))
     for _round in range(max(0, max_repair)):
         failing = [
@@ -1456,6 +1652,7 @@ async def run_staged_v2_pipeline(
         ]
         if not failing and smoke_errors:
             failing = [m for m in modules if m["path"] in code_map]
+        failing = [m for m in failing if m["path"] not in repair_history.dropped]
         if not failing or _remaining() < _CALL_FLOOR_SEC:
             break
         yield {"kind": "step", "payload": {
@@ -1477,11 +1674,74 @@ async def run_staged_v2_pipeline(
                 )
             repair_jobs.append(_module_job(m, instruction))
         repaired = await _run_jobs(repair_jobs, slots)
+        repair_rounds_run += 1
+        applied: list[str] = []
+        stalled: dict[str, str] = {}
         for m, content in zip(failing, repaired):
             if content or allows_empty_content(m["path"]):
+                # 同じ本文・前に試した本文は採らない — 検査し直しても同じ結果になる (f_10 §11.1-3)
+                verdict = repair_history.body_verdict(m["path"], content, previous=code_map.get(m["path"]))
+                if verdict:
+                    stalled[m["path"]] = verdict
+                    continue
                 code_map[m["path"]] = content
+                applied.append(m["path"])
+        if not applied:
+            # コードが変わっていない — 検査の結果も変わらない。同じ回に兄弟も変わらなかったときだけ外す
+            # (兄弟が直ると、巻き添えで落ちていたモジュールの同じ本文が正しかったと分かることがある)
+            for path, verdict in stalled.items():
+                repair_history.drop(path, verdict)
+                logger.info(
+                    "staged v2: smoke repair round %d of %s returned %s code; dropping it from repair",
+                    _round + 1, path, "the same" if verdict == "same" else "previously tried",
+                )
+            continue
         missing = [m["path"] for m in modules if m["path"] not in code_map]
         code_map, smoke_errors, static_issues = await _check(code_map)
+        # 直前の回と同じエラーの集合になったモジュールを外す (悪化の判定はこの後もそのまま掛かる)
+        for path in applied:
+            if repair_history.errors_verdict(path, _repair_errors(path, smoke_errors)):
+                repair_history.drop(path, "errors")
+                logger.info(
+                    "staged v2: smoke repair round %d of %s gave the same error set as before; dropping it from repair",
+                    _round + 1, path,
+                )
+        # 作り直さなかったモジュールのエラーの集合を覚え、外したモジュールの集合が変わったら作り直しへ戻す
+        for m in modules:
+            if m["path"] in code_map and m["path"] not in applied:
+                if repair_history.observe_errors(m["path"], _repair_errors(m["path"], smoke_errors)):
+                    logger.info(
+                        "staged v2: the errors of %s changed after round %d; repairing it again",
+                        m["path"], _round + 1,
+                    )
+        if not revert_if_worse:
+            best_state_round = _round + 1
+            continue
+        current = _verified(code_map, missing, _round + 1)
+        sign, field_name = compare(current, best)
+        if sign < 0:
+            best, best_state_round = current, _round + 1
+            best_detail = (list(smoke_errors), list(static_issues), list(smoke_unchecked), dict(syntax_unchecked))
+        elif sign > 0:
+            # 作り直しで悪化した — 最良の版に戻して作り直しを止める (同点は戻さない)
+            smoke_reverted = sorted(
+                p for p in {*code_map, *best.code_map} if code_map.get(p) != best.code_map.get(p)
+            )
+            repair_reverts += 1
+            logger.warning(
+                "staged v2: smoke repair round %d made things worse (%s); keeping round %d for %s",
+                _round + 1, field_name, best.round, smoke_reverted,
+            )
+            break
+    if revert_if_worse and code_map != dict(best.code_map):
+        # 悪化した版、または最良と同点の後の版 — 配信するのは最良の版 (同点は先の版、f_10 §11.1-3)
+        code_map, missing = dict(best.code_map), list(best.missing)
+        smoke_errors, static_issues = list(best_detail[0]), list(best_detail[1])
+        smoke_unchecked[:] = best_detail[2]
+        syntax_unchecked.clear()
+        syntax_unchecked.update(best_detail[3])
+    # 配信する版の検査結果 (契約テストの作り直しの比べる相手、f_10 §11.1-4)
+    delivered_state = best if revert_if_worse else _verified(code_map, missing, best_state_round)
     phase_sec["smoke"] = round(time.monotonic() - t0, 1)
     for path, content in code_map.items():
         try:
@@ -1494,6 +1754,8 @@ async def run_staged_v2_pipeline(
     checks: list[CheckOutcome] = []
     if missing:
         verification.append(msg("create.not_generated", names=", ".join(missing)))
+    if smoke_reverted:
+        verification.append(msg("create.smoke_repair_worse", paths=", ".join(smoke_reverted)))
     if smoke_errors:
         static_check = CheckOutcome.failed(CheckKind.STATIC, errors=len(smoke_errors))
     elif smoke_unchecked:
@@ -1588,6 +1850,10 @@ async def run_staged_v2_pipeline(
         )
         return outcome, blamed, (run.stderr or "")[-3000:]
 
+    def _usage_not_run(check: CheckOutcome) -> bool:
+        # 時間切れ・実行の場の制約 — もう 1 回実行しても同じ結果になる
+        return check.is_unchecked and check.reason is UncheckedReason.NOT_RUN
+
     usage_check: CheckOutcome | None = None
     usage_checked_code: dict[str, str] = {}
     if command is not None and code_map and not smoke_errors:
@@ -1633,13 +1899,17 @@ async def run_staged_v2_pipeline(
             if content:
                 # 作り直した版は smoke と使い方の実行の両方に通ったときだけ採る (通らなければ修正前のまま)
                 wired_trial, trial_errors, trial_issues = await _check({**code_map, target["path"]: content})
-                if not trial_errors and not smoke_unchecked:
+                trial_state = _verified(wired_trial, missing, delivered_state.round)
+                # 時間切れで走らなかった import スモークも合格に数えない (f_10 §11.1-4)
+                smoke_not_run = revert_if_worse and not trial_state.smoke_ran
+                if not trial_errors and not smoke_unchecked and not smoke_not_run:
                     trial_check, _, _ = await _run_usage_check(wired_trial)
                     if trial_check.status is CheckStatus.PASSED:
                         for path, text in wired_trial.items():
                             if code_map.get(path) != text:
                                 ws.write_file(path, text, kind="src", stage="code", task_id=_task_id(path))
                         code_map, static_issues, usage_check = dict(wired_trial), trial_issues, trial_check
+                        delivered_state = trial_state
                 if usage_check.is_failure:
                     logger.warning(
                         "staged v2: the usage repair of %s did not make `%s` run; keeping the previous version",
@@ -1650,6 +1920,8 @@ async def run_staged_v2_pipeline(
 
     # ── 4. (Pro) 契約テスト ──────────────────────────────────────
     advisory_note = ""
+    # 契約テストの作り直しの「同じ本文」(smoke の作り直しと同じ判定、f_10 §11.1-3)
+    contract_history = RepairHistory()
     # SPEC.md に載せる入出力例。契約テストで例ごとに判定できたときは合格した例だけ (除外・不合格の例を落とす)。
     # 判定できなかったとき (smoke 不合格・例が組めない・進捗行が読めない) は None = 骨組みのまま「(未検証)」を添える
     # (骨組みの例は創作で、実コードと食い違う例を仕様として配っていた、2026-10-02 ライブ監査 K01 / K05)
@@ -1724,15 +1996,21 @@ async def run_staged_v2_pipeline(
                     for m in failing if m["path"] in code_map
                 ]
                 repaired = await _run_jobs(repair_jobs, slots)
+                repair_rounds_run += 1 if repair_jobs else 0
                 candidates = {
                     m["path"]: content
                     for m, content in zip([m for m in failing if m["path"] in code_map], repaired)
                     if content
                 }
                 # 同じ本文が返った作り直しは検査し直しても結果が変わらない — smoke と契約の再実行を飛ばす
-                unchanged = [p for p, c in candidates.items() if c.strip() == code_map.get(p, "").strip()]
+                # (判定は smoke の作り直しの停滞と同じ RepairHistory、f_10 §11.1-3)
+                unchanged = [
+                    p for p, c in candidates.items()
+                    if contract_history.body_verdict(p, c, previous=code_map.get(p, ""))
+                ]
                 for path in unchanged:
                     logger.info("staged v2: the contract repair of %s returned the same code; not re-checking", path)
+                    contract_history.drop(path, "same")
                     candidates.pop(path)
                 repair_changed = bool(candidates)
                 # 作り直した版は smoke を通してから採る (f_10 §11.1-4)。いまの code_map は smoke
@@ -1741,9 +2019,16 @@ async def run_staged_v2_pipeline(
                 # smoke が未検査 (外へ書こうとした) になった版も採らない — いまの code_map の smoke は
                 # 未検査ではなかったので、採ると「検査済みの不合格」が「未検査」に化ける (独立レビュー)
                 static_was_checked = not static_check.is_unchecked
+                trial_state = delivered_state
                 while candidates:
                     wired_trial, trial_errors, _ = await _check({**code_map, **candidates})
-                    if static_was_checked and smoke_unchecked and not trial_errors:
+                    trial_state = _verified(wired_trial, missing, delivered_state.round)
+                    # 時間切れで走らなかった smoke も「検査できなかった」— 合格に数えない (f_10 §11.1-4)
+                    lost_smoke = (
+                        "smoke" in lost_checks(trial_state, delivered_state) if revert_if_worse
+                        else static_was_checked and bool(smoke_unchecked)
+                    )
+                    if lost_smoke and not trial_errors:
                         trial_errors = [f"{p}: import smoke could not be checked" for p in candidates]
                     if not trial_errors:
                         break
@@ -1763,6 +2048,9 @@ async def run_staged_v2_pipeline(
                             code_map[path] = content
                             adopted = True
                             ws.write_file(path, content, kind="src", stage="code", task_id=_task_id(path))
+                # 契約テストのファイルはこの工程しか書かず、テストの実行は tests/ へ書けない (隔離が止める) ので、
+                # 実際には契約は変わらない。変わった回 (将来、契約を作り直す経路を足したとき) に件数を比べない
+                # ための防御 (test_fix_is_kept_when_the_contract_itself_changed が固定する)
                 contract_now = _read_text(ws.path("tests/test_examples.py"))
                 if repair_changed:
                     gate = await asyncio.to_thread(runner.run, test_logical_path="test_examples.py")
@@ -1771,26 +2059,57 @@ async def run_staged_v2_pipeline(
                 comparable = adopted and contract_now == example_src
                 # 修正前は不合格 (検査できた) — 修正版が未検査なら「不合格」が「未検査」に化ける
                 unchecked_after = comparable and gate.skipped
-                worse = comparable and not gate.skipped and failed_count(gate) > failed_count(gate_before)
-                if worse or unchecked_after:
-                    # 作り直しで悪化した — 修正前の版に戻す (K01: 2 → 4 failed のまま配信された)
-                    reverted = [p for p in code_map if p in code_before and code_map[p] != code_before[p]]
+                count_worse = comparable and not gate.skipped and failed_count(gate) > failed_count(gate_before)
+                worse = count_worse or unchecked_after
+                decided_by: str | None = "contract" if worse else None
+                usage_trial = usage_check
+                if revert_if_worse and adopted:
+                    # smoke と同じ方針で比べる (f_10 §11.1-4)。使い方は作り直した版でその場で実行する —
+                    # 契約の失敗が減っても使い方が合格 → 不合格になったら戻す
+                    if usage_check is not None and not _usage_not_run(usage_check):
+                        usage_trial, _, _ = await _run_usage_check(code_map)
+                        if _usage_not_run(usage_trial):
+                            # 時間切れは負荷による一過性のことがある — 1 回だけ実行し直してから決める
+                            usage_trial, _, _ = await _run_usage_check(code_map)
+                    state_before = replace(
+                        delivered_state, code_map=code_before, usage=usage_check,
+                        contract_failed=failed_count(gate_before), contract_key=example_src,
+                    )
+                    state_after = replace(
+                        trial_state, code_map=dict(code_map), usage=usage_trial,
+                        contract_failed=None if gate.skipped else failed_count(gate), contract_key=contract_now,
+                    )
+                    sign, decided_by = compare(state_after, state_before)
+                    # 未検査の契約は、使い方が良くなっても検査済みの不合格の上に採らない
+                    if unchecked_after:
+                        decided_by = "contract"
+                    worse = sign > 0 or unchecked_after
+                    if not worse and usage_check is not None:
+                        usage_check, usage_checked_code = usage_trial, dict(code_map)
+                        delivered_state = state_after
+                if worse:
+                    # 作り直しで悪化した — 修正前の版に丸ごと戻す (K01: 2 → 4 failed のまま配信された)。
+                    # 配線で増えたファイルも消す (残すと版が混ざる)
+                    changed = [p for p in code_before if code_map.get(p) != code_before[p]]
+                    added = [p for p in code_map if p not in code_before]
+                    reverted = changed + added
                     logger.warning(
-                        "staged v2: the contract repair made things worse (%d failed -> %s); "
+                        "staged v2: the contract repair made things worse (%s; %d failed -> %s); "
                         "keeping the previous version of %s",
-                        failed_count(gate_before),
-                        "not checked" if unchecked_after else f"{failed_count(gate)} failed", reverted,
+                        decided_by, failed_count(gate_before),
+                        "not checked" if gate.skipped else f"{failed_count(gate)} failed", reverted,
                     )
-                    for path in reverted:
-                        code_map[path] = code_before[path]
+                    code_map = dict(code_before)
+                    for path in changed:
                         ws.write_file(path, code_before[path], kind="src", stage="code", task_id=_task_id(path))
-                    verification.append(
-                        msg("create.contract_repair_unchecked", paths=", ".join(reverted)) if unchecked_after
-                        else msg(
-                            "create.contract_repair_worse", before=failed_count(gate_before),
-                            after=failed_count(gate), paths=", ".join(reverted),
-                        )
-                    )
+                    for path in added:
+                        ws.remove_file(path, kind="src")
+                    repair_reverts += 1
+                    verification.append(_contract_revert_line(
+                        decided_by, reverted, before=failed_count(gate_before), after=failed_count(gate),
+                        contract_unchecked=gate.skipped,
+                        usage_unchecked=usage_trial is None or usage_trial.is_unchecked,
+                    ))
                     gate = gate_before
                     # 最新の記録を戻した版の結果にする (悪化版のまま残さない)
                     _record_gate("test_examples", gate, kind="pytest")
@@ -1894,9 +2213,25 @@ async def run_staged_v2_pipeline(
             if advisory_check.failures:
                 verification.append(advisory_check.render_failures())
         phase_sec["tests"] = round(time.monotonic() - t0, 1)
+    # 自分の前の検査 (import / 静的検査) が不合格で飛ばした検査は、何も出さずに消えるのでなく未検査 (前提の不合格) として
+    # 伝える。契約テストの行は、その工程がある構成 (Pro) だけ — Free に足すと ``unchecked_labels`` が毎回ラベル無しにする。
+    # 使い方の実行は ``usage_check`` に入れない (作り直しの比較 ``staged_v2_state`` は未実行と未検査を同じ点に数える)
+    if smoke_errors and code_map:
+        skip_detail = msg("create.check.label.static")
+        skipped: list[CheckOutcome] = []
+        if tests_enabled:
+            skipped.append(CheckOutcome.unchecked(
+                CheckKind.CONTRACT, UncheckedReason.PREREQUISITE_FAILED, detail=skip_detail,
+            ))
+        if command is not None:
+            skipped.append(CheckOutcome.unchecked(
+                CheckKind.USAGE, UncheckedReason.PREREQUISITE_FAILED, detail=skip_detail,
+            ))
+        for skipped_check in skipped:
+            checks.append(skipped_check)
+            verification.append(skipped_check.render())
     if usage_check is not None:
-        timed_out = usage_check.is_unchecked and usage_check.reason is UncheckedReason.NOT_RUN
-        if code_map != usage_checked_code and not timed_out:
+        if code_map != usage_checked_code and not _usage_not_run(usage_check):
             # 契約テストの作り直しでコードが変わった — 作り直しなしでもう 1 回実行して差し替える。前回が時間切れ・
             # 実行の場の制約 (NOT_RUN) なら同じ結果になるので 1 回目を使う (最大 30 秒増えた、独立レビュー 低 d)
             usage_check, _, _ = await _run_usage_check(code_map)
@@ -1921,6 +2256,21 @@ async def run_staged_v2_pipeline(
             ))
         elif usage_check.is_unchecked and usage_check.reason is UncheckedReason.SIDE_EFFECTS:
             notices.append(msg("create.usage_not_checked", usage=skeleton.get("usage", ""), line=usage_check.render()))
+    # ── 実行時プローブ (観測のみ、f_10 §11.1-3): notes にだけ記録し、checks・tasks_failed・作り直しには流さない ──
+    probe_notes = _empty_probe_notes()
+    if bool(staged_cfg.get("runtime_probe_enabled", True)) and code_map and not _is_cancelled():
+        probe_skip = (
+            "no runnable usage command" if command is None
+            else "import smoke failed" if smoke_errors
+            else "usage run failed" if usage_check is not None and usage_check.is_failure
+            else ""
+        )
+        probe_files = {**(_package_files(code_map) if package else dict(code_map)), **usage_data}
+        probe_notes = await asyncio.to_thread(
+            _observe_runtime, {p: c for p, c in code_map.items() if p.endswith(".py")}, probe_files,
+            "" if probe_skip else command[0], probe_skip,
+            float(staged_cfg.get("runtime_probe_timeout_sec", 15.0)),
+        )
     # サブコマンドの振り分け (§11.1-1 (b)): 補完できなかった・振り分けに入らなかったモジュールを伝える
     if subcommands and code_map:
         py_code = {p: c for p, c in code_map.items() if p.endswith(".py")}
@@ -2017,9 +2367,22 @@ async def run_staged_v2_pipeline(
         "unbaked_defaults": unbaked_defaults,
     })
     _finish_run_safely(run_store, event_log, exit_kind, tasks_failed=tasks_failed)
+    # 照合は配信する版のもの (最後の _check の版と違えば照合し直す — 戻した版・同点で残した先の版)
+    conformance_observed: list[str] = []
+    if conformance_on:
+        conformance_observed = (
+            list(conformance_seen["messages"]) if conformance_seen["code"] == code_map else _conformance(code_map)
+        )
     logger.info(
         "staged v2 finished: run=%s modules=%d failed=%d phases=%s total=%.1fs",
         run_id, len(code_map), tasks_failed, phase_sec, time.monotonic() - t_start,
+    )
+    logger.info(
+        "staged v2 hardening: run=%s repair_rounds=%d reverts=%d best_round=%d stagnation_stops=%d "
+        "sibling_sheet_modules=%d conformance_violations=%d skipped_checks=%d",
+        run_id, repair_rounds_run, repair_reverts, best_state_round, repair_history.stops + contract_history.stops,
+        sibling_sheet_modules, len(conformance_observed),
+        sum(1 for c in checks if c.reason is UncheckedReason.PREREQUISITE_FAILED),
     )
     yield {"kind": "result", "payload": {
         "exit_kind": exit_kind,
@@ -2031,11 +2394,25 @@ async def run_staged_v2_pipeline(
             "verification": verification,
             "checks": [c.to_dict() for c in checks],
             "unchecked_checks": unchecked_count(checks),
+            "skipped_checks": [c.check for c in checks if c.reason is UncheckedReason.PREREQUISITE_FAILED],
+            "skipped_check_count": sum(1 for c in checks if c.reason is UncheckedReason.PREREQUISITE_FAILED),
             "advisory_dropped": advisory_dropped,
             "incomplete_checks": [c.check for c in blocked],
             "rebased_paths": rebased_paths,
             "unbaked_defaults": unbaked_defaults,
             "cache_bypass_retries": int(gen_stats.get("cache_bypass_retries") or 0),
+            # 作り直しで悪化して戻した回数 (smoke + 契約) と、配信した smoke の版の回 (0 = 作り直す前)
+            "repair_reverts": repair_reverts,
+            "sibling_sheet_modules": sibling_sheet_modules,
+            "best_state_round": best_state_round,
+            # 作り直しの回数 (smoke + 契約) と停滞で外したモジュールの数 (f_10 §11.1-3)
+            "repair_rounds_run": repair_rounds_run,
+            "stagnation_stops": repair_history.stops + contract_history.stops,
+            # 骨組みのシグネチャとの照合 (観測だけ、f_10 §11.1-3)
+            "conformance_violations": len(conformance_observed),
+            "conformance_observed": conformance_observed[:20],
+            # 実行時プローブ (観測だけ、f_10 §11.1-3): 作り直し・採点・checks には流さない
+            **probe_notes,
             "notices": notices,
         },
         "run_id": run_id,

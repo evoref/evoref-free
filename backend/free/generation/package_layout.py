@@ -655,6 +655,120 @@ def usage_missing_dependency(code_map: dict[str, str]) -> str:
     return ""
 
 
+def _is_dirname_call(node: ast.AST) -> bool:
+    """``os.path.dirname(X)`` / ``path.dirname(X)`` / ``dirname(X)`` の呼出し。"""
+    if not isinstance(node, ast.Call) or len(node.args) != 1:
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "dirname"
+    if not (isinstance(func, ast.Attribute) and func.attr == "dirname"):
+        return False
+    base = func.value
+    return (isinstance(base, ast.Attribute) and base.attr == "path") or (
+        isinstance(base, ast.Name) and base.id in ("path", "posixpath", "ntpath")
+    )
+
+
+def _dirname_made(call: ast.Call) -> ast.Call | None:
+    """``os.makedirs(dirname(X))`` / ``Path(dirname(X)).mkdir(...)`` の ``dirname(X)`` (その形でなければ ``None``)。"""
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == "makedirs" and isinstance(func.value, ast.Name)             and func.value.id == "os" or isinstance(func, ast.Name) and func.id == "makedirs":
+        return call.args[0] if call.args and _is_dirname_call(call.args[0]) else None
+    if isinstance(func, ast.Attribute) and func.attr == "mkdir" and isinstance(func.value, ast.Call):
+        ctor = func.value
+        name = ctor.func.id if isinstance(ctor.func, ast.Name) else getattr(ctor.func, "attr", "")
+        if name == "Path" and ctor.args and _is_dirname_call(ctor.args[0]):
+            return ctor.args[0]
+    return None
+
+
+#: 呼ぶと絶対パスを返す関数・メソッド名 (``os.path.abspath`` / ``Path.resolve`` / ``Path.home`` 等)。
+_ABSOLUTE_PATH_CALLS = frozenset({
+    "abspath", "realpath", "expanduser", "resolve", "absolute", "getcwd", "home", "cwd", "gettempdir", "mkdtemp",
+})
+
+
+def _provably_absolute(node: ast.AST, env: dict[str, list[ast.AST]], depth: int = 0) -> bool:
+    """式が絶対パスだと構文から言えるか (言えなければ ``False`` — 引数・不明な名前は相対かもしれない側に倒す)。
+
+    ``__file__`` / ``abspath(..)`` / ``Path(..).resolve()`` 由来、``/`` で始まる文字列、それらを土台にした
+    ``os.path.join`` / ``Path / x`` / ``.parent`` と、同じファイルで代入された名前 (代入が全部そうであるとき)。
+    """
+    if depth > 6:
+        return False
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and (node.value.startswith(("/", "\\")) or node.value[1:3] in (":\\", ":/"))
+    if isinstance(node, ast.Name):
+        if node.id == "__file__":
+            return True
+        values = env.get(node.id)
+        return bool(values) and all(_provably_absolute(v, env, depth + 1) for v in values)
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("parent", "parents") and _provably_absolute(node.value, env, depth + 1)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _provably_absolute(node.left, env, depth + 1)
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+        if name in _ABSOLUTE_PATH_CALLS:
+            return True
+        if name in ("join", "Path", "PurePath", "dirname") and node.args:
+            return _provably_absolute(node.args[0], env, depth + 1)
+        if isinstance(func, ast.Attribute) and name in ("joinpath", "with_name", "with_suffix"):
+            return _provably_absolute(func.value, env, depth + 1)
+    return False
+
+
+def _assigned_values(tree: ast.AST) -> dict[str, list[ast.AST]]:
+    """ファイル内の ``NAME = <式>`` (単一の名前への代入) を名前ごとに集める。"""
+    env: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            env.setdefault(node.targets[0].id, []).append(node.value)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            env.setdefault(node.target.id, []).append(node.value)
+    return env
+
+
+def empty_dirname_makedirs(py: dict[str, str]) -> list[str]:
+    """``os.makedirs(os.path.dirname(X))`` / ``Path(os.path.dirname(X)).mkdir`` のうち空文字のガードが無い呼出し (``<file>:<line>``)。
+
+    ``dirname("todos.json")`` は ``""`` で、``os.makedirs("")`` は ``FileNotFoundError`` になる (実行時プローブの静的所見、
+    f_10 §11.1-3 — 観測のみ)。``or "."`` のように呼出しが ``dirname`` でなくなるものと、同じ ``dirname(X)`` を条件にした
+    ``if`` の中の呼出し、``X`` が絶対パスだと構文から言える呼出し (``__file__`` / ``abspath`` 由来など。``dirname`` が
+    空になり得ない) は数えない。構造の抽出だけで語彙の判定ではない。
+    """
+    found: list[tuple[str, int]] = []
+
+    def visit(path: str, node: ast.AST, guards: frozenset[str], env: dict[str, list[ast.AST]]) -> None:
+        if isinstance(node, ast.If):
+            tested = {ast.dump(n) for n in ast.walk(node.test) if _is_dirname_call(n)}
+            visit(path, node.test, guards, env)
+            for child in (*node.body, *node.orelse):
+                visit(path, child, guards | tested, env)
+            return
+        if isinstance(node, ast.Call):
+            made = _dirname_made(node)
+            if (
+                made is not None and ast.dump(made) not in guards
+                and not _provably_absolute(made.args[0], env)
+            ):
+                found.append((path, node.lineno))
+        for child in ast.iter_child_nodes(node):
+            visit(path, child, guards, env)
+
+    for path in sorted(py):
+        if not path.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(py[path])
+        except (SyntaxError, ValueError):
+            continue
+        visit(path, tree, frozenset(), _assigned_values(tree))
+    return [f"{path}:{line}" for path, line in sorted(set(found))]
+
+
 def _last_exception(stderr: str) -> str:
     for line in reversed([ln.strip() for ln in stderr.splitlines() if ln.strip()]):
         match = _EXCEPTION_LINE_RE.match(line)
@@ -729,6 +843,7 @@ __all__ = [
     "SUBCOMMAND_ENTRY_NAMES",
     "SUBCOMMAND_ENTRY_SIGNATURE",
     "choose_entry",
+    "empty_dirname_makedirs",
     "is_main_guard",
     "package_code_map",
     "package_from_usage",

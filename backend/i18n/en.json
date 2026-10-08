@@ -783,6 +783,9 @@
     "contract_repair_reverted": "Reverted the fix after the contract tests (it failed the smoke check): {paths}",
     "contract_repair_worse": "Reverted the fix after the contract tests (failures went from {before} to {after}): {paths}",
     "contract_repair_unchecked": "Reverted the fix after the contract tests (the fixed version could not be checked): {paths}",
+    "contract_repair_broke_usage": "Reverted the fix after the contract tests (running the usage got worse): {paths}",
+    "contract_repair_usage_unchecked": "Reverted the fix after the contract tests (running the usage could not be checked on the fixed version): {paths}",
+    "smoke_repair_worse": "Reverted the fix of the check errors (the fixed version checked worse): {paths}",
     "checks_not_run": "Some checks could not run because the code tried to write outside the work folder: {lines}",
     "incomplete": {
       "written": "Wrote {paths}, but the work is not complete ({reasons}).",
@@ -827,6 +830,7 @@
         "lint_dropped": "lint removed all {detail} generated tests",
         "needs_input": "needs input or a screen: {detail}",
         "side_effects": "may act outside the sandbox: {detail}",
+        "prerequisite_failed": "not run because an earlier check failed: {detail}",
         "not_run": "could not be run"
       },
       "reason_by_check": {
