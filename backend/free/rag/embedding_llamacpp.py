@@ -15,6 +15,7 @@ import time
 import httpx
 import numpy as np
 
+from backend.constants import FLOAT_EPS
 from backend.free.llm._base_client import (
     BaseHTTPClient,
     HealthLogGate,
@@ -295,7 +296,7 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         self._dim_detected = True
 
         # L2 正規化
-        norms = np.linalg.norm(result, axis=1, keepdims=True).clip(min=1e-9)
+        norms = np.linalg.norm(result, axis=1, keepdims=True).clip(min=FLOAT_EPS)
         result = result / norms
 
         # DebugLogger

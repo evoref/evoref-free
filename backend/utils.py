@@ -1,6 +1,5 @@
 """共通ユーティリティ関数"""
 
-import math
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -198,6 +197,7 @@ def parse_utc(value: str | float | int | None) -> datetime | None:
 
 
 _EPOCH_ZERO = datetime.fromtimestamp(0, tz=timezone.utc)
+_MICROS_PER_SECOND = 1_000_000
 
 #: 永続化する instant の唯一の形 (``YYYY-MM-DDTHH:MM:SS.ffffffZ``、c_05 §0.5.4)。
 _PERSISTED_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
@@ -234,8 +234,8 @@ def epoch_to_utc(epoch: float | int | None) -> str | None:
         # ``floor(value * 1e6)`` は float の積が整数へ切り上がると元を超え (約 0.6%)、
         # 有理数で厳密に切り捨てると μs で書かれた値を 1µs 削る。読み戻しと同じ
         # ``micros / 1e6`` で比べ、元を超えるときだけ 1µs 下げる。
-        micros = round(value * 1_000_000)
-        if micros / 1_000_000 > value:
+        micros = round(value * _MICROS_PER_SECOND)
+        if micros / _MICROS_PER_SECOND > value:
             micros -= 1
         return format_utc(_EPOCH_ZERO + timedelta(microseconds=micros))
     except (OverflowError, OSError, ValueError):

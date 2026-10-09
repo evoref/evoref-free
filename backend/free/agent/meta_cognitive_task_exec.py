@@ -382,6 +382,9 @@ def continues_after_last_url(description: str) -> bool:
 #: ``_try_fast_path`` にツール判定が渡されていない印 (``None`` は「ツール無し」の判定)。
 _UNJUDGED = object()
 
+#: 前段の結果を system に載せるときの文字数上限 (CHARS)。
+_LOOP_CONTEXT_MAX_CHARS = 3000
+
 #: 取得の後に処理 (要約・計算・抽出) を求める計画の種別 (``json_schemas.PLAN_TASK_KINDS``)。
 PROCESSING_PLAN_KINDS: frozenset[str] = frozenset({"process", "retrieve_then_process"})
 
@@ -1239,8 +1242,8 @@ class _TaskExecutionMixin:
     def _loop_context_text(context_parts: list[str]) -> str:
         """前段の結果を system に載せる形 (3000 文字で切る)。"""
         context_text = "\n".join(context_parts) if context_parts else "(none)"
-        if len(context_text) > 3000:
-            context_text = context_text[:3000] + "\n... (truncated)"
+        if len(context_text) > _LOOP_CONTEXT_MAX_CHARS:
+            context_text = context_text[:_LOOP_CONTEXT_MAX_CHARS] + "\n... (truncated)"
         return context_text
 
     def _with_turn_context_blocks(self, prompt: str) -> str:

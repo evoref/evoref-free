@@ -5,6 +5,7 @@ import time
 from fastapi import APIRouter, Depends
 
 from backend.app_state import AppState, get_app_state
+from backend.constants import DEFAULT_LLAMA_PORT
 from backend.free.api.system._status_collectors import (
     compute_log_disk_usage_mb,
     count_recent_errors,
@@ -208,7 +209,7 @@ async def get_status(state: AppState = Depends(get_app_state)):
 
     # llama-server 接続チェック
     llama_host = llama_cfg.get("host", "127.0.0.1")
-    llama_port = llama_cfg.get("port", 8080)
+    llama_port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
     llama_url = f"http://{llama_host}:{llama_port}"
     connected = False
 

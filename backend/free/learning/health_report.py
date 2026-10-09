@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from backend.constants import SECONDS_PER_DAY
 from backend.data_root import store_root
 from backend.free.learning.level0_instant import fold_experience_file
 from backend.utils import parse_utc, utc_now_dt
@@ -168,8 +169,8 @@ def summarize(
         (b[0] - a[0]).total_seconds() / 60.0 for a, b in zip(stamped, stamped[1:], strict=False)
     ]
     idle = [g for g in gaps if g >= IDLE_GAP_MINUTES]
-    span_days = (stamped[-1][0] - stamped[0][0]).total_seconds() / 86400.0 if len(stamped) > 1 else 0.0
-    history_days = (now - stamped[0][0]).total_seconds() / 86400.0 if stamped else 0.0
+    span_days = (stamped[-1][0] - stamped[0][0]).total_seconds() / SECONDS_PER_DAY if len(stamped) > 1 else 0.0
+    history_days = (now - stamped[0][0]).total_seconds() / SECONDS_PER_DAY if stamped else 0.0
     per_day = sorted(days.values())
     return {
         "generated_at": now.isoformat(),

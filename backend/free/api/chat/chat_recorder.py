@@ -147,8 +147,6 @@ class SessionLedger:
     started_at: str | None = None
     #: 全ターンの蓄積 (WM のエビクションに依存しない完全な履歴)。
     turns: list[dict] = field(default_factory=list)
-    #: private ターンを 1 度でも含んだか (``memory.private.history_storage: skip`` 用)。
-    had_private: bool = False
     #: 会話単位の根拠台帳 (``[参考情報]`` に注入した資料の所在、ターン順)。
     sources: list[dict] = field(default_factory=list)
     #: ``turns`` のうち履歴の追記ログへ出し済みの件数 (次に出すターンの ``seq``)。
@@ -197,7 +195,6 @@ def _accumulate_turn(
     3 キーだけで、**履歴から回帰タスクを組み直せなかった** (2026-09-05 監査)。
     """
     if private:
-        _ledger(session_id).had_private = True
         logger.debug(
             "accumulate skipped (private turn): role=%s, session=%s, len=%d",
             role, session_id, len(content),
@@ -609,21 +606,6 @@ def _save_session_to_history(
     try:
         from backend.config import get_config
         cfg = get_config()
-
-        # memory.private.history_storage:
-        #   memory_only (既定) — private ターンのみディスクから除外し、
-        #                        同席した通常ターンはセッションファイルに残す
-        #   skip            — private ターンを含んだセッションは丸ごと永続化しない
-        private_cfg = ((cfg.get("memory") or {}).get("private") or {})
-        if (
-            private_cfg.get("history_storage", "memory_only") == "skip"
-            and ledger.had_private
-        ):
-            logger.info(
-                "history save skipped (history_storage=skip, session had private turns): %s",
-                session_id,
-            )
-            return
 
         from backend.io.readonly import is_readonly
 

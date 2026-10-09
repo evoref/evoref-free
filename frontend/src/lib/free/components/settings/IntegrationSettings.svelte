@@ -7,10 +7,8 @@
 	import TextField from './fields/TextField.svelte';
 	import NumberField from './fields/NumberField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
-	import SelectField from './fields/SelectField.svelte';
 
 	let tools = $derived(configSection($configData, 'tools'));
-	let externalApi = $derived(configSection($configData, 'external_api'));
 	let widgetProxy = $derived(configSection($configData, 'widget_proxy'));
 </script>
 
@@ -21,30 +19,8 @@
 		<NumberField label="settings.tools.fetch_url_timeout" value={Number(tools.fetch_url_timeout ?? 10)} min={1} onchange={fieldUpdater('tools', 'fetch_url_timeout')} />
 	</FieldGroup>
 
-	<!-- Pro: External API + Widget Proxy -->
+	<!-- Pro: Widget Proxy -->
 	<ProSection>
-		<FieldGroup label="settings.group_external_api">
-			<ToggleField label="settings.external_api.enabled" value={Boolean(externalApi.enabled ?? false)} onchange={fieldUpdater('external_api', 'enabled')} />
-			<SelectField
-				label="settings.external_api.provider"
-				value={String(externalApi.provider ?? 'anthropic')}
-				options={[
-					{ value: 'anthropic', label: 'Anthropic' },
-					{ value: 'openai', label: 'OpenAI' }
-				]}
-				onchange={fieldUpdater('external_api', 'provider')}
-			/>
-			<TextField
-				label="settings.external_api.api_key"
-				value={String(externalApi.api_key ?? '')}
-				type="password"
-				onchange={fieldUpdater('external_api', 'api_key')}
-			/>
-			<TextField label="settings.external_api.model" value={String(externalApi.model ?? '')} onchange={fieldUpdater('external_api', 'model')} />
-			<NumberField label="settings.external_api.max_tokens" value={Number(externalApi.max_tokens ?? 1024)} min={1} onchange={fieldUpdater('external_api', 'max_tokens')} />
-			<NumberField label="settings.external_api.timeout" value={Number(externalApi.timeout ?? 30)} min={1} onchange={fieldUpdater('external_api', 'timeout')} />
-		</FieldGroup>
-
 		<FieldGroup label="settings.group_widget_proxy">
 			<ToggleField label="settings.widget_proxy.enabled" value={Boolean(widgetProxy.enabled ?? false)} onchange={fieldUpdater('widget_proxy', 'enabled')} />
 			<TextField label="settings.widget_proxy.global_rate_limit" value={String(widgetProxy.global_rate_limit ?? '60/min')} onchange={fieldUpdater('widget_proxy', 'global_rate_limit')} />

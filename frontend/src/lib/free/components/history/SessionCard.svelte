@@ -22,39 +22,44 @@
 	);
 </script>
 
-<div
-	class="session-card"
-	class:selected
-	onclick={() => onselect(session.session_id)}
-	onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onselect(session.session_id); } }}
-	role="button"
-	tabindex="0"
-	aria-label={ariaLabel}
-	aria-pressed={selected}
->
-	<div class="session-main">
-		<span class="session-mode mode-{session.mode}">{session.mode}</span>
-		<span class="session-summary">{displayText}</span>
-	</div>
-	{#if matchedPreview}
-		<div class="session-match-preview">{matchedPreview}</div>
-	{/if}
-	<div class="session-meta">
-		<span class="session-time">{formatTime(session.started_at)}</span>
-		<span class="session-turns">{$t('history_page.turns', { count: session.turn_count })}</span>
-		<span class="session-duration">{$t('history_page.duration', { minutes: formatDuration(session.duration_sec) })}</span>
-		<button
-			class="delete-btn"
-			onclick={(e) => ondelete(e, session.session_id)}
-			aria-label={$t('history_page.delete_confirm')}
-		>
-			{$t('common.delete')}
-		</button>
-	</div>
+<div class="session-card" class:selected>
+	<button
+		type="button"
+		class="session-select"
+		onclick={() => onselect(session.session_id)}
+		aria-label={ariaLabel}
+		aria-pressed={selected}
+	>
+		<span class="session-main">
+			<span class="session-mode mode-{session.mode}">{session.mode}</span>
+			<span class="session-summary">{displayText}</span>
+		</span>
+		{#if matchedPreview}
+			<span class="session-match-preview">{matchedPreview}</span>
+		{/if}
+		<span class="session-meta">
+			<span class="session-time">{formatTime(session.started_at)}</span>
+			<span class="session-turns">{$t('history_page.turns', { count: session.turn_count })}</span>
+			<span class="session-duration">{$t('history_page.duration', { minutes: formatDuration(session.duration_sec) })}</span>
+		</span>
+	</button>
+	<button
+		type="button"
+		class="delete-btn"
+		onclick={(e) => ondelete(e, session.session_id)}
+		aria-label={`${$t('common.delete')}: ${displayText}`}
+	>
+		{$t('common.delete')}
+	</button>
 </div>
 
 <style>
 	.session-card {
+		position: relative;
+		border-radius: 6px;
+		transition: background 0.15s;
+	}
+	.session-select {
 		display: block;
 		width: 100%;
 		text-align: left;
@@ -63,9 +68,12 @@
 		background: transparent;
 		border: none;
 		cursor: pointer;
-		transition: background 0.15s;
 		font-family: inherit;
 		color: inherit;
+	}
+	.session-select:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: -2px;
 	}
 	.session-card:hover {
 		background: color-mix(in srgb, var(--accent) 6%, transparent);
@@ -105,6 +113,7 @@
 		white-space: nowrap;
 	}
 	.session-match-preview {
+		display: block;
 		font-size: 11px;
 		color: var(--text-secondary);
 		margin-top: 2px;
@@ -123,7 +132,9 @@
 		padding-left: 2px;
 	}
 	.delete-btn {
-		margin-left: auto;
+		position: absolute;
+		right: 10px;
+		bottom: 8px;
 		font-size: 11px;
 		color: var(--text-secondary);
 		background: none;
@@ -135,6 +146,7 @@
 		transition: opacity 0.15s, color 0.15s;
 	}
 	.session-card:hover .delete-btn,
+	.session-card:focus-within .delete-btn,
 	.delete-btn:focus-visible {
 		opacity: 1;
 	}

@@ -11,6 +11,8 @@ export interface ConfigFullResponse {
 export interface ConfigUpdateResponse {
 	section: string;
 	updated: boolean;
+	/** true なら再起動するまで反映されない (embedding / instance / i18n 以外) */
+	restart_required: boolean;
 }
 
 export interface ConfigValidateResponse {

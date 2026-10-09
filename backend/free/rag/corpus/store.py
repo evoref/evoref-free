@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from backend.constants import FLOAT_EPS
 from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.free.rag.corpus.chunking import CHUNKER_VERSION, chunk_documents
 from backend.free.rag.corpus.office_inspect import inspect_office_file
@@ -2006,7 +2007,7 @@ class CorpusStore:
             return ids
         query = np.asarray(query_vec, dtype=np.float32).ravel()
         norm = float(np.linalg.norm(query))
-        if norm < 1e-9:
+        if norm < FLOAT_EPS:
             return ids
         query = query / norm
 

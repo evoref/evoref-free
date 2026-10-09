@@ -113,6 +113,9 @@ _CONTEXT_SAFETY_MARGIN = 256
 # 追記を含む) は非類似=採用に倒す (no-op 誤判定で全変異を棄却した旧バグの逆方向)。
 _TEXT_SIMILARITY_THRESHOLD = 0.97
 _TEXT_LEN_DELTA = 5
+# 極端に短い候補とみなす文字数の下限 / そのときの減点
+_SHORT_CANDIDATE_MIN_CHARS = 50
+_SHORT_CANDIDATE_PENALTY = 0.05
 
 #: base prompt 進化の欠陥重み: 共有表 (fitness.DEFECT_WEIGHTS) を土台に、
 #: **プロンプトが責任を持つ失敗**を重くする。指示違反 (``outcome_instruction``:
@@ -613,8 +616,8 @@ class PromptEvolver:
             bonus += COVERAGE_TIEBREAK_MAX * (covered / len(failure_keywords))
 
         # 極端に短い候補 (指示が消えた) は罰する。長い側はハードゲートが担う。
-        if len(candidate) < 50:
-            bonus -= 0.05
+        if len(candidate) < _SHORT_CANDIDATE_MIN_CHARS:
+            bonus -= _SHORT_CANDIDATE_PENALTY
 
         return max(0.0, min(1.0, base_score + bonus))
 

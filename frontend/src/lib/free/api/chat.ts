@@ -6,6 +6,8 @@ import { BASE_URL, cancelStreamingOperation, parseApiError } from './_client';
 import { readSseFrames, SSE_FRAME_TYPES, type SSEFrameType } from './sse_frames';
 import type { FileContext } from './files';
 
+const SSE_PARSE_ERROR_PREVIEW_CHARS = 200;
+
 export interface TokenInfo {
 	used: number;
 	limit: number;
@@ -199,7 +201,7 @@ export async function* chatStream(
 			chunkTimeoutMs: STREAM_CHUNK_TIMEOUT_MS,
 			onParseError: (raw, e) => {
 				parseErrorCount++;
-				console.warn(`[SSE Parse Error] count=${parseErrorCount} data="${raw.slice(0, 200)}"`, e);
+				console.warn(`[SSE Parse Error] count=${parseErrorCount} data="${raw.slice(0, SSE_PARSE_ERROR_PREVIEW_CHARS)}"`, e);
 			}
 		})) {
 			if (IS_DEV && !firstByteRecorded) {

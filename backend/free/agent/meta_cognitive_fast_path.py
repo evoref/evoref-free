@@ -60,6 +60,11 @@ from backend.free.core.prompt_blocks import local_today
 
 logger = get_logger("agent.meta_cognitive")
 
+#: 既存ファイル編集の fast path が扱う本文の上限 (文字数)。
+_EDIT_MAX_CHARS = 2_000_000
+#: 同 (バイト数。読込時の上限で、文字数上限と同じ値にしている)。
+_EDIT_MAX_BYTES = 2_000_000
+
 #: 既存と同一の生成を棄却した後の再生成に添える指示。同じプロンプトのまま
 #: 再生成すると同じ写しが返り、長い生成を無駄に繰り返す (2026-10-02 ライブ監査 D07#3)。
 _UNCHANGED_EDIT_RETRY_HINT = (
@@ -768,9 +773,9 @@ class _FastPathMixin:
             p = Path(file_path)
             if p.suffix.lower() in _EXPORT_DOC_EXTS:
                 return None
-            if len(content) > 2_000_000:
+            if len(content) > _EDIT_MAX_CHARS:
                 return None
-            read = read_text_for_edit(p, max_bytes=2_000_000)
+            read = read_text_for_edit(p, max_bytes=_EDIT_MAX_BYTES)
         except Exception:
             return None
         if not isinstance(read, TextFile):

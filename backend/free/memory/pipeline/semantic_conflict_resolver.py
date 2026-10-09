@@ -87,6 +87,7 @@ from backend.free.memory.types import SemanticFact
 from backend.io.codec import CodecError, codec_for, persisted
 from backend.io.format_registry import FormatSpec, register_format
 from backend.io.jsonl_store import JSONLAppendStore
+from backend.constants import SECONDS_PER_DAY, SECONDS_PER_HOUR
 from backend.log_config import get_logger
 from backend.free.core.inference import SUMMARY_TAIL_RE
 from backend.utils import epoch_to_utc
@@ -429,7 +430,7 @@ class SemanticConflictResolver:
         cfg = ((config or {}).get("memory", {}) or {}).get("conflict", {}) or {}
         self.default_mode: str = cfg.get("default_mode", "auto")
         self.confirm_window_sec: float = (
-            float(cfg.get("confirm_window_hours", 1.0)) * 3600.0
+            float(cfg.get("confirm_window_hours", 1.0)) * SECONDS_PER_HOUR
         )
         self.project_tag_always_manual: bool = bool(
             cfg.get("project_tag_always_manual", True),
@@ -439,7 +440,7 @@ class SemanticConflictResolver:
         )
         # pending 競合の TTL 自動解消 (秒)。0 で無効。
         self.pending_ttl_sec: float = (
-            float(cfg.get("pending_auto_resolve_days", 3.0)) * 86400.0
+            float(cfg.get("pending_auto_resolve_days", 3.0)) * SECONDS_PER_DAY
         )
         self.attribute_similarity_threshold: float = float(
             cfg.get(

@@ -70,6 +70,10 @@ logger = get_logger("memory.sleep.correction_curator")
 #: (``correction_verified_at`` を立てないため)。
 _MAX_PER_CYCLE = 6
 
+#: ``correction_verify`` の出力トークン上限と生成温度。
+_VERIFY_MAX_TOKENS = 384
+_VERIFY_TEMPERATURE = 0.1
+
 #: ``target=self`` の照合元として遡るユーザー発話の件数。
 _SELF_CONTEXT_TURNS = 3
 
@@ -288,8 +292,8 @@ async def curate_corrections(
                     prev_response, content, prev_user=prev_user,
                 ),
                 purpose="correction_verify",
-                max_tokens=384,
-                temperature=0.1,
+                max_tokens=_VERIFY_MAX_TOKENS,
+                temperature=_VERIFY_TEMPERATURE,
                 response_schema=CorrectionVerdict,
             )
         except Exception as exc:  # noqa: BLE001 - 一過性失敗でマーカーを立てない

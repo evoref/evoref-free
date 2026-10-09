@@ -62,10 +62,6 @@ def build_export_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--exclude", help="Categories to leave out (comma-separated)")
     parser.add_argument(
-        "--include-private", action="store_true",
-        help="Also export memory records marked private / secret",
-    )
-    parser.add_argument(
         "--no-mask", action="store_true",
         help="Keep strings that look like secrets (API keys, tokens, e-mail addresses) as they are",
     )
@@ -162,7 +158,7 @@ def run_export(argv: list[str]) -> int:
     try:
         report = export_data(
             data_root, destination, edition=offline_edition(), categories=categories,
-            include_private=args.include_private, mask=not args.no_mask,
+            mask=not args.no_mask,
         )
     except DataTransferError as e:
         return _render_failure(console, e)

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+_SECONDS_PER_MINUTE = 60
+_SECONDS_PER_HOUR = 3600
+
 
 def parse_iso(s: str) -> datetime | None:
     """ISO 8601 文字列を datetime にパース
@@ -35,12 +38,12 @@ def format_datetime(iso_str: str) -> str:
 
 def format_duration(seconds: int) -> str:
     """秒数 → 読みやすい時間文字列（例: 2m 5s）"""
-    if seconds < 60:
+    if seconds < _SECONDS_PER_MINUTE:
         return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60}s"
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
+    if seconds < _SECONDS_PER_HOUR:
+        return f"{seconds // _SECONDS_PER_MINUTE}m {seconds % _SECONDS_PER_MINUTE}s"
+    h = seconds // _SECONDS_PER_HOUR
+    m = (seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE
     return f"{h}h {m}m"
 
 

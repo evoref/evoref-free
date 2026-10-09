@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 
 from backend.app_state import AppState
+from backend.constants import DEFAULT_LLAMA_PORT
 from backend.free.api.chat.chat_constants import DEFAULT_WORKING_MAX_TOKENS
 from backend.free.api.chat.chat_recorder import accumulate_user_turn
 from backend.free.api.chat.chat_types import ChatMessage, FileContextDict
@@ -106,7 +107,7 @@ async def _try_lazy_connect_base(state: AppState, cfg: dict) -> bool:
 
     llama_cfg = cfg.get("llama", {})
     llama_url = (
-        f"http://{llama_cfg.get('host', '127.0.0.1')}:{llama_cfg.get('port', 8080)}"
+        f"http://{llama_cfg.get('host', '127.0.0.1')}:{llama_cfg.get('port', DEFAULT_LLAMA_PORT)}"
     )
     return await _try_lazy_connect(state, llama_url, llama_cfg)
 
@@ -127,7 +128,7 @@ async def prepare_memory_context(
     if not state.get_memory_system():
         logger.debug("Memory not initialized, using single-turn context")
         session_id = req.session_id or "default"
-        accumulate_user_turn(session_id, req.message, private=req.private)
+        accumulate_user_turn(session_id, req.message)
         return [{"role": "user", "content": req.message}], session_id
 
     # ``session_id`` 未指定は **新規セッションの要求** として扱う。
@@ -176,7 +177,6 @@ async def prepare_memory_context(
     user_turn_id = wm.add_turn(
         "user",
         req.message,
-        private=req.private,
         mode=req.mode,
         source="user",
         correction=correction,
@@ -185,7 +185,7 @@ async def prepare_memory_context(
     # 生成が失敗 / タイムアウトしたターンは WM に居るのに履歴には無い。
     # 冪等なので record_* 側の保険と二重には数えない。
     accumulate_user_turn(
-        requested_session, req.message, private=req.private,
+        requested_session, req.message,
         turn_id=user_turn_id,
         meta={"mode": req.mode, "source": "user", "is_correction": correction or None},
     )
@@ -2052,7 +2052,7 @@ async def _wait_base_model_loading(client: LLMClient, cfg: dict) -> bool:
     """
     from backend.free.cli.pid_manager import find_port_occupant
 
-    port = (cfg.get("llama") or {}).get("port", 8080)
+    port = (cfg.get("llama") or {}).get("port", DEFAULT_LLAMA_PORT)
     if await asyncio.to_thread(find_port_occupant, port) is None:
         return False
 

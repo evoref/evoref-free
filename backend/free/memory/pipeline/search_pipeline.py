@@ -61,6 +61,13 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.search_pipeline")
 
+#: ログに出すクエリの先頭文字数 (通常 / 長め)。
+_LOG_QUERY_PREVIEW_CHARS = 50
+_LOG_QUERY_PREVIEW_LONG_CHARS = 80
+
+#: ``zlib.crc32`` を 32bit 符号なしに揃えるマスク。
+_CRC32_MASK = 0xFFFFFFFF
+
 # STM / LTM 用スレッドプール（設計書 4.10.1）
 _search_executor = ThreadPoolExecutor(max_workers=3)
 
@@ -966,7 +973,7 @@ def _yield_past_answers_to_corpus(
             candidates=["drop", "keep"],
             reason=reason,
             context={
-                "query": query[:80],
+                "query": query[:_LOG_QUERY_PREVIEW_LONG_CHARS],
                 ("dropped_ids" if drop else "kept_ids"): sorted(present),
                 "corpus_top_cosine": None if body_top is None else round(float(body_top), 4),
                 "corpus_floor": round(float(corpus_floor), 4),
@@ -1011,7 +1018,7 @@ def _log_unadopted_yield(
             chosen="logged",
             candidates=["logged"],
             reason="corpus_not_adopted",
-            context={"query": query[:80], "dropped_ids": sorted(dropped), "final_ids": final_ids},
+            context={"query": query[:_LOG_QUERY_PREVIEW_LONG_CHARS], "dropped_ids": sorted(dropped), "final_ids": final_ids},
         )
 
 
@@ -1825,7 +1832,7 @@ async def unified_search(
     rescore_candidates = _resolve_rescore_candidates(rag_cfg)
     logger.debug(
         "unified_search: query=%r, top_k=%d, fetch_k=%d (mult=%d, corpus=%d)",
-        query[:80], top_k, fetch_k, multiplier, corpus_fetch_k,
+        query[:_LOG_QUERY_PREVIEW_LONG_CHARS], top_k, fetch_k, multiplier, corpus_fetch_k,
     )
 
     # Step 1: Self-RAG 検索必要性判定 (純ルール、uncertain は retrieve に倒す)
@@ -1870,7 +1877,7 @@ async def unified_search(
     # 即終了し、ToolCallJudge / fetch_url ツールに委ねる。
     if necessity in ("skip", "fetch"):
         logger.info(
-            "Search skipped (necessity=%s) for query: %s", necessity, query[:50],
+            "Search skipped (necessity=%s) for query: %s", necessity, query[:_LOG_QUERY_PREVIEW_CHARS],
         )
         return SearchResult(skipped=True, from_memory=True)
 
@@ -1888,7 +1895,7 @@ async def unified_search(
     if drop_past_answers:
         logger.info(
             "This query repeats an earlier turn; past answers will be kept out "
-            "of the reference block (query=%r)", query[:50],
+            "of the reference block (query=%r)", query[:_LOG_QUERY_PREVIEW_CHARS],
         )
     # ゲートは **素の cosine** を全ストア共通の較正済みの棒で掛ける (c_16 §7.1)。
     thresholds = QualityThresholds.from_config(rag_cfg)
@@ -1919,7 +1926,7 @@ async def unified_search(
         if skip_corpus:
             logger.info(
                 "Corpus layer skipped: the query is date arithmetic answered by a tool: %s",
-                query[:50],
+                query[:_LOG_QUERY_PREVIEW_CHARS],
             )
     widen_corpus = corpus_fetch_k > fetch_k and not skip_corpus
     pq_seeds: list[str] = []
@@ -2007,7 +2014,7 @@ async def unified_search(
                 "Pseudo-query gate: corpus skipped (top pq cosine %.3f < gate %.3f, "
                 "top body %.3f < on_topic %.3f, veto=%s) for query: %s",
                 top_pq, pq_gate, top_body, on_topic_bar, pq_veto,
-                query[:50],
+                query[:_LOG_QUERY_PREVIEW_CHARS],
             )
             corpus_entries = []
             pseudo_entries = []
@@ -2241,7 +2248,7 @@ async def unified_search(
                 "(quality=%s) for query: %s",
                 len(passed), len(merged),
                 {k: round(v, 3) for k, v in applied_floors.items()},
-                quality, query[:50],
+                quality, query[:_LOG_QUERY_PREVIEW_CHARS],
             )
         if debug_logger is not None:
             debug_logger.log_rag_selection(
@@ -2259,7 +2266,7 @@ async def unified_search(
         # フロア無効 (0.0) の構成では従来どおり「low はクエリ単位で全件破棄」。
         logger.info(
             "Search results discarded (quality=low, floor disabled) "
-            "for query: %s", query[:50],
+            "for query: %s", query[:_LOG_QUERY_PREVIEW_CHARS],
         )
         merged = []
 
@@ -3033,7 +3040,7 @@ def _merge_results(*result_lists: list[StoreEntry]) -> list[StoreEntry]:
 
 def _expansion_seed(query: str) -> int:
     """クエリ文字列から決定論的な乱数シードを作る (純粋関数)。"""
-    return zlib.crc32((query or "").encode("utf-8")) & 0xFFFFFFFF
+    return zlib.crc32((query or "").encode("utf-8")) & _CRC32_MASK
 
 
 async def _expand_and_research(

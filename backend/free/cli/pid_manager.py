@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
+from backend.constants import DEFAULT_LLAMA_PORT
 from backend.log_config import get_logger
 
 logger = get_logger("cli.pid_manager")
@@ -502,7 +503,7 @@ def collect_configured_ports(config: dict) -> list[int]:
 
     # ベース llama-server
     llama_cfg = config.get("llama", {})
-    ports.append(llama_cfg.get("port", 8080))
+    ports.append(llama_cfg.get("port", DEFAULT_LLAMA_PORT))
 
     # 補助タスク
 
@@ -536,7 +537,7 @@ def expected_images_by_port(
     """
     expected: dict[int, tuple[str, ...]] = {
         config.get("server", {}).get("port", 8000): IMAGE_BACKEND,
-        config.get("llama", {}).get("port", 8080): IMAGE_LLAMA,
+        config.get("llama", {}).get("port", DEFAULT_LLAMA_PORT): IMAGE_LLAMA,
     }
     embed_cfg = config.get("embedding", {})
     if embed_cfg.get("backend") == "llama-cpp" and embed_cfg.get("llama_port"):

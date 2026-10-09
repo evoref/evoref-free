@@ -4,14 +4,16 @@
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { isPro } from '$lib/edition';
+	import { proActive } from '$lib/free/stores/server';
 	import { t } from '$lib/i18n';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 
 	// Pro ガード: Free 版ではトップにリダイレクト (Pro 専用機能)。
 	// goto は SSR 中に呼ぶと 500 になるため browser ガード必須。
-	if (browser && !isPro) {
-		goto('/');
-	}
+	// backend が free の場合 (Pro ビルド + Free バックエンド) もトップへ戻す。
+	$effect(() => {
+		if (browser && !$proActive) goto('/');
+	});
 
 	const proLoaders = import.meta.glob<{ default: Component }>(
 		'/src/lib/pro/components/KnowledgeSources.svelte'
@@ -32,7 +34,7 @@
 </script>
 
 <PageLayout title={$t('sidebar.knowledge_sources')}>
-	{#if KnowledgeSources}
+	{#if KnowledgeSources && $proActive}
 		<KnowledgeSources />
 	{:else if isPro}
 		<div class="loading">{$t('common.loading')}</div>

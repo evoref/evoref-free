@@ -8,6 +8,9 @@
 
 	type ModeFilter = 'all' | 'chat' | 'create';
 
+	/** 例クエリの折りたたみ表示の最大文字数 */
+	const QUERY_PREVIEW_CHARS = 80;
+
 	let examples = $state<FewShotExample[]>([]);
 	let archived = $state<FewShotExample[]>([]);
 	let poolSize = $state(0);
@@ -69,7 +72,7 @@
 		expandedId = expandedId === id ? null : id;
 	}
 
-	function truncate(text: string, max = 80): string {
+	function truncate(text: string, max = QUERY_PREVIEW_CHARS): string {
 		if (text.length <= max) return text;
 		return `${text.slice(0, max)}...`;
 	}

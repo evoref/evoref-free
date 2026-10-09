@@ -7,6 +7,7 @@ from enum import Enum
 from pathlib import Path
 
 from backend.config import PathResolver
+from backend.constants import DEFAULT_LLAMA_PORT
 from backend.error_handlers import E1001
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
@@ -243,7 +244,7 @@ def _check_llama_connection(config: dict) -> CheckResult:
     """llama.cpp サーバーへの接続確認（同期版）"""
     llama_cfg = config.get("llama", {})
     host = llama_cfg.get("host", "localhost")
-    port = llama_cfg.get("port", 8080)
+    port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
 
     try:
         import httpx

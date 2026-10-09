@@ -36,6 +36,13 @@ from backend.utils import estimate_tokens
 
 logger = get_logger("llm.local_client")
 
+# llama-server への HTTP クライアントのタイムアウト (秒)
+_HTTP_TIMEOUT_SEC = 120.0
+# コンテキスト超過ガードで最大メッセージを切り詰める最大反復回数
+_CTX_GUARD_MAX_ITERATIONS = 40
+# 中間切除で末尾に残す割合 (本文長に対する比)
+_CTX_KEEP_TAIL_RATIO = 0.25
+
 
 def truncation_notice() -> str:
     """max_tokens 到達でストリームが途中終了したことをユーザーへ開示する注記。
@@ -612,7 +619,7 @@ class LocalClient(BaseHTTPClient):
         on_runaway: str = "fallback",
         context_size: int | None = None,
     ):
-        super().__init__(timeout=120.0)
+        super().__init__(timeout=_HTTP_TIMEOUT_SEC)
         # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
         self._health_log_gate = HealthLogGate()
 
@@ -948,7 +955,7 @@ class LocalClient(BaseHTTPClient):
         #     ツール実行結果の末尾 → 前置ブロック (RAG / 記憶 / few-shot) の先頭
         #     の順で削る。それ以外のメッセージは中間切除 (先頭 / 末尾を残す)。
         truncated_msgs = 0
-        for _ in range(40):
+        for _ in range(_CTX_GUARD_MAX_ITERATIONS):
             if self._estimate_prompt_tokens(trimmed) <= budget:
                 break
             idx = max(
@@ -962,7 +969,7 @@ class LocalClient(BaseHTTPClient):
                 new_content = self._shrink_last_user(content, over)
             elif len(content) > self._CTX_GUARD_MIN_CONTENT_CHARS:
                 keep_head = int(len(content) * 0.5)
-                keep_tail = int(len(content) * 0.25)
+                keep_tail = int(len(content) * _CTX_KEEP_TAIL_RATIO)
                 new_content = (
                     content[:keep_head] + _ctx_truncation_notice() + content[-keep_tail:]
                 )
@@ -1027,7 +1034,7 @@ class LocalClient(BaseHTTPClient):
             if len(raw) <= self._CTX_GUARD_MIN_CONTENT_CHARS:
                 return content
             keep_head = int(len(raw) * 0.5)
-            keep_tail = int(len(raw) * 0.25)
+            keep_tail = int(len(raw) * _CTX_KEEP_TAIL_RATIO)
             return raw[:keep_head] + notice + raw[-keep_tail:]
         # 推定は CJK 1 文字 ≒ 1 トークン / ASCII 4 文字 ≒ 1 トークンなので、
         # 文字数換算は素直に「トークン超過 × 実測比」で見積もる。注記を 2 箇所
@@ -1488,7 +1495,7 @@ class LocalClient(BaseHTTPClient):
         started_at = _time.monotonic()
         try:
             # ストリーミング専用の新規クライアント（接続プール共有による stale 接続を回避）
-            async with httpx.AsyncClient(timeout=120.0) as stream_client:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT_SEC) as stream_client:
                 async with stream_client.stream(
                     "POST",
                     f"{self.url}/v1/chat/completions",

@@ -44,6 +44,7 @@ from backend.free.rag.evidence import (
 )
 from backend.free.rag.evidence.types import KIND_IDS, TIER_IDS, UNKNOWN_I16
 from backend.free.rag.vector_store import dequantize_int8
+from backend.constants import SECONDS_PER_DAY
 from backend.log_config import get_logger
 from backend.utils import utc_now_dt
 
@@ -452,7 +453,7 @@ class EpisodicStore:
         で ``long:<月>`` シャードへ入る。
         """
         reference = utc_now_dt().timestamp() if now is None else float(now)
-        cutoff = reference - float(short_days) * 86400.0
+        cutoff = reference - float(short_days) * SECONDS_PER_DAY
         promoted = 0
         for note in self.iter_notes(tier="short", include_private=True):
             if note.created_at <= 0 or note.created_at > cutoff:

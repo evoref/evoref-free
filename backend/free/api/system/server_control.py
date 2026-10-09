@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from backend.app_state import AppState, get_app_state
 from backend.config import get_config
+from backend.constants import DEFAULT_LLAMA_PORT
 from backend.free.core.launch_adapters import LaunchAdapters, adapters_for_launch
 from backend.log_config import get_logger
 
@@ -140,7 +141,7 @@ def _compose_cmd(
     if name == "base":
         llama_cfg = cfg.get("llama", {})
         host = llama_cfg.get("host", "127.0.0.1")
-        port = llama_cfg.get("port", 8080)
+        port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
         if adapters is None:
             from backend.config import get_path_resolver
 
@@ -324,7 +325,7 @@ def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
     """
     if name == "base":
         lc = cfg.get("llama", {}) or {}
-        return lc.get("host", "127.0.0.1"), int(lc.get("port", 8080))
+        return lc.get("host", "127.0.0.1"), int(lc.get("port", DEFAULT_LLAMA_PORT))
     if name == "embed":
         emb = cfg.get("embedding", {}) or {}
         return emb.get("llama_host", "localhost"), int(emb.get("llama_port", 8082))
@@ -657,7 +658,7 @@ async def _try_reconnect(
         from backend.free.api.system.status import _try_lazy_connect
         llama_cfg = cfg.get("llama", {})
         host = llama_cfg.get("host", "127.0.0.1")
-        port = llama_cfg.get("port", 8080)
+        port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
         url = f"http://{host}:{port}"
         await _try_lazy_connect(state, url, llama_cfg)
 

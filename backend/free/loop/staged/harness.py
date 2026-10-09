@@ -28,6 +28,10 @@ if TYPE_CHECKING:
 
 logger = get_logger("loop.staged.harness")
 
+#: 締切から差し引く余裕 (秒) と、残り時間の床 (秒)。
+_DEADLINE_RESERVE_SEC = 300.0
+_DEADLINE_FLOOR_SEC = 120.0
+
 #: 拡張子 → editor 表示用言語ラベル (best-effort)。
 _EXT_LANG: dict[str, str] = {
     "py": "python", "js": "javascript", "ts": "typescript", "jsx": "javascript",
@@ -228,5 +232,5 @@ class StagedCodeHarness:
         """
         if not req.deadline_monotonic:
             return None
-        remaining = req.deadline_monotonic - time.monotonic() - 300.0
-        return max(120.0, remaining)
+        remaining = req.deadline_monotonic - time.monotonic() - _DEADLINE_RESERVE_SEC
+        return max(_DEADLINE_FLOOR_SEC, remaining)

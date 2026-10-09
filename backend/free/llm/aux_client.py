@@ -176,6 +176,9 @@ PURPOSE_TIMEOUT_DEFAULTS: dict[str, float] = {
 }
 
 _DEFAULT_TIMEOUT = 60.0
+# temperature 未指定時の既定: 文法制約 JSON 生成 / 通常生成
+_CONSTRAINED_DEFAULT_TEMPERATURE = 0.1
+_GENERATE_DEFAULT_TEMPERATURE = 0.3
 
 
 # 反応的タイムアウト較正の対象外 purpose。
@@ -735,7 +738,7 @@ class AuxClient:
                     content = await self.local.generate_constrained(
                         messages,
                         response_format=resolved,
-                        temperature=0.1 if temperature is None else temperature,
+                        temperature=_CONSTRAINED_DEFAULT_TEMPERATURE if temperature is None else temperature,
                         max_tokens=max_tokens if max_tokens is not None else 256,
                         id_slot=slot,
                         timeout=effective_timeout,
@@ -749,7 +752,7 @@ class AuxClient:
                 out = await self.local.generate(
                     messages=messages,
                     stream=False,
-                    temperature=0.3 if temperature is None else temperature,
+                    temperature=_GENERATE_DEFAULT_TEMPERATURE if temperature is None else temperature,
                     max_tokens=max_tokens,
                     id_slot=slot,
                     request_timeout=effective_timeout,

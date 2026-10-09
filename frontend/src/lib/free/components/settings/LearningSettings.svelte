@@ -2,12 +2,15 @@
 	import { configData } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import SettingsSection from './SettingsSection.svelte';
+	import ProSection from './ProSection.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import NumberField from './fields/NumberField.svelte';
+	import TextField from './fields/TextField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
 
 	let learning = $derived(configSection($configData, 'learning'));
 	let agent = $derived(configSection($configData, 'agent'));
+	let schedule = $derived(configSection($configData, 'schedule'));
 </script>
 
 <SettingsSection tabId="learning">
@@ -16,15 +19,17 @@
 		<NumberField label="settings.learning.level1_min_experiences" value={Number(learning.level1_min_experiences ?? 20)} min={1} onchange={fieldUpdater('learning', 'level1_min_experiences')} />
 		<NumberField label="settings.learning.level1_generations" value={Number(learning.level1_generations ?? 10)} min={1} onchange={fieldUpdater('learning', 'level1_generations')} />
 		<NumberField label="settings.learning.level1_population_size" value={Number(learning.level1_population_size ?? 5)} min={1} onchange={fieldUpdater('learning', 'level1_population_size')} />
-		<NumberField label="settings.learning.level2_min_failures" value={Number(learning.level2_min_failures ?? 50)} min={1} onchange={fieldUpdater('learning', 'level2_min_failures')} />
 		<NumberField label="settings.learning.full_idle_minutes" value={Number(learning.full_idle_minutes ?? 10)} min={1} onchange={fieldUpdater('learning', 'full_idle_minutes')} />
 		<NumberField label="settings.learning.level1_idle_minutes" value={Number(learning.level1_idle_minutes ?? 30)} min={1} onchange={fieldUpdater('learning', 'level1_idle_minutes')} />
 		<NumberField label="settings.learning.level1_recheck_interval_sec" value={Number(learning.level1_recheck_interval_sec ?? 60)} min={1} onchange={fieldUpdater('learning', 'level1_recheck_interval_sec')} />
 		<NumberField label="settings.learning.priority_threshold_ratio" value={Number(learning.priority_threshold_ratio ?? 0.5)} min={0} max={1} step={0.05} onchange={fieldUpdater('learning', 'priority_threshold_ratio')} />
 		<NumberField label="settings.learning.active_minutes" value={Number(learning.active_minutes ?? 5)} min={1} onchange={fieldUpdater('learning', 'active_minutes')} />
-		<NumberField label="settings.learning.level2_spsa_iterations" value={Number(learning.level2_spsa_iterations ?? 500)} min={1} onchange={fieldUpdater('learning', 'level2_spsa_iterations')} />
-		<NumberField label="settings.learning.level2_sparse_params" value={Number(learning.level2_sparse_params ?? 200)} min={1} onchange={fieldUpdater('learning', 'level2_sparse_params')} />
-		<NumberField label="settings.learning.level2_schedule_hour" value={Number(learning.level2_schedule_hour ?? 3)} min={0} max={23} onchange={fieldUpdater('learning', 'level2_schedule_hour')} />
+		<ProSection>
+			<NumberField label="settings.learning.level2_min_failures" value={Number(learning.level2_min_failures ?? 50)} min={1} onchange={fieldUpdater('learning', 'level2_min_failures')} />
+			<NumberField label="settings.learning.level2_spsa_iterations" value={Number(learning.level2_spsa_iterations ?? 500)} min={1} onchange={fieldUpdater('learning', 'level2_spsa_iterations')} />
+			<NumberField label="settings.learning.level2_sparse_params" value={Number(learning.level2_sparse_params ?? 200)} min={1} onchange={fieldUpdater('learning', 'level2_sparse_params')} />
+			<NumberField label="settings.learning.level2_schedule_hour" value={Number(learning.level2_schedule_hour ?? 3)} min={0} max={23} onchange={fieldUpdater('learning', 'level2_schedule_hour')} />
+		</ProSection>
 	</FieldGroup>
 
 	<!-- Free: Pattern Detection -->
@@ -44,9 +49,13 @@
 		<NumberField label="settings.agent.step_compaction_command_head_tail" value={Number(agent.step_compaction_command_head_tail ?? 5)} min={1} onchange={fieldUpdater('agent', 'step_compaction_command_head_tail')} />
 		<ToggleField label="settings.agent.reminders_enabled" value={Boolean(agent.reminders_enabled ?? true)} onchange={fieldUpdater('agent', 'reminders_enabled')} />
 		<NumberField label="settings.agent.max_reminders_per_turn" value={Number(agent.max_reminders_per_turn ?? 2)} min={0} onchange={fieldUpdater('agent', 'max_reminders_per_turn')} />
-		<ToggleField label="settings.agent.dangerous_command_block" value={Boolean(agent.dangerous_command_block ?? true)} onchange={fieldUpdater('agent', 'dangerous_command_block')} />
+		<ToggleField label="settings.agent.dangerous_command_block" value={Boolean(agent.dangerous_command_block ?? true)} disabled={Boolean(agent.dangerous_command_block ?? true)} onchange={fieldUpdater('agent', 'dangerous_command_block')} />
 		<ToggleField label="settings.agent.tool_judge_enabled" value={Boolean(agent.tool_judge_enabled ?? true)} onchange={fieldUpdater('agent', 'tool_judge_enabled')} />
 		<ToggleField label="settings.agent.meta_cognitive_enabled" value={Boolean(agent.meta_cognitive_enabled ?? true)} onchange={fieldUpdater('agent', 'meta_cognitive_enabled')} />
 		<NumberField label="settings.agent.meta_cognitive_min_budget" value={Number(agent.meta_cognitive_min_budget ?? 512)} min={0} onchange={fieldUpdater('agent', 'meta_cognitive_min_budget')} />
+	</FieldGroup>
+
+	<FieldGroup label="settings.group_schedule">
+		<TextField label="settings.schedule.local_tz" description="settings.schedule.local_tz_desc" value={String(schedule.local_tz ?? 'Asia/Tokyo')} placeholder="Asia/Tokyo" onchange={fieldUpdater('schedule', 'local_tz')} />
 	</FieldGroup>
 </SettingsSection>

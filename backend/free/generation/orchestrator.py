@@ -152,6 +152,15 @@ _MIN_UNIQUE_SENTENCE_RATIO = 0.6
 _WARN_UNIQUE_SENTENCE_RATIO = 0.8
 # 重複判定で無視する短文 (定型の相槌・見出し断片を拾わないため)。
 _DUP_MIN_SENTENCE_CHARS = 15
+# 肥大 unit を分割する閾値: 目標 token に掛ける倍率 / 下限 token
+_SPLIT_THRESHOLD_RATIO = 1.5
+_SPLIT_THRESHOLD_MIN_TOKENS = 600
+# メモリコンテキストに使う直近ターン数
+_MEMORY_RECENT_TURNS = 6
+# 追加生成の max_tokens: 残り token に掛ける 2 段の倍率 / 下限 token
+_EXTEND_REMAINING_RATIO = 0.6
+_EXTEND_MARGIN_RATIO = 1.5
+_EXTEND_MIN_TOKENS = 512
 # 総文数に依存しない退化検出の下限文字数。比率ゲートは _DUP_CHECK_MIN_SENTENCES
 # (12 文) 未満だと一切評価しないため、短い退化出力を丸ごと素通ししていた
 # (実測 2026-07-27: 「箇条書きを使わず地の文で 400 字に縮めて」の応答が
@@ -1516,7 +1525,7 @@ class LongFormOrchestrator:
                 turns = self.memory_wm.get_messages()
                 # 直近のターンをメモリコンテキストとして使用
                 memory_parts = []
-                for turn in turns[-6:]:  # 直近6ターン
+                for turn in turns[-_MEMORY_RECENT_TURNS:]:  # 直近6ターン
                     role = turn.get("role", "")
                     content = turn.get("content", "")[:200]
                     if content:
@@ -1726,7 +1735,7 @@ class LongFormOrchestrator:
     def _build_extend_gen_kwargs(self, remaining: int) -> dict:
         """追加生成用の generate kwargs を構築する。"""
         unit_max = self._lf_policy("unit_max_tokens", "chat", 2000)
-        max_tokens = min(unit_max, max(int(remaining * 0.6 * 1.5), 512))
+        max_tokens = min(unit_max, max(int(remaining * _EXTEND_REMAINING_RATIO * _EXTEND_MARGIN_RATIO), _EXTEND_MIN_TOKENS))
         gen_kwargs: dict = {
             "stream": True,
             "temperature": self._generation_params.get("temperature", 0.7),
@@ -2034,7 +2043,7 @@ def _split_oversized_text_units(
     - 親ユニットの key_points をサブユニットへ連続分配し、続きユニットが
       内容仕様ゼロにならないようにする (逐語再掲の抑止)。
     """
-    split_threshold = max(int(unit_target_tokens * 1.5), 600)
+    split_threshold = max(int(unit_target_tokens * _SPLIT_THRESHOLD_RATIO), _SPLIT_THRESHOLD_MIN_TOKENS)
 
     if max_units and max_units > 0:
         text_total = sum(
@@ -2048,7 +2057,7 @@ def _split_oversized_text_units(
                 unit_target_tokens, floor_target, max_units,
             )
             unit_target_tokens = floor_target
-            split_threshold = max(int(unit_target_tokens * 1.5), 600)
+            split_threshold = max(int(unit_target_tokens * _SPLIT_THRESHOLD_RATIO), _SPLIT_THRESHOLD_MIN_TOKENS)
 
     new_units: list[CodeUnit | SectionPlan] = []
     for unit in plan.units:

@@ -33,6 +33,12 @@ if TYPE_CHECKING:
 
 logger = get_logger("rag.self_rag_judge")
 
+#: ログに出すクエリの先頭文字数。
+_LOG_QUERY_PREVIEW_CHARS = 50
+
+#: 挨拶 / 相槌パターンによるスキップを適用するクエリ長の上限 (文字数、未満)。
+_SKIP_PATTERN_MAX_QUERY_CHARS = 20
+
 VALID_QUALITIES = {"high", "medium", "low"}
 
 # 検索スキップパターン
@@ -524,7 +530,7 @@ class RetrievalNecessityJudge:
         ):
             logger.debug(
                 "Necessity: uncertain (session self-reference with an "
-                "incomplete window: %r)", query_stripped[:50],
+                "incomplete window: %r)", query_stripped[:_LOG_QUERY_PREVIEW_CHARS],
             )
             return "uncertain"
 
@@ -537,7 +543,7 @@ class RetrievalNecessityJudge:
         if either(FETCH_INTENT_PATTERNS, FETCH_INTENT_PATTERNS_EN):
             logger.debug(
                 "Necessity: fetch (fetch intent pattern matched: %r)",
-                query_stripped[:50],
+                query_stripped[:_LOG_QUERY_PREVIEW_CHARS],
             )
             return "fetch"
 
@@ -545,7 +551,7 @@ class RetrievalNecessityJudge:
         if either(TRIVIAL_QUESTION_PATTERNS, TRIVIAL_QUESTION_PATTERNS_EN):
             logger.debug(
                 "Necessity: skip (trivial question pattern matched: %r)",
-                query_stripped[:50],
+                query_stripped[:_LOG_QUERY_PREVIEW_CHARS],
             )
             return "skip"
 
@@ -585,7 +591,7 @@ class RetrievalNecessityJudge:
         if is_contentless_social_formula(query_stripped, assistant_closers=False):
             logger.debug(
                 "Necessity: skip (whole utterance is a social formula: %r)",
-                query_stripped[:50],
+                query_stripped[:_LOG_QUERY_PREVIEW_CHARS],
             )
             return "skip"
 
@@ -596,12 +602,12 @@ class RetrievalNecessityJudge:
             if len(query_stripped) < _UNCERTAIN_QUERY_MAX_CHARS:
                 logger.debug(
                     "Necessity: uncertain (short question marker: %r)",
-                    query_stripped[:50],
+                    query_stripped[:_LOG_QUERY_PREVIEW_CHARS],
                 )
                 return "uncertain"
             logger.debug(
                 "Necessity: retrieve (long question marker matched: %r)",
-                query_stripped[:50],
+                query_stripped[:_LOG_QUERY_PREVIEW_CHARS],
             )
             return "retrieve"
 
@@ -609,7 +615,7 @@ class RetrievalNecessityJudge:
         # 全文が定型の発話 (「そうですか。」を含む) は 3.7 で取り終えている。
         # 「そうですか」のように質問マーカーを含む相槌は 4. に先に当たるため、
         # ここへは届かない — ここが拾うのは定型の後に短い残余がある発話だけ。
-        if either(SKIP_PATTERNS, SKIP_PATTERNS_EN) and len(query_stripped) < 20:
+        if either(SKIP_PATTERNS, SKIP_PATTERNS_EN) and len(query_stripped) < _SKIP_PATTERN_MAX_QUERY_CHARS:
             logger.debug("Necessity: skip (greeting/simple pattern matched: %r)", query_stripped[:30])
             return "skip"
 
@@ -622,7 +628,7 @@ class RetrievalNecessityJudge:
                 logger.debug(
                     "Necessity: uncertain (back-reference to an earlier turn "
                     "overrides the sufficient-context skip: %r)",
-                    query_stripped[:50],
+                    query_stripped[:_LOG_QUERY_PREVIEW_CHARS],
                 )
                 return "uncertain"
             logger.debug("Necessity: skip (sufficient context: %d turns)", context_count)
@@ -630,7 +636,7 @@ class RetrievalNecessityJudge:
 
         # 7. デフォルトは uncertain (呼出側のリコール送り)
         # 旧 FORCE_PATTERNS が拾っていたケースもここに落ちる。
-        logger.debug("Necessity: uncertain (default, query=%r)", query_stripped[:50])
+        logger.debug("Necessity: uncertain (default, query=%r)", query_stripped[:_LOG_QUERY_PREVIEW_CHARS])
         return "uncertain"
 
     def judge(

@@ -102,20 +102,6 @@ class MetadataCorruptedError(StorageError):
     i18n_key = "error.fs.metadata_corrupted"
 
 
-class IndexMetadataMismatchError(StorageError):
-    """E3003: インデックスとメタデータの不整合"""
-
-    code = "E3003"
-    i18n_key = "error.fs.index_metadata_mismatch"
-
-
-class MemoryFileCorruptedError(StorageError):
-    """E3004: メモリファイル破損"""
-
-    code = "E3004"
-    i18n_key = "error.fs.memory_corrupted"
-
-
 class DiskFullError(StorageError):
     """E3005: ディスク容量不足"""
 
@@ -141,14 +127,6 @@ class RAGError(EvorefError):
     i18n_key = "error.rag.generic"
 
 
-class EmptyIndexError(RAGError):
-    """E4001: 空インデックス検索"""
-
-    code = "E4001"
-    status_code = 400
-    i18n_key = "error.rag.empty_index"
-
-
 class ChunkError(RAGError):
     """E4002: チャンク分割失敗"""
 
@@ -165,35 +143,12 @@ class CartridgeInvalidZipError(RAGError):
     i18n_key = "error.cartridge.invalid_zip"
 
 
-class CartridgeSchemaMismatchError(RAGError):
-    """E4004: スキーマ不一致"""
-
-    code = "E4004"
-    status_code = 422
-    i18n_key = "error.cartridge.schema_mismatch"
-
-
 class CartridgeDuplicateIdError(RAGError):
     """E4005: ID 重複"""
 
     code = "E4005"
     status_code = 409
     i18n_key = "error.cartridge.duplicate_id"
-
-
-class SearchNoResultError(RAGError):
-    """E4006: 検索結果なし"""
-
-    code = "E4006"
-    status_code = 200
-    i18n_key = "error.rag.no_results"
-
-
-class STMIntegrityError(RAGError):
-    """E4007: STM ノート整合性エラー"""
-
-    code = "E4007"
-    i18n_key = "error.rag.stm_integrity"
 
 
 class VectorDimensionMismatchError(RAGError):
@@ -266,14 +221,6 @@ class InsufficientContextError(LongFormError):
     code = "E9010"
     status_code = 400
     i18n_key = "error.long_form.insufficient_context"
-
-
-class PlanGenerationError(LongFormError):
-    """E9011: 計画生成失敗"""
-
-    code = "E9011"
-    status_code = 500
-    i18n_key = "error.long_form.plan_failed"
 
 
 class UnitGenerationError(LongFormError):

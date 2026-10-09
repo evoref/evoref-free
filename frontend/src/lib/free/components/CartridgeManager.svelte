@@ -2,7 +2,7 @@
 	import { t } from '$lib/i18n';
 	import { onMount } from 'svelte';
 	import type { Snippet } from 'svelte';
-	import type { Cartridge, CartridgeDetail } from '$lib/free/api';
+	import type { Cartridge, CartridgeDetail, CartridgeChangeResult } from '$lib/free/api';
 	import {
 		getCartridges,
 		installCartridgeStreaming,
@@ -14,6 +14,7 @@
 		getCartridgeDetail
 	} from '$lib/free/api';
 	import { handleApiCall } from '$lib/free/utils/error';
+	import { addToast } from '$lib/free/stores/toast';
 	import { formatSize } from '$lib/free/utils/format';
 	import { templatesRevision } from '$lib/free/stores/chat';
 	import CartridgeDetailDialog from './CartridgeDetailDialog.svelte';
@@ -168,19 +169,38 @@
 		await refreshCartridges();
 	}
 
+	// Pro で LoRA が古くなったときだけバックエンドが lora_impact を付ける (Free では出ない)。
+	function notifyLoraImpact(result: CartridgeChangeResult | undefined) {
+		const impact = result?.lora_impact;
+		if (!impact?.has_impact) return;
+		const rolledBack = /^base_rollback_to_v(\d+)$/.exec(impact.action_taken);
+		addToast({
+			type: 'warning',
+			i18nKey: rolledBack
+				? 'cartridge.lora_impact_rolled_back'
+				: 'cartridge.lora_impact_stale',
+			params: rolledBack ? { version: rolledBack[1] } : undefined,
+			duration: 10000
+		});
+	}
+
 	async function handleUnload(id: string) {
 		errorMessage = '';
-		await handleApiCall(() => unloadCartridge(id), {
-			fallbackKey: 'cartridge.unload_failed'
-		});
+		notifyLoraImpact(
+			await handleApiCall(() => unloadCartridge(id), {
+				fallbackKey: 'cartridge.unload_failed'
+			})
+		);
 		await refreshCartridges();
 	}
 
 	async function handleDelete(id: string) {
 		errorMessage = '';
-		await handleApiCall(() => deleteCartridge(id), {
-			fallbackKey: 'cartridge.delete_failed'
-		});
+		notifyLoraImpact(
+			await handleApiCall(() => deleteCartridge(id), {
+				fallbackKey: 'cartridge.delete_failed'
+			})
+		);
 		await refreshCartridges();
 	}
 

@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 import yaml
 
+from backend.constants import DEFAULT_LLAMA_PORT
 from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.config_loader import _find_project_root
 from backend.free.cli.develop_mode_setup import add_data_root_flag, setup_develop_mode
@@ -317,7 +318,7 @@ def _spawn_llama_base(
         release_pid(project_root)
         return None
     llama_cfg = config.get("llama", {})
-    return llama_cfg.get("host", "127.0.0.1"), llama_cfg.get("port", 8080)
+    return llama_cfg.get("host", "127.0.0.1"), llama_cfg.get("port", DEFAULT_LLAMA_PORT)
 
 
 def _spawn_and_wait_llama(
@@ -897,7 +898,7 @@ def _spawn_all_servers(
     # ── base llama-server ──
     llama_cfg = cfg.get("llama", {})
     llama_host = llama_cfg.get("host", "127.0.0.1")
-    llama_port = llama_cfg.get("port", 8080)
+    llama_port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
     state.llama_port = llama_port
 
     if not skip_base:
@@ -972,7 +973,7 @@ async def _start_auto_serve_rerank_after_base(
     if no_llama:
         return None
     llama_cfg = cfg.get("llama", {})
-    base_url = f"http://{llama_cfg.get('host', '127.0.0.1')}:{state.llama_port or llama_cfg.get('port', 8080)}"
+    base_url = f"http://{llama_cfg.get('host', '127.0.0.1')}:{state.llama_port or llama_cfg.get('port', DEFAULT_LLAMA_PORT)}"
     for _ in range(timeout_llama):
         if await _check_llama_health(base_url):
             break
@@ -1363,7 +1364,7 @@ async def _maybe_spawn_auto_serve_llama(
         return {}
     llama_cfg = cfg.get("llama", {})
     llama_host = llama_cfg.get("host", "localhost")
-    llama_port_val = llama_cfg.get("port", 8080)
+    llama_port_val = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
     llama_url = f"http://{llama_host}:{llama_port_val}"
     llama_already_running = await _check_llama_health(llama_url)
     if llama_already_running:

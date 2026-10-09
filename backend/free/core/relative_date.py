@@ -191,10 +191,13 @@ def has_non_today_offset_anchor(text: str) -> bool:
     return any(a.kind != ANCHOR_TODAY for a in offset_anchors(text))
 
 
+_MONTHS_PER_YEAR = 12
+
+
 def _shift_months(anchor: date, months: int) -> date:
-    y, m = divmod(anchor.month - 1 + months, 12)
+    y, m = divmod(anchor.month - 1 + months, _MONTHS_PER_YEAR)
     year, month = anchor.year + y, m + 1
-    last = (date(year + (month // 12), month % 12 + 1, 1) - timedelta(days=1)).day
+    last = (date(year + (month // _MONTHS_PER_YEAR), month % _MONTHS_PER_YEAR + 1, 1) - timedelta(days=1)).day
     return date(year, month, min(anchor.day, last))
 
 
@@ -206,7 +209,7 @@ def resolve_offset(anchor: date, m: re.Match[str]) -> date:
     if unit in _UNIT_DAYS:
         return base + timedelta(days=n * _UNIT_DAYS[unit])
     if unit == "年":
-        return _shift_months(base, 12 * n)
+        return _shift_months(base, _MONTHS_PER_YEAR * n)
     return _shift_months(base, n)
 
 #: 既に絶対日付が併記されている表現 (「来週の金曜日 (2026-09-18)」) を二重に

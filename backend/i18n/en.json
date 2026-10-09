@@ -149,12 +149,6 @@
     "help_pin": "Persistently pin text to semantic memory",
     "help_unpin": "Unpin a fact (use --force to override lock)",
     "help_pinned": "List pinned facts",
-    "private_usage": "Usage: /private on | off | status",
-    "private_enabled": "Private session ON (LTM/SemMem/history persistence will be skipped)",
-    "private_disabled": "Private session OFF",
-    "private_status_on": "Private session: ON",
-    "private_status_off": "Private session: OFF",
-    "help_private": "Toggle private session ON/OFF (memory_only — WM/STM only, volatile at exit)",
     "help_header": "Available commands",
     "help_file": "Add file to context (read and chunk)",
     "help_file_list": "List files in context",
@@ -410,7 +404,7 @@
     "export_invalid_category": "Invalid category: {categories}",
     "export_locked": "evoref is running, so the data cannot be exported. Stop it and run again ({detail})",
     "export_category_line": "  {category}: {files} file(s) / {records} record(s) ({size} MB)",
-    "export_private_excluded": "{count} private / secret record(s) were left out (--include-private includes them)",
+    "export_private_excluded": "{count} private / secret record(s) were left out",
     "export_redacted": "Masked {count} string(s) that look like secrets (API keys, tokens, e-mail addresses) (--no-mask keeps them)",
     "export_redaction_kept": "Kept {count} string(s) that look like secrets (API keys, tokens, e-mail addresses) unmasked (--no-mask)",
     "export_destination_inside": "Write the export outside the data root or under {outputs}: {path}",
@@ -692,8 +686,6 @@
     "fs": {
       "index_corrupted": "Vector index corrupted. Attempting recovery.",
       "metadata_corrupted": "Metadata file corrupted. Attempting recovery.",
-      "index_metadata_mismatch": "Index/metadata count mismatch. Attempting repair.",
-      "memory_corrupted": "Memory file corrupted. Resetting.",
       "disk_full": "Insufficient disk space. Please free up space."
     },
     "rag": {
@@ -703,13 +695,11 @@
     },
     "cartridge": {
       "invalid_zip": "Invalid cartridge file: {filename}",
-      "schema_mismatch": "Cartridge definition file is invalid.",
       "duplicate_id": "Cartridge with this ID already exists: {id}"
     },
     "long_form": {
       "generic": "An error occurred during long-form generation.",
       "insufficient_context": "Context size is insufficient for long-form generation. Minimum recommended: 2048 tokens.",
-      "plan_failed": "Failed to generate long-form plan. Try simplifying your instructions.",
       "unit_failed": "Failed to generate long-form unit."
     },
     "cli": {

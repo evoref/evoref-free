@@ -14,6 +14,9 @@ from backend.log_config import get_logger
 
 logger = get_logger("agent.event_reminder")
 
+#: コンテキスト使用率がこれを超えたら圧迫のリマインダを出す (PERCENT)。
+_CONTEXT_PRESSURE_PCT = 85
+
 
 @dataclass
 class ReminderEvent:
@@ -91,7 +94,7 @@ class EventDetector:
                 )
 
         # コンテキスト圧迫
-        if state.context_usage_pct > 85:
+        if state.context_usage_pct > _CONTEXT_PRESSURE_PCT:
             events.append(
                 ReminderEvent(
                     "context_pressure",

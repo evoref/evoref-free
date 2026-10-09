@@ -1,11 +1,15 @@
-import { writable } from 'svelte/store';
+import { derived, writable } from 'svelte/store';
 import { isPro } from '$lib/edition';
 import type {
 	AutoTuneInfo,
 	ComponentStatus,
 	DataHealthInfo,
 	DebugStatusInfo,
+	EmbedPlacementInfo,
+	LearningHealthInfo,
+	LivenessAlert,
 	MemoryStats,
+	RerankStatusInfo,
 	ServerName
 } from '$lib/free/api';
 import { getStatus } from '$lib/free/api';
@@ -43,6 +47,15 @@ let editionMismatchNotified = false;
 
 export const serverState = writable<ServerState>(initial);
 
+/** /api/status の診断項目 (ダッシュボードの状態カード用)。未取得・到達不能なら null */
+export interface SystemHealth {
+	liveness: LivenessAlert[];
+	rerank: RerankStatusInfo | null;
+	embedPlacement: EmbedPlacementInfo | null;
+	learningHealth: LearningHealthInfo | null;
+}
+export const systemHealth = writable<SystemHealth | null>(null);
+
 /** /api/status の auto_tune (環境調整の確認待ちバナー用)。未取得・到達不能なら null */
 export const autoTuneStatus = writable<AutoTuneInfo | null>(null);
 
@@ -51,6 +64,9 @@ export const autoTuneStatus = writable<AutoTuneInfo | null>(null);
  * ビルド時の isPro が Pro でもバックエンドが free なら Pro の導線を出さない。
  */
 export const backendEdition = writable<string | null>(null);
+
+/** Pro の導線を出してよいか (ビルドが Pro かつ backend が free でない) */
+export const proActive = derived(backendEdition, ($edition) => isPro && $edition !== 'free');
 
 /**
  * 現在 start/stop 操作中のサーバー名 (ModelServerControl のスピナー表示用)
@@ -79,6 +95,12 @@ export async function refreshServerStatus(): Promise<void> {
 		});
 		backendEdition.set(status.edition ?? null);
 		autoTuneStatus.set(status.auto_tune ?? null);
+		systemHealth.set({
+			liveness: status.liveness ?? [],
+			rerank: status.rerank ?? null,
+			embedPlacement: status.embed_placement ?? null,
+			learningHealth: status.learning_health ?? null
+		});
 		if (status.data_health?.readonly && !readonlyNotified) {
 			readonlyNotified = true;
 			addToast({ type: 'error', i18nKey: 'chat.data_readonly_toast', duration: 0 });
@@ -99,6 +121,7 @@ export async function refreshServerStatus(): Promise<void> {
 		}
 	} else {
 		autoTuneStatus.set(null);
+		systemHealth.set(null);
 		serverState.set({
 			backendOnline: false,
 			components: [],

@@ -115,6 +115,9 @@ DEFAULT_RATIOS: dict[str, dict[str, list[float | int]]] = {
     },
 }
 
+# 切り詰め時に文字数上限を縮める倍率 (token 上限に収まるまで繰り返す)
+_TRUNCATE_SHRINK_RATIO = 0.8
+
 # TokenBudget が持つスロット名（フィールド順）
 _SLOT_NAMES = [
     "system_prompt",
@@ -133,7 +136,7 @@ def truncate_head(text: str, token_limit: int) -> str:
     # estimate_tokens: CJK=1tok, ASCII=0.25tok → 平均的に1トークン≈2文字と仮定
     char_limit = max(token_limit * 2, 1)
     while char_limit > 0 and estimate_tokens(text[:char_limit]) > token_limit:
-        char_limit = int(char_limit * 0.8)
+        char_limit = int(char_limit * _TRUNCATE_SHRINK_RATIO)
     return text[:char_limit]
 
 
@@ -143,7 +146,7 @@ def truncate_tail(text: str, token_limit: int) -> str:
         return text
     char_limit = max(token_limit * 2, 1)
     while char_limit > 0 and estimate_tokens(text[-char_limit:]) > token_limit:
-        char_limit = int(char_limit * 0.8)
+        char_limit = int(char_limit * _TRUNCATE_SHRINK_RATIO)
     return text[-char_limit:]
 
 

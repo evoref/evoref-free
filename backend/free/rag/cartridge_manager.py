@@ -280,9 +280,6 @@ class CartridgeManager:
     def loaded_count(self) -> int:
         return len(self._corpus.loaded_ids)
 
-    def get_loaded_ids(self) -> list[str]:
-        return self._corpus.loaded_ids
-
     def get_tool_hints(self) -> list[dict]:
         return self._corpus.get_tool_hints()
 

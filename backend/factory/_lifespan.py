@@ -58,6 +58,9 @@ def _log_timings(label: str, timings: dict[str, float], total_ms: float) -> None
 #: (停止を無期限に待たせない。停止は kill 前提、c_05 §0.4)。
 _SLEEP_QUIESCE_TIMEOUT_SEC = 8.0
 
+#: チャット書き手スレッドの停止を待つ上限 (秒)。
+_CHAT_WRITER_STOP_TIMEOUT_SEC = 20.0
+
 
 async def _shutdown_sleep_quiesce(sleep_scheduler: "SleepTimeScheduler | None") -> None:
     """走っている sleep-time サイクル (ワーカースレッドを含む) の終わりを待つ。
@@ -226,7 +229,7 @@ def _shutdown_chat_writer() -> None:
 
     writer = default_writer()
     try:
-        if not writer.stop(timeout=20.0):
+        if not writer.stop(timeout=_CHAT_WRITER_STOP_TIMEOUT_SEC):
             logger.warning("Chat writer did not finish on shutdown")
     except Exception as e:
         logger.warning("Chat writer stop failed: %s", e)

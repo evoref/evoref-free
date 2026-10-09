@@ -57,19 +57,13 @@ E0000 = "E0000"  # 分類できない例外（チャットのエラー分類の�
 # ファイルシステム (E3xxx)
 E3001 = "E3001"  # ベクトルインデックス破損 (index_q8.npy / scales.npy)
 E3002 = "E3002"  # metadata.json 破損
-E3003 = "E3003"  # インデックス/メタデータ不整合
-E3004 = "E3004"  # メモリファイル破損
 E3005 = "E3005"  # ディスク容量不足
 E3006 = "E3006"  # パス不存在
 
 # RAG / メモリ (E4xxx)
-E4001 = "E4001"  # 空インデックス検索
 E4002 = "E4002"  # チャンク分割失敗
 E4003 = "E4003"  # 不正 ZIP
-E4004 = "E4004"  # スキーマ不一致
 E4005 = "E4005"  # ID 重複
-E4006 = "E4006"  # 検索結果なし
-E4007 = "E4007"  # STM ノート整合性エラー
 E4011 = "E4011"  # ベクトル次元不一致（実行時）
 
 # CLI (E6xxx)
@@ -132,8 +126,6 @@ def handle_fs_error(code: str, **context) -> JSONResponse:
     mapping = {
         E3001: (500, "error.fs.index_corrupted", "Vector index corrupted: {path}"),
         E3002: (500, "error.fs.metadata_corrupted", "Metadata file corrupted: {path}"),
-        E3003: (500, "error.fs.index_metadata_mismatch", "Index/metadata mismatch: index={idx_count}, metadata={meta_count}"),
-        E3004: (500, "error.fs.memory_corrupted", "Memory file corrupted: {path}"),
         E3005: (500, "error.fs.disk_full", "Disk space insufficient: {path}"),
     }
     return _lookup_mapping(mapping, code, "fs", **context)
@@ -144,7 +136,6 @@ def handle_rag_error(code: str, **context) -> JSONResponse:
     mapping = {
         E4002: (400, "error.rag.chunk_failed", "Failed to chunk file: {filename}"),
         E4003: (400, "error.cartridge.invalid_zip", "Invalid cartridge ZIP file: {filename}"),
-        E4004: (422, "error.cartridge.schema_mismatch", "Cartridge schema validation failed: {detail}"),
         E4005: (409, "error.cartridge.duplicate_id", "Cartridge ID already exists: {id}"),
     }
     return _lookup_mapping(mapping, code, "rag", **context)

@@ -14,7 +14,7 @@ from backend.free.cli.renderer import render_error
 logger = get_logger("cli.command_parser")
 
 # 非同期コマンド（handle_command ではなく handle_async_command で処理）
-ASYNC_COMMANDS = {"/history", "/learn", "/page", "/status", "/cartridge", "/migrate-model", "/web", "/theme", "/reindex", "/pin", "/unpin", "/pinned", "/private"}
+ASYNC_COMMANDS = {"/history", "/learn", "/page", "/status", "/cartridge", "/migrate-model", "/web", "/theme", "/reindex", "/pin", "/unpin", "/pinned"}
 
 
 @dataclass
@@ -38,9 +38,6 @@ class SessionState:
     ttft_history: list[float] = field(default_factory=list)
     response_times: list[float] = field(default_factory=list)
     error_count: int = 0
-    # プライベートセッション (memory_only)
-    # ``True`` の間、チャットリクエストに ``private: true`` を付与する。
-    private_mode: bool = False
     # `default_cli_mode()` でエディション既定が解決される。Pro=create / Free=chat。
     # `_build_chat_payload` / `_register_session` / `_save_session` 等で参照する。
     mode: str = field(default_factory=lambda: _resolve_default_mode())
@@ -153,7 +150,6 @@ async def handle_async_command(
         _cmd_page,
         _cmd_pin,
         _cmd_pinned,
-        _cmd_private,
         _cmd_reindex,
         _cmd_status,
         _cmd_theme,
@@ -162,8 +158,6 @@ async def handle_async_command(
     )
 
     console.print()
-    if cmd == "/private":
-        return await _cmd_private(args, state, console)
     if cmd == "/pin":
         return await _cmd_pin(args, state, console)
     if cmd == "/unpin":

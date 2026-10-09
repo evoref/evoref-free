@@ -25,7 +25,7 @@ import asyncio
 import re
 import time
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -305,8 +305,3 @@ def bind_debug_logger(debug_logger: Any) -> None:
 def answer_conditions_verdict(text: str, outcome: ExtractionOutcome) -> Verdict:
     """判定点として評価して記録する (ターンに 1 回)。"""
     return predicate.evaluate(text or "", {"outcome": outcome})
-
-
-def note_spans(verdict: Verdict, outcome: ExtractionOutcome) -> Sequence[str]:
-    """注記に載せる span (発火したときだけ)。"""
-    return outcome.spans if verdict.fired else ()

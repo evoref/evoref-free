@@ -92,6 +92,7 @@ from backend.free.core.query_anchors import (
     has_anchor,
     query_anchors,
 )
+from backend.constants import SECONDS_PER_DAY
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens, parse_utc
 from backend.free.core.script_ranges import (
@@ -624,9 +625,6 @@ class InjectionPlan:
                 seen.add(tagged)
                 out.append(tagged)
         return out
-
-    def by_tier(self, tier: int) -> list[InjectedItem]:
-        return [it for it in self.items if it.tier == tier]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2178,7 +2176,7 @@ class MemoryInjector:
     def _recency_term(self, accessed_at: float) -> float:
         if accessed_at <= 0:
             return 0.0
-        age_days = max(0.0, (self._now_provider() - accessed_at) / 86400.0)
+        age_days = max(0.0, (self._now_provider() - accessed_at) / SECONDS_PER_DAY)
         # 半減期に基づく指数減衰 (0..1)
         return math.exp(-age_days * math.log(2) / _RECENCY_HALF_LIFE_DAYS)
 
@@ -2363,7 +2361,7 @@ class MemoryInjector:
         created_at = float(getattr(fact, "created_at", 0.0) or 0.0)
         if created_at <= 0:
             return None
-        return max(0.0, (self._now_provider() - created_at) / 86400.0)
+        return max(0.0, (self._now_provider() - created_at) / SECONDS_PER_DAY)
 
     @staticmethod
     def _supersedes(candidate: SemanticFact, current: SemanticFact) -> bool:

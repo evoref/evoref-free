@@ -368,6 +368,10 @@ def truncate_repetition(content: str, min_repeat: int = 4) -> str:
 #: ストリーム生成中の退化検査の間隔 (チャンク数) と、検査を始める最小文字数。
 STREAM_DEGENERATION_CHECK_EVERY = 256
 STREAM_DEGENERATION_MIN_CHARS = 1500
+#: 反復除去後の長さがこの比率を下回ったら退化 (繰り返し) とみなす。
+_DEGENERATION_KEEP_RATIO = 0.6
+#: 長いファイルを縮めるとき、そのまま残す先頭の行数。
+_SKELETON_HEAD_LINES = 25
 
 
 def stream_has_degenerated(text: str) -> bool:
@@ -379,7 +383,7 @@ def stream_has_degenerated(text: str) -> bool:
     """
     if len(text) < STREAM_DEGENERATION_MIN_CHARS:
         return False
-    return len(truncate_repetition(text)) < len(text) * 0.6
+    return len(truncate_repetition(text)) < len(text) * _DEGENERATION_KEEP_RATIO
 
 
 def _truncate_block_repetition(
@@ -501,15 +505,15 @@ def summarize_file_content(content: str, max_lines: int = 40) -> str:
     lines = content.split("\n")
     if len(lines) <= max_lines:
         return content
-    head = "\n".join(lines[:25])
+    head = "\n".join(lines[:_SKELETON_HEAD_LINES])
     skeleton = [
-        line for line in lines[25:]
+        line for line in lines[_SKELETON_HEAD_LINES:]
         if re.match(r"\s*(def |class |import |from |#\s)", line)
     ]
     skeleton_text = "\n".join(skeleton) if skeleton else ""
     return (
         f"{head}\n"
-        f"... ({len(lines) - 25} more lines) ...\n"
+        f"... ({len(lines) - _SKELETON_HEAD_LINES} more lines) ...\n"
         f"{skeleton_text}"
     )
 

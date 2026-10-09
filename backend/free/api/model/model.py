@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from backend.constants import DEFAULT_LLAMA_PORT
 from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.free.api.model._model_helpers import (
     build_model_detail_response,
@@ -746,7 +747,7 @@ async def reload_model(state: AppState = Depends(get_app_state)):
     cfg = get_config()
     llama_cfg = cfg.get("llama", {})
     llama_host = llama_cfg.get("host", "127.0.0.1")
-    llama_port = llama_cfg.get("port", 8080)
+    llama_port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
     llama_url = f"http://{llama_host}:{llama_port}"
 
     try:

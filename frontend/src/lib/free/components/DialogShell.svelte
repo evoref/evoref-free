@@ -53,7 +53,7 @@
 		}
 		if (e.key === 'Tab' && dialogEl) {
 			const focusable = dialogEl.querySelectorAll<HTMLElement>(
-				'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+				'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
 			);
 			if (focusable.length === 0) return;
 			const first = focusable[0];
@@ -112,8 +112,8 @@
 		border: 1px solid var(--border);
 		border-radius: calc(var(--border-radius) * 2);
 		padding: 24px;
-		min-width: var(--dialog-min-width);
-		max-width: var(--dialog-max-width);
+		min-width: min(var(--dialog-min-width), calc(100vw - 32px));
+		max-width: min(var(--dialog-max-width), calc(100vw - 32px));
 		max-height: 85vh;
 		overflow-y: auto;
 		box-shadow: 0 8px 32px var(--shadow-dialog);

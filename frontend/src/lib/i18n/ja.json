@@ -148,6 +148,19 @@
 		"placement_cpu": "CPU"
 	},
 	"dashboard": {
+		"health": {
+			"title": "システム状態",
+			"ok": "正常",
+			"data": "データ",
+			"data_readonly": "読み取り専用",
+			"data_warnings": "警告 {count} 件",
+			"liveness": "効果の死活監視",
+			"liveness_alerts": "警告 {count} 件",
+			"rerank": "リランカー",
+			"rerank_on": "有効",
+			"embed_placement": "埋め込みの配置",
+			"learning_verdict": "学習の判定"
+		},
 		"learning_status": "学習状態",
 		"lora_versions": "LoRAバージョン",
 		"rollback": "ロールバック",
@@ -257,6 +270,7 @@
 		"apply": "適用",
 		"applying": "適用中...",
 		"applied": "設定を適用しました",
+		"applied_restart_required": "設定を保存しました。反映にはバックエンドの再起動が必要です",
 		"apply_failed": "設定の適用に失敗しました",
 		"reset": "リセット",
 		"unsaved_changes": "未保存の変更があります",
@@ -347,6 +361,11 @@
 		"group_theme": "テーマ",
 		"group_i18n": "言語設定",
 		"group_rag": "RAG検索",
+		"group_rerank": "リランカー",
+		"group_memory_injection": "記憶の注入予算",
+		"group_memory_retention": "記憶の保持方針",
+		"group_memory_pins": "ピン留めされた記憶",
+		"group_schedule": "スケジュール",
 		"group_working_memory": "ワーキングメモリ",
 		"group_short_term": "短期メモリ",
 		"group_conflict": "競合解決",
@@ -374,7 +393,6 @@
 		"group_local_paths": "ローカルパス",
 		"group_history": "チャット履歴",
 		"group_tools": "ツール",
-		"group_external_api": "外部API",
 		"group_widget_proxy": "ウィジェットプロキシ",
 		"group_llama_server": "サーバー接続",
 		"group_llama_performance": "パフォーマンス",
@@ -395,7 +413,11 @@
 			"host": "ホスト",
 			"port": "ポート",
 			"frontend_port": "フロントエンドポート",
-			"timeout": "タイムアウト (秒)"
+			"timeout": "タイムアウト (秒)",
+			"host_remote_without_allow": "外部から届く host ですが allow_remote が false です。LAN から使うには config.yaml の server.allow_remote を true にしてください (トークン必須になります)",
+			"allow_remote_without_remote_host": "allow_remote が true ですが host はこの PC 専用です。LAN から使うには host も変更してください",
+			"allow_remote_on": "allow_remote: 有効 (トークン必須)。この値は config.yaml でのみ変更できます",
+			"allow_remote_off": "allow_remote: 無効。この値は config.yaml でのみ変更できます"
 		},
 		"i18n": {
 			"locale": "表示言語",
@@ -415,7 +437,9 @@
 			"sequential": "連続",
 			"semantic": "セマンティック",
 			"fixed": "固定",
-			"none": "なし"
+			"none": "なし",
+			"on": "オン",
+			"off": "オフ"
 		},
 		"llama": {
 			"host": "ホスト",
@@ -449,17 +473,18 @@
 			"semantic_max_chunk": "セマンティック最大チャンク",
 			"top_k": "Top K",
 			"embedding_dim": "埋め込み次元数",
-			"contextual_retrieval": "コンテキスト検索",
-			"contextual_prefix_max_tokens": "コンテキストプレフィックス最大トークン",
-			"contextual_max_doc_chars": "コンテキストドキュメント最大文字数",
-			"contextual_batch_size": "コンテキストバッチサイズ",
 			"quantization": "量子化",
 			"rescore_candidates": "リスコア候補数",
 			"memmap_threshold": "memmap 閾値",
 			"relevance_threshold": "関連性閾値",
 			"support_threshold": "支持度閾値",
 			"confidence_threshold": "信頼度閾値",
-			"hysteresis_band": "ヒステリシスバンド"
+			"hysteresis_band": "ヒステリシスバンド",
+			"rerank_mode": "リランカーのモード",
+			"rerank_note": "ポートや GPU 配置などの詳細は config.yaml で設定します。モデル (model_paths.rerank_model) が無いと、オンでも起動しません",
+			"rerank_status_unknown": "状態: 未取得",
+			"rerank_status_enabled": "状態: 有効 (検索候補を並べ替えています)",
+			"rerank_status_disabled": "状態: 無効 (理由: {reason})"
 		},
 		"reindex": {
 			"preview": "再構築（プレビュー）",
@@ -509,7 +534,38 @@
 			"note_evolution_enabled": "ノート進化",
 			"note_evolution_batch": "進化バッチ",
 			"note_evolution_context_k": "コンテキスト K",
-			"llm_call_base_interval": "LLM呼出し基本間隔 (秒)"
+			"llm_call_base_interval": "LLM呼出し基本間隔 (秒)",
+			"injection_chat_budget_tokens": "チャットの注入予算 (トークン)",
+			"injection_create_budget_tokens": "クリエイトの注入予算 (トークン)",
+			"retention_note": "超過分は古い順 (ピン留めを除く) に整理されます。再起動後に反映されます",
+			"retention_short_days": "短期ノートの保持日数",
+			"retention_long_max_records": "長期ノートの上限件数",
+			"retention_idx_max_records": "索引の上限件数",
+			"retention_events_keep_months": "事象ファイルの保持月数",
+			"retention_snapshots_keep": "スナップショットの保持版数",
+			"pins": {
+				"note": "ピン留めした記憶は保持方針による整理の対象外になります。操作は即時に反映されます (適用ボタンは不要)",
+				"loading": "読み込み中…",
+				"load_failed": "ピン留めの一覧を取得できませんでした",
+				"empty": "ピン留めされた記憶はありません",
+				"locked": "ロック中",
+				"unpin": "解除",
+				"force_confirm": "このピンはロック中です。それでも解除しますか？",
+				"removed": "ピン留めを解除しました",
+				"remove_failed": "ピン留めを解除できませんでした",
+				"add_placeholder": "覚えておいてほしいこと",
+				"add": "ピン留め",
+				"added": "ピン留めしました",
+				"add_failed": "ピン留めできませんでした"
+			}
+		},
+		"pro": {
+			"knowledge_enabled": "知識の自動取得 (know.*)",
+			"knowledge_enabled_desc": "登録した取得元を、アイドル時間の sleep-time で巡回して知識を取り込みます。取得元が無ければ何もしません"
+		},
+		"schedule": {
+			"local_tz": "タイムゾーン",
+			"local_tz_desc": "夜間実行など、学習の時刻判定に使う IANA 名 (例: Asia/Tokyo, UTC)"
 		},
 		"learning": {
 			"level1_min_experiences": "Level 1 最小経験数",
@@ -555,7 +611,8 @@
 			"rag_top_k_per_unit": "ユニットごとのRAG Top-K"
 		},
 		"local_paths": {
-			"outputs_dir": "生成物の既定の書込み先 (データ根からの相対)"
+			"outputs_dir": "生成物の既定の書込み先 (データ根からの相対)",
+			"outputs_dir_desc": "この画面では変更できません。config.yaml の local_paths.outputs_dir で変更してください。"
 		},
 		"history": {
 			"auto_save": "自動保存",
@@ -567,14 +624,6 @@
 		"tools": {
 			"fetch_url_enabled": "URL取得",
 			"fetch_url_timeout": "URLタイムアウト (秒)"
-		},
-		"external_api": {
-			"enabled": "有効",
-			"provider": "プロバイダー",
-			"api_key": "APIキー",
-			"model": "モデル",
-			"max_tokens": "最大トークン数",
-			"timeout": "タイムアウト (秒)"
 		},
 		"widget_proxy": {
 			"enabled": "有効",
@@ -707,6 +756,22 @@
 		"list_empty": "カートリッジがインストールされていません",
 		"load_failed": "カートリッジの読込みに失敗しました",
 		"unload_failed": "カートリッジの取外しに失敗しました",
+		"project_map": {
+			"title": "ProjectMap",
+			"disabled": "無効 (rag.project_map.enabled=false)",
+			"no_version": "未作成",
+			"nodes": "ノード",
+			"edges": "エッジ",
+			"updated_at": "最終更新",
+			"update": "更新",
+			"updating": "更新中...",
+			"update_done": "ProjectMap を更新しました ({count} root)",
+			"update_failed": "ProjectMap の更新に失敗しました",
+			"load_failed": "ProjectMap の状態を取得できませんでした",
+			"languages": "言語"
+		},
+		"lora_impact_stale": "LoRA が古くなりました。優先学習を待つか、LoRA のバージョンを確認してください",
+		"lora_impact_rolled_back": "LoRA を v{version} に自動で戻しました",
 		"delete_failed": "カートリッジの削除に失敗しました",
 		"detail_title": "カートリッジ詳細",
 		"detail_failed": "カートリッジ詳細の取得に失敗しました",
@@ -831,7 +896,20 @@
 		"first_message": "（先頭メッセージ）",
 		"copy_turn": "コピー",
 		"copied": "コピーしました",
-		"copy_failed": "コピーに失敗しました"
+		"copy_failed": "コピーに失敗しました",
+		"date_from": "開始日",
+		"date_to": "終了日",
+		"stats_summary": "{sessions} 件 / {turns} ターン / {size} MB (上限 {max} MB)",
+		"compact": "圧縮",
+		"compact_confirm_title": "履歴を圧縮しますか？",
+		"compact_confirm_message": "保持ポリシーに従い、古い会話を圧縮・要約化し、期限を過ぎたものを削除します。削除した会話は元に戻せません。",
+		"compact_done": "圧縮 {compressed} 件・要約化 {summarized} 件・削除 {deleted} 件 ({freed} MB 解放)",
+		"compact_failed": "履歴の圧縮に失敗しました",
+		"bulk_delete": "表示中の {count} 件を削除",
+		"bulk_delete_confirm_title": "履歴をまとめて削除しますか？",
+		"bulk_delete_confirm_message": "現在の絞り込みに合う {count} 件の会話をすべて削除します。この操作は元に戻せません。",
+		"bulk_deleted": "{count} 件の履歴を削除しました",
+		"bulk_delete_failed": "履歴の一括削除に失敗しました"
 	},
 	"api": {
 		"auto_tune_restamp_refused": "この PC の結果として残せませんでした。ホスト名以外 (CPU・メモリ・GPU 等) が変わっているときは「変更なし」は選べません。「実行する」で測り直してください。",
