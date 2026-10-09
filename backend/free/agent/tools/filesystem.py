@@ -27,7 +27,12 @@ from backend.io.text_file import (
     decode_text_for_display,
     read_text_for_edit,
 )
-from backend.io.user_file import UnencodableTextError, roll_back_user_write, write_user_text
+from backend.io.user_file import (
+    UnencodableTextError,
+    overwrite_risks,
+    roll_back_user_write,
+    write_user_text,
+)
 
 logger = get_logger("agent.tools.builtin")
 
@@ -513,8 +518,17 @@ def write_file(file_path: str, content: str) -> str:
             p, content, like=existing if isinstance(existing, TextFile) else None,
         )
         # 報告は書いたバイト数 (文字数ではない、2026-07-26)。形式は変えない —
-        # output_format.WRITTEN_PATH_RE と CLI の chat_loop が読む。
-        return f"Written {result.bytes_written} bytes to {file_path}"
+        # output_format.WRITTEN_PATH_RE と CLI の chat_loop が読む。警告は別行に足す。
+        warning = ""
+        if isinstance(existing, TextFile) and result.backup is not None:
+            risks = overwrite_risks(existing.text, content, p.suffix)
+            if risks:
+                warning = (
+                    f"\nWarning: {'; '.join(risks)}. The previous version was saved to "
+                    f"{result.backup}; to restore it run: "
+                    f'evoref backups restore "{result.backup}" --to "{file_path}"'
+                )
+        return f"Written {result.bytes_written} bytes to {file_path}{warning}"
     except UnencodableTextError as e:
         return f"Error: edit refused (unencodable): {file_path} ({e.chars})"
     except Exception as e:

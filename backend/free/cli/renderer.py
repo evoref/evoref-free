@@ -516,6 +516,8 @@ def render_help(console: Console) -> None:
         ("/pin <text>", msg("cli.help_pin")),
         ("/unpin <id> [--force]", msg("cli.help_unpin")),
         ("/pinned", msg("cli.help_pinned")),
+        ("/memory [stats|notes [N]]", msg("cli.help_memory")),
+        ("/rag", msg("cli.help_rag")),
         ("/exit", msg("cli.help_exit")),
     ]
 

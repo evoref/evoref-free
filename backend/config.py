@@ -539,6 +539,13 @@ def load_config(path: str | Path | None = None, project_root: Path | None = None
     if project_root is None:
         project_root = Path(__file__).parent.parent
 
+    _config = read_config_file(path, project_root)
+    _path_resolver = PathResolver(_config, project_root)
+    return _config
+
+
+def read_config_file(path: str | Path | None, project_root: Path) -> dict:
+    """``load_config`` と同じ規則で読み込み・検証した設定を返す (グローバルは触らない)。"""
     if path is None:
         path = project_root / "config.yaml"
 
@@ -567,13 +574,10 @@ def load_config(path: str | Path | None = None, project_root: Path | None = None
     from backend.schemas import validate_config
 
     try:
-        _config = validate_config(_config)
+        return validate_config(_config)
     except ValidationError as e:
         logger.error("Config validation failed:\n%s", e)
         raise
-
-    _path_resolver = PathResolver(_config, project_root)
-    return _config
 
 
 def get_config() -> dict:
@@ -630,19 +634,22 @@ def get_project_root() -> Path:
     return Path(__file__).parent.parent
 
 
-def save_config_section(section: str, data: dict) -> dict:
+def save_config_section(
+    section: str, data: dict, *, project_root: Path | None = None, reload: bool = True,
+) -> dict:
     """設定セクションを保存してリロード
 
     1. config.yaml を読み込み
     2. config.yaml.bak にバックアップ
     3. 対象セクションを更新
     4. バリデーション
-    5. 書き込み + リロード
+    5. 書き込み + リロード (``reload=False`` ならグローバル設定は触らない)
     """
     from backend.io.readonly import guard_write
     from backend.schemas import validate_config
 
-    project_root = get_project_root()
+    if project_root is None:
+        project_root = get_project_root()
     config_path = project_root / "config.yaml"
     # 設定は store/ の外 (インストール根) だが、readonly の間は設定 API も止める
     # (c_05 §0.4.2)。API では 423 / E0423 になる。
@@ -688,7 +695,8 @@ def save_config_section(section: str, data: dict) -> dict:
     logger.info("Config section '%s' saved to %s", section, config_path)
 
     # グローバル設定をリロード
-    load_config(config_path, project_root)
+    if reload:
+        load_config(config_path, project_root)
 
     return validated
 

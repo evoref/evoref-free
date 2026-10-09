@@ -275,7 +275,7 @@ def _make_serve_cleanup(
     """serve 用 cleanup クロージャを生成（signal ハンドラから呼ばれる）。"""
 
     def cleanup(signum=None, frame=None):  # noqa: ARG001
-        render_info(console, "Shutting down...")
+        render_info(console, msg("cli.svc_shutting_down"))
         for p in procs:
             _kill_process_tree(p.pid)
         for p in procs:
@@ -289,7 +289,7 @@ def _make_serve_cleanup(
             except OSError:
                 pass
         release_pid(project_root)
-        render_info(console, "All processes stopped")
+        render_info(console, msg("cli.svc_all_stopped"))
 
     return cleanup
 
@@ -302,7 +302,7 @@ def _spawn_llama_base(
     console,
 ) -> tuple[str, int] | None:
     """ベース llama-server を起動。失敗時 ``None`` を返し PID を解放する。"""
-    render_info(console, "Starting llama-server...")
+    render_info(console, msg("cli.svc_starting_llama"))
     try:
         llama_cmd = _build_llama_cmd(project_root, config)
         stderr_f = _open_stderr_log(project_root, "llama-base")
@@ -314,7 +314,7 @@ def _spawn_llama_base(
         )
         procs.append(llama_proc)
     except (FileNotFoundError, ValueError) as e:
-        render_error(console, f"Failed to start llama-server: {e}")
+        render_error(console, msg("cli.svc_llama_start_failed", reason=e))
         release_pid(project_root)
         return None
     llama_cfg = config.get("llama", {})
@@ -344,7 +344,7 @@ def _spawn_and_wait_llama(
     )
     all_servers.update(extra_servers)
 
-    render_info(console, f"Waiting for {len(all_servers)} server(s)...")
+    render_info(console, msg("cli.svc_waiting_servers", count=len(all_servers)))
     if not _wait_for_health_all(
         all_servers, procs, console, project_root, timeout=_serve_health_wait(config, project_root),
     ):
@@ -403,7 +403,7 @@ def _start_rerank_process(
         return None
     logger.info("Starting rerank server (self-test runs only when the PC changed)")
     if console is not None:
-        render_info(console, "Starting rerank server (self-test runs only when the PC changed)...")
+        render_info(console, msg("cli.svc_starting_rerank"))
     stderr_f = _open_stderr_log(project_root, "llama-rerank")
     stderr_files.append(stderr_f)
     launched = start_rerank_server(
@@ -413,7 +413,7 @@ def _start_rerank_process(
     if launched.proc is None:
         logger.warning("rerank disabled: %s", launched.message)
         if console is not None:
-            render_info(console, f"rerank disabled: {launched.message}")
+            render_info(console, msg("cli.svc_rerank_disabled", message=launched.message))
         return None
     return launched.proc, (RERANK_HOST, rerank_port(config))
 
@@ -443,7 +443,7 @@ def _spawn_backend(
 ) -> int | None:
     """FastAPI バックエンドを起動。成功時はバインドポート、失敗時 ``None``。"""
     backend_port = config.get("server", {}).get("port", args.port)
-    render_info(console, f"Starting FastAPI backend on :{backend_port}...")
+    render_info(console, msg("cli.svc_starting_backend", port=backend_port))
     backend_env = _build_backend_env(args)
     try:
         backend_proc = subprocess.Popen(
@@ -454,7 +454,7 @@ def _spawn_backend(
         )
         procs.append(backend_proc)
     except FileNotFoundError as e:
-        render_error(console, f"Failed to start backend: {e}")
+        render_error(console, msg("cli.svc_backend_start_failed", reason=e))
         return None
     return backend_port
 
@@ -467,13 +467,13 @@ def _print_serve_running_banner(
 ) -> None:
     """`serve` 起動完了バナーを表示する。"""
     render_info(console, "")
-    render_info(console, "=== evoref is running ===")
+    render_info(console, msg("cli.svc_running_banner"))
     render_info(console, f"  API:   http://localhost:{backend_port}")
     if not no_llama:
         for name, (host, port) in all_servers.items():
             render_info(console, f"  {name}: http://{host}:{port}")
     render_info(console, "")
-    render_info(console, "Press Ctrl+C to stop all services")
+    render_info(console, msg("cli.svc_press_ctrl_c"))
 
 
 def _monitor_serve_processes(
@@ -493,7 +493,7 @@ def _monitor_serve_processes(
             for p in list(procs):
                 ret = p.poll()
                 if ret is not None and p in optional:
-                    render_error(console, f"rerank server exited (code={ret}); continuing without it")
+                    render_error(console, msg("cli.svc_rerank_exited", code=ret))
                     optional.remove(p)
                     procs.remove(p)
                     continue
@@ -611,7 +611,7 @@ def _show_stderr_tail(console, project_root: Path, name: str, lines: int = 10) -
         content = log_file.read_text(encoding="utf-8", errors="replace")
         tail = content.strip().splitlines()[-lines:]
         if tail:
-            render_info(console, f"── {name} stderr (last {len(tail)} lines) ──")
+            render_info(console, msg("cli.svc_stderr_header", name=name, count=len(tail)))
             for line in tail:
                 console.print(f"  {line}")
     except OSError:
@@ -743,15 +743,15 @@ def _spawn_extra_servers(
     servers: dict[str, tuple[str, int]] = {}
     host, port = _embed_endpoint(config)
     try:
-        render_info(console, f"Starting embed server on :{port}...")
+        render_info(console, msg("cli.svc_starting_embed", port=port))
         launched = _start_embed(project_root, config, stderr_files, wait_base_sec=_base_wait_sec(config, project_root))
     except (FileNotFoundError, ValueError, OSError) as e:
-        render_error(console, f"Failed to start embed server: {e}")
+        render_error(console, msg("cli.svc_embed_start_failed", reason=e))
         return servers
     if launched is None or launched.proc is None:
         return servers
     if launched.fell_back:
-        render_info(console, "embed server restarted on CPU after the GPU start failed")
+        render_info(console, msg("cli.svc_embed_cpu_restart"))
     procs.append(launched.proc)
     servers["embed"] = (host, port)
     return servers
@@ -807,7 +807,7 @@ def _wait_for_health_all(
                 resp = httpx.get(f"http://{host}:{port}/health", timeout=2.0)
                 if resp.status_code == 200:
                     pending.discard(name)
-                    render_info(console, f"{name} server is ready")
+                    render_info(console, msg("cli.svc_server_ready", name=name))
             except (httpx.ConnectError, httpx.TimeoutException):
                 pass
 
@@ -825,7 +825,7 @@ def _wait_for_health_all(
             )
             _show_stderr_tail(console, project_root, "llama-base")
             return False
-        render_error(console, f"{name} server health check timed out")
+        render_error(console, msg("cli.svc_health_timeout", name=name))
 
     return True
 

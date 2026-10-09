@@ -30,7 +30,8 @@ snapshot には残るので監査で追え、物理削除は snapshot 3 版後�
 ``--id`` — ファクト id の直接指定。
 複数回指定できる。
 
-既定は **dry-run**。実際に取り下げるには ``--apply`` を付ける。
+既定は **dry-run**。実際に取り下げるには ``--apply`` を付ける (単一書き手ロックを取るので
+serve の稼働中は拒否する。ID 指定だけなら ``evoref forget --id`` が兄弟・旧値・根拠ノートも見せる)。
 
 ログは英語固定 (リポジトリ規約)。
 """
@@ -221,13 +222,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[purge] {exc}", file=sys.stderr)
         return 1
 
-    n = purge(
-        memory_dir,
-        needle=args.contains,
-        subject=args.subject,
-        fact_ids=set(args.fact_ids),
-        apply=args.apply,
-    )
+    lock = None
+    if args.apply:
+        # serve の稼働中に事象ログへ書かない (単一書き手ロック、c_05 §0.5.8)
+        from backend.io.writer_lock import WriterLockHeld, acquire_writer_lock
+
+        try:
+            lock = acquire_writer_lock(memory_dir.parent)
+        except WriterLockHeld as exc:
+            print(f"[purge] evoref is running; stop it and retry ({exc})", file=sys.stderr)
+            return 1
+    try:
+        n = purge(
+            memory_dir,
+            needle=args.contains,
+            subject=args.subject,
+            fact_ids=set(args.fact_ids),
+            apply=args.apply,
+        )
+    finally:
+        if lock is not None:
+            lock.release()
     print(f"[purge] {'retracted' if args.apply else 'would retract'}: {n}")
     return 0
 

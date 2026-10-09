@@ -47,6 +47,12 @@ BACKUP_MAX_BYTES = 1 << 30
 #: 退避のファイル名に使う元の名前の上限 (長い名前は切り詰める)。
 _MAX_BACKUP_NAME = 80
 
+#: 上書きで行数がこの割合以下に縮んだら警告する (元がこの行数以上のときだけ。小さいファイルの書き直しは普通)。
+SHRINK_MAX_RATIO = 0.2
+SHRINK_MIN_OLD_LINES = 10
+#: 先頭行がヘッダ行の表形式。先頭行の変更は列の取り違えを意味しやすい。
+_HEADER_SUFFIXES = (".csv", ".tsv")
+
 _backup_sink: contextvars.ContextVar[list[tuple[Path, Path]] | None] = contextvars.ContextVar(
     "evoref_user_file_backups", default=None,
 )
@@ -125,6 +131,25 @@ def write_user_text(path: Path | str, text: str, *, like: TextFile | None) -> Us
         encoding, newline = like.encoding, like.newline
     size, backup = _write_bytes(target, data)
     return UserWriteResult(target, size, encoding, newline, backup)
+
+
+
+def overwrite_risks(old: str, new: str, suffix: str) -> list[str]:
+    """上書きで失われたものがありそうな理由 (人が読む英語、なければ空)。判定は行数と先頭行だけ。
+
+    書込みは止めない (前の版は退避済み)。結果に添えて、モデルと利用者がその場で気づけるようにする。
+    """
+    old_lines, new_lines = old.splitlines(), new.splitlines()
+    reasons: list[str] = []
+    if len(old_lines) >= SHRINK_MIN_OLD_LINES and len(new_lines) <= len(old_lines) * SHRINK_MAX_RATIO:
+        reasons.append(f"the file shrank from {len(old_lines)} to {len(new_lines)} lines")
+    if (
+        suffix.lower() in _HEADER_SUFFIXES
+        and len(old_lines) >= 2
+        and old_lines[0].strip() != (new_lines[0].strip() if new_lines else "")
+    ):
+        reasons.append("the first (header) line changed")
+    return reasons
 
 
 def write_user_bytes(path: Path | str, data: bytes) -> UserWriteResult:

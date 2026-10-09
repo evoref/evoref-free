@@ -568,10 +568,13 @@ async def _main_loop_sequential(state: SessionState, console) -> None:
         cmd, args = parse_command(text)
         if cmd:
             logger.debug("Command detected: %s, args=%r", cmd, args[:50] if args else "")
-            if is_async_command(cmd):
-                await handle_async_command(cmd, args, state, console)
-            else:
-                handle_command(cmd, args, state, console)
+            try:
+                if is_async_command(cmd):
+                    await handle_async_command(cmd, args, state, console)
+                else:
+                    handle_command(cmd, args, state, console)
+            except httpx.TimeoutException:
+                render_error(console, msg("cli.command_timeout"))
             if not state.should_exit:
                 render_separator(console)
             continue
