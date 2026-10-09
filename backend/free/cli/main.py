@@ -61,7 +61,13 @@ logger = get_logger("cli.main")
 # - "create": 対話モード (Pro はクリエイト、Free は警告 + chat フォールバック)
 _SUBCOMMANDS = {
     "serve", "chat", "create", "gui", "export", "import", "reindex", "projectmap", "theme",
-    "config", "reset", "doctor", "tune",
+    "config", "reset", "forget", "doctor", "backups", "tune", "lora", "rag", "knowledge", "model", "learn",
+}
+
+#: 値を 1 つ取るオプション。直後の語はサブコマンド判定から外す。
+_VALUE_OPTIONS = {
+    "-f", "--file", "--data-root", "--mode", "--backend-url", "--host", "--port",
+    "--frontend-port", "--develop", "--edition",
 }
 
 #: 旧サブコマンド名 → 現行名。``code`` はクリエイトモードへの改名に追随して
@@ -114,8 +120,8 @@ def _build_gui_arg_parser() -> argparse.ArgumentParser:
         help="Frontend host (default: localhost)",
     )
     parser.add_argument(
-        "--port", default=8000, type=int,
-        help="Backend port (default: 8000)",
+        "--port", default=None, type=int,
+        help="Backend port (default: config server.port, else 8000)",
     )
     parser.add_argument(
         "--frontend-port", default=None, type=int,
@@ -158,10 +164,13 @@ def _resolve_gui_ports(
         cfg = _load_config(project_root)
         if frontend_port is None:
             frontend_port = cfg.get("server", {}).get("frontend_port", 5173)
-        backend_port = cfg.get("server", {}).get("port", args.port)
+        if backend_port is None:
+            backend_port = cfg.get("server", {}).get("port", 8000)
     except (OSError, ValueError):
         if frontend_port is None:
             frontend_port = 5173
+    if backend_port is None:
+        backend_port = 8000
     return frontend_port, backend_port
 
 
@@ -434,13 +443,64 @@ def _get_subcommand_handler(name: str):
     if name == "reset":
         from backend.free.cli.reset_command import run_reset
         return run_reset
+    if name == "forget":
+        from backend.free.cli.forget_command import run_forget
+        return run_forget
     if name == "doctor":
         from backend.free.cli.doctor_command import run_doctor_command
         return run_doctor_command
+    if name == "backups":
+        from backend.free.cli.backups_command import run_backups
+        return run_backups
     if name == "tune":
         from backend.free.cli.tune_command import run_tune
         return run_tune
+    if name == "lora":
+        return _run_lora_subcmd
+    if name == "rag":
+        from backend.free.cli.rag_command import run_rag
+        return run_rag
+    if name == "knowledge":
+        return _run_knowledge_subcmd
+    if name == "model":
+        from backend.free.cli.model_commands import run_model
+        return run_model
+    if name == "learn":
+        return _run_learn_subcmd
     return None
+
+
+def _run_lora_subcmd(argv: list[str]) -> int:
+    """lora サブコマンド (Pro 専用)。Free には Pro モジュールが無いので案内して終える。"""
+    try:
+        from backend.pro.cli.lora_command import run_lora
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="lora"), file=sys.stderr)
+        return 1
+    return run_lora(argv)
+
+
+def _run_knowledge_subcmd(argv: list[str]) -> int:
+    """knowledge サブコマンド (Pro 専用)。Free には Pro モジュールが無いので案内して終える。"""
+    try:
+        from backend.pro.cli.knowledge_command import run_knowledge
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="knowledge"), file=sys.stderr)
+        return 1
+    return run_knowledge(argv)
+
+
+def _run_learn_subcmd(argv: list[str]) -> int:
+    """learn サブコマンド (Pro 専用)。Free には Pro モジュールが無いので案内して終える。"""
+    try:
+        from backend.pro.cli.learn_command import run_learn
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="learn"), file=sys.stderr)
+        return 1
+    return run_learn(argv)
 
 
 # ────────────────────────────────────────────
@@ -846,10 +906,11 @@ async def async_main(args: argparse.Namespace) -> int:
     # モデルをロードさせる)。同一モード / create_model 未設定なら no-op。
     await _sync_server_mode(state.backend_url, state.mode)
 
+    _load_context_files(state, console)
+
     if non_interactive:
         return await _run_non_interactive_chat(args, state, console, auto_serve_state)
 
-    _load_context_files(state, console)
     return await _run_interactive_loop(
         state, console, project_root, status_data, auto_serve_state,
     )
@@ -869,19 +930,32 @@ def main() -> None:
     argv = _canonicalize_subcommands(sys.argv[1:])
 
     # サブコマンドルーティング
-    for subcmd in _SUBCOMMANDS:
-        if subcmd in argv:
-            handler = _get_subcommand_handler(subcmd)
-            if handler is not None:
-                sub_argv = [a for a in argv if a != subcmd]
-                sys.exit(handler(sub_argv))
+    # 複数一致しても先頭の語を採る (set の反復順に依存させない)
+    # 語を除くのは最初の 1 つだけ (``config set instance.name config`` の値を消さない)。
+    # 値を取るオプションの直後の語 (``-f rag`` のファイル名など) はサブコマンドとみなさない。
+    for idx, subcmd in (
+        (i, a) for i, a in enumerate(argv)
+        if a in _SUBCOMMANDS and (i == 0 or argv[i - 1] not in _VALUE_OPTIONS)
+    ):
+        handler = _get_subcommand_handler(subcmd)
+        if handler is not None:
+            sub_argv = argv[:idx] + argv[idx + 1:]
+            sys.exit(handler(sub_argv))
+        break
 
-    # "chat" / "create" サブコマンド: 対話モードと同等（引数を除去するだけ）。
-    # 実モード解決は `--mode` + エディションデフォルト (`cli_mode.coerce_cli_mode`) に委譲する。
-    if "chat" in argv:
-        argv = [a for a in argv if a != "chat"]
-    if "create" in argv:
-        argv = [a for a in argv if a != "create"]
+    # "chat" / "create" サブコマンド: 語を除去し、``--mode`` として解決へ渡す
+    # (未指定なら Pro は create 既定になってしまうため、chat 指定を明示する)。
+    # Free の create は `cli_mode.coerce_cli_mode` が警告つきで chat へ落とす。
+    sub_idx = next(
+        (i for i, a in enumerate(argv)
+         if a in ("chat", "create") and (i == 0 or argv[i - 1] != "--mode")),
+        None,
+    )
+    if sub_idx is not None:
+        sub_mode = argv[sub_idx]
+        argv = argv[:sub_idx] + argv[sub_idx + 1:]
+        if not any(a == "--mode" or a.startswith("--mode=") for a in argv):
+            argv = ["--mode", sub_mode, *argv]
 
     parser = _build_interactive_parser()
     args = parser.parse_args(argv)

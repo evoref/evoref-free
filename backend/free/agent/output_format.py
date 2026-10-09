@@ -239,6 +239,40 @@ PRODUCTION_WROTE_RE = re.compile(
 )
 
 
+#: ``write_file`` が上書きで縮小・ヘッダ変更を検出したときに結果の 2 行目へ添える警告
+#: (``tools/filesystem.write_file`` が組む)。最終応答では生の英文を出さず、
+#: :func:`split_overwrite_warning` で分けて ``agent.overwrite_warning`` の文にする。
+_OVERWRITE_WARNING_RE = re.compile(
+    r"^Warning: (?P<reasons>.*?)\. The previous version was saved to .*?; to restore it run: "
+    r'evoref backups restore "(?P<backup>.+?)" --to "(?P<dest>.+?)"[ \t]*$',
+    re.MULTILINE,
+)
+_SHRANK_RE = re.compile(r"the file shrank from (\d+) to (\d+) lines")
+_HEADER_CHANGED = "the first (header) line changed"
+
+
+def split_overwrite_warning(text: str) -> tuple[str, dict | None]:
+    """書込み結果から上書きの警告行を分ける (純粋関数)。
+
+    Returns:
+        (警告行を除いた結果, 警告)。警告は ``{"shrank": (旧行数, 新行数) | None,
+        "header": bool, "backup": str, "dest": str}``、無ければ ``None``。
+    """
+    match = _OVERWRITE_WARNING_RE.search(text or "")
+    if match is None:
+        return text, None
+    reasons = match.group("reasons")
+    shrank = _SHRANK_RE.search(reasons)
+    warning = {
+        "shrank": (int(shrank.group(1)), int(shrank.group(2))) if shrank else None,
+        "header": _HEADER_CHANGED in reasons,
+        "backup": match.group("backup"),
+        "dest": match.group("dest"),
+    }
+    rest = (text[: match.start()] + text[match.end():]).rstrip("\n")
+    return rest, warning
+
+
 def written_paths(text: str) -> list[str]:
     """書込み結果テキストから書込み先パスを重複なく、現れた順に取り出す (純粋関数)。
 

@@ -134,13 +134,33 @@ class ThemeManager:
         """URL からテーマ ZIP をダウンロードしてインストール"""
         from backend.free.themes.theme_installer import install_from_url as _install_url
 
-        return await _install_url(url, self.themes_dir)
+        return self._drop_stale_trust(await _install_url(url, self.themes_dir))
 
     def install(self, zip_path: Path) -> ThemeInstallResult:
         """ZIP パッケージからテーマをインストール"""
         from backend.free.themes.theme_installer import install_theme
 
-        return install_theme(zip_path, self.themes_dir)
+        return self._drop_stale_trust(install_theme(zip_path, self.themes_dir))
+
+    def _drop_stale_trust(self, result: ThemeInstallResult) -> ThemeInstallResult:
+        """新しく入れたテーマに信頼を引き継がせない。
+
+        ディレクトリを手で消したテーマの ID は ``theme.trusted`` に残る。同じ ID の
+        別パッケージを入れるとその信頼をそのまま受け継ぎ、確認していない JS が
+        オリジン内で動く (docs/c_11 §1)。インストールは常に未信頼から始める。
+        """
+        theme_id = result["theme_id"]
+        if theme_id in self._trusted_ids:
+            self._trusted_ids.discard(theme_id)
+            try:
+                self._persist_trusted_list()
+            except Exception:
+                # 信頼を外せないまま残すと再起動で未確認の JS が信頼済みになる。入れたテーマごと戻す
+                shutil.rmtree(self.themes_dir / theme_id, ignore_errors=True)
+                self._trusted_ids.add(theme_id)
+                raise
+            logger.warning("Dropped stale trust for newly installed theme: id=%s", theme_id)
+        return result
 
     def activate(self, theme_id: str, color_mode: str | None = None) -> ThemeActivateResult:
         """テーマをアクティベート（設計書 §9.2 準拠）"""

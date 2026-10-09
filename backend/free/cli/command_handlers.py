@@ -179,7 +179,7 @@ def _cmd_save(args: str, state: SessionState, console) -> CommandResult:
     name = args.strip() or "default"
 
     if state.sessions_dir is None:
-        render_error(console, "Sessions directory not configured")
+        render_error(console, msg("cli.sessions_dir_not_configured"))
         return CommandResult()
 
     state.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -211,7 +211,7 @@ def _cmd_save(args: str, state: SessionState, console) -> CommandResult:
         session_file.load()  # 新しい版・G1 でないファイルは readonly (上書きしない)
     session_file.payload = _CLI_SESSION_CODEC.encode(session)
     if not session_file.save():
-        render_error(console, f"Failed to save session: {session_file.last_status or path}")
+        render_error(console, msg("cli.session_save_failed", reason=session_file.last_status or path))
         return CommandResult()
     logger.debug("/save: wrote %s (%d turns)", path, len(state.turns))
     state.manually_saved = True
@@ -232,24 +232,24 @@ def _cmd_load(args: str, state: SessionState, console) -> CommandResult:
 
     name = args.strip() or "default"
     if state.sessions_dir is None:
-        render_error(console, "Sessions directory not configured")
+        render_error(console, msg("cli.sessions_dir_not_configured"))
         return CommandResult()
 
     path = state.sessions_dir / f"{name}.json"
     if not path.exists():
         logger.debug("/load: file not found: %s", path)
-        render_error(console, f"Session not found: {name}")
+        render_error(console, msg("cli.session_not_found", name=name))
         return CommandResult()
 
     session_file = _session_file(path)
     if not session_file.load():
-        render_error(console, f"Failed to load session: {session_file.last_status}")
+        render_error(console, msg("cli.session_load_failed", reason=session_file.last_status))
         return CommandResult()
     try:
         session = _CLI_SESSION_CODEC.decode(session_file.payload)
     except CodecError as e:
         logger.debug("/load: unreadable session %s: %s", path, e)
-        render_error(console, f"Failed to load session: {e}")
+        render_error(console, msg("cli.session_load_failed", reason=e))
         return CommandResult()
     result = _apply_session_data(_CLI_SESSION_CODEC.encode(session), path, state, console)
     state.loaded_session = session
@@ -284,8 +284,13 @@ async def _cmd_history(args: str, state: SessionState, console) -> CommandResult
     rest = parts[1:] if len(parts) > 1 else []
     backend_url = state.backend_url
 
+    rest, date_from, date_to, bad_date = _pop_date_range(rest)
+    if bad_date is not None:
+        render_error(console, msg("cli.history_invalid_date", date=bad_date))
+        return CommandResult()
+
     if action == "" or action == "list":
-        # /history or /history list [-n N]
+        # /history or /history list [-n N] [--from D] [--to D]
         limit = 10
         if "-n" in rest:
             idx = rest.index("-n")
@@ -294,21 +299,21 @@ async def _cmd_history(args: str, state: SessionState, console) -> CommandResult
                     limit = int(rest[idx + 1])
                 except ValueError:
                     pass
-        _history_list(backend_url, console, limit=limit)
+        _history_list(backend_url, console, limit=limit, date_from=date_from, date_to=date_to)
         return CommandResult()
 
     if action == "search":
         query = " ".join(rest)
         if not query:
-            render_error(console, "Usage: /history search <query>")
+            render_error(console, msg("cli.usage_history_search"))
             return CommandResult()
-        _history_search(backend_url, console, query=query)
+        _history_search(backend_url, console, query=query, date_from=date_from, date_to=date_to)
         return CommandResult()
 
     if action == "show":
         session_id = rest[0] if rest else ""
         if not session_id:
-            render_error(console, "Usage: /history show <session_id>")
+            render_error(console, msg("cli.usage_history_show"))
             return CommandResult()
         _history_show(backend_url, console, session_id)
         return CommandResult()
@@ -324,7 +329,7 @@ async def _cmd_history(args: str, state: SessionState, console) -> CommandResult
     if action == "delete":
         session_id = rest[0] if rest else ""
         if not session_id:
-            render_error(console, "Usage: /history delete <session_id>")
+            render_error(console, msg("cli.usage_history_delete"))
             return CommandResult()
         _history_delete(backend_url, console, session_id)
         return CommandResult()
@@ -332,13 +337,38 @@ async def _cmd_history(args: str, state: SessionState, console) -> CommandResult
     if action == "prune":
         before = rest[0] if rest else ""
         if not before:
-            render_error(console, "Usage: /history prune <YYYY-MM-DD>")
+            render_error(console, msg("cli.usage_history_prune"))
             return CommandResult()
         _history_prune(backend_url, console, before)
         return CommandResult()
 
     render_error(console, msg("cli.history_unknown_action", action=action))
     return CommandResult()
+
+
+def _pop_date_range(
+    tokens: list[str],
+) -> tuple[list[str], str | None, str | None, str | None]:
+    """``--from D`` / ``--to D`` を取り出す。戻り値は (残りの語, from, to, 不正な日付)。"""
+    from datetime import datetime
+
+    out: list[str] = []
+    found: dict[str, str | None] = {"--from": None, "--to": None}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in found and i + 1 < len(tokens):
+            value = tokens[i + 1]
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                return tokens, None, None, value
+            found[tok] = value
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out, found["--from"], found["--to"], None
 
 
 async def _cmd_page(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
@@ -353,7 +383,7 @@ async def _cmd_page(args: str, state: SessionState, console) -> CommandResult:  
         render_error(console, msg("cli.backend_not_running"))
         return CommandResult()
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return CommandResult()
 
     if not data.get("has_output"):
@@ -405,7 +435,7 @@ async def _cmd_status(args: str, state: SessionState, console) -> CommandResult:
         render_error(console, msg("cli.backend_not_running"))
         return CommandResult()
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return CommandResult()
 
     from backend.version import get_runtime_version
@@ -507,7 +537,7 @@ async def _cmd_pin(args: str, state: SessionState, console) -> CommandResult:
         render_error(console, msg("cli.backend_not_running"))
         return CommandResult()
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code} {e.response.text}")
+        render_error(console, f"{msg('cli.api_error', code=e.response.status_code)} {e.response.text}")
         return CommandResult()
 
     fact = data.get("fact", {})
@@ -541,7 +571,7 @@ async def _cmd_unpin(args: str, state: SessionState, console) -> CommandResult:
         elif e.response.status_code == 409:
             render_error(console, msg("cli.pin_locked", id=fact_id))
         else:
-            render_error(console, f"API error: {e.response.status_code}")
+            render_error(console, msg("cli.api_error", code=e.response.status_code))
         return CommandResult()
 
     fact = data.get("fact", {})
@@ -563,7 +593,7 @@ async def _cmd_pinned(args: str, state: SessionState, console) -> CommandResult:
         render_error(console, msg("cli.backend_not_running"))
         return CommandResult()
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return CommandResult()
 
     facts = data.get("facts", [])
@@ -620,42 +650,42 @@ async def _cmd_cartridge(args: str, state: SessionState, console) -> CommandResu
 
     if action == "install":
         if not rest:
-            render_error(console, "Usage: /cartridge install <file>")
+            render_error(console, msg("cli.usage_cartridge_install"))
             return CommandResult()
         _cartridge_install(backend_url, console, rest[0])
         return CommandResult()
 
     if action == "show":
         if not rest:
-            render_error(console, "Usage: /cartridge show <id>")
+            render_error(console, msg("cli.usage_cartridge_show"))
             return CommandResult()
         _cartridge_show(backend_url, console, rest[0])
         return CommandResult()
 
     if action == "load":
         if not rest:
-            render_error(console, "Usage: /cartridge load <id>")
+            render_error(console, msg("cli.usage_cartridge_load"))
             return CommandResult()
         _cartridge_load(backend_url, console, rest[0])
         return CommandResult()
 
     if action == "unload":
         if not rest:
-            render_error(console, "Usage: /cartridge unload <id>")
+            render_error(console, msg("cli.usage_cartridge_unload"))
             return CommandResult()
         _cartridge_unload(backend_url, console, rest[0])
         return CommandResult()
 
     if action == "uninstall":
         if not rest:
-            render_error(console, "Usage: /cartridge uninstall <id>")
+            render_error(console, msg("cli.usage_cartridge_uninstall"))
             return CommandResult()
         _cartridge_uninstall(backend_url, console, rest[0])
         return CommandResult()
 
     if action == "rebuild":
         if not rest:
-            render_error(console, "Usage: /cartridge rebuild <id>")
+            render_error(console, msg("cli.usage_cartridge_rebuild"))
             return CommandResult()
         _cartridge_rebuild(backend_url, console, rest[0])
         return CommandResult()
@@ -806,7 +836,7 @@ async def _cmd_web(args: str, state: SessionState, console) -> CommandResult:
         render_error(console, msg("cli.web_http_error", status=e.response.status_code))
         return CommandResult()
     except Exception as e:
-        render_error(console, f"Error: {e}")
+        render_error(console, msg("cli.generic_error", reason=e))
         return CommandResult()
 
     # BeautifulSoup が使えれば使う、なければ正規表現フォールバック
@@ -872,11 +902,11 @@ async def _cmd_learn(args: str, state: SessionState, console) -> CommandResult:
 def _handle_httpx_error(e: Exception, console) -> None:
     """httpx 通信エラーの共通ハンドリング"""
     if isinstance(e, httpx.HTTPStatusError):
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
     elif isinstance(e, httpx.ConnectError):
-        render_error(console, "Backend connection failed")
+        render_error(console, msg("cli.backend_connection_failed"))
     else:
-        render_error(console, f"Request failed: {e}")
+        render_error(console, msg("cli.request_failed", reason=e))
 
 
 async def _learn_status(state: SessionState, console) -> CommandResult:
@@ -891,23 +921,23 @@ async def _learn_status(state: SessionState, console) -> CommandResult:
             def _fmt_time(iso_str: str | None) -> str:
                 """UTC ISO文字列をローカル時刻 (YYYY-MM-DD HH:MM:SS) に変換"""
                 if not iso_str:
-                    return "never"
+                    return msg("cli.learning_never")
                 dt = parse_iso(iso_str)
                 if dt is None:
                     return iso_str
                 return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
             lines = [
-                "=== Learning Status ===",
-                f"  Experience count:    {sched.get('experience_count', '?')}",
-                f"  Min experiences:     {sched.get('min_experiences', '?')}",
-                f"  Conditions met:      {sched.get('conditions_met', '?')}",
-                f"  Running:             {sched.get('running', '?')}",
-                f"  Last Level 1 run:    {_fmt_time(sched.get('last_level1_run'))}",
-                f"  Last Level 2 run:    {_fmt_time(sched.get('last_level2_run'))}",
-                f"  LoRA version:        {data.get('lora_version', '?')}",
-                f"  LoRA adapter exists: {data.get('lora_adapter_exists', '?')}",
-                f"  Eval cases:          {data.get('eval_cases_count', '?')}",
+                f"=== {msg('cli.learning_status_title')} ===",
+                f"  {msg('cli.ls_experience_count')}{sched.get('experience_count', '?')}",
+                f"  {msg('cli.ls_min_experiences')}{sched.get('min_experiences', '?')}",
+                f"  {msg('cli.ls_conditions_met')}{sched.get('conditions_met', '?')}",
+                f"  {msg('cli.ls_running')}{sched.get('running', '?')}",
+                f"  {msg('cli.ls_last_level1')}{_fmt_time(sched.get('last_level1_run'))}",
+                f"  {msg('cli.ls_last_level2')}{_fmt_time(sched.get('last_level2_run'))}",
+                f"  {msg('cli.ls_lora_version')}{data.get('lora_version', '?')}",
+                f"  {msg('cli.ls_lora_adapter')}{data.get('lora_adapter_exists', '?')}",
+                f"  {msg('cli.ls_eval_cases')}{data.get('eval_cases_count', '?')}",
             ]
             render_info(console, "\n".join(lines))
     except (httpx.HTTPStatusError, httpx.ConnectError) as e:
@@ -917,7 +947,7 @@ async def _learn_status(state: SessionState, console) -> CommandResult:
 
 async def _learn_trigger(state: SessionState, console, level: str) -> CommandResult:
     """学習サイクルを手動トリガー"""
-    render_info(console, f"Triggering {level}...")
+    render_info(console, msg("cli.learning_triggering", level=level))
     try:
         async with httpx.AsyncClient(headers=backend_headers(), timeout=_LEARN_TRIGGER_TIMEOUT_SEC) as client:
             resp = await client.post(
@@ -925,20 +955,20 @@ async def _learn_trigger(state: SessionState, console, level: str) -> CommandRes
                 json={"level": level},
             )
             if resp.status_code == 409:
-                render_error(console, "Learning cycle already running")
+                render_error(console, msg("cli.learning_already_running"))
                 return CommandResult()
             if resp.status_code == 503:
-                render_error(console, f"Service unavailable: {resp.json().get('detail', '')}")
+                render_error(console, msg("cli.service_unavailable", detail=resp.json().get('detail', '')))
                 return CommandResult()
             resp.raise_for_status()
             data = resp.json()
 
             if data.get("triggered"):
-                render_info(console, f"Triggered: {data.get('message', '')}")
-                render_info(console, f"Experience count: {data.get('experience_count', '?')}")
+                render_info(console, msg("cli.learning_triggered", message=data.get('message', '')))
+                render_info(console, msg("cli.learning_experience_count", count=data.get('experience_count', '?')))
             else:
-                render_error(console, f"Not triggered: {data.get('message', '')}")
-                render_info(console, f"Experience count: {data.get('experience_count', '?')}")
+                render_error(console, msg("cli.learning_not_triggered", message=data.get('message', '')))
+                render_info(console, msg("cli.learning_experience_count", count=data.get('experience_count', '?')))
     except (httpx.HTTPStatusError, httpx.ConnectError) as e:
         _handle_httpx_error(e, console)
     return CommandResult()

@@ -484,6 +484,8 @@ async def _run_lifespan_shutdown(
     # 書き手ロックは最後に手放す (プロセス終了でも OS が解放する)
     gate = state.data_gate
     if gate is not None:
+        if gate.presence is not None:
+            gate.presence.release()
         gate.lock.release()
     return shutdown_timings
 

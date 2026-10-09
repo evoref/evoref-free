@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 
 from backend.free.cli.backend_headers import backend_headers
+from backend.io.atomic import atomic_write_bytes
 from backend.free.cli.renderer import (
     render_error,
     render_info,
@@ -87,6 +88,7 @@ def _cartridge_list(backend_url: str, console) -> int:
     try:
         resp = httpx.get(
             f"{backend_url}/api/cartridges",
+            headers=backend_headers(),
             timeout=_timeouts.default,
         )
         resp.raise_for_status()
@@ -94,7 +96,7 @@ def _cartridge_list(backend_url: str, console) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return 1
 
     data = resp.json()
@@ -162,7 +164,7 @@ def _cartridge_install(backend_url: str, console, file_path: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return 1
     except OSError as e:
         render_error(console, msg("cli.cartridge_file_not_found", path=str(e)))
@@ -191,6 +193,7 @@ def _cartridge_show(backend_url: str, console, cartridge_id: str) -> int:
     try:
         resp = httpx.get(
             f"{backend_url}/api/cartridges/{cartridge_id}",
+            headers=backend_headers(),
             timeout=_timeouts.default,
         )
         if resp.status_code == 404:
@@ -201,12 +204,12 @@ def _cartridge_show(backend_url: str, console, cartridge_id: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return 1
 
     c = resp.json()
 
-    render_info(console, f"Cartridge: {c['id']}")
+    render_info(console, msg("cli.cartridge_detail_header", id=c['id']))
     render_info(console, f"  {msg('cli.cartridge_col_name')}: {c.get('name', '')}")
     render_info(console, f"  {msg('cli.cartridge_col_version')}: {c.get('version', '')}")
     render_info(console, f"  {msg('cli.cartridge_col_status')}: {c.get('status', '')}")
@@ -259,7 +262,7 @@ def _cartridge_load(backend_url: str, console, cartridge_id: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return 1
 
     result = resp.json()
@@ -287,7 +290,7 @@ def _cartridge_unload(backend_url: str, console, cartridge_id: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return 1
 
     render_info(console, msg("cli.cartridge_unloaded", id=cartridge_id))
@@ -318,7 +321,7 @@ def _cartridge_uninstall(backend_url: str, console, cartridge_id: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return 1
 
     render_info(console, msg("cli.cartridge_uninstalled", id=cartridge_id))
@@ -349,7 +352,7 @@ def _cartridge_rebuild(backend_url: str, console, cartridge_id: str) -> int:
         render_error(console, msg("cli.backend_not_running"))
         return 1
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return 1
 
     result = resp.json()
@@ -437,7 +440,7 @@ def _build_create_multipart(
                 ("files", (sf.name, open(sf, "rb"), "application/octet-stream"))
             )
         except OSError as e:
-            render_error(console, f"Cannot read: {sf} ({e})")
+            render_error(console, msg("cli.cannot_read_file", path=sf, reason=e))
 
     if not multipart_files:
         return None
@@ -496,7 +499,7 @@ def _execute_create_request(
         render_error(console, msg("cli.backend_not_running"))
         return None
     except httpx.HTTPStatusError as e:
-        render_error(console, f"API error: {e.response.status_code}")
+        render_error(console, msg("cli.api_error", code=e.response.status_code))
         return None
     finally:
         for _, file_tuple in multipart_files:
@@ -528,7 +531,7 @@ def _display_and_download_result(
 
     if result.get("errors"):
         for err in result["errors"]:
-            render_info(console, f"  Warning: {err}")
+            render_info(console, msg("cli.cartridge_warning_line", error=err))
 
     duration = result.get("duration_sec", 0)
     if duration > 0:
@@ -543,16 +546,18 @@ def _display_and_download_result(
         try:
             dl_resp = httpx.get(
                 f"{backend_url}{download_url}",
+                headers=backend_headers(),
                 timeout=_timeouts.default,
             )
             dl_resp.raise_for_status()
-            zip_path.write_bytes(dl_resp.content)
+            # 途中で落ちると壊れた ZIP が完成品の名前で残るので、一時ファイル経由で置く。
+            atomic_write_bytes(zip_path, dl_resp.content)
             render_info(console, msg(
                 "cli.cartridge_create_saved",
                 path=str(zip_path),
             ))
         except Exception as e:
-            render_error(console, f"Failed to download ZIP: {e}")
+            render_error(console, msg("cli.zip_download_failed", reason=e))
             return 1
 
     return 0

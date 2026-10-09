@@ -441,10 +441,12 @@ class EpisodicStore:
         self._invalidate_cache(record_id)
         return self.evidence.patch(record_id, **fields)
 
-    def retract_note(self, record_id: str, reason: str) -> Evidence | None:
+    def retract_note(
+        self, record_id: str, reason: str, *, by: str | None = None,
+    ) -> Evidence | None:
         """``veracity=retracted`` にする (物理削除はしない)。"""
         self._invalidate_cache(record_id)
-        return self.evidence.retract(record_id, reason)
+        return self.evidence.retract(record_id, reason, by=by)
 
     def promote_aged_notes(self, *, short_days: float, now: float | None = None) -> int:
         """``short_days`` を超えた ``short`` ノートを ``long`` へ ``patch`` する。
