@@ -123,10 +123,7 @@ def lock_held(store_dir: Path) -> bool:
 def acquire_writer_lock(store_dir: Path, *, started_at: str = "") -> WriterLock:
     """``<store_dir>/.writer.lock`` を取る。取れなければ :class:`WriterLockHeld`。"""
     store_dir.mkdir(parents=True, exist_ok=True)
-    return _acquire_at(store_dir / LOCK_FILENAME, started_at=started_at)
-
-
-def _acquire_at(path: Path, *, started_at: str = "") -> WriterLock:
+    path = store_dir / LOCK_FILENAME
     fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
     fh = os.fdopen(fd, "r+b", buffering=0)
     try:
@@ -143,82 +140,4 @@ def _acquire_at(path: Path, *, started_at: str = "") -> WriterLock:
     return WriterLock(path=path, _fh=fh)
 
 
-# ── インストール根単位のロック (config.yaml の書き手を serve と排他にする) ──
-#
-# ``config.yaml`` はインストール根に 1 つだけで、データ根は ``--data-root`` /
-# ``--isolate-data`` で serve ごとに違えられる。データ根のロックでは別の根で動く serve を
-# 見逃すので、serve は自分専用の「在席」ファイルをここで保持し、config を書く側は
-# 全在席ファイルと書き手ロックを順に確かめる。
-#
-# 順序 (どちらかが必ず相手を見る): serve は在席を取ってから書き手ロックを確かめ、
-# 書き手は書き手ロックを取ってから在席を確かめる。
-
-INSTALL_LOCK_DIRNAME = ".evoref-locks"
-_CONFIG_WRITER = "config-writer.lock"
-_SERVE_PREFIX = "serve-"
-
-
-def _install_lock_dir(install_root: Path) -> Path:
-    d = install_root / INSTALL_LOCK_DIRNAME
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _probe_held(path: Path) -> bool:
-    """``path`` のロック領域を別プロセスが持っているか (保持しない)。"""
-    try:
-        fh = open(path, "r+b", buffering=0)  # noqa: SIM115 — 下の with で閉じる
-    except FileNotFoundError:
-        return False
-    with fh:
-        try:
-            _lock(fh)
-        except OSError:
-            return True
-        _unlock(fh)
-    return False
-
-
-def acquire_serve_presence(install_root: Path, *, started_at: str = "") -> WriterLock:
-    """serve が稼働中であることを示す専用ファイルを保持する。
-
-    config を書いている最中 (書き手ロックが取られている) なら :class:`WriterLockHeld`。
-    """
-    lock_dir = _install_lock_dir(install_root)
-    presence = _acquire_at(lock_dir / f"{_SERVE_PREFIX}{os.getpid()}-{os.urandom(4).hex()}.lock", started_at=started_at)
-    writer = lock_dir / _CONFIG_WRITER
-    if _probe_held(writer):
-        presence.release()
-        raise WriterLockHeld(writer, read_holder(writer))
-    return presence
-
-
-def acquire_config_write_lock(install_root: Path) -> WriterLock:
-    """config.yaml を書く権利を取る。他の書き手か稼働中の serve がいれば :class:`WriterLockHeld`。
-
-    取り残しの在席ファイル (保持者がいない) はここで片付ける。
-    """
-    lock_dir = _install_lock_dir(install_root)
-    lock = _acquire_at(lock_dir / _CONFIG_WRITER)
-    for entry in sorted(lock_dir.glob(f"{_SERVE_PREFIX}*.lock")):
-        if _probe_held(entry):
-            lock.release()
-            raise WriterLockHeld(entry, read_holder(entry))
-        try:
-            entry.unlink()
-        except OSError:
-            pass
-    return lock
-
-
-__all__ = [
-    "INSTALL_LOCK_DIRNAME",
-    "LOCK_FILENAME",
-    "WriterLock",
-    "WriterLockHeld",
-    "acquire_config_write_lock",
-    "acquire_serve_presence",
-    "acquire_writer_lock",
-    "lock_held",
-    "read_holder",
-]
+__all__ = ["LOCK_FILENAME", "WriterLock", "WriterLockHeld", "acquire_writer_lock", "lock_held", "read_holder"]

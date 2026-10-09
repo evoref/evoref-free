@@ -87,11 +87,11 @@ def _load_from_history(
 ) -> CommandResult:
     """--history フラグ付き /load の処理"""
     if state.history_dir is None:
-        render_error(console, msg("cli.hist_dir_not_configured"))
+        render_error(console, "History directory not configured")
         return CommandResult()
 
     if not state.history_dir.exists():
-        render_error(console, msg("cli.hist_none_found"))
+        render_error(console, "No history found")
         return CommandResult()
 
     remaining = [p for p in parts if p != "--history"]
@@ -101,7 +101,7 @@ def _load_from_history(
 
     session_id = remaining[0] if remaining else ""
     if not session_id:
-        render_error(console, msg("cli.usage_load_history"))
+        render_error(console, "Usage: /load --history <session_id> or /load --history --latest")
         return CommandResult()
 
     return _load_history_by_id(session_id, state, console)
@@ -129,7 +129,7 @@ def _load_latest_history(state: SessionState, console) -> CommandResult:
             break
 
     if latest_file is None:
-        render_error(console, msg("cli.hist_no_sessions"))
+        render_error(console, "No history sessions found")
         return CommandResult()
 
     logger.debug("/load --history --latest: found %s", latest_file)
@@ -145,7 +145,7 @@ def _load_history_by_id(
             logger.debug("/load --history %s: found %s", session_id, f)
             return _restore_history_session(f, state, console)
 
-    render_error(console, msg("cli.hist_session_not_found", session_id=session_id))
+    render_error(console, f"History session not found: {session_id}")
     return CommandResult()
 
 
@@ -158,7 +158,7 @@ def _restore_history_session(
     read = read_session_file(path)
     if not read.ok or not isinstance(read.payload, dict):
         logger.debug("/load: failed to read %s: %s %s", path, read.status, read.detail)
-        render_error(console, msg("cli.session_load_failed_detail", status=read.status, detail=read.detail))
+        render_error(console, f"Failed to load session: {read.status} {read.detail}")
         return CommandResult()
     return _apply_session_data(read.payload, path, state, console)
 

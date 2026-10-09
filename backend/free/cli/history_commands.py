@@ -23,8 +23,6 @@ logger = get_logger("cli.history")
 
 _DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 30.0
-#: ``GET /api/history`` の ``limit`` の上限 (``Query(le=100)``)。
-_PAGE_LIMIT = 100
 
 
 def http_error_detail(e: httpx.HTTPStatusError) -> str:
@@ -64,7 +62,6 @@ def _history_list(
     try:
         resp = httpx.get(
             f"{backend_url}/api/history",
-            headers=backend_headers(),
             params=params,
             timeout=_TIMEOUT,
         )
@@ -168,7 +165,6 @@ def _history_show(backend_url: str, console, session_id: str) -> int:
     try:
         resp = httpx.get(
             f"{backend_url}/api/history/{session_id}",
-            headers=backend_headers(),
             timeout=_TIMEOUT,
         )
         if resp.status_code == 404:
@@ -185,7 +181,7 @@ def _history_show(backend_url: str, console, session_id: str) -> int:
     s = resp.json()
 
     # メタ情報
-    render_info(console, msg("cli.history_session_header", id=s['session_id']))
+    render_info(console, f"Session: {s['session_id']}")
     render_info(console, f"  {msg('cli.history_col_date')}: {format_datetime(s.get('started_at', ''))}")
     render_info(console, f"  {msg('cli.history_col_turns')}: {s.get('turn_count', 0)}")
     duration = s.get("duration_sec", 0)
@@ -216,7 +212,6 @@ def _history_stats(backend_url: str, console) -> int:
     try:
         resp = httpx.get(
             f"{backend_url}/api/history/stats",
-            headers=backend_headers(),
             timeout=_TIMEOUT,
         )
         resp.raise_for_status()
@@ -302,22 +297,14 @@ def _history_prune(backend_url: str, console, before: str) -> int:
         render_error(console, msg("cli.history_invalid_date", date=before))
         return 1
 
-    # 対象セッションを取得 (一覧 API の limit は 100 まで — 超えると 422 になるので頁を送る)
-    sessions: list[dict] = []
+    # 対象セッションを取得
     try:
-        while True:
-            resp = httpx.get(
-                f"{backend_url}/api/history",
-                headers=backend_headers(),
-                params={"limit": _PAGE_LIMIT, "offset": len(sessions), "to": before},
-                timeout=_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            page = data.get("sessions", [])
-            sessions.extend(page)
-            if not page or len(sessions) >= int(data.get("total", 0)):
-                break
+        resp = httpx.get(
+            f"{backend_url}/api/history",
+            params={"limit": 1000, "offset": 0, "to": before},
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
     except httpx.ConnectError:
         render_error(console, msg("cli.backend_not_running"))
         return 1
@@ -325,6 +312,7 @@ def _history_prune(backend_url: str, console, before: str) -> int:
         render_error(console, format_http_error(e))
         return 1
 
+    sessions = resp.json().get("sessions", [])
     if not sessions:
         render_info(console, msg("cli.history_prune_none", before=before))
         return 0

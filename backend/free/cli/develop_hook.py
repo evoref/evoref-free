@@ -95,7 +95,7 @@ class _FreeDevelopHook:
             metavar="LEVEL",
             help=(
                 "Develop mode level (required value): "
-                "debug (Free/Pro/Develop) | investigate (Free/Pro/Develop) | "
+                "debug (Free/Pro/Develop) | investigate (Pro/Develop) | "
                 "evolve (Develop only)"
             ),
         )

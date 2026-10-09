@@ -29,13 +29,7 @@ from typing import Any
 
 from backend.config import PathResolver
 from backend.data_location import DataLocation, inspect_location
-from backend.data_root import (
-    DATA_GENERATION,
-    GENERATION_DIRNAME,
-    generation_dirs,
-    install_root,
-    store_root,
-)
+from backend.data_root import DATA_GENERATION, GENERATION_DIRNAME, generation_dirs, store_root
 from backend.io.format_registry import FormatRegistry
 from backend.io.generation_seal import (
     SEAL_FILENAME,
@@ -44,12 +38,7 @@ from backend.io.generation_seal import (
     updated_seal,
     write_seal,
 )
-from backend.io.writer_lock import (
-    WriterLock,
-    WriterLockHeld,
-    acquire_serve_presence,
-    acquire_writer_lock,
-)
+from backend.io.writer_lock import WriterLock, WriterLockHeld, acquire_writer_lock
 from backend.log_config import get_logger
 
 logger = get_logger("factory.data_gate")
@@ -67,8 +56,6 @@ class DataGateResult:
     data_root: Path
     location: DataLocation
     lock: WriterLock
-    #: インストール根単位の在席ファイル。config.yaml を書く CLI が serve を見つけるのに使う。
-    presence: WriterLock | None = None
     readonly: bool = False
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -142,14 +129,9 @@ def run_data_gate(
         lock = acquire_writer_lock(store_dir, started_at=started_at)
     except WriterLockHeld as e:
         raise DataGateRefused("data_root_locked", str(e)) from e
-    try:
-        presence = acquire_serve_presence(install_root(), started_at=started_at)
-    except WriterLockHeld as e:
-        lock.release()
-        raise DataGateRefused("config_being_edited", str(e)) from e
 
     result = DataGateResult(
-        data_root=data_root, location=location, lock=lock, presence=presence, warnings=warnings,
+        data_root=data_root, location=location, lock=lock, warnings=warnings,
         edition=edition, app_version=app_version,
         format_versions={s.format_id: s.version for s in registry.read_by(edition)},  # type: ignore[arg-type]
     )
@@ -159,7 +141,6 @@ def run_data_gate(
     try:
         _check_generation(result, store_dir, registry, edition=edition, app_version=app_version)
     except BaseException:
-        presence.release()
         lock.release()
         raise
     if not result.readonly:

@@ -536,18 +536,18 @@ class SemanticStore:
         logger.debug("update_fact: id=%s changes=%s", fact_id, sorted(changes.keys()))
         return fact
 
-    def retract_fact(self, fact_id: str, reason: str, *, by: str | None = None) -> bool:
+    def retract_fact(self, fact_id: str, reason: str) -> bool:
         """``veracity=retracted`` にする (物理削除はしない、c_16 §3)。
 
         取り下げたファクトは読み出し系から消えるが、事象ログと snapshot には
         残るので監査で追える。物理削除は snapshot 3 版後の GC が担う
-        (:meth:`pending_physical_gc`)。``by`` は事象ログの書き手 (省略時はストアの既定)。
+        (:meth:`pending_physical_gc`)。
         """
         fact = self._facts.pop(fact_id, None)
         if fact is None:
             return False
         self._remove_from_indexes(fact)
-        self.evidence.retract(fact_id, reason, by=by)
+        self.evidence.retract(fact_id, reason)
         self._clear_dangling_supersession({fact_id})
         self._revision += 1
         self._invalidate_vectors()

@@ -48,7 +48,6 @@ from backend.free.agent.edit_mode_gate import resolve_edit_mode
 from backend.free.agent.output_format import (
     WRITTEN_PATH_RE,
     anchor_relative_output_path,
-    split_overwrite_warning,
     written_paths,
 )
 from backend.free.agent.write_gate import WRITE_DENIED_RE, overwrite_exempt
@@ -2493,10 +2492,6 @@ class MetaCognitiveAgent(
         if not paths:
             return []
         out: list[tuple[str, str]] = []
-        # 上書きで縮小・ヘッダ変更があれば、書いた内容の前に目立つ注意として出す (f_11 §5.6)
-        _, warning = split_overwrite_warning(result)
-        if warning is not None:
-            out.append(("note", MetaCognitiveAgent._overwrite_warning_note(warning)))
         match = WRITTEN_PATH_RE.search(result)
         block = (
             MetaCognitiveAgent._written_content_block(result)
@@ -2511,20 +2506,6 @@ class MetaCognitiveAgent(
         if rest:
             out.append(("written", msg("agent.files_written", paths="、".join(rest))))
         return out
-
-    @staticmethod
-    def _overwrite_warning_note(warning: dict) -> str:
-        """上書きの警告 (``split_overwrite_warning``) を、引用ブロックの注意書きにする。"""
-        reasons = []
-        if warning["shrank"] is not None:
-            old, new = warning["shrank"]
-            reasons.append(msg("agent.overwrite_shrank", old=old, new=new))
-        if warning["header"]:
-            reasons.append(msg("agent.overwrite_header"))
-        return msg(
-            "agent.overwrite_warning",
-            reasons="".join(reasons), backup=warning["backup"], dest=warning["dest"],
-        )
 
     @staticmethod
     def _task_body_parts(
@@ -2579,5 +2560,4 @@ class MetaCognitiveAgent(
         # 切り詰めは chat_stream_meta に残す。
         # 書込みタスクの書いた内容は ``_written_presentation`` が添える
         # (「Written N bytes to …」だけでは中身が分からない、2026-09-08 F-05)。
-        # 上書きの警告行は生の英文のまま出さず、同じく ``_written_presentation`` が整形して添える。
-        return [split_overwrite_warning(task.result)[0]]
+        return [task.result]
