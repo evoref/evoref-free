@@ -38,11 +38,16 @@ def get_cli_theme() -> CLITheme:
     return _cli_theme
 
 
+# トークン使用率の色分け境界 (PERCENT): 未満なら low / mid
+_TOKEN_USAGE_MID_PCT = 60
+_TOKEN_USAGE_HIGH_PCT = 85
+
+
 def _token_color(pct: int) -> str:
     """トークン使用率に応じた色"""
-    if pct < 60:
+    if pct < _TOKEN_USAGE_MID_PCT:
         return _cli_theme.token_low
-    elif pct < 85:
+    elif pct < _TOKEN_USAGE_HIGH_PCT:
         return _cli_theme.token_mid
     return _cli_theme.token_high
 
@@ -511,7 +516,6 @@ def render_help(console: Console) -> None:
         ("/pin <text>", msg("cli.help_pin")),
         ("/unpin <id> [--force]", msg("cli.help_unpin")),
         ("/pinned", msg("cli.help_pinned")),
-        ("/private on|off|status", msg("cli.help_private")),
         ("/exit", msg("cli.help_exit")),
     ]
 

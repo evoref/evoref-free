@@ -71,6 +71,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from backend.constants import FLOAT_EPS
 from backend.embed_priority import P1_FRESHNESS, embed_priority
 from backend.export.markdown_patterns import RE_LINK
 from backend.free.core.tuning.tuners.embed_params import HTTP_BATCH_MAX, http_batch_of
@@ -1988,8 +1989,8 @@ class EvidenceStore:
                 self.store_name,
             )
             return out
-        norms = np.linalg.norm(restored, axis=1).clip(min=1e-9)
-        query_norm = float(np.linalg.norm(query).clip(min=1e-9))
+        norms = np.linalg.norm(restored, axis=1).clip(min=FLOAT_EPS)
+        query_norm = float(np.linalg.norm(query).clip(min=FLOAT_EPS))
         out[known] = restored @ query / (norms * query_norm)
         return out
 

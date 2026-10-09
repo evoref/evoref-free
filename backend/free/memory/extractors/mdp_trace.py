@@ -76,6 +76,9 @@ MEM_DECISION_PREFIX = "mem.decision."
 
 _FAILURE_KEYWORDS = ("fail", "error", "exception", "abort")
 
+#: トレース由来ファクトの確信度。
+_TRACE_FACT_CONFIDENCE = 0.6
+
 
 def _is_failure_outcome(outcome: str, steps: list[dict[str, Any]] | None = None) -> bool:
     """エピソード outcome が失敗かを判定する。
@@ -358,7 +361,7 @@ class MDPTraceExtractor(BaseExtractor):
             scope=scope,
             note=None,
             ctx=ctx,
-            confidence=0.6,
+            confidence=_TRACE_FACT_CONFIDENCE,
             trace_id=trace_id,
             failure_signature=signature,
             # MDP トレースは **アシスタント自身の行動記録** (c_16 §3)。
@@ -401,7 +404,7 @@ class MDPTraceExtractor(BaseExtractor):
             scope=scope,
             note=None,
             ctx=ctx,
-            confidence=0.6,
+            confidence=_TRACE_FACT_CONFIDENCE,
             trace_id=trace_id,
             # MDP トレースは **アシスタント自身の行動記録** (c_16 §3)。
             origin="assistant",

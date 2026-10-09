@@ -16,6 +16,7 @@ export interface ServerConfig {
 	port: number;
 	frontend_port: number;
 	timeout: number;
+	allow_remote?: boolean;
 }
 
 export interface MtpConfig {
@@ -78,10 +79,6 @@ export interface RAGConfig {
 	semantic_max_chunk: number;
 	top_k: number;
 	embedding_dim: number;
-	contextual_retrieval: boolean;
-	contextual_prefix_max_tokens: number;
-	contextual_max_doc_chars: number;
-	contextual_batch_size: number;
 	quantization: 'none' | 'int8';
 	rescore_candidates: number;
 	memmap_threshold: number;
@@ -89,6 +86,8 @@ export interface RAGConfig {
 	support_threshold: number;
 	confidence_threshold: number;
 	hysteresis_band: number;
+	/** off / on。YAML 1.1 の真偽値で来ることもある */
+	rerank?: { mode?: 'off' | 'on' | boolean };
 	self_rag: {
 		quality_judge: {
 			enabled: boolean;
@@ -122,6 +121,21 @@ export interface MemoryConfig {
 	note_evolution_batch: number;
 	note_evolution_context_k: number;
 	llm_call_base_interval: number;
+	injection?: { chat_budget_tokens?: number; create_budget_tokens?: number };
+	evidence?: {
+		retention?: {
+			short_days?: number;
+			long_max_records?: number;
+			idx_max_records?: number;
+			events_keep_months?: number;
+			snapshots_keep?: number;
+		};
+	};
+}
+
+/** 学習のローカル時刻判定に使うタイムゾーン (トップレベル `schedule` セクション) */
+export interface ScheduleConfig {
+	local_tz: string;
 }
 
 export interface LearningConfig {
@@ -180,15 +194,6 @@ export interface WidgetProxyConfig {
 	max_response_size_kb: number;
 	cache_ttl_sec: number;
 	apis: WidgetApiConfig[];
-}
-
-export interface ExternalApiConfig {
-	enabled: boolean;
-	provider: 'anthropic' | 'openai';
-	api_key: string;
-	model: string;
-	max_tokens: number;
-	timeout: number;
 }
 
 export interface I18nConfig {
@@ -250,10 +255,10 @@ export interface ConfigData {
 	embedding: EmbeddingConfig;
 	memory: MemoryConfig;
 	learning: LearningConfig;
+	schedule: ScheduleConfig;
 	agent: AgentConfig;
 	tools: ToolsConfig;
 	widget_proxy: WidgetProxyConfig;
-	external_api: ExternalApiConfig;
 	i18n: I18nConfig;
 	modes: ModesConfig;
 	editor: EditorSettingsConfig;

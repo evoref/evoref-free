@@ -23,6 +23,6 @@
 
 	<!-- データはデータ根 (userdata/) の下に置く。利用者が変えられるのは生成物の既定の書込み先だけ -->
 	<FieldGroup label="settings.group_local_paths" fullWidth>
-		<TextField label="settings.local_paths.outputs_dir" value={String(local.outputs_dir ?? 'outputs/')} onchange={(v) => updateField('local_paths', 'outputs_dir', v)} />
+		<TextField label="settings.local_paths.outputs_dir" value={String(local.outputs_dir ?? 'outputs/')} disabled description="settings.local_paths.outputs_dir_desc" onchange={(v) => updateField('local_paths', 'outputs_dir', v)} />
 	</FieldGroup>
 </SettingsSection>

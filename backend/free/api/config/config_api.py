@@ -32,7 +32,7 @@ logger = get_logger("api.config")
 router = APIRouter(prefix="/api/config", tags=["config"])
 
 # Pro 専用セクション（Free では読み書き不可）
-PRO_ONLY_SECTIONS = {"widget_proxy", "mode_models"}
+PRO_ONLY_SECTIONS = {"widget_proxy", "mode_models", "pro"}
 
 # 機密フィールド（GET 時にマスク）。現状マスク対象なし。
 SENSITIVE_FIELDS: dict[str, list[str]] = {}
@@ -346,7 +346,9 @@ async def update_config_section(
     # コンポーネント再生成（設定変更を即座に反映）
     await _reload_components_if_needed(section, state)
 
-    return ConfigUpdateResponse(section=section, updated=True)
+    return ConfigUpdateResponse(
+        section=section, updated=True, restart_required=section not in _RELOAD_HANDLERS,
+    )
 
 
 @router.post("/{section}/validate", response_model=ConfigValidateResponse)

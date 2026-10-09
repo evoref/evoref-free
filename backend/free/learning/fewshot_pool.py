@@ -162,6 +162,12 @@ FEWSHOT_BONUS_WEIGHTS: dict[str, float] = {
 #: この同点を割るために入れるので、fitness と同等の重みを与える。
 _QUALITY_WEIGHT = 0.5
 
+# 品質採点 (補助タスク) に渡す query / response の最大文字数、max_tokens、temperature
+_QUALITY_QUERY_MAX_CHARS = 600
+_QUALITY_RESPONSE_MAX_CHARS = 900
+_QUALITY_MAX_TOKENS = 768
+_QUALITY_TEMPERATURE = 0.1
+
 
 def _effective_fitness(example: FewShotExample) -> float:
     """順位付けに使う実効スコア (純粋関数)。
@@ -1262,13 +1268,13 @@ class FewShotPool(VersionedJsonFile):
                     {
                         "role": "user",
                         "content": (
-                            f"Q: {example.query[:600]}\n"
-                            f"A: {example.response[:900]}"
+                            f"Q: {example.query[:_QUALITY_QUERY_MAX_CHARS]}\n"
+                            f"A: {example.response[:_QUALITY_RESPONSE_MAX_CHARS]}"
                         ),
                     },
                 ],
-                max_tokens=768,
-                temperature=0.1,
+                max_tokens=_QUALITY_MAX_TOKENS,
+                temperature=_QUALITY_TEMPERATURE,
                 purpose="fewshot_quality_score",
                 response_schema=FewShotQualityJudgement,
             )

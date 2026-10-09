@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from backend.constants import SECONDS_PER_HOUR
 from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.i18n_helper import msg
 from backend.io import atomic_write_text
@@ -125,6 +126,8 @@ def _fmt_adoption_measure(verdict: dict) -> str:
 # success を True と偽らない (ReadTimeout 等で実質何も学習できていないため。
 # 一方、変異は成功したが改善が無い「健全な収束」は success=True を維持する)。
 _MUTATION_DEGRADED_RATE = 0.5
+# 採否判定ログに載せる失敗ケースの query 先頭文字数
+_CASE_QUERY_PREVIEW_CHARS = 80
 
 #: 1 つの Level1Session が yield できる上限。これを超えたら session を破棄して
 #: 経験カーソルを進める (同じ snapshot を何日も抱えたまま resume を繰り返さない)。
@@ -798,7 +801,7 @@ class LearningScheduler:
         if time.time() < self._level2_not_before.get(target, 0.0):
             return False
         return self.seconds_since_level2_run(target) >= (
-            self.level2_cooldown_hours(target) * 3600.0
+            self.level2_cooldown_hours(target) * SECONDS_PER_HOUR
         )
 
     def seconds_since_level2_run(self, target: str = "base") -> float:
@@ -1784,11 +1787,11 @@ class LearningScheduler:
                 "excluded": verdict.get("excluded", {}),
                 "adopt": verdict["adopt"], "reason": verdict["reason"],
                 "cases": [
-                    {"case_id": c.case_id, "kind": c.kind, "query": c.query[:80],
+                    {"case_id": c.case_id, "kind": c.kind, "query": c.query[:_CASE_QUERY_PREVIEW_CHARS],
                      "verdict": outcomes.get(c.case_id)}
                     for c in failures
                 ] + [
-                    {"case_id": c.case_id, "kind": c.kind, "query": c.query[:80],
+                    {"case_id": c.case_id, "kind": c.kind, "query": c.query[:_CASE_QUERY_PREVIEW_CHARS],
                      "verdict": sample_outcomes.get(c.case_id)}
                     for c in samples
                 ],
@@ -1964,7 +1967,7 @@ class LearningScheduler:
                     "cases": [
                         {
                             "case_id": c.case_id, "kind": c.kind,
-                            "query": c.query[:80],
+                            "query": c.query[:_CASE_QUERY_PREVIEW_CHARS],
                             "before": round(before[c.case_id], 3),
                             "after": round(after[c.case_id], 3),
                         }

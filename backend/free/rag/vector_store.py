@@ -6,12 +6,16 @@ from pathlib import Path
 
 import numpy as np
 
+from backend.constants import FLOAT_EPS
 from backend.exceptions import VectorDimensionMismatchError
 from backend.io import atomic_write_text
 from backend.log_config import get_logger
 from backend.utils import utc_now
 
 logger = get_logger("rag.vector_store")
+
+#: int8 量子化の最大絶対値 (スケールで割った値をここへ写す)。
+INT8_MAX = 127
 
 # rescore 候補数のデフォルト下限
 _DEFAULT_RESCORE_MIN = 50
@@ -63,8 +67,8 @@ def quantize_int8(
     Returns:
         (quantized, scales) — quantized: int8 (N, dim), scales: float32 (N, 1)
     """
-    scales = np.abs(vectors).max(axis=1, keepdims=True).clip(min=1e-9)
-    quantized = np.round(vectors / scales * 127).astype(np.int8)
+    scales = np.abs(vectors).max(axis=1, keepdims=True).clip(min=FLOAT_EPS)
+    quantized = np.round(vectors / scales * INT8_MAX).astype(np.int8)
     return quantized, scales.astype(np.float32)
 
 
@@ -73,7 +77,7 @@ def dequantize_int8(
     scales: np.ndarray,
 ) -> np.ndarray:
     """int8 ベクトルを float32 に復元"""
-    return quantized.astype(np.float32) * scales / 127
+    return quantized.astype(np.float32) * scales / INT8_MAX
 
 
 def _kmeans_numpy(
@@ -632,8 +636,8 @@ class VectorStore:
             return None
         if len(self.cluster_centroids) == 0:
             return None
-        q_n = float(np.linalg.norm(query_f32)) + 1e-9
-        c_norms = np.linalg.norm(self.cluster_centroids, axis=1) + 1e-9
+        q_n = float(np.linalg.norm(query_f32)) + FLOAT_EPS
+        c_norms = np.linalg.norm(self.cluster_centroids, axis=1) + FLOAT_EPS
         sims = self.cluster_centroids @ query_f32 / (c_norms * q_n)
         n_probe = min(self.cluster_n_probe, len(self.cluster_centroids))
         if n_probe >= len(self.cluster_centroids):
@@ -725,8 +729,8 @@ class VectorStore:
             self.vectors_q8[candidate_indices],
             self.scales[candidate_indices],
         )
-        norms = np.linalg.norm(restored, axis=1).clip(min=1e-9)
-        query_norm = np.linalg.norm(query_f32).clip(min=1e-9)
+        norms = np.linalg.norm(restored, axis=1).clip(min=FLOAT_EPS)
+        query_norm = np.linalg.norm(query_f32).clip(min=FLOAT_EPS)
         similarities = restored @ query_f32 / (norms * query_norm)
 
         # top_k 選択
@@ -805,7 +809,7 @@ class VectorStore:
         )
         mean = floats.mean(axis=0)
         norm = float(np.linalg.norm(mean))
-        if norm < 1e-9:
+        if norm < FLOAT_EPS:
             return None
         return (mean / norm).astype(np.float32)
 

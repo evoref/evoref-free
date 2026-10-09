@@ -1,12 +1,14 @@
 """EvorefMem (WM/STM/LTM + SemMem) 関連スキーマ"""
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.log_config import get_logger
 
 logger = get_logger("config")
+
+_warned_private_removed = False
 
 #: 1 メッセージあたりの推定トークン数 (平均)。
 #: 2026-08-16 ライブ監査の実セッション (80 メッセージ / 7,264 tok) の実測値。
@@ -354,28 +356,6 @@ class PinConfig(BaseModel):
     """自動 Pin 検出を有効化するか"""
 
 
-class PrivateSessionConfig(BaseModel):
-    """プライベートセッション設定
-
-    `private: true` のターンは memory_only で動作し、LTM/SemMem に書き込まない。
-    会話履歴のディスク永続化もスキップする。セッション終了時に揮発する。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    default: bool = False
-    """セッション開始時のデフォルト private モード"""
-
-    history_storage: str = Field(default="memory_only", pattern=r"^(memory_only|skip)$")
-    """history 保存方針。
-
-    - ``memory_only`` (既定): private ターンだけをディスク永続化から除外し、
-      WM/STM のみで保持する。同じセッションの通常ターンは履歴に残る。
-    - ``skip``: private ターンを 1 度でも含んだセッションは、通常ターンも含めて
-      セッションファイルごと永続化しない。
-    """
-
-
 class SemMemLimitsConfig(BaseModel):
     """SemMem 容量上限と GC 戦略
 
@@ -550,6 +530,22 @@ class MemoryConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @model_validator(mode="before")
+    @classmethod
+    def drop_removed_private_key(cls, data: Any) -> Any:
+        """撤去済みの ``memory.private`` を落とす (既存 config.yaml の起動を壊さない)。"""
+        global _warned_private_removed
+        if isinstance(data, dict) and "private" in data:
+            data = {k: v for k, v in data.items() if k != "private"}
+            if not _warned_private_removed:
+                _warned_private_removed = True
+                logger.warning(
+                    "memory.private is no longer supported (the private session "
+                    "entry points were removed); the key is ignored. Remove it "
+                    "from config.yaml.",
+                )
+        return data
+
     # Subject 正規化辞書
     subject_dictionary: SubjectDictionaryConfig = Field(
         default_factory=SubjectDictionaryConfig,
@@ -558,8 +554,6 @@ class MemoryConfig(BaseModel):
     facts: FactsConfig = Field(default_factory=FactsConfig)
     # Pin 機能
     pin: PinConfig = Field(default_factory=PinConfig)
-    # プライベートセッション
-    private: PrivateSessionConfig = Field(default_factory=PrivateSessionConfig)
     # SemMem コンフリクト解消
     conflict: SemMemConflictConfig = Field(default_factory=SemMemConflictConfig)
     # MemoryInjector

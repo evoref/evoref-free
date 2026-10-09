@@ -70,6 +70,9 @@ MAX_UNANSWERED_ATTEMPTS = 3
 
 #: 昇格させる帰属。
 _PROMOTED_TARGET = "assistant"
+# correction_verify 補助タスクの max_tokens と temperature
+_VERIFY_MAX_TOKENS = 384
+_VERIFY_TEMPERATURE = 0.1
 
 
 def _is_pending(signals) -> bool:
@@ -416,8 +419,8 @@ async def verify_pending_corrections(
                         prev_response, candidate, prev_user=prev_query,
                     ),
                     purpose="correction_verify",
-                    max_tokens=384,
-                    temperature=0.1,
+                    max_tokens=_VERIFY_MAX_TOKENS,
+                    temperature=_VERIFY_TEMPERATURE,
                     response_schema=CorrectionVerdict,
                 )
         except Exception as exc:  # noqa: BLE001 - 検証失敗で学習を止めない

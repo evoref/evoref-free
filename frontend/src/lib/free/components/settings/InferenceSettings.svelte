@@ -2,6 +2,7 @@
 	import { configData } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater, nestedFieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import SettingsSection from './SettingsSection.svelte';
+	import ProSection from './ProSection.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import TextField from './fields/TextField.svelte';
 	import NumberField from './fields/NumberField.svelte';
@@ -47,7 +48,7 @@
 		<SelectField label="settings.llama.cache_type_k" value={String(llama.cache_type_k ?? 'q8_0')} options={cacheTypeOptions} onchange={fieldUpdater('llama', 'cache_type_k')} />
 		<SelectField label="settings.llama.cache_type_v" value={String(llama.cache_type_v ?? 'q8_0')} options={cacheTypeOptions} onchange={fieldUpdater('llama', 'cache_type_v')} />
 		<NumberField label="settings.llama.max_tokens" value={Number(llama.max_tokens ?? 1024)} min={0} description="settings.llama.max_tokens_desc" onchange={fieldUpdater('llama', 'max_tokens')} />
-		<TextField label="settings.llama.lora_target" value={String(llama.lora_target ?? 'auto')} onchange={fieldUpdater('llama', 'lora_target')} />
+		<ProSection><TextField label="settings.llama.lora_target" value={String(llama.lora_target ?? 'auto')} onchange={fieldUpdater('llama', 'lora_target')} /></ProSection>
 		<TagListField label="settings.llama.extra_args" value={(llama.extra_args as string[]) ?? []} placeholder="--arg value" onchange={fieldUpdater('llama', 'extra_args')} />
 	</FieldGroup>
 

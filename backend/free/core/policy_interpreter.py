@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from backend.constants import FLOAT_EPS
 from backend.io.format_registry import FormatSpec, register_format
 from backend.io.readonly import is_readonly
 from backend.io.versioned import VersionedPayloadFile
@@ -121,7 +122,7 @@ def _normalize_sum_to_one_groups(domain: str, mode_params: dict) -> list[str]:
         if any(v is None for v in values):
             continue
         total = float(sum(max(0.0, float(v)) for v in values))
-        if total <= 0.0 or abs(total - 1.0) < 1e-9:
+        if total <= 0.0 or abs(total - 1.0) < FLOAT_EPS:
             continue
         for k, v in zip(keys, values, strict=True):
             mode_params[k] = round(max(0.0, float(v)) / total, 6)

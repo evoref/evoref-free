@@ -33,6 +33,9 @@ _CORRECTION_RATE_THRESHOLD = 0.3   # 訂正率がこれ以上なら「明確性�
 _CHANNEL_RATE_THRESHOLD = 0.3      # 支配的な失敗チャネルがこれ以上なら報告
 _CONSECUTIVE_DECLINE_N = 3         # fitness 連続低下の検出閾値
 _HIGH_AGENT_LOOPS = 3              # エージェントループ数の警告閾値
+_HIGH_LOOP_FAILURE_RATE = 0.3      # 失敗のうち高ループが占める割合の下限 (未満ならパターン化しない)
+_MODE_FAILURE_RATE = 0.4           # モード別の失敗率の下限 (未満ならパターン化しない)
+_SYNTHESIS_TEMPERATURE = 0.3       # critique_synthesis 補助タスクの temperature
 
 # システム能力と矛盾する改善ヒントの検出。「ローカルにアクセスできない前提で
 # 振る舞え」系のヒントはファイル出力依頼の拒否/迂回を助長する
@@ -232,7 +235,7 @@ def _analyze_high_agent_loops(
     if high_loop_count == 0:
         return None, None
     rate = high_loop_count / max(1, len(failures))
-    if rate < 0.3:
+    if rate < _HIGH_LOOP_FAILURE_RATE:
         return None, None
     pattern = (
         f"Excessive agent loops in {rate:.0%} of failures: "
@@ -263,7 +266,7 @@ def _analyze_mode_concentration(
     for mode, fail_count in mode_failures.items():
         mode_total = mode_totals.get(mode, 1)
         rate = fail_count / mode_total
-        if rate < 0.4:
+        if rate < _MODE_FAILURE_RATE:
             continue
         patterns.append(
             f"Failure concentrated in '{mode}' mode "
@@ -457,7 +460,7 @@ class CritiqueSynthesizer:
         data = await self._llm_client.generate_json(
             prompt,
             max_tokens=512,
-            temperature=0.3,
+            temperature=_SYNTHESIS_TEMPERATURE,
             purpose="critique_synthesis",
         )
 

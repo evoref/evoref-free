@@ -119,6 +119,13 @@ _CALL_FLOOR_SEC = 60.0
 #: 使い方を配信形で実行する時間の上限 (``test_timeout_sec`` と小さい方、f_10 §11.1-3)。
 _USAGE_TIMEOUT_SEC = 30.0
 
+# プロンプトへ埋め込む文字数の上限 (CHARS)
+_CODE_EXCERPT_CHARS = 6000  # 既に書いた依存ファイル / コードの抜粋
+_PREVIOUS_CODE_CHARS = 12000  # 作り直し時に渡す直前のコード
+_REPAIR_ERRORS_CHARS = 3000  # 作り直し時に渡すエラー本文
+_TEST_OUTPUT_TAIL_CHARS = 3000  # テスト出力 (pytest / stderr) の末尾
+_GATE_OUTPUT_TAIL_CHARS = 2000  # ゲート結果に残す出力の末尾
+
 _SKELETON_PROMPT = """\
 You design a small software deliverable before any code is written. Return ONLY JSON.
 
@@ -810,7 +817,7 @@ def _module_instruction(
     deps = [d for d in module.get("imports_from") or [] if d in (written or {})]
     if deps:
         task += "\nAlready written files this file uses (use exactly their API / ids / paths):\n" + "\n".join(
-            f"```{languages.fence_language(d)}\n# {d}\n{written[d][:6000]}\n```" for d in deps
+            f"```{languages.fence_language(d)}\n# {d}\n{written[d][:_CODE_EXCERPT_CHARS]}\n```" for d in deps
         ) + "\n"
     task += sibling_sheet
     return f"{shared}{SHARED_CONTEXT_BOUNDARY}{task}"
@@ -914,7 +921,7 @@ def _data_file_instruction(
     """依頼されたデータファイルの生成指示 (書き上がったコードを見て形式を合わせる)。"""
     shared = (f"{brief}\n\n" if brief else "") + render_skeleton_context(skeleton, request)
     code = "\n".join(
-        f"```{languages.fence_language(p)}\n# {p}\n{c[:6000]}\n```" for p, c in code_map.items()
+        f"```{languages.fence_language(p)}\n# {p}\n{c[:_CODE_EXCERPT_CHARS]}\n```" for p, c in code_map.items()
     )
     return f"{shared}{SHARED_CONTEXT_BOUNDARY}" + _DATA_FILE_TASK.format(path=path) + (
         f"\nCode of this deliverable:\n{code}\n" if code else ""
@@ -1153,7 +1160,7 @@ def _contract_evidence(failed_cases: list, stdout_tail: str) -> str:
     """契約テスト後の作り直しに渡す証拠: 落ちた例の式と期待値 + pytest の出力の末尾。"""
     lines = [f"- `{case.module}.{case.call}` must return `{case.expected}`" for case in failed_cases]
     head = "These input/output examples from the contract failed:\n" + "\n".join(lines) + "\n\n" if lines else ""
-    return head + "pytest output:\n" + stdout_tail[-3000:]
+    return head + "pytest output:\n" + stdout_tail[-_TEST_OUTPUT_TAIL_CHARS:]
 
 
 def _unchecked_reason(gate) -> UncheckedReason:
@@ -1669,8 +1676,8 @@ async def run_staged_v2_pipeline(
             if m["path"] in code_map:
                 instruction += "\n\n" + _REPAIR_TASK.format(
                     path=m["path"], fence=languages.fence_language(m["path"]),
-                    errors="\n".join(_errors_for(m["path"], smoke_errors) or smoke_errors)[:3000],
-                    previous=code_map[m["path"]][:12000],
+                    errors="\n".join(_errors_for(m["path"], smoke_errors) or smoke_errors)[:_REPAIR_ERRORS_CHARS],
+                    previous=code_map[m["path"]][:_PREVIOUS_CODE_CHARS],
                 )
             repair_jobs.append(_module_job(m, instruction))
         repaired = await _run_jobs(repair_jobs, slots)
@@ -1848,7 +1855,7 @@ async def run_staged_v2_pipeline(
         outcome, blamed = usage_outcome(
             run, package, args=args, stems={PurePosixPath(p).stem for p in py},
         )
-        return outcome, blamed, (run.stderr or "")[-3000:]
+        return outcome, blamed, (run.stderr or "")[-_TEST_OUTPUT_TAIL_CHARS:]
 
     def _usage_not_run(check: CheckOutcome) -> bool:
         # 時間切れ・実行の場の制約 — もう 1 回実行しても同じ結果になる
@@ -1893,7 +1900,7 @@ async def run_staged_v2_pipeline(
                     )
                     + " failed:\n" + (trace or "; ".join(usage_check.failures))
                 ),
-                previous=code_map[target["path"]][:12000],
+                previous=code_map[target["path"]][:_PREVIOUS_CODE_CHARS],
             )
             [content] = await _run_jobs([_module_job(target, instruction)], slots)
             if content:
@@ -1958,7 +1965,7 @@ async def run_staged_v2_pipeline(
                     task_id=task_id, passed=gate.ok, failed_count=failed_count(gate),
                     attempt=attempts[task_id],
                     summary=gate.error or gate.skip_reason or ("passed" if gate.ok else ""),
-                    output_tail=(gate.stdout_tail or gate.stderr_tail or "")[-2000:],
+                    output_tail=(gate.stdout_tail or gate.stderr_tail or "")[-_GATE_OUTPUT_TAIL_CHARS:],
                     ran_at=time.time(), kind="unchecked" if gate.skipped else kind,
                 ))
             except Exception as exc:  # noqa: BLE001 - 記録の失敗で制作は止めない
@@ -1992,7 +1999,7 @@ async def run_staged_v2_pipeline(
                     _module_job(m, _module_instruction(skeleton, m, request=query, brief=brief, locale=locale)
                                 + "\n\n" + _REPAIR_TASK.format(
                                     path=m["path"], fence=languages.fence_language(m["path"]),
-                                    errors=evidence, previous=code_map.get(m["path"], "")[:12000]))
+                                    errors=evidence, previous=code_map.get(m["path"], "")[:_PREVIOUS_CODE_CHARS]))
                     for m in failing if m["path"] in code_map
                 ]
                 repaired = await _run_jobs(repair_jobs, slots)

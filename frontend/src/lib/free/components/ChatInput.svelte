@@ -45,6 +45,9 @@
 	import FileUpload from './FileUpload.svelte';
 	import FilePreview from './FilePreview.svelte';
 
+	/** デバッグログに出すステップ詳細の最大文字数 */
+	const STEP_DEBUG_DETAIL_CHARS = 120;
+
 	/** インストール済みの文書テンプレート一覧 (0 件なら選択 UI 自体を出さない) */
 	let templates = $state<TemplateSummary[]>([]);
 	let selectedTemplateInfo = $derived(
@@ -222,7 +225,7 @@
 					});
 				} else if (event.type === 'step' && event.step) {
 					if (import.meta.env.DEV) {
-						console.debug('[Chat Step]', event.step.type, event.step.status, event.step.detail?.slice(0, 120));
+						console.debug('[Chat Step]', event.step.type, event.step.status, event.step.detail?.slice(0, STEP_DEBUG_DETAIL_CHARS));
 					}
 					if (event.step.type === 'needs_input') {
 						// blocked のまま次ターンで再開するので、run 記録はここでは消さない。

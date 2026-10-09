@@ -103,6 +103,10 @@ EXTRACTOR_VERSION = 1
 #: 超過分はマーカーが立たないので次サイクルが拾う。
 _MAX_PER_CYCLE = 4
 
+#: ``slot_edit`` の出力トークン上限と生成温度。
+_SLOT_EDIT_MAX_TOKENS = 384
+_SLOT_EDIT_TEMPERATURE = 0.1
+
 #: 判定に出す発話の最大文字数 (長文は 1 つの編集ではない)。
 _MAX_CHARS = 400
 
@@ -715,8 +719,8 @@ async def _ask(aux_client, prompt: str) -> dict:
     parsed = await aux_client.generate_json(
         prompt,
         purpose="slot_edit",
-        max_tokens=384,
-        temperature=0.1,
+        max_tokens=_SLOT_EDIT_MAX_TOKENS,
+        temperature=_SLOT_EDIT_TEMPERATURE,
         response_schema=SlotEdit,
     )
     return parsed if isinstance(parsed, dict) else {}

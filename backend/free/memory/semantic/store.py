@@ -75,6 +75,7 @@ from backend.free.rag.evidence import (
 )
 from backend.free.rag.evidence.ranking import RankColumns, score_rows
 from backend.free.rag.vector_store import dequantize_int8
+from backend.constants import SECONDS_PER_DAY
 from backend.log_config import get_logger
 from backend.utils import parse_utc, utc_now_dt
 
@@ -1237,7 +1238,7 @@ class SemanticStore:
         half_life = record.half_life_days
         if half_life is None or half_life <= 0:
             return False
-        age_days = max(0.0, (now - fact.created_at) / 86400.0)
+        age_days = max(0.0, (now - fact.created_at) / SECONDS_PER_DAY)
         freshness = 0.5 ** (age_days / float(half_life))
         return freshness < KNOW_FRESHNESS_FLOOR
 

@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 import numpy as np
 
+from backend.constants import FLOAT_EPS
 from backend.log_config import get_logger
 
 logger = get_logger("optimizer.spsa")
@@ -89,7 +90,7 @@ class SPSAOptimizer:
 
         # 勾配近似（片側でも番兵値なら 0 勾配でスキップ）
         if invalid_loss is not None and (
-            abs(loss_plus - invalid_loss) < 1e-9 or abs(loss_minus - invalid_loss) < 1e-9
+            abs(loss_plus - invalid_loss) < FLOAT_EPS or abs(loss_minus - invalid_loss) < FLOAT_EPS
         ):
             gradient = np.zeros_like(params)
         else:
@@ -178,7 +179,7 @@ class SPSAOptimizer:
                     (loss_plus, prev_params + perturbation),
                     (loss_minus, prev_params - perturbation),
                 ):
-                    if invalid_loss is not None and abs(ploss - invalid_loss) < 1e-9:
+                    if invalid_loss is not None and abs(ploss - invalid_loss) < FLOAT_EPS:
                         continue
                     if ploss < best_loss:
                         best_loss = ploss

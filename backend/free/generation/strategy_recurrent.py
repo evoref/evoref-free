@@ -45,6 +45,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("backend.free.generation.strategy_recurrent")
 
+# 展開プランの目標文字数: 入力長に掛ける倍率 / 下限 (文字) / 1 unit あたり token の下限 / 目標文字数を割る unit 数
+_EXPAND_INPUT_SCALE = 1.5
+_EXPAND_MIN_TARGET_CHARS = 3000
+_EXPAND_MIN_UNIT_TOKENS = 600
+_EXPAND_UNIT_DIVISOR = 12
+# unit 生成の max_tokens: 見積り token に掛ける余裕倍率
+_UNIT_TOKENS_MARGIN = 1.5
+# 要約のフォールバック (新セクション末尾) の長さ (文字) と要約更新の temperature
+_SUMMARY_FALLBACK_TAIL_CHARS = 300
+_SUMMARY_TEMPERATURE = 0.3
+
 
 # ── プロンプトテンプレート ──
 
@@ -249,8 +260,12 @@ class RecurrentStrategy:
             # EXPAND/SPLIT モード: 詳細仕様書として再構成
             excerpt = excerpt_for_expand(existing_content)
             user_target = extract_target_chars(instruction, default=0)
-            target_length = max(user_target, int(len(existing_content) * 1.5), 3000)
-            per_unit_tokens = max(600, target_length // 12)
+            target_length = max(
+                user_target,
+                int(len(existing_content) * _EXPAND_INPUT_SCALE),
+                _EXPAND_MIN_TARGET_CHARS,
+            )
+            per_unit_tokens = max(_EXPAND_MIN_UNIT_TOKENS, target_length // _EXPAND_UNIT_DIVISOR)
             prompt = _EXPAND_PLAN_PROMPT.format(
                 instruction=instruction,
                 existing_content=excerpt,
@@ -324,7 +339,7 @@ class RecurrentStrategy:
     ) -> AsyncIterator[str]:
         """メインモデルでユニットを逐次生成（ストリーミング）"""
         config_max = self._lf_config.get("unit_max_tokens", 2000)
-        unit_max_tokens = max(config_max, int(unit.estimated_tokens * 1.5))
+        unit_max_tokens = max(config_max, int(unit.estimated_tokens * _UNIT_TOKENS_MARGIN))
 
         if content_type == ContentType.CODE:
             assert isinstance(unit, CodeUnit)
@@ -368,7 +383,7 @@ class RecurrentStrategy:
                 "Recurrent update_summary: aux_client is None, "
                 "returning new section tail as fallback",
             )
-            return new_section[-300:]
+            return new_section[-_SUMMARY_FALLBACK_TAIL_CHARS:]
 
         prompt = _SUMMARY_UPDATE_PROMPT.format(
             budget=budget.skeleton_or_summary,
@@ -379,7 +394,7 @@ class RecurrentStrategy:
             result = await self.aux_client.generate(
                 [{"role": "user", "content": prompt}],
                 max_tokens=budget.skeleton_or_summary,
-                temperature=0.3,
+                temperature=_SUMMARY_TEMPERATURE,
                 purpose="summarize",
                 # 長文生成の途中要約はユーザーが待っている前景処理。purpose 既定
                 # (sleep-time の要約) の「チャットのアイドルを待つ」に巻き込まれると
@@ -390,7 +405,7 @@ class RecurrentStrategy:
         except Exception as e:
             logger.warning("Summary update failed: %s", e)
             # フォールバック: 新セクションの末尾を返す
-            return new_section[-300:]
+            return new_section[-_SUMMARY_FALLBACK_TAIL_CHARS:]
 
     # ── プロンプト構築 ──
 

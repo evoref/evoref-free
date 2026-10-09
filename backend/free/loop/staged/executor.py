@@ -122,6 +122,25 @@ CodegenDelegate = Callable[[str, str], Awaitable[dict[str, str]]]
 # aux / codegen 呼出をそもそも行わずその工程を failure に畳む。
 _STAGE_BUDGET_FLOOR_SEC = 120.0
 
+# spec 文書 (生成 / 深化 / 再試行) の生成温度と、再試行のタイムアウト倍率。
+_SPEC_DOC_TEMPERATURE = 0.3
+_SPEC_RETRY_TIMEOUT_FACTOR = 1.5
+# FlowSpec 合成 (全体 / 部分) のステージ希望タイムアウト (秒)。
+_FLOW_SPEC_TIMEOUT_SEC = 300.0
+_FLOW_PART_TIMEOUT_SEC = 60.0
+# FlowSpec 文脈の先頭部 (Module 節より前) の切詰め長と、1 モジュール当たりの下限 (文字数)。
+_FLOW_HEAD_MAX_CHARS = 2500
+_FLOW_PER_MODULE_MIN_CHARS = 1200
+# smoke ゲート再試行の開始試行番号 (ログ / 状態上の attempt 番号)。
+_SMOKE_FAILFAST_START_ATTEMPT = 30
+_SMOKE_RETRY_START_ATTEMPT = 20
+# smoke エラー要約 / テスト出力末尾 / 成果物 sha の切詰め長 (文字数)。
+_SMOKE_ERR_SUMMARY_CHARS = 300
+_STDOUT_TAIL_MAX_CHARS = 2000
+_ARTIFACT_SHA_PREFIX_CHARS = 12
+# spec 改訂判定 (spec_revision_judge) の出力トークン上限。
+_SPEC_REVISION_JUDGE_MAX_TOKENS = 1536
+
 
 class _StageBudgetExhausted(RuntimeError):
     """残りステージ予算が床を切ったため呼出をスキップしたことを示す内部例外。
@@ -396,10 +415,10 @@ def _condensed_flow_context(spec: str, module_paths: list[str]) -> str:
     """
     entry = extract_entry_point_section(spec)
     idx = spec.find("## Module:")
-    head = (spec[:idx] if idx >= 0 else spec).strip()[:2500]
+    head = (spec[:idx] if idx >= 0 else spec).strip()[:_FLOW_HEAD_MAX_CHARS]
     n = max(len(module_paths), 1)
     per_module = max(
-        (_FLOW_CONTEXT_CHARS - len(head) - len(entry)) // n, 1200,
+        (_FLOW_CONTEXT_CHARS - len(head) - len(entry)) // n, _FLOW_PER_MODULE_MIN_CHARS,
     )
     parts = [head]
     for path in module_paths:
@@ -1678,7 +1697,7 @@ class StagedCreateExecutor:
             timeout = self._stage_timeout(self.spec_timeout_sec, "create_spec_doc")
             resp = await self.aux_client.generate(
                 msgs, purpose="create_spec_doc", max_tokens=self.spec_max_tokens,
-                temperature=0.3, timeout=timeout,
+                temperature=_SPEC_DOC_TEMPERATURE, timeout=timeout,
             )
         except Exception as exc:
             logger.warning("spec doc generation failed: %s", exc)
@@ -1696,11 +1715,11 @@ class StagedCreateExecutor:
         )
         try:
             timeout = self._stage_timeout(
-                self.spec_timeout_sec * 1.5, "create_spec_doc_retry",
+                self.spec_timeout_sec * _SPEC_RETRY_TIMEOUT_FACTOR, "create_spec_doc_retry",
             )
             resp2 = await self.aux_client.generate(
                 msgs, purpose="create_spec_doc", max_tokens=retry_tokens,
-                temperature=0.3, timeout=timeout,
+                temperature=_SPEC_DOC_TEMPERATURE, timeout=timeout,
             )
         except Exception as exc:
             logger.warning("spec doc regeneration failed: %s", exc)
@@ -1743,7 +1762,7 @@ class StagedCreateExecutor:
             resp = await self.aux_client.generate(
                 msgs, purpose="create_spec_deepen",
                 max_tokens=_SPEC_DEEPEN_MAX_TOKENS,
-                temperature=0.3, timeout=timeout,
+                temperature=_SPEC_DOC_TEMPERATURE, timeout=timeout,
             )
         except Exception as exc:
             logger.warning(
@@ -1824,7 +1843,7 @@ class StagedCreateExecutor:
             telemetry: dict = {}
             t_flow = time.monotonic()
             try:
-                timeout = self._stage_timeout(300.0, "flow_spec_synthesis")
+                timeout = self._stage_timeout(_FLOW_SPEC_TIMEOUT_SEC, "flow_spec_synthesis")
                 data = await self.aux_client.generate_json(
                     prompt, system=self.brief or None,
                     max_tokens=_FLOW_MAX_TOKENS, temperature=0.2,
@@ -1910,7 +1929,7 @@ class StagedCreateExecutor:
             steps: list[FlowStep] = []
             for _attempt in range(2):  # 初回 + 再試行 1 回
                 try:
-                    timeout = self._stage_timeout(60.0, "flow_spec_part_synthesis")
+                    timeout = self._stage_timeout(_FLOW_PART_TIMEOUT_SEC, "flow_spec_part_synthesis")
                     data = await self.aux_client.generate_json(
                         prompt, system=self.brief or None,
                         max_tokens=768, temperature=0.2,
@@ -2539,10 +2558,10 @@ class StagedCreateExecutor:
         smoke_ok, gate, errors = await self._smoke_gate(
             task, source_path, src_code,
             max_rounds=(0 if retry_smoke_failfast else None),
-            start_attempt=(30 if retry_smoke_failfast else 1),
+            start_attempt=(_SMOKE_FAILFAST_START_ATTEMPT if retry_smoke_failfast else 1),
         )
         if retry_smoke_failfast and not smoke_ok:
-            err_summary = ("; ".join(errors)[:300] or "smoke errors")
+            err_summary = ("; ".join(errors)[:_SMOKE_ERR_SUMMARY_CHARS] or "smoke errors")
             self.workspace.upsert_task(
                 task_id=task.task_id, title=task.title, stage="test",
                 status="failed", depends_on=task.depends_on,
@@ -2587,7 +2606,7 @@ class StagedCreateExecutor:
             )
         ):
             smoke_ok, gate, errors = await self._smoke_gate(
-                task, source_path, src_code, max_rounds=1, start_attempt=20,
+                task, source_path, src_code, max_rounds=1, start_attempt=_SMOKE_RETRY_START_ATTEMPT,
             )
             if smoke_ok:
                 test_sha, advisory_status, _pytest_gate = (
@@ -2607,7 +2626,7 @@ class StagedCreateExecutor:
             )
         else:
             err_summary = (
-                ("; ".join(errors)[:300] or "smoke errors") if errors else None
+                ("; ".join(errors)[:_SMOKE_ERR_SUMMARY_CHARS] or "smoke errors") if errors else None
             )
         self.workspace.upsert_task(
             task_id=task.task_id, title=task.title, stage="test",
@@ -3238,7 +3257,7 @@ class StagedCreateExecutor:
             )
             data = await self.aux_client.generate_json(
                 prompt, purpose="spec_revision_judge", system=self.brief or None,
-                max_tokens=1536, temperature=0.2, telemetry=judge_telemetry,
+                max_tokens=_SPEC_REVISION_JUDGE_MAX_TOKENS, temperature=0.2, telemetry=judge_telemetry,
                 timeout=timeout,
             )
         except _StageBudgetExhausted as exc:
@@ -3597,7 +3616,7 @@ class StagedCreateExecutor:
         ``kind`` は出所 (``"pytest"`` = 生成テストを実行した / ``"smoke"`` =
         静的ゲートのみ)。``tests_passing`` の集計が両者を区別するために必須。
         """
-        tail = (gate.stdout_tail or gate.stderr_tail or "")[-2000:]
+        tail = (gate.stdout_tail or gate.stderr_tail or "")[-_STDOUT_TAIL_MAX_CHARS:]
         self.workspace.record_test_result(StageTestResult(
             task_id=task_id, passed=gate.ok,
             failed_count=0 if gate.ok else 1,
@@ -3612,7 +3631,7 @@ def _smoke_gate_result(errors: list[str], warnings: list[str]) -> GateResult:
     return GateResult(
         name="import_smoke", ok=ok, skipped=False,
         returncode=0 if ok else 1, duration_ms=0,
-        stdout_tail="\n".join(errors)[-2000:],
+        stdout_tail="\n".join(errors)[-_STDOUT_TAIL_MAX_CHARS:],
         stderr_tail="\n".join(warnings)[-500:],
         error=None if ok else f"{len(errors)} smoke error(s)",
     )
@@ -3620,7 +3639,7 @@ def _smoke_gate_result(errors: list[str], warnings: list[str]) -> GateResult:
 
 def _artifact(logical_path: str, sha256: str) -> ArtifactEntry:
     return ArtifactEntry(
-        path=logical_path, diff_sha1=(sha256[:12] if sha256 else ""),
+        path=logical_path, diff_sha1=(sha256[:_ARTIFACT_SHA_PREFIX_CHARS] if sha256 else ""),
         lines_added=0, lines_removed=0, action_kind="edit_file",
     )
 

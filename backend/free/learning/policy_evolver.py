@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from backend.constants import FLOAT_EPS
 from backend.free.core.session_mode import normalize_session_mode
 from backend.free.learning.fitness import DEFECT_WEIGHTS, defect_rate_fitness
 from backend.io.codec import codec_for, persisted
@@ -1283,7 +1284,7 @@ class PolicyParamEvolver(VersionedJsonFile):
             # 変化がない場合はスキップ
             if param_type == "int" and new_val == current_val:
                 continue
-            if param_type == "float" and abs(new_val - current_val) < 1e-9:
+            if param_type == "float" and abs(new_val - current_val) < FLOAT_EPS:
                 continue
 
             delta[key] = new_val

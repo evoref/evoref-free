@@ -19,6 +19,10 @@ from backend.log_config import get_logger
 
 logger = get_logger("cli.split_layout")
 
+# トークン使用率の色分け境界 (PERCENT): 未満なら low / mid
+_TOKEN_USAGE_MID_PCT = 60
+_TOKEN_USAGE_HIGH_PCT = 85
+
 # textual は optional — ImportError 時は split レイアウト無効
 try:
     from textual.widgets import RichLog
@@ -289,9 +293,9 @@ class SplitLayout:
         self._stop_spinner()
         pct = int(used / limit * 100) if limit > 0 else 0
 
-        if pct < 60:
+        if pct < _TOKEN_USAGE_MID_PCT:
             token_style = theme.token_low
-        elif pct < 85:
+        elif pct < _TOKEN_USAGE_HIGH_PCT:
             token_style = theme.token_mid
         else:
             token_style = theme.token_high
@@ -341,12 +345,6 @@ class SplitLayout:
     def set_streaming(self, streaming: bool) -> None:
         self._app._streaming = streaming
         self._app._interrupt_streaming = False
-
-    def check_interrupt(self) -> bool:
-        if self._app._interrupt_streaming:
-            self._app._interrupt_streaming = False
-            return True
-        return False
 
     # ── ユーティリティ ──
 

@@ -3,8 +3,10 @@
 	import { onMount } from 'svelte';
 	import type { Component } from 'svelte';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
+	import ProjectMapStatus from '$lib/free/components/ProjectMapStatus.svelte';
 	import CartridgeManager from '$lib/free/components/CartridgeManager.svelte';
 	import { isPro } from '$lib/edition';
+	import { proActive } from '$lib/free/stores/server';
 
 	// エディション境界: Free 配下のコンポーネントは $lib/pro を参照できない。
 	// route 層 (ここ) が edition-aware composition 層として Pro コンポーネントを
@@ -27,9 +29,10 @@
 </script>
 
 <PageLayout title={$t('sidebar.cartridges')}>
+	<ProjectMapStatus />
 	<CartridgeManager>
 		{#snippet headerExtra({ refresh }: { refresh: () => Promise<void> })}
-			{#if isPro && CartridgeCreateDialog}
+			{#if $proActive && CartridgeCreateDialog}
 				<button class="create-btn" onclick={() => (showCreateDialog = true)}>
 					{$t('cartridge.create')}
 				</button>

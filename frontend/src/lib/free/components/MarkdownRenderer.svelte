@@ -48,6 +48,8 @@
 	 */
 	const renderCache = new Map<string, string>();
 	const RENDER_CACHE_MAX = 512;
+	/** 非表示タブで rAF が止まるときの描画フォールバック間隔 (ms、約 1 フレーム) */
+	const HIDDEN_TAB_RENDER_DELAY_MS = 16;
 
 	function cachePut(key: string, html: string): void {
 		// FIFO で上限を保つ (Map は挿入順を保持する)。
@@ -93,7 +95,7 @@
 		const hidden = typeof document !== 'undefined' && document.hidden;
 		pendingIsTimer = hidden || typeof requestAnimationFrame !== 'function';
 		return pendingIsTimer
-			? (setTimeout(cb, 16) as unknown as number)
+			? (setTimeout(cb, HIDDEN_TAB_RENDER_DELAY_MS) as unknown as number)
 			: requestAnimationFrame(() => cb());
 	}
 	function unschedule(id: number): void {

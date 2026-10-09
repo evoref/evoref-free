@@ -28,7 +28,7 @@ const BASE_TAB_SECTIONS: Readonly<Record<string, readonly string[]>> = {
 	model: ['model_paths', 'embedding'],
 	rag: ['rag'],
 	memory: ['memory'],
-	learning: ['learning', 'agent'],
+	learning: ['learning', 'agent', 'schedule'],
 	storage: ['local_paths', 'history'],
 	integration: ['tools'],
 	generation: ['modes', 'long_form'],
@@ -44,7 +44,8 @@ export function buildTabSections(edition: string): Record<string, string[]> {
 		sections[key] = [...value];
 	}
 	if (edition === 'pro') {
-		sections.integration = ['external_api', 'widget_proxy', 'tools'];
+		sections.integration = ['widget_proxy', 'tools'];
+		sections.memory = ['memory', 'pro'];
 	}
 	return sections;
 }
@@ -334,25 +335,27 @@ function findTabForSection(section: string): string | null {
 
 // ── applySection 分割 ──
 
-/** セクション群を順次保存し、エラーがあればメッセージ配列で返す */
+/** セクション群を順次保存し、エラーのメッセージ配列と再起動要否を返す */
 async function saveSections(
 	sections: string[],
 	config: Record<string, Record<string, unknown>>
-): Promise<string[]> {
+): Promise<{ errors: string[]; restartRequired: boolean }> {
 	const errors: string[] = [];
+	let restartRequired = false;
 	for (const section of sections) {
 		const data = config[section];
 		if (!data || typeof data !== 'object') continue;
 
 		try {
-			await saveSection(section, data);
+			const res = await saveSection(section, data);
+			if (res?.restart_required === true) restartRequired = true;
 			snapshotSection(section, data);
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
 			errors.push(`${section}: ${msg}`);
 		}
 	}
-	return errors;
+	return { errors, restartRequired };
 }
 
 /** バックエンドから最新設定を再取得してストアに反映 */
@@ -406,7 +409,7 @@ export async function applySection(tabId: string): Promise<boolean> {
 
 	try {
 		const config = get(configData);
-		const errors = await saveSections(sections, config);
+		const { errors, restartRequired } = await saveSections(sections, config);
 
 		if (errors.length > 0) {
 			tabErrors.update((e) => ({ ...e, [tabId]: errors }));
@@ -419,7 +422,10 @@ export async function applySection(tabId: string): Promise<boolean> {
 		await refreshSidebarIfServerSections(sections);
 
 		dirtyTabs.update((d) => ({ ...d, [tabId]: false }));
-		addToast({ type: 'success', i18nKey: 'settings.applied' });
+		addToast({
+			type: 'success',
+			i18nKey: restartRequired ? 'settings.applied_restart_required' : 'settings.applied'
+		});
 		return true;
 	} finally {
 		savingTabs.update((s) => ({ ...s, [tabId]: false }));

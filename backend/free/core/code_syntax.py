@@ -203,15 +203,6 @@ def syntax_checker_missing(path: str) -> str | None:
     return SYNTAX_CHECKER_PACKAGE if not syntax_checker_installed() else f"tree-sitter grammar {lang}"
 
 
-def syntax_check_unavailable(path: str) -> bool:
-    """このパスは tree-sitter で構文を検査する言語なのに、構文検査器が無くて検査できないか。
-
-    :func:`syntax_error_detail` の ``None`` (誤りなし) と「検査しなかった」を分けるため
-    (f_10 §12.4: 飛ばした検査を「合格」と書かない、2026-09-27 ライブ監査 S9)。
-    """
-    return syntax_checker_missing(path) is not None
-
-
 def runtime_environment() -> dict[str, Any]:
     """起動した Python の実行ファイルと任意依存の有無 (起動ログと ``evoref doctor`` が出す)。"""
     import sys

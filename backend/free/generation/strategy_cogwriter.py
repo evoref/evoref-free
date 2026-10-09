@@ -58,6 +58,20 @@ logger = logging.getLogger("backend.free.generation.strategy_cogwriter")
 _CODE_SPEC_MAX_TOKENS = 1536
 _CODE_SPEC_RETRY_MAX_TOKENS = 2560
 _CODE_SPEC_RETRY_TIMEOUT_SEC = 180.0
+# 展開/分割プランの目標文字数: 入力長に掛ける倍率 / 下限 (文字) / 1 unit あたり token の下限 / 目標文字数を割る unit 数
+_EXPAND_INPUT_SCALE = 1.5
+_EXPAND_MIN_TARGET_CHARS = 3000
+_EXPAND_MIN_UNIT_TOKENS = 600
+_EXPAND_UNIT_DIVISOR = 12
+# 補助 JSON 生成 (フローチャート / コードレビュー) の max_tokens と、レビュー系の temperature
+_FLOWCHART_MAX_TOKENS = 1024
+_CODE_REVIEW_MAX_TOKENS = 1024
+_TEXT_REVIEW_MAX_TOKENS = 2048
+_REVIEW_TEMPERATURE = 0.3
+# unit 生成の max_tokens: 見積り token に掛ける余裕倍率
+_UNIT_TOKENS_MARGIN = 1.5
+# 生成済み unit のプレビュー長 (文字)
+_UNIT_PREVIEW_CHARS = 300
 
 
 # ── プロンプトテンプレート ──
@@ -675,9 +689,9 @@ class CogWriterStrategy:
             excerpt = excerpt_for_expand(existing_content)
             # target_length は「ユーザー指定 > 入力長 × 1.5 > 最小 3000」
             user_target = extract_target_chars(instruction, default=0)
-            input_scaled = int(len(existing_content) * 1.5)
-            target_length = max(user_target, input_scaled, 3000)
-            per_unit_tokens = max(600, target_length // 12)
+            input_scaled = int(len(existing_content) * _EXPAND_INPUT_SCALE)
+            target_length = max(user_target, input_scaled, _EXPAND_MIN_TARGET_CHARS)
+            per_unit_tokens = max(_EXPAND_MIN_UNIT_TOKENS, target_length // _EXPAND_UNIT_DIVISOR)
             if long_form_mode == LongFormMode.SPLIT:
                 prompt = _TEXT_PLAN_SPLIT_PROMPT.format(
                     instruction=instruction,
@@ -857,7 +871,7 @@ class CogWriterStrategy:
             # 下で延長 timeout 付き再合成 → なお切断/失敗なら spec=None で安全に縮退。
             spec_telemetry: dict = {}
             data = await self.aux_client.generate_json(
-                prompt, max_tokens=_CODE_SPEC_MAX_TOKENS, temperature=0.3,
+                prompt, max_tokens=_CODE_SPEC_MAX_TOKENS, temperature=_REVIEW_TEMPERATURE,
                 purpose="code_spec_synthesis", telemetry=spec_telemetry,
             )
             # spec 切断はモジュール/インタフェース欠落 → 後続ファイルの黙殺欠落を招く。
@@ -873,7 +887,7 @@ class CogWriterStrategy:
                     retry_tel: dict = {}
                     data_retry = await self.aux_client.generate_json(
                         prompt, max_tokens=_CODE_SPEC_RETRY_MAX_TOKENS,
-                        temperature=0.3, purpose="code_spec_synthesis",
+                        temperature=_REVIEW_TEMPERATURE, purpose="code_spec_synthesis",
                         timeout=_CODE_SPEC_RETRY_TIMEOUT_SEC, telemetry=retry_tel,
                     )
                     if isinstance(data_retry, dict) and data_retry:
@@ -935,7 +949,7 @@ class CogWriterStrategy:
         )
         try:
             data = await self.aux_client.generate_json(
-                prompt, max_tokens=1024, temperature=0.3,
+                prompt, max_tokens=_FLOWCHART_MAX_TOKENS, temperature=_REVIEW_TEMPERATURE,
                 purpose="flowchart_synthesis",
             )
             if isinstance(data, dict):
@@ -953,7 +967,7 @@ class CogWriterStrategy:
         """メインモデルでユニットを逐次生成（ストリーミング）"""
         config_max = self._lf_config.get("unit_max_tokens", 2000)
         # estimated_tokens の 1.5 倍を上限に（余裕を持たせる）、設定値と比較して大きい方
-        unit_max_tokens = max(config_max, int(unit.estimated_tokens * 1.5))
+        unit_max_tokens = max(config_max, int(unit.estimated_tokens * _UNIT_TOKENS_MARGIN))
 
         if content_type == ContentType.CODE:
             assert isinstance(unit, CodeUnit)
@@ -1028,7 +1042,7 @@ class CogWriterStrategy:
         config_max = self._lf_config.get("unit_max_tokens", 2000)
         # リライト時も元のユニットのトークン数に応じた上限を設定
         from backend.utils import estimate_tokens as _est
-        unit_max_tokens = max(config_max, int(_est(original) * 1.5))
+        unit_max_tokens = max(config_max, int(_est(original) * _UNIT_TOKENS_MARGIN))
 
         if content_type == ContentType.TEXT:
             async for token in self._revise_text_unit(
@@ -1205,7 +1219,7 @@ class CogWriterStrategy:
                 # 複数 ReviewIssue(unit_idx/issue/fix) を配列で返すため 512 では
                 # finish_reason=length で約半数が途中切断され json_repair 依存に
                 # なる。1024 へ拡張して切断を抑える。
-                prompt, max_tokens=1024, temperature=0.3,
+                prompt, max_tokens=_CODE_REVIEW_MAX_TOKENS, temperature=_REVIEW_TEMPERATURE,
                 purpose="long_form_code_review",
                 list_key="issues",
             )
@@ -1237,7 +1251,7 @@ class CogWriterStrategy:
 
         generated_previews = []
         for i, text in enumerate(rolling.generated_units):
-            preview = text[:300]
+            preview = text[:_UNIT_PREVIEW_CHARS]
             generated_previews.append(f"[section {i}] {preview}")
 
         prompt = _TEXT_REVIEW_PROMPT.format(
@@ -1251,7 +1265,7 @@ class CogWriterStrategy:
                 # でも 2/8 が finish=length 切断 → json_repair は先頭要素しか
                 # 救済できず後半 unit のレビューが黙って落ちる (2026-07-15
                 # 実測)。2048 へ拡張 (timeout 90s 内に収まる)。
-                prompt, max_tokens=2048, temperature=0.3,
+                prompt, max_tokens=_TEXT_REVIEW_MAX_TOKENS, temperature=_REVIEW_TEMPERATURE,
                 purpose="long_form_text_review",
                 list_key="issues",
             )

@@ -15,6 +15,18 @@
 	let theme = $derived(configSection($configData, 'theme'));
 	let i18n = $derived(configSection($configData, 'i18n'));
 
+	const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1'];
+	let allowRemote = $derived(Boolean(server.allow_remote ?? false));
+	let hostIsLoopback = $derived(LOOPBACK_HOSTS.includes(String(server.host ?? '').trim().toLowerCase()));
+	/** host と allow_remote の食い違い。allow_remote は能力キー相当なので config.yaml でのみ変える */
+	let hostWarning = $derived(
+		!hostIsLoopback && !allowRemote
+			? 'settings.server.host_remote_without_allow'
+			: hostIsLoopback && allowRemote
+				? 'settings.server.allow_remote_without_remote_host'
+				: ''
+	);
+
 	async function handlePromptLocaleChange(newLocale: string | boolean | null) {
 		if (typeof newLocale !== 'string') return;
 		const currentLocale = String(i18n.prompt_locale ?? 'ja');
@@ -55,8 +67,12 @@
 		<TextField
 			label="settings.server.host"
 			value={String(server.host ?? '')}
+			error={hostWarning ? $t(hostWarning) : ''}
 			onchange={fieldUpdater('server', 'host')}
 		/>
+		<p class="remote-state" data-testid="allow-remote-state">
+			{$t(allowRemote ? 'settings.server.allow_remote_on' : 'settings.server.allow_remote_off')}
+		</p>
 		<NumberField
 			label="settings.server.port"
 			value={Number(server.port ?? 8000)}
@@ -132,3 +148,11 @@
 		/>
 	</FieldGroup>
 </SettingsSection>
+
+<style>
+	.remote-state {
+		margin: 0;
+		font-size: 12px;
+		color: var(--text-secondary);
+	}
+</style>

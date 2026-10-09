@@ -2,9 +2,11 @@
 	import { t } from '$lib/i18n';
 	import { layout } from '$lib/free/stores/theme';
 	import { isPro } from '$lib/edition';
+	import { proActive } from '$lib/free/stores/server';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 	import LearningStatus from '$lib/free/components/LearningStatus.svelte';
 	import RAGStats from '$lib/free/components/RAGStats.svelte';
+	import SystemHealthCard from '$lib/free/components/SystemHealthCard.svelte';
 	import { onMount, onDestroy } from 'svelte';
 	import type { Component } from 'svelte';
 	import type { DashboardLearningData, DashboardRagStats } from '$lib/free/api';
@@ -91,7 +93,7 @@
 				fitnessHistory={learningData.fitness_history}
 				policyEvolverStatus={learningData.policy_evolver_status}
 			/>
-			{#if isPro && DashboardProPanels}
+			{#if $proActive && DashboardProPanels}
 				{@const ProPanels = DashboardProPanels}
 				<ProPanels
 					evalCasesCount={learningData.eval_cases_count}
@@ -101,6 +103,7 @@
 				/>
 			{/if}
 			<RAGStats stats={ragStats} />
+			<SystemHealthCard />
 		</div>
 	{:else}
 		<div class="loading">{$t('common.loading')}</div>

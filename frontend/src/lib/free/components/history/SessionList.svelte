@@ -70,6 +70,13 @@
 		background: var(--bg-primary);
 		padding: 8px;
 	}
+	@media (max-width: 767px) {
+		.session-list-pane {
+			width: 100%;
+			min-width: 0;
+			max-height: 40%;
+		}
+	}
 	.center-msg {
 		display: flex;
 		align-items: center;

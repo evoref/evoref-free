@@ -157,8 +157,6 @@ from backend.log_config import get_logger
 from backend.trace_context import (
     generate_trace_id,
     run_in_executor_with_context,
-    set_private,
-    set_private_text,
     set_trace_id,
 )
 
@@ -530,7 +528,6 @@ def _try_reactive_layer(
     record_response(
         state, reactive_resp.content, [], session_id,
         req.message, req.mode, 0,
-        private=req.private,
     )
     if req.stream:
         return StreamingResponse(
@@ -1083,7 +1080,7 @@ async def _dispatch_continuation(
     )
     kwargs = dict(
         mode=req.mode, max_tokens=max_tokens,
-        generation_params=gen_params, timer=timer, private=req.private,
+        generation_params=gen_params, timer=timer,
         continuation_tail=pending.tail,
     )
     return await _respond(
@@ -1169,7 +1166,7 @@ async def _dispatch_reactive_light(
     )
     kwargs = dict(
         mode=req.mode, max_tokens=light_max,
-        generation_params=gen_params, timer=timer, private=req.private,
+        generation_params=gen_params, timer=timer,
     )
     return await _respond(
         req, client, session_id,
@@ -1290,6 +1287,10 @@ def _asks_user_attribute(query: str, mode: str) -> bool:
 #: ``build_messages`` が決めるので、ここは「渡す前に常識的な大きさへ畳む」
 #: ための上限にすぎない (入り切らなければ build_messages 側が更に切る)。
 _ARTIFACT_BLOCK_MAX_CHARS = 6000
+
+#: long_form の総タイムアウトを丸めるときの余裕 (ターン予算から引く) と下限 (SECONDS)。
+_TURN_DEADLINE_MARGIN_SEC = 90.0
+_LONG_FORM_TIMEOUT_FLOOR_SEC = 300.0
 
 
 def _resolve_artifact_block(
@@ -2263,7 +2264,7 @@ def _clamp_long_form_timeout(cfg: dict, mode: str) -> dict:
         turn_budget = float((cfg.get("create") or {}).get("turn_timeout_sec", 3600.0) or 3600.0)
     else:
         turn_budget = float((cfg.get("agent") or {}).get("total_timeout", 1800) or 1800)
-    clamped = max(300.0, turn_budget - 90.0)
+    clamped = max(_LONG_FORM_TIMEOUT_FLOOR_SEC, turn_budget - _TURN_DEADLINE_MARGIN_SEC)
     lf_cfg = dict(cfg.get("long_form") or {})
     existing = float(lf_cfg.get("total_timeout_sec", 1800.0) or 0.0)
     lf_cfg["total_timeout_sec"] = clamped if existing <= 0 else min(existing, clamped)
@@ -2399,7 +2400,6 @@ async def _dispatch_long_form(
     )
     kwargs = dict(
         timer=timer,
-        private=req.private,
         output_target=output_target,
         prefetched_rag=ctx.scored_chunks,
         prefetched_rag_top_score=ctx.rag_top_raw,
@@ -2509,7 +2509,7 @@ async def _run_template_fill(
     # 「モデルが何を返して検査のどこで落ちたか」が追えない (2026-09-20 実機確認)。
     logger.debug(
         "template_fill: decided values (%s): %s",
-        selected.provenance_key, "[PRIVATE]" if req.private else raw_values,
+        selected.provenance_key, raw_values,
     )
     logger.info(
         "template_fill: %s ok=%s missing=%s",
@@ -2583,7 +2583,6 @@ async def _dispatch_template_fill(
         # 通常経路 (ストリーム終了時の clear) より先に record_response が走る。
         record_response(
             state, text, [], session_id, req.message, req.mode, 0,
-            private=req.private,
         )
     finally:
         # ターン終了で必ず捨てる (c_16 §4.5.1)。このディスパッチは _respond を
@@ -3038,7 +3037,6 @@ async def _dispatch_meta_cognitive(
     kwargs = dict(
         generation_params=gen_params,
         timer=timer,
-        private=req.private,
         output_target=output_target,
         rag_used=ctx.rag_used,
         rag_top1_score=ctx.rag_top1_score,
@@ -3102,7 +3100,6 @@ async def _dispatch_deliberative(
         conversation=history,
         generation_params=gen_params,
         timer=timer,
-        private=req.private,
         rag_used=rag_used,
         rag_top1_score=rag_top1_score,
         tool_judge_task=tool_judge_task,
@@ -3150,13 +3147,6 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     """``chat`` の本体 (ターンリースの内側)。"""
     trace_id = generate_trace_id()
     set_trace_id(trace_id)
-    # private セッションではユーザー発話をログへ書かない。書く地点は多数
-    # あるので contextvar で伝播し、redaction processor 側で伏せる
-    # (structlog_config._PRIVATE_CONTENT_KEYS_LOWER)。
-    set_private(req.private)
-    set_private_text(
-        req.message if req.private else "", req.session_id or "",
-    )
 
     logger.debug(
         "POST /api/chat: mode=%s, stream=%s, message_len=%d, session=%s, trace_id=%s",
@@ -3344,7 +3334,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     logger.info(
         "Agent layer: %s (mode=%s) for query: %s",
         plan.layer, req.mode,
-        "[PRIVATE]" if req.private else req.message[:80],
+        req.message[:80],
     )
     # primary routing を decision.jsonl に記録 (evolve 限定)。後続の reactive→
     # light/deliberative escalation (_log_layer_escalation) は別 decision_point。
@@ -3382,7 +3372,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     # (router は EVOLVABLE_DOMAINS から意図的に凍結されている)。
     # 投げっぱなしにして TTFT を 1ms も増やさない。private ターンは渡さない。
     layer_shadow = getattr(state, "layer_shadow", None)
-    if layer_shadow is not None and not req.private:
+    if layer_shadow is not None:
         try:
             _shadow_task = asyncio.create_task(
                 layer_shadow.observe(req.message, plan.layer),

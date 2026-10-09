@@ -148,6 +148,19 @@
 		"placement_cpu": "CPU"
 	},
 	"dashboard": {
+		"health": {
+			"title": "System Health",
+			"ok": "OK",
+			"data": "Data",
+			"data_readonly": "Read-only",
+			"data_warnings": "{count} warning(s)",
+			"liveness": "Effect monitor",
+			"liveness_alerts": "{count} alert(s)",
+			"rerank": "Reranker",
+			"rerank_on": "Enabled",
+			"embed_placement": "Embedding placement",
+			"learning_verdict": "Learning verdict"
+		},
 		"learning_status": "Learning Status",
 		"lora_versions": "LoRA Versions",
 		"rollback": "Rollback",
@@ -257,6 +270,7 @@
 		"apply": "Apply",
 		"applying": "Applying...",
 		"applied": "Settings applied",
+		"applied_restart_required": "Settings saved. A backend restart is required for them to take effect",
 		"apply_failed": "Failed to apply settings",
 		"reset": "Reset",
 		"unsaved_changes": "Unsaved changes",
@@ -347,6 +361,11 @@
 		"group_theme": "Theme",
 		"group_i18n": "Language Settings",
 		"group_rag": "RAG Search",
+		"group_rerank": "Reranker",
+		"group_memory_injection": "Memory Injection Budget",
+		"group_memory_retention": "Memory Retention",
+		"group_memory_pins": "Pinned Memories",
+		"group_schedule": "Schedule",
 		"group_working_memory": "Working Memory",
 		"group_short_term": "Short-Term Memory",
 		"group_conflict": "Conflict Resolution",
@@ -374,7 +393,6 @@
 		"group_local_paths": "Local Paths",
 		"group_history": "Conversation History",
 		"group_tools": "Tools",
-		"group_external_api": "External API",
 		"group_widget_proxy": "Widget Proxy",
 		"group_llama_server": "Server Connection",
 		"group_llama_performance": "Performance",
@@ -395,7 +413,11 @@
 			"host": "Host",
 			"port": "Port",
 			"frontend_port": "Frontend Port",
-			"timeout": "Timeout (sec)"
+			"timeout": "Timeout (sec)",
+			"host_remote_without_allow": "This host is reachable from outside, but allow_remote is false. To use it from a LAN, set server.allow_remote to true in config.yaml (a token becomes mandatory)",
+			"allow_remote_without_remote_host": "allow_remote is true but the host is local to this PC. Change the host as well to use it from a LAN",
+			"allow_remote_on": "allow_remote: enabled (token required). Change it only in config.yaml",
+			"allow_remote_off": "allow_remote: disabled. Change it only in config.yaml"
 		},
 		"i18n": {
 			"locale": "Display Language",
@@ -415,7 +437,9 @@
 			"sequential": "Sequential",
 			"semantic": "Semantic",
 			"fixed": "Fixed",
-			"none": "None"
+			"none": "None",
+			"on": "On",
+			"off": "Off"
 		},
 		"llama": {
 			"host": "Host",
@@ -449,17 +473,18 @@
 			"semantic_max_chunk": "Semantic Max Chunk",
 			"top_k": "Top K",
 			"embedding_dim": "Embedding Dimension",
-			"contextual_retrieval": "Contextual Retrieval",
-			"contextual_prefix_max_tokens": "Context Prefix Max Tokens",
-			"contextual_max_doc_chars": "Context Max Doc Chars",
-			"contextual_batch_size": "Context Batch Size",
 			"quantization": "Quantization",
 			"rescore_candidates": "Rescore Candidates",
 			"memmap_threshold": "memmap Threshold",
 			"relevance_threshold": "Relevance Threshold",
 			"support_threshold": "Support Threshold",
 			"confidence_threshold": "Confidence Threshold",
-			"hysteresis_band": "Hysteresis Band"
+			"hysteresis_band": "Hysteresis Band",
+			"rerank_mode": "Reranker Mode",
+			"rerank_note": "Port, GPU placement and other details are set in config.yaml. Without a model (model_paths.rerank_model) it does not start even when on",
+			"rerank_status_unknown": "Status: not available",
+			"rerank_status_enabled": "Status: enabled (search candidates are reordered)",
+			"rerank_status_disabled": "Status: disabled (reason: {reason})"
 		},
 		"reindex": {
 			"preview": "Reindex (preview)",
@@ -509,7 +534,38 @@
 			"note_evolution_enabled": "Note Evolution",
 			"note_evolution_batch": "Evolution Batch",
 			"note_evolution_context_k": "Context K",
-			"llm_call_base_interval": "LLM Call Base Interval (sec)"
+			"llm_call_base_interval": "LLM Call Base Interval (sec)",
+			"injection_chat_budget_tokens": "Chat injection budget (tokens)",
+			"injection_create_budget_tokens": "Create injection budget (tokens)",
+			"retention_note": "Excess records are trimmed oldest first (pinned ones excepted). Takes effect after a restart",
+			"retention_short_days": "Short-term note retention (days)",
+			"retention_long_max_records": "Long-term note limit (records)",
+			"retention_idx_max_records": "Index limit (records)",
+			"retention_events_keep_months": "Event file retention (months)",
+			"retention_snapshots_keep": "Snapshots to keep",
+			"pins": {
+				"note": "Pinned memories are exempt from retention trimming. Changes take effect immediately (no Apply needed)",
+				"loading": "Loading…",
+				"load_failed": "Could not load the pinned list",
+				"empty": "No pinned memories",
+				"locked": "Locked",
+				"unpin": "Unpin",
+				"force_confirm": "This pin is locked. Unpin it anyway?",
+				"removed": "Unpinned",
+				"remove_failed": "Could not unpin",
+				"add_placeholder": "Something to remember",
+				"add": "Pin",
+				"added": "Pinned",
+				"add_failed": "Could not pin"
+			}
+		},
+		"pro": {
+			"knowledge_enabled": "Automatic knowledge fetching (know.*)",
+			"knowledge_enabled_desc": "Visits the registered sources during idle sleep-time and ingests knowledge. Does nothing when no source is registered"
+		},
+		"schedule": {
+			"local_tz": "Time zone",
+			"local_tz_desc": "IANA name used for learning time-of-day decisions such as night runs (e.g. Asia/Tokyo, UTC)"
 		},
 		"learning": {
 			"level1_min_experiences": "Level 1 Min Experiences",
@@ -555,7 +611,8 @@
 			"rag_top_k_per_unit": "RAG Top-K per Unit"
 		},
 		"local_paths": {
-			"outputs_dir": "Default output directory (relative to the data root)"
+			"outputs_dir": "Default output directory (relative to the data root)",
+			"outputs_dir_desc": "Read-only here. Change it in config.yaml (local_paths.outputs_dir)."
 		},
 		"history": {
 			"auto_save": "Auto Save",
@@ -567,14 +624,6 @@
 		"tools": {
 			"fetch_url_enabled": "URL Fetch",
 			"fetch_url_timeout": "URL Timeout (sec)"
-		},
-		"external_api": {
-			"enabled": "Enabled",
-			"provider": "Provider",
-			"api_key": "API Key",
-			"model": "Model",
-			"max_tokens": "Max Tokens",
-			"timeout": "Timeout (sec)"
 		},
 		"widget_proxy": {
 			"enabled": "Enabled",
@@ -707,6 +756,22 @@
 		"list_empty": "No cartridges installed",
 		"load_failed": "Failed to load cartridge",
 		"unload_failed": "Failed to unload cartridge",
+		"project_map": {
+			"title": "ProjectMap",
+			"disabled": "Disabled (rag.project_map.enabled=false)",
+			"no_version": "Not built yet",
+			"nodes": "Nodes",
+			"edges": "Edges",
+			"updated_at": "Last updated",
+			"update": "Update",
+			"updating": "Updating...",
+			"update_done": "ProjectMap updated ({count} root)",
+			"update_failed": "Failed to update ProjectMap",
+			"load_failed": "Could not load ProjectMap status",
+			"languages": "Languages"
+		},
+		"lora_impact_stale": "The LoRA is now stale. Wait for priority learning or review the LoRA versions",
+		"lora_impact_rolled_back": "LoRA was automatically rolled back to v{version}",
 		"delete_failed": "Failed to delete cartridge",
 		"detail_title": "Cartridge Details",
 		"detail_failed": "Failed to get cartridge details",
@@ -831,7 +896,20 @@
 		"first_message": "(first message)",
 		"copy_turn": "Copy",
 		"copied": "Copied",
-		"copy_failed": "Copy failed"
+		"copy_failed": "Copy failed",
+		"date_from": "From date",
+		"date_to": "To date",
+		"stats_summary": "{sessions} sessions / {turns} turns / {size} MB (limit {max} MB)",
+		"compact": "Compact",
+		"compact_confirm_title": "Compact history?",
+		"compact_confirm_message": "Following the retention policy, old conversations are compressed or summarized, and expired ones are deleted. Deleted conversations cannot be restored.",
+		"compact_done": "Compressed {compressed}, summarized {summarized}, deleted {deleted} ({freed} MB freed)",
+		"compact_failed": "Failed to compact history",
+		"bulk_delete": "Delete {count} shown",
+		"bulk_delete_confirm_title": "Delete history in bulk?",
+		"bulk_delete_confirm_message": "All {count} conversations matching the current filters will be deleted. This cannot be undone.",
+		"bulk_deleted": "Deleted {count} conversations",
+		"bulk_delete_failed": "Failed to delete history in bulk"
 	},
 	"api": {
 		"auto_tune_restamp_refused": "Could not keep the saved results for this PC. \"No change\" is only allowed when only the hostname changed (not the CPU, memory or GPUs); run the tuning to measure again.",

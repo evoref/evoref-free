@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable
 
+from backend.constants import SECONDS_PER_DAY
 from backend.free.memory.types import SemanticFact
 
 
@@ -112,7 +113,7 @@ def select_expired_superseded(
     if retention_days <= 0:
         return []
     now = (now_provider or time.time)()
-    cutoff = now - retention_days * 86400.0
+    cutoff = now - retention_days * SECONDS_PER_DAY
     materialized = list(facts)
     # 誰かの ``superseded_by`` が指している ID は残す。消すと
     # ``delete_facts`` がその参照元を live へ戻し、捨てた値が復活する。

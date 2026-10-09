@@ -38,6 +38,9 @@ logger = get_logger("agent.tools.builtin")
 # 通常のソースファイルはこれより十分小さい。
 _TOOL_MAX_FILE_READ_BYTES = 2_000_000
 
+#: read_file の結果に載せる本文の上限 (CHARS)。超えたら切り詰めの注記を付ける。
+_READ_RESULT_MAX_CHARS = 50000
+
 #: search_code の走査で降りないディレクトリ (隠しディレクトリは別に除く)。
 _WALK_EXCLUDED_DIRS = frozenset({
     "node_modules", "__pycache__", ".git", "models",
@@ -194,8 +197,8 @@ def read_file(
 
         header += "]"
         # 大きすぎるファイルは切り詰め (メタ行は残す)
-        if len(content) > 50000:
-            content = content[:50000] + "\n\n... (truncated, file too large)"
+        if len(content) > _READ_RESULT_MAX_CHARS:
+            content = content[:_READ_RESULT_MAX_CHARS] + "\n\n... (truncated, file too large)"
         return f"{header}\n{content}"
     except Exception as e:
         return f"Error: {e}"

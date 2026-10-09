@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("memory.scheduler")
 
+#: 分と秒の換算。
+_SECONDS_PER_MINUTE = 60
+
 
 #: 補助タスクの「失敗」に数えない理由。チャットに枠を譲ったのは正常動作。
 _AUX_NON_FAILURE_REASONS = frozenset({"preempted_by_chat"})
@@ -533,7 +536,7 @@ class SleepTimeScheduler:
                     "Full task kept alive across user input "
                     "(forced_run=%s, requested=%s, deferred=%.1f min)",
                     self._full_forced_run, self._full_requested,
-                    self._full_deferred_seconds() / 60,
+                    self._full_deferred_seconds() / _SECONDS_PER_MINUTE,
                 )
             else:
                 self._full_task.cancel()
@@ -684,7 +687,7 @@ class SleepTimeScheduler:
                 "Trigger B: keeping the pending full across the response "
                 "(forced_run=%s, requested=%s, deferred=%.1f min)",
                 self._full_forced_run, self._full_requested,
-                self._full_deferred_seconds() / 60,
+                self._full_deferred_seconds() / _SECONDS_PER_MINUTE,
             )
             return
 
@@ -815,7 +818,7 @@ class SleepTimeScheduler:
         if self._last_user_input == 0:
             return False
         elapsed = time.time() - self._last_user_input
-        return elapsed < self.active_minutes * 60
+        return elapsed < self.active_minutes * _SECONDS_PER_MINUTE
 
     async def _run_light(self) -> None:
         """Trigger A: LLM 生成開始直後に Light 版を即座に実行（遅延なし）"""
@@ -880,7 +883,7 @@ class SleepTimeScheduler:
         limit = self.full_max_defer_minutes
         if limit <= 0:
             return False
-        waited_min = self._full_deferred_seconds() / 60
+        waited_min = self._full_deferred_seconds() / _SECONDS_PER_MINUTE
         if waited_min < limit:
             return False
         if not quiet:
@@ -915,7 +918,7 @@ class SleepTimeScheduler:
             # 前倒し要求時は下限だけ待つ (0 秒で起きると生成が in-flight のまま
             # chat_in_flight で弾かれ、次の応答まで再試行できない)。
             return _FULL_MIN_WAIT_SEC
-        idle_s = float(self.full_idle_minutes) * 60
+        idle_s = float(self.full_idle_minutes) * _SECONDS_PER_MINUTE
         if self._verification_waiting:
             # 検証を見送った訂正が残る間は、静穏窓が明けた頃に起きる。再要求は
             # 1 回だけなので、会話中に使い切ると会話が止まっても次の Full は
@@ -928,7 +931,7 @@ class SleepTimeScheduler:
         limit = self.full_max_defer_minutes
         if limit <= 0:
             return idle_s
-        remaining = max(0.0, limit * 60 - self._full_deferred_seconds())
+        remaining = max(0.0, limit * _SECONDS_PER_MINUTE - self._full_deferred_seconds())
         return min(idle_s, max(_FULL_MIN_WAIT_SEC, remaining))
 
     def _chat_recent(self, quiet_sec: float) -> bool:
@@ -1087,7 +1090,7 @@ class SleepTimeScheduler:
         self._level1_defer_since = None
         logger.info(
             "Trigger B: resumed after %.1f min deferred by Level 1",
-            (time.monotonic() - started) / 60,
+            (time.monotonic() - started) / _SECONDS_PER_MINUTE,
         )
 
     async def _schedule_full(self) -> None:
@@ -1161,7 +1164,7 @@ class SleepTimeScheduler:
                 else:
                     logger.debug(
                         "Trigger B: still deferred by Level 1 (%.1f min)",
-                        (time.monotonic() - self._level1_defer_since) / 60,
+                        (time.monotonic() - self._level1_defer_since) / _SECONDS_PER_MINUTE,
                     )
                 success = True
                 skipped_reason = "level1_running"
@@ -1369,7 +1372,7 @@ class SleepTimeScheduler:
     def is_level1_idle(self) -> bool:
         """Level 1 用のアイドル判定（level1_idle_minutes 基準）"""
         elapsed = time.time() - self._level1_idle_since()
-        return elapsed >= self.level1_idle_minutes * 60
+        return elapsed >= self.level1_idle_minutes * _SECONDS_PER_MINUTE
 
     def level1_gate_status(self) -> dict[str, object]:
         """Level 1 常駐ループのゲート状態を返す (観測用、副作用なし)。
@@ -1387,7 +1390,7 @@ class SleepTimeScheduler:
         ``waiting_for_idle`` にしか見えなかった。
         """
         remaining = (
-            self.level1_idle_minutes * 60
+            self.level1_idle_minutes * _SECONDS_PER_MINUTE
             - (time.time() - self._level1_idle_since())
         )
         seconds_until_idle = max(0.0, remaining)
@@ -1414,7 +1417,7 @@ class SleepTimeScheduler:
         self._level1_loop_defer_since = None
         logger.info(
             "Level 1 loop: resumed after %.1f min deferred by the full cycle",
-            (time.monotonic() - started) / 60,
+            (time.monotonic() - started) / _SECONDS_PER_MINUTE,
         )
 
     async def _schedule_level1_loop(self) -> None:
@@ -1458,7 +1461,7 @@ class SleepTimeScheduler:
                         logger.debug(
                             "Level 1 loop: still deferred by the full cycle "
                             "(%.1f min)",
-                            (time.monotonic() - self._level1_loop_defer_since) / 60,
+                            (time.monotonic() - self._level1_loop_defer_since) / _SECONDS_PER_MINUTE,
                         )
                     continue
                 self._note_level1_loop_defer_ended()

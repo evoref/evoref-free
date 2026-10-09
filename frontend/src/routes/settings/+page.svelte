@@ -38,6 +38,8 @@
 		develop: DeveloperSettings
 	};
 
+	let ActiveTab = $derived(TAB_COMPONENTS[$activeTab]);
+
 	onMount(() => {
 		loadConfig();
 	});
@@ -48,8 +50,8 @@
 		<div class="settings-container">
 			<SettingsTabs />
 			<div class="settings-content">
-				{#if TAB_COMPONENTS[$activeTab]}
-					<svelte:component this={TAB_COMPONENTS[$activeTab]} />
+				{#if ActiveTab}
+					<ActiveTab />
 				{/if}
 			</div>
 		</div>

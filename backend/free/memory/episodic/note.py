@@ -96,6 +96,7 @@ from backend.free.rag.evidence import (
     derive_confidence,
     new_evidence_id,
 )
+from backend.constants import SECONDS_PER_DAY
 from backend.log_config import get_logger
 from backend.utils import epoch_to_utc, format_utc, parse_utc, utc_now, utc_now_dt, utc_to_epoch
 
@@ -681,7 +682,7 @@ def note_age_days(note: MemoryNote, now: float | None = None) -> float:
     created = float(note.created_at or 0.0)
     if created <= 0:
         return 0.0
-    return max(0.0, (reference - created) / 86400.0)
+    return max(0.0, (reference - created) / SECONDS_PER_DAY)
 
 
 __all__ = [

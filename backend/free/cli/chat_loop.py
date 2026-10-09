@@ -91,12 +91,6 @@ def _build_chat_payload(
         "mode": sess_state.mode,
         "session_id": sess_state.session_id,
     }
-    # プライベートセッション中はターン単位で private フラグを送信
-    # 受信側 (`backend.free.api.chat.chat`) は `private=True` のターンを memory_only
-    # で扱い、LTM/SemMem 昇格と履歴ディスク永続化をスキップする。
-    if getattr(sess_state, "private_mode", False):
-        payload["private"] = True
-        logger.debug("chat_stream: private mode is ON")
     if file_contexts:
         payload["file_contexts"] = file_contexts
         logger.debug("chat_stream: sending %d file contexts", len(file_contexts))

@@ -126,8 +126,8 @@ def truncate_for_prompt(text: str, limit: int) -> str:
 def public_notes(notes: list["MemoryNote"]) -> list["MemoryNote"]:
     """private セッション由来のノートを落とす (純粋関数)。
 
-    private ターンは ``memory_only`` で動き、LTM / SemMem への昇格をしない契約
-    (``config.yaml`` の ``memory.private``)。Step 8 の抽出器はこれを
+    private ターンは LTM / SemMem への昇格をしない契約 (入口は撤去済みだが、
+    既存のノートの ``private`` は残る)。Step 8 の抽出器はこれを
     ``extractors/base.py`` の ``if note.private: skip`` で守っているが、後から
     足された Step 8.4 / 8.5 / 8.6 の 3 キュレーターは **同じ
     ``short_term.notes.values()`` を受け取りながら同じガードを持っていなかった**。

@@ -12,7 +12,7 @@ export:
   ``learning`` は全 model_key のパーティション (Pro なら ``store/pro/learning/`` も)。
 - Evidence Store (episodic / semantic) は事象ログや snapshot を写さず、畳み込み済みで
   取り消されていないレコードを ``memory/<store>/records.jsonl`` へ論理ダンプする。
-  ``private`` / ``secret`` のレコードは ``include_private`` が無い限り除く。
+  ``private`` / ``secret`` のレコードは常に除く。
 - テキスト (json / jsonl / md / yaml) は ``redact_string`` で走査し、既定で伏せる。
 - 書き出し先はデータ根の外か ``<data_root>/outputs/`` の下。
 
@@ -328,7 +328,7 @@ def resolve_destination(data_root: Path, output: Path | None) -> Path:
 
 
 def _iter_dump_lines(
-    data_root: Path, store_name: str, *, include_private: bool, mask: bool, stats: CategoryStats,
+    data_root: Path, store_name: str, *, mask: bool, stats: CategoryStats,
 ) -> Iterator[str]:
     from backend.free.rag.evidence.store import EvidenceStore
 
@@ -346,7 +346,7 @@ def _iter_dump_lines(
             if record.ignored:
                 stats.ignored_records += 1
                 continue
-            if (record.private or record.confidentiality == "secret") and not include_private:
+            if (record.private or record.confidentiality == "secret"):
                 stats.private_excluded += 1
                 continue
             data = record.to_record()
@@ -381,7 +381,6 @@ def export_data(
     *,
     edition: str,
     categories: Iterable[str] = CATEGORIES,
-    include_private: bool = False,
     mask: bool = True,
     registry: FormatRegistry = FORMATS,
 ) -> ExportReport:
@@ -400,7 +399,7 @@ def export_data(
         if "memory" in stats:
             for store_name in evidence_stores(data_root, registry):
                 lines = list(_iter_dump_lines(
-                    data_root, store_name, include_private=include_private, mask=mask,
+                    data_root, store_name, mask=mask,
                     stats=stats["memory"],
                 ))
                 data = ("\n".join(lines) + "\n").encode("utf-8") if lines else b""

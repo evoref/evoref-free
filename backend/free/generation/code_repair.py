@@ -38,6 +38,17 @@ _MAX_OUTPUT_TOKENS = 6144
 # aux context_size に対する安全マージン (chat template / 特殊トークン分)。
 _CONTEXT_SAFETY_MARGIN = 256
 
+# 修正候補の採用範囲: 元コード長に対する下限 / 上限の倍率 (外れると prose 混入 / 切断とみなす)
+_CANDIDATE_MIN_LEN_RATIO = 0.5
+_CANDIDATE_MAX_LEN_RATIO = 1.8
+# 出力 token の見積り: コード token に掛ける倍率 / 下限
+_OUTPUT_TOKENS_RATIO = 1.4
+_OUTPUT_TOKENS_MIN = 512
+# aux context_size が取れないときの仮定値 (token)
+_DEFAULT_AUX_CONTEXT_SIZE = 8192
+# 修正リクエストの temperature
+_REPAIR_TEMPERATURE = 0.2
+
 # 拡張子 → 言語ラベル (aux 自己点検プロンプト + Python 判定)。
 _EXT_LANG: dict[str, str] = {
     "py": "python", "pyi": "python",
@@ -226,7 +237,7 @@ class CodeRepairer:
         # 検証器が無いため保守的に: 長さが大きく乖離した応答 (prose 混入 /
         # truncation) は採用せず原文を維持する。
         accepted = bool(candidate) and (
-            0.5 * len(code) <= len(candidate) <= 1.8 * len(code)
+            _CANDIDATE_MIN_LEN_RATIO * len(code) <= len(candidate) <= _CANDIDATE_MAX_LEN_RATIO * len(code)
         )
         self._log(
             language=language, attempts=1,
@@ -235,8 +246,8 @@ class CodeRepairer:
         return candidate if accepted else code
 
     async def _ask(self, prompt: str, code: str) -> str:
-        max_tokens = min(_MAX_OUTPUT_TOKENS, max(512, int(estimate_tokens(code) * 1.4)))
-        context_size = getattr(self._aux_client, "context_size", 8192)
+        max_tokens = min(_MAX_OUTPUT_TOKENS, max(_OUTPUT_TOKENS_MIN, int(estimate_tokens(code) * _OUTPUT_TOKENS_RATIO)))
+        context_size = getattr(self._aux_client, "context_size", _DEFAULT_AUX_CONTEXT_SIZE)
         prompt_tokens = estimate_tokens(prompt)
         if prompt_tokens + max_tokens > context_size - _CONTEXT_SAFETY_MARGIN:
             logger.warning(
@@ -248,7 +259,7 @@ class CodeRepairer:
         resp = await self._aux_client.generate(
             [{"role": "user", "content": prompt}],
             purpose="code_repair",
-            temperature=0.2,
+            temperature=_REPAIR_TEMPERATURE,
             max_tokens=max_tokens,
         )
         return remove_code_fences(_extract_content(resp)).strip()

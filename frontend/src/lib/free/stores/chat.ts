@@ -1,7 +1,7 @@
 import { writable, derived, get } from 'svelte/store';
 import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact, CorpusMode, TemplateHint } from '$lib/free/api';
 import { switchModeApi } from '$lib/free/api';
-import { MODE_RESTART_STATUS_TIMEOUT_MS } from '$lib/free/constants';
+import { DEFAULT_TOKEN_LIMIT, MODE_RESTART_STATUS_TIMEOUT_MS } from '$lib/free/constants';
 
 export interface AgenticStep {
 	type: string;
@@ -127,7 +127,7 @@ export const templateHint = writable<TemplateHint | null>(null);
 export const sessionId = writable<string>(modeSessions.chat);
 
 /** トークン使用量 */
-export const tokenInfo = writable<TokenInfo>({ used: 0, limit: 4096, pct: 0, instance_name: 'evoref' });
+export const tokenInfo = writable<TokenInfo>({ used: 0, limit: DEFAULT_TOKEN_LIMIT, pct: 0, instance_name: 'evoref' });
 
 /** ストリーミング中フラグ */
 export const isStreaming = writable<boolean>(false);
@@ -397,7 +397,7 @@ export function clearMessages(): void {
 	modeMessages[current] = [];
 	const newSessionId = crypto.randomUUID();
 	modeSessions[current] = newSessionId;
-	tokenInfo.set({ used: 0, limit: 4096, pct: 0, instance_name: 'evoref' });
+	tokenInfo.set({ used: 0, limit: DEFAULT_TOKEN_LIMIT, pct: 0, instance_name: 'evoref' });
 	sessionId.set(newSessionId);
 	templateHint.set(null);
 }

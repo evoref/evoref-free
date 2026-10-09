@@ -91,6 +91,10 @@ def explicit_ubatch(cfg: dict[str, Any]) -> int | None:
     return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
 
 
+# 「全層を GPU に載せる」を表す -ngl の値 (llama.cpp は層数以上を全層として扱う)
+_NGL_ALL_LAYERS = 999
+
+
 def base_placement(ngl: int, n_layers: int | None, *, has_gpu: bool) -> str:
     """base の配置 (``gpu`` 全層 / ``partial`` 一部 / ``cpu``) を ``-ngl`` から決める (純関数)。
 
@@ -98,7 +102,7 @@ def base_placement(ngl: int, n_layers: int | None, *, has_gpu: bool) -> str:
     """
     if not has_gpu or ngl == 0:
         return "cpu"
-    if ngl < 0 or ngl >= 999 or (n_layers and ngl >= n_layers):
+    if ngl < 0 or ngl >= _NGL_ALL_LAYERS or (n_layers and ngl >= n_layers):
         return "gpu"
     return "partial"
 
@@ -108,7 +112,7 @@ def resolve_base_ngl(cfg: dict[str, Any], project_root: Path, hw: Any) -> int:
 
     項目 ``threads`` / ``ram_params`` が base の配置を知るために使う (保存も resolve_tuned の規則どおり)。
     """
-    raw = (cfg.get("llama") or {}).get("gpu_layers", 999)
+    raw = (cfg.get("llama") or {}).get("gpu_layers", _NGL_ALL_LAYERS)
     if isinstance(raw, int) and not isinstance(raw, bool):
         return raw
     from backend.free.core.tuning.resolve import resolve_tuned
@@ -116,7 +120,7 @@ def resolve_base_ngl(cfg: dict[str, Any], project_root: Path, hw: Any) -> int:
     value = resolve_tuned(
         cfg, "ngl", project_root=project_root, hardware=hw, use_cache=False, can_recompute=no_nested_recompute,
     ).value
-    return value if isinstance(value, int) and not isinstance(value, bool) else 999
+    return value if isinstance(value, int) and not isinstance(value, bool) else _NGL_ALL_LAYERS
 
 
 #: 環境移行の確認待ち (gate の ``tune_pending`` / ``tune_declined``) の間も、起動スクリプトが **保存しない

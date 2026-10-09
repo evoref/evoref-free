@@ -19,9 +19,12 @@ from typing import Any, Callable, TypeVar
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
 
 
+_TRACE_ID_LENGTH = 12
+
+
 def generate_trace_id() -> str:
     """UUID4 短縮形式の trace_id を生成する（12文字 hex）"""
-    return uuid.uuid4().hex[:12]
+    return uuid.uuid4().hex[:_TRACE_ID_LENGTH]
 
 
 def set_trace_id(trace_id: str) -> None:

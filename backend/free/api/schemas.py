@@ -37,9 +37,6 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     file_contexts: list[FileContext] = Field(default_factory=list)
     stream: bool = True
-    # プライベートセッション。``True`` のターンは memory_only
-    # で動作し、LTM/SemMem/履歴ディスク永続化に書き込まない。
-    private: bool = False
     # 文書 (corpus パッケージ) の参加モード (f_01 §8.1、2026-09-14)。
     # ``auto`` = 問いの性質と較正の棒で決める (既定)、``on`` = 問い側の抑止
     # (日付演算等) を掛けずに引く、``off`` = このターンは corpus / 疑似クエリ層を
@@ -693,6 +690,7 @@ class ConfigUpdateResponse(BaseModel):
     """設定セクション更新レスポンス"""
     section: str
     updated: bool
+    restart_required: bool = True
 
 
 class ConfigValidateResponse(BaseModel):

@@ -149,12 +149,6 @@
     "help_pin": "テキストを意味記憶に永続 Pin する",
     "help_unpin": "Pin を解除する (--force でロックを上書き)",
     "help_pinned": "Pin 済みファクト一覧を表示",
-    "private_usage": "使い方: /private on | off | status",
-    "private_enabled": "プライベートセッションを ON にしました (LTM/SemMem/履歴永続化をスキップします)",
-    "private_disabled": "プライベートセッションを OFF にしました",
-    "private_status_on": "プライベートセッション: ON",
-    "private_status_off": "プライベートセッション: OFF",
-    "help_private": "プライベートセッション ON/OFF (memory_only — WM/STM のみ、終了時に揮発)",
     "help_header": "利用可能なコマンド",
     "help_file": "ファイルをコンテキストに追加（読込み・チャンク分割）",
     "help_file_list": "コンテキスト内のファイル一覧を表示",
@@ -410,7 +404,7 @@
     "export_invalid_category": "無効なカテゴリです: {categories}",
     "export_locked": "evoref が稼働中のためエクスポートできません。停止してから再実行してください ({detail})",
     "export_category_line": "  {category}: ファイル {files} 件 / 記録 {records} 件 ({size} MB)",
-    "export_private_excluded": "非公開 (private / secret) の記録 {count} 件は含めていません (--include-private で含めます)",
+    "export_private_excluded": "非公開 (private / secret) の記録 {count} 件は含めていません",
     "export_redacted": "秘密らしい文字列 (API キー・トークン・メールアドレス等) {count} 箇所を伏せました (--no-mask で原文のまま書き出します)",
     "export_redaction_kept": "秘密らしい文字列 (API キー・トークン・メールアドレス等) {count} 箇所を伏せずに書き出しました (--no-mask)",
     "export_destination_inside": "書き出し先はデータ根の外か {outputs} の下にしてください: {path}",
@@ -692,8 +686,6 @@
     "fs": {
       "index_corrupted": "ベクトルインデックスが破損しています。復旧を試みます。",
       "metadata_corrupted": "メタデータファイルが破損しています。復旧を試みます。",
-      "index_metadata_mismatch": "インデックスとメタデータの件数が一致しません。修復を試みます。",
-      "memory_corrupted": "メモリファイルが破損しています。初期化します。",
       "disk_full": "ディスク容量が不足しています。不要なファイルを削除してください。"
     },
     "rag": {
@@ -703,13 +695,11 @@
     },
     "cartridge": {
       "invalid_zip": "不正なカートリッジファイルです: {filename}",
-      "schema_mismatch": "カートリッジの定義ファイルに不備があります。",
       "duplicate_id": "同じIDのカートリッジが既に登録されています: {id}"
     },
     "long_form": {
       "generic": "長文生成中にエラーが発生しました。",
       "insufficient_context": "コンテキストサイズが長文生成に不十分です。最低2048トークンを推奨します。",
-      "plan_failed": "長文生成の計画生成に失敗しました。指示を簡潔にして再試行してください。",
       "unit_failed": "長文生成のユニット生成に失敗しました。"
     },
     "cli": {

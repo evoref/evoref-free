@@ -148,6 +148,8 @@ _WRITTEN_PREVIEW_FULL_BYTES = 2048
 _WRITTEN_PREVIEW_HEAD_LINES = 40
 #: 先頭のみ見せるときの文字数上限 (1 行が極端に長いファイル向けの二重の蓋)。
 _WRITTEN_PREVIEW_MAX_CHARS = 4000
+#: ターン締切 (process() 開始 + 総タイムアウト) から制作ステージの締切までに引く余裕 (SECONDS)。
+_TURN_DEADLINE_MARGIN_SEC = 90.0
 #: 本文提示のためにディスクから読む上限 (バイト)。巨大ファイルを丸ごと載せない。
 _WRITTEN_PREVIEW_READ_BYTES = 64 * 1024
 #: 提示ブロックのフェンス言語 (拡張子 → 言語)。未登録は拡張子をそのまま使う。
@@ -1408,7 +1410,7 @@ class MetaCognitiveAgent(
 
         # 制作ステージの締切 = ターン締切 (process() 開始 + _total_timeout) − 90 秒
         # (f_03 §4.4)。_turn_started_monotonic は _process_or_fallback が設定する。
-        deadline_monotonic = self._turn_started_monotonic + self._total_timeout - 90.0
+        deadline_monotonic = self._turn_started_monotonic + self._total_timeout - _TURN_DEADLINE_MARGIN_SEC
         req = ProductionRequest(
             instruction=original_query,
             brief=self._brief,

@@ -52,18 +52,18 @@
 		{#if !collapsed}
 			<nav class="sidebar-nav" aria-label={$t('sidebar.nav_label')}>
 				<div class="nav-chat-row">
-					<a href="/" class="nav-item nav-chat-link" class:active={isActive('/')}>{$t('sidebar.chat')}</a>
+					<a href="/" class="nav-item nav-chat-link" class:active={isActive('/')} aria-current={isActive('/') ? 'page' : undefined}>{$t('sidebar.chat')}</a>
 					<button class="new-chat-btn" onclick={handleNewChat} aria-label={$t('sidebar.new_chat')} title={$t('sidebar.new_chat')}>+</button>
 				</div>
-				<a href="/history" class="nav-item" class:active={isActive('/history')}>{$t('sidebar.history')}</a>
-				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')}>{$t('sidebar.cartridges')}</a>
+				<a href="/history" class="nav-item" class:active={isActive('/history')} aria-current={isActive('/history') ? 'page' : undefined}>{$t('sidebar.history')}</a>
+				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')} aria-current={isActive('/cartridge') ? 'page' : undefined}>{$t('sidebar.cartridges')}</a>
 				{#if showPro}
-					<a href="/knowledge" class="nav-item" class:active={isActive('/knowledge')}>{$t('sidebar.knowledge_sources')}</a>
+					<a href="/knowledge" class="nav-item" class:active={isActive('/knowledge')} aria-current={isActive('/knowledge') ? 'page' : undefined}>{$t('sidebar.knowledge_sources')}</a>
 				{/if}
-				<a href="/themes" class="nav-item" class:active={isActive('/themes')}>{$t('sidebar.themes')}</a>
-				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')}>{$t('sidebar.dashboard')}</a>
-				<a href="/learning" class="nav-item" class:active={isActive('/learning')}>{$t('sidebar.fewshot')}</a>
-				<a href="/settings" class="nav-item" class:active={isActive('/settings')}>{$t('sidebar.settings')}</a>
+				<a href="/themes" class="nav-item" class:active={isActive('/themes')} aria-current={isActive('/themes') ? 'page' : undefined}>{$t('sidebar.themes')}</a>
+				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')} aria-current={isActive('/dashboard') ? 'page' : undefined}>{$t('sidebar.dashboard')}</a>
+				<a href="/learning" class="nav-item" class:active={isActive('/learning')} aria-current={isActive('/learning') ? 'page' : undefined}>{$t('sidebar.fewshot')}</a>
+				<a href="/settings" class="nav-item" class:active={isActive('/settings')} aria-current={isActive('/settings') ? 'page' : undefined}>{$t('sidebar.settings')}</a>
 				{#if debugEnabled}
 					<span class="debug-badge">{$t('sidebar.debug_mode')}</span>
 				{/if}
@@ -340,6 +340,10 @@
 		outline: none;
 		min-width: 56px;
 		font-family: inherit;
+	}
+	.footer-select:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
 	}
 
 	/* トグルスイッチ */

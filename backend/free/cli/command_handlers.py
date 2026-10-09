@@ -33,6 +33,11 @@ from backend.utils import utc_now
 
 logger = get_logger("cli.command_handlers")
 
+_WEB_MAX_CHARS = 20000  # /web で取り込む本文の上限 (CHARS)
+_WEB_PREVIEW_CHARS = 2000  # /web のコンソール先頭プレビュー (CHARS)
+_LEARN_TRIGGER_TIMEOUT_SEC = 300.0  # 学習の手動トリガー API の待ち時間
+_REINDEX_TIMEOUT_SEC = 600.0  # ベクトルインデックス再構築 API の待ち時間
+
 
 @persisted()
 @dataclass
@@ -544,29 +549,6 @@ async def _cmd_unpin(args: str, state: SessionState, console) -> CommandResult:
     return CommandResult()
 
 
-async def _cmd_private(args: str, state: SessionState, console) -> CommandResult:
-    """/private on|off — プライベートセッションの ON/OFF を切り替える
-
-    プライベート中は WM/STM までで会話が完結し、LTM/SemMem への昇格と
-    ディスク履歴永続化がスキップされる。セッション切替や CLI 終了で揮発する。
-    """
-    arg = args.strip().lower()
-    if arg in ("on", "true", "1", "enable"):
-        state.private_mode = True
-        render_info(console, msg("cli.private_enabled"))
-        return CommandResult()
-    if arg in ("off", "false", "0", "disable"):
-        state.private_mode = False
-        render_info(console, msg("cli.private_disabled"))
-        return CommandResult()
-    if arg in ("", "status"):
-        key = "cli.private_status_on" if state.private_mode else "cli.private_status_off"
-        render_info(console, msg(key))
-        return CommandResult()
-    render_error(console, msg("cli.private_usage"))
-    return CommandResult()
-
-
 async def _cmd_pinned(args: str, state: SessionState, console) -> CommandResult:  # noqa: ARG001
     """/pinned — pin 済みファクト一覧を表示する"""
     try:
@@ -844,15 +826,15 @@ async def _cmd_web(args: str, state: SessionState, console) -> CommandResult:
 
     # 20000文字で切り詰め
     truncated = False
-    if len(text) > 20000:
-        text = text[:20000]
+    if len(text) > _WEB_MAX_CHARS:
+        text = text[:_WEB_MAX_CHARS]
         truncated = True
 
     # コンソール表示（先頭 2000 文字）
-    preview = text[:2000]
+    preview = text[:_WEB_PREVIEW_CHARS]
     console.print()
     console.print(preview)
-    if len(text) > 2000:
+    if len(text) > _WEB_PREVIEW_CHARS:
         render_info(console, msg("cli.web_preview_truncated", total=len(text)))
     if truncated:
         render_info(console, msg("cli.web_content_truncated"))
@@ -937,7 +919,7 @@ async def _learn_trigger(state: SessionState, console, level: str) -> CommandRes
     """学習サイクルを手動トリガー"""
     render_info(console, f"Triggering {level}...")
     try:
-        async with httpx.AsyncClient(headers=backend_headers(), timeout=300.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=_LEARN_TRIGGER_TIMEOUT_SEC) as client:
             resp = await client.post(
                 f"{state.backend_url}/api/learning/trigger",
                 json={"level": level},
@@ -990,7 +972,7 @@ async def _cmd_reindex(args: str, state: SessionState, console) -> CommandResult
         params["cartridge"] = cartridge
 
     try:
-        async with httpx.AsyncClient(headers=backend_headers(), timeout=600.0) as client:
+        async with httpx.AsyncClient(headers=backend_headers(), timeout=_REINDEX_TIMEOUT_SEC) as client:
             # まずドライランで対象件数を取得
             preview_params = dict(params)
             preview_params["dry_run"] = "true"

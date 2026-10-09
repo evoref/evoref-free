@@ -721,13 +721,6 @@ memory:
   # は <data_root>/store/overrides/triggers/<name>.yaml に置く 2 段階解決 (override 優先)。config では指定しない。
   pin:
     auto_detect: true                                          # 自動 Pin 検出 (覚えて/重要/忘れないで等)
-  # --- プライベートセッション ---
-  # private: true のターンは memory_only で動作し、LTM/SemMem への昇格と
-  # 会話履歴のディスク永続化をスキップする。セッション終了時に揮発する。
-  private:
-    default: false                                             # セッション開始時のデフォルト private モード
-    history_storage: memory_only                               # memory_only: private ターンのみ永続化しない (通常ターンは残る)
-                                                               # skip: private ターンを含むセッションは丸ごと永続化しない
   # --- SemMem コンフリクト解消 ---
   conflict:
     default_mode: auto                                         # auto: 例外を除き自動マージ / manual: 全件 pending

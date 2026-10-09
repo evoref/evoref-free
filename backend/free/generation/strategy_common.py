@@ -126,6 +126,15 @@ TEXT_UNIT_CONTINUATION_SYSTEM = """\
 #: 依頼で system を膨らませない。
 _PLAN_REQUEST_MAX_CHARS = 600
 
+# 長文計画の補助 JSON 生成の temperature
+_PLANNING_TEMPERATURE = 0.3
+# 継続モードの既存テキスト圧縮: 超過判定の文字数 / 先頭 / 末尾の保持文字数
+_CONDENSE_TRIGGER_CHARS = 1500
+_CONDENSE_HEAD_CHARS = 500
+_CONDENSE_TAIL_CHARS = 800
+# EXPAND/SPLIT モード用の抜粋の文字数上限
+_EXPAND_EXCERPT_MAX_CHARS = 4000
+
 
 def plan_context_block(plan: GenerationPlan) -> str:
     """unit の system に入れる計画の文脈 (``global_context`` + ``constraints`` + 依頼の原文)。
@@ -426,7 +435,7 @@ async def generate_seeded_plan_json(
         return await aux_client.generate_json(
             prompt,
             max_tokens=768,
-            temperature=0.3,
+            temperature=_PLANNING_TEMPERATURE,
             purpose="long_form_planning",
             response_schema=TextPlanSeeded,
             telemetry=telemetry,
@@ -633,8 +642,8 @@ def excerpt_continuation_content(existing: str) -> str:
     1500 char 以下はそのまま返す。LLM コンテキストと計画精度のバランスを
     考慮した固定値。
     """
-    if len(existing) > 1500:
-        return existing[:500] + "\n\n[...中略...]\n\n" + existing[-800:]
+    if len(existing) > _CONDENSE_TRIGGER_CHARS:
+        return existing[:_CONDENSE_HEAD_CHARS] + "\n\n[...中略...]\n\n" + existing[-_CONDENSE_TAIL_CHARS:]
     return existing
 
 
@@ -646,7 +655,7 @@ def excerpt_for_expand(existing_content: str) -> str:
     以前は冒頭 2000 + 末尾 2000 字で、中盤の節 (データモデル / 入力検証) が
     ちょうど落ちた (2026-09-21 ライブ監査 K01、f_08 §2.2)。
     """
-    return condense_design_doc(existing_content, 4000)
+    return condense_design_doc(existing_content, _EXPAND_EXCERPT_MAX_CHARS)
 
 
 _MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s", re.MULTILINE)
@@ -872,7 +881,7 @@ async def generate_plan_json(
         return await aux_client.generate_json(
             prompt,
             max_tokens=max_tokens,
-            temperature=0.3,
+            temperature=_PLANNING_TEMPERATURE,
             purpose="long_form_planning",
             list_key="units",
             response_schema=plan_schema,

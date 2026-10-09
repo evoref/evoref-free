@@ -23,6 +23,9 @@ export const COPY_NOTIFICATION_TIMEOUT_MS = 1500;
  */
 export const STREAM_CHUNK_TIMEOUT_MS = 180_000;
 
+/** 初期表示のコンテキスト上限 (トークン) — 実値取得前の既定 */
+export const DEFAULT_TOKEN_LIMIT = 4096;
+
 /** 添付ファイルの最大サイズ (bytes) — 10MB */
 export const FILE_MAX_SIZE_BYTES = 10 * 1024 * 1024;
 
