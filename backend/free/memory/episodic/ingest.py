@@ -17,6 +17,7 @@ from typing import Any
 
 from backend.free.core.text_quality import (
     detect_lang,
+    foreign_script_leak,
     is_query_echo,
     strip_echoed_query,
 )
@@ -191,6 +192,7 @@ def ingest_session(
         return 0
     created = 0
     dropped_echo = 0
+    dropped_leak = 0
     # 直前の user 発話。エコー落とし (下記) の比較対象で、ノート化していない
     # ターンから始めても正しく引けるよう、開始位置の 1 つ前から拾う。
     last_user = ""
@@ -208,6 +210,13 @@ def ingest_session(
         role = str(turn.get("role") or "user")
         if role == "user":
             last_user = content
+        elif role == "assistant" and foreign_script_leak(content, query=last_user) is not None:
+            # 他言語のトークンが紛れた応答 (「岚山」「段階별」) は記憶しない。
+            # ノートになると [参考情報] として再注入され、次の応答が混入を
+            # 写す (2026-10-09 監査: 「氵」「杂」が 2 回再注入された)。
+            # 会話の素の記録 (history) は原文のまま残る。
+            dropped_leak += 1
+            continue
         elif last_user and content:
             # 直前のユーザー発言を逐語コピーしただけの応答は記憶しない。
             # 保存すると同じ問いで想起されて再生産され、繰り返し回数が増える
@@ -243,6 +252,11 @@ def ingest_session(
         logger.info(
             "Episodic ingest: dropped %d echo-only assistant turn(s) (session=%s)",
             dropped_echo, session.session_id,
+        )
+    if dropped_leak:
+        logger.info(
+            "Episodic ingest: dropped %d assistant turn(s) with a foreign-script "
+            "token leak (session=%s)", dropped_leak, session.session_id,
         )
     store.progress.mark(session.session_id, session.turns, len(session.turns))
     if created:

@@ -142,3 +142,12 @@
 {"text": "名乗るときは下の名前だけにしています。", "label": "name", "id": "name_shita"}
 {"text": "四捨五入すると五十に近いです。", "label": "age", "id": "age_shisha"}
 {"text": "生まれ育ちはどちらも北の方です。", "label": "origin", "id": "origin_kita"}
+{"text": "数学はずっと苦手です。", "label": "proficiency", "id": "proficiency_sugaku"}
+{"text": "英語は割と得意なほうです。", "label": "proficiency", "id": "proficiency_eigo"}
+{"text": "投資は始めたばかりで、まだよく分かっていません。", "label": "proficiency", "id": "proficiency_toshi"}
+{"text": "楽器はまったく弾けません。", "label": "proficiency", "id": "proficiency_gakki"}
+{"text": "プログラミングは独学で半年ほどです。", "label": "proficiency", "id": "proficiency_dokugaku"}
+{"text": "Excel の関数はそこそこ使いこなせます。", "label": "proficiency", "id": "proficiency_excel"}
+{"text": "妻は数学が苦手です。", "label": "none", "id": "none_third_proficiency"}
+{"text": "数学が苦手な人に向けた勉強法を教えてください。", "label": "none", "id": "none_ask_proficiency"}
+{"text": "私の得意なことは何だと思いますか。", "label": "none", "id": "none_ask_strength"}

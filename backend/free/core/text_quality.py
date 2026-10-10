@@ -29,11 +29,13 @@ from backend.free.core.response_arithmetic import (
 )
 from backend.free.core.response_verifiers import (
     declared_count_mismatch,
+    mask_item_numbers,
     misstated_change_rate,
 )
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.script_ranges import (
     HALFWIDTH_KATAKANA,
+    HANGUL,
     HIRAGANA,
     JAPANESE,
     KANA_BLOCKS,
@@ -158,8 +160,21 @@ _BARE_COPULA_ZE_RE = re.compile(r"是")
 
 @cache
 def _simplified_only_re() -> re.Pattern[str]:
-    """日本語文に混じる簡体字 (符号表から導出、``script_ranges.simplified_only_hanzi``)。"""
-    return re.compile(f"[{simplified_only_hanzi()}]")
+    """日本語文に混じる簡体字の **語** (符号表から導出、``script_ranges.simplified_only_hanzi``)。
+
+    簡体字が語を成しているときだけを見る — 漢字・カタカナと隣り合う (「体验」「杂音」
+    「岚山」) か、ひらがなに両側を挟まれて文中に埋まっている (「とても杂な音」)。
+    前後が括弧・句読点・行頭の単独の字は語ではなく **字そのものへの言及**
+    (「「氵（さんずい）」は水に関係する字」の部首) で、日本語の文章に普通に現れる
+    (2026-10-09 監査: 部首を説明した漢字学習の応答が中国語混入として failed に
+    された)。
+    """
+    simplified = simplified_only_hanzi()
+    word = f"{KANJI}{KATAKANA_WORD}"
+    return re.compile(
+        f"[{simplified}](?=[{word}])|(?<=[{word}])[{simplified}]"
+        f"|(?<=[{HIRAGANA}])[{simplified}](?=[{HIRAGANA}])"
+    )
 
 
 def has_chinese_token_leak(text: str) -> bool:
@@ -175,7 +190,8 @@ def has_chinese_token_leak(text: str) -> bool:
     誤検出を避けるため、判定はコードブロックの外に限り、かつ
 
     - 日本の漢字に存在しない **簡体字** (GB2312 にあり cp932 に無い字を符号表から
-      導出する。手書きの 30 字は「处」「细」を見逃し「没頭」を誤検出していた)
+      導出する。手書きの 30 字は「处」「细」を見逃し「没頭」を誤検出していた) が
+      漢字と隣り合って語を成している形 (部首など単独の字への言及は除く)
     - 熟語 (是非 / 是正 / 是認 / 国是) の構成要素でない **単独の「是」**
 
     という「日本語文には現れえない」形だけを見る。実測 (2026-08-16 監査の
@@ -184,13 +200,74 @@ def has_chinese_token_leak(text: str) -> bool:
 
     漢字は中国語と共有するため、中国語のみで書かれた文も True になる。手本の
     足切りという用途では望ましい側なのでそのままにする。
+
+    引用 (鉤括弧・引用符・行頭 ``>``) とインラインコードの内側も見ない
+    (:func:`_script_leak_scan_body`)。問いに応じた混入の除外 (翻訳依頼) は
+    :func:`foreign_script_leak` が持つ — 判定点はそちらを使う。
     """
-    outside = _CODE_FENCE_RE.sub("\n", text)
+    outside = _script_leak_scan_body(text)
     if not _JA_CHAR_RE.search(outside):
         return False
     if _simplified_only_re().search(outside):
         return True
     return bool(_BARE_COPULA_ZE_RE.search(_JA_ZE_COMPOUND_RE.sub("", outside)))
+
+
+#: ハングル 1 字。
+_HANGUL_RE = re.compile(f"[{HANGUL}]")
+
+#: インラインコード (`` `…` ``)。識別子や原文の引用で他言語の文字が正当に現れる。
+_LEAK_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+#: Markdown の引用行 (行頭 ``>``)。
+_LEAK_BLOCKQUOTE_RE = re.compile(r"^[ \t]*>.*$", re.MULTILINE)
+
+#: 問いがその言語を名指ししている (翻訳・語学の依頼)。言語名の閉じた集合で、
+#: 字句の鍵 (不変則 #14 の対象外) — 意味の分類ではない。
+_ASKS_KOREAN_RE = re.compile(r"韓国語|朝鮮語|ハングル|korean|hangul", re.IGNORECASE)
+_ASKS_CHINESE_RE = re.compile(
+    r"中国語|中文|簡体字|繁体字|北京語|普通話|chinese|mandarin", re.IGNORECASE,
+)
+
+
+def _script_leak_scan_body(text: str) -> str:
+    """他言語トークン混入の判定に掛ける本文 (コード・引用の内側を落としたコピー)。"""
+    from backend.free.core.correction_verdict import mask_quoted_speech
+
+    body = _CODE_FENCE_RE.sub("\n", text or "")
+    body = _LEAK_INLINE_CODE_RE.sub(" ", body)
+    body = _LEAK_BLOCKQUOTE_RE.sub("", body)
+    return mask_quoted_speech(body)
+
+
+def foreign_script_leak(text: str, *, query: str = "") -> str | None:
+    """ja / en の応答に紛れた他言語のトークンの種別を返す (純粋関数)。
+
+    返り値は ``"hangul"`` / ``"chinese"`` / ``None``。**出力契約の SSOT** で、
+    失敗ラベル (``FeedbackCollector``)・few-shot の門・欠陥計数・記憶への取り込みと
+    再注入の門がこの 1 つを読む (不変則 #14 (a))。
+
+    2026-10-09 監査 (実機 301 ターン): 日本語応答の 14 件 (4.7%) に「岚山」「段階별」
+    「빠르게 학습」「杂音」が混入し、生成が長いほど増えた。混入した語は episodic /
+    経験 / 履歴に残り、``[参考情報]`` として再注入されていた。
+
+    - ``hangul``: 引用・コードの外にハングルがある。UI ロケールは ja / en だけなので
+      ハングルは常に混入側。
+    - ``chinese``: :func:`has_chinese_token_leak` (日本語文脈の簡体字の語 / 単独の是)。
+
+    除外: 問いに同じ文字種があるか、問いがその言語を名指ししているとき
+    (翻訳・語学の依頼。応答に当該文字が出るのが正解)。
+    """
+    q = query or ""
+    if _HANGUL_RE.search(_script_leak_scan_body(text)) and not (
+        _HANGUL_RE.search(q) or _ASKS_KOREAN_RE.search(q)
+    ):
+        return "hangul"
+    if has_chinese_token_leak(text) and not (
+        _ASKS_CHINESE_RE.search(q) or any(ch in simplified_only_hanzi() for ch in q)
+    ):
+        return "chinese"
+    return None
 
 
 #: 「<ラベル>は<数値>」型の言明。ラベルは記号・句読点で切れる 1 つながりの語で、
@@ -1243,7 +1320,7 @@ def attribute_belongs_to_another_person(
     text = sentence or ""
     if not text:
         return False
-    own_words = {w for w in trigger_words if w}
+    own_words = tuple(w for w in trigger_words if w)
     saw_trigger = False
     for word in trigger_words:
         if not word:
@@ -1252,21 +1329,32 @@ def attribute_belongs_to_another_person(
         while (pos := text.find(word, search_from)) >= 0:
             search_from = pos + len(word)
             saw_trigger = True
-            head = text[:pos]
-            last_other = -1
-            for m in _OTHER_PERSON_NOUN_RE.finditer(head):
-                noun = re.sub(_PERSON_SUFFIX + r"?(?:が|は|も)$", "", m.group(0))
-                if noun in own_words:
-                    continue
-                last_other = m.start()
-            if last_other < 0:
-                return False
-            last_self = -1
-            for m in _SELF_REFERENCE_RE.finditer(head):
-                last_self = m.start()
-            if last_self > last_other:
+            if not another_person_is_subject_before(text[:pos], own_words):
                 return False
     return saw_trigger
+
+
+def another_person_is_subject_before(head: str, own_words: tuple[str, ...] = ()) -> bool:
+    """``head`` (文頭から注目位置まで) の直近の主語が本人以外の人か (純粋関数)。
+
+    :func:`attribute_belongs_to_another_person` の 1 出現分。本人以外の人 + が / は / も
+    (:data:`_OTHER_PERSON_NOUN_RE`) が一人称より後ろにあれば真。``own_words`` の人
+    (家族スロットの「妻」「娘」) は主語ではなく値なので数えない。Step 8.3 の主体と
+    枠の門 (``memory.notes.speaker_frame_gate``) も同じこの判定を読む (不変則 #14a)。
+    """
+    own = set(own_words)
+    last_other = -1
+    for m in _OTHER_PERSON_NOUN_RE.finditer(head or ""):
+        noun = re.sub(_PERSON_SUFFIX + r"?(?:が|は|も)$", "", m.group(0))
+        if noun in own:
+            continue
+        last_other = m.start()
+    if last_other < 0:
+        return False
+    last_self = -1
+    for m in _SELF_REFERENCE_RE.finditer(head):
+        last_self = m.start()
+    return last_self <= last_other
 
 
 #: 一人称の直後の「の<本人以外の人>」(「私の娘の」— 持ち主は娘)。
@@ -1580,6 +1668,7 @@ __all__ = [
     "has_boilerplate_closing",
     "has_broken_ja_spacing",
     "has_chinese_token_leak",
+    "foreign_script_leak",
     "is_japanese_text",
     "labeled_numeric_claims",
     "strip_system_notes",
@@ -1689,12 +1778,32 @@ def fabricated_household_count(
         n = _person_count_to_int(m.group(1))
         if n is None or n in stated:
             continue
-        lo = max(0, m.start() - _HOUSEHOLD_WINDOW_CHARS)
-        hi = m.end() + _HOUSEHOLD_WINDOW_CHARS
-        if not _HOUSEHOLD_WORD_RE.search(body[lo:hi]):
+        if not _household_word_governs(body, m.start(), m.end()):
             continue
         return f"{m.group(0)} is not a count the user stated"
     return None
+
+
+#: 人数と後ろの世帯語を別の節に分ける区切り (読点・句点・改行)。
+_HOUSEHOLD_CLAUSE_END_RE = re.compile(r"[、，,。．\n]")
+
+
+def _household_word_governs(body: str, start: int, end: int) -> bool:
+    """``body[start:end]`` の人数が世帯の人数として述べられているか (純粋関数)。
+
+    世帯語は **同じ行の前** (「ご家族は…4人ですね」) か、**同じ節の後ろ**
+    (「4人家族」「3人で暮らして」) にあるときだけ人数に係る。行を跨いだ見出しの
+    世帯語や、読点の後ろの別の節の世帯語は係らない (2026-10-09 監査:
+    「**家族やパートナーと共有する**\\n節約は一人で行うものではなく、家族や…」の
+    「一人」を世帯の人数と数えていた)。
+    """
+    line_start = body.rfind("\n", 0, start) + 1
+    lo = max(line_start, start - _HOUSEHOLD_WINDOW_CHARS)
+    if _HOUSEHOLD_WORD_RE.search(body, lo, start):
+        return True
+    after = body[end:end + _HOUSEHOLD_WINDOW_CHARS]
+    brk = _HOUSEHOLD_CLAUSE_END_RE.search(after)
+    return bool(_HOUSEHOLD_WORD_RE.search(after[:brk.start()] if brk else after))
 
 
 #: 答えとして敬称付きで名指した人名 (漢字・カタカナの連なり + 敬称 + 断定)。T2 の形
@@ -1981,8 +2090,14 @@ def is_cut_off_answer(text: str) -> bool:
 
 
 def retracts_own_conclusion(text: str) -> bool:
-    """応答が自分の結論を途中で撤回しているか (純粋関数)。"""
-    if _SELF_RETRACTION_RE.search(text or ""):
+    """応答が自分の結論を途中で撤回しているか (純粋関数)。
+
+    謝罪・訂正の語は引用 (鉤括弧・引用符) の外だけを見る — 例文として引いた
+    「すみません、正しくは…」は撤回ではない。
+    """
+    from backend.free.core.correction_verdict import mask_quoted_speech
+
+    if _SELF_RETRACTION_RE.search(mask_quoted_speech(text or "")):
         return True
     if degenerate_correction(text) is not None:
         return True
@@ -2223,7 +2338,7 @@ def _response_numbers(text: str) -> list[float]:
     4667 に割っていたため、calculate の結果 24666.67 をそのまま述べた回答を
     「結果の無視」と判定した (2026-09-27 監査 C01#3)。
     """
-    return [n.value for n in iter_ja_numbers(text)]
+    return [n.value for n in iter_ja_numbers(mask_item_numbers(text))]
 
 
 def ignores_calculate_result(response: str, result: float | None) -> str | None:
@@ -2319,7 +2434,9 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
         return []
     out: list[str] = []
     # 全角の「２７．８」も読む (位置を保つ正規化。読み手と同じ綴りで小数桁を数える)
-    body = normalize_numerals(_CODE_FENCE_RE.sub("\n", text or ""))
+    # 項目の番号 (「1.」「2.」) は量ではない (2026-10-09 監査: 結果 1 に対し一覧の
+    # 「2.」を丸め違いと読み、正しい応答を failed にした)
+    body = normalize_numerals(mask_item_numbers(_CODE_FENCE_RE.sub("\n", text or "")))
     magnitude = abs(result)  # 本文の数は符号を読まない (ignores_calculate_result と同じ)
     for num in iter_ja_numbers(body):
         if num.has_unit or _PERIOD_DENOMINATOR_TAIL_RE.match(body, num.end):
@@ -3408,7 +3525,7 @@ def count_response_defects(
         "cut_off": int(is_cut_off_answer(text)),
         "cites_reference": int(cites_reference_material(text)),
         "broken_ja_spacing": int(has_broken_ja_spacing(text)),
-        "chinese_leak": int(has_chinese_token_leak(text)),
+        "chinese_leak": int(foreign_script_leak(text, query=query) is not None),
         "self_retraction": int(retracts_own_conclusion(text)),
         "task_log_residue": int(looks_like_task_log_residue(text)),
         "internal_label": int(bool(_INTERNAL_LABEL_RE.search(text))),

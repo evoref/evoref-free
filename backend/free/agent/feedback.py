@@ -77,8 +77,8 @@ from backend.free.core.text_quality import (
     claims_completed_state_change,
     contradicts_measured_values,
     fabricated_household_count,
+    foreign_script_leak,
     has_broken_ja_spacing,
-    has_chinese_token_leak,
     is_cut_off_answer,
     ungrounded_answer_names,
     retracts_own_conclusion,
@@ -269,12 +269,17 @@ _ASSISTANT_SELF_RETRACTION_RE = re.compile(
 
 
 def detect_assistant_self_retraction(response: str) -> bool:
-    """応答冒頭がアシスタント自身による前ターンの撤回かを判定する (純粋関数)。"""
+    """応答冒頭がアシスタント自身による前ターンの撤回かを判定する (純粋関数)。
+
+    引用 (鉤括弧・引用符) の内側は撤回の語として数えない — 「「すみません」と
+    「申し訳ありません」の使い分け」は語を説明しているのであって謝っていない
+    (2026-10-09 監査: 例文を引いた応答が直前ターンを failed に落としていた)。
+    """
     if not response:
         return False
     return bool(
         _ASSISTANT_SELF_RETRACTION_RE.search(
-            response[:_SELF_RETRACTION_HEAD_CHARS],
+            mask_quoted_speech(response)[:_SELF_RETRACTION_HEAD_CHARS],
         ),
     )
 
@@ -987,6 +992,7 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("change rate contradiction", "content.arithmetic", "content_contradiction"),
     ("broken JA spacing", "content.broken_text", "output_broken"),
     ("Chinese token leaked", "content.broken_text", "output_broken"),
+    ("Hangul token leaked", "content.broken_text", "output_broken"),
     ("response retracts", "content.self_retraction", "content_contradiction"),
     ("measured value contradiction", "content.measured", "content_contradiction"),
     ("tool result ignored", "content.tool_result", "tool_result_ignored"),
@@ -1747,7 +1753,7 @@ class FeedbackCollector:
             return "failed", "routing false positive"
         if _is_user_echo(query, text):
             return "failed", "user echo"
-        broken = FeedbackCollector._find_broken_output_reason(text)
+        broken = FeedbackCollector._find_broken_output_reason(text, query=query)
         if broken is not None:
             logger.info("Turn marked failed (%s)", broken)
             return "failed", broken
@@ -1961,7 +1967,7 @@ class FeedbackCollector:
         return None
 
     @staticmethod
-    def _find_broken_output_reason(text: str) -> str | None:
+    def _find_broken_output_reason(text: str, *, query: str = "") -> str | None:
         """応答本文の決定論的な破綻を返す (無ければ ``None``)。
 
         判定器はすべて横断基盤の純粋関数。few-shot の内容棄却ゲートと同じ
@@ -1983,8 +1989,11 @@ class FeedbackCollector:
             return f"sign contradiction: {sign}"
         if has_broken_ja_spacing(text):
             return "broken JA spacing"
-        if has_chinese_token_leak(text):
+        leak = foreign_script_leak(text, query=query)
+        if leak == "chinese":
             return "Chinese token leaked into JA response"
+        if leak == "hangul":
+            return "Hangul token leaked into response"
         if retracts_own_conclusion(text):
             return "response retracts its own conclusion mid-answer"
         if is_cut_off_answer(text):

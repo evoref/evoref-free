@@ -102,6 +102,7 @@ from backend.free.core.intent_vocab import (
     resolve_session_answer,
     resolve_session_position_message,
     only_session_ordinal_recall,
+    recall_form_points_into_conversation,
     session_answer_asks_restate,
     session_answer_ordinal,
     session_position_kind,
@@ -109,6 +110,7 @@ from backend.free.core.intent_vocab import (
     unused_tool_question,
     unverified_claim_numbers,
 )
+from backend.free.core.conversation_scope import addresses_ongoing_conversation
 from backend.free.core.inference import messages_carry_evidence
 from backend.free.core.text_quality import asks_for_person, misrounded_result_values
 from backend.free.core.turn_text import TOOL_RESULT_HEADER, append_to_last_user
@@ -528,6 +530,23 @@ _RECALL_IN_WINDOW_GUIDANCES: dict[str, str] = {
         "conversation, and the relevant message is in the conversation history "
         "above (there is no need to search other past conversations). Find that "
         "message in the history and answer by showing its content as it is."
+    ),
+}
+#: 同じ抑止で、問いが **特定の発言ではなく会話そのもの** を対象にした依頼
+#: (「ここまでの要点をチェックリストにして」) のときの文言。「該当する発言を探し、
+#: そのまま示せ」は要約・変換の依頼を 1 つの発言の再掲へ枠付けし、まとめ漏れを
+#: 招く (2026-10-09 実機 10:18)。対象と材料の所在だけを伝える。
+_RECALL_IN_WINDOW_WHOLE_GUIDANCES: dict[str, str] = {
+    "ja": (
+        "\n\n確定事実: 尋ねられているのはこの会話そのもので、材料は上の会話履歴に"
+        "ある (過去の別の会話を検索する必要は無い)。会話履歴の内容をもとに依頼に"
+        "答えること。"
+    ),
+    "en": (
+        "\n\nEstablished fact: the request is about this conversation itself, and "
+        "the material is in the conversation history above (there is no need to "
+        "search other past conversations). Answer the request from the content of "
+        "the history."
     ),
 }
 
@@ -3589,7 +3608,7 @@ class DeliberativeAgent:
         (2026-09-27 監査 F9)。それ以外は「検索していない」の注記。
         """
         if judgement.recall_in_window:
-            DeliberativeAgent._append_recall_in_window_note(messages)
+            DeliberativeAgent._append_recall_in_window_note(messages, query)
         elif judgement.answered_from_memory:
             DeliberativeAgent._append_answered_from_memory_note(messages)
         elif judgement.partially_answered_from_memory:
@@ -3622,16 +3641,27 @@ class DeliberativeAgent:
         )
 
     @staticmethod
-    def _append_recall_in_window_note(messages: list[dict]) -> None:
+    def _append_recall_in_window_note(messages: list[dict], query: str = "") -> None:
         """窓内想起で履歴検索を止めたターンへ「対象はこの会話の中」と注記する。
 
         ``_append_history_not_searched_note`` (「検索していない。確認できていない
         なら正直に」) をここで付けると、会話にある答えを「記録は含まれていない」
         と否定する (2026-09-26 監査 C05#5)。
+
+        問いが会話そのものを対象にした依頼 (``addresses_ongoing_conversation``) で、
+        特定の発言を指していない (位置・N 番目の回答・会話内の想起の形が無い)
+        ときは「該当する発言をそのまま示せ」を付けず、材料の所在だけを伝える
+        (``_RECALL_IN_WINDOW_WHOLE_GUIDANCES``)。
         """
-        append_to_last_user(
-            messages, _localized(_RECALL_IN_WINDOW_GUIDANCES), separator="",
+        q = query or ""
+        whole = (
+            addresses_ongoing_conversation(q)
+            and session_position_kind(q, anchored=True) is None
+            and session_answer_ordinal(q) is None
+            and not recall_form_points_into_conversation(q)
         )
+        guidances = _RECALL_IN_WINDOW_WHOLE_GUIDANCES if whole else _RECALL_IN_WINDOW_GUIDANCES
+        append_to_last_user(messages, _localized(guidances), separator="")
 
     @staticmethod
     def _append_write_target_unknown_note(

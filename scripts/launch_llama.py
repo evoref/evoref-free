@@ -1596,6 +1596,12 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
         # 再帰状態のサイズ (``<arch>.ssm.state_size`` / ``<arch>.ssm.inner_size``)。
         "ssm_state_size": None,
         "ssm_inner_size": None,
+        # 再帰層の畳み込み状態 (``<arch>.ssm.conv_kernel`` / ``<arch>.ssm.group_count``)。
+        # checkpoint 1 つの状態量の見積り (estimate_checkpoint_state_mb) に使う。
+        "ssm_conv_kernel": None,
+        "ssm_group_count": None,
+        # SWA の窓 (``<arch>.attention.sliding_window``)。不在 = SWA なし。
+        "sliding_window": None,
         # LoRA アダプタ専用の evoref 独自 KV (学習元モデルの model_key)
         "trained_on_model_key": None,
     }
@@ -1678,6 +1684,21 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                 elif key.endswith(".ssm.inner_size"):
                     try:
                         result["ssm_inner_size"] = int(_gguf_read_scalar_or_skip(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".ssm.conv_kernel"):
+                    try:
+                        result["ssm_conv_kernel"] = int(_gguf_read_scalar_or_skip(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".ssm.group_count"):
+                    try:
+                        result["ssm_group_count"] = int(_gguf_read_scalar_or_skip(f, vtype))
+                    except (TypeError, ValueError):
+                        pass
+                elif key.endswith(".attention.sliding_window"):
+                    try:
+                        result["sliding_window"] = int(_gguf_read_scalar_or_skip(f, vtype))
                     except (TypeError, ValueError):
                         pass
                 elif key == "tokenizer.chat_template":
@@ -2058,6 +2079,71 @@ def estimate_kv_cache_mb(
         )
 
     return int(round(total / (1024 * 1024)))
+
+
+def estimate_checkpoint_state_mb(
+    meta: dict,
+    n_ctx: int,
+    cache_type_k: str | None,
+    cache_type_v: str | None,
+) -> int | None:
+    """コンテキスト checkpoint 1 つ (1 スロット) がホスト RAM に持つ状態量 (MiB) を GGUF から見積もる。
+
+    llama-server が checkpoint を作るのは部分巻き戻しのできないモデルだけで、保存するのは
+    KV 全体ではなく巻き戻せない部分だけ:
+
+    - **再帰層** (hybrid recurrent / 純 SSM): ``estimate_kv_cache_mb`` の再帰状態と同じ
+      ``n_recurrent × ssm_state_size × ssm_inner_size × 4B (f32)`` に、畳み込み状態
+      ``n_recurrent × (ssm_conv_kernel - 1) × (ssm_inner_size + 2 × ssm_group_count × ssm_state_size) × 4B``
+      を足す (文脈長に依存しない)。実測 (2026-10-09, Qwen3.6-35B-A3B: 30 再帰層 / state 128 /
+      inner 4096 / conv 4 / group 16) の 62.8 MiB と本式の 62.8 MiB が一致する。
+    - **SWA**: 窓 ``min(sliding_window, n_ctx)`` 分の KV。どの層が SWA かは GGUF から確実に
+      取れないので全層で数える (多め = RAM を保守側に見る)。
+
+    どちらでもない純 attention モデルは checkpoint を作らないので 0。必要なメタデータが
+    欠けて見積れなければ ``None`` (呼び出し側で概算へ縮退する)。
+    """
+    n_layers = meta.get("block_count")
+    if not n_layers:
+        return None
+    n_blocks = int(n_layers) - int(meta.get("nextn_predict_layers") or 0)
+    if n_blocks <= 0:
+        return None
+    interval = int(meta.get("full_attention_interval") or 0)
+    state_size = meta.get("ssm_state_size")
+    window = int(meta.get("sliding_window") or 0)
+    is_recurrent = bool(state_size) or interval > 1
+    if not is_recurrent and window <= 0:
+        return 0
+
+    total = 0
+    if is_recurrent:
+        inner_size = meta.get("ssm_inner_size")
+        if not (state_size and inner_size):
+            return None
+        n_attn = n_blocks // interval if interval > 1 else 0
+        n_recurrent = n_blocks - n_attn
+        total += n_recurrent * int(state_size) * int(inner_size) * 4
+        conv_kernel = int(meta.get("ssm_conv_kernel") or 0)
+        if conv_kernel > 1:
+            conv_dim = int(inner_size) + 2 * int(meta.get("ssm_group_count") or 0) * int(state_size)
+            total += n_recurrent * (conv_kernel - 1) * conv_dim * 4
+    if window > 0:
+        n_head_kv = meta.get("head_count_kv")
+        head_dim_k = meta.get("key_length")
+        head_dim_v = meta.get("value_length") or head_dim_k
+        if not head_dim_k:
+            n_embd = meta.get("embedding_length")
+            n_head = meta.get("head_count")
+            if n_embd and n_head:
+                head_dim_k = head_dim_v = n_embd // n_head
+        if not (n_head_kv and head_dim_k and head_dim_v and n_ctx and n_ctx > 0):
+            return None
+        tokens = min(window, int(n_ctx))
+        total += tokens * n_blocks * int(n_head_kv) * (
+            head_dim_k * _kv_bytes_per_elem(cache_type_k) + head_dim_v * _kv_bytes_per_elem(cache_type_v)
+        )
+    return max(1, int(-(-total // (1024 * 1024))))
 
 
 _gguf_meta_cache: dict[tuple[str, int, int], dict] = {}

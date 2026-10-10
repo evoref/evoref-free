@@ -31,7 +31,7 @@ from backend.free.core.correction_verdict import (
     norm_span,
 )
 from backend.free.core.correction_target import old_value_core, split_sentences
-from backend.free.core.intent_vocab import is_plain_statement
+from backend.free.core.intent_vocab import is_plain_statement, plain_statement_sentences
 from backend.free.core.relative_date import strip_date_annotation_after
 from backend.free.core.text_quality import (
     person_trigger_is_oblique,
@@ -517,6 +517,14 @@ _CHANGE_ANNOUNCEMENT_RE = re.compile(
     r"(?:変わりました|変わった|変更(?:に)?なりました|変更しました|変更です"
     r"|延期になりました|延期です|前倒しになりました)[。．.!！]*\s*$",
 )
+
+
+def _is_request_material(content: str, evidence: str) -> bool:
+    """根拠の文が依頼の素材 (例文・後ろの依頼の目的語) か (判定は記録する)。"""
+    from backend.free.memory.notes.speaker_frame_gate import REQUEST_MATERIAL, judge
+
+    verdict = judge(content, evidence)
+    return verdict.fired and verdict.evidence == REQUEST_MATERIAL
 
 
 def _drop_shadowed_by_predicate_slot(
@@ -2019,9 +2027,10 @@ class ChatExtractor(BaseExtractor):
                 # trigger 辞書が 1 語も当たらず、値アンカーも継承も効かなかった。
                 # このノートは抽出対象にならない (記憶が 1 件も残らない)。
                 result.notes_without_tags += 1
-                # 平叙文だけを別に数える — 生の件数は会話の形でほぼ決まり、
-                # 指標にならない (base.py の注記を参照)。
-                if is_plain_statement(content):
+                # 平叙の文を持つものだけを別に数える — 生の件数は会話の形でほぼ
+                # 決まり、指標にならない (base.py の注記を参照)。平叙かは文単位
+                # (Step 8.3 の条件 3 と同じ 1 実装、2026-10-10)。
+                if plain_statement_sentences(content):
                     result.notes_without_tags_stating += 1
             # 主語を省いた訂正の旧値を本人以外の人が持つなら、訂正の文が解決した
             # 本人のスロットには書かない (2026-09-27 監査 F10: 子どもの卵アレルギーの
@@ -2371,6 +2380,11 @@ class ChatExtractor(BaseExtractor):
                         # (「息子と一緒に見られる作品がいい」) も本人の属性ではない
                         # (2026-09-12 ライブ監査 T08/4)。
                         and not person_trigger_is_oblique(spec[1], spec[2])
+                        # 依頼の素材 (「例文: 私は京都に住んでいます。これを英訳
+                        # して。」) は本人の言明ではない。Step 8.3 の主体と枠の門と
+                        # 同じ判定の、依頼の素材の理由だけを読む (2026-10-10。他の
+                        # 理由は Step 8 の既存の門が担っている)。
+                        and not _is_request_material(content, spec[1])
                     ]
                     attr_specs = _drop_shadowed_by_predicate_slot(attr_specs)
                 else:

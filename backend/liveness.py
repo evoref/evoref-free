@@ -53,7 +53,11 @@ GATE_MIN_DECISIONS = 100
 #: 何百回でも ``none`` のままで正常なので、「いつも否定ラベル」は恒偽として警告しない。
 #: 警告するのは **いつも否定でない** (恒真) とき。2026-10-06 ライブ監査: 91 件の実質的な依頼の
 #: 間 ``none`` だけで退化と出た。名前の実在は test_liveness の検査が固定する。
-RARE_EVENT_GATES = frozenset({"gate.contentless_social_formula"})
+#: ``speaker_own_statement`` (例文・虚構・他者の話の値を拒む、2026-10-10) も同じ形。
+RARE_EVENT_GATES = frozenset({
+    "gate.contentless_social_formula",
+    "gate.speaker_own_statement",
+})
 
 FAILURE_CLASSES = ("transient", "unrecoverable")
 _BAND_CODES = {"fire": "f", "abstain": "a", "skip": "s"}

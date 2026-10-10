@@ -62,9 +62,9 @@ from backend.free.core.text_quality import (
     SYSTEM_MEASUREMENT_MARKER,
     SYSTEM_NOTE_TAIL_RE,
     asks_verbatim_excerpt,
+    foreign_script_leak,
     has_boilerplate_closing,
     has_broken_ja_spacing,
-    has_chinese_token_leak,
     is_query_echo,
     retracts_own_conclusion,
     violates_length_constraint,
@@ -270,12 +270,13 @@ def _response_leaks_internal_scaffold(response: str) -> bool:
 #: — 別々に定義すると片方だけ直る。
 _response_has_broken_ja_spacing = has_broken_ja_spacing
 
-#: 日本語の応答に中国語の語彙が紛れた例も手本にしない。語間空白と同じく
+#: 日本語の応答に中国語・ハングルの語彙が紛れた例も手本にしない。語間空白と同じく
 #: 「崩れた出力が手本として再生産される自己増幅」を断つための決定論ゲート。
 #: 2026-08-16 ライブ監査 (Qwen3.8-27B): 「私について知っていること」を 2 度
 #: 尋ねた両方で「名前**是**小川さんです。」と繋辞の ``是`` が出た (2 度目は
-#: 1 度目の出力が文脈に残っていたための複写)。
-_response_has_chinese_token_leak = has_chinese_token_leak
+#: 1 度目の出力が文脈に残っていたための複写)。判定は失敗ラベル・記憶の門と同じ
+#: :func:`foreign_script_leak` (問いが翻訳依頼なら混入としない)。
+_response_script_leak = foreign_script_leak
 
 
 #: 発話時点の「いま」を指す語。これを含む問いへの答えは、その日にしか成立しない。
@@ -587,9 +588,12 @@ def find_content_rejection(
     # 手本として再生産される自己増幅ループになる (_JA_INTERWORD_SPACE_RE 参照)。
     if _response_has_broken_ja_spacing(response):
         return "broken JA spacing"
-    # 日本語に中国語の語彙が紛れた応答も同じ理由で手本にしない。
-    if _response_has_chinese_token_leak(response):
+    # 日本語に中国語・ハングルの語彙が紛れた応答も同じ理由で手本にしない。
+    leak = _response_script_leak(response, query=query)
+    if leak == "chinese":
         return "Chinese token leaked into JA response"
+    if leak == "hangul":
+        return "Hangul token leaked into response"
     # 質問を逐語で繰り返しただけの応答は「問いをそのまま返すのが正解」という
     # バイアスを注入する (2026-08-04 ライブ監査: 同文 5 回で答えが出なくなった)。
     if is_query_echo(response, query):
@@ -694,6 +698,7 @@ FEWSHOT_ATTRIBUTABLE_REASONS: tuple[str, ...] = (
     "declared count mismatch",
     "broken JA spacing",
     "Chinese token leaked",
+    "Hangul token leaked",
     "response retracts",
     "retracted by assistant",
     "user echo",

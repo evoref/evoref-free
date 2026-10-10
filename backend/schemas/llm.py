@@ -329,7 +329,22 @@ class ProfileSamplingConfig(BaseModel):
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=0)
     presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
     repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+
+
+class ProfileSamplingByModeConfig(BaseModel):
+    """モデルプロファイルの ``sampling_by_mode`` セクション (モード別の推奨サンプリング)。
+
+    優先順は schema 既定 < ここ < config で明示した ``modes.<mode>.*`` <
+    旧形式の ``sampling`` (``backend/config.py`` の ``get_mode_generation_params``)。
+    旧形式の ``sampling`` はモードを横断して config の明示値まで上書きするため非推奨。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    chat: ProfileSamplingConfig | None = None
+    create: ProfileSamplingConfig | None = None
 
 
 class ProfileReasoningConfig(BaseModel):

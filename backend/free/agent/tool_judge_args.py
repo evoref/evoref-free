@@ -12,6 +12,7 @@ import functools
 import re
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit, urlunsplit
 
 from backend.log_config import get_logger
 
@@ -21,6 +22,42 @@ logger = get_logger("agent.tool_judge_args")
 # 入力で末尾テキストを URL に取り込まないようにする
 # (例: https://news.yahoo.co.jp/で取得して... → https://news.yahoo.co.jp/ のみ)。
 _URL_IN_QUERY_RE = re.compile(r"(https?://[^\s\]）」』\u0080-\U0010ffff]+)")
+
+#: 文中の URL の直後に付きやすい ASCII の句読点・閉じ括弧 (Markdown の ``(url)`` 等)。
+#: ``_URL_IN_QUERY_RE`` は URL 内にも現れうるのでこれらを除外していない。
+_URL_TRAILING_PUNCT = ".,;:!?)'\">"
+
+
+def normalize_fetch_url(url: str) -> str:
+    """取得の鍵にする URL の最小限の正規化 (純粋関数)。
+
+    スキームとホストを小文字に、フラグメントとパス末尾の ``/`` を落とす。
+    クエリ文字列とパスの大小文字は残す (別の資源でありうる)。
+    """
+    raw = url.strip()
+    if not raw:
+        return ""
+    parts = urlsplit(raw)
+    return urlunsplit((
+        parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"),
+        parts.query, "",
+    ))
+
+
+def urls_in_text(text: str) -> frozenset[str]:
+    """本文に逐語で現れる URL を :func:`normalize_fetch_url` した集合 (純粋関数)。
+
+    文末の句読点・閉じ括弧を剥いだ形も入れる (``…/a.`` と ``…/a`` のどちらが
+    URL の一部かは字面では決まらないので両方を候補にする)。
+    """
+    found: set[str] = set()
+    for match in _URL_IN_QUERY_RE.finditer(text or ""):
+        raw = match.group(1)
+        for candidate in (raw, raw.rstrip(_URL_TRAILING_PUNCT)):
+            key = normalize_fetch_url(candidate)
+            if key:
+                found.add(key)
+    return frozenset(found)
 def _normalize_path_text(text: str) -> str:
     """パス照合用にセパレータと大小文字を正規化する (純粋関数)。"""
     return text.replace("\\", "/").casefold()

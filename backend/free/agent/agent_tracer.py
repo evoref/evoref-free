@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
@@ -47,9 +48,16 @@ class AgentTracer:
         self,
         debug_logger: DebugLogger | None = None,
         trace_store: AgentTraceStore | None = None,
+        env_valued_action: Callable[[str], bool] | None = None,
     ) -> None:
+        """``env_valued_action`` はツール名がマシンの状態を返すかの述語
+        (``ToolsRegistry.returns_environment_values``)。該当する step に private 印を
+        打つ — その観測値はユーザーの発話ではなく、エピソード記憶や decision
+        ファクトへ持ち越すと実 IP / ホスト名が長期保存される。
+        """
         self._debug_logger = debug_logger
         self._trace_store = trace_store
+        self._env_valued_action = env_valued_action
         self._episodes: dict[str, list[MDPStep]] = {}
         #: episode_id → conversation_id。例外 / キャンセルで ``end_episode`` に
         #: 到達しなかったエピソードを ``abort_open_episodes`` で閉じるための索引。
@@ -98,16 +106,27 @@ class AgentTracer:
 
         self._episodes[episode_id].append(step)
 
-        self._log({
+        event: dict = {
             "event": "step",
             "episode_id": episode_id,
             **asdict(step),
-        })
+        }
+        if self._is_env_valued(step.action):
+            event["private"] = True
+        self._log(event)
 
         logger.debug(
             "Step recorded: ep=%s step=%d action=%s reward=%.2f",
             episode_id, step.step_index, step.action, step.reward,
         )
+
+    def _is_env_valued(self, action: str) -> bool:
+        """step の action (計画タスクでは ``", "`` 連結のツール名) に、マシンの状態を
+        返すと宣言されたツールが含まれるか。"""
+        predicate = self._env_valued_action
+        if predicate is None:
+            return False
+        return any(predicate(name.strip()) for name in action.split(",") if name.strip())
 
     def end_episode(self, episode_id: str, outcome: str) -> None:
         """エピソードを終了"""

@@ -21,7 +21,10 @@ from backend.log_config import get_logger
 
 logger = get_logger("core.response_verifiers")
 
-__all__ = ["declared_count_mismatch", "false_tool_unavailability", "misstated_change_rate"]
+__all__ = [
+    "declared_count_mismatch", "false_tool_unavailability", "mask_item_numbers",
+    "misstated_change_rate",
+]
 
 #: 走査する本文の上限 (文字)。計算量を入力長に線形で抑え、巨大な応答でも止まらない。
 _MAX_SCAN_CHARS = 50_000
@@ -273,6 +276,29 @@ def _declared_count(token: str) -> int | None:
     if n is None or not _DECLARED_MIN <= n <= _DECLARED_MAX:
         return None
     return n
+
+
+def mask_item_numbers(text: str) -> str:
+    """番号付き一覧の番号 (行頭の「1.」「2)」) を空白に置き換えたコピー (純粋関数)。
+
+    一覧の番号は量ではない。消すのは **1 から始まり 2 項目以上続く一覧** の番号だけ —
+    行頭に「2.」が 1 つあるだけでは一覧と言えず、量として読む (「合計は 707 万円\\n2. 構成比」)。
+    文字位置は保つ (呼出側が元の本文と位置を突き合わせる)。
+    """
+    lines = (text or "").split("\n")
+    by_indent: dict[int, list[tuple[int, re.Match[str]]]] = {}
+    for i, line in enumerate(lines):
+        m = _NUMBERED_ITEM_RE.match(line)
+        if m is not None:
+            by_indent.setdefault(_indent_width(m.group("indent")), []).append((i, m))
+    for items in by_indent.values():
+        nums = [int(m.group("num")) for _, m in items]
+        if len(nums) < 2 or nums[:2] != [1, 2]:
+            continue
+        for i, m in items:
+            s, e = m.span("num")
+            lines[i] = lines[i][:s] + " " * (e - s) + lines[i][e:]
+    return "\n".join(lines)
 
 
 def _indent_width(indent: str) -> int:

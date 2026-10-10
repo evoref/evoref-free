@@ -6,6 +6,8 @@
 # 一律に潰してしまう。Qwen3 はモード別の温度差が有効なので modes.* に委ねるのが最適。
 # (Qwen3 公式の非 thinking 推奨は temp 0.7 / top_p 0.8 / top_k 20 だが、単一 arch
 #  プロファイルでは chat/create を区別できないため採用しない。)
+# モード別に推奨を宣言するなら旧形式の sampling (非推奨) ではなく sampling_by_mode:
+# {chat: {...}, create: {...}} に書く (config で明示した modes.* が勝つ。qwen35.yaml 参照)。
 #
 # dense なので MoE 無効。内蔵テンプレートを使うため --jinja を付与。
 launch_flags:

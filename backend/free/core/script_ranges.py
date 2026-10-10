@@ -76,6 +76,10 @@ KATAKANA_BLOCK: Final = "゠-ヿ"
 #: 和文文字 (ひらがな + カタカナ + 漢字)。「日本語で書かれているか」の既定。
 JAPANESE: Final = HIRAGANA + KATAKANA + KANJI
 
+#: ハングル (字母 U+1100〜U+11FF + 互換字母 U+3130〜U+318F + 音節 U+AC00〜U+D7AF)。
+#: ja / en の応答に混じる他言語トークンの検出に使う (text_quality.foreign_script_leak)。
+HANGUL: Final = "ᄀ-ᇿ㄰-㆏가-힯"
+
 
 def _encodable(ch: str, codec: str) -> bool:
     try:
@@ -108,6 +112,7 @@ def simplified_only_hanzi() -> str:
 
 __all__ = [
     "HALFWIDTH_KATAKANA",
+    "HANGUL",
     "HIRAGANA",
     "HIRAGANA_BLOCK",
     "JAPANESE",

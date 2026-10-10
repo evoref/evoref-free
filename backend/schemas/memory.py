@@ -1,6 +1,6 @@
 """EvorefMem (WM/STM/LTM + SemMem) 関連スキーマ"""
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -585,7 +585,12 @@ class MemoryConfig(BaseModel):
     # ターン数側は「短い発話でもトークン側が先に効く」よう tokens/16 に置く
     # (:data:`_SHORT_TURN_TOKENS_PER_MESSAGE` の解説を参照)。
     working_max_turns: int = Field(default=256, ge=1)
-    working_max_tokens: int = Field(default=4096, ge=256)
+    # ``auto`` (既定) は base の context_size から生成予約・system 上限・動的ブロック
+    # 予約・要点表の予算を引いた残り (``core.prompt_budget.resolve_working_window``)。
+    # 整数は上限で、予算に収まらなければ丸める。固定の既定 (4096) は ctx 16k でも
+    # 4k 前後で押し出しを起こし、押し出しのたびに接頭辞 KV が崩れていた
+    # (2026-10-09 実機 301 ターン: 4,000 トークン超の全再計算 4 回・TTFT 約 21 秒)。
+    working_max_tokens: Annotated[int, Field(ge=256)] | Literal["auto"] = "auto"
     # 上限に達したときに **まとめて** 押し出すターン数 (ヒステリシス)。
     # 1 ターンずつ削ると窓の先頭が毎ターン動き、llama-server の接頭辞 KV
     # キャッシュが system プロンプト以降まるごと無効化される。実測
@@ -668,6 +673,9 @@ class MemoryConfig(BaseModel):
         """
         from backend.log_config import get_logger
 
+        if not isinstance(self.working_max_tokens, int):
+            # ``auto`` の窓は context_size が決まるまで分からない
+            return self
         estimated = self.working_max_turns * _SHORT_TURN_TOKENS_PER_MESSAGE
         if estimated < self.working_max_tokens:
             get_logger("config").warning(

@@ -1,0 +1,127 @@
+{"_comment": "分類器の省略ゲート (tool_classifier_skip、docs/f_03 §3.1.3 / c_17 §3.22) の専用事例。tool_gate_exemplars.jsonl (門 / 層 5.95 の gate_verdict と共有) とは分ける — 共有ファイルに none を足すと門の判定まで動くため。ラベルはすべて人が付けたもの (source は human:*)。判定ログ (decision.jsonl の skip_* / classifier_raw) の出力から自動で採らない (不変則 #15: 近道自身の出力を近道の正例に数えない。test_tool_classifier_skip_exemplars.py が固定)。none = ツール不要 (一般知識・定義・助言・手順・作文・会話のまとめ)、tool = ツールが要る (ファイル・URL・手元の状態・与えた数値の計算・日付演算・履歴やコードの検索)。none 側は 2026-10-09 監査 (scripts/bench/conversation_golden/themes_20261009.json) の問いの型を別の話題で書き直したもので、台本の発話そのものは入れない (再生測定と LOO を混ぜない)。"}
+{"text": "光合成とは？", "label": "none", "id": "n-def-01", "source": "human:audit_20261009_type"}
+{"text": "インフレーションとは何ですか", "label": "none", "id": "n-def-02", "source": "human:audit_20261009_type"}
+{"text": "サブネットマスクって何？", "label": "none", "id": "n-def-03", "source": "human:audit_20261009_type"}
+{"text": "俳句と川柳の違いは？", "label": "none", "id": "n-def-04", "source": "human:audit_20261009_type"}
+{"text": "ウイルスと細菌の違いをわかりやすく説明して。", "label": "none", "id": "n-def-05", "source": "human:audit_20261009_type"}
+{"text": "再帰関数の考え方を簡単に。", "label": "none", "id": "n-def-06", "source": "human:audit_20261009_type"}
+{"text": "What is a hash table?", "label": "none", "id": "n-def-07", "source": "human:written"}
+{"text": "ハードフォークとソフトフォークの違いを教えて。", "label": "none", "id": "n-def-08", "source": "human:audit_20261009_type"}
+{"text": "潮の満ち引きはどうして起きるの？", "label": "none", "id": "n-why-01", "source": "human:audit_20261009_type"}
+{"text": "虹はなぜ七色に見える？", "label": "none", "id": "n-why-02", "source": "human:audit_20261009_type"}
+{"text": "明治維新が起きた背景は？", "label": "none", "id": "n-why-03", "source": "human:audit_20261009_type"}
+{"text": "パンが膨らむ仕組みを教えて。", "label": "none", "id": "n-why-04", "source": "human:audit_20261009_type"}
+{"text": "肩こりの原因として考えられることは？", "label": "none", "id": "n-why-05", "source": "human:audit_20261009_type"}
+{"text": "ギターの弦はどれくらいの頻度で替えればいい？", "label": "none", "id": "n-qty-01", "source": "human:audit_20261009_type"}
+{"text": "ストレッチは1回あたり何秒くらい伸ばせばいい？", "label": "none", "id": "n-qty-02", "source": "human:audit_20261009_type"}
+{"text": "観葉植物の水やりは週に何回がいい？", "label": "none", "id": "n-qty-03", "source": "human:audit_20261009_type"}
+{"text": "結婚式のご祝儀は一般的にいくらぐらい包む？", "label": "none", "id": "n-qty-04", "source": "human:audit_20261009_type"}
+{"text": "子どもの睡眠時間は何時間くらい必要？", "label": "none", "id": "n-qty-05", "source": "human:audit_20261009_type"}
+{"text": "キャンプに持っていく水は一人何リットルが目安？", "label": "none", "id": "n-qty-06", "source": "human:audit_20261009_type"}
+{"text": "緑茶を淹れるお湯は何度がいい？", "label": "none", "id": "n-qty-07", "source": "human:audit_20261009_type"}
+{"text": "筋トレは週に何日やれば効果がある？", "label": "none", "id": "n-qty-08", "source": "human:audit_20261009_type"}
+{"text": "リフォームを頼むとき、業者は何社くらい比べるべき？", "label": "none", "id": "n-qty-09", "source": "human:audit_20261009_type"}
+{"text": "試験の前日は何時間くらい寝ればいい？", "label": "none", "id": "n-qty-10", "source": "human:audit_20261009_type"}
+{"text": "プレゼンで緊張しないコツは？", "label": "none", "id": "n-adv-01", "source": "human:audit_20261009_type"}
+{"text": "部屋を片付ける習慣を続けるには？", "label": "none", "id": "n-adv-02", "source": "human:audit_20261009_type"}
+{"text": "面接で聞かれやすい質問への備え方は？", "label": "none", "id": "n-adv-03", "source": "human:audit_20261009_type"}
+{"text": "子どもに読み聞かせるときの注意は？", "label": "none", "id": "n-adv-04", "source": "human:audit_20261009_type"}
+{"text": "中古車を選ぶときに見るべきポイントは？", "label": "none", "id": "n-adv-05", "source": "human:audit_20261009_type"}
+{"text": "夏バテを防ぐにはどうしたらいい？", "label": "none", "id": "n-adv-06", "source": "human:audit_20261009_type"}
+{"text": "賃貸と持ち家、どちらを選ぶべき？", "label": "none", "id": "n-adv-07", "source": "human:audit_20261009_type"}
+{"text": "パスワードを安全に管理する方法は？", "label": "none", "id": "n-adv-08", "source": "human:audit_20261009_type"}
+{"text": "初めての海外旅行で気をつけることは？", "label": "none", "id": "n-adv-09", "source": "human:audit_20261009_type"}
+{"text": "雨の日に子どもと家で楽しめる遊びは？", "label": "none", "id": "n-adv-10", "source": "human:audit_20261009_type"}
+{"text": "How can I get better at public speaking?", "label": "none", "id": "n-adv-11", "source": "human:written"}
+{"text": "味噌汁をおいしく作る手順は？", "label": "none", "id": "n-how-01", "source": "human:audit_20261009_type"}
+{"text": "自転車のチェーンに油を差す方法を教えて。", "label": "none", "id": "n-how-02", "source": "human:audit_20261009_type"}
+{"text": "Gitでブランチを切る手順は？", "label": "none", "id": "n-how-03", "source": "human:audit_20261009_type"}
+{"text": "水彩画を始めるのに必要な道具は？", "label": "none", "id": "n-how-04", "source": "human:audit_20261009_type"}
+{"text": "冬に咲くおすすめの花は？", "label": "none", "id": "n-rec-01", "source": "human:audit_20261009_type"}
+{"text": "北海道で食べておきたい名物を3つ挙げて。", "label": "none", "id": "n-rec-02", "source": "human:audit_20261009_type"}
+{"text": "初心者に向いているボードゲームの選び方は？", "label": "none", "id": "n-rec-03", "source": "human:audit_20261009_type"}
+{"text": "平安時代の貴族の暮らしは？", "label": "none", "id": "n-hist-01", "source": "human:audit_20261009_type"}
+{"text": "産業革命が社会に与えた影響は？", "label": "none", "id": "n-hist-02", "source": "human:audit_20261009_type"}
+{"text": "ルネサンスの代表的な画家の特徴を教えて。", "label": "none", "id": "n-hist-03", "source": "human:audit_20261009_type"}
+{"text": "月の満ち欠けの周期はどのくらい？", "label": "none", "id": "n-sci-01", "source": "human:audit_20261009_type"}
+{"text": "地球から太陽までの距離はおよそどれくらい？", "label": "none", "id": "n-sci-02", "source": "human:audit_20261009_type"}
+{"text": "人間の骨は全部で何本ある？", "label": "none", "id": "n-sci-03", "source": "human:audit_20261009_type"}
+{"text": "週末の作り置きおかずの献立を考えて。", "label": "none", "id": "n-gen-01", "source": "human:audit_20261009_type"}
+{"text": "3日間の筋トレメニューを作って。", "label": "none", "id": "n-gen-02", "source": "human:audit_20261009_type"}
+{"text": "お礼のメールの文面を考えて。", "label": "none", "id": "n-gen-03", "source": "human:audit_20261009_type"}
+{"text": "春の俳句を一つ詠んで。", "label": "none", "id": "n-gen-04", "source": "human:audit_20261009_type"}
+{"text": "新人研修の1週間の予定表を作ってください。", "label": "none", "id": "n-gen-05", "source": "human:audit_20261009_type"}
+{"text": "大掃除のやることリストを作って。", "label": "none", "id": "n-gen-06", "source": "human:audit_20261009_type"}
+{"text": "簡単な英語の挨拶の例文をいくつかください。", "label": "none", "id": "n-gen-07", "source": "human:audit_20261009_type"}
+{"text": "ここまでの話を箇条書きで整理して。", "label": "none", "id": "n-sum-01", "source": "human:audit_20261009_type"}
+{"text": "今の内容を初心者向けに言い換えて。", "label": "none", "id": "n-sum-02", "source": "human:audit_20261009_type"}
+{"text": "話した要点を表にまとめて。", "label": "none", "id": "n-sum-03", "source": "human:audit_20261009_type"}
+{"text": "それぞれのメリットとデメリットは？", "label": "none", "id": "n-sum-04", "source": "human:audit_20261009_type"}
+{"text": "その中で一番手軽なのはどれ？", "label": "none", "id": "n-sum-05", "source": "human:audit_20261009_type"}
+{"text": "もう少し詳しく教えて。", "label": "none", "id": "n-sum-06", "source": "human:audit_20261009_type"}
+{"text": "AIに仕事を奪われるという意見をどう思う？", "label": "none", "id": "n-opn-01", "source": "human:audit_20261009_type"}
+{"text": "読書と映画、教養が身につくのはどっち？", "label": "none", "id": "n-opn-02", "source": "human:audit_20261009_type"}
+{"text": "単体テストとE2Eテストはどう使い分ける？", "label": "none", "id": "n-tech-01", "source": "human:audit_20261009_type"}
+{"text": "マイクロサービスに分けるべきタイミングは？", "label": "none", "id": "n-tech-02", "source": "human:audit_20261009_type"}
+{"text": "例外処理を書くときの一般的な注意点は？", "label": "none", "id": "n-tech-03", "source": "human:audit_20261009_type"}
+{"text": "会員は現在 480 人です。年会費が 3200 円だとすると、年間の会費収入はいくらになりますか。", "label": "tool", "id": "t-calc-01", "source": "human:tool_gate_exemplars"}
+{"text": "42.195kmをキロ5分30秒のペースで走ると何時間何分かかりますか。", "label": "tool", "id": "t-calc-02", "source": "human:tool_gate_exemplars"}
+{"text": "5000 円の商品を 3 つ買って 15% 引き、その後消費税 10% を加えるといくら？", "label": "tool", "id": "t-calc-03", "source": "human:tool_gate_exemplars"}
+{"text": "可用性 99.9% を年間で維持する場合、許容されるダウンタイムは何分ですか。", "label": "tool", "id": "t-calc-04", "source": "human:tool_gate_exemplars"}
+{"text": "1234 × 5678 はいくつ？", "label": "tool", "id": "t-calc-05", "source": "human:tool_gate_exemplars"}
+{"text": "想定トラフィックは 1 日あたり 500 万リクエストです。平均 RPS はいくつになりますか。", "label": "tool", "id": "t-calc-06", "source": "human:tool_gate_exemplars"}
+{"text": "月に3万円ずつ年利4%で20年積み立てると最終的にいくらになる？", "label": "tool", "id": "t-calc-07", "source": "human:written"}
+{"text": "身長172cm、体重68kgのBMIを計算して。", "label": "tool", "id": "t-calc-08", "source": "human:written"}
+{"text": "時給1250円で1日6時間、週4日働くと月にいくら稼げる？", "label": "tool", "id": "t-calc-09", "source": "human:written"}
+{"text": "2の64乗を正確に出して。", "label": "tool", "id": "t-calc-10", "source": "human:written"}
+{"text": "その金額を8人で割ると一人いくらになりますか。", "label": "tool", "id": "t-calc-11", "source": "human:written"}
+{"text": "さっきの見積もりに消費税10%を足した合計を出して。", "label": "tool", "id": "t-calc-12", "source": "human:written"}
+{"text": "1000の階乗の桁数はいくつ？", "label": "tool", "id": "t-calc-13", "source": "human:written"}
+{"text": "What is 17.5% of 2,340?", "label": "tool", "id": "t-calc-14", "source": "human:written"}
+{"text": "今日から100日後は何月何日で、何曜日になりますか？", "label": "tool", "id": "t-date-01", "source": "human:tool_gate_exemplars"}
+{"text": "2027年3月1日は何曜日？", "label": "tool", "id": "t-date-02", "source": "human:written"}
+{"text": "今年のクリスマスまであと何日ある？", "label": "tool", "id": "t-date-03", "source": "human:written"}
+{"text": "納期の15営業日後は何日になる？", "label": "tool", "id": "t-date-04", "source": "human:written"}
+{"text": "保存したファイルの中身をそのまま見せてください。", "label": "tool", "id": "t-file-01", "source": "human:tool_gate_exemplars"}
+{"text": "そのファイルの行数と文字数を教えてください。", "label": "tool", "id": "t-file-02", "source": "human:tool_gate_exemplars"}
+{"text": "booking_schema.sql をもう一度読んで、テーブルがいくつ定義されているか数えてください。", "label": "tool", "id": "t-file-03", "source": "human:tool_gate_exemplars"}
+{"text": "E:\\tmp\\note1.txt に「テスト行」とだけ書いて保存してください。", "label": "tool", "id": "t-file-04", "source": "human:tool_gate_exemplars"}
+{"text": "そのファイルに、保持期間の方針を3文で追記してください。", "label": "tool", "id": "t-file-05", "source": "human:tool_gate_exemplars"}
+{"text": "さっき作った audit_test.txt を削除してください。", "label": "tool", "id": "t-file-06", "source": "human:tool_gate_exemplars"}
+{"text": "E:\\tmp にあるファイルを一覧してください。", "label": "tool", "id": "t-file-07", "source": "human:tool_gate_exemplars"}
+{"text": "今のレシピを recipe.md に保存して。", "label": "tool", "id": "t-file-08", "source": "human:written"}
+{"text": "report.csv を開いて、売上列の合計を出して。", "label": "tool", "id": "t-file-09", "source": "human:written"}
+{"text": "config.yaml の中で port が何番になっているか確認して。", "label": "tool", "id": "t-file-10", "source": "human:written"}
+{"text": "Read notes.txt and tell me how many lines it has.", "label": "tool", "id": "t-file-11", "source": "human:written"}
+{"text": "https://example.com/news/123 の記事を要約して。", "label": "tool", "id": "t-url-01", "source": "human:written"}
+{"text": "このURLのページに何が書いてあるか読んで: https://example.org/guide", "label": "tool", "id": "t-url-02", "source": "human:written"}
+{"text": "さっき貼ったリンク先の内容を3行でまとめて。", "label": "tool", "id": "t-url-03", "source": "human:written"}
+{"text": "Summarize the page at https://example.com/blog/post.", "label": "tool", "id": "t-url-04", "source": "human:written"}
+{"text": "この PC の CPU とメモリ容量を教えて。", "label": "tool", "id": "t-env-01", "source": "human:tool_gate_exemplars"}
+{"text": "Eドライブの空き容量はどれくらい？", "label": "tool", "id": "t-env-02", "source": "human:tool_gate_exemplars"}
+{"text": "このマシンのホスト名と IP アドレスを確認して。", "label": "tool", "id": "t-env-03", "source": "human:written"}
+{"text": "今入っている Python のバージョンは？", "label": "tool", "id": "t-env-04", "source": "human:written"}
+{"text": "この PC の OS のバージョンを調べて。", "label": "tool", "id": "t-env-05", "source": "human:written"}
+{"text": "過去の会話で、登山の話題をしたことはありますか？探してください。", "label": "tool", "id": "t-hist-01", "source": "human:tool_gate_exemplars"}
+{"text": "先月相談した引っ越しの件、過去の会話から探して。", "label": "tool", "id": "t-hist-02", "source": "human:written"}
+{"text": "以前のセッションで決めたバックアップ方針を履歴から見つけて。", "label": "tool", "id": "t-hist-03", "source": "human:written"}
+{"text": "前に話したレシピのやり取りを過去ログから検索して。", "label": "tool", "id": "t-hist-04", "source": "human:written"}
+{"text": "CorpusStore クラスはどのファイルで定義されていて、誰が使っていますか。", "label": "tool", "id": "t-code-01", "source": "human:tool_gate_exemplars"}
+{"text": "このリポジトリのエントリポイントはどのファイルですか。", "label": "tool", "id": "t-code-02", "source": "human:tool_gate_exemplars"}
+{"text": "Where is the function project_map_package_id defined and who calls it?", "label": "tool", "id": "t-code-03", "source": "human:tool_gate_exemplars"}
+{"text": "chunk_documents を変更したら影響を受けるモジュールを教えて。", "label": "tool", "id": "t-code-04", "source": "human:tool_gate_exemplars"}
+{"text": "コードの中で TODO が書かれている箇所を探して。", "label": "tool", "id": "t-code-05", "source": "human:written"}
+{"text": "10kmを1時間5分で走ったら、1kmあたりのペースは何分何秒？", "label": "tool", "id": "t-calc-15", "source": "human:written"}
+{"text": "自転車で時速18kmなら35kmは何分かかる？", "label": "tool", "id": "t-calc-16", "source": "human:written"}
+{"text": "駅まで1.2kmを分速80mで歩くと何分かかりますか。", "label": "tool", "id": "t-calc-17", "source": "human:written"}
+{"text": "Convert 72 degrees Fahrenheit to Celsius and give the exact value.", "label": "tool", "id": "t-calc-18", "source": "human:written"}
+{"text": "来年の元日は何曜日になる？", "label": "tool", "id": "t-date-05", "source": "human:written"}
+{"text": "3月15日から6月30日までは何日間ありますか。", "label": "tool", "id": "t-date-06", "source": "human:written"}
+{"text": "今日から6週間後の日付と曜日を出して。", "label": "tool", "id": "t-date-07", "source": "human:written"}
+{"text": "Can you read https://example.net/docs and list the main points?", "label": "tool", "id": "t-url-05", "source": "human:written"}
+{"text": "https://example.jp/recipe のページから材料だけ抜き出して。", "label": "tool", "id": "t-url-06", "source": "human:written"}
+{"text": "前のセッションで私が話した旅行の予定を検索して。", "label": "tool", "id": "t-hist-05", "source": "human:written"}
+{"text": "昨日の会話で決めた締め切りを履歴から確認して。", "label": "tool", "id": "t-hist-06", "source": "human:written"}
+{"text": "以前おすすめしてもらった本のタイトルを、過去のやり取りから見つけて。", "label": "tool", "id": "t-hist-07", "source": "human:written"}
+{"text": "Search our past conversations for what I said about my car.", "label": "tool", "id": "t-hist-08", "source": "human:written"}
+{"text": "車の保険について話した回があったか、会話の記録を調べて。", "label": "tool", "id": "t-hist-09", "source": "human:written"}

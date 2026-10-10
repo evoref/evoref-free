@@ -68,10 +68,15 @@ _FORCED_FULL: ContextVar[bool] = ContextVar("evoref_forced_full", default=False)
 #: チャットと重なる量を抑える。Step 8.0 (訂正の検証) は最古から 2 件、Step 8.3
 #: (属性の分割、趣味の追加・削除のような「私は〜」の言い直し) は 1 件。
 _FORCED_VERIFY_MAX = 2
-#: 強制実行の Full で要約 (Step 8-9) が打ち切られずに出せる回数。連続利用ではターンの間隔が
-#: 要約 1 回 (約 6〜8 秒) より短く、通常の Full は毎回打ち切られて 30〜80 分遅れた
-#: (2026-10-06 ライブ監査)。訂正の検証と同じ「回数で重なる量を抑える」方式 (1 サイクルは包まない)。
-_FORCED_SUMMARY_MAX = 2
+#: 強制実行の Full で要約 (Step 8-9) が打ち切られずに出せる回数。**待ちすぎた会話
+#: があるときだけ** 使う (:meth:`SleepTimeWorker._summary_overdue_seconds`)。連続利用では
+#: ターンの間隔が要約 1 回より短く、通常の Full は毎回打ち切られて 30〜80 分遅れた
+#: (2026-10-06)。一方で毎回 2 回を打ち切らせないと、強制 Full のたびに応答直後の
+#: 要約 (チャットと重なって 13〜21 秒) が次のターンの first token を遅らせた (2026-10-10:
+#: 重なった 15 ターンの p50 5.75 秒、他 3.48 秒)。
+_FORCED_SUMMARY_MAX = 1
+#: 結果辞書: 要約待ちのうち会話が止まってから最も長く待っている会話の経過秒 (c_07 §7.1)。
+SUMMARY_OLDEST_PENDING_KEY = "summary_oldest_pending_sec"
 _FORCED_SPLIT_MAX = 1
 #: Step 8.35 (集合値の属性の編集) も 1 件。
 _FORCED_SLOT_EDIT_MAX = 1
@@ -954,7 +959,11 @@ class SleepTimeWorker:
         from backend.free.memory.sleep.summarize import count_sessions_needing_summary
 
         result["summaries_generated_input"] = count_sessions_needing_summary()
+        self._summary_oldest_pending_sec = 0
         result["summaries_generated"] = await self._step8_9_summarize_sessions(llm_client)
+        # 要約の遅れ (秒)。待ちすぎた会話だけを打ち切らせずに要約するので、この値が
+        # 閾値を大きく超えて伸び続けるなら、その 1 件すら出せていない (c_07 §7.1)。
+        result[SUMMARY_OLDEST_PENDING_KEY] = int(self._summary_oldest_pending_sec)
         step_durations["step8_9_summarize"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
@@ -1518,6 +1527,7 @@ class SleepTimeWorker:
         """
         from backend.free.memory.sleep.summarize import (
             chat_summary_skip_modes,
+            oldest_pending_summary,
             summarize_unsummarized_sessions,
         )
 
@@ -1526,18 +1536,41 @@ class SleepTimeWorker:
 
         history_cfg = self._cycle_config().get("history") or {}
         quiet = quiet_seconds(self.config)
-        # 静穏窓で譲る (ターンの合間に出すと次のターンに打ち切られる)。強制実行の Full で
-        # 打ち切らせない回数が残る間だけは譲らない。
-        with self._bounded_step_scope(_FORCED_SUMMARY_MAX):
+        # 配信モデルが chat のモデルと違う間は chat の要約を作らない (M3)
+        skip_modes = chat_summary_skip_modes()
+        age, oldest_id = oldest_pending_summary(skip_modes=skip_modes)
+        self._summary_oldest_pending_sec = age
+        # 静穏窓で譲る (ターンの合間に出すと次のターンに打ち切られる)。強制実行の Full でも
+        # 打ち切らせないのは、待ちすぎた最古の会話 1 件だけ (それ以外は次の窓へ回す)。
+        overdue = oldest_id is not None and age >= self._summary_overdue_seconds()
+        if overdue and _FORCED_FULL.get():
+            logger.info(
+                "Step 8-9: session %s has waited %ds for a summary; summarizing it "
+                "without yielding to chat", oldest_id, age,
+            )
+        with self._bounded_step_scope(_FORCED_SUMMARY_MAX if overdue else 0):
             return await summarize_unsummarized_sessions(
                 llm_client,
                 self.embedder,
                 batch_size=int(history_cfg.get("summary_batch_size", 20)),
                 is_cancelled=self._check_cancelled,
                 should_pause=lambda: not preemption_suspended() and self._chat_recent(quiet),
-                # 配信モデルが chat のモデルと違う間は chat の要約を作らない (M3)
-                skip_modes=chat_summary_skip_modes(),
+                skip_modes=skip_modes,
+                first_session_id=oldest_id if overdue else None,
             )
+
+    def _summary_overdue_seconds(self) -> float:
+        """要約が待ちすぎたとみなす経過秒 (``learning.full_idle_minutes``)。
+
+        アイドルで Full が走る使い方なら、会話が止まってからこの時間で要約が付く。
+        これを超えて残っているのは、連続利用で毎回チャットに譲った会話だけ。
+        """
+        learning = self.config.get("learning") or {}
+        try:
+            minutes = float(learning.get("full_idle_minutes", 10))
+        except (TypeError, ValueError):
+            minutes = 10.0
+        return minutes * 60.0
 
     # ── Step 7.5 (MDP トレース → episodic LTM) ─────────
 
@@ -1669,8 +1702,9 @@ class SleepTimeWorker:
         強制実行の Full では、区間内の補助タスクの先頭 ``max_calls`` 回を、
         アイドル窓で出せたものに限り打ち切らせない (generation_gate.run_to_completion)。
         疑似クエリのように 1 サイクルが長い段は包まない — 包むとその間ずっとチャットと
-        GPU を分け合う。要約 (Step 8-9) は回数 (``_FORCED_SUMMARY_MAX``) で重なる量を
-        抑えて包む。通常の Full では打ち切りを数えるだけ。
+        GPU を分け合う。要約 (Step 8-9) は待ちすぎた会話があるときだけ
+        ``_FORCED_SUMMARY_MAX`` 回を包み、それ以外は 0 回 (打ち切り可能のまま数えるだけ)。
+        通常の Full では打ち切りを数えるだけ。
         区間内でチャットに打ち切られた数は結果辞書の ``bounded_aux_preempted`` へ。
         """
         from backend.aux_telemetry import current_aux_failures

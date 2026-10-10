@@ -63,6 +63,7 @@ from backend.free.core.intent_vocab import (
 from backend.free.core.relative_date import absolutize_annotated_dates, annotate_relative_dates
 from backend.free.core.text_quality import (
     carries_no_assertion,
+    foreign_script_leak,
     is_payload_dump,
     looks_like_task_log_residue,
     mentions_self,
@@ -86,6 +87,8 @@ from backend.free.memory.semantic.namespaces import is_injectable
 from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.types import MemoryMode, SemanticFact
 from backend.i18n_helper import prompt_locale
+from backend.free.core.conversation_scope import addresses_ongoing_conversation
+from backend.free.core.temporal_deixis import present_day_terms
 from backend.free.core.query_anchors import (
     ANCHOR_SCAFFOLD,
     QUERY_ANCHOR_RE,
@@ -1087,6 +1090,7 @@ class MemoryInjector:
         rejected_note_ids: "Iterable[str] | None" = None,
         current_session_id: str | None = None,
         context_bound: bool = False,
+        session_scoped: bool = False,
     ) -> InjectionPlan:
         """注入計画を構築する。
 
@@ -1161,6 +1165,15 @@ class MemoryInjector:
                 内容語のいずれかを要る。今の会話・セッション不明の記憶と、本人の
                 属性・好みは影響しない。呼出側は窓に前のアシスタントの応答がある
                 (指す対象がある) ターンでだけ真にする。
+            session_scoped: このターンの問いが **今の会話そのもの** を対象にしている
+                (「ここまでの内容を3行でまとめて」「今日の話を5つの原則に」。
+                エピソード検索を自セッションに閉じる
+                ``search_pipeline.episodic_session_scope`` と同じ判定)。真なら chat
+                モードで、別の会話だと分かるノートを載せず、今の会話のノートは
+                窓 (``session_user_texts``) に同じ本文があるものだけ落とす — 窓から
+                押し出されたターンは残す (証拠は省かない、不変則 #15)。ファクトは
+                影響しない (2026-10-09 実機: まとめ漏れ 9 件のうち 6 件で別の会話の
+                「ここまでの内容を3行でまとめて。」等が載っていた)。
             query_embedding: 現在のユーザー発話の埋め込み。与えられた場合、
                 埋め込みを持つ候補は類似度 ``relevance_min_score`` 未満なら
                 注入しない (``pinned`` は明示指定なので常に通す)。``None``
@@ -1299,6 +1312,26 @@ class MemoryInjector:
         query_points_to_past = points_to_past_session(query_text)
         query_mentions_self = mentions_self(query_text)
         cross_session_question_dropped = 0
+        # 別の会話で答えを受けた発話のノートは、今回の問いと内容語で結び付くときだけ
+        # 載せる (ノートのループの説明)。照合する語が無い問いでも素通りさせない —
+        # 結び付きが無いことに変わりはない (2026-10-09 実機: 「ここまでの内容を3行で
+        # まとめて。」は内容語が空で門ごと外れていた)。発話日の語 (今日 / 本日) は
+        # 話題ではないので結び付きに数えない (「今日の話を10行以内で」が別の会話の
+        # 「今日の話を5つの原則に」と「今日」だけで結び付いていた)。
+        answered_turn_gate = not (query_points_to_past or query_mentions_self)
+        present_day = frozenset(present_day_terms())
+        topic_anchors = tuple(a for a in anchors if a not in present_day)
+        cross_session_answered_dropped = 0
+        # 今の会話そのものを対象にした問い (``session_scoped`` の説明)。
+        session_scope_gate = bool(session_scoped) and is_chat_mode(mode)
+        window_texts = (
+            {_normalize_for_dup(t) for t in session_user_texts if t}
+            if session_scope_gate else set()
+        )
+        session_scope_dropped = 0
+        window_duplicate_dropped = 0
+        # 別の会話の、その会話そのものを対象にした発話 (「ここまでの内容を…」)。
+        other_session_meta_dropped = 0
 
         for fact in facts:
             if fact.superseded_by:
@@ -1484,6 +1517,39 @@ class MemoryInjector:
                 filtered_out += 1
                 topicless_dropped += 1
                 continue
+            note_text = getattr(note, "content", "") or ""
+            other_session = self._note_from_other_session(note, current_session_id)
+            # 今の会話そのものを対象にした問いでは、答えの材料は今の会話にしか無い。
+            # 別の会話のノートは載せず、今の会話のノートは窓に同じ本文があるもの
+            # (重複) だけ落とす。窓から押し出されたターンは残す (不変則 #15)。
+            # pin も例外にしない (pin は話題の結び付きの証拠ではない、下の門と同じ)。
+            if session_scope_gate:
+                if other_session:
+                    filtered_out += 1
+                    session_scope_dropped += 1
+                    continue
+                if _normalize_for_dup(note_text) in window_texts:
+                    filtered_out += 1
+                    window_duplicate_dropped += 1
+                    continue
+            # 別の会話の、**その会話そのもの** を対象にした発話 (「ここまでの内容を
+            # 3行でまとめて。」「今日の話を5つの原則にまとめて。」) は、どの問いにも
+            # 載せない。本文の「ここまで」「今日の話」はその会話を指していて、今の会話へ
+            # 持ち出しても情報量が無く、今の指示を別の会話へ誘導する。注入された行が
+            # 次の会話の候補になって増えていた (2026-10-09 実機: 1 ターンに 6 行)。
+            # 問いが過去の会話を指すときと、本文に一人称がある (本人の言明を含みうる)
+            # ときは従来どおり。字句の問い・依頼の門は「〜まとめて。」を依頼と読まない
+            # ので、そちらの語形は足さず会話を対象にする形で取る (不変則 #14 (a))。
+            if (
+                other_session
+                and not query_points_to_past
+                and getattr(note, "source", "user") == "user"
+                and addresses_ongoing_conversation(note_text)
+                and not mentions_self(note_text)
+            ):
+                filtered_out += 1
+                other_session_meta_dropped += 1
+                continue
             # ファクト側で却下した世代が、同じ本文のままノート経由で戻るのを塞ぐ
             # (``_is_stale_duplicate`` 参照)。pin も例外にしない — 判断済みの
             # 内容の再提示に優先度を与える理由が無い。
@@ -1565,6 +1631,14 @@ class MemoryInjector:
             if not pinned and getattr(note, "source", "user") == "assistant":
                 filtered_out += 1
                 continue
+            # pin された応答でも、他言語のトークンが紛れたもの (「岚山」「段階별」) は
+            # 根拠にしない。載せると次の応答が混入を写す (2026-10-09 監査)。
+            if (
+                getattr(note, "source", "user") == "assistant"
+                and foreign_script_leak(getattr(note, "content", "") or "") is not None
+            ):
+                filtered_out += 1
+                continue
             # 本文の過半がコードフェンスの中身 = 「いつでも取り直せるデータの
             # コピー」。記憶として再注入すると内容が古びるうえ、「ペイロードを
             # 貼るのが正解」という手本として働く (2026-08-16 動作検証: README を
@@ -1605,10 +1679,11 @@ class MemoryInjector:
             # 尋ねられた属性 / 語彙アンカーの決定論の根拠があるノートは、検索の床と
             # 別の会話の扱いから免除する (ファクト側と同じ立て付け)。
             note_content = getattr(note, "content", "") or ""
-            note_exempt = _has_anchor(note_content, anchors) or bool(
+            note_attr_exempt = bool(
                 asked_attrs
                 and any(slug in asked_attrs for _, slug in _attribute_slots_of(note_content))
             )
+            note_exempt = _has_anchor(note_content, anchors) or note_attr_exempt
             if not note_exempt:
                 if note.id in rejected_notes:
                     filtered_out += 1
@@ -1622,6 +1697,26 @@ class MemoryInjector:
                     filtered_out += 1
                     cross_session_dropped += 1
                     continue
+            # 別の会話で答えを受けた発話 (``answered_by``) は、答えがその会話にあって
+            # ここには載らない (assistant のノートは上で落ちる)。問い・依頼だけの門は
+            # 字句の判定で、前置きの言明 (「〜したいです。」「ありがとう。」) が付くと
+            # 値ありと読むので、それだけでは止まらない (2026-10-09 監査: 81 ターンの
+            # 203 行がすべて別の会話の相談・依頼で、「1週間の実践プランを作って」に
+            # ランニング・数学・Python・英語の相談が 10 行)。検索の問い差し替え
+            # (``search_pipeline._answers_for_question_only_hits``) と同じく、今回の
+            # 問いの内容語 (発話日の語を除く ``topic_anchors``) も尋ねられた属性も
+            # 持たない別の会話のターンはコサインだけでは使わない。本人の値は SemMem が
+            # 運び、問いが過去の会話を指すか一人称なら従来どおり。
+            if (
+                answered_turn_gate
+                and not pinned
+                and getattr(note, "answered_by", None)
+                and other_session
+                and not (_has_anchor(note_content, topic_anchors) or note_attr_exempt)
+            ):
+                filtered_out += 1
+                cross_session_answered_dropped += 1
+                continue
             gate_reached += 1
             if not self._passes_gate(
                 query_vec, note,
@@ -1729,6 +1824,24 @@ class MemoryInjector:
                 "conversations; the query neither points to a past conversation nor "
                 "refers to the user",
                 cross_session_question_dropped,
+            )
+        if cross_session_answered_dropped:
+            logger.info(
+                "MemoryInjector: dropped %d note(s) of turns answered in other "
+                "conversations that share no content word with the query (anchors=%s)",
+                cross_session_answered_dropped, ", ".join(sorted(topic_anchors)) or "-",
+            )
+        if session_scope_dropped or window_duplicate_dropped:
+            logger.info(
+                "MemoryInjector: the query addresses the ongoing conversation; dropped "
+                "%d note(s) from other conversations and %d note(s) already in the window",
+                session_scope_dropped, window_duplicate_dropped,
+            )
+        if other_session_meta_dropped:
+            logger.info(
+                "MemoryInjector: dropped %d note(s) from other conversations whose text "
+                "addresses that conversation itself",
+                other_session_meta_dropped,
             )
         if retired_dropped:
             # 訂正が効いているかを実機で追えるようにする (沈黙で落とさない)。

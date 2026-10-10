@@ -647,6 +647,9 @@ class LocalClient(BaseHTTPClient):
         #: 接頭辞 KV キャッシュの効きを測れる唯一の一次情報で、これが無いと
         #: llama-base.stderr.log の行とチャットターンを突き合わせるしかない。
         self._last_timings: dict | None = None
+        #: チャットスロットで直近に観測した ``finish_reason`` (``_last_timings`` と
+        #: 同じ持ち主規則)。``op=timing`` 行へ載せ、途中切れが length か自然終了かを分ける。
+        self._last_finish_reason: str | None = None
         #: 分類器スロットの共有接頭辞 (backend/free/llm/slot_prefix.py)。
         #: ツール分類器が公開し、同じスロットへ送る AuxClient が system を
         #: byte 一致させるために読む。未公開なら None。
@@ -1335,7 +1338,10 @@ class LocalClient(BaseHTTPClient):
                 )
             data = resp.json()
             content = extract_content(data)
-            if (data.get("choices") or [{}])[0].get("finish_reason") == "length":
+            sync_reason = (data.get("choices") or [{}])[0].get("finish_reason")
+            if self._owns_last_timings(payload.get("id_slot")):
+                self._last_finish_reason = sync_reason or None
+            if sync_reason == "length":
                 # 非ストリーミング経路は補助タスク (JSON 応答) にも使われるため
                 # **本文へ注記を足さない** (パースを壊す)。診断できるようログだけ
                 # 残す。ユーザーへの開示はチャット応答が通るストリーム経路で行う。
@@ -1463,8 +1469,10 @@ class LocalClient(BaseHTTPClient):
         # 背景 / 分類器のストリームは kv_cache の JSONL 行だけを出し、ユーザーの
         # ターンの値には触れない。
         id_slot = payload.get("id_slot")
-        if self._owns_last_timings(id_slot):
+        owns_last = self._owns_last_timings(id_slot)
+        if owns_last:
             self._last_timings = None
+            self._last_finish_reason = None
         #: timings (finish チャンク) を記録済みなら usage チャンクでは二重に
         #: 記録しない (llama-server は両方を別チャンクで送りうる)。
         kv_recorded = False
@@ -1568,6 +1576,8 @@ class LocalClient(BaseHTTPClient):
                             if reason:
                                 last_finish_reason = reason
                                 outcome.finish_reason = reason
+                                if owns_last:
+                                    self._last_finish_reason = reason
                             # 接頭辞 KV キャッシュの効きを記録する。llama.cpp が timings
                             # を載せる構成 (finish チャンク) ならより正確なそちらを優先し、
                             # 無ければ usage チャンク (``stream_options.include_usage``) の

@@ -428,12 +428,17 @@ class DebugLogger:
         agent_layer: str = "",
         tokens_generated: int = 0,
         mode: str = "",
+        finish_reason: str = "",
+        session_id: str = "",
     ) -> None:
         """リクエスト処理のステージ別タイミング内訳を記録
 
         同じ trace_id の補助呼出 (``log_aux_request``) を purpose 別に集計して
         ``aux_usage`` (``{purpose: {n, elapsed_sec, queue_wait_sec}}``) として付ける。
         timing を出した後に終わる補助呼出 (応答後の背景処理) は含まない。
+
+        ``finish_reason`` は本応答の llama-server の終端 (``stop`` / ``length`` 等。
+        取れない経路では空で、キーごと出さない)、``session_id`` は会話単位の集計用。
         """
         if not self.enabled or not self.log_requests:
             return
@@ -446,6 +451,10 @@ class DebugLogger:
         }
         if mode:
             entry["mode"] = mode
+        if finish_reason:
+            entry["finish_reason"] = finish_reason
+        if session_id:
+            entry["session_id"] = session_id
         aux_usage = self._pop_turn_aux()
         if aux_usage:
             entry["aux_usage"] = aux_usage

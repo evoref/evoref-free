@@ -9,6 +9,7 @@
 	import SelectField from './fields/SelectField.svelte';
 	import PinnedFacts from './PinnedFacts.svelte';
 	import ProSection from './ProSection.svelte';
+	import { autoNumber } from '$lib/free/utils/autotune_view';
 
 	let memory = $derived(configSection($configData, 'memory'));
 	let injection = $derived(memory.injection ?? {});
@@ -19,7 +20,7 @@
 <SettingsSection tabId="memory">
 	<FieldGroup label="settings.group_working_memory">
 		<NumberField label="settings.memory.working_max_turns" value={Number(memory.working_max_turns ?? 10)} min={1} onchange={fieldUpdater('memory', 'working_max_turns')} />
-		<NumberField label="settings.memory.working_max_tokens" value={Number(memory.working_max_tokens ?? 2048)} min={256} onchange={fieldUpdater('memory', 'working_max_tokens')} />
+		<NumberField label="settings.memory.working_max_tokens" value={autoNumber(memory.working_max_tokens, true, 4096)} min={256} onchange={fieldUpdater('memory', 'working_max_tokens')} />
 	</FieldGroup>
 
 	<FieldGroup label="settings.group_short_term">

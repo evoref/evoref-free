@@ -324,6 +324,19 @@ class RepetitionGuardFilter:
     #: 先出ししても打ち切り判定そのものは行完成時に従来どおり効く。
     _EAGER_FLUSH_CHARS = 120
 
+    #: 行内の句の巡回 (同じ部分文字列が切れ目なく繰り返される)。空白の無い日本語では
+    #: ``_has_token_runaway`` の空白区切りが効かず、行も切れないので行単位の判定も
+    #: 届かない (実測 2026-07-25: 「箱や袋に…ため、」が 1 行のまま数十回続いた。
+    #: frequency_penalty 0.3 を入れた理由)。語彙ではなく構造で見る: 長さ
+    #: ``_CYCLE_MIN_PERIOD``〜``_CYCLE_MAX_PERIOD`` の単位が ``_CYCLE_MIN_REPEATS`` 回
+    #: 以上連続したら打ち切る。単位に英数字・かな・漢字 (``str.isalnum``) が
+    #: ``_CYCLE_MIN_DISTINCT`` 種以上あることを要求し、罫線・区切り記号・笑いの
+    #: 「ｗｗｗ」のような字種の乏しい連続を巻き込まない。
+    _CYCLE_MIN_PERIOD = 5
+    _CYCLE_MAX_PERIOD = 80
+    _CYCLE_MIN_REPEATS = 5
+    _CYCLE_MIN_DISTINCT = 3
+
     def __init__(self, query: str | None = None) -> None:
         self._buffer = ""
         #: ``_buffer`` の先頭から何文字を既に先出ししたか (行完成時にリセット)。
@@ -360,6 +373,79 @@ class RepetitionGuardFilter:
             else:
                 prev, run = token, 1
         return False
+
+    @classmethod
+    def _has_cycle_chars(cls, text: str) -> bool:
+        """巡回の単位とみなせる字種があるか (罫線・「ｗｗｗ」等の連続を除く)。"""
+        return len({c for c in text if c.isalnum()}) >= cls._CYCLE_MIN_DISTINCT
+
+    @classmethod
+    def _tail_echo_start(cls, text: str) -> int:
+        """末尾が ``p`` 文字前の繰り返しになっている部分の始まり (純粋関数)。
+
+        先出しはここまでに留める — 巡回で打ち切ると先出し済みの反復は取り消せない。
+        繰り返しが ``_CYCLE_MIN_PERIOD`` 文字未満 / 字種が乏しいときは ``len(text)``。
+        """
+        n = len(text)
+        start = n
+        for p in range(cls._CYCLE_MIN_PERIOD, min(cls._CYCLE_MAX_PERIOD, n // 2) + 1):
+            k = n - 1
+            while k - p >= 0 and text[k] == text[k - p]:
+                k -= 1
+            if n - 1 - k >= cls._CYCLE_MIN_PERIOD and cls._has_cycle_chars(text[k + 1:]):
+                start = min(start, k + 1)
+        return start
+
+    @classmethod
+    def _phrase_cycle_end(cls, text: str, *, tail_only: bool = False) -> int | None:
+        """行内で句が巡回していれば、その 1 回目の終端位置を返す (純粋関数)。
+
+        ``text[a-p:a]`` を単位 (長さ ``p``) として ``text[a-p:]`` 以降が
+        ``_CYCLE_MIN_REPEATS`` 回以上連続するとき ``a`` を返す (単位 1 回分は残す)。
+        ``tail_only`` は ``text`` の末尾で終わる巡回だけを見る — ストリームの未確定行を
+        チャンクごとに見るための O(周期) 版。巡回が無ければ ``None``。
+        """
+        n = len(text)
+        reps = cls._CYCLE_MIN_REPEATS
+        best: int | None = None
+        for p in range(cls._CYCLE_MIN_PERIOD, min(cls._CYCLE_MAX_PERIOD, n // reps) + 1):
+            need = (reps - 1) * p
+            if tail_only:
+                k = n - 1
+                while k - p >= 0 and text[k] == text[k - p]:
+                    k -= 1
+                starts = [k + 1] if n - 1 - k >= need else []
+            else:
+                starts = []
+                run = 0
+                for k in range(p, n):
+                    run = run + 1 if text[k] == text[k - p] else 0
+                    if run == need:
+                        starts.append(k - run + 1)
+            for a in starts:
+                if not cls._has_cycle_chars(text[a - p:a]):
+                    continue
+                if best is None or a < best:
+                    best = a
+                break
+        return best
+
+    def _cycle_guarded(self, text: str) -> bool:
+        """句の巡回を見てよい文脈か (コード中と表の行は正当な繰り返しがある)。"""
+        return not self._in_code_fence and not text.lstrip().startswith("|")
+
+    def _trip_on_cycle(self, text: str, cut: int) -> str:
+        """句の巡回で打ち切る。1 回目までの未出力分を返す。"""
+        kept = text[self._emitted_in_line:cut] if cut > self._emitted_in_line else ""
+        self._tripped = True
+        self._buffer = ""
+        self._emitted_in_line = 0
+        record_verifier_hit("repetition")
+        logger.warning(
+            "RepetitionGuardFilter: truncated output after an in-line phrase "
+            "cycle (before_cut=%s)", text[max(0, cut - 40):cut],
+        )
+        return kept
 
     @property
     def tripped(self) -> bool:
@@ -432,6 +518,10 @@ class RepetitionGuardFilter:
         out: list[str] = []
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
+            cut = self._phrase_cycle_end(line) if self._cycle_guarded(line) else None
+            if cut is not None:
+                out.append(self._trip_on_cycle(line, cut))
+                return "".join(out)
             if self._line_is_repeat(line):
                 self._tripped = True
                 self._buffer = ""
@@ -446,16 +536,32 @@ class RepetitionGuardFilter:
             # 先出し済みの分は二重に出さない。
             out.append(line[self._emitted_in_line:] + "\n")
             self._emitted_in_line = 0
+        # 改行の来ない暴走は行が完成しないので、未確定行の末尾でも見る。
+        if self._buffer and self._cycle_guarded(self._buffer):
+            cut = self._phrase_cycle_end(self._buffer, tail_only=True)
+            if cut is not None:
+                out.append(self._trip_on_cycle(self._buffer, cut))
+                return "".join(out)
         # 長い未確定行は改行を待たずに先出しする (_EAGER_FLUSH_CHARS 参照)。
+        # 末尾が少し前の繰り返しになっている間はその部分を出さずに待つ — 巡回で打ち切ると
+        # 先出し済みの反復は取り消せないため (続きが違えば次のチャンクで出る)。
         if len(self._buffer) >= self._EAGER_FLUSH_CHARS:
-            out.append(self._buffer[self._emitted_in_line:])
-            self._emitted_in_line = len(self._buffer)
+            upto = len(self._buffer)
+            if self._cycle_guarded(self._buffer):
+                upto = self._tail_echo_start(self._buffer)
+            if upto > self._emitted_in_line:
+                out.append(self._buffer[self._emitted_in_line:upto])
+                self._emitted_in_line = upto
         return "".join(out)
 
     def flush(self) -> str:
         """残りバッファを排出する (打ち切り済みなら空)。"""
         if self._tripped:
             return ""
+        if self._buffer and self._cycle_guarded(self._buffer):
+            cut = self._phrase_cycle_end(self._buffer)
+            if cut is not None:
+                return self._trip_on_cycle(self._buffer, cut)
         remaining = self._buffer[self._emitted_in_line:]
         self._buffer = ""
         self._emitted_in_line = 0

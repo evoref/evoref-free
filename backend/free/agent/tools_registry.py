@@ -65,6 +65,12 @@ class ToolDefinition:
     #: 層のガード (パス解決 / action_blocked) を飛ばすため、**目録だけを**
     #: 実態に合わせる。
     inventory_modes: list[str] | None = None
+    #: 結果が **ユーザーのマシンの状態** (IP / ホスト名 / ハードウェア / コマンド出力)
+    #: を運ぶツール。ユーザーの発話ではない値なので、MDP トレースの step に private
+    #: 印を打ち、エピソード記憶 (Step 7.5) と decision ファクト (Step 8) へ持ち越さない
+    #: (``AgentTracer`` の ``env_valued_action``)。実機の監査: 「IPアドレスとは？」で
+    #: ``run_command_readonly`` が走り、実 IP が private:false で長期保存された。
+    env_valued: bool = False
 
     def listed_in(self, mode: str | None) -> bool:
         """``mode`` の capability summary に載せるべきか (純粋関数)。"""
@@ -398,12 +404,15 @@ class ToolsRegistry:
         hidden: bool = False,
         timeout_sec: float | None = None,
         inventory_modes: list[str] | None = None,
+        env_valued: bool = False,
     ) -> None:
         """ツールを登録
 
         ``inventory_modes`` は「使えるツール一覧」に載せるモード
         (既定は ``modes``)。選択可否は変えずに目録だけ広げたいときに使う
         (:attr:`ToolDefinition.inventory_modes` の説明を参照)。
+        ``env_valued`` はマシンの状態を返すツールの宣言
+        (:attr:`ToolDefinition.env_valued`)。
         """
         self._tools[name] = ToolDefinition(
             name=name,
@@ -414,8 +423,14 @@ class ToolsRegistry:
             hidden=hidden,
             timeout_sec=timeout_sec,
             inventory_modes=inventory_modes,
+            env_valued=env_valued,
         )
         logger.info("Registered tool: %s", name)
+
+    def returns_environment_values(self, name: str) -> bool:
+        """``name`` がマシンの状態を返すと宣言されたツールか (未登録は ``False``)。"""
+        tool = self._tools.get(name)
+        return tool is not None and tool.env_valued
 
     def timeout_for(self, name: str, default: float) -> float:
         """ツールの実行タイムアウトを返す (未宣言なら ``default``)。"""

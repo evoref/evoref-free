@@ -43,12 +43,19 @@ def no_nested_recompute() -> bool:
     return False
 
 
+def _checkpoint_unknown(_ctx: int) -> int | None:
+    """checkpoint 1 つの状態量が見積れない (GGUF から導けない) ときの既定。"""
+    return None
+
+
 @dataclass(frozen=True)
 class BaseModelInfo:
     """見積りに使う base モデルの性質。
 
     ``kv_mb(ctx)`` は文脈長 ``ctx`` の文脈メモリ (KV + hybrid の再帰状態、MiB)。スロット数は
     config の ``llama.slots`` (``auto`` は ctx で 3 / 4) から決めて渡す。見積れなければ ``None``。
+    ``checkpoint_mb(ctx)`` はコンテキスト checkpoint 1 つ (1 スロット) の状態量 (MiB、
+    ``launch_llama.estimate_checkpoint_state_mb``)。純 attention は 0、見積れなければ ``None``。
     """
 
     name: str
@@ -58,6 +65,7 @@ class BaseModelInfo:
     profile_ctx: int | None
     kv_mb: Callable[[int], int | None]
     compute_mb: int = COMPUTE_MARGIN_MIB
+    checkpoint_mb: Callable[[int], int | None] = _checkpoint_unknown
 
     @property
     def basis(self) -> str:
@@ -255,6 +263,9 @@ def load_base_model_info(cfg: dict[str, Any], project_root: Path) -> BaseModelIn
             meta, ctx, lc.get("cache_type_k"), lc.get("cache_type_v"), n_seq=slots_for(raw_slots, ctx),
         )
 
+    def checkpoint_mb(ctx: int) -> int | None:
+        return ll.estimate_checkpoint_state_mb(meta, ctx, lc.get("cache_type_k"), lc.get("cache_type_v"))
+
     layers = meta.get("block_count") or ll._read_gguf_layer_count(path)
     return BaseModelInfo(
         name=path.name, model_mb=int(size), n_layers=int(layers) if layers else None,
@@ -263,6 +274,7 @@ def load_base_model_info(cfg: dict[str, Any], project_root: Path) -> BaseModelIn
         kv_mb=kv_mb,
         # 明示の ``-ub`` はその計算バッファで見る (``auto`` の ub は項目 ngl が b・ub の解決値で差し替える)
         compute_mb=compute_mb_for_ubatch(explicit_ubatch(cfg)),
+        checkpoint_mb=checkpoint_mb,
     )
 
 

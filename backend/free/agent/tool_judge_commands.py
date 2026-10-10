@@ -56,6 +56,7 @@ from backend.free.core.intent_vocab import (
     PRESENT_ANCHOR_RE,
     PYTHON_VERSION_TERMS,
     STORAGE_SPEC_TERMS,
+    asks_concept_definition,
     is_plain_statement,
     is_practice_advice_query,
 )
@@ -2238,6 +2239,21 @@ def _infer_executable_command(query: str) -> str:
     if is_practice_advice_query(query):
         logger.debug("Practice/advice question, no executable command: %s", query[:50])
         return ""
+    # 「IPアドレスとは？」のように対象を一般概念として尋ねる問いは、手元の値を
+    # 求めていない (判定点 ``concept_definition_query`` と同じ 1 実装)。
+    if asks_concept_definition(query):
+        logger.debug("Concept definition question, no executable command: %s", query[:50])
+        return ""
+    return match_executable_command(query)
+
+
+def match_executable_command(query: str) -> str:
+    """規則表だけでコマンドを組む (平叙文・助言・定義の問いの除外を掛けない)。
+
+    規則層の判定点 (``concept_definition_query``) を **候補のあるターンだけ**
+    記録するために、除外の前の照合結果を呼出側へ見せる口。実行に使うのは
+    :func:`_infer_executable_command` の方。
+    """
     # 日数の問いは「何日」を含まない形もある (「残り日数と総勉強時間を計算し
     # 直してください」)。日時の入口 (``何日`` 等、表の先頭) に掛からず規則層を
     # 素通りし、訂正後の 4/25 までの日数が暗算になっていた (2026-09-27 監査

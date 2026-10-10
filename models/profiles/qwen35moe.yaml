@@ -1,0 +1,36 @@
+# Qwen3.5 / 3.6 MoE 系 (arch "qwen35moe")。
+#
+# Qwen3.6-35B-A3B の GGUF は general.architecture="qwen35moe" を報告するため、qwen35.yaml
+# ではマッチしない (cf. lfm2 と lfm2moe の分離)。このファイルが無かった間は
+# プロファイル外 (launch_flags 無し・reasoning は chat_template の family から推定・
+# sampling は modes.* と schema 既定) で動いていた。
+#
+# GGUF メタデータ実測 (2026-10-10, models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_M.gguf):
+#   architecture=qwen35moe / block_count=41 / context_length=262144 / expert_count=256
+#   attention.head_count=16 / head_count_kv=2 / key_length=value_length=256
+#   embedding_length=2048 / full_attention_interval=4
+#   ssm.state_size=128 / ssm.inner_size=4096 / ssm.conv_kernel=4 / ssm.group_count=16
+#   nextn_predict_layers=1 (MTP ヘッド内蔵) / chat_template あり
+#
+# **宣言はサンプリングだけに留める** — 挙動を変えないため。launch_flags (--jinja /
+# --reasoning-format auto)・reasoning・context_size・moe を足すと起動引数と
+# enable_thinking の送り方が変わるので、qwen35.yaml に揃えるかは実機で確かめてから決める。
+
+# モード別の推奨サンプリング (優先順と出典は qwen35.yaml の sampling_by_mode 参照)。
+# 値はプロファイル外で動いていた 2026-10-10 時点の実効値 (= schema 既定) のまま。
+# Qwen3 系モデルカードの non-thinking 推奨は temperature 0.7 / top_p 0.8 / top_k 20
+# (Qwen3.6-35B-A3B のカードはこのファイルを書いた時点では読んでいない)。
+# 採否は A/B の実測で決めてから書き換える。
+sampling_by_mode:
+  chat:
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 40
+    presence_penalty: 0.0
+    frequency_penalty: 0.3
+  create:
+    temperature: 0.3
+    top_p: 0.95
+    top_k: 20
+    presence_penalty: 0.0
+    frequency_penalty: 0.0
