@@ -3724,6 +3724,53 @@ def is_practice_advice_query(query: str) -> bool:
     return bool(_PRACTICE_ADVICE_RE.search(query))
 
 
+#: 対象を **一般概念として** 尋ねる文の骨組み (「X とは？」「X とは何ですか」
+#: 「X って何」「X の違いは」「X を説明して」「What is an X?」)。語の種類は見ず、
+#: 問いの形だけを見る。「とは」は文末か「何 / どういう」で閉じるときだけ
+#: (「この会話とは別に」「GW とは何日から」を拾わない)。英語の what is は不定冠詞
+#: のときだけ (「What is the hostname?」は手元の値を尋ねうる)。
+_CONCEPT_DEFINITION_FRAME_RE = re.compile(
+    r"とは\s*(?:[？?。．!！]|$)"
+    r"|とは\s*(?:何|なに|なん)\s*(?:です|でしょう|か|[？?。．]|$)"
+    r"|とは\s*どういう(?:意味|こと|もの)"
+    r"|って\s*(?:何|なに|なん)\s*(?:です|でしょう|か|[？?。．]|$)"
+    r"|の違い(?:は|を|について|って)"
+    r"|(?:説明|解説)して"
+    r"|(?<![A-Za-z])what\s+is\s+an?\s+[A-Za-z]"
+    r"|(?<![A-Za-z])what\s+does\s+.{1,40}\s+(?:mean|stand\s+for)"
+    r"|(?<![A-Za-z])difference\s+between(?![A-Za-z])"
+    r"|(?<![A-Za-z])(?:explain|describe)(?![A-Za-z])",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+#: この PC・今・自分の環境への言及 (「私の」「この」「今の」「my」「this」)。
+#: これがある問いは一般概念ではなく **手元の値** を尋ねうるので、定義の問いと
+#: みなさない (規則層は従来どおり撃つ)。
+_SELF_ENVIRONMENT_ANCHOR_RE = re.compile(
+    r"(?:私|わたし|僕|ぼく|俺|おれ|自分|うち)の|この|今の|いまの|現在の|手元の"
+    r"|(?<![A-Za-z])(?:my|mine|this|current|our)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def asks_concept_definition(query: str) -> bool:
+    """対象を一般概念として尋ねる **定義・知識の問い** か (純粋関数)。
+
+    executable query の語彙 (「IP アドレス」「ホスト名」「OS」…) は概念そのものを
+    尋ねる問いにも現れる。実インシデント (2026-10-09 ライブ監査 trace
+    9d836069a0c9): 「ネットワークの基礎を学びたい。IPアドレスとは？」で規則層が
+    ``socket.gethostbyname`` を撃ち、手元のホスト名と IP がプロンプトに載った。
+    語を語彙から外すと「この PC の IP は？」が撃てなくなる (RAM / 容量で繰り返した
+    型)。判定は **問いの形** で行う — 定義を尋ねる骨組みがあり、この PC・今・自分の
+    環境への言及が無いとき True。
+    """
+    if not query:
+        return False
+    if _SELF_ENVIRONMENT_ANCHOR_RE.search(query):
+        return False
+    return bool(_CONCEPT_DEFINITION_FRAME_RE.search(query))
+
+
 def is_plain_statement(query: str) -> bool:
     """問い・依頼のマーカーが無く、平叙の文末で終わる **自己申告** か (純粋関数)。
 
@@ -3743,6 +3790,57 @@ def is_plain_statement(query: str) -> bool:
     if _REQUEST_MARKER_RE.search(query):
         return False
     return bool(_STATEMENT_TAIL_RE.search(query.strip()))
+
+
+def is_asking_sentence(sentence: str) -> bool:
+    """1 文が問い・依頼か (問い・依頼のマーカー、または依頼の文末 / 純粋関数)。
+
+    マーカーは :func:`is_plain_statement` と同じ :data:`_REQUEST_MARKER_RE`、
+    文末は :func:`is_request_sentence`。どちらにも当たらない文 (平叙・体言止め) は
+    問いでも依頼でもない。**平叙の文 (:func:`is_plain_statement`) は問いに数えない**
+    — 「忘れないようにお願いします。」は依頼の文末を持つが平叙の文末 (ます) でもあり、
+    発話全体の ``is_plain_statement`` は従来これを言明として通していた。数えると
+    予定の言明 (「…部長会議があります。忘れないようにお願いします。」) が型付けを
+    失い、同じバッチの値の更新が旧値を見つけられなくなる (2026-10-10 回帰)。
+    """
+    s = (sentence or "").strip()
+    if not s or is_plain_statement(s):
+        return False
+    return bool(_REQUEST_MARKER_RE.search(s) or is_request_sentence(s))
+
+
+def plain_statement_sentences(text: str) -> list[str]:
+    """発話のうち **平叙の文** (:func:`is_plain_statement` が真の文) を順に返す (純粋関数)。
+
+    文単位の平叙判定の 1 実装 (不変則 #14a)。発話 **全体** に
+    :func:`is_plain_statement` を掛けると、言明の後ろに問い・依頼が続く発話
+    (「犬を飼い始めました。最初に用意するものは？」) は問いのマーカーで丸ごと
+    落ちる。言明の文が 1 つでもあるかは、この関数の戻り値で見る
+    (2026-10-10: 実データ 301 発話の言明 + 問いの混在が記憶に 1 件も残らなかった)。
+    読み手は ``note_builder._attribute_backed_tags`` / Step 8.3 の
+    ``personal_fact_curator.is_untyped_statement`` / Step 8 の指標
+    ``notes_without_tags_stating``。
+    """
+    out: list[str] = []
+    for raw in split_sentences(text):
+        sentence = raw.strip()
+        if sentence and is_plain_statement(sentence):
+            out.append(sentence)
+    return out
+
+
+def without_asking_sentences(text: str) -> str:
+    """問い・依頼の文 (:func:`is_asking_sentence`) を落とした発話 (純粋関数)。
+
+    属性の解決を言明の側に限るためのもの — 問いの文の語 (「勉強の**進め方**を
+    教えて」) でスロットが決まると、根拠の文が依頼文になる。落とすと何も
+    残らない (全文が問い・依頼) なら元の発話を返す (判定不能なものを絞らない)。
+    """
+    sentences = split_sentences(text)
+    kept = [s for s in sentences if not is_asking_sentence(s)]
+    if not kept or len(kept) == len(sentences):
+        return text or ""
+    return "".join(kept)
 
 
 # ─────────────────────────────────────────────────────────────────────

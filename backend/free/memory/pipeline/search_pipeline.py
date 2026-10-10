@@ -28,10 +28,9 @@ from backend.free.core.intent_vocab import (
     only_session_ordinal_recall,
     points_to_past_session,
     recall_form_points_into_conversation,
-    refers_to_ongoing_session,
-    refers_to_previous_output,
     session_user_turns,
 )
+from backend.free.core.conversation_scope import addresses_ongoing_conversation
 from backend.free.core.session_mode import is_create_mode
 from backend.free.memory.corrections import LINK_UPDATE, correction_links_by_target
 from backend.free.memory.episodic.note import record_mode
@@ -599,6 +598,11 @@ def episodic_session_scope(
     監査: 「さっきの距離は何マイル？」に別セッションのマラソンの換算「約 26.22
     マイル」が返った)。
 
+    第 1 分岐 (直前の出力 / 会話そのものを対象にした問い) は
+    :func:`~backend.free.core.conversation_scope.addresses_ongoing_conversation` の
+    1 本で、記憶の注入 (判定点 ``query_conversation_scope``) と同じ規則を読む
+    (「今日の話を5つの原則にまとめて」も会話そのものを対象にする、2026-10-09 実機)。
+
     ガードは履歴検索を撃つと決まった問いにしか掛からないが、ここは全ターンで判定
     するので、近接語・位置語が会話の中のものを指す形
     (:func:`recall_form_points_into_conversation`、「さっきの距離」「最初に私が
@@ -617,7 +621,7 @@ def episodic_session_scope(
     「以前」「前回」「昨日」のような過去セッションを指す語があればどちらの述語も
     偽なので、別セッションも従来どおり引く。
     """
-    if refers_to_previous_output(query) or refers_to_ongoing_session(query):
+    if addresses_ongoing_conversation(query):
         return session_id
     if user_turns < RECALL_IN_SESSION_MIN_USER_TURNS:
         return None
@@ -819,6 +823,7 @@ def _answers_for_question_only_hits(
     from backend.free.core.text_quality import (
         abstains_on_reference_material,
         carries_no_assertion,
+        foreign_script_leak,
         states_no_user_value,
     )
     from backend.free.memory.episodic.store import EpisodicHit
@@ -852,6 +857,8 @@ def _answers_for_question_only_hits(
             or carries_no_assertion(answer.text)
             or states_no_user_value(answer.text)
             or abstains_on_reference_material(answer.text)
+            # 他言語のトークンが紛れた答え (取り込みの門より前に入った既存ノート)
+            or foreign_script_leak(answer.text, query=hit.text) is not None
         ):
             out.append(hit)
             continue

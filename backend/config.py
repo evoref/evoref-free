@@ -13,6 +13,10 @@ logger = get_logger("config")
 
 _config: dict | None = None
 _path_resolver: "PathResolver | None" = None
+#: ``load_config`` が読んだ設定で **明示された** ``modes.<mode>`` のキー。検証後の
+#: 設定は schema 既定で埋まり明示と既定を区別できないため、検証前の値から
+#: pydantic の ``model_fields_set`` で取って、読んだ設定 dict と対で持つ。
+_explicit_mode_keys: "tuple[dict, dict[str, frozenset[str]]] | None" = None
 
 #: base_model 未指定時のフォールバック (歴史的既定)。
 _DEFAULT_BASE_MODEL = "models/gemma-4-12b-it-qat-q4_0.gguf"
@@ -534,18 +538,47 @@ def load_config(path: str | Path | None = None, project_root: Path | None = None
     config.yaml（共通）を読込み、backend/pro/ 存在時は config.pro.yaml を
     deep merge する。
     """
-    global _config, _path_resolver
+    global _config, _path_resolver, _explicit_mode_keys
 
     if project_root is None:
         project_root = Path(__file__).parent.parent
 
-    _config = read_config_file(path, project_root)
+    raw = _read_raw_config_file(path, project_root)
+    _config = _validate_raw_config(raw)
+    _explicit_mode_keys = (_config, explicit_mode_keys(raw))
     _path_resolver = PathResolver(_config, project_root)
     return _config
 
 
+def explicit_mode_keys(raw: dict | None) -> dict[str, frozenset[str]]:
+    """検証前の設定から、``modes.<mode>`` ごとに明示されたキーの集合を返す。"""
+    from backend.schemas._common import ModesConfig
+
+    modes = ModesConfig.model_validate((raw or {}).get("modes") or {})
+    return {
+        name: frozenset(getattr(modes, name).model_fields_set)
+        for name in ModesConfig.model_fields
+    }
+
+
+def _explicit_mode_keys_for(cfg: dict, mode: str, mode_cfg: dict) -> frozenset[str]:
+    """``cfg`` で明示された ``modes.<mode>`` のキー。
+
+    ``load_config`` を経ずに作られた設定 dict (テストの直接代入等) は明示の記録を
+    持たないので、書かれているキーを全部明示とみなす (この変更前と同じ結果)。
+    """
+    if _explicit_mode_keys is not None and _explicit_mode_keys[0] is cfg:
+        return _explicit_mode_keys[1].get(mode, frozenset())
+    return frozenset(mode_cfg)
+
+
 def read_config_file(path: str | Path | None, project_root: Path) -> dict:
     """``load_config`` と同じ規則で読み込み・検証した設定を返す (グローバルは触らない)。"""
+    return _validate_raw_config(_read_raw_config_file(path, project_root))
+
+
+def _read_raw_config_file(path: str | Path | None, project_root: Path) -> dict:
+    """config.yaml (と Pro では config.pro.yaml) を読み、検証前のマージ結果を返す。"""
     if path is None:
         path = project_root / "config.yaml"
 
@@ -569,12 +602,15 @@ def read_config_file(path: str | Path | None, project_root: Path) -> dict:
             "config.pro.yaml found but backend/pro/ does not exist. "
             "Pro settings will be ignored. Install Pro edition or remove config.pro.yaml."
         )
+    return _config
 
-    # Pydantic スキーマでバリデーション + デフォルト値補完
+
+def _validate_raw_config(raw: dict) -> dict:
+    """Pydantic スキーマでバリデーション + デフォルト値補完した設定を返す。"""
     from backend.schemas import validate_config
 
     try:
-        return validate_config(_config)
+        return validate_config(raw)
     except ValidationError as e:
         logger.error("Config validation failed:\n%s", e)
         raise
@@ -757,7 +793,7 @@ def _normalize_profile(raw: dict) -> dict:
     """検証付きセクションを正規化する (キャッシュ格納前に 1 回だけ走る)。
 
     ``reasoning`` は ``ProfileReasoningConfig``、``sampling`` は
-    ``ProfileSamplingConfig`` で検証する。宣言が無い / 検証に失敗したセクションは
+    ``ProfileSamplingConfig``、``sampling_by_mode`` は ``ProfileSamplingByModeConfig`` で検証する。宣言が無い / 検証に失敗したセクションは
     キーごと落とす (プロファイル全体は落とさない)。他のキーは素通しで、
     プロファイル YAML への寛容さ (綴り違いで起動を落とさない) を維持する。
     """
@@ -790,6 +826,20 @@ def _normalize_profile(raw: dict) -> dict:
             profile.pop("sampling", None)
     else:
         profile.pop("sampling", None)
+
+    by_mode = profile.get("sampling_by_mode")
+    if isinstance(by_mode, dict) and by_mode:
+        from backend.schemas.llm import ProfileSamplingByModeConfig
+
+        try:
+            profile["sampling_by_mode"] = ProfileSamplingByModeConfig(
+                **by_mode,
+            ).model_dump(exclude_none=True)
+        except Exception as e:
+            logger.warning("Invalid sampling_by_mode profile (ignored): %s", e)
+            profile.pop("sampling_by_mode", None)
+    else:
+        profile.pop("sampling_by_mode", None)
 
     return profile
 
@@ -832,8 +882,13 @@ def _profile_for(cfg: dict, target: str) -> dict:
 
 
 def _resolve_profile_sampling_for_mode(cfg: dict, mode: str) -> dict:
-    """アクティブモデル ("chat"|"create") のプロファイルから sampling 既定を返す。"""
+    """アクティブモデル ("chat"|"create") のプロファイルから旧形式の ``sampling`` を返す。"""
     return _profile_for(cfg, mode).get("sampling") or {}
+
+
+def _resolve_profile_sampling_by_mode(cfg: dict, mode: str) -> dict:
+    """アクティブモデル ("chat"|"create") のプロファイルから ``sampling_by_mode.<mode>`` を返す。"""
+    return (_profile_for(cfg, mode).get("sampling_by_mode") or {}).get(mode) or {}
 
 
 def _resolve_profile_reasoning(cfg: dict, slot: str) -> dict:
@@ -1050,40 +1105,35 @@ def get_mode_generation_params(mode: str) -> dict:
         ValueError: 不明なモード名
         RuntimeError: Config 未ロード
     """
+    from backend.schemas._common import ModesConfig
+
     cfg = get_config()
     modes_cfg = cfg.get("modes", {})
 
-    # デフォルト値
-    # モデルパスは生成パラメータと分離し、create は model_paths.create_model から引く。
-    defaults = {
-        "chat": {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "top_k": 40,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-        },
-        "create": {
-            "temperature": 0.3,
-            "top_p": 0.95,
-            "top_k": 20,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-        },
-    }
-
-    if mode not in defaults:
+    if mode not in ModesConfig.model_fields:
         raise ValueError(f"Unknown mode: {mode!r} (available: chat, create)")
+    # schema 既定 (backend/schemas/_common.py の ChatModeConfig / CreateModeConfig)。
+    # モデルパスは生成パラメータと分離し、create は model_paths.create_model から引く。
+    defaults = ModesConfig().model_dump()[mode]
 
-    mode_cfg = dict(modes_cfg.get(mode, {}))
+    mode_cfg = dict(modes_cfg.get(mode) or {})
     # 生成パラメータのみを採用 (model はここには存在しない)
     mode_cfg.pop("model", None)
-    # モデル arch プロファイルの sampling 既定を、汎用 modes.* より優先で適用する
-    # (モデル切替時にモデル推奨値を自動反映する目的)。空 {} なら従来どおり。
-    # 上書きしたい場合は <data_root>/profiles/<arch>.yaml か auto_model_flags:false。
-    # 学習デルタは後段 (apply_deltas) で最優先に適用される。
-    profile_sampling = _resolve_profile_sampling_for_mode(cfg, mode)
-    params = {**defaults[mode], **mode_cfg, **profile_sampling}
+    explicit_keys = _explicit_mode_keys_for(cfg, mode, mode_cfg)
+    implicit = {k: v for k, v in mode_cfg.items() if k not in explicit_keys}
+    explicit = {k: v for k, v in mode_cfg.items() if k in explicit_keys}
+    # 優先順: schema 既定 < プロファイルのモード別推奨 (sampling_by_mode.<mode>)
+    #   < config で明示した modes.<mode>.* < 旧形式のプロファイル sampling。
+    # 旧形式 (sampling) はモードを横断して明示値まで上書きする — 後方互換のため位置を
+    # 変えない (非推奨。新しい宣言は sampling_by_mode へ)。学習デルタは後段
+    # (apply_deltas) で最優先に適用される。
+    params = {
+        **defaults,
+        **implicit,
+        **_resolve_profile_sampling_by_mode(cfg, mode),
+        **explicit,
+        **_resolve_profile_sampling_for_mode(cfg, mode),
+    }
 
     # ベースモデル。chat は常にここを採用。
     # create は model_paths.create_model 指定が無い/空の場合のみフォールバック。

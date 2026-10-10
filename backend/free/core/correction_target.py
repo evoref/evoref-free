@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from backend.free.core.intent_vocab import split_sentences as _split_sentences_raw
 from backend.free.core.script_ranges import (
     HIRAGANA,
     KANJI,
@@ -98,8 +99,8 @@ _SENTENCE_SPLIT_RE = re.compile(r"[。！？!?\n]")
 #: 本人の値更新 (``memory.extractors.base.value_update_spans``)・旧値で結ぶ
 #: assertion の畳み込み (``memory.sleep.extraction``) が :func:`contrast_pairs` を共有する。
 CONTRAST_MARKER = r"(?:ではなく|じゃなく|では無く)"
-#: 1 文 = 終端記号以外の並び + 終端記号 (残す)。改行も文の境界。
-_SENTENCE_WITH_TERMINAL_RE = re.compile(r"[^。！？!?\n]+[。！？!?]*")
+#: 終端記号だけの断片 (「すごい！！」の 2 つ目の ！)。直前の文へ戻す。
+_TERMINALS_ONLY_RE = re.compile(r"[。．！？!?]+")
 #: 「<旧> ではなく[、] <新> <断定・変更の述語>」。旧値の区間 (``head``) は直前の
 #: 区切り (読点・句点・文頭) から印まで。述語で閉じない形 (「Python ではなく Go で
 #: 書いてください」「コーヒーではなく紅茶が好きな人もいます」) は対比にしない。
@@ -126,11 +127,21 @@ def split_sentences(text: str) -> list[str]:
     文末の形 (「〜でした。」「〜ますか？」) を文ごとに判定するためのもの。
     発話全体の末尾で判定すると、訂正の後に問いや依頼が続く形で 1 文目が
     見えなくなる (2026-09-26 監査 #13)。
+
+    文の区切りは :func:`backend.free.core.intent_vocab.split_sentences` の 1 実装に
+    寄せる (不変則 #14a、2026-10-10)。ここは各文の前後の空白を落とし、終端記号
+    だけの断片 (「！！」の 2 つ目) を直前の文へ戻すだけ。
     """
-    return [
-        s.strip() for s in _SENTENCE_WITH_TERMINAL_RE.findall(text or "")
-        if s.strip()
-    ]
+    out: list[str] = []
+    for raw in _split_sentences_raw(text or ""):
+        sentence = raw.strip()
+        if not sentence:
+            continue
+        if out and _TERMINALS_ONLY_RE.fullmatch(sentence):
+            out[-1] += sentence
+            continue
+        out.append(sentence)
+    return out
 
 
 def _is_single_hiragana(text: str) -> bool:

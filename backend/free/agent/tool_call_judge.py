@@ -36,6 +36,7 @@ from backend.free.core.intent_vocab import (
     ANAPHORIC_OPERAND_RE,
     NUMBER_LITERAL_RE,
     asks_quantity_without_operands,
+    asks_concept_definition,
     is_plain_statement,
     is_practice_advice_query,
     looks_like_numeric_question,
@@ -61,6 +62,7 @@ from backend.free.agent.safety_patterns import (
     strip_command_literals,
 )
 from backend.free.agent.tools_registry import ToolDefinition, ToolsRegistry
+from backend.free.agent.concept_definition_gate import concept_definition_verdict
 from backend.free.agent.tool_judge_annuity import (
     annuity_request_rule,
     annuity_request_verdict,
@@ -189,6 +191,7 @@ from backend.free.agent.tool_judge_commands import (
     _build_spec_command,
     _command_is_readonly_inspection,
     _infer_executable_command,
+    match_executable_command,
     _is_past_fact_recall,
     _readonly_command_rejected,
     DateIntentParams,
@@ -1953,7 +1956,16 @@ class ToolCallJudge:
         # ツール名は mode から解決する (chat は run_command_readonly)。
         exec_tool = _executable_tool_for_mode(tools_registry, mode)
         if exec_tool:
-            command = _infer_executable_command(query)
+            # 規則表がコマンドを組めるターンだけ、定義の問いかを判定点として記録する。
+            # 発火 (「IPアドレスとは？」) なら規則層は棄権して後段へ渡す
+            # (2026-10-09 ライブ監査 trace 9d836069a0c9)。
+            if (
+                match_executable_command(query)
+                and concept_definition_verdict(query).band == "fire"
+            ):
+                command = ""
+            else:
+                command = _infer_executable_command(query)
             if command and not self._reject_readonly(exec_tool, command, call):
                 logger.debug("Executable query detected: %s", query[:50])
                 result = self._finalize(
@@ -4821,6 +4833,7 @@ class ToolCallJudge:
             and exec_tool
             and not asks_about_prior_conversation_entity(query)
             and not is_practice_advice_query(query)
+            and not asks_concept_definition(query)
         ):
             # システム情報クエリは具体的なコマンドを生成
             command = _infer_executable_command(query)

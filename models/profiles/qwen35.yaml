@@ -6,7 +6,7 @@
 #
 # sampling は意図的に空: プロファイル sampling は modes.* を上書きするため、
 # ここで値を入れると chat (temp 0.7) と create (temp 0.3) のモード別チューニングを
-# 一律に潰してしまう。Qwen3 系はモード別の温度差が有効なので modes.* に委ねる。
+# 一律に潰してしまう。モード別の推奨は sampling_by_mode に書く (下記)。
 #
 # dense なので MoE 無効。内蔵テンプレートを使うため --jinja を付与。
 launch_flags:
@@ -31,6 +31,28 @@ moe:
   enabled: false
   n_cpu_moe: null
 sampling: {}
+# モード別の推奨サンプリング (backend/config.py get_mode_generation_params)。
+# 優先順: schema 既定 < ここ < config.yaml で明示した modes.<mode>.* < 旧形式の sampling
+# (旧形式はモード横断で明示値まで上書きするため非推奨。新しい宣言はここへ書く)。
+# 値は 2026-10-10 時点の実効値 (= schema 既定、backend/schemas/_common.py) のままで、
+# 挙動は変えない。モデルカード (Qwen3.5 / Qwen3.8) の non-thinking 推奨は
+# temperature 0.7 / top_p 0.8 / top_k 20 / presence_penalty 1.5 (presence は日本語の
+# language mixing が出やすいので不採用)。採否は A/B の実測で決めてから書き換える。
+# by-model 層の sampling: {top_k: 20} (Qwen3.5-9B / Qwen3.8-27B 等) は旧形式なので、
+# そのモデルでは top_k がここより優先される。
+sampling_by_mode:
+  chat:
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 40
+    presence_penalty: 0.0
+    frequency_penalty: 0.3
+  create:
+    temperature: 0.3
+    top_p: 0.95
+    top_k: 20
+    presence_penalty: 0.0
+    frequency_penalty: 0.0
 # reasoning (thinking)。mode は toggle (enable_thinking で ON/OFF 可) / always
 # (常時思考・OFF 不可、例 DeepSeek-R1) / none (非対応) の3値。
 # toggle/always のみ reasoning_budget を送信、toggle のみ enable_thinking を送信する

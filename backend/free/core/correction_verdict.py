@@ -340,10 +340,15 @@ def narrow_to_new_value(
 #: と言われ / らしい)。「以前は1.5%ではなく1.2%でしたが、今は2%です」「部下に
 #: よると、試験日は18日ではなく25日でした。」を self に倒さない (独立レビュー M-c)。
 #: 門は LLM の判定を上げる方向なので、標識があれば倒さず LLM の答えに任せる。
+#: 仮定の標識。Step 8.3 の主体と枠の門 (``memory.notes.speaker_frame_gate``) も
+#: 読む (不変則 #14a)。
+HYPOTHETICAL_MARKER = r"仮に|もし|としたら|とすると|なら"
+#: 伝聞の標識 (同上)。
+HEARSAY_MARKER = r"によると|と言って|と言われ|らしい"
 _NOT_OWN_RESTATEMENT_RE = re.compile(
-    r"仮に|もし|としたら|とすると|なら"
-    r"|以前は|先月|今は|今月は"
-    r"|によると|と言って|と言われ|らしい",
+    HYPOTHETICAL_MARKER
+    + r"|以前は|先月|今は|今月は|"
+    + HEARSAY_MARKER,
 )
 
 

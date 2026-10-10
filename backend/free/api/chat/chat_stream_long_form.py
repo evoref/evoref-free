@@ -315,7 +315,10 @@ async def _finalize_long_form_stream(
             "Long-form stream cancelled by the user; skipping write/episode "
             "(tokens=%d, session=%s)", state.tokens_generated, session_id,
         )
-        _emit_timing(sess_state, timer, "long_form", state.tokens_generated, mode=mode)
+        _emit_timing(
+            sess_state, timer, "long_form", state.tokens_generated, mode=mode,
+            session_id=session_id,
+        )
         yield sse.token_info(make_token_info(
             messages, state.tokens_generated, context_size, instance_name,
         ))
@@ -482,7 +485,10 @@ async def _finalize_long_form_stream(
             else:
                 text = msg("agent.tasks_all_failed")
             yield sse.token(text)
-    _emit_timing(sess_state, timer, "long_form", state.tokens_generated, mode=mode)
+    _emit_timing(
+        sess_state, timer, "long_form", state.tokens_generated, mode=mode,
+        session_id=session_id,
+    )
     if state.truncated:
         # 切断の開示は本文の外 (deliberative と同じ扱い)。本文へ注記を混ぜると
         # 履歴 / STM へ保存され次ターンで復唱される。
@@ -708,7 +714,7 @@ async def stream_long_form(
             errored = True
             async for frame in _emit_stream_error(
                 state, e, timer=timer, agent_layer="long_form", mode=mode,
-                tokens_generated=stream_state.tokens_generated,
+                tokens_generated=stream_state.tokens_generated, session_id=session_id,
             ):
                 yield frame
             if not stream_state.recorded:

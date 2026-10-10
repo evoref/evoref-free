@@ -16,16 +16,19 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from backend.config import get_path_resolver, mode_base_model_raw
+from backend.free.core.intent_vocab import split_sentences
 from backend.free.core.session_mode import normalize_session_mode
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
+from backend.utils import parse_utc
 
 if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend
@@ -46,6 +49,26 @@ _SUMMARY_MAX_TOKENS = 128
 #: されていた (2026-09-27 独立レビュー)。プロセス内だけの印 (再起動で 1 回だけ
 #: 再試行する) で、セッション索引の形式は変えない。
 _TRUNCATED_AT: dict[str, int] = {}
+
+#: 作り直しても行為主体の無い文が残った会話 (``_TRUNCATED_AT`` と同じ扱いの印)。
+_UNATTRIBUTED_AT: dict[str, int] = {}
+
+#: 要約の各文が名指すべき行為主体 (要約の入力 ``<role>: <発話>`` の 2 者)。
+#: 文に主語が無いと、アシスタントの提案 (「浅草や渋谷を訪れ…」) がユーザーの
+#: 行動として読める (2026-10-10: 31 要約中 8 件が主語なし、うち 2 件がそう読めた)。
+#: 照合は小文字化した文に対して行う (「ユーザ」は長音の有無の両方を受ける)。
+_ACTORS: tuple[str, ...] = ("ユーザ", "アシスタント", "user", "assistant")
+
+_SUMMARY_PROMPT = (
+    "以下の会話を1-2文で要約してください。各文は「ユーザーは」または「アシスタントは」"
+    "で始め、誰の発言・行動かを明示してください (例: ユーザーは〜を尋ね、"
+    "アシスタントは〜を提案した)。アシスタントの提案や説明を、ユーザーが実際に"
+    "行ったこととして書かないでください。"
+)
+_SUMMARY_RETRY_NOTE = (
+    "前回の要約には主語の無い文がありました。すべての文に「ユーザー」か"
+    "「アシスタント」を主語として書いてください。"
+)
 
 
 def chat_summary_skip_modes() -> frozenset[str]:
@@ -70,17 +93,33 @@ def chat_summary_skip_modes() -> frozenset[str]:
     return frozenset()
 
 
-async def _generate_summary(llm_client: Any, turns_text: str, session_id: str) -> str | None:
+def unattributed_sentences(summary: str) -> list[str]:
+    """行為主体 (ユーザー / アシスタント) を名指さない文 (無ければ空)。
+
+    語形の一覧ではなく構造の検査 — 要約の入力は 2 者の発話だけなので、各文が
+    どちらの行為かを名指していれば、提案と実行の取り違えは文面に表れる。
+    """
+    sentences = (s.strip() for s in split_sentences(summary))
+    return [
+        s for s in sentences
+        if s and not any(actor in s.lower() for actor in _ACTORS)
+    ]
+
+
+async def _generate_summary(
+    llm_client: Any, turns_text: str, session_id: str, *, retry_note: str = "",
+) -> str | None:
     """要約を 1 つ作る。``finish_reason=length`` なら上限を倍にして 1 回だけ作り直す。
 
     それでも切れたら ``None`` (保存しない)。切れた要約が保存・昇格され、途中で
     途切れた文と誤答の日付が事実として運ばれた (2026-09-27 監査 M3)。
     """
+    instruction = f"{_SUMMARY_PROMPT}{retry_note}"
     for max_tokens in (_SUMMARY_MAX_TOKENS, _SUMMARY_MAX_TOKENS * 2):
         result = await llm_client.generate(
             messages=[{
                 "role": "user",
-                "content": f"以下の会話を1-2文で要約してください:\n\n{turns_text}",
+                "content": f"{instruction}\n\n{turns_text}",
             }],
             stream=False,
             max_tokens=max_tokens,
@@ -95,6 +134,85 @@ async def _generate_summary(llm_client: Any, turns_text: str, session_id: str) -
             session_id, max_tokens,
         )
     return None
+
+
+async def _generate_attributed_summary(
+    llm_client: Any, turns_text: str, session_id: str,
+) -> tuple[str | None, str]:
+    """主語の検査を通った要約と、通らなかった理由 (``truncated`` / ``unattributed``)。
+
+    主語の無い文が残れば 1 回だけ主語を求めて作り直し、それでも残れば保存しない。
+    """
+    summary = await _generate_summary(llm_client, turns_text, session_id)
+    if summary is None:
+        return None, "truncated"
+    if not unattributed_sentences(summary):
+        return summary, ""
+    logger.info(
+        "Summary for session %s has a sentence without an actor; regenerating once",
+        session_id,
+    )
+    summary = await _generate_summary(
+        llm_client, turns_text, session_id, retry_note=_SUMMARY_RETRY_NOTE,
+    )
+    if summary is None:
+        return None, "truncated"
+    if unattributed_sentences(summary):
+        logger.warning(
+            "Summary for session %s still has a sentence without an actor; not saved",
+            session_id,
+        )
+        return None, "unattributed"
+    return summary, ""
+
+
+def _held_back(entry: object, skip_modes: frozenset[str]) -> bool:
+    """このサイクルでは要約に出さない会話か (mode の見送り / 作り直しても保存できなかった)。"""
+    if skip_modes and normalize_session_mode(getattr(entry, "mode", None)) in skip_modes:
+        return True
+    turn_count = int(getattr(entry, "turn_count", 0) or 0)
+    session_id = getattr(entry, "session_id", "")
+    return (
+        _TRUNCATED_AT.get(session_id) == turn_count
+        or _UNATTRIBUTED_AT.get(session_id) == turn_count
+    )
+
+
+def oldest_pending_summary(
+    *, skip_modes: frozenset[str] = frozenset(), now: float | None = None,
+) -> tuple[int, str | None]:
+    """要約待ちのうち、会話が止まってから最も長く待っている会話の ``(経過秒, session_id)``。
+
+    会話が止まった時刻はセッションの ``ended_at`` (ターンを保存するたびに更新される)、
+    無ければ ``started_at``。新しい永続化は持たない。待ちが無い / 読めないときは ``(0, None)``。
+    """
+    from backend.free.history.history_manager import get_history_manager
+
+    try:
+        mgr = get_history_manager()
+        index = mgr._load_index()
+    except Exception as exc:  # noqa: BLE001 - 観測のための読み出しで落とさない
+        logger.debug("Failed to read the history index for summary ages: %s", exc)
+        return 0, None
+    now = time.time() if now is None else now
+    oldest: tuple[int, str | None] = (0, None)
+    for entry in index.sessions:
+        if not needs_summary(entry) or _held_back(entry, skip_modes):
+            continue
+        try:
+            session = mgr.get_session(entry.session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to read session %s: %s", entry.session_id, exc)
+            continue
+        if session is None or not session.turns:
+            continue
+        stopped = parse_utc(session.ended_at or session.started_at)
+        if stopped is None:
+            continue
+        age = max(0, int(now - stopped.timestamp()))
+        if oldest[1] is None or age > oldest[0]:
+            oldest = (age, entry.session_id)
+    return oldest
 
 
 def needs_summary(entry: object) -> bool:
@@ -132,6 +250,7 @@ async def summarize_unsummarized_sessions(
     is_cancelled: Callable[[], bool] | None = None,
     should_pause: Callable[[], bool] | None = None,
     skip_modes: frozenset[str] = frozenset(),
+    first_session_id: str | None = None,
 ) -> int:
     """未要約セッションに LLM 要約 + 埋め込みベクトルを生成する。
 
@@ -141,8 +260,10 @@ async def summarize_unsummarized_sessions(
        シングルトンを取得 (失敗時は warning ログ + ``0`` 返却)。
     2. インデックスから ``summary is None`` のセッションを順次取得
        (1 サイクルあたり ``batch_size`` 件まで)。
-    3. LLM に「以下の会話を 1-2 文で要約してください」プロンプトを投げ、
-       末尾 20 ターン (各 200 文字まで) を入力とする。
+    3. LLM に「以下の会話を 1-2 文で要約してください」プロンプト (各文に
+       ユーザー / アシスタントの主語を求める) を投げ、末尾 20 ターン (各 200 文字まで)
+       を入力とする。主語の無い文が残れば 1 回だけ作り直し、それでも残れば保存しない
+       (:func:`_generate_attributed_summary`)。
     4. 生成された要約を :meth:`HistoryManager.update_session_fields` で
        セッションへ書く (書き手スレッドの上で追記ログと一緒に畳むので、要約中に
        届いたターンを落とさない。索引も同時に更新される)。
@@ -163,6 +284,8 @@ async def summarize_unsummarized_sessions(
             次サイクルが拾う。
         skip_modes: このサイクルで要約しないセッションの mode
             (:func:`chat_summary_skip_modes`)。見送ったセッションは次サイクルが拾う。
+        first_session_id: 先に要約する会話 (待ちすぎた最古の会話、
+            :func:`oldest_pending_summary`)。打ち切らせない 1 回をこの会話に充てる。
 
     Returns:
         実際に要約を生成できたセッション数。
@@ -180,8 +303,11 @@ async def summarize_unsummarized_sessions(
     #: should_pause 発火時に「まだ要約が必要な件数」を報告するための分母。
     pending_total = sum(1 for e in index.sessions if needs_summary(e))
     attempted = 0
+    entries = list(index.sessions)
+    if first_session_id is not None:
+        entries.sort(key=lambda e: getattr(e, "session_id", None) != first_session_id)
 
-    for entry in index.sessions:
+    for entry in entries:
         if is_cancelled is not None and is_cancelled():
             break
         # 協調 yield: チャット生成が走っている間はセッション境界で手を止める
@@ -205,11 +331,9 @@ async def summarize_unsummarized_sessions(
             # 1〜2 ターン伸びるたびに作り直さない — 同じセッションが 20 サイクルで
             # 26 回要約されていた (2026-09-12 実測、入力は末尾 20 ターン固定)。
             continue
-        if skip_modes and normalize_session_mode(getattr(entry, "mode", None)) in skip_modes:
+        if _held_back(entry, skip_modes):
             continue
         turn_count = int(getattr(entry, "turn_count", 0) or 0)
-        if _TRUNCATED_AT.get(entry.session_id) == turn_count:
-            continue
 
         session = mgr.get_session(entry.session_id)
         if session is None or not session.turns:
@@ -225,11 +349,15 @@ async def summarize_unsummarized_sessions(
             for t in session.turns[-_SUMMARY_TURN_WINDOW:]
         )
         try:
-            summary = await _generate_summary(llm_client, turns_text, entry.session_id)
+            summary, reason = await _generate_attributed_summary(
+                llm_client, turns_text, entry.session_id,
+            )
             if summary is None:
-                _TRUNCATED_AT[entry.session_id] = turn_count
+                held = _TRUNCATED_AT if reason == "truncated" else _UNATTRIBUTED_AT
+                held[entry.session_id] = turn_count
                 continue
             _TRUNCATED_AT.pop(entry.session_id, None)
+            _UNATTRIBUTED_AT.pop(entry.session_id, None)
             emb = await embedder.embed([summary], is_query=False)
             # 要約の基にしたターン数を刻む。会話がここから伸びたら次回作り直す。
             fields: dict[str, Any] = {

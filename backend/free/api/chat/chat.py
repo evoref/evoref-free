@@ -26,7 +26,6 @@ from backend.free.api.chat.chat_constants import (
     REACTIVE_EVIDENCE_LATE_WAIT_S,
     REACTIVE_LIGHT_HISTORY_TURNS, REACTIVE_LIGHT_MAX_TOKENS,
     SESSION_ID_MAX_LENGTH, SESSION_ID_MIN_LENGTH,
-    DEFAULT_WORKING_MAX_TOKENS,
 )
 from backend.free.api.schemas import (
     CancelRequest, CancelResponse, ChatRequest, ChatResponse, TokenInfo,
@@ -338,10 +337,13 @@ def _history_budget(cfg: dict) -> tuple[int, int]:
     軽量パスは「履歴を削らない」立て付けなので、履歴の床も主経路と同じ値にする
     (0 のままだと動的ブロック (記憶) が履歴を押し出しうる)。
     """
+    from backend.free.core.prompt_budget import resolve_working_max_tokens
+
     mem = cfg.get("memory") or {}
+    # WM と同じ解決 (``auto`` は ctx から導く。素の値を読むと ``auto`` が数値にならない)。
     return (
         int(mem.get("history_min_tokens", DEFAULT_HISTORY_MIN_TOKENS)),
-        int(mem.get("working_max_tokens", DEFAULT_WORKING_MAX_TOKENS)),
+        resolve_working_max_tokens(cfg),
     )
 
 
@@ -447,7 +449,7 @@ def _resolve_system_prompt(
 def _fact_slate_text(state: AppState, session_id: str | None, budget: int) -> str:
     """押し出したターンの要点表 (f_02 §1.2) を生テキストで返す (無ければ "")。
 
-    ``_append_fact_slate`` (静的 system 末尾への合成) と ProductionBrief
+    ``_history_preamble`` (窓の先頭への前置。meta だけ ``_append_fact_slate`` で system 末尾) と ProductionBrief
     (f_08 §2.2) の Facts 節が、同じスレートを別々の予算で読む共通材料。
     """
     get = getattr(state, "get_memory_system", None)
@@ -465,16 +467,28 @@ def _fact_slate_text(state: AppState, session_id: str | None, budget: int) -> st
     return slate.render(budget, prompt_locale())
 
 
-def _append_fact_slate(state: AppState, session_id: str | None, system_prompt: str) -> str:
-    """押し出したターンの要点表 (f_02 §1.2) を静的 system の末尾に足す。
+def _history_preamble(state: AppState, session_id: str | None) -> str:
+    """押し出したターンの要点表 (f_02 §1.2) を、窓の先頭へ置く形で返す (無ければ "")。
 
-    スレートは押し出しのあったターンでしか変わらないので、system は同一
-    セッション内で押し出しの間隔だけ安定し、接頭辞 KV は静的部分まで共通のまま。
+    ``build_chat_messages(history_preamble=...)`` が system の外 (窓の先頭の user) へ
+    置く。以前は静的 system の末尾に足していたが、押し出しのたびに system が
+    変わり、途中から巻き戻せない hybrid (recurrent) モデルでは system ごと全再計算
+    になっていた (2026-10-09 実機: 4,000 トークン超の全再計算 4 回・TTFT 約 21 秒)。
     予算は ``prompt.fact_slate_max_tokens`` (0 で無効)。
     """
     cfg = getattr(state, "config", None) or {}
     budget = int((cfg.get("prompt") or {}).get("fact_slate_max_tokens", 200))
-    text = _fact_slate_text(state, session_id, budget)
+    return _fact_slate_text(state, session_id, budget)
+
+
+def _append_fact_slate(state: AppState, session_id: str | None, system_prompt: str) -> str:
+    """押し出したターンの要点表 (f_02 §1.2) を system の末尾に足す。
+
+    **meta_cognitive 専用**。meta は反復ごとに system へステップ結果を結合する
+    経路で接頭辞 KV を狙っていない (``build_messages_for_loop``) ので、system に
+    足してよい。それ以外の経路は :func:`_history_preamble` を使う。
+    """
+    text = _history_preamble(state, session_id)
     return f"{system_prompt}\n\n{text}" if text else system_prompt
 
 
@@ -1052,6 +1066,7 @@ async def _dispatch_continuation(
         post_append_reserve_tokens=notes_post_append_reserve_tokens(),
         # 最後の user は継続指示 (利用者の発話ではない)。人格の判定点に掛けない。
         persona_note=False,
+        history_preamble=_history_preamble(state, session_id),
     )
     logger.info(
         "Continuation dispatch: resuming %s response (tail=%d chars)",
@@ -1157,6 +1172,7 @@ async def _dispatch_reactive_light(
         session_id=session_id,
         # ツール結果は積まれないが、接地注記は全経路で積まれる。
         post_append_reserve_tokens=notes_post_append_reserve_tokens(),
+        history_preamble=_history_preamble(state, session_id),
     )
     await _append_statement_note(state, light_messages, req.message)
     light_max = min(max_tokens or REACTIVE_LIGHT_MAX_TOKENS, REACTIVE_LIGHT_MAX_TOKENS)
@@ -1916,6 +1932,7 @@ async def _build_messages_with_search(
         post_append_reserve_tokens=deliberative_post_append_reserve_tokens(),
         rag_source_path=await _corpus_heading_paths(state, scored_chunks),
         answer_conditions=conditions_outcome.spans if conditions_outcome else (),
+        history_preamble=_history_preamble(state, session_id),
     )
     if conditions_outcome is not None:
         shown_ids = getattr(messages, "shown_rag_ids", None)
@@ -3197,9 +3214,10 @@ async def _chat_turn(req: ChatRequest, state: AppState):
     file_ledger_scope(session_id, history)
     # system は静的 (query 非依存) に保ち KV キャッシュを効かせる。query 依存の
     # few-shot は動的ブロックとして最後の user メッセージへ前置する (build_messages)。
-    system_prompt = _append_fact_slate(
-        state, session_id,
-        _resolve_system_prompt(state, req.mode, instance_name, session_id=session_id),
+    # 要点表は system に足さない (押し出しのたびに system が変わり接頭辞 KV が
+    # system ごと崩れる)。窓の先頭へ置く (_history_preamble)。meta だけは system へ。
+    system_prompt = _resolve_system_prompt(
+        state, req.mode, instance_name, session_id=session_id,
     )
 
     # 直前の応答が max_tokens で切れていて、今回の発話が「続けて」だけなら
@@ -3591,7 +3609,7 @@ async def _chat_turn(req: ChatRequest, state: AppState):
                     )
                 return await _dispatch_meta_cognitive(
                     req, client, state, cfg, gen_params,
-                    system_prompt, history,
+                    _append_fact_slate(state, session_id, system_prompt), history,
                     session_id, instance_name, context_size, ctx, timer,
                     output_target=plan.output_target,
                     brief=brief,

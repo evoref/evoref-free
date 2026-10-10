@@ -25,6 +25,8 @@ from backend.free.agent.tool_judge_args import (
     _extract_file_path,
     _extract_head_line_count,
     _normalize_path_text,
+    normalize_fetch_url,
+    urls_in_text,
 )
 from backend.free.agent.tool_judge_commands import (
     command_lacks_date_arithmetic,
@@ -123,6 +125,8 @@ class GuardContext:
     recall_in_window: bool = False
     #: 直近の ``apply_guards`` で判定を no_tool へ降格させたガードの名前 (空 = 降格なし)。
     demoted_by: str = ""
+    #: 降格させたガードが残す根拠 (decision.jsonl の ``context.evidence``)。空 = 無し。
+    demote_evidence: dict[str, Any] = field(default_factory=dict)
     #: 進行中セッションの全ターンが ``conversation`` (窓) に載っているか。
     #: ``WorkingMemory.session_evicted_turns == 0`` を呼出側が写す。不明なら
     #: ``None`` (単体のガードだけを掛ける経路)。
@@ -1098,6 +1102,40 @@ def _suppress_ungrounded_read_path(
     )
 
 
+def _suppress_ungrounded_fetch_url(
+    result: ToolJudgement, ctx: GuardContext,
+) -> ToolJudgement:
+    """クエリにも会話にも逐語で現れない URL の ``fetch_url`` を no_tool へ格下げ.
+
+    分類器 (層 5.9) の引数は自由生成で、モデルが知識から **URL を作話** する。
+    実インシデント (2026-10-09 / 10-10 に同じ問いで再発): 睡眠の相談の続きの
+    「それでも改善しない場合は何科に行く？」に、発話にも会話にも無い厚労省の
+    URL を組んだ ``fetch_url`` を選び、404 で失敗した。外界の識別子は推測で
+    埋める値ではない — 分類器が見たのはクエリと会話だけなので、そこに無い URL は
+    作話と見なせる (不変則 #15: 引数の出どころを確かめずに撃たない)。
+
+    接地は :func:`urls_in_text` の正規化 (``normalize_fetch_url``: スキーム・ホストの
+    大小文字、フラグメント、パス末尾の ``/`` を同一視) で照合する。会話には過去の
+    応答に出した出典・貼られた添付の本文も含まれる。aux 経路だけに掛ける —
+    規則層のクエリ内 URL と、規則が選んだ fetch_url の空欄を埋めるリコール
+    (``_maybe_recall_url``) はコード側が出どころを持つ。
+    """
+    if not result.tool_needed or result.tool_name != "fetch_url":
+        return result
+    url = str((result.tool_args or {}).get("url") or "").strip()
+    if not url:
+        return result
+    key = normalize_fetch_url(url)
+    if key in urls_in_text(ctx.query) or key in urls_in_text(ctx.dialogue_text):
+        return result
+    logger.info(
+        "Suppressing fetch_url with ungrounded URL %r (absent from query and "
+        "dialogue); answering without the tool", url[:200],
+    )
+    ctx.demote_evidence = {"reason": "ungrounded_tool_arg", "arg": "url", "value": url[:200]}
+    return ToolJudgement(tool_needed=False, source=result.source)
+
+
 def _always(ctx: GuardContext) -> bool:
     """層を問わず適用する (対象ツール名が違えば no-op なので安全)。"""
     return True
@@ -1171,6 +1209,7 @@ GUARD_PIPELINE: tuple[GuardSpec, ...] = (
     GuardSpec("ungrounded_calculate", _suppress_ungrounded_calculate, _aux_only),
     GuardSpec("suspicious_calculate", _flag_suspicious_calculate),
     GuardSpec("ungrounded_read_path", _suppress_ungrounded_read_path, _aux_only),
+    GuardSpec("ungrounded_fetch_url", _suppress_ungrounded_fetch_url, _aux_only),
     GuardSpec(
         "hidden_tool_from_aux",
         _suppress_hidden_tool_from_aux,
@@ -1191,6 +1230,7 @@ def apply_guards(result: ToolJudgement, ctx: GuardContext) -> ToolJudgement:
     DEBUG 行を探すしかなかった (develop=debug 以上でしか出ない)。
     """
     ctx.demoted_by = ""
+    ctx.demote_evidence = {}
     for spec in GUARD_PIPELINE:
         if not spec.applies(ctx):
             continue
@@ -1214,20 +1254,24 @@ def _log_guard_downgrade(
     dl = getattr(ctx, "debug_logger", None)
     if dl is None:
         return
+    evidence = dict(getattr(ctx, "demote_evidence", None) or {})
+    context = {
+        "guard": guard,
+        "tool_name": tool_name,
+        "mode": ctx.mode,
+        "aux_guards": ctx.aux_guards,
+        "measurement_blocked": ctx.measurement_blocked,
+        "action_blocked": ctx.action_blocked,
+    }
+    if evidence:
+        context["evidence"] = evidence
     try:
         dl.log_decision(
             decision_point="tool_guard_downgrade",
             chosen=guard,
             candidates=[spec.name for spec in GUARD_PIPELINE],
-            reason=f"downgraded_{tool_name or 'unknown'}",
-            context={
-                "guard": guard,
-                "tool_name": tool_name,
-                "mode": ctx.mode,
-                "aux_guards": ctx.aux_guards,
-                "measurement_blocked": ctx.measurement_blocked,
-                "action_blocked": ctx.action_blocked,
-            },
+            reason=str(evidence.get("reason") or f"downgraded_{tool_name or 'unknown'}"),
+            context=context,
             scope="request",
         )
     except Exception as e:  # pragma: no cover - ログで判定を落とさない

@@ -40,6 +40,7 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     # (1) 出力そのものが壊れた。sampling パラメータの寄与が大きい。
     ("broken JA spacing", "outcome_broken_output"),
     ("Chinese token leaked", "outcome_broken_output"),
+    ("Hangul token leaked", "outcome_broken_output"),
     ("answer cut off", "outcome_broken_output"),
     # (2) 本文が自分自身 / 手元の事実と食い違う。プロンプトと推論の寄与が大きい。
     ("arithmetic contradiction", "outcome_contradiction"),

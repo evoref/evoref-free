@@ -8,7 +8,7 @@ no_tool だった。そこで「分類器を呼ぶ前に、ツールは不要と
 
 - 採択は常に規則 (= 現在の挙動、分類器を撃つ)。``policy="shadow"`` なので事例段の
   結論は ``decision.jsonl`` に並べて残すだけで、返り値は変わらない。
-- 省けると言うのは、事例段 (``tool_gate_exemplars.jsonl`` の近傍投票) が
+- 省けると言うのは、事例段 (``tool_classifier_skip_exemplars.jsonl`` の近傍投票) が
   ``none`` で決まり、**かつ** ターンに構造上のツールの手掛かりが 1 つも無いとき
   だけ。手掛かりは既存の抽出器の出力をそのまま読む (語彙を足さない)。
 - 分類器の実際の結論 (``classifier_raw``) は呼出側が ``tool_call_decision`` の
@@ -53,19 +53,25 @@ PREDICATE_NAME = "tool_classifier_skip"
 #: 規則 (= 現在の挙動) のラベル。ツール要否ゲートと同じ語彙 (``tool`` / ``none``)。
 TOOL_LABEL = "tool"
 
-#: 同梱事例。ツール要否ゲート (``tool_gate_knn``) と同じファイルを読む。
+#: 同梱事例 (専用)。門 (``tool_gate_knn``) と層 5.95 の ``gate_verdict`` が読む
+#: ``tool_gate_exemplars.jsonl`` とは分ける — 共有ファイルに none を足すと門の判定まで
+#: 動く。ラベルは人が付けたものだけで、判定ログの出力からは採らない (不変則 #15)。
 DEFAULT_EXEMPLARS_FILE = (
-    Path(__file__).resolve().parent / "_defaults" / "tool_gate_exemplars.jsonl"
+    Path(__file__).resolve().parent / "_defaults" / "tool_classifier_skip_exemplars.jsonl"
 )
 
 #: 近傍投票数と発火 (= ``none`` で決まる) に要る得票率。**保守的に「省かない」寄り**。
 #:
-#: 門 (k=5 の多数決) が開いた回は 5 近傍のうち 3 票以上が ``tool``。k=9 で
-#: ``none`` が ceil(9 × 0.65) = 6 票に届くのは、5 近傍がちょうど 3 対 2 で、
-#: 6〜9 番目がすべて ``none`` のときだけになる。閾値を緩める判断は再生測定
-#: (取りこぼし 0) の後に人が行う (docs/f_03 §3.1.3)。
-DEFAULT_K = 9
-DEFAULT_FIRE_RATIO = 0.65
+#: ``none`` で決まるには ceil(5 × 0.8) = 4 票が要る。事例集合は門 (k=5 の多数決、
+#: ``tool_gate_exemplars.jsonl``) と別なので、門が開いた回でも票は門から導けない。
+#: 専用事例 (2026-10-10 初版 112 件、bge-m3) の LOO 格子: k=9/0.65 は none の
+#: 適合率 0.907 (誤り 5 件すべて tool→none) で自己検査を割った。k=5/0.65・0.8 は
+#: 判定分の正解率 0.987・棄権 37/112、k=7/0.8 は 1.0 だが棄権 62/112。棄権は
+#: 分類器を撃つ (= 従来どおり) なので安全側だが、省ける回を取りこぼしすぎない
+#: k=5 を採る。閾値を緩める判断は LOO (none の適合率) と再生測定 (取りこぼし 0)
+#: の後に人が行う (docs/f_03 §3.1.3)。
+DEFAULT_K = 5
+DEFAULT_FIRE_RATIO = 0.8
 
 
 def structural_tool_cues(query: str, recent_dialogue: str = "") -> tuple[str, ...]:

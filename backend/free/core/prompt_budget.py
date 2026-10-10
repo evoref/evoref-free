@@ -16,6 +16,9 @@ meta_cognitive のループ予算がそれぞれ独立に窓を計算し、設�
     fact_slate          = prompt.fact_slate_max_tokens
     working_max         = context_size − generation_reserve − system − dyn_reserve − fact_slate
 
+WM の窓 (``memory.working_max_tokens`` の実効値) は :func:`resolve_working_window`
+が ``working_max`` から決める (既定 ``auto``。整数は上限)。
+
 純粋関数に近い (config dict を受けて計算するだけ)。
 """
 
@@ -109,3 +112,61 @@ def resolve_budgets(
         fact_slate_tokens=slate,
         working_max_tokens=max(WORKING_MIN_TOKENS, working),
     )
+
+
+#: ``memory.working_max_tokens`` が ``auto`` で、context_size も分からない (``llama``
+#: セクションの無い素の dict) ときの窓。スキーマが整数既定だった頃の値。
+DEFAULT_WORKING_WINDOW_TOKENS = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingWindow:
+    """WM の窓 (``memory.working_max_tokens`` の実効値) の解決結果。"""
+
+    #: 設定の値 (整数ならそのまま、``auto`` なら ``ceiling``)。
+    tokens: int
+    #: 予算から導いた窓の上限 (context_size が分からなければ ``None``)。WM はこれを
+    #: 超える整数指定を丸める (``memory.stores.working._reconcile_working_max_tokens``)。
+    ceiling: int | None = None
+    budgets: PromptBudgets | None = None
+
+
+def resolve_working_window(config: dict) -> WorkingWindow:
+    """WM の窓 (``memory.working_max_tokens`` の実効値) を 1 か所で解決する。
+
+    WM の押し出し・``build_messages`` の履歴上限・meta のループ予算が同じ値を読む。
+
+    - ``auto`` (既定) / 未設定: base の context_size から :func:`resolve_budgets` で導く。
+      固定値にすると ctx 16k でも 4k 前後で押し出しが始まり、そのたびに接頭辞 KV が
+      崩れる (2026-10-09 実機 301 ターン: 4,000 トークン超の全再計算が 4 回)。
+    - 整数: 上限として扱う (値はそのまま返し、丸めは WM が ``ceiling`` で行う)。
+    - context_size が分からない (``llama`` セクションの無い素の dict): 推測で窓を
+      動かさない。整数ならそのまま、``auto`` なら :data:`DEFAULT_WORKING_WINDOW_TOKENS`。
+    """
+    mem = (config.get("memory") or {}) if isinstance(config, dict) else {}
+    raw = mem.get("working_max_tokens", "auto")
+    configured = (
+        int(raw) if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else None
+    )
+    llama = (config.get("llama") or {}) if isinstance(config, dict) else {}
+    context_size = 0
+    if llama:
+        try:
+            from backend.config import resolve_context_size
+
+            context_size = int(resolve_context_size(config, "base") or 0)
+        except Exception:
+            context_size = 0
+    if context_size <= 0:
+        return WorkingWindow(tokens=configured or DEFAULT_WORKING_WINDOW_TOKENS)
+    budgets = resolve_budgets(config, context_size)
+    ceiling = budgets.working_max_tokens
+    return WorkingWindow(
+        tokens=ceiling if configured is None else configured,
+        ceiling=ceiling, budgets=budgets,
+    )
+
+
+def resolve_working_max_tokens(config: dict) -> int:
+    """:func:`resolve_working_window` の窓のトークン数だけを返す。"""
+    return resolve_working_window(config).tokens

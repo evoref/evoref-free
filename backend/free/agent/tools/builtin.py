@@ -1084,6 +1084,7 @@ def register_builtin_tools(
             "command": {"type": "string", "description": "Shell command to execute"},
         },
         modes=["create"],
+        env_valued=True,
     )
 
     # chat モードの executable query (時刻 / OS / スペック等) 専用。
@@ -1103,6 +1104,7 @@ def register_builtin_tools(
         },
         modes=["chat"],
         hidden=True,
+        env_valued=True,
     )
 
     # 搭載 / 空き RAM・CPU・OS・CPU 使用率・GPU VRAM を **シェルを介さず**
@@ -1122,6 +1124,7 @@ def register_builtin_tools(
         parameters={},
         modes=["chat"],
         hidden=True,
+        env_valued=True,
     )
 
     # 自己構成 (どのモデルを serve しているか / n_ctx / ポート)。ハードウェアと

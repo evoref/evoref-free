@@ -54,6 +54,7 @@ from backend.free.memory.notes.note_builder import (
     get_fact_attributes,
     resolve_fact_attributes_path,
 )
+from backend.free.memory.notes.speaker_frame_gate import judge as judge_speaker_frame
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.sleep._curator_common import public_notes
 from backend.free.memory.sleep.curation_backoff import (
@@ -136,6 +137,15 @@ def _allowed_slots(
                 continue
             allowed[f"{kind}.{spec.slug}"] = (fact_type, spec.slug)
     return allowed
+
+
+def _slot_words(fact_type: str, slug: str) -> tuple[str, ...]:
+    """スロットの trigger 語 (主体の門で「主語ではなく値」と数える人の語)。"""
+    attrs = get_fact_attributes(resolve_fact_attributes_path())
+    for spec in (attrs.get("chat") or {}).get(fact_type) or ():
+        if spec.slug == slug:
+            return spec.triggers
+    return ()
 
 
 def resolve_slot(
@@ -322,14 +332,24 @@ def needs_split(
        取りこぼしで属性が丸ごと落ちている形。
     2. **抽出済みの object が 2 節以上に跨る** — 1 スロットが隣の属性まで
        飲み込んでいる形。
-    3. **候補タグが 1 つも立たなかった平叙の言明** (:func:`is_untyped_statement`)
-       — trigger 辞書の語形に 1 語も当たらず、Step 8 / 事例ゲート /
-       条件 1・2 のどれにも届かない形。2026-09-17 監査: 「食品商社で輸入担当の
-       仕事をしています。」「週末はクロスカントリースキーをしています。」から
-       occupation も hobby も作られず、別セッションの「私の趣味は何でしたか。」
-       に「読書と、娘と一緒に過ごす時間です」と捏造した。語形を足す代わりに、
-       この段 (語形に依存しない) へ届く道を作る。本人の属性でない言明は補助
-       タスクが空を返し、値は逐語 span と slot 表で検証される。
+    3. **本人の属性 (personal_fact / preference) の候補タグが立たなかった、
+       平叙の文を持つ発話**
+       (:func:`is_untyped_statement`) — trigger 辞書の語形に 1 語も当たらず、
+       Step 8 / 事例ゲート / 条件 1・2 のどれにも届かない形。2026-09-17 監査:
+       「食品商社で輸入担当の仕事をしています。」「週末はクロスカントリースキーを
+       しています。」から occupation も hobby も作られず、別セッションの
+       「私の趣味は何でしたか。」に「読書と、娘と一緒に過ごす時間です」と捏造
+       した。語形を足す代わりに、この段 (語形に依存しない) へ届く道を作る。
+       本人の属性でない言明は補助タスクが空を返し、値は逐語 span・slot 表・
+       主体と枠の門 (:mod:`~backend.free.memory.notes.speaker_frame_gate`) で
+       検証される。平叙かは **文単位** で見る (2026-10-10): 言明の後ろに問いが
+       続く発話 (「犬を飼い始めました。最初に用意するものは？」) は Step 8 の
+       型付けを受けない (正規表現の経路は広げない) ので、ここが唯一の入口。
+
+    スロットの数は **問い・依頼の文を落とした本文** で数える
+    (:func:`~backend.free.core.intent_vocab.without_asking_sentences`)。
+    「数学が苦手です。勉強の進め方を教えて。」の「進め方」(依頼文の語) を
+    本人のスロットに数えない。
 
     どちらも「regex が仕事をしきれなかった」ことの観測可能な兆候で、
     発話の語彙には依存しない。型付けが十分なノート (自己紹介 1 属性など) は
@@ -352,13 +372,19 @@ def needs_split(
     # 自己開示として型付けされた発話だけを対象にする。質問文 / 依頼文は
     # builder 側の ``is_plain_statement`` / ``states_no_user_value`` で落ちる。
     tags = builder.candidate_fact_tags(content)
-    if not any(tag in _KIND_BY_FACT_TYPE for tag in tags):
-        return not tags and is_untyped_statement(content)
+    if not _has_user_attribute_tag(tags):
+        # 本人の属性以外のタグ (world_fact / emotion …) は条件 3 を塞がない。
+        # 「来月、京都に2泊で旅行します。最初に決めることは？」は問いの「こと**は**」が
+        # world_fact の trigger「とは」に当たり、本人の予定が Step 8.3 へ届かなかった
+        # (2026-10-10)。world_fact の Step 8 は本人の属性を書かない。
+        return is_untyped_statement(content)
 
+    from backend.free.core.intent_vocab import without_asking_sentences
     from backend.free.memory.notes.note_builder import (
         resolve_fact_attribute_matches,
     )
 
+    stated = without_asking_sentences(content)
     # **スロット数は slug の異なる数で数える** (fact_type は数えない)。同じ
     # 属性 (beverage) が personal_fact と preference の両節にあると 1 発話が
     # 両タグに当たるが、それは属性の多様性ではない。``(fact_type, slug)`` で
@@ -370,7 +396,7 @@ def needs_split(
         slug
         for fact_type in _KIND_BY_FACT_TYPE
         for slug, _ in resolve_fact_attribute_matches(
-            content, fact_type, mode="chat",
+            stated, fact_type, mode="chat",
             triggers_dir=getattr(builder, "triggers_dir", None),
         )
         if slug != _FALLBACK_SLUG
@@ -385,25 +411,38 @@ def needs_split(
     )
 
 
-def is_untyped_statement(content: str) -> bool:
-    """候補タグの立たなかった発話が、属性を述べている **かもしれない** 平叙文か。
+def _has_user_attribute_tag(tags: list[str]) -> bool:
+    """本人の属性 (personal_fact / preference) の候補タグがあるか。"""
+    return any(tag in _KIND_BY_FACT_TYPE for tag in tags)
 
-    問い・依頼・値を述べない文・中身の無い定型句 (相槌 / 挨拶) は落とす。
+
+def is_untyped_statement(content: str) -> bool:
+    """候補タグの立たなかった発話が、属性を述べている **かもしれない** 平叙の文を持つか。
+
+    平叙かは **文単位** で見る (:func:`~backend.free.core.intent_vocab.
+    plain_statement_sentences`)。発話全体に ``is_plain_statement`` を掛けると、
+    言明の後ろに問いが続く発話 (「来月、京都に2泊で旅行します。最初に決める
+    ことは？」) が問いのマーカーで丸ごと落ち、本人の予定が記憶に 1 件も残らな
+    かった (2026-10-10、実データ 301 発話)。問いの文の側は補助タスクのプロンプトと
+    主体と枠の門 (``in_question``) が落とす。
+
+    平叙の文の側で、値を述べない文・中身の無い定型句 (相槌 / 挨拶) は落とす。
     ここは「補助タスクへ出す価値があるか」の前段で、属性かどうかは判定しない
     (語彙で判定すると同じ穴を作る)。
     """
-    from backend.free.core.intent_vocab import is_plain_statement
+    from backend.free.core.intent_vocab import plain_statement_sentences
     from backend.free.core.text_quality import (
         carries_no_assertion,
         states_no_user_value,
     )
     from backend.free.memory.notes.social_formula_gate import is_note_worthy
 
-    if not is_plain_statement(content):
+    stated = "".join(plain_statement_sentences(content))
+    if not stated:
         return False
-    if carries_no_assertion(content) or states_no_user_value(content):
+    if carries_no_assertion(stated) or states_no_user_value(stated):
         return False
-    return is_note_worthy(content)
+    return is_note_worthy(stated)
 
 
 @functools.lru_cache(maxsize=8)
@@ -508,6 +547,8 @@ def accept_items(
     - 表に無い slot (新スロットを生やさない)
     - 発話の逐語 span でない value (幻覚)
     - 文をまたぐ / 発話全体と同じ value (分割になっていない)
+    - 話者本人の言明の中に無い value (主体と枠の門、
+      :mod:`~backend.free.memory.notes.speaker_frame_gate`)
     (主題を落とした量の value は落とさず、主題を含む逐語 span に広げる —
     :func:`topic_widened_value`、「2人で8万円」→「予算は2人で8万円」)
     - 同じスロットの 2 件目 — ただし **単値スロットだけ** (先勝ち)。多値 /
@@ -545,6 +586,15 @@ def accept_items(
             logger.debug(
                 "personal_fact_curator: value is a bare predicate (dropped): %r",
                 value,
+            )
+            continue
+        # 話者本人の言明の中の値か (例文・引用・問いの文・仮定・終わった状態・
+        # 他者 / 虚構の主体を落とす、2026-10-10)。プロンプトの除外を決定論で二重化する。
+        frame = judge_speaker_frame(content, value, _slot_words(fact_type, slug))
+        if frame.band != "skip":
+            logger.debug(
+                "personal_fact_curator: value is not the speaker's own statement "
+                "(%s, dropped): %r", frame.evidence, value,
             )
             continue
         widened = topic_widened_value(value, content, fact_type, slug)
@@ -637,7 +687,7 @@ async def curate_personal_facts(
     # 平叙文 (条件 3: 属性を含むかは未知) を後に回す。上限で切られた分は
     # マーカーが立たないので次サイクルが拾う。
     candidates.sort(key=lambda n: (
-        not builder.candidate_fact_tags((n.content or "").strip()),
+        not _has_user_attribute_tag(builder.candidate_fact_tags((n.content or "").strip())),
         float(getattr(n, "created_at", 0.0) or 0.0),
     ))
     if len(candidates) > max_per_cycle:

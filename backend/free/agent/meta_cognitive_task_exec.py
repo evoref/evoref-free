@@ -10,7 +10,6 @@ import time
 
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 from backend.config import resolve_context_size_for_mode
 from backend.free.agent.agent_state import AgentState
 from backend.free.agent.meta_cognitive_tasks import (
@@ -48,7 +47,7 @@ from backend.free.agent.meta_cognitive_utils import (
 from backend.free.agent.meta_cognitive_tool_io import fetch_error_type
 from backend.free.agent.step_compactor import StepResult
 from backend.free.agent.table_aggregate_intent import aggregate_retrieved_table
-from backend.free.agent.tool_judge_args import _URL_IN_QUERY_RE
+from backend.free.agent.tool_judge_args import _URL_IN_QUERY_RE, normalize_fetch_url
 from backend.free.agent.tools_registry import FILESYSTEM_TOOL_NAMES
 from backend.free.api.chat.chat_constants import (
     TOOL_EXECUTION_TIMEOUT_SEC,
@@ -347,22 +346,6 @@ def same_retrieval_result(tool_name: str, earlier: str, later: str) -> bool:
 
         return fold(earlier) == fold(later)
     return earlier == later
-
-
-def normalize_fetch_url(url: str) -> str:
-    """取得の鍵にする URL の最小限の正規化 (純粋関数)。
-
-    スキームとホストを小文字に、フラグメントとパス末尾の ``/`` を落とす。
-    クエリ文字列とパスの大小文字は残す (別の資源でありうる)。
-    """
-    raw = url.strip()
-    if not raw:
-        return ""
-    parts = urlsplit(raw)
-    return urlunsplit((
-        parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"),
-        parts.query, "",
-    ))
 
 
 def continues_after_last_url(description: str) -> bool:

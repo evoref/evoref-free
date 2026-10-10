@@ -2022,7 +2022,15 @@ def _init_agent_tracer(state: AppState, debug_logger: "DebugLogger") -> None:
 
     trace_dir = _agent_trace_dir()
     trace_store = AgentTraceStore(trace_dir) if trace_dir is not None else None
-    agent_tracer = AgentTracer(debug_logger=debug_logger, trace_store=trace_store)
+    # マシンの状態を返すツールの宣言 (ToolsRegistry) を step の private 印に使う。
+    # _init_tools が先に走る (registry が無ければ印を打たない)。
+    tools_reg = getattr(state, "tools_registry", None)
+    agent_tracer = AgentTracer(
+        debug_logger=debug_logger, trace_store=trace_store,
+        env_valued_action=(
+            tools_reg.returns_environment_values if tools_reg is not None else None
+        ),
+    )
     state.agent_tracer = agent_tracer
     logger.info("AgentTracer initialized (trace_dir=%s)", trace_dir)
 
@@ -2712,6 +2720,11 @@ async def _build_learn_pillar(
 
     social_formula_gate.bind_debug_logger(debug_logger)
 
+    # Step 8.3 / Step 8 の主体と枠の門 (値が話者本人の言明の中にあるか) も字句段だけ。
+    from backend.free.memory.notes import speaker_frame_gate
+
+    speaker_frame_gate.bind_debug_logger(debug_logger)
+
     # 長文 unit の固有値の矛盾 / 捏造候補の判定点 (c_17 §3.7) も字句段だけ。
     # 配線を忘れると log_decision が no-op になり decision.jsonl に 1 行も出ない
     # (2026-09-18 実機で発覚)。
@@ -2738,6 +2751,11 @@ async def _build_learn_pillar(
     from backend.free.core import context_bound
 
     context_bound.bind_debug_logger(debug_logger)
+
+    # 問いが今の会話そのものを対象にしているかの判定点 (記憶の注入) も字句段だけ。
+    from backend.free.core import conversation_scope
+
+    conversation_scope.bind_debug_logger(debug_logger)
 
     # アシスタント自身への問いかの判定点 (c_17 §3.20、人格注記の帯) も字句段だけ。
     from backend.free.core import persona_question
@@ -2773,6 +2791,11 @@ async def _build_learn_pillar(
     from backend.free.agent import tool_judge_annuity
 
     tool_judge_annuity.bind_debug_logger(debug_logger)
+
+    # 規則層を定義の問いで棄権させる判定点 (f_03 §3.1、executable_command_rule) も字句段だけ。
+    from backend.free.agent import concept_definition_gate
+
+    concept_definition_gate.bind_debug_logger(debug_logger)
 
     # 文書テンプレートの選択判定 (c_16 §4.5.2 / c_17 §3.8) も字句段だけ。
     from backend.free.api.chat import _template_select

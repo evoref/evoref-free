@@ -33,7 +33,7 @@ from typing import Any, Iterator
 import yaml
 
 from backend.free.core.correction_verdict import mask_quoted_speech
-from backend.free.core.intent_vocab import is_plain_statement
+from backend.free.core.intent_vocab import is_plain_statement, plain_statement_sentences
 from backend.free.core.session_mode import is_create_mode
 from backend.free.core.correction_target import split_sentences
 from backend.free.core.text_quality import (
@@ -1844,10 +1844,26 @@ class _ModeAwareNoteBuilder(NoteBuilder):
 
         誤って拾っても着地は候補タグまでで、Step 8 側の質問文・依頼文フィルタと
         assistant 発話の除外が後段に残る。
+
+        平叙かは **文単位** で見る (:func:`plain_statement_sentences`、Step 8.3 の
+        条件 3 と Step 8 の指標と同じ 1 実装、2026-10-10)。型付けするのは平叙の文が
+        あり、**問い・依頼の文が 1 つも無い** 発話だけ。言明の後ろに問いが続く発話
+        (「犬を飼い始めました。最初に用意するものは？」) は型付けしない — 型付けすると
+        正規表現の Step 8 が同じ形の例文・虚構・他者の話 (「小説の主人公が犬を飼い
+        始めました。この後の展開は？」) からも本人の値を作る。そうした発話は Step 8.3
+        (補助タスク + 主体と枠の門) だけが拾う。
         """
         if not self.ATTRIBUTE_BACKED_TAGS or not content:
             return []
-        if not is_plain_statement(content) or states_no_user_value(content):
+        # 平叙の文が無い発話と、問い・依頼が混ざった発話 (発話全体としては平叙で
+        # ない) は型付けしない。後者を判定する境界は従来の発話全体の判定のまま
+        # にする — 文単位に寄せると「…があります。忘れないようにお願いします。」の
+        # ような言明の型付けが変わり、同じバッチの値の更新が旧値を見失う。
+        if (
+            not plain_statement_sentences(content)
+            or not is_plain_statement(content)
+            or states_no_user_value(content)
+        ):
             return []
         return [
             tag for tag in self.ATTRIBUTE_BACKED_TAGS

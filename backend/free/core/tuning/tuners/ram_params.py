@@ -5,10 +5,13 @@
 (CPU / iGPU 配置はモデル + KV + 計算バッファ、単体 GPU の一部オフロードは RAM に残る層の重み) を引いた
 **余裕** を元に、
 
-- ``ctx_checkpoints``: 1 つの checkpoint はスロットごとに再帰状態 (と SWA の窓) のスナップショット 1 つで、
-  :data:`CHECKPOINT_STATE_MIB` (約 150 MiB) と見積もる。``スロット数 × checkpoint 数 × 150 MiB`` が余裕の
-  :data:`CHECKPOINT_SHARE` に収まる最大を :data:`CHECKPOINT_LADDER` から選ぶ。上限は従来の既定 8 で、
-  空きが少ないときだけ 4 / 2 へ **下げる** (150 MiB は実測でない概算なので、従来より増やす側には使わない)
+- ``ctx_checkpoints``: 1 つの checkpoint はスロットごとに巻き戻せない状態 (hybrid / SSM の再帰状態、SWA の窓の
+  KV) のスナップショット 1 つ。その量は GGUF から導く (``BaseModelInfo.checkpoint_mb`` =
+  ``launch_llama.estimate_checkpoint_state_mb``)。``スロット数 × checkpoint 数 × 状態量`` が余裕の
+  :data:`CHECKPOINT_SHARE` に収まる最大を :data:`CHECKPOINT_LADDER` (16 / 8 / 4 / 2) から選ぶ。
+  純 attention のモデルは checkpoint を作らない (状態量 0) ので RAM を予約せず、値は効かないので従来の 8 のまま。
+  GGUF から導けないときは
+  概算 :data:`CHECKPOINT_STATE_MIB` (150 MiB) に縮退し、段は従来の上限 8 から (概算で増やさない)
 - ``cache_ram_mib``: 常に 0 (無効)。2026-09-11 の A/B (kv_cache_audit) で ``cache_ram_mib: 2048`` は wall
   305 → 326 秒に悪化し効果が無かったため 0 に戻した実測の結論に合わせる (空き RAM から値を出さない)
 
@@ -44,14 +47,15 @@ KEY = "ram_params"
 CONFIG_KEYS: dict[str, str] = {
     "ctx_checkpoints": "llama.ctx_checkpoints", "cache_ram_mib": "llama.cache_ram_mib",
 }
-#: checkpoint 1 つ (1 スロット) が RAM に載せる状態の見積り (MiB)。PLAUSIBLE な概算で実測ではない:
+#: checkpoint 1 つ (1 スロット) の状態量が GGUF から導けないときの概算 (MiB、実測ではない):
 #: hybrid recurrent の 27B 級で再帰状態 1 シーケンスが約 150 MiB (``LlamaConfig.slots`` の注記と同じ値)。
-#: 純 attention のモデルは checkpoint を作らないので過大側 (= RAM を多めに見る保守側) の見積りになる。
 CHECKPOINT_STATE_MIB = 150
-#: 選ぶ checkpoint 数 (大きい順)。先頭は従来の既定 8 (起動スクリプト・schema・雛形で一致していた値) で、
-#: これより増やさない: 4 スロット × 16 × 150 MiB ≈ 9.6 GB のように、根拠の無い概算で RAM を大きく取らない。
-#: 末尾は余裕が足りなくても使う下限 (0 にすると分岐のたびに全量 re-prefill)。
-CHECKPOINT_LADDER: tuple[int, ...] = (8, 4, 2)
+#: 選ぶ checkpoint 数 (大きい順)。末尾は余裕が足りなくても使う下限 (0 にすると分岐のたびに全量 re-prefill)。
+#: 8 枠では長いセッションで system 末尾の checkpoint が古い順に押し出され、次のセッションの初手が全量
+#: 再計算になる (2026-10-09 実測、Qwen3.6-35B-A3B) ので、状態量を導けたときは 16 まで取る。
+CHECKPOINT_LADDER: tuple[int, ...] = (16, 8, 4, 2)
+#: 状態量を導けず概算 (:data:`CHECKPOINT_STATE_MIB`) を使うときの段の上限 (従来の既定。概算で増やさない)。
+UNDERIVED_MAX_CHECKPOINTS = 8
 #: 余裕のうち checkpoint に使ってよい割合 (残りは backend・埋め込み・OS の揺れ)。
 CHECKPOINT_SHARE = 0.25
 #: ``--cache-ram`` の自動の値。0 (無効): 2026-09-11 の A/B で 2048 は wall 305 → 326 秒に悪化し効果が無かった。
@@ -117,35 +121,64 @@ def base_ram_mib(hw: HardwareProfile, model: BaseModelInfo, ctx: int, ngl: int) 
     return int(model.model_mb * max(0.0, 1.0 - ngl / model.n_layers))
 
 
-def decide_ram_params(hw: HardwareProfile, *, slots: int, base_ram: int, basis: str = "") -> TuneOutcome:
-    """空き RAM の余裕から checkpoint 数と cache-ram を決める (純関数)。RAM が取れなければ環境起因の失敗。"""
+def decide_ram_params(
+    hw: HardwareProfile, *, slots: int, base_ram: int, basis: str = "", state_mib: int | None = None,
+) -> TuneOutcome:
+    """空き RAM の余裕から checkpoint 数と cache-ram を決める (純関数)。RAM が取れなければ環境起因の失敗。
+
+    ``state_mib`` は checkpoint 1 つ (1 スロット) の状態量 (GGUF から導いた値。0 = checkpoint を作らない
+    純 attention、``None`` = 導けない → :data:`CHECKPOINT_STATE_MIB` の概算で段の上限は
+    :data:`UNDERIVED_MAX_CHECKPOINTS`)。
+    """
     if hw.free_ram_mib <= 0:
         return TuneOutcome("failed", reason="ram_unknown", environmental=True)
     spare = hw.free_ram_mib - RAM_RESERVE_MIB - base_ram
     room = max(0, spare)
-    per = max(1, slots) * CHECKPOINT_STATE_MIB
+    if state_mib is None:
+        state, ladder = CHECKPOINT_STATE_MIB, tuple(n for n in CHECKPOINT_LADDER if n <= UNDERIVED_MAX_CHECKPOINTS)
+        how = "rough estimate (GGUF gave no state size; capped at 8)"
+    elif state_mib <= 0:
+        # 純 attention は checkpoint を作らない (値は効かない) ので RAM を予約せず、値は従来の既定のまま
+        state, ladder = 0, (int(FALLBACK["ctx_checkpoints"]),)
+        how = "none made: pure attention, no RAM reserved"
+    else:
+        state, ladder = int(state_mib), CHECKPOINT_LADDER
+        how = "derived from GGUF"
+    per = max(1, slots) * state
     budget = int(room * CHECKPOINT_SHARE)
-    fitting = [n for n in CHECKPOINT_LADDER if n * per <= budget]
-    checkpoints = fitting[0] if fitting else CHECKPOINT_LADDER[-1]
+    fitting = [n for n in ladder if n * per <= budget]
+    checkpoints = fitting[0] if fitting else ladder[-1]
     cache = AUTO_CACHE_RAM_MIB
     warn = "" if fitting else "warn: "
     reason = (
         f"{warn}spare {spare} MiB (free {hw.free_ram_mib} - reserve {RAM_RESERVE_MIB} - base {base_ram}); "
-        f"checkpoints {checkpoints} x {slots} slots x {CHECKPOINT_STATE_MIB} MiB (budget {budget} MiB); "
+        f"checkpoints {checkpoints} x {slots} slots x {state} MiB/state, {how} (budget {budget} MiB); "
         f"cache-ram {cache} MiB (off: no gain in the 2026-09-11 A/B)"
     )
     if basis:
         reason = f"{reason}; {basis}"
     return TuneOutcome("ok", value={
         "ctx_checkpoints": checkpoints, "cache_ram_mib": cache, "spare_ram_mib": spare,
+        "checkpoint_state_mib": state if state_mib is not None else None,
     }, reason=reason)
 
 
 def ram_basis(cfg: dict[str, Any], project_root: Any) -> str | None:
-    """保存結果の前提の印: base モデルと式の版 (``v2`` = cache-ram 0 / checkpoint 上限 8。以前の版の保存値
-    (cache-ram 4096 / checkpoint 16) は前提違いとして見積り直す)。"""
+    """保存結果の前提の印: base モデル・式の版・状態量と checkpoint の総量を変える設定。
+
+    ``v3`` = checkpoint の状態量を GGUF から導き段を 16 まで取る (以前の版 ``v2`` = 概算 150 MiB / 上限 8、
+    ``v1`` = cache-ram 4096 / checkpoint 16 の保存値は前提違いとして見積り直す)。スロット数・文脈長
+    (SWA の窓の上限)・KV の型を含める (変われば checkpoint の総量が変わる)。
+    """
     basis = base_basis(cfg, project_root)
-    return f"ram_params_v2[{basis}]" if basis is not None else None
+    if basis is None:
+        return None
+    lc = cfg.get("llama") or {}
+    knobs = (
+        f"slots={lc.get('slots', 'auto')};ctx={lc.get('context_size', 'auto')};"
+        f"ctk={lc.get('cache_type_k') or 'f16'};ctv={lc.get('cache_type_v') or 'f16'}"
+    )
+    return f"ram_params_v3[{basis};{knobs}]"
 
 
 def run(ctx: TuneContext) -> TuneOutcome:
@@ -165,6 +198,7 @@ def run(ctx: TuneContext) -> TuneOutcome:
     ngl = resolve_base_ngl(ctx.cfg, ctx.project_root, hw)
     outcome = decide_ram_params(
         hw, slots=slots, base_ram=base_ram_mib(hw, model, n_ctx, ngl), basis=ram_basis(ctx.cfg, ctx.project_root) or "",
+        state_mib=model.checkpoint_mb(n_ctx),
     )
     manual = manual_fields(ctx.cfg)
     if outcome.status == "ok" and manual:
@@ -184,7 +218,7 @@ SPEC = register(TuneSpec(
     needs_servers=False,
     safe_while_running=False,  # base に効く (稼働中は予約)
     basis=ram_basis,
-    description="base --ctx-checkpoints (up to 8) from the spare RAM; --cache-ram stays 0, c_16 §7.2.3",
+    description="base --ctx-checkpoints (16/8/4/2) from the spare RAM and the per-checkpoint state in the GGUF; --cache-ram stays 0, c_16 §7.2.3",
 ))
 
 
@@ -195,9 +229,11 @@ __all__ = [
     "CONFIG_KEYS",
     "FALLBACK",
     "KEY",
+    "UNDERIVED_MAX_CHECKPOINTS",
     "RamParams",
     "base_ram_mib",
     "decide_ram_params",
     "effective_ram_params",
     "manual_fields",
+    "ram_basis",
 ]

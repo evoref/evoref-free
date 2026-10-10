@@ -81,6 +81,21 @@ def read_llama_prompt_tokens(state: AppState) -> tuple[int | None, int | None]:
     return prompt_n + cache_n, cache_n
 
 
+def read_llama_finish_reason(state: AppState) -> str | None:
+    """直近のチャットスロット生成の ``finish_reason`` (未観測なら ``None``)。
+
+    読み先と制約は :func:`read_llama_prompt_tokens` と同じ (クライアント単位の直近値)。
+    """
+    for client in (
+        getattr(state, "llm_client", None),
+        getattr(getattr(state, "gen", None), "llm_client", None),
+    ):
+        reason = getattr(getattr(client, "local", client), "_last_finish_reason", None)
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
 def is_content_type_mismatch(metrics: dict, user_query: str) -> bool:
     """文書拡張子への出力依頼なのに ``content_type=code`` を返したか。
 

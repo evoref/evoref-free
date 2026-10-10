@@ -505,7 +505,10 @@ async def _finalize_deliberative_stream(
         truncated=state.truncated,
     )
     state.recorded = True
-    _emit_timing(sess_state, timer, agent_layer, state.tokens_generated, mode=mode)
+    _emit_timing(
+        sess_state, timer, agent_layer, state.tokens_generated, mode=mode,
+        session_id=session_id,
+    )
     truncation = _truncation_frame(sess_state, state, session_id, mode)
     if truncation:
         yield truncation
@@ -675,7 +678,7 @@ async def stream_deliberative(
             errored = True
             async for frame in _emit_stream_error(
                 state, e, timer=timer, agent_layer="deliberative", mode=mode,
-                tokens_generated=stream_state.tokens_generated,
+                tokens_generated=stream_state.tokens_generated, session_id=session_id,
             ):
                 yield frame
             if not stream_state.recorded:
@@ -805,7 +808,7 @@ async def stream_reactive_light(
             errored = True
             async for frame in _emit_stream_error(
                 state, e, timer=timer, agent_layer="reactive", mode=mode,
-                tokens_generated=stream_state.tokens_generated,
+                tokens_generated=stream_state.tokens_generated, session_id=session_id,
             ):
                 yield frame
             if not stream_state.recorded:

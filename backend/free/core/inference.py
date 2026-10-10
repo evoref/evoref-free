@@ -1662,6 +1662,32 @@ def _latest_kept_chars(
     return len(kept_text.removesuffix("..."))
 
 
+def _prepend_history_preamble(messages: list[ChatMessage], preamble: str) -> None:
+    """窓の先頭の user メッセージへ ``preamble`` を前置する (in-place)。
+
+    窓から外れた発話の要点表 (``memory.stores.fact_slate``) の置き場。system に
+    足すと押し出しのたびに system が変わり、llama-server の接頭辞 KV が system
+    ごと無効化される (hybrid / recurrent モデルは途中から巻き戻せず、checkpoint は
+    system 末尾にしか無い。2026-10-09 実機: 4,000 トークン超の全再計算 4 回・
+    TTFT 約 21 秒)。窓の先頭は押し出しのときにしか動かず、要点表も押し出しの
+    ときにしか変わらないので、ここに置けば押し出しの無いターンは 1 トークンも
+    再計算せず、押し出しのターンも system 末尾から先だけの再計算で済む。
+    user が無い (契約違反) ときは system へ結合して情報を落とさない。
+    """
+    for i, message in enumerate(messages):
+        if i == 0 or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        messages[i] = {**message, "content": f"{preamble}\n\n{content}"}
+        return
+    if messages and messages[0].get("role") == "system":
+        messages[0] = {
+            **messages[0], "content": f"{messages[0]['content']}\n\n{preamble}",
+        }
+
+
 def build_messages(
     system_prompt: str,
     history: list[ChatMessage],
@@ -1682,9 +1708,14 @@ def build_messages(
     persona_note: bool = True,
     rag_source_path: Callable[[str], list[str]] | None = None,
     answer_conditions: Sequence[str] = (),
+    history_preamble: str = "",
 ) -> BuiltMessages:
     """
     messages リストを組み立て、トークン予算内に収める。
+
+    ``history_preamble`` は窓から外れた発話の要点表 (``fact_slate``)。system の外の
+    **窓の先頭の user メッセージ** へ前置する (:func:`_prepend_history_preamble`)。
+    予算は system と同じく最初に引く。
 
     戻り値は :class:`BuiltMessages` (list 互換)。
 
@@ -1755,6 +1786,8 @@ def build_messages(
     total_fc = len(file_contexts) if file_contexts else 0
 
     sys_tokens = _estimate_tokens(system_prompt)
+    if history_preamble:
+        sys_tokens += _estimate_tokens(history_preamble)
     remaining = budget - sys_tokens
 
     # 最新 user ターン (現在の質問) のトークンを動的ブロック配分に先立って予約する。
@@ -2036,6 +2069,9 @@ def build_messages(
                 _estimate_tokens(recovered.get("content", "")),
             )
 
+    if history_preamble:
+        _prepend_history_preamble(messages, history_preamble)
+
     logger.debug(
         "build_messages complete: %d messages "
         "(history %d→%d, rag %d/%d, files %d/%d)",
@@ -2102,7 +2138,9 @@ def build_messages_for_loop(
     else:
         sys_content = system
 
-    working_max = cfg.get("memory", {}).get("working_max_tokens", DEFAULT_WORKING_MAX_TOKENS)
+    from backend.free.core.prompt_budget import resolve_working_max_tokens
+
+    working_max = resolve_working_max_tokens(cfg)
     history_budget = min(remaining, working_max)
     # build_messages と同じく、最新ターンの切り詰めが確定しているなら system へ
     # 足す注記の分を先に履歴予算から引く (後付けすると予算を超える)。

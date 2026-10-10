@@ -694,6 +694,36 @@ def _query_context_bound(
     return query_context_bound_verdict(query_text).fired
 
 
+def _query_session_scoped(
+    state: AppState, session_id: str | None, query_text: str,
+) -> bool:
+    """問いが今の会話そのものを対象にしているか (記憶の注入で別の会話のノートを載せない用)。
+
+    エピソード検索を自セッションに閉じる ``search_pipeline.episodic_session_scope`` と
+    同じ判定を読む (不変則 #14 (a))。会話そのものを対象にした形は判定点
+    ``query_conversation_scope`` で記録する (棄権は発火として扱わない)。近接語・
+    位置語の想起 (「さっきの距離は」) は会話の利用者の発話数で決まるので、窓の
+    発話数を同じ数え方 (``session_user_turns``) で渡す。
+    """
+    if not query_text or not session_id:
+        return False
+    from backend.free.core.conversation_scope import query_conversation_scope_verdict
+
+    if query_conversation_scope_verdict(query_text).fired:
+        return True
+    from backend.free.core.intent_vocab import session_user_turns
+    from backend.free.memory.pipeline.search_pipeline import episodic_session_scope
+
+    working = _session_wm(state, session_id)
+    try:
+        turns = list(working.get_context()) if working is not None else []
+    except Exception:
+        turns = []
+    return episodic_session_scope(
+        query_text, session_id, user_turns=session_user_turns(turns),
+    ) is not None
+
+
 #: supersede 済みファクトの provenance から求めた retired note id を
 #: ストアごとにキャッシュする (f_02 §8.3)。``all_facts(include_superseded=True)``
 #: の全件走査は 1 チャットターンに複数回発生しうるが、ストアはプロセス常駐で
@@ -1170,6 +1200,7 @@ def build_semmem_injection(
                 rejected_note_ids=rejected_note_ids,
                 current_session_id=session_id,
                 context_bound=context_bound,
+                session_scoped=_query_session_scoped(state, session_id, query_text),
             )
             rendered = plan.render() or None
             if covered_attributes is not None:
@@ -1326,6 +1357,7 @@ def build_chat_messages(
     persona_note: bool = True,
     rag_source_path: Callable[[str], list[str]] | None = None,
     answer_conditions: Sequence[str] = (),
+    history_preamble: str = "",
 ) -> list[ChatMessage]:
     """messages 組み立て（build_messages で few-shot・file・メモリ・RAG・履歴を統合）。
 
@@ -1342,6 +1374,8 @@ def build_chat_messages(
             軽量 / 継続パスは :func:`notes_post_append_reserve_tokens`。
         persona_note: 人格注記を評価して付けるか (:func:`build_messages` へ渡す)。
             継続パスは最後の user が継続指示なので ``False``。
+        history_preamble: 窓から外れた発話の要点表 (``chat._fact_slate_text``)。
+            system の外、窓の先頭の user へ置く (:func:`build_messages`)。
     """
     messages = build_messages(
         system_prompt, history,
@@ -1361,6 +1395,7 @@ def build_chat_messages(
         persona_note=persona_note,
         rag_source_path=rag_source_path,
         answer_conditions=answer_conditions,
+        history_preamble=history_preamble,
     )
     apply_grounding_notes(
         messages, history, evicted_turns, session_id,

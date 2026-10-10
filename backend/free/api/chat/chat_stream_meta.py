@@ -458,7 +458,9 @@ def _finalize_meta_cognitive_stream(
         **meta_last_command_call(resp),
     )
 
-    _emit_timing(state, timer, "meta_cognitive", estimated_tokens, mode=mode)
+    _emit_timing(
+        state, timer, "meta_cognitive", estimated_tokens, mode=mode, session_id=session_id,
+    )
     return make_token_info(messages, estimated_tokens, context_size, instance_name)
 
 
@@ -565,6 +567,7 @@ async def stream_meta_cognitive(
             errored = True
             async for frame in _emit_stream_error(
                 state, e, timer=timer, agent_layer="meta_cognitive", mode=mode,
+                session_id=session_id,
             ):
                 yield frame
             if not recorded:

@@ -32,33 +32,23 @@ def _reconcile_working_max_tokens(config: dict, mem: dict) -> int:
     — 設定値は context_size=8192 の下でどうやっても満たせない。従来は WARNING で
     「config を下げろ」と促すだけで、実際には毎ターン二重に切られていた。
 
-    元の設定値が達成可能ならそのまま返す (縮めない)。
+    元の設定値が達成可能ならそのまま返す (縮めない)。既定の ``auto`` は予算から
+    導いた値そのもの (ctx に比例して伸びる)。解決は
+    :func:`backend.free.core.prompt_budget.resolve_working_window` が 1 か所で行い、
+    ``build_messages`` の履歴上限 (``chat._history_budget``) も同じ値を読む。
 
     **context_size が分からないときは丸めない。** 素の dict で作る呼出
     (テスト / 部分 config) では ``resolve_context_size`` が既定値を返すが、
     それは推測であって実機の窓ではない。推測で窓を縮めると、設定と無関係に
     挙動が変わる。``llama`` セクションを持つ config だけを対象にする。
     """
-    configured = int(mem.get("working_max_tokens", 4096) or 4096)
-    if not (config.get("llama") or {}):
+    from backend.free.core.prompt_budget import resolve_working_window
+
+    window = resolve_working_window({**config, "memory": mem})
+    configured, ceiling, budgets = window.tokens, window.ceiling, window.budgets
+    if ceiling is None or budgets is None or configured <= ceiling:
         return configured
-    try:
-        from backend.config import resolve_context_size
-        from backend.free.core.prompt_budget import resolve_budgets
-    except Exception:
-        return configured
-    try:
-        context_size = int(resolve_context_size(config, "base") or 0)
-    except Exception:
-        context_size = 0
-    if context_size <= 0:
-        return configured
-    # 予算関数は 1 つ (c_02 §6.3)。system はレンダラが守る上限
-    # (``prompt.system_max_share``) で見積もる — WM はレンダ前に作られる。
-    budgets = resolve_budgets(config, context_size)
-    ceiling = budgets.working_max_tokens
-    if configured <= ceiling:
-        return configured
+    context_size = budgets.context_size
     key = (context_size, configured)
     if key not in _reconcile_warned:
         _reconcile_warned.add(key)
@@ -341,14 +331,18 @@ class WorkingMemory:
         ターンが最後の 1 件になった場合はそのまま残し、次の add_turn で
         新しい user ターンが追加された後の押し出しで改めて連鎖させる。
         """
+        evicted: list[dict] = []
         if self.turns:
-            evicted = self.turns.pop(0)
-            # 要点表は窓の補助 (f_02 §1.2)。押し出したターンの要点だけを残す。
-            self.fact_slate.absorb([evicted])
+            evicted.append(self.turns.pop(0))
             self.session_evicted_turns += 1
         while len(self.turns) > 1 and self.turns[0].get("role") == "assistant":
-            self.turns.pop(0)
+            evicted.append(self.turns.pop(0))
             self.session_evicted_turns += 1
+        if evicted:
+            # 要点表は窓の補助 (f_02 §1.2)。押し出した問いと **その答え** を一緒に
+            # 渡す (以前は user だけで、要点が問いにラベルを付けただけになり、
+            # 後で「まとめて」と頼まれても落とした分の答えを復元できなかった)。
+            self.fact_slate.absorb(evicted)
 
     def _total_tokens(self) -> int:
         """全ターンの推定トークン数"""

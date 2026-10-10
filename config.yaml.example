@@ -185,8 +185,10 @@ llama:
                                   #   ⚠️ SWA モデル（gemma-4 等）では llama.cpp が自動無効化し no-op（毎ターン full re-prefill）。非 SWA base のみ有効
   ctx_checkpoints: auto           # --ctx-checkpoints / slot ごとのコンテキスト checkpoint 上限（0=無効）。
                                   #   hybrid recurrent モデル（Qwen3.5/3.8 等）は KV を部分巻き戻しできず checkpoint 単位でしか戻れない
-                                  #   auto: 環境調整が空き RAM の余裕から 8 / 4 / 2 を選ぶ (上限は従来の 8、空きが少ないときだけ
-                                  #   下げる。checkpoint は RAM に slots × 数 × 約 150 MiB 載る見積り)。決められないときは 8。整数は明示
+                                  #   auto (既定・推奨): 環境から導く。checkpoint 1 つの状態量 (再帰状態 / SWA の窓) を GGUF から
+                                  #   求め、RAM に載る slots × 数 × 状態量が空き RAM の余裕の 1/4 に収まる最大を 16 / 8 / 4 / 2 から選ぶ。
+                                  #   純 attention のモデルは checkpoint を作らないので RAM を予約しない。状態量を導けないときは
+                                  #   約 150 MiB の概算で上限 8、何も決められないときは 8。整数は明示 (環境に追従しなくなる)
   checkpoint_min_step: 256        # --checkpoint-min-step / checkpoint 間の最小トークン間隔。上流既定 8192 だと context_size=8192 で
                                   #   中間 checkpoint が生まれず、prompt が前回の最終 user 位置より手前で分岐すると system prompt ごと全量 re-prefill。
                                   #   256 なら user ターンごとに 1 つ置かれ、分岐コストは最後に一致したターン以降の窓だけになる
@@ -288,13 +290,18 @@ llama:
 # ベースモデル (= チャット用) + クリエイト用モデル の 2 モデル構成。
 # - chat: 常に model_paths.base_model を使用 (独立 model フィールド無し)
 # - create: 生成パラメータのみ。モデルパスは model_paths.create_model に指定
+# - 優先順: schema 既定 < モデルプロファイルの sampling_by_mode.<mode>
+#   (models/profiles/<arch>.yaml) < ここに **書いた** 値 < プロファイルの旧形式 sampling。
+#   書かなかったキーはプロファイルのモデル別推奨 (無ければ schema 既定) が効く。
+#   chat は既定で値を書かない (モデル切替でモデル別の推奨が効くように)。固定したいキーだけ
+#   コメントを外す (そのときは `chat: {}` の `{}` を消す)。
 modes:
-  chat:
-    temperature: 0.7                # 生成温度（0.0〜2.0）— 高いほど多様な応答
-    top_p: 0.9                      # Top-P サンプリング（0.0〜1.0）
-    top_k: 40                       # Top-K サンプリング（0=無効、1〜1000）
-    presence_penalty: 0.0           # 存在ペナルティ（-2.0〜2.0）— 一度出た語を一律に抑制するため日本語では 0.0 推奨
-    frequency_penalty: 0.3          # 頻度ペナルティ（-2.0〜2.0）— 出現回数に比例して抑制。0.0 だと同一句の暴走反復が止まらない
+  chat: {}
+    # temperature: 0.7              # 生成温度（0.0〜2.0）— 高いほど多様な応答
+    # top_p: 0.9                    # Top-P サンプリング（0.0〜1.0）
+    # top_k: 40                     # Top-K サンプリング（0=無効、1〜1000）
+    # presence_penalty: 0.0         # 存在ペナルティ（-2.0〜2.0）— 一度出た語を一律に抑制するため日本語では 0.0 推奨
+    # frequency_penalty: 0.3        # 頻度ペナルティ（-2.0〜2.0）— 出現回数に比例して抑制。0.0 だと同一句の暴走反復が止まらない
   create:
     temperature: 0.3                # クリエイトは低温度で正確性重視
     top_p: 0.95                     # やや高めで十分な候補を確保
@@ -816,14 +823,13 @@ memory:
   #   したがって max_turns は **短い発話でもトークン側が先に効く** 値にする
   #   (目安: working_max_tokens / 16)。窓が伸びても押し出しの契機はトークン側の
   #   段階的縮退 (下限水位 60%) になるので、先頭が動く頻度はむしろ下がる。
-  working_max_tokens: 4096        # ワーキングメモリの最大トークン数 (下表: llama.context_size 8192 の推奨値)
-  # 推奨: 512〜(context_size * 0.6) の範囲で設定
-  # | context_size | 上限目安 | 推奨値 |
-  # |       4,096  |    2,457 |  2,048 |
-  # |       8,192  |    4,915 |  4,096 |
-  # |      16,384  |    9,830 |  8,192 |
-  # |      32,768  |   19,660 | 16,384 |
-  # 下限 512: これ以下だと毎ターン圧縮が発動し会話が成立しない
+  working_max_tokens: auto        # ワーキングメモリの最大トークン数。auto = context_size から導く (推奨)
+  # auto: context_size − llama.max_tokens − system 上限 (prompt.system_max_share) −
+  #       動的ブロック予約 (prompt.*_max_tokens の合計) − 要点表 (prompt.fact_slate_max_tokens)
+  #       モデルや context_size を替えても窓が自然に伸び縮みする。
+  # 整数を書くと上限として扱う (予算に収まらなければ起動時に丸めて WARNING)。
+  # 固定の小さな値を置くと ctx を広げても早く押し出しが始まり、押し出しのたびに
+  # 接頭辞 KV キャッシュが崩れて履歴が再 prefill される。下限 256。
   history_min_tokens: 1024        # 過去履歴の最低確保トークン数 (床)。RAG 等の動的ブロックより優先して確保。0 で無効
   short_term_max_notes: 100       # 短期メモリの最大ノート数
   # --- SemMem 容量上限 + GC ---

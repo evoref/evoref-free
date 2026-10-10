@@ -33,6 +33,7 @@ from backend.free.api.chat.chat_constants import (
     MAX_STEP_QUEUE_SIZE,
 )
 from backend.free.api.chat.chat_recorder import (
+    read_llama_finish_reason,
     read_llama_prompt_tokens,
     record_response,
     tool_routing_signals,
@@ -163,8 +164,13 @@ def rag_signals_from_chunks(
 def _emit_timing(
     state: AppState, timer: StageTimer | None,
     agent_layer: str, tokens_generated: int, mode: str = "",
+    session_id: str = "",
 ) -> None:
-    """StageTimer の計測結果をデバッグログに出力し、直近メトリクスを更新する"""
+    """StageTimer の計測結果をデバッグログに出力し、直近メトリクスを更新する
+
+    ``finish_reason`` (直近のチャットスロット生成) と ``session_id`` も行に載せる。
+    会話の再生で「途中切れが max_tokens か自然終了か」をセッション単位に数えるため。
+    """
     if timer is None:
         return
     timing = timer.to_dict()
@@ -200,6 +206,8 @@ def _emit_timing(
         dl.log_request_timing(
             timing, agent_layer=agent_layer,
             tokens_generated=tokens_generated, mode=mode,
+            finish_reason=read_llama_finish_reason(state) or "",
+            session_id=session_id,
         )
 
 
@@ -348,6 +356,7 @@ async def _emit_stream_error(
     agent_layer: str,
     mode: str,
     tokens_generated: int = 0,
+    session_id: str = "",
 ) -> AsyncIterator[str]:
     """ストリーム層の ``except Exception`` 末尾の共通処理 (計測停止 → error → done)。
 
@@ -362,7 +371,9 @@ async def _emit_stream_error(
     logger.error("%s stream error: %r", agent_layer, exc, exc_info=True)
     if timer:
         timer.stop("llm_total_ms")
-    _emit_timing(state, timer, agent_layer, tokens_generated, mode=mode)
+    _emit_timing(
+        state, timer, agent_layer, tokens_generated, mode=mode, session_id=session_id,
+    )
     info = classify_chat_error(exc)
     if isinstance(exc, EvorefError) and not isinstance(exc, LLMError):
         text = msg(exc.i18n_key, **{k: v for k, v in exc.context.items() if isinstance(v, str | int | float)})

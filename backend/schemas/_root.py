@@ -159,9 +159,11 @@ class EvorefConfig(BaseModel):
         raw_context = getattr(self.llama, "context_size", 0)
         # ``auto`` / null は起動時に決まる (c_16 §7.2.3) ので、ここでは比べない
         context = raw_context if isinstance(raw_context, int) else 0
-        window = int(self.memory.working_max_tokens)
-        if context <= 0:
+        raw_window = self.memory.working_max_tokens
+        if context <= 0 or not isinstance(raw_window, int):
+            # ``auto`` の窓は context_size から導くので比は常に推奨の内側
             return self
+        window = int(raw_window)
         share = window / context
         if share < _WORKING_WINDOW_MIN_SHARE or share > _WORKING_WINDOW_MAX_SHARE:
             get_logger("config").warning(

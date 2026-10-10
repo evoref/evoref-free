@@ -32,6 +32,8 @@ def resolve_meta_cognitive_loop_budget(config: dict, mode: str = "chat") -> int:
 
     ``ctx_size - OUTPUT_RESERVE_TOKENS - LOOP_OVERHEAD_TOKENS - history_budget``。
     """
+    from backend.free.core.prompt_budget import resolve_working_max_tokens
+
     ctx_size = resolve_context_size_for_mode(config, mode)
-    history_budget = config.get("memory", {}).get("working_max_tokens", 2048)
+    history_budget = resolve_working_max_tokens(config)
     return ctx_size - OUTPUT_RESERVE_TOKENS - LOOP_OVERHEAD_TOKENS - history_budget

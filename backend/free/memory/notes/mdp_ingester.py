@@ -196,10 +196,15 @@ class EpisodeRecord:
         ``private_trace_ids`` (STM の private ノート由来) は、Full が走る前に
         当該ノートが押し出されていると空になる。begin イベント自体の印は
         ノートの寿命に依らないので、こちらを一次情報として併用する。
+
+        step の印も見る — private でないリクエストでも、マシンの状態 (IP /
+        ホスト名 / コマンド出力) を返すと宣言されたツールの step は書き手
+        (``AgentTracer``) が印を打つ。その観測値はユーザーの発話ではないので、
+        エピソード記憶 / decision ファクトへ持ち越さない。
         """
-        return bool(
-            isinstance(self.begin, dict) and self.begin.get("private"),
-        )
+        if isinstance(self.begin, dict) and self.begin.get("private"):
+            return True
+        return any(isinstance(s, dict) and s.get("private") for s in self.steps)
 
     def absorb_event(self, obj: dict[str, Any]) -> None:
         """1 行ぶんのイベントを取り込む。"""
