@@ -179,9 +179,9 @@
 	}
 	.message-bubble {
 		max-width: 85%;
-		padding: 10px 14px;
-		border-radius: var(--border-radius);
-		margin-bottom: 12px;
+		padding: 10px 16px;
+		border-radius: var(--radius-xl);
+		margin-bottom: var(--space-4);
 	}
 	/* 切り詰め注記 (入力側は該当 user 発言、出力側は該当 assistant 応答に付く) */
 	.truncation-notice {
@@ -194,16 +194,18 @@
 	/* --- チャットモード --- */
 	.message-bubble.user:not(.create) {
 		align-self: flex-end;
-		background-color: color-mix(in srgb, var(--accent) 18%, var(--bg-secondary));
+		background-color: color-mix(in srgb, var(--accent) 14%, var(--bg-secondary));
 		color: var(--text-primary);
-		border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
-		border-bottom-right-radius: 2px;
+		border-bottom-right-radius: var(--radius-sm);
 	}
+	/* 応答は面を持たず本文として流す。誰の発言かは位置と見出しで足りる */
 	.message-bubble.assistant:not(.create) {
 		align-self: flex-start;
-		background-color: var(--bg-secondary);
+		max-width: 100%;
+		background: transparent;
 		color: var(--text-primary);
-		border-bottom-left-radius: 2px;
+		padding-left: 0;
+		padding-right: 0;
 	}
 	/* --- クリエイトモード: 横幅いっぱい --- */
 	.message-bubble.create {
@@ -215,8 +217,8 @@
 		align-self: flex-start;
 		background-color: var(--bg-secondary);
 		color: var(--text-primary);
-		border: 1px solid var(--border);
-		border-bottom-left-radius: 2px;
+		border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+		border-bottom-left-radius: var(--radius-sm);
 	}
 	.message-bubble.create.assistant {
 		background-color: transparent;
@@ -227,21 +229,22 @@
 		display: flex;
 		align-items: baseline;
 		margin-bottom: 4px;
-		font-size: 0.85rem;
+		font-size: var(--font-size-xs);
+		letter-spacing: 0.02em;
 	}
 	.message-header.header-right {
 		justify-content: flex-end;
 	}
 	.role-label {
 		font-weight: 600;
-		opacity: 0.8;
+		opacity: 0.65;
 	}
 	.timestamp {
 		opacity: 0.6;
 		font-size: 0.8rem;
 	}
 	.message-content {
-		line-height: 1.5;
+		line-height: 1.7;
 		word-break: break-word;
 	}
 	/* user メッセージは plain text の <p> のみ。

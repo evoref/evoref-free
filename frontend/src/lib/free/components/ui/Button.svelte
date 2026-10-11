@@ -36,17 +36,17 @@
 		align-items: center;
 		justify-content: center;
 		gap: var(--space-1);
-		border-radius: var(--border-radius);
+		border-radius: var(--radius-lg);
 		font-family: inherit;
 		line-height: 1.3;
 		cursor: pointer;
 		white-space: nowrap;
 		transition:
-			background-color 0.15s,
-			border-color 0.15s;
+			background-color 0.15s var(--ease),
+			border-color 0.15s var(--ease);
 	}
 	.btn-md {
-		padding: 6px 14px;
+		padding: 7px 16px;
 		font-size: var(--font-size-base);
 	}
 	.btn-sm {
@@ -62,7 +62,7 @@
 	.btn-secondary {
 		background-color: transparent;
 		color: var(--text-primary);
-		border: 1px solid var(--input-border);
+		border: 1px solid color-mix(in srgb, var(--input-border) 70%, transparent);
 	}
 	.btn-danger {
 		background-color: transparent;

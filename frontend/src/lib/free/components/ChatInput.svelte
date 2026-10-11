@@ -486,43 +486,52 @@
 
 <style>
 	.chat-input-area {
-		border-top: 0.5px solid var(--border);
-		padding: 0 24px 16px;
+		width: 80%;
+		margin: 0 auto;
+		padding: 0 var(--space-4) var(--space-4);
 	}
+	/* 入力欄は 1 枚の浮いたカードにまとめる */
 	.input-row {
 		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding-top: 12px;
+		align-items: flex-end;
+		gap: var(--space-2);
+		margin-top: var(--space-3);
+		padding: var(--space-2);
+		background: var(--input-bg);
+		border: 1px solid color-mix(in srgb, var(--input-border) 55%, transparent);
+		border-radius: var(--radius-xl);
+		box-shadow: var(--elev-2);
+		transition: border-color 0.15s var(--ease);
+	}
+	.input-row:focus-within {
+		border-color: var(--accent);
 	}
 	textarea {
 		flex: 1;
 		resize: none;
-		border: 0.5px solid var(--input-border);
-		border-radius: 6px;
-		padding: 8px 12px;
-		font-size: 14px;
-		background: var(--input-bg);
+		border: none;
+		border-radius: var(--radius-lg);
+		padding: 8px 6px;
+		font-size: var(--font-size-base);
+		background: transparent;
 		color: var(--text-primary);
 		font-family: inherit;
 		line-height: 1.5;
 		max-height: 200px;
 		outline: none;
 	}
-	textarea:focus {
-		border-color: var(--accent);
-	}
 	textarea:disabled {
 		opacity: 0.6;
 	}
 	.send-btn {
-		padding: 6px 16px;
-		background: linear-gradient(135deg, var(--accent) 0%, color-mix(in srgb, var(--accent) 85%, #000) 100%);
+		padding: 8px 18px;
+		background: var(--accent);
 		color: var(--text-on-accent);
 		border: none;
-		border-radius: 6px;
+		border-radius: var(--radius-lg);
 		cursor: pointer;
-		font-size: 13px;
+		font-size: var(--font-size-sm);
+		font-weight: 600;
 		white-space: nowrap;
 	}
 	.send-btn:hover:not(:disabled) {
@@ -533,13 +542,14 @@
 		cursor: not-allowed;
 	}
 	.cancel-btn {
-		padding: 6px 16px;
+		padding: 8px 18px;
 		background: var(--text-primary);
 		color: var(--bg-primary);
-		border: 1px solid var(--border);
-		border-radius: 6px;
+		border: none;
+		border-radius: var(--radius-lg);
 		cursor: pointer;
-		font-size: 13px;
+		font-size: var(--font-size-sm);
+		font-weight: 600;
 		white-space: nowrap;
 	}
 	.cancel-btn:hover {

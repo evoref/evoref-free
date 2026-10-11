@@ -44,11 +44,14 @@
 	.page {
 		display: flex;
 		flex-direction: column;
-		padding: var(--space-5);
+		padding: var(--space-6) var(--space-6) var(--space-5);
+		max-width: 1080px;
+		margin: 0 auto;
 	}
 	.page.full-height {
 		height: 100%;
 		padding: 0;
+		max-width: none;
 	}
 	.page-header {
 		display: flex;
@@ -56,7 +59,7 @@
 		justify-content: space-between;
 		flex-wrap: wrap;
 		gap: var(--space-3);
-		margin-bottom: var(--space-4);
+		margin-bottom: var(--space-5);
 		flex-shrink: 0;
 	}
 	.full-height > .page-header {
@@ -67,8 +70,9 @@
 		flex: 1 1 280px;
 	}
 	.page-title {
-		font-size: var(--font-size-xl);
-		font-weight: 600;
+		font-size: calc(var(--font-size-base) + 8px);
+		font-weight: 650;
+		letter-spacing: -0.02em;
 		margin: 0;
 		color: var(--text-primary);
 	}
