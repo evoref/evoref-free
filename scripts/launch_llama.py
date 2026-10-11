@@ -146,6 +146,26 @@ def _tuned_effective(cfg: dict, project_root: Path, name: str):
 _UNTUNED_CACHE_RAM_MIB = 0
 
 
+def _apply_launch_args(cfg: dict) -> None:
+    """3 つの節の ``launch_args`` が写す値 (``-c`` → ``context_size`` 等) を ``cfg`` に書き込む (冪等、c_16 §7.2.4)。
+
+    写した値は明示値と同じ扱いになり、環境調整はその項目を決めない。検証済みの config には同じ値が既にある。
+    """
+    from backend.llama_launch_args import apply_launch_args
+
+    apply_launch_args(cfg)
+
+
+def _with_launch_args(cmd: list[str], section_cfg: dict) -> list[str]:
+    """自動で組み立てた ``cmd`` から ``launch_args`` と同じフラグを値ごと除き、``launch_args`` を末尾に足す。
+
+    ``launch_args`` が空なら ``cmd`` をそのまま返す (従来のコマンドと完全に一致する)。
+    """
+    from backend.llama_launch_args import merge_launch_args, parse_launch_args
+
+    return merge_launch_args(cmd, parse_launch_args(section_cfg.get("launch_args")))
+
+
 def _explicit_int(value: object) -> int | None:
     """config の値が明示の整数ならその値 (``auto`` / ``null`` / bool は ``None``)。"""
     return value if isinstance(value, int) and not isinstance(value, bool) else None
@@ -716,9 +736,13 @@ def build_llama_cmd(
     *,
     model_override: str | None = None,
 ) -> list[str]:
-    """config.yaml の llama セクションから起動コマンドを生成"""
+    """config.yaml の llama セクションから起動コマンドを生成
+
+    ``llama.launch_args`` (c_16 §7.2.4) は最後に :func:`_with_launch_args` で重ねる (同じフラグを置き換える)。
+    """
     if "llama" not in cfg:
         raise ValueError("config.yaml に 'llama' セクションがありません")
+    _apply_launch_args(cfg)
     lc = cfg["llama"]
     sp = cfg.get("model_paths", {})
 
@@ -889,7 +913,7 @@ def build_llama_cmd(
     # 追加オプション
     cmd += lc.get("extra_args", [])
 
-    return cmd
+    return _with_launch_args(cmd, lc)
 
 
 def _embed_model_path(cfg: dict, project_root: Path) -> Path:
@@ -970,7 +994,11 @@ def _forget_tuned(cfg: dict, key: str) -> None:
 
 
 def _embed_cmd(cfg: dict, project_root: Path, *, port: int, gpu_layers: int) -> list[str]:
-    """埋め込み用 llama-server のコマンド (ポートと ``-ngl`` 以外は設定から。判別の一時サーバも同じ引数)。"""
+    """埋め込み用 llama-server のコマンド (ポートと ``-ngl`` 以外は設定から。判別の一時サーバも同じ引数)。
+
+    ``embedding.launch_args`` (c_16 §7.2.4) は最後に重ねる (同じフラグを置き換える)。
+    """
+    _apply_launch_args(cfg)
     emb_cfg = cfg.get("embedding", {})
     embed_model_path = _embed_model_path(cfg, project_root)
 
@@ -1044,7 +1072,7 @@ def _embed_cmd(cfg: dict, project_root: Path, *, port: int, gpu_layers: int) -> 
     # 黙って分割される (base と同じ footgun、_resolve_kv_unified 参照)。
     _append_kv_unified_args(cmd, emb_cfg, slots=slots)
 
-    return cmd
+    return _with_launch_args(cmd, emb_cfg)
 
 
 # ── rerank (リランカー、c_16 §7.2.1) ───────────────────────
@@ -1171,9 +1199,11 @@ def build_rerank_cmd(
 
     ``rag.rerank.mode`` が off / ``model_paths.rerank_model`` 未設定 / ファイル無しなら
     ``None`` (起動しない)。モデルパスは空白・括弧を含んでも argv の 1 要素のまま渡す。
+    下の固定の引数は既定で、``rag.rerank.launch_args`` (c_16 §7.2.4) の同じフラグが置き換える。
     """
     if project_root is None:
         project_root = Path.cwd()
+    _apply_launch_args(cfg)
     ok, why = rerank_launchable(cfg, project_root)
     if not ok:
         print(f"[launch] rerank server not started: {why}")
@@ -1199,7 +1229,7 @@ def build_rerank_cmd(
         cmd += ["-fa", "on", "-t", str(threads or RERANK_GPU_DEFAULT_THREADS)]
     elif threads > 0:
         cmd += ["-t", str(threads)]
-    return cmd
+    return _with_launch_args(cmd, _rerank_cfg(cfg))
 
 
 def rerank_cpu_fallback_cmd(cfg: dict, project_root: Path | None, cmd: list[str] | None) -> list[str] | None:
@@ -4084,6 +4114,14 @@ if __name__ == "__main__":
         sys.exit(1)
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     project_root = cfg_path.parent
+    # launch_args (c_16 §7.2.4) の -c / -ngl 等を先に設定のキーへ写す (VRAM 予算の検査・環境調整が明示値を見る)
+    from backend.llama_launch_args import LaunchArgsError
+
+    try:
+        _apply_launch_args(cfg)
+    except LaunchArgsError as e:
+        print(f"[launch] ERROR: {e}")
+        sys.exit(1)
 
     health_ports: dict[str, int] = {"base": int(cfg.get("llama", {}).get("port", 8080))}
     _emb = cfg.get("embedding", {}) or {}

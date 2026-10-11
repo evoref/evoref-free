@@ -42,7 +42,7 @@
 		margin-top: 4px;
 		padding: 0 14px 4px;
 		font-size: 0.78rem;
-		color: var(--text-secondary, #666);
+		color: var(--text-secondary);
 	}
 	.toggle {
 		background: none;
@@ -70,7 +70,7 @@
 	}
 	.item {
 		padding: 4px 0;
-		border-top: 1px solid var(--border-color, #e0e0e0);
+		border-top: 1px solid var(--border);
 	}
 	.head {
 		display: flex;

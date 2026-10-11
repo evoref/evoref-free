@@ -483,33 +483,6 @@ class ModesConfig(BaseModel):
     create: CreateModeConfig = Field(default_factory=CreateModeConfig)
 
 
-class EditorSettingsConfig(BaseModel):
-    """エディタ設定"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    font_family: str = "monospace"
-    font_size: int = Field(default=14, ge=8, le=48)
-    line_height: float = Field(default=1.5, ge=1.0, le=3.0)
-    tab_size: int = Field(default=4, ge=1, le=8)
-    word_wrap: bool = False
-    show_line_numbers: bool = True
-    show_active_line: bool = True
-    show_toolbar: bool = True
-    default_encoding: str = Field(
-        default="utf-8",
-        pattern=r"^(utf-8|shift_jis|euc-jp|iso-2022-jp)$",
-    )
-    default_line_ending: str = Field(
-        default="lf", pattern=r"^(lf|crlf|cr)$"
-    )
-    highlight_languages: list[str] = Field(
-        default_factory=lambda: [
-            "markdown", "python", "javascript", "typescript",
-            "json", "html", "css", "yaml", "xml", "sql", "php",
-        ]
-    )
-
 
 class ProcessManagerConfig(BaseModel):
     """llama-server プロセスマネージャ設定

@@ -4,6 +4,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.llama_launch_args import derive_into
+
 
 class CartridgeGateConfig(BaseModel):
     """Cartridge Gate (centroid 事前フィルタ) 設定"""
@@ -280,6 +282,17 @@ class RerankConfig(BaseModel):
     threads: int = Field(default=0, ge=0, description=(
         "-t (0 = 自動: GPU 配置なら 2、CPU 配置なら環境調整 (c_16 §7.2.3 の項目 threads) が物理コア数から配分した値)"
     ))
+    launch_args: str = Field(default="", description=(
+        "rerank 用 llama-server の起動オプション (c_16 §7.2.4)。指定したフラグは既定の引数 "
+        "(-c 8192 -b 8192 -ub 2048 -np 1 --cache-ram 0 等) の同じフラグを置き換える。"
+        "-ngl / -t は gpu_layers / threads へ写す。-m / --port / --host は不可"
+    ))
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_from_launch_args(cls, data: object) -> object:
+        """``launch_args`` の ``-ngl`` / ``-t`` を ``gpu_layers`` / ``threads`` へ写す (c_16 §7.2.4)。"""
+        return derive_into(data, "rerank")
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -513,6 +526,17 @@ class EmbeddingConfig(BaseModel):
     # idle slot offload。埋め込みは chat slots を使わないため
     # 上流既定 8192 MiB の RAM 予約は無意味。0 で明示 disable する。
     cache_ram_mib: int = Field(default=0, ge=-1)
+    # 埋め込み用 llama-server の起動オプション (c_16 §7.2.4)。指定したフラグは自動で組み立てた
+    # 同じフラグを置き換え、環境調整より優先する。``-c`` / ``-ngl`` / ``-np`` / ``-t`` / ``-b`` / ``-ub`` /
+    # ``--cache-ram`` は上のキーへ写す。``-m`` / ``--port`` / ``--host`` は不可。
+    launch_args: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_from_launch_args(cls, data: object) -> object:
+        """``launch_args`` の ``-c`` / ``-ngl`` 等を対応するキーへ写す (c_16 §7.2.4)。"""
+        return derive_into(data, "embedding")
+
     # --- 永続埋め込みキャッシュ ---
     cache_enabled: bool = True
     cache_max_mb: int = Field(default=100, ge=1)

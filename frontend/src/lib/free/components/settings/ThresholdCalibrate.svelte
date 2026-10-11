@@ -135,11 +135,11 @@
 		gap: 0.5rem;
 		margin-top: 0.75rem;
 		padding-top: 0.75rem;
-		border-top: 1px solid var(--border-color, #ddd);
+		border-top: 1px solid var(--border);
 	}
 	.hint {
 		font-size: 0.85rem;
-		color: var(--text-secondary, #555);
+		color: var(--text-secondary);
 	}
 	.row {
 		display: flex;
@@ -149,7 +149,7 @@
 	}
 	.note {
 		font-size: 0.8rem;
-		color: var(--text-secondary, #555);
+		color: var(--text-secondary);
 	}
 	.advisory {
 		font-size: 0.8rem;
@@ -158,9 +158,9 @@
 	button {
 		padding: 0.4rem 0.8rem;
 		border-radius: 4px;
-		border: 1px solid var(--border-color, #999);
-		background: var(--bg-secondary, #f5f5f5);
-		color: var(--text-primary, #222);
+		border: 1px solid var(--input-border);
+		background: var(--bg-secondary);
+		color: var(--text-primary);
 		cursor: pointer;
 		font-size: 0.9rem;
 	}
@@ -170,9 +170,9 @@
 	}
 	button.calib-btn,
 	button.apply-btn {
-		background: var(--accent-bg, #2563eb);
-		color: var(--accent-text, #fff);
-		border-color: var(--accent-bg, #2563eb);
+		background: var(--accent);
+		color: var(--text-on-accent);
+		border-color: var(--accent);
 	}
 	table {
 		border-collapse: collapse;
@@ -184,7 +184,7 @@
 	}
 	.dist {
 		font-size: 0.78rem;
-		color: var(--text-secondary, #555);
+		color: var(--text-secondary);
 		margin-bottom: 0.4rem;
 	}
 	.actions {
@@ -198,18 +198,18 @@
 		font-size: 0.85rem;
 	}
 	.result.info {
-		background: var(--bg-info-soft, #eff6ff);
-		color: var(--text-info, #1e40af);
-		border: 1px solid var(--border-info, #93c5fd);
+		background: var(--bg-secondary);
+		color: var(--text-primary);
+		border: 1px solid var(--border);
 	}
 	.result.success {
-		background: var(--bg-success-soft, #ecfdf5);
-		color: var(--text-success, #065f46);
-		border: 1px solid var(--border-success, #6ee7b7);
+		background: var(--bg-secondary);
+		color: var(--text-primary);
+		border: 1px solid var(--color-success);
 	}
 	.result.error {
-		background: var(--bg-error-soft, #fef2f2);
-		color: var(--text-error, #991b1b);
-		border: 1px solid var(--border-error, #fca5a5);
+		background: var(--bg-secondary);
+		color: var(--color-error);
+		border: 1px solid var(--color-error);
 	}
 </style>

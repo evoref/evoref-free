@@ -23,9 +23,8 @@ import {
 	isStreaming,
 	messages,
 	nextMessageId,
-	pushGeneratedEditorCode,
-	restoreSession,
-	setEditorRouteToLastAssistant
+	appendGeneratedCodeToLastAssistant,
+	restoreSession
 } from '$lib/free/stores/chat';
 
 const POLL_INTERVAL_MS = 3000;
@@ -142,15 +141,15 @@ async function beginReconnect(sessionIdValue: string, runId: string): Promise<vo
 async function deliverArtifacts(runId: string): Promise<void> {
 	try {
 		const res = await getCreateRunArtifacts(runId);
+		if (res.artifacts.length > 0 && get(messages).at(-1)?.role !== 'assistant') {
+			addMessage({ id: nextMessageId(), role: 'assistant', content: '', timestamp: Date.now() });
+		}
 		for (const artifact of res.artifacts) {
-			pushGeneratedEditorCode({
+			appendGeneratedCodeToLastAssistant({
 				filename: artifact.path,
 				language: artifact.language,
 				content: artifact.content
 			});
-		}
-		if (res.artifacts.length > 0) {
-			setEditorRouteToLastAssistant('editor');
 		}
 	} catch {
 		// best-effort: 成果物取得に失敗してもチャット状態は復旧済みなので諦める

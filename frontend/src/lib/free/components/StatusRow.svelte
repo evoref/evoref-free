@@ -1,21 +1,13 @@
 <script lang="ts">
 	interface StatusRowProps {
-		active?: boolean;
 		label: string;
 		value: string;
-		ariaLabel?: string;
 	}
 
-	let { active = false, label, value, ariaLabel }: StatusRowProps = $props();
+	let { label, value }: StatusRowProps = $props();
 </script>
 
 <div class="status-row">
-	<span
-		class="indicator"
-		class:active
-		role="status"
-		aria-label={ariaLabel}
-	></span>
 	<span class="label">{label}</span>
 	<span class="value">{value}</span>
 </div>
@@ -23,28 +15,20 @@
 <style>
 	.status-row {
 		display: flex;
-		align-items: center;
-		gap: 8px;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 12px;
 		font-size: 0.875rem;
-		color: var(--text-primary);
+		padding: 2px 0;
 	}
 	.label {
-		flex: 1;
-	}
-	.value {
-		font-variant-numeric: tabular-nums;
 		color: var(--text-secondary);
-	}
-	.indicator {
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		background-color: var(--text-secondary);
-		opacity: 0.3;
 		flex-shrink: 0;
 	}
-	.indicator.active {
-		background-color: var(--color-success);
-		opacity: 1;
+	.value {
+		color: var(--text-primary);
+		font-variant-numeric: tabular-nums;
+		text-align: right;
+		overflow-wrap: anywhere;
 	}
 </style>

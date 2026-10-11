@@ -5,6 +5,8 @@
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 	import ProjectMapStatus from '$lib/free/components/ProjectMapStatus.svelte';
 	import CartridgeManager from '$lib/free/components/CartridgeManager.svelte';
+	import CartridgeInstallButton from '$lib/free/components/CartridgeInstallButton.svelte';
+	import Button from '$lib/free/components/ui/Button.svelte';
 	import { isPro } from '$lib/edition';
 	import { proActive } from '$lib/free/stores/server';
 
@@ -26,6 +28,7 @@
 	let CartridgeTrustPanel: Component | null = $state(null);
 	let TeamHubPanel: Component | null = $state(null);
 	let showCreateDialog = $state(false);
+	let manager: ReturnType<typeof CartridgeManager> | undefined = $state();
 
 	onMount(async () => {
 		if (!isPro) return;
@@ -46,19 +49,19 @@
 </script>
 
 <PageLayout title={$t('sidebar.cartridges')}>
-	<ProjectMapStatus />
-	<CartridgeManager>
+	{#snippet description()}{$t('cartridge.page_description')}{/snippet}
+	{#snippet actions()}
+		<CartridgeInstallButton onInstalled={() => manager?.refresh()} />
+	{/snippet}
+	<CartridgeManager bind:this={manager}>
 		{#snippet headerExtra({ refresh }: { refresh: () => Promise<void> })}
 			{#if $proActive && CartridgeCreateDialog}
-				<button class="create-btn" onclick={() => (showCreateDialog = true)}>
+				<Button size="sm" onclick={() => (showCreateDialog = true)}>
 					{$t('cartridge.create')}
-				</button>
+				</Button>
 				{#if showCreateDialog}
 					{@const Dialog = CartridgeCreateDialog}
-					<Dialog
-						onClose={() => (showCreateDialog = false)}
-						onCreated={refresh}
-					/>
+					<Dialog onClose={() => (showCreateDialog = false)} onCreated={refresh} />
 				{/if}
 			{/if}
 		{/snippet}
@@ -71,19 +74,5 @@
 		{@const HubPanel = TeamHubPanel}
 		<HubPanel />
 	{/if}
+	<ProjectMapStatus />
 </PageLayout>
-
-<style>
-	.create-btn {
-		padding: 6px 14px;
-		background-color: var(--bg-secondary);
-		color: var(--text-primary);
-		border: 1px solid var(--border);
-		border-radius: var(--border-radius);
-		cursor: pointer;
-		font-size: 0.95rem;
-	}
-	.create-btn:hover {
-		opacity: 0.85;
-	}
-</style>

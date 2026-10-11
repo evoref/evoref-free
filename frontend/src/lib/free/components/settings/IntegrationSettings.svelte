@@ -7,6 +7,7 @@
 	import TextField from './fields/TextField.svelte';
 	import NumberField from './fields/NumberField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
+	import RuntimeSettingsGroup from './RuntimeSettingsGroup.svelte';
 
 	let tools = $derived(configSection($configData, 'tools'));
 	let widgetProxy = $derived(configSection($configData, 'widget_proxy'));
@@ -29,4 +30,7 @@
 			<NumberField label="settings.widget_proxy.cache_ttl_sec" value={Number(widgetProxy.cache_ttl_sec ?? 60)} min={0} onchange={fieldUpdater('widget_proxy', 'cache_ttl_sec')} />
 		</FieldGroup>
 	</ProSection>
+
+	<!-- create の実行環境 (php / node) は専用 API で保存する (タブの「適用」には乗らない) -->
+	<RuntimeSettingsGroup />
 </SettingsSection>

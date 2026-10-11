@@ -4,25 +4,24 @@
 	let { title, children }: { title: string; children: Snippet } = $props();
 </script>
 
-<fieldset class="card">
-	<legend class="card-legend">{title}</legend>
+<section class="card">
+	<h2 class="card-title">{title}</h2>
 	{@render children()}
-</fieldset>
+</section>
 
 <style>
 	.card {
 		background: var(--card-bg);
-		border: 0.5px solid var(--card-border);
-		border-radius: 10px;
+		border: 1px solid var(--card-border);
+		border-radius: var(--border-radius);
 		padding: 14px 16px;
 		margin: 0;
-		backdrop-filter: blur(6px);
-		-webkit-backdrop-filter: blur(6px);
+		min-width: 0;
 	}
-	.card-legend {
-		font-size: 14.5px;
+	.card-title {
+		margin: 0 0 10px;
+		font-size: 0.9375rem;
 		font-weight: 600;
-		color: var(--text-secondary);
-		padding: 0 6px;
+		color: var(--text-primary);
 	}
 </style>

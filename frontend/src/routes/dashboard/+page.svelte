@@ -2,9 +2,12 @@
 	import { t } from '$lib/i18n';
 	import { layout } from '$lib/free/stores/theme';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
-	import LearningStatus from '$lib/free/components/LearningStatus.svelte';
-	import RAGStats from '$lib/free/components/RAGStats.svelte';
-	import SystemHealthCard from '$lib/free/components/SystemHealthCard.svelte';
+	import DashboardOverview from '$lib/free/components/DashboardOverview.svelte';
+	import LearningSummary from '$lib/free/components/LearningSummary.svelte';
+	import DocumentSummary from '$lib/free/components/DocumentSummary.svelte';
+	import LearningDetail from '$lib/free/components/LearningDetail.svelte';
+	import RagDetail from '$lib/free/components/RagDetail.svelte';
+	import SystemHealthDetail from '$lib/free/components/SystemHealthDetail.svelte';
 	import { onMount, onDestroy } from 'svelte';
 	import type { Component } from 'svelte';
 	import { isPro } from '$lib/edition';
@@ -70,46 +73,39 @@
 	});
 </script>
 
+<!--
+	Free (一般向け) は全体の状態・学習・文書だけを出す。Pro (プロ向け) はその下に「詳細」
+	(学習効果・成長のゲートと回帰・RAG の内訳・システムの診断・組織ポリシー・モデル適合) を足す。
+-->
 <PageLayout title={$t('sidebar.dashboard')}>
 	{#if loaded}
-		{#if fetchError}
-			<p class="fetch-error">{$t('dashboard.fetch_error')}</p>
-		{/if}
-		<div class="dashboard-grid" style="grid-template-columns: repeat({gridCols}, 1fr)">
-			<LearningStatus
-				running={learningData.running}
-				experienceCount={learningData.experience_count}
-				newExperienceCount={learningData.new_experience_count}
-				minExperiences={learningData.min_experiences}
-				conditionsMet={learningData.conditions_met}
-				level1BlockedReason={learningData.level1_blocked_reason}
-				level1SecondsUntilIdle={learningData.level1_seconds_until_idle}
-				lastLevel1Run={learningData.last_level1_run}
-				isDisabled={learningData.is_disabled}
-				lastLevel0Record={learningData.last_level0_record}
-				experienceByMode={learningData.experience_by_mode}
-				correctionRate={learningData.correction_rate}
-				ragUsageRate={learningData.rag_usage_rate}
-				prevCorrectionRate={learningData.prev_correction_rate}
-				prevRagUsageRate={learningData.prev_rag_usage_rate}
-				level1RunCount={learningData.level1_run_count}
-				lastLevel1Results={learningData.last_level1_results}
-				executedPhases={learningData.executed_phases}
-				fitnessHistory={learningData.fitness_history}
-				policyEvolverStatus={learningData.policy_evolver_status}
+		<DashboardOverview {ragStats} {fetchError} />
+		<div class="summary-grid" style="grid-template-columns: repeat({gridCols}, minmax(0, 1fr))">
+			<LearningSummary
+				data={learningData}
 				{growth}
+				showMeasure={$proActive}
 				onGrowthChange={refreshDashboardData}
 			/>
-			<RAGStats stats={ragStats} />
-			<SystemHealthCard />
+			<DocumentSummary stats={ragStats} />
 		</div>
-		{#if $proActive && OrgPolicyPanel}
-			{@const PolicyPanel = OrgPolicyPanel}
-			<PolicyPanel />
-		{/if}
-		{#if $proActive && ModelFitPanel}
-			{@const FitPanel = ModelFitPanel}
-			<FitPanel />
+		{#if $proActive}
+			<details class="details" open>
+				<summary>{$t('dashboard.details_title')}</summary>
+				<div class="details-grid">
+					<LearningDetail data={learningData} {growth} />
+					<RagDetail stats={ragStats} />
+					<SystemHealthDetail />
+				</div>
+				{#if OrgPolicyPanel}
+					{@const PolicyPanel = OrgPolicyPanel}
+					<PolicyPanel />
+				{/if}
+				{#if ModelFitPanel}
+					{@const FitPanel = ModelFitPanel}
+					<FitPanel />
+				{/if}
+			</details>
 		{/if}
 	{:else}
 		<div class="loading">{$t('common.loading')}</div>
@@ -117,22 +113,34 @@
 </PageLayout>
 
 <style>
-	.dashboard-grid {
+	.summary-grid {
 		display: grid;
 		gap: 12px;
+		align-items: start;
+	}
+	.details {
+		margin-top: 20px;
+	}
+	.details > summary {
+		cursor: pointer;
+		font-size: 0.9375rem;
+		font-weight: 600;
+		color: var(--text-secondary);
+		margin-bottom: 12px;
+	}
+	.details-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+		gap: 12px;
+		align-items: start;
 	}
 	@media (max-width: 900px) {
-		.dashboard-grid {
-			grid-template-columns: 1fr !important;
+		.summary-grid {
+			grid-template-columns: minmax(0, 1fr) !important;
 		}
-	}
-	.fetch-error {
-		color: var(--color-error, #ef4444);
-		font-size: 0.875rem;
-		padding: 8px 12px;
-		margin-bottom: 8px;
-		background-color: var(--bg-secondary);
-		border-radius: var(--border-radius);
+		.details-grid {
+			grid-template-columns: minmax(0, 1fr);
+		}
 	}
 	.loading {
 		display: flex;

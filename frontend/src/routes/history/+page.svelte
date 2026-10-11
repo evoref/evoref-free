@@ -23,7 +23,7 @@
 	import SessionList from '$lib/free/components/history/SessionList.svelte';
 	import SessionDetail from '$lib/free/components/history/SessionDetail.svelte';
 	import HistoryStatsBar from '$lib/free/components/history/HistoryStatsBar.svelte';
-	import HistoryConfirmDialog from '$lib/free/components/history/HistoryConfirmDialog.svelte';
+	import ConfirmDialog from '$lib/free/components/ui/ConfirmDialog.svelte';
 
 	/** 履歴一覧の 1 ページあたり件数 */
 	const HISTORY_PAGE_SIZE = 20;
@@ -301,7 +301,7 @@
 </PageLayout>
 
 {#if confirming === 'compact'}
-	<HistoryConfirmDialog
+	<ConfirmDialog
 		title={$t('history_page.compact_confirm_title')}
 		message={$t('history_page.compact_confirm_message')}
 		confirmLabel={$t('history_page.compact')}
@@ -310,7 +310,7 @@
 		onCancel={() => (confirming = null)}
 	/>
 {:else if confirming === 'bulk_delete'}
-	<HistoryConfirmDialog
+	<ConfirmDialog
 		title={$t('history_page.bulk_delete_confirm_title')}
 		message={$t('history_page.bulk_delete_confirm_message', { count: total })}
 		confirmLabel={$t('common.delete')}

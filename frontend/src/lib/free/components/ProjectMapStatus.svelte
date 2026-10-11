@@ -6,6 +6,8 @@
 	import { handleApiCall } from '$lib/free/utils/error';
 	import { formatDate } from '$lib/free/utils/format';
 	import { addToast } from '$lib/free/stores/toast';
+	import Button from './ui/Button.svelte';
+	import Disclosure from './ui/Disclosure.svelte';
 
 	let status = $state<ProjectMapStatus | null>(null);
 	let updating = $state(false);
@@ -41,90 +43,65 @@
 </script>
 
 {#if status}
+	<!-- 開発者向けの状態。通常は sleep-time が自動で更新するので既定で閉じる -->
 	<section class="project-map" data-testid="project-map-status">
-		<div class="head">
-			<h3>{$t('cartridge.project_map.title')}</h3>
-			<button class="update-btn" onclick={handleUpdate} disabled={updating || !status.enabled}>
-				{updating ? $t('cartridge.project_map.updating') : $t('cartridge.project_map.update')}
-			</button>
-		</div>
-		{#if !status.enabled}
-			<p class="muted">{$t('cartridge.project_map.disabled')}</p>
-		{:else}
-			<ul class="roots">
-				{#each status.roots as r (r.root)}
-					<li>
-						<span class="root">{r.root}</span>
-						{#if r.version}
-							<span>
-								{$t('cartridge.project_map.nodes')}: {r.nodes} /
-								{$t('cartridge.project_map.edges')}: {r.edges}
-							</span>
-							<span>{$t('cartridge.project_map.updated_at')}: {formatDate(r.written_at)}</span>
-							{#if Object.keys(r.languages).length > 0}
+		<Disclosure label={$t('cartridge.project_map.title')}>
+			<p class="muted">{$t('cartridge.project_map.description')}</p>
+			{#if !status.enabled}
+				<p class="muted">{$t('cartridge.project_map.disabled')}</p>
+			{:else}
+				<ul class="roots">
+					{#each status.roots as r (r.root)}
+						<li>
+							<span class="root">{r.root}</span>
+							{#if r.version}
 								<span>
-									{$t('cartridge.project_map.languages')}:
-									{Object.entries(r.languages)
-										.map(([lang, n]) => `${lang} ${n}`)
-										.join(', ')}
+									{$t('cartridge.project_map.nodes')}: {r.nodes} /
+									{$t('cartridge.project_map.edges')}: {r.edges}
 								</span>
+								<span>{$t('cartridge.project_map.updated_at')}: {formatDate(r.written_at)}</span>
+								{#if Object.keys(r.languages).length > 0}
+									<span>
+										{$t('cartridge.project_map.languages')}:
+										{Object.entries(r.languages)
+											.map(([lang, n]) => `${lang} ${n}`)
+											.join(', ')}
+									</span>
+								{/if}
+							{:else}
+								<span class="muted">{$t('cartridge.project_map.no_version')}</span>
 							{/if}
-						{:else}
-							<span class="muted">{$t('cartridge.project_map.no_version')}</span>
-						{/if}
-					</li>
-				{/each}
-			</ul>
-		{/if}
+						</li>
+					{/each}
+				</ul>
+			{/if}
+			<div class="tools">
+				<Button size="sm" onclick={handleUpdate} disabled={updating || !status.enabled}>
+					{updating ? $t('cartridge.project_map.updating') : $t('cartridge.project_map.update')}
+				</Button>
+			</div>
+		</Disclosure>
 	</section>
 {/if}
 
 <style>
 	.project-map {
-		margin-bottom: 16px;
-		padding: 12px;
-		border: 1px solid var(--border);
-		border-radius: var(--border-radius);
-		background-color: var(--bg-secondary);
-	}
-	.head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-	}
-	h3 {
-		margin: 0;
-		font-size: 1rem;
-		color: var(--text-primary);
-	}
-	.update-btn {
-		padding: 4px 12px;
-		background-color: var(--accent);
-		color: var(--text-on-accent);
-		border: none;
-		border-radius: var(--border-radius);
-		cursor: pointer;
-		font-size: 0.9rem;
-	}
-	.update-btn:disabled {
-		opacity: 0.5;
-		cursor: default;
+		margin-top: var(--space-5);
 	}
 	.roots {
 		list-style: none;
-		margin: 8px 0 0;
+		margin: var(--space-2) 0 0;
 		padding: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 6px;
-		font-size: 0.9rem;
+		gap: var(--space-1);
+		font-size: var(--font-size-sm);
 		color: var(--text-primary);
 	}
 	.roots li {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 4px 14px;
+		gap: var(--space-1) var(--space-3);
 	}
 	.root {
 		font-family: monospace;
@@ -132,7 +109,10 @@
 	}
 	.muted {
 		color: var(--text-secondary);
-		margin: 8px 0 0;
-		font-size: 0.9rem;
+		margin: var(--space-1) 0 0;
+		font-size: var(--font-size-sm);
+	}
+	.tools {
+		margin-top: var(--space-3);
 	}
 </style>

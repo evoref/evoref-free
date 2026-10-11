@@ -5,5 +5,9 @@
 </script>
 
 <PageLayout title={$t('fewshot.title')}>
+	{#snippet description()}
+		{$t('fewshot.page_description')}
+		<a href="/dashboard">{$t('fewshot.dashboard_link')}</a>
+	{/snippet}
 	<FewShotCurator />
 </PageLayout>

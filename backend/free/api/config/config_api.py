@@ -165,6 +165,80 @@ def _guard_capability_keys(section: str, data: dict) -> None:
         )
 
 
+#: ``launch_args`` を持つ節 (設定 API の節 → その中の位置、c_16 §7.2.4)。
+_LAUNCH_ARGS_NODES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "llama": ("llama", ()),
+    "embedding": ("embedding", ()),
+    "rag": ("rerank", ("rerank",)),
+}
+
+
+def _launch_node(data: dict, path: tuple[str, ...]) -> dict | None:
+    node: object = data
+    for key in path:
+        node = node.get(key) if isinstance(node, dict) else None
+    return node if isinstance(node, dict) else None
+
+
+def _guard_launch_args(section: str, data: dict) -> None:
+    """``launch_args`` の変更を検査する (c_06 §1.5 の例外、c_16 §7.2.4)。
+
+    設定 API から書けるのは性能・メモリの調整フラグだけ (:func:`api_disallowed_flags`)。ファイルや
+    ネットワークに触れるフラグは 403 (config.yaml を手で編集する)。解釈できない値は 422。
+    """
+    from backend.llama_launch_args import LaunchArgsError, api_disallowed_flags, parse_launch_args
+
+    spec = _LAUNCH_ARGS_NODES.get(section)
+    if spec is None:
+        return
+    new = _launch_node(data, spec[1])
+    if new is None or "launch_args" not in new:
+        return
+    current = _launch_node(get_config().get(section, {}) or {}, spec[1]) or {}
+    if new["launch_args"] == current.get("launch_args", ""):
+        return
+    try:
+        blocked = api_disallowed_flags(parse_launch_args(str(new["launch_args"] or "")))
+    except LaunchArgsError as e:
+        raise api_error(422, "E0422", str(e), "api.config_launch_args_invalid", error=str(e)) from e
+    if blocked:
+        raise api_error(
+            403,
+            "E0403",
+            f"launch_args flags cannot be set via the API: {', '.join(blocked)}. Edit config.yaml directly.",
+            "api.config_launch_args_protected",
+            flags=", ".join(blocked),
+        )
+
+
+def _drop_launch_derived(section: str, data: dict) -> dict:
+    """``launch_args`` が写すキー (``-c`` → ``context_size`` 等) を保存する値から除く。
+
+    画面は検証済みの config (写した値入り) を節ごと送り返すので、そのまま保存すると写した値が
+    config.yaml に固定され、``launch_args`` から消しても自動 (環境調整) に戻らなくなる。現在と新しい
+    ``launch_args`` の両方が写すキーを除けば、config.yaml にはもとの値が残る。
+    """
+    from backend.llama_launch_args import derived_keys
+
+    spec = _LAUNCH_ARGS_NODES.get(section)
+    if spec is None:
+        return data
+    kind, path = spec
+    new = _launch_node(data, path)
+    if new is None:
+        return data
+    current = _launch_node(get_config().get(section, {}) or {}, path) or {}
+    keys = derived_keys(kind, current.get("launch_args")) | derived_keys(kind, new.get("launch_args"))
+    if not keys:
+        return data
+    out = copy.deepcopy(data)
+    node = _launch_node(out, path)
+    assert node is not None
+    for key in keys:
+        node.pop(key, None)
+    return out
+
+
 # ── 固定パスのエンドポイント（{section} より先に定義） ──
 
 
@@ -318,9 +392,10 @@ async def update_config_section(
 
     # 能力キー (コード実行・秘密・任意パスにつながる値) は API から危険側へ変えない
     _guard_capability_keys(section, req.data)
+    _guard_launch_args(section, req.data)
 
     # api_key マスク値の場合は既存値を保持
-    data = dict(req.data)
+    data = _drop_launch_derived(section, dict(req.data))
     if section in SENSITIVE_FIELDS:
         current = get_config().get(section, {})
         for field in SENSITIVE_FIELDS[section]:

@@ -5,8 +5,6 @@
 	import type { Cartridge, CartridgeDetail } from '$lib/free/api';
 	import {
 		getCartridges,
-		installCartridgeStreaming,
-		cancelCartridgeInstall,
 		loadCartridge,
 		unloadCartridge,
 		deleteCartridge,
@@ -17,16 +15,16 @@
 	import { formatSize } from '$lib/free/utils/format';
 	import { templatesRevision } from '$lib/free/stores/chat';
 	import CartridgeDetailDialog from './CartridgeDetailDialog.svelte';
-	import CartridgeProgressView, {
-		type PhaseSpec,
-		type ProgressState
-	} from './CartridgeProgressView.svelte';
-	import DialogShell from './DialogShell.svelte';
 	import RegisterTemplateDialog from './RegisterTemplateDialog.svelte';
+	import Badge from './ui/Badge.svelte';
+	import Button from './ui/Button.svelte';
+	import ConfirmDialog from './ui/ConfirmDialog.svelte';
+	import EmptyState from './ui/EmptyState.svelte';
+	import MoreMenu from './ui/MoreMenu.svelte';
 
 	// エディション固有 UI (Pro 等) は親 route から snippet として注入する。
 	// Free 配下のコンポーネントが $lib/pro を直接参照すると境界違反になるため、
-	// ここでは Pro を一切知らない。
+	// ここでは Pro を一切知らない。主操作のインストールは route が PageLayout の actions に置く。
 	type HeaderExtraArgs = { refresh: () => Promise<void> };
 	type Props = {
 		headerExtra?: Snippet<[HeaderExtraArgs]>;
@@ -34,34 +32,19 @@
 	let { headerExtra }: Props = $props();
 
 	let cartridges = $state<Cartridge[]>([]);
-	let fileInput: HTMLInputElement | undefined = $state();
-	let errorMessage = $state('');
 	let selectedDetail = $state<CartridgeDetail | null>(null);
 	let showRegisterTemplate = $state(false);
-
-	// インストール進捗状態
-	const INSTALL_PHASES: PhaseSpec[] = [
-		{ id: 'extract', labelKey: 'cartridge.progress.phase_extract' },
-		{ id: 'chunk_embed', labelKey: 'cartridge.progress.phase_chunk_embed' },
-		{ id: 'index', labelKey: 'cartridge.progress.phase_index' }
-	];
-	let progressDialogOpen = $state(false);
-	let progressState = $state<ProgressState>({
-		currentPhase: null,
-		completedPhases: new Set(),
-		current: 0,
-		total: 0,
-		detail: ''
-	});
-	let installSessionId = $state('');
-	let installAbort: AbortController | null = null;
-	let cancelling = $state(false);
+	let pendingDelete = $state<Cartridge | null>(null);
+	let deleting = $state(false);
+	// 埋め込みモデル切替後にカートリッジ単位で再構築 (再埋め込み)。
+	let rebuildingId = $state<string | null>(null);
 
 	onMount(() => {
-		refreshCartridges();
+		refresh();
 	});
 
-	async function refreshCartridges() {
+	/** 一覧を取り直す (インストール完了時に route からも呼ぶ) */
+	export async function refresh() {
 		const result = await handleApiCall(() => getCartridges(), {
 			silent: true,
 			fallback: []
@@ -72,129 +55,52 @@
 		templatesRevision.update((n) => n + 1);
 	}
 
-	function _resetProgress() {
-		progressState = {
-			currentPhase: null,
-			completedPhases: new Set(),
-			current: 0,
-			total: 0,
-			detail: ''
-		};
-		cancelling = false;
+	/** 索引 (読込み / 取外し / 再構築) は docs セクションの操作。provides が無い旧応答は docs 扱い */
+	function hasDocs(cart: Cartridge): boolean {
+		return !cart.provides || cart.provides.includes('docs');
 	}
 
-	async function handleInstall(e: Event) {
-		const input = e.target as HTMLInputElement;
-		const file = input.files?.[0];
-		if (!file) {
-			return;
-		}
-
-		_resetProgress();
-		errorMessage = '';
-		installSessionId =
-			typeof crypto !== 'undefined' && 'randomUUID' in crypto
-				? crypto.randomUUID()
-				: `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-		installAbort = new AbortController();
-		progressDialogOpen = true;
-
-		try {
-			let installSucceeded = false;
-			let errorOccurred = false;
-			for await (const ev of installCartridgeStreaming(
-				file,
-				installSessionId,
-				installAbort.signal
-			)) {
-				if (ev.type === 'step' && ev.step) {
-					const { phase, status, current, total, detail } = ev.step;
-					if (status === 'running') {
-						progressState = {
-							currentPhase: phase,
-							completedPhases: progressState.completedPhases,
-							current: current ?? 0,
-							total: total ?? 0,
-							detail: detail ?? ''
-						};
-					} else if (status === 'done') {
-						const completed = new Set(progressState.completedPhases);
-						completed.add(phase);
-						progressState = {
-							currentPhase: null,
-							completedPhases: completed,
-							current: total ?? progressState.current,
-							total: total ?? progressState.total,
-							detail: ''
-						};
-					}
-				} else if (ev.type === 'result') {
-					installSucceeded = true;
-				} else if (ev.type === 'error') {
-					errorOccurred = true;
-					errorMessage = ev.error?.message ?? $t('error.cartridge_install_failed');
-				}
-			}
-			if (installSucceeded && !errorOccurred) {
-				await refreshCartridges();
-			}
-		} catch (e) {
-			if (!(e instanceof DOMException && e.name === 'AbortError')) {
-				errorMessage =
-					e instanceof Error ? e.message : $t('error.cartridge_install_failed');
-			}
-		} finally {
-			progressDialogOpen = false;
-			installAbort = null;
-			installSessionId = '';
-			cancelling = false;
-			input.value = '';
-		}
-	}
-
-	async function handleCancelInstall() {
-		if (!installSessionId || cancelling) return;
-		cancelling = true;
-		await cancelCartridgeInstall(installSessionId);
-		// fetch 自体も中止 (ストリーム side だけ閉じても残ってしまうケースに備えて)
-		installAbort?.abort();
+	function providesLabel(cart: Cartridge): string {
+		return (cart.provides ?? []).map((p) => $t(`cartridge.provides_${p}`)).join(' / ');
 	}
 
 	async function handleLoad(id: string) {
-		errorMessage = '';
 		await handleApiCall(() => loadCartridge(id), {
 			fallbackKey: 'cartridge.load_failed'
 		});
-		await refreshCartridges();
+		await refresh();
 	}
 
 	async function handleUnload(id: string) {
-		errorMessage = '';
 		await handleApiCall(() => unloadCartridge(id), {
 			fallbackKey: 'cartridge.unload_failed'
 		});
-		await refreshCartridges();
+		await refresh();
 	}
 
-	async function handleDelete(id: string) {
-		errorMessage = '';
-		await handleApiCall(() => deleteCartridge(id), {
-			fallbackKey: 'cartridge.delete_failed'
-		});
-		await refreshCartridges();
+	async function confirmDelete() {
+		if (!pendingDelete) return;
+		const id = pendingDelete.id;
+		deleting = true;
+		try {
+			await handleApiCall(() => deleteCartridge(id), {
+				fallbackKey: 'cartridge.delete_failed'
+			});
+			await refresh();
+		} finally {
+			deleting = false;
+			pendingDelete = null;
+		}
 	}
 
-	// 埋め込みモデル切替後にカートリッジ単位で再構築 (再埋め込み)。
-	let rebuildingId = $state<string | null>(null);
 	async function handleRebuild(id: string) {
 		if (rebuildingId) return;
-		errorMessage = '';
 		rebuildingId = id;
 		try {
 			await handleApiCall(() => rebuildCartridge(id), {
 				fallbackKey: 'cartridge.rebuild_failed'
 			});
-			await refreshCartridges();
+			await refresh();
 		} finally {
 			rebuildingId = null;
 		}
@@ -209,13 +115,8 @@
 		}
 	}
 
-	function handleDetailClose() {
-		selectedDetail = null;
-	}
-
 	async function handleDetailUpdated() {
-		await refreshCartridges();
-		// 詳細情報も再取得
+		await refresh();
 		if (selectedDetail) {
 			const updated = await handleApiCall(() => getCartridgeDetail(selectedDetail!.id), {
 				silent: true
@@ -225,90 +126,88 @@
 			}
 		}
 	}
-
 </script>
 
-<div class="cartridge-manager">
-	<div class="header">
-		{#if headerExtra}
-			{@render headerExtra({ refresh: refreshCartridges })}
-		{/if}
-		<button class="install-btn" onclick={() => fileInput?.click()} disabled={progressDialogOpen}>
-			{$t('cartridge.install')}
-		</button>
-		<button class="install-btn template-register-btn" onclick={() => (showRegisterTemplate = true)}>
-			{$t('cartridge.template_register')}
-		</button>
-		<input
-			bind:this={fileInput}
-			type="file"
-			accept=".evocart,.zip"
-			class="hidden"
-			onchange={handleInstall}
-		/>
+<section class="cartridge-manager">
+	<div class="list-head">
+		<h2 class="list-title">{$t('cartridge.installed_heading', { count: cartridges.length })}</h2>
+		<div class="list-tools">
+			{#if headerExtra}
+				{@render headerExtra({ refresh })}
+			{/if}
+			<Button size="sm" onclick={() => (showRegisterTemplate = true)}>
+				{$t('cartridge.template_register')}
+			</Button>
+		</div>
 	</div>
 
-	{#if errorMessage}
-		<p class="error">{errorMessage}</p>
-	{/if}
-
 	{#if cartridges.length === 0}
-		<p class="empty">{$t('cartridge.list_empty')}</p>
+		<EmptyState message={$t('cartridge.list_empty')}>
+			<span class="empty-hint">{$t('cartridge.list_empty_hint')}</span>
+		</EmptyState>
 	{:else}
 		<ul class="cartridge-list">
-			{#each cartridges as cart}
-				<!-- 索引 (読み込み / 取外し / 再構築) は docs セクションの操作。様式や言語
-				     パックだけのパッケージには出さない (provides が無い旧応答は従来どおり) -->
-				{@const hasDocs = !cart.provides || cart.provides.includes('docs')}
-				<li class="cartridge-item" class:loaded={cart.status === 'loaded'}>
+			{#each cartridges as cart (cart.id)}
+				{@const docs = hasDocs(cart)}
+				{@const loaded = docs && cart.status === 'loaded'}
+				<li class="cartridge-item">
 					<button class="info" onclick={() => handleShowDetail(cart.id)}>
-						<span class="name">{cart.name}</span>
-						<span class="desc">{cart.description}</span>
-						<span class="meta">
-							{#if hasDocs}
-								v{cart.version} / {cart.chunks} chunks / {formatSize(cart.size_mb)}
-							{:else}
-								v{cart.version} / {(cart.provides ?? [])
-									.map((p) => $t(`cartridge.provides_${p}`))
-									.join(' / ')}
+						<span class="title-line">
+							<span class="name">{cart.name}</span>
+							{#if docs}
+								<Badge tone={loaded ? 'strong' : 'muted'}>
+									{loaded ? $t('cartridge.status_loaded') : $t('cartridge.status_not_loaded')}
+								</Badge>
 							{/if}
 						</span>
-					</button>
-					<div class="actions">
-						{#if hasDocs}
-							{#if cart.status === 'loaded'}
-								<button class="action-btn unload" onclick={() => handleUnload(cart.id)}>
-									{$t('cartridge.unload')}
-								</button>
-							{:else}
-								<button class="action-btn primary" onclick={() => handleLoad(cart.id)}>
-									{$t('cartridge.load')}
-								</button>
-							{/if}
-							<button
-								class="action-btn"
-								disabled={rebuildingId !== null}
-								onclick={() => handleRebuild(cart.id)}
-							>
-								{rebuildingId === cart.id
-									? $t('cartridge.rebuilding')
-									: $t('cartridge.rebuild')}
-							</button>
+						{#if cart.description}
+							<span class="desc">{cart.description}</span>
 						{/if}
-						<button class="action-btn danger" onclick={() => handleDelete(cart.id)}>
-							{$t('cartridge.uninstall')}
-						</button>
+						<span class="meta">
+							v{cart.version} · {docs ? formatSize(cart.size_mb) : providesLabel(cart)}
+						</span>
+					</button>
+					<div class="row-actions">
+						{#if docs}
+							{#if loaded}
+								<Button size="sm" onclick={() => handleUnload(cart.id)}>
+									{$t('cartridge.unload')}
+								</Button>
+							{:else}
+								<Button size="sm" onclick={() => handleLoad(cart.id)}>
+									{$t('cartridge.load')}
+								</Button>
+							{/if}
+						{/if}
+						<MoreMenu>
+							<Button variant="ghost" size="sm" onclick={() => handleShowDetail(cart.id)}>
+								{$t('cartridge.show_detail')}
+							</Button>
+							{#if docs}
+								<Button
+									variant="ghost"
+									size="sm"
+									disabled={rebuildingId !== null}
+									onclick={() => handleRebuild(cart.id)}
+								>
+									{rebuildingId === cart.id ? $t('cartridge.rebuilding') : $t('cartridge.rebuild')}
+								</Button>
+							{/if}
+							<Button variant="danger" size="sm" onclick={() => (pendingDelete = cart)}>
+								{$t('cartridge.uninstall')}
+							</Button>
+						</MoreMenu>
 					</div>
 				</li>
 			{/each}
 		</ul>
 	{/if}
-</div>
+</section>
 
 {#if selectedDetail}
 	<CartridgeDetailDialog
 		detail={selectedDetail}
-		onClose={handleDetailClose}
+		onClose={() => (selectedDetail = null)}
 		onUpdated={handleDetailUpdated}
 	/>
 {/if}
@@ -316,110 +215,61 @@
 {#if showRegisterTemplate}
 	<RegisterTemplateDialog
 		onClose={() => (showRegisterTemplate = false)}
-		onRegistered={refreshCartridges}
+		onRegistered={refresh}
 	/>
 {/if}
 
-{#if progressDialogOpen}
-	<DialogShell
-		ariaLabel={$t('cartridge.progress.install_title')}
-		onClose={() => {
-			/* 進捗中はオーバーレイ / Escape からは閉じない */
-		}}
-		minWidth="420px"
-		maxWidth="520px"
-		canCloseOnOverlayClick={false}
-	>
-		<h3 class="progress-title">{$t('cartridge.progress.install_title')}</h3>
-		<CartridgeProgressView
-			phases={INSTALL_PHASES}
-			state={progressState}
-			{cancelling}
-			onCancel={handleCancelInstall}
-		/>
-	</DialogShell>
+{#if pendingDelete}
+	<ConfirmDialog
+		title={$t('cartridge.uninstall_confirm_title')}
+		message={$t('cartridge.uninstall_confirm_message', { name: pendingDelete.name })}
+		confirmLabel={$t('cartridge.uninstall')}
+		busy={deleting}
+		onConfirm={confirmDelete}
+		onCancel={() => (pendingDelete = null)}
+	/>
 {/if}
 
 <style>
-	.cartridge-manager {
-		padding: 16px;
-	}
-	.header {
+	.list-head {
 		display: flex;
 		align-items: center;
-		justify-content: flex-end;
-		gap: 12px;
-		margin-bottom: 16px;
+		justify-content: space-between;
+		flex-wrap: wrap;
+		gap: var(--space-2);
+		margin-bottom: var(--space-3);
 	}
-	.install-btn {
-		padding: 6px 14px;
-		background-color: var(--accent);
-		color: var(--text-on-accent);
-		border: none;
-		border-radius: var(--border-radius);
-		cursor: pointer;
-		font-size: 0.95rem;
-	}
-	.install-btn:disabled {
-		opacity: 0.5;
-	}
-	.progress-title {
-		margin: 0 0 14px;
-		font-size: 1.1rem;
+	.list-title {
+		margin: 0;
+		font-size: var(--font-size-base);
+		font-weight: 600;
 		color: var(--text-primary);
 	}
-	.hidden {
-		display: none;
+	.list-tools {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
 	}
-	.error {
-		color: var(--color-error);
-		font-size: 0.95rem;
-		margin-bottom: 8px;
-	}
-	.empty {
-		color: var(--text-secondary);
-		font-style: italic;
+	.empty-hint {
+		color: var(--text-muted);
+		font-size: var(--font-size-sm);
 	}
 	.cartridge-list {
 		list-style: none;
 		padding: 0;
 		margin: 0;
-		display: grid;
-		grid-template-columns: 1fr;
-		gap: 8px;
+		border-top: 1px solid var(--border);
 	}
 	.cartridge-item {
 		display: flex;
-		align-items: flex-start;
-		padding: 10px 12px;
-		background-color: var(--bg-secondary);
-		border: 0.5px solid var(--card-border);
-		border-radius: 10px;
-	}
-	.cartridge-item.loaded {
-		background-color: var(--bg-primary);
-		border-width: 2px;
-	}
-	@media (max-width: 900px) {
-		.cartridge-list {
-			grid-template-columns: 1fr;
-		}
-		.cartridge-item {
-			flex-direction: column;
-			align-items: flex-start;
-			gap: 8px;
-		}
-		.actions {
-			flex-direction: column;
-			width: 100%;
-		}
-		.action-btn {
-			width: 100%;
-			text-align: center;
-		}
+		align-items: center;
+		gap: var(--space-3);
+		padding: var(--space-3) var(--space-1);
+		border-bottom: 1px solid var(--border);
 	}
 	.info {
 		flex: 1;
+		min-width: 0;
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
@@ -429,61 +279,36 @@
 		text-align: left;
 		cursor: pointer;
 		font-family: inherit;
+		color: inherit;
 	}
 	.info:hover .name {
 		text-decoration: underline;
+	}
+	.title-line {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		flex-wrap: wrap;
 	}
 	.name {
 		font-weight: 600;
 		color: var(--text-primary);
 	}
-	.cartridge-item:not(.loaded) .name {
-		color: var(--text-secondary);
-		opacity: 0.6;
-	}
 	.desc {
-		font-size: 0.9rem;
+		font-size: var(--font-size-sm);
 		color: var(--text-secondary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.meta {
-		font-size: 0.8rem;
-		color: var(--text-secondary);
-		opacity: 0.7;
-		margin-top: 2px;
+		font-size: var(--font-size-xs);
+		color: var(--text-muted);
 	}
-	.cartridge-item:not(.loaded) .desc {
-		opacity: 0.6;
-	}
-	.actions {
+	.row-actions {
 		display: flex;
-		flex-direction: column;
-		gap: 6px;
-	}
-	.action-btn {
-		padding: 4px 10px;
-		font-size: 0.9rem;
-		background: none;
-		border: 1px solid var(--border);
-		border-radius: var(--border-radius);
-		color: var(--text-primary);
-		cursor: pointer;
-	}
-	.action-btn.primary {
-		background: none;
-		color: var(--text-primary);
-		border: 1.5px solid var(--border);
-	}
-	.action-btn.unload {
-		background-color: var(--control-bg);
-		color: var(--text-primary);
-		border: 1.5px solid var(--border);
-	}
-	.action-btn.danger {
-		background-color: var(--color-error);
-		color: var(--text-on-accent);
-		border: 1px solid var(--color-error);
-	}
-	.action-btn:hover {
-		opacity: 0.85;
+		align-items: center;
+		gap: var(--space-1);
+		flex-shrink: 0;
 	}
 </style>

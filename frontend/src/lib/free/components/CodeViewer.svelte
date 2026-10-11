@@ -2,8 +2,7 @@
 	/**
 	 * CodeViewer — Free 版チャット応答内コードブロック用の読み取り専用 CodeMirror ラッパ。
 	 *
-	 * Free / Pro でハイライト見た目を一貫させるため、Pro の CodeMirrorEditor と同じ
-	 * 言語拡張 + `defaultHighlightStyle` を使う。ただし以下を排除し、編集 UI を一切
+	 * 言語拡張 + `defaultHighlightStyle` を使い、以下を排除して編集 UI を一切
 	 * 露出しない:
 	 *   - history / historyKeymap / indentWithTab
 	 *   - onchange / ondropfiles コールバック
@@ -14,8 +13,7 @@
 	 *   - EditorState.readOnly.of(true)         … doc が dispatch でしか変えられない
 	 *   - EditorView.editable.of(false)         … contenteditable=false / フォーカス不可
 	 *
-	 * Pro 版の編集 UI (EditorPanel / CodeMirrorEditor) とは独立。Free 配下の
-	 * edition boundary test (edition_boundary.test.ts) が `$lib/pro/...` への
+	 * Free 配下の edition boundary test (edition_boundary.test.ts) が `$lib/pro/...` への
 	 * import / `EditorView.editable.of(true)` / `onchange` props を検知して fail する。
 	 */
 	import { onMount, onDestroy, untrack } from 'svelte';

@@ -281,6 +281,8 @@ async def get_status(state: AppState = Depends(get_app_state)):
     cart_mgr = getattr(state, "cartridge_manager", None)
     cartridges_loaded = cart_mgr.loaded_count if cart_mgr is not None else 0
     learning_health = await _learning_health()
+    rerank = _rerank_status(state)
+    rerank.connected = await _rerank_connected(cfg)
     return StatusResponse(
         status=status,
         edition=current_edition().name.lower(),
@@ -306,7 +308,7 @@ async def get_status(state: AppState = Depends(get_app_state)):
             for alert in liveness_ledger().alerts()
         ],
         data_health=_data_health(state),
-        rerank=_rerank_status(state),
+        rerank=rerank,
         embed_placement=_embed_placement(state),
         auto_tune=_auto_tune(state),
         learning_health=learning_health,
@@ -361,6 +363,25 @@ def _rerank_status(state: AppState) -> RerankStatusInfo:
         tested_at=status.tested_at,
         model_changed_since_selftest=status.model_changed_since_selftest,
     )
+
+
+async def _rerank_connected(cfg: dict) -> bool:
+    """rerank 用 llama-server が ``/health`` に応えるか (モデル未設定なら問い合わせず False)。
+
+    設定画面のサーバ制御の状態表示用。``rerank_status`` は起動時に 1 回決めた値で、画面から起動・停止
+    しても変わらないので、接続だけはその都度見る。
+    """
+    if not (cfg.get("model_paths") or {}).get("rerank_model"):
+        return False
+    from backend.free.api.system.server_control import _check_health, _resolve_endpoint
+
+    endpoint = _resolve_endpoint("rerank", cfg)
+    if endpoint is None:
+        return False
+    try:
+        return await _check_health(*endpoint)
+    except Exception:  # noqa: BLE001 — 観測の失敗で /api/status を落とさない
+        return False
 
 
 def _embed_placement(state: AppState) -> EmbedPlacementInfo:

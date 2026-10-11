@@ -3,11 +3,14 @@
 
 	let {
 		title = '',
+		description,
 		actions,
 		children,
 		fullHeight = false
 	}: {
 		title?: string;
+		/** 見出しの下に置く 1〜2 行の説明 (この画面が何のためにあるか) */
+		description?: Snippet;
 		actions?: Snippet;
 		children: Snippet;
 		fullHeight?: boolean;
@@ -17,9 +20,14 @@
 <div class="page" class:full-height={fullHeight}>
 	{#if title || actions}
 		<div class="page-header">
-			{#if title}
-				<h1 class="page-title">{title}</h1>
-			{/if}
+			<div class="page-heading">
+				{#if title}
+					<h1 class="page-title">{title}</h1>
+				{/if}
+				{#if description}
+					<p class="page-description">{@render description()}</p>
+				{/if}
+			</div>
 			{#if actions}
 				<div class="page-actions">
 					{@render actions()}
@@ -36,7 +44,7 @@
 	.page {
 		display: flex;
 		flex-direction: column;
-		padding: 20px 24px;
+		padding: var(--space-5);
 	}
 	.page.full-height {
 		height: 100%;
@@ -44,24 +52,37 @@
 	}
 	.page-header {
 		display: flex;
-		align-items: center;
+		align-items: flex-start;
 		justify-content: space-between;
-		margin-bottom: 16px;
+		flex-wrap: wrap;
+		gap: var(--space-3);
+		margin-bottom: var(--space-4);
 		flex-shrink: 0;
 	}
 	.full-height > .page-header {
-		padding: 20px 24px 0;
+		padding: var(--space-5) var(--space-5) 0;
+	}
+	.page-heading {
+		min-width: 0;
+		flex: 1 1 280px;
 	}
 	.page-title {
-		font-size: 18px;
-		font-weight: 500;
+		font-size: var(--font-size-xl);
+		font-weight: 600;
 		margin: 0;
 		color: var(--text-primary);
+	}
+	.page-description {
+		margin: var(--space-1) 0 0;
+		color: var(--text-secondary);
+		font-size: var(--font-size-sm);
+		line-height: 1.6;
 	}
 	.page-actions {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		flex-wrap: wrap;
+		gap: var(--space-2);
 	}
 	.page-body {
 		flex: 1;
