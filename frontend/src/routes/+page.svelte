@@ -62,8 +62,10 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		color: var(--text-secondary);
-		font-size: 14px;
+		color: var(--text-muted);
+		font-size: calc(var(--font-size-base) + 6px);
+		font-weight: 500;
+		letter-spacing: -0.01em;
 	}
 	.slot-chat-header {
 		flex-shrink: 0;

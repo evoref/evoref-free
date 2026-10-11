@@ -22,7 +22,6 @@
 
 <div
 	class="message-list"
-	class:constrained={$currentMode !== 'create'}
 	role="log"
 	aria-live="polite"
 	aria-label={$t('chat.message_list')}
@@ -39,17 +38,15 @@
 </div>
 
 <style>
+	/* 横幅は 80% に絞って中央に置く (チャット / クリエイト共通) */
 	.message-list {
 		flex: 1;
 		overflow-y: auto;
 		display: flex;
 		flex-direction: column;
-		padding: 16px;
+		padding: var(--space-5) var(--space-4);
 		gap: 4px;
-		width: 100%;
-	}
-	.message-list.constrained {
-		max-width: 960px;
+		width: 80%;
 		margin-left: auto;
 		margin-right: auto;
 	}
