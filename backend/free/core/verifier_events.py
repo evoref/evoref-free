@@ -76,6 +76,7 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "content.table_aggregate",  # コードで集計した表の値と別の値を述べた (述べなかった)
     "content.declared_count",   # 「以下の N つ」と宣言した直後の一覧が N 項目でない
     "content.tool_unavailable",  # 常に登録されているツールを「使えない」と述べて断った
+    "content.weekday",          # 西暦つきの月日に添えた曜日が暦と食い違う
 })
 
 

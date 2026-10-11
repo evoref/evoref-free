@@ -4,13 +4,13 @@
 	import DashboardCard from '$lib/free/components/DashboardCard.svelte';
 	import StatusSection from '$lib/free/components/StatusSection.svelte';
 	import StatusRow from '$lib/free/components/StatusRow.svelte';
+	import GrowthSection from '$lib/free/components/GrowthSection.svelte';
 	import type {
 		ExperienceByMode,
 		Level1ResultEntry,
 		FitnessPoint,
-		PolicyEvolverDomainStatus,
-		Level2Status,
-		Level2TargetStatus
+		GrowthResponse,
+		PolicyEvolverDomainStatus
 	} from '$lib/free/api';
 
 	interface LearningStatusProps {
@@ -24,7 +24,6 @@
 		/** waiting_for_idle のとき、アイドル成立までの残り秒数 */
 		level1SecondsUntilIdle?: number | null;
 		lastLevel1Run?: string | null;
-		lastLevel2Run?: string | null;
 		lastLevel0Record?: string | null;
 		experienceByMode?: ExperienceByMode;
 		correctionRate?: number;
@@ -36,10 +35,12 @@
 		executedPhases?: string[];
 		fitnessHistory?: Record<string, FitnessPoint[]>;
 		policyEvolverStatus?: Record<string, PolicyEvolverDomainStatus>;
-		runningTarget?: string | null;
-		level2?: Level2Status | null;
 		/** `--no-learning` 起動中 (常時バナーを出す) */
 		isDisabled?: boolean;
+		/** Level 2 (成長) の状態 (`GET /api/learning/growth`。取れなければ欄を出さない) */
+		growth?: GrowthResponse | null;
+		/** 提案の採用・却下・巻き戻しの後に呼ぶ (親が再取得する) */
+		onGrowthChange?: () => void;
 	}
 
 	let {
@@ -50,7 +51,6 @@
 		level1BlockedReason = null,
 		level1SecondsUntilIdle = null,
 		lastLevel1Run = null,
-		lastLevel2Run = null,
 		experienceByMode = { chat: 0, create: 0 },
 		correctionRate = 0,
 		ragUsageRate = 0,
@@ -60,9 +60,9 @@
 		lastLevel1Results = {},
 		fitnessHistory = {},
 		policyEvolverStatus = {},
-		runningTarget = null,
-		level2 = null,
 		isDisabled = false,
+		growth = null,
+		onGrowthChange,
 		..._ // experienceCount, lastLevel0Record, executedPhases: API互換のため受容
 	}: LearningStatusProps = $props();
 
@@ -187,106 +187,6 @@
 		}
 		return phaseLabel(status.phase);
 	}
-
-	// ── Level 2 状態 ──
-	interface Level2TargetView {
-		key: 'base';
-		label: string;
-		isRunning: boolean;
-		method: string;
-		versionLabel: string;
-		current: number;
-		required: number | null; // null = no-op (発火しない方式)
-		statusLabel: string;
-		reasonLabel: string; // 発火しない理由 (空文字なら非表示)
-		progress: number;
-	}
-
-	/** target の残りクールダウン時間（h、小数1桁）。算出不能なら null */
-	function remainingCooldownHours(key: 'base'): number | null {
-		const gates = level2?.gates;
-		if (!gates) return null;
-		const since = gates.seconds_since_run?.[key];
-		if (since === null || since === undefined) return null;
-		const cooldown = gates.cooldown_hours?.[key] ?? gates.overdue_hours;
-		const remain = cooldown - since / 3600;
-		return remain > 0 ? Math.round(remain * 10) / 10 : 0;
-	}
-
-	/** Level 2 の状態 + 発火閾値を表示用に整形する */
-	function buildTargetView(key: 'base', tStat: Level2TargetStatus): Level2TargetView {
-		const isRunning = runningTarget === key;
-		// 発火に必要な閾値: adapter 未生成なら bootstrap、生成済みは方式で分岐。
-		// base=lora(adapter有) は no-op skip のため required=null。
-		let required: number | null;
-		if (!tStat.adapter_exists) {
-			required = tStat.bootstrap_min;
-		} else if (tStat.method === 'cvector') {
-			required = tStat.cvector_min;
-		} else if (tStat.method === 'spsa-real-eval') {
-			required = tStat.spsa_min;
-		} else {
-			required = null;
-		}
-		const current = tStat.experiences_current;
-		// データが揃っていても、クールダウン中の target は実際には起動しない
-		// (実機 2026-08-14: base は「発火可」表示のまま
-		//  `still within cooldown (24.0h); skipping` を 5 分おきに出し続けた)。
-		// 「発火可」はデータ充足 AND overdue のときだけ出す。overdue 未提供の
-		// 旧バックエンドは true 扱いで従来表示を維持する。
-		const overdue = level2?.gates?.overdue?.[key] ?? true;
-		const cooldownRemainH = remainingCooldownHours(key);
-		let statusLabel: string;
-		if (isRunning) statusLabel = $t('dashboard.level2_running');
-		else if (required === null) statusLabel = $t('dashboard.level2_noop');
-		else if (current >= required && !overdue)
-			statusLabel = $t('dashboard.level2_cooldown', { hours: cooldownRemainH ?? '?' });
-		else if (current >= required) statusLabel = $t('dashboard.level2_ready');
-		else statusLabel = $t('dashboard.level2_accumulating');
-		// backend が算出した発火不可理由 ("" = 発火可能) を i18n ラベル化する。
-		// 表示と実トリガの乖離 (例: ready なのに発火しない) を可視化する単一ソース。
-		const reasonLabel = tStat.block_reason
-			? $t(`dashboard.level2_reason_${tStat.block_reason}`)
-			: '';
-		return {
-			key,
-			label: $t('dashboard.level2_base'),
-			isRunning,
-			method: tStat.method || '-',
-			versionLabel: tStat.adapter_exists
-				? `v${tStat.version}`
-				: $t('dashboard.level2_adapter_none'),
-			current,
-			required,
-			statusLabel,
-			reasonLabel,
-			progress: required && required > 0 ? Math.min(current / required, 1) : 0
-		};
-	}
-
-	let level2Targets = $derived(
-		level2
-			? [buildTargetView('base', level2.base)]
-			: []
-	);
-
-	// 連続無改善で延長クールダウン中の target。素の overdue_hours だけを出すと
-	// 「期限を過ぎているのに発火しない」ように見えるため、実効値を併記する。
-	let level2Backoff = $derived.by(() => {
-		const gates = level2?.gates;
-		if (!gates) return null;
-		const streaks = gates.no_improve_streak ?? {};
-		const cooldowns = gates.cooldown_hours ?? {};
-		const threshold = gates.stale_streak ?? 0;
-		if (threshold <= 0) return null;
-		const stalled = Object.keys(streaks).filter((k) => (streaks[k] ?? 0) >= threshold);
-		if (stalled.length === 0) return null;
-		return {
-			targets: stalled.join(' / '),
-			hours: Math.max(...stalled.map((k) => cooldowns[k] ?? gates.overdue_hours)),
-			streak: Math.max(...stalled.map((k) => streaks[k] ?? 0))
-		};
-	});
 </script>
 
 <DashboardCard title={$t('dashboard.learning_status')}>
@@ -377,63 +277,11 @@
 			{:else}
 				<StatusRow active={false} label="" value={$t('dashboard.no_history')} />
 			{/if}
-			{#if isPro && lastLevel2Run}
-				<StatusRow
-					active={true}
-					label={$t('dashboard.last_level2')}
-					value={formatRelativeTime(lastLevel2Run)}
-				/>
-			{/if}
 		</StatusSection>
 
-		<!-- セクション 2.5: Level 2 状態 + 発火条件 -->
-		{#if isPro && level2}
-			<StatusSection label={$t('dashboard.level2_section')}>
-				{#each level2Targets as tv (tv.key)}
-					<div class="level2-row">
-						<span class="l2-dot" class:running={tv.isRunning}></span>
-						<span class="l2-name">{tv.label}</span>
-						<span class="l2-status" class:running={tv.isRunning}>{tv.statusLabel}</span>
-						<span class="l2-meta">{tv.method} · {tv.versionLabel}</span>
-					</div>
-					{#if tv.reasonLabel}
-						<div class="level2-reason-row">
-							<span class="l2-reason">{tv.reasonLabel}</span>
-						</div>
-					{/if}
-					<div class="level2-progress-row">
-						{#if tv.required !== null && tv.progress >= 1}
-							<span class="l2-count l2-saturated">
-								{$t('dashboard.level2_sufficient_data', { count: tv.current })}
-							</span>
-						{:else if tv.required !== null}
-							<div class="progress-bar">
-								<div class="progress-fill" style="width: {tv.progress * 100}%"></div>
-							</div>
-							<span class="l2-count">{tv.current} / {tv.required}</span>
-						{:else}
-							<span class="l2-count l2-noop">{tv.current} / —</span>
-						{/if}
-					</div>
-				{/each}
-				<div class="level2-gates">
-					<span class="sub-label">{$t('dashboard.level2_firing_conditions')}</span>
-					<span class="gate-line">
-						{$t('dashboard.level2_gate_idle', { min: level2.gates.active_minutes })} ・
-						{$t('dashboard.level2_gate_overdue', { hours: level2.gates.overdue_hours })} ・
-						{$t('dashboard.level2_gate_interval', { sec: level2.gates.recheck_interval_sec })}
-					</span>
-					{#if level2Backoff}
-						<span class="gate-line gate-backoff">
-							{$t('dashboard.level2_gate_backoff', {
-								targets: level2Backoff.targets,
-								streak: level2Backoff.streak,
-								hours: level2Backoff.hours
-							})}
-						</span>
-					{/if}
-				</div>
-			</StatusSection>
+		<!-- Level 2 (成長): 自動採用の状態・提案・回帰台帳・巻き戻しの提案 (f_04 §6.8) -->
+		{#if growth}
+			<GrowthSection {growth} onchange={onGrowthChange} />
 		{/if}
 
 		<!-- セクション 3: 経験の質 -->
@@ -612,91 +460,6 @@
 		font-size: 0.75rem;
 		color: var(--text-secondary);
 		padding-left: 16px;
-	}
-
-	/* ── Level 2 状態 ── */
-	.level2-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 2px 0;
-		font-size: 0.8125rem;
-	}
-	.l2-dot {
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
-		border: 1.5px solid var(--text-secondary);
-		flex-shrink: 0;
-	}
-	.l2-dot.running {
-		background-color: var(--color-info, var(--accent));
-		border-color: var(--color-info, var(--accent));
-		animation: pulse-anim 1.5s ease-in-out infinite;
-	}
-	.l2-name {
-		min-width: 52px;
-		font-weight: 500;
-		color: var(--text-primary);
-	}
-	.l2-status {
-		font-size: 0.75rem;
-		color: var(--text-secondary);
-	}
-	.l2-status.running {
-		color: var(--color-info, var(--accent));
-		font-weight: 500;
-	}
-	.l2-meta {
-		margin-left: auto;
-		font-size: 0.6875rem;
-		color: var(--text-secondary);
-		font-variant-numeric: tabular-nums;
-	}
-	.level2-reason-row {
-		padding: 0 0 2px 16px;
-	}
-	.l2-reason {
-		font-size: 0.6875rem;
-		color: var(--text-warning, var(--text-secondary));
-		opacity: 0.85;
-	}
-	.level2-progress-row {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		padding: 0 0 4px 16px;
-	}
-	.l2-count {
-		font-size: 0.6875rem;
-		color: var(--text-secondary);
-		font-variant-numeric: tabular-nums;
-		white-space: nowrap;
-	}
-	.l2-count.l2-noop {
-		opacity: 0.6;
-	}
-	.l2-count.l2-saturated {
-		color: var(--color-success, var(--accent));
-		font-weight: 500;
-	}
-	.level2-gates {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		padding-left: 16px;
-	}
-	.level2-gates .sub-label {
-		font-size: 0.6875rem;
-		color: var(--text-secondary);
-	}
-	.gate-line {
-		font-size: 0.6875rem;
-		color: var(--text-secondary);
-		font-variant-numeric: tabular-nums;
-	}
-	.gate-line.gate-backoff {
-		color: var(--color-warning, var(--text-secondary));
 	}
 
 	/* ── 探索/活用: パラメータ最適化 ── */

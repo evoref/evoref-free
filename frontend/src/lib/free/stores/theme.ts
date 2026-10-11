@@ -101,7 +101,7 @@ const defaultLayout: LayoutConfig = {
 		editor: { ...defaultEditorConfig }
 	},
 	dashboard: {
-		panels: ['learning_status', 'lora_versions', 'performance_chart', 'rag_stats'],
+		panels: ['learning_status', 'rag_stats'],
 		grid_columns: 2
 	},
 	global: {

@@ -3,7 +3,6 @@
 Trigger A: LLM 応答生成開始直後に Light 実行（§8.1）
 Trigger B: 最終応答送信から full_idle_minutes 後に Full 実行
 Trigger C: Level 1 独立常駐ループ
-Trigger D: 夜間（schedule_hour）に Level 2 をトリガー
 ユーザー入力で実行中の処理を協調的に yield
 """
 
@@ -163,7 +162,7 @@ def _emit_bg_task_outcome(
 
     ``evolve`` レベル限定。``debug_logger`` が ``None`` の場合は no-op。
     ``kind`` は ``"bg_task"`` 固定で、``quality_signals.task_name`` で
-    light / full / level1_loop / level2_schedule を識別する。
+    light / full / level1_loop を識別する。
     """
     if debug_logger is None:
         return
@@ -265,15 +264,6 @@ class SleepTimeScheduler:
             learning.get("level1_recheck_interval_sec", 60)
         )
         self.active_minutes: float = learning.get("active_minutes", 5)
-        # level2_schedule_hour は優先窓のヒント (_seconds_until_hour で利用可能)。
-        # 実発火は再起動耐性のある overdue/idle 判定 (Level 2 常駐ループ) で行う。
-        self.level2_schedule_hour: int = learning.get("level2_schedule_hour", 3)
-        self.level2_recheck_interval_sec: float = float(
-            learning.get("level2_recheck_interval_sec", 300)
-        )
-        self.level2_overdue_hours: float = float(
-            learning.get("level2_overdue_hours", 24.0)
-        )
 
         self._last_user_input: float = 0.0
         # プロセス起動時刻。``_last_user_input`` が 0 (再起動後まだ一度も
@@ -290,16 +280,13 @@ class SleepTimeScheduler:
         self._snapshot_task: asyncio.Task | None = None
         #: 応答後に tail 索引を埋めるタスク (:meth:`arm_tail_refresh`)。
         self._tail_task: asyncio.Task | None = None
-        # Level 1 / Level 2 独立常駐ループ
+        # Level 1 独立常駐ループ
         self._level1_loop_task: asyncio.Task | None = None
-        self._level2_loop_task: asyncio.Task | None = None
         self._worker = None  # SleepTimeWorker, set via set_worker()
         #: Full 実行の直前に走らせる前処理 (任意)。未設定なら no-op。
         self._pre_full_flush = None
         self._llm_client = None  # LocalClient for Full mode
-        self._learning_scheduler = None  # LearningScheduler for Level 1/2
-        self._lora_path = None  # Path to LoRA adapter for Level 2
-        self._base_model_path = None  # Path to base model GGUF for LoRA target resolution
+        self._learning_scheduler = None  # LearningScheduler for Level 1
         self._running = False
 
     def _resolve_local_tz(self, tz_name: str) -> tzinfo:
@@ -473,14 +460,6 @@ class SleepTimeScheduler:
         """
         self._pre_full_flush = callback
 
-    def set_lora_path(self, path) -> None:
-        """Level 2 で使用する LoRA アダプタパスを設定"""
-        self._lora_path = path
-
-    def set_base_model_path(self, path) -> None:
-        """Level 2 で使用するベースモデル GGUF パスを設定（LoRA ターゲット自動判定用）"""
-        self._base_model_path = path
-
     def on_user_input(self) -> None:
         """ユーザー入力通知: 実行中のタスクをキャンセル"""
         self._last_user_input = time.time()
@@ -543,11 +522,10 @@ class SleepTimeScheduler:
                 self._full_task = None
                 logger.info("Full task cancelled by user input")
 
-        # Level 1/2 学習を協調 yield
+        # Level 1 学習を協調 yield
         # 現世代を完走させて Level1Session に進捗を残し、次回 tick で resume する
         if self._learning_scheduler is not None:
             self._learning_scheduler.cancel(graceful=True)
-        # Level 2 常駐ループは停止しない (各 tick で is_user_active を見て自律 skip)。
 
     def on_llm_start(self) -> None:
         """LLM 応答生成開始通知: Trigger A (Light) を即座に実行（§8.1）
@@ -698,8 +676,6 @@ class SleepTimeScheduler:
         self._full_task = asyncio.create_task(
             self._schedule_full()
         )
-        # Level 2 は on_response_sent では起動しない。再起動耐性のある
-        # 独立常駐ループ (start_level2_loop) が overdue/idle で発火する。
 
     def arm_tail_refresh(self) -> None:
         """tail 索引を埋める (既に走っていれば何もしない、c_16 §6.4)。
@@ -1145,8 +1121,7 @@ class SleepTimeScheduler:
                 return
 
             # Level 1 が同じ background_slot で走っている間は Full を走らせない
-            # (KV とスロットを奪い合い両方が遅くなる)。Level 2 ループと同じ
-            # ゲート。次の応答でタイマーが張り直されるのを待たず、同じ待ち時間で
+            # (KV とスロットを奪い合い両方が遅くなる)。次の応答でタイマーが張り直されるのを待たず、同じ待ち時間で
             # 自分を再スケジュールして繰り延べる (L-A5)。
             l1_running = getattr(self._learning_scheduler, "running", False)
             if isinstance(l1_running, bool) and l1_running:
@@ -1448,8 +1423,7 @@ class SleepTimeScheduler:
                 # (0) Full sleep-time が走っている間は起こさない。両者は同じ
                 # background_slot を奪い合ううえ、Level 1 の入力 (経験 /
                 # few-shot / SemMem) は Full が書き終えるまで途中の状態になる
-                # (Trigger B 側の Level 1 ゲートと対称。Level 2 ループの
-                # ``ls.running`` チェックと同じ形)。
+                # (Trigger B 側の Level 1 ゲートと対称)。
                 if self._full_running:
                     if self._level1_loop_defer_since is None:
                         self._level1_loop_defer_since = time.monotonic()
@@ -1533,113 +1507,6 @@ class SleepTimeScheduler:
             self._debug_logger,
             task_name="level1_loop",
             # 常駐ループは「停止 (cancel)」が正常終了。例外で抜けた場合は False。
-            success=cancelled_ok,
-            duration_ms=elapsed_ms,
-            extra={"cancelled": cancelled_ok},
-        )
-        trace_id_var.reset(token)
-
-    # ── Level 2 独立常駐ループ (再起動耐性) ───────
-
-    def start_level2_loop(self) -> None:
-        """Level 2 独立常駐ループを起動する (lifespan startup で一度だけ)。
-
-        旧実装は 03:00 まで ``asyncio.sleep`` するため、それ以前の再起動で
-        毎回キャンセルされ Level 2 が永遠に発火しなかった。本ループは
-        ``level2_recheck_interval_sec`` ごとに overdue (前回実行から
-        ``level2_overdue_hours`` 超過) + 非アクティブを判定して発火するため、
-        再起動を跨いでも ``_last_level2_run`` (永続化) を基準に継続する。
-        """
-        if self._level2_loop_task is not None and not self._level2_loop_task.done():
-            return
-        self._level2_loop_task = asyncio.create_task(self._schedule_level2_loop())
-        logger.info(
-            "Level 2 loop started (interval=%.0fs, overdue=%.1fh)",
-            self.level2_recheck_interval_sec, self.level2_overdue_hours,
-        )
-
-    async def stop_level2_loop(self) -> None:
-        """Level 2 常駐ループを停止する (lifespan shutdown 用)"""
-        if self._level2_loop_task is None or self._level2_loop_task.done():
-            return
-        self._level2_loop_task.cancel()
-        try:
-            await self._level2_loop_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        self._level2_loop_task = None
-        logger.info("Level 2 loop stopped")
-
-    async def _schedule_level2_loop(self) -> None:
-        """常駐ループ。overdue + 非アクティブで Level 2 をトリガーする。
-
-        bg_task wrapper として最外殻に trace_id を発行し、ループ停止 (cancel)
-        時に outcome.jsonl へ結末記録する。
-        """
-        token = trace_id_var.set(generate_trace_id())
-        t_start = time.monotonic()
-        cancelled_ok = False
-        while True:
-            try:
-                await asyncio.sleep(self.level2_recheck_interval_sec)
-
-                ls = self._learning_scheduler
-                if ls is None:
-                    continue
-
-                if self.is_user_active():
-                    continue
-                # ここは「overdue でないなら check をまるごと省く」ための
-                # **安価な事前チェック** に徹する。実際に起動するかは
-                # check_level2 → Level2Runner.check_and_run が決め、クールダウンも
-                # そこで掛かる (単一述語 LearningScheduler.is_level2_overdue)。
-                if not ls.is_level2_overdue("base"):
-                    continue
-
-                if getattr(ls, "running", False):
-                    # 学習継続中。次 tick で再評価する。
-                    continue
-
-                # Level 2 の発火判定 (get_failures) と eval_core 追記は
-                # ``signals.user_correction`` を読む。記録時は候補どまりなので、
-                # 判定より前に検証を通す (2026-09-08 監査 F-03)。
-                # ``check_level2`` は同期なのでここが唯一の await 可能点。
-                try:
-                    await ls.verify_correction_candidates(self._llm_client)
-                except Exception as e:
-                    logger.warning("Correction verification failed: %s", e)
-
-                triggered = False
-                try:
-                    triggered = bool(ls.check_level2(
-                        is_user_active=self.is_user_active(),
-                        lora_path=self._lora_path,
-                        base_model_path=self._base_model_path,
-                    ))
-                except Exception as e:
-                    logger.error("Level 2 check failed: %s", e, exc_info=True)
-                if triggered:
-                    logger.info("Level 2 LoRA tuning triggered (overdue loop)")
-                    _emit_bg_task_outcome(
-                        self._debug_logger,
-                        task_name="level2_schedule",
-                        success=True,
-                        duration_ms=0.0,
-                        extra={"triggered": True},
-                    )
-
-            except asyncio.CancelledError:
-                logger.info("Level 2 loop cancelled")
-                cancelled_ok = True
-                break
-            except Exception as e:
-                logger.error("Level 2 loop iteration failed: %s", e, exc_info=True)
-                # ループ自体は継続 (次 interval で再評価)
-
-        elapsed_ms = (time.monotonic() - t_start) * 1000
-        _emit_bg_task_outcome(
-            self._debug_logger,
-            task_name="level2_loop",
             success=cancelled_ok,
             duration_ms=elapsed_ms,
             extra={"cancelled": cancelled_ok},

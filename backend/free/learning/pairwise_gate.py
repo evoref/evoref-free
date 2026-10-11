@@ -35,6 +35,26 @@ def noise_floor(canary: Mapping[str, int]) -> int:
     return abs(net_wins(canary))
 
 
+def guard_tally(
+    outcomes: Mapping[str, int],
+    guard_ids: frozenset[str],
+    second: Mapping[str, int] | None = None,
+) -> tuple[int, int]:
+    """標本の勝敗のうち回帰台帳の guard の ``(合格, 不合格)`` (f_04 §6.5)。
+
+    不合格 = 候補が現行に負けた guard (2 回引いたときはどちらかの引きで負けたもの)。
+    測れなかった guard は数えない。
+    """
+    passed = failed = 0
+    for case_id in guard_ids:
+        if case_id not in outcomes:
+            continue
+        lost = outcomes[case_id] < 0 or (second is not None and second.get(case_id, 0) < 0)
+        failed += int(lost)
+        passed += int(not lost)
+    return passed, failed
+
+
 def pairwise_verdict(net: int, noise: int, min_net_wins: int) -> str:
     """純勝ちが ``min_net_wins`` 以上 **かつ** 雑音フロアを超えれば ``PAIRWISE_NET_WINS``。"""
     if net >= min_net_wins and net > noise:

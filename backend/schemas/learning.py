@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from backend.config_normalize import reject_retired_keys
+
 
 class ScheduleConfig(BaseModel):
     """スケジューラの tz 設定
@@ -84,6 +86,63 @@ class LearningPolicyConfig(BaseModel):
     evolve_writeback: Literal["yaml", "semmem"] = "yaml"
 
 
+class GrowthRegressionConfig(BaseModel):
+    """Level 2 (成長) の回帰台帳 (f_04 §6.2 / §6.4 / §6.5)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_cases: int = Field(default=200, ge=1)
+    """台帳の件数上限 (同梱の種ケースは数えない)。超えたら retired → quarantined → active の順に古い行から消す"""
+
+    max_guard_cases: int = Field(default=12, ge=0)
+    """採用ゲートの標本に足す guard の上限 (同じモード)"""
+
+    max_cases_per_tick: int = Field(default=6, ge=1)
+    """Level 1 の 1 tick で再生するケースの上限"""
+
+    guard_min_pass_streak: int = Field(default=2, ge=1)
+    """guard とみなす連続合格の回数"""
+
+    use_seed: bool = True
+    """同梱の種ケース (ガード専用) を読むか"""
+
+
+class GrowthHarvestConfig(BaseModel):
+    """sleep-time Step 13.6 の収穫源 (f_04 §6.3)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    consistency: bool = True
+    """会話の整合性検査 (``conversation_consistency``) の検出を収穫するか"""
+
+
+class GrowthRecallKeysConfig(BaseModel):
+    """段 3: episodic 想起の鍵 (f_04 §6.9、条件付き・未実装)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+
+class GrowthConfig(BaseModel):
+    """Level 2 (成長) — 回帰台帳・提案キュー・成長の台帳 (f_04 §6.7)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    """``false`` で収穫・再生・提案を止める (sleep-time の結果辞書には 0 を返す)"""
+
+    auto_adopt: bool = False
+    """既定は提案のみ。``true`` でも f_04 §6.6 の条件を満たすまで自動採用は効かない"""
+
+    min_guards_for_auto: int = Field(default=3, ge=0)
+    max_pending_proposals: int = Field(default=20, ge=1)
+    proposal_ttl_days: int = Field(default=14, ge=1)
+    regression: GrowthRegressionConfig = Field(default_factory=GrowthRegressionConfig)
+    harvest: GrowthHarvestConfig = Field(default_factory=GrowthHarvestConfig)
+    recall_keys: GrowthRecallKeysConfig = Field(default_factory=GrowthRecallKeysConfig)
+
+
 class LearningConfig(BaseModel):
     """学習サイクル設定"""
 
@@ -92,15 +151,8 @@ class LearningConfig(BaseModel):
     # base モデルの自己学習データは常に ``store/learning/<model_key>/`` で
     # パーティション化する (c_05 §0.5.12)。flat に戻すキー
     # (``partition_by_base_model``) は G1 で撤去した (:meth:`_reject_flat_layout`)。
-    # Level 2 アダプタ (Pro の LoRA / control vector、store/pro/learning/) の
-    # パーティション粒度。
-    # "model_mode" (既定): (model×mode) で分け、chat/create で別々に訓練・保存し、
-    #   モード切替時に当てるアダプタが変われば該当サーバを再起動して切り替える。
-    #   同一モデルを両モードで使う構成でも chat 用 / create 用は混ざらない。
-    # "model": モデル単位 (両モードの経験を 1 アダプタにプール、置き場は
-    #   ``<model_key>/chat/``)。chat↔create 切替でアダプタ差分による再起動を
-    #   しないため、切替レイテンシを最優先したい場合のレガシー互換値。
-    level2_adapter_partition: Literal["model", "model_mode"] = "model_mode"
+    # Pro Level 2 (LoRA / control vector / SPSA / CMA-ES) のキーは config v2 で
+    # 撤去した (:meth:`_reject_retired_level2`、f_04 §6.7)。
 
     #: Level 1 の起動に要る経験数。前回実行以降の **新規** 件数にも同じ値が
     #: 掛かる (``LearningScheduler.has_enough_new_experiences``)。
@@ -114,17 +166,6 @@ class LearningConfig(BaseModel):
     #: 側にあるので、変異生成は少数で足りる。
     level1_generations: int = Field(default=5, ge=1)
     level1_population_size: int = Field(default=5, ge=1)
-    #: 実測の失敗率は chat 16/120 = 13% / create 5/41 = 12% (2026-09-21、
-    #: 失敗プールを共有の欠陥表へ寄せた後)。50 件は約 400 ターンを要し、
-    #: 初期状態からの実機テストでは到達しない。
-    level2_min_failures: int = Field(default=25, ge=1)
-    # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures に
-    # フォールバックする。create は経験が溜まりにくく (2026-07-26 実測: chat 180 件に対し
-    # create 2 件)、chat と同じ閾値では「chat が回るたびに create も無駄に評価される」か
-    # 「create が永久に発火しない」のどちらかになるため、モード別に持てるようにする。
-    level2_min_failures_by_mode: dict[Literal["chat", "create"], int] = Field(
-        default_factory=dict,
-    )
     # アイドル判定タイマー
     full_idle_minutes: int = Field(default=10, ge=1)        # Trigger B: Full sleep-time
     # Trigger B: アイドルを待ち続ける上限 (分)。会話が途切れないと毎ターン
@@ -136,74 +177,6 @@ class LearningConfig(BaseModel):
     level1_recheck_interval_sec: int = Field(default=60, ge=1)  # Level 1 ループ再評価間隔
     priority_threshold_ratio: float = Field(default=0.5, ge=0.0, le=1.0)  # 優先 Level 1 の経験数閾値緩和率
     active_minutes: int = Field(default=5, ge=1)
-    level2_spsa_iterations: int = Field(default=500, ge=1)
-    level2_sparse_params: int = Field(default=200, ge=1)
-    level2_schedule_hour: int = Field(default=3, ge=0, le=23)  # 優先窓のヒント (強制 sleep ではない)
-    # Level 2 常駐ループ (再起動耐性): 03:00 固定 sleep を廃し overdue/idle 判定で発火
-    level2_recheck_interval_sec: int = Field(default=300, ge=10)
-    level2_overdue_hours: float = Field(default=24.0, ge=0.0)
-    # 連続で改善版を採用できなかった回数がこの値に達した target は
-    # level2_stale_backoff_hours の延長クールダウンへ落ちる。1 サイクルが実推論で
-    # 1 時間規模になりうるため、探索が局所最適に張り付いた状態で 24h 間隔を
-    # 回し続けないための天井 (採用に成功したらストリークは 0 へ戻る)。
-    level2_stale_streak: int = Field(default=2, ge=1)
-    level2_stale_backoff_hours: float = Field(default=72.0, ge=0.0)
-    # 採用に必要な最小改善幅 (baseline_loss に対する相対比)。実推論 eval は
-    # 決定論なので微小差も実差だが、少数の held-out ケースに対する 0.0x% の
-    # 改善は汎化ではなく過適合で、LoRA の版だけが増える。既定 0.1%。
-    level2_min_improvement_ratio: float = Field(default=0.001, ge=0.0, le=1.0)
-    # 採用に必要な改善幅の下限を、反復間の loss 標準偏差 × この値でも重ねる
-    # (比率と併用、大きい方が効く)。best は多数のノイズ標本の最小値で選択
-    # バイアスを持ち、3 件評価では 0.1% の比率をノイズが軽々と越える
-    # (2026-09-05 実機: 差分 0.17% に対し反復レンジ 1.2%)。0 で無効。
-    level2_min_improvement_sigma: float = Field(default=1.0, ge=0.0)
-    # SPSA の best が更新されないまま連続でこの反復数を超えたら打ち切る (0 で無効)。
-    # 実推論 eval 経路のみ有効 (1 反復 = 候補サーバ 2 起動)。
-    level2_early_stop_patience: int = Field(default=10, ge=0)
-    # 候補評価用の使い捨て llama-server に --no-warmup を付ける。1 サイクルで
-    # 数十回起動するため空回しのウォームアップが積み上がる。旧 llama.cpp で
-    # フラグ非対応の場合のみ false にする。
-    level2_eval_no_warmup: bool = True
-    # Level 2 初回 full-train (bootstrap): 既存 LoRA が無いとき初期アダプタを生成して
-    # パイプラインを起動可能にする。llama.cpp の LoRA GGUF 形式を生成するため、実
-    # llama-server へのロード検証が済むまで既定 False (誤った形式は server 起動を妨げる)。
-    level2_bootstrap_enabled: bool = False
-    level2_bootstrap_rank: int = Field(default=8, ge=1, le=256)
-    level2_bootstrap_init_sigma: float = Field(default=1e-4, ge=0.0)
-    #: 初回 bootstrap は本学習よりさらに低く置く (13% の失敗率で約 60 ターン)。
-    level2_bootstrap_min_failures: int = Field(default=8, ge=1)
-    # Level 2 base=C: ベースモデルの自己進化を control vector (残差ストリーム操舵) で行う。
-    # llama-cvector-generator (forward-only) で生成し、llama-server --control-vector-scaled
-    # で次回起動時に適用する。'cvector' 指定が enable (Pro 限定)。既定 'lora' の SPSA 改良は
-    # no-op (対称摂動で勾配 0) のためトリガ段階で skip され Level 2 base は何も起動しない
-    # (#3a)。base の実学習は 'cvector' または 'spsa-real-eval' で有効化する
-    # (実 llama-server ロード検証後)。
-    # 'spsa-real-eval': CandidateEvalHarness を
-    # base 用に配線し、候補 LoRA を ephemeral llama-server (base モデル + scratch port) に
-    # 実ロードして eval_core.json ケースで実推論評価する。-ngl は本番と同じだが、起動前に
-    # 空き VRAM / RAM を見て、収まらなければ CPU 推論 (-ngl 0) かスキップへ倒す
-    # (c_16 §7.2.3)。CPU 配置では base モデルサイズ次第で 1 サイクルが長時間化しうる。
-    level2_base_method: Literal["lora", "cvector", "spsa-real-eval"] = "lora"
-    # base=spsa-real-eval 実推論 eval 有効時の SPSA 反復数
-    # (1 反復で候補サーバを複数回起動するためコスト天井として低く設定)。
-    base_realeval_spsa_iterations: int = Field(default=30, ge=1)
-    base_eval_scratch_port: int = Field(default=8091, ge=1024, le=65535)
-    base_eval_loss_w1: float = Field(default=0.7, ge=0.0, le=1.0)  # keyword/pattern 一致項
-    base_eval_loss_w2: float = Field(default=0.3, ge=0.0, le=1.0)  # mean neg-logprob 項
-    base_eval_max_tokens: int = Field(default=64, ge=1)
-    base_eval_max_cases: int = Field(default=20, ge=1)
-    base_eval_health_timeout: int = Field(default=120, ge=10)
-    cvector_method: Literal["pca", "mean"] = "pca"
-    cvector_pca_batch: int = Field(default=100, ge=1)
-    cvector_pca_iter: int = Field(default=1000, ge=1)
-    # 空 = arch の block_count から全層自動。"START END" / "START,END" 指定可。
-    cvector_layer_range: str = ""
-    # --control-vector-scaled FNAME:SCALE。実測 (2026-10-06、4B) で 1.0 は応答が反復で崩壊し、
-    # 0.3 から崩れ始めた。採用前の応答の健全性確認 (cvector/health.py) もこの値で行う。
-    cvector_scale: float = Field(default=0.2)
-    # キュレーション種ペア JSON のパス (空 = 組込デフォルト軸)。HYBRID 対照例の種。
-    cvector_seed_pairs_file: str = ""
-    cvector_min_experiences: int = Field(default=40, ge=1)  # HYBRID 対照例の最小数
     # パターン検出キーワード学習
     pattern_max_patterns: int = Field(default=200, ge=10, le=1000)
     pattern_initial_weight: float = Field(default=0.5, ge=0.1, le=1.0)
@@ -237,16 +210,6 @@ class LearningConfig(BaseModel):
     fewshot_stale_after_days: int = Field(default=30, ge=1)
     # 有害判定の最小使用回数 (harmful 率がプール平均の 2 倍超で退避)。
     fewshot_harmful_min_uses: int = Field(default=10, ge=1)
-    # Level 2 補助タスク
-    # Level 2 最適化器切替
-    # "spsa" は Free 版にも実装あり (`backend/free/optimizer/spsa.py`)。
-    # "full-cma-es" は Pro 版で `cma` パッケージ利用 (`backend/pro/cma_es_full.py`)。
-    # `cma` 未インストール時は Level2Runner が SPSA に自動フォールバックする。
-    optimizer: Literal["spsa", "full-cma-es"] = "spsa"
-    # CMA-ES 初期ステップサイズ（探索範囲の標準偏差）
-    cma_sigma0: float = Field(default=0.1, gt=0.0)
-    # CMA-ES 1 世代あたりの個体数 (0 = 自動: 4 + floor(3 * ln(N)))
-    cma_popsize: int = Field(default=0, ge=0)
     # トークン予算進化
     budget_generations: int = Field(default=5, ge=1)
     budget_sigma: float = Field(default=0.05, ge=0.0, le=1.0)
@@ -256,6 +219,8 @@ class LearningConfig(BaseModel):
     feedback_pipe: FeedbackPipeConfig = Field(default_factory=FeedbackPipeConfig)
     # ポリシー / 進化結果書き戻し設定
     policy: LearningPolicyConfig = Field(default_factory=LearningPolicyConfig)
+    # Level 2 (成長) (f_04 §6.7)
+    growth: GrowthConfig = Field(default_factory=GrowthConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -274,4 +239,16 @@ class LearningConfig(BaseModel):
                     "always partitioned by model_key (docs/c_05 §0.5.12). "
                     "Remove the key from config.yaml.",
                 )
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_level2(cls, data: object) -> object:
+        """撤去した Pro Level 2 のキーを拒否する (``extra="allow"`` を素通りさせない)。
+
+        設定したのに効かない状態を作らない。``evoref config normalize`` が
+        config.yaml を退避してから落とす (f_04 §6.7)。
+        """
+        if isinstance(data, dict):
+            reject_retired_keys("learning", data)
         return data

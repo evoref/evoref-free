@@ -918,6 +918,40 @@ class SystemPromptManager:
         self._drop_frozen()
         logger.info("Manual update: mode=%s, version=%d", mode, meta.version)
 
+    def _prepare_evolved(self, mode: str, content: str) -> str | None:
+        """``update_evolved`` が書く本文 (正規化後に現行と同一なら ``None``)。"""
+        # 名前プレフィックスが進化結果に混入していても本文へ焼き込まない (防御)。
+        # プレフィックスはランタイムで get_prompt() が付与する唯一の供給源。
+        content = _strip_name_prefix(content)
+
+        # 保護セクション最終ゲート
+        current = self.contents.get(mode, "")
+
+        # 段落レベル重複を最終正規化（同一段落の二重追加を防ぐ）
+        content = dedupe_paragraphs(content)
+
+        if not validate_protected_sections(current, content):
+            logger.warning(
+                "Evolved prompt for %s lost protected sections, force-restoring", mode,
+            )
+            content = restore_protected_sections(current, content)
+            # 復元後に重複が生じる可能性があるので再正規化
+            content = dedupe_paragraphs(content)
+
+        if _normalized_equal(current, content):
+            return None
+        return content
+
+    def evolved_differs(self, mode: str, content: str) -> bool:
+        """``update_evolved`` が版を上げる候補か (正規化後に現行と違うか)。何も書かない。
+
+        Level 2 (成長) の提案は ``update_evolved`` を呼ばずに積むので、採用できない
+        (現行と同一の) 候補を提案にしないためにここで先に見る (f_04 §6.6)。
+        """
+        if mode not in self.MODES:
+            raise ValueError(f"Unknown mode: {mode}")
+        return self._prepare_evolved(mode, content) is not None
+
     def update_evolved(
         self,
         mode: str,
@@ -946,32 +980,16 @@ class SystemPromptManager:
         if mode not in self.MODES:
             raise ValueError(f"Unknown mode: {mode}")
 
-        # 名前プレフィックスが進化結果に混入していても本文へ焼き込まない (防御)。
-        # プレフィックスはランタイムで get_prompt() が付与する唯一の供給源。
-        content = _strip_name_prefix(content)
-
-        # 保護セクション最終ゲート
-        current = self.contents.get(mode, "")
-
-        # 段落レベル重複を最終正規化（同一段落の二重追加を防ぐ）
-        content = dedupe_paragraphs(content)
-
-        if not validate_protected_sections(current, content):
-            logger.warning(
-                "Evolved prompt for %s lost protected sections, force-restoring", mode,
-            )
-            content = restore_protected_sections(current, content)
-            # 復元後に重複が生じる可能性があるので再正規化
-            content = dedupe_paragraphs(content)
-
+        prepared = self._prepare_evolved(mode, content)
         # 内容の意味的同一性ガード - 正規化後に変化がなければ採用しない
-        if _normalized_equal(current, content):
+        if prepared is None:
             logger.warning(
                 "Evolved prompt for %s is semantically identical to current "
                 "(fitness=%.3f), skipping update to avoid no-op version bump",
                 mode, fitness,
             )
             return False
+        content = prepared
 
         self._archive_current(mode)
         self._adopt_content(mode, content)

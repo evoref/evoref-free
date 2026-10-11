@@ -12,13 +12,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-
-class EvalCaseInfo(BaseModel):
-    id: str
-    mode: str
-    query: str
-    weight: float = 1.0
-    description: str = ""
+from backend.free.api.learning._growth_schemas import GrowthSummaryModel
 
 
 class ExperienceByModeModel(BaseModel):
@@ -57,6 +51,11 @@ class Level1ResultEntry(BaseModel):
     sample_ties: int | None = None
     #: 失敗の証拠があったのに評価ケースにしなかった件数 (除外理由 → 件数)。
     excluded: dict[str, int] | None = None
+    #: 標本に足した回帰台帳の guard の合否 (f_04 §6.5)。
+    guards_passed: int | None = None
+    guards_failed: int | None = None
+    #: ゲートを通ったが自動採用が効かず提案にした回の提案 ID (``reason == "proposed"``、f_04 §6.6)。
+    proposal_id: str | None = None
 
 
 class PolicyEvolverDomainStatus(BaseModel):
@@ -98,60 +97,13 @@ class ActiveSessionInfo(BaseModel):
     experience_count: int = 0
 
 
-class Level2TargetStatus(BaseModel):
-    """Level 2 の状態 + 発火条件（Pro）"""
-    method: str = ""
-    bootstrap_enabled: bool = False
-    adapter_exists: bool = False
-    version: int = 0
-    # 蓄積中の発火データ数 (失敗数)
-    experiences_current: int = 0  # 失敗数 (総経験数ではない)
-    experiences_total: int = 0
-    bootstrap_min: int = 0
-    spsa_min: int = 0
-    cvector_min: int = 0
-    # 発火しない理由コード ("" = 発火可能)。表示ラベル化はフロント側 i18n が行う。
-    # 例: noop_base_lora / bootstrap_disabled /
-    #     insufficient_data / components_missing
-    block_reason: str = ""
-
-
-class Level2GatesModel(BaseModel):
-    """Level 2 自動発火の共通タイミングゲート（Pro）"""
-    active_minutes: float = 5.0
-    overdue_hours: float = 24.0
-    recheck_interval_sec: float = 300.0
-    #: target ごとの **実効** クールダウン時間 (h)。連続無改善が
-    #: ``stale_streak`` に達した target は延長クールダウンへ落ちるため、
-    #: 素の ``overdue_hours`` とは一致しないことがある。
-    cooldown_hours: dict[str, float] = Field(default_factory=dict)
-    #: target ごとの連続無改善回数 (採用成功で 0 に戻る)。
-    no_improve_streak: dict[str, int] = Field(default_factory=dict)
-    #: 延長クールダウンへ落ちる連続無改善回数の閾値。
-    stale_streak: int = 2
-    #: target ごとの「クールダウンを過ぎているか」。データ充足
-    #: (``block_reason == ""``) と AND を取って初めて「発火可」になる。
-    #: 実行側と同じ単一述語 (``is_level2_overdue``) 由来。
-    overdue: dict[str, bool] = Field(default_factory=dict)
-    #: target ごとの前回実行からの経過秒。未実行は ``None``。
-    seconds_since_run: dict[str, float | None] = Field(default_factory=dict)
-
-
-class Level2StatusModel(BaseModel):
-    """Level 2 (LoRA) の状態（Pro のみ非 None）"""
-    running_target: str | None = None
-    next_target: str = "base"
-    base: Level2TargetStatus = Field(default_factory=Level2TargetStatus)
-    gates: Level2GatesModel = Field(default_factory=Level2GatesModel)
-
-
 class SchedulerStatusModel(BaseModel):
     """学習スケジューラの状態"""
     running: bool = False
     # --no-learning (自己学習 OFF) で起動中かどうか。GUI/CLI が学習無効状態を
     # 観測できるように surface する (scheduler.get_status の is_disabled を伝播)。
     is_disabled: bool = False
-    #: ``llama.slots < 2`` で Level 1 / Level 2 を止めているか (f_04 §10.1 #15)。
+    #: ``llama.slots < 2`` で Level 1 を止めているか (f_04 §10.1 #15)。
     single_slot: bool = False
     experience_count: int = 0
     new_experience_count: int = 0
@@ -182,11 +134,6 @@ class SchedulerStatusModel(BaseModel):
     #: 延期が始まった時刻 (ISO 8601 UTC)。延期していなければ None。
     deferred_since: str | None = None
     last_level1_run: str | None = None
-    last_level2_run: str | None = None
-    # 実行中の Level 2 対象 ("base"/None)
-    running_target: str | None = None
-    # Level 2 (LoRA) の状態 + 発火条件（Pro のみ非 None）
-    level2: Level2StatusModel | None = None
     # Level 0 詳細
     last_level0_record: str | None = None
     experience_by_mode: ExperienceByModeModel = Field(
@@ -219,14 +166,11 @@ class SchedulerStatusModel(BaseModel):
     # 優先キューと SUSPENDED session
     priority_queue: list[PriorityRequestEntry] = Field(default_factory=list)
     active_session: ActiveSessionInfo | None = None
+    #: Level 2 (成長) の要約 (自動採用の有効性・未決の提案数・guard / pressure 件数、f_04 §6.8)。
+    growth: GrowthSummaryModel | None = None
 
 
 class LearningStatusResponse(BaseModel):
-    lora_version: int
-    lora_adapter_exists: bool
-    eval_cases_count: int
-    eval_pass_threshold: float
-    eval_cases: list[EvalCaseInfo] = Field(default_factory=list)
     scheduler_status: SchedulerStatusModel = Field(default_factory=SchedulerStatusModel)
 
 
@@ -241,16 +185,6 @@ class TriggerResponse(BaseModel):
     message: str
     queued: bool = False
     queue_length: int = 0
-
-
-class ImprovementPoint(BaseModel):
-    version: int
-    eval_score: float
-    created_at: str
-
-
-class ImprovementCurveResponse(BaseModel):
-    lora_scores: list[ImprovementPoint] = Field(default_factory=list)
 
 
 class TurnFeedbackRequest(BaseModel):

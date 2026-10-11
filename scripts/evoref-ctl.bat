@@ -104,7 +104,7 @@ if exist ".venv\Scripts\python.exe" (
     set "VENV_UVICORN=uvicorn"
 )
 
-rem An old config.yaml without config_version is rewritten once before start
+rem An old config.yaml (no or outdated config_version) is rewritten once before start
 rem (backup config.yaml.g0-<stamp>). Refused while another evoref holds the lock.
 "%VENV_PYTHON%" -m backend.free.cli.main config normalize --if-needed
 if errorlevel 1 (
@@ -132,8 +132,7 @@ rem Not a console / any failure is ignored (it stays pending and the GUI asks).
 "%VENV_PYTHON%" -m backend.free.cli.main tune --startup-check
 
 echo [start] Starting llama-server (base + embedding + rerank if enabled)...
-rem The launcher adds the trained adapters (--lora / --control-vector, Pro only)
-rem and runs scripts\launch_llama.py, which never resolves adapters itself.
+rem The launcher runs scripts\launch_llama.py with the same arguments.
 set SPAWN_CMD="%VENV_PYTHON%" -m backend.free.cli.llama_launcher config.yaml --all
 call :spawn
 

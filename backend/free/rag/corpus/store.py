@@ -100,6 +100,7 @@ from backend.free.rag.corpus.language import (
     validate_language_install,
 )
 from backend.free.rag.corpus.pseudo_queries import PSEUDO_QUERIES_DIR, PseudoQueryIndex
+from backend.free.rag.corpus.signature import SignatureVerdict, verify_installing_package
 from backend.free.rag.corpus.templates import (
     TEMPLATES_FORMAT_ID,
     TEMPLATES_FORMAT_VERSION,
@@ -559,6 +560,8 @@ class InstallResult:
     errors: list[str] = field(default_factory=list)
     #: 同じ (id, 版) が同じ内容で既に active だったので何もしなかった (c_16 §4.3)。
     already_installed: bool = False
+    #: 外から持ち込んだパッケージの署名検証の結果 (検証器が無い / internal なら ``None``)。
+    signature: SignatureVerdict | None = None
 
 
 class CorpusInstallCancelled(Exception):
@@ -1417,15 +1420,21 @@ class CorpusStore:
 
         write_package_meta(directory, meta)
 
-        if contents.prebuilt is not None and not internal:
-            # 署名が無いので、同梱の埋め込み・scales・重心が docs と対応している保証が無い
-            # (敵対的なベクトルで全クエリに当たるよう細工できる)。外から持ち込んだ
-            # パッケージは docs/ から手元で作り直す (docs/c_06 §1.5 / c_16 §4.3)。
-            logger.info("Ignoring prebuilt embeddings of external package %s", meta.id)
+        signature = None if internal else verify_installing_package(directory, meta)
+        adopt_prebuilt = internal or (signature is not None and signature.adopt_prebuilt)
+        if contents.prebuilt is not None and not adopt_prebuilt:
+            # 検証済みの署名が無いので、同梱の埋め込み・scales・重心が docs と対応している
+            # 保証が無い (敵対的なベクトルで全クエリに当たるよう細工できる)。外から持ち込んだ
+            # パッケージは docs/ から手元で作り直す (docs/c_06 §1.5 / c_16 §4.3 / p_06)。
+            logger.info(
+                "Ignoring prebuilt embeddings of external package %s (signature: %s)",
+                meta.id, "no verifier" if signature is None else signature.status,
+            )
         result = await self._build_version(
-            directory, meta, contents.prebuilt if internal else None,
+            directory, meta, contents.prebuilt if adopt_prebuilt else None,
             progress_cb=progress_cb, cancel_check=cancel_check,
         )
+        result.signature = signature
 
         previous = self.manifest.active.get(meta.id)
         self.manifest.active[meta.id] = meta.version

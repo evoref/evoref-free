@@ -73,11 +73,6 @@ def run_serve_checks(
     if not skip_llama_check:
         results.append(_check_llama_connection(config))
 
-    # 5. [WARNING] LoRA アダプタの存在確認 (Pro のみ)
-    lora_result = _check_lora_adapter(project_root, config)
-    if lora_result is not None:
-        results.append(lora_result)
-
     # 6. [INFO] ベクトルインデックスの存在確認
     results.append(_check_vector_index(project_root, config))
 
@@ -267,32 +262,6 @@ def _check_llama_connection(config: dict) -> CheckResult:
         name="llama.cpp",
         message=msg("cli.startup_llama_unreachable", host=host, port=port),
         code=E1001,
-    )
-
-
-def _check_lora_adapter(project_root: Path, config: dict) -> CheckResult | None:
-    """起動時に当てる LoRA があるか (Pro のみ。Free はアダプタを持たないので ``None``)。"""
-    from backend.edition import get_pro_handler
-    from backend.free.core.launch_adapters import HANDLER_NAME, adapters_for_launch
-
-    adapters = adapters_for_launch(config, project_root, "chat")
-    if get_pro_handler(HANDLER_NAME) is None:  # 取得口の登録は上の呼出しで済む
-        return None
-    if adapters.lora is None:
-        logger.info("No usable LoRA adapter (starting without LoRA)")
-        return CheckResult(
-            level=CheckLevel.WARNING,
-            status=CheckStatus.WARN,
-            name="LoRA adapter",
-            message=msg("cli.startup_lora_missing"),
-        )
-
-    logger.debug("LoRA adapter found: %s", adapters.lora)
-    return CheckResult(
-        level=CheckLevel.WARNING,
-        status=CheckStatus.OK,
-        name="LoRA adapter",
-        message=msg("cli.startup_lora_ok"),
     )
 
 

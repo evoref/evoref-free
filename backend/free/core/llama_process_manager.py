@@ -103,22 +103,7 @@ def _compose_cmd(component: str, cfg: dict, project_root: Path) -> list[str] | N
     mod = _load_launch_module(project_root)
 
     if component == "base":
-        # 学習済みアダプタ (Pro) はモード切替経路 (backend.free.api.config.mode)
-        # と同じ取得口から、現在のモードの分を当てる (Free では無し)。
-        from backend.config import get_path_resolver
-        from backend.free.core.launch_adapters import adapters_for_launch
-
-        try:
-            mode = get_path_resolver().active_mode
-        except RuntimeError:
-            # config 未ロード (単体テスト等)。起動時の既定モードへ倒す。
-            mode = "chat"
-        adapters = adapters_for_launch(cfg, project_root, mode)
-        return mod.build_llama_cmd(
-            cfg, project_root,
-            lora_override=adapters.lora,
-            control_vector_override=adapters.control_vector,
-        )
+        return mod.build_llama_cmd(cfg, project_root)
     if component == "embedding":
         return mod.build_embed_cmd(cfg, project_root)
     if component == "rerank":

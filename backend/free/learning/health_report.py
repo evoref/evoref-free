@@ -68,6 +68,37 @@ def _is_burst(stamps: list[datetime]) -> bool:
     return False
 
 
+def _window_days(
+    stamped: list[tuple[datetime, dict]], now: datetime,
+) -> dict[str, list[tuple[datetime, dict]]]:
+    """直近 ``NATURAL_USE_DAYS`` 日の窓のターンを UTC の日 (``YYYY-MM-DD``) ごとに分ける。"""
+    window_start = now - timedelta(days=NATURAL_USE_DAYS)
+    by_day: dict[str, list[tuple[datetime, dict]]] = {}
+    for ts, rec in stamped:
+        if ts >= window_start:
+            by_day.setdefault(ts.date().isoformat(), []).append((ts, rec))
+    return by_day
+
+
+def _day_kind(turns: list[tuple[datetime, dict]]) -> str:
+    """1 日のターンを ``burst`` / ``natural`` / ``sparse`` (ターン数が足りない) に分ける。"""
+    if _is_burst([ts for ts, _ in turns]):
+        return "burst"
+    return "natural" if len(turns) >= MIN_TURNS_PER_ACTIVE_DAY else "sparse"
+
+
+def natural_day_keys(stamped: list[tuple[datetime, dict]], now: datetime) -> set[str]:
+    """直近 ``NATURAL_USE_DAYS`` 日の窓の自然な利用日 (UTC の ``YYYY-MM-DD``) の集合。
+
+    ``natural_days`` と同じ規則 (:func:`_natural_use`)。信号を自然な利用日のターンだけで
+    数える他の報告 (``scripts/growth_signal_report.py`` の取りこぼしラベル) が共有する。
+    """
+    return {
+        day for day, turns in _window_days(stamped, now).items()
+        if _day_kind(turns) == "natural"
+    }
+
+
 def _natural_use(stamped: list[tuple[datetime, dict]], now: datetime) -> dict[str, Any]:
     """直近 ``NATURAL_USE_DAYS`` 日の窓の自然な利用日と、その日のターンだけの信号の件数。
 
@@ -75,17 +106,14 @@ def _natural_use(stamped: list[tuple[datetime, dict]], now: datetime) -> dict[st
     監査・試験は欠陥を狙って失敗を膨らませるので、失敗・検証済み訂正も自然な利用日のターン
     だけで数える。
     """
-    window_start = now - timedelta(days=NATURAL_USE_DAYS)
-    by_day: dict[str, list[tuple[datetime, dict]]] = {}
-    for ts, rec in stamped:
-        if ts >= window_start:
-            by_day.setdefault(ts.date().isoformat(), []).append((ts, rec))
+    by_day = _window_days(stamped, now)
     natural_days = burst_days = failures = corrections = 0
     for turns in by_day.values():
-        if _is_burst([ts for ts, _ in turns]):
+        kind = _day_kind(turns)
+        if kind == "burst":
             burst_days += 1
             continue
-        if len(turns) < MIN_TURNS_PER_ACTIVE_DAY:
+        if kind != "natural":
             continue
         natural_days += 1
         for _ts, rec in turns:
@@ -101,6 +129,21 @@ def _natural_use(stamped: list[tuple[datetime, dict]], now: datetime) -> dict[st
         "natural_failures": failures,
         "natural_corrections": corrections,
     }
+
+
+def stamp_records(
+    records_by_partition: dict[str, list[dict]], *, since: datetime | None = None,
+) -> list[tuple[datetime, dict]]:
+    """全パーティションの経験を ``(時刻, 記録)`` の時刻順にする (時刻の読めない記録は落とす)。"""
+    stamped: list[tuple[datetime, dict]] = []
+    for recs in records_by_partition.values():
+        for rec in recs:
+            ts = parse_utc(rec.get("timestamp"))
+            if ts is None or (since is not None and ts < since):
+                continue
+            stamped.append((ts, rec))
+    stamped.sort(key=lambda x: x[0])
+    return stamped
 
 
 def _unlearned_partitions(
@@ -132,14 +175,7 @@ def summarize(
     ``unlearned_partitions`` に件数を出す。
     """
     now = now or utc_now_dt()
-    stamped: list[tuple[datetime, dict]] = []
-    for recs in records_by_partition.values():
-        for rec in recs:
-            ts = parse_utc(rec.get("timestamp"))
-            if ts is None or (since is not None and ts < since):
-                continue
-            stamped.append((ts, rec))
-    stamped.sort(key=lambda x: x[0])
+    stamped = stamp_records(records_by_partition, since=since)
 
     outcomes: Counter[str] = Counter()
     failed_reasons: Counter[str] = Counter()

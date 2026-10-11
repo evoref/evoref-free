@@ -30,6 +30,9 @@ DECLARING_MODULES: tuple[str, ...] = (
     "backend.free.learning.exploration_controller",
     "backend.free.learning.fewshot_pool",
     "backend.free.learning.generation_delta_store",
+    "backend.free.learning.growth.ledger",
+    "backend.free.learning.growth.proposals",
+    "backend.free.learning.growth.regression",
     "backend.free.learning.learning_state_store",
     "backend.free.learning.level0_instant",
     "backend.free.learning.level1_session",
@@ -74,10 +77,20 @@ DECLARING_MODULES: tuple[str, ...] = (
 #: Pro の形式を宣言するモジュール (``register_pro_format``)。Pro が同梱されている
 #: ときだけ読む (Free 単独の配布物には無い)。
 PRO_DECLARING_MODULES: tuple[str, ...] = (
+    "backend.pro.airgap.history",
+    "backend.pro.airgap.manifest",
+    "backend.pro.audit.ledger",
+    "backend.pro.audit.model_digests",
     "backend.pro.cartridge_creator",
-    "backend.pro.eval_core_manager",
-    "backend.pro.learning.level2_trainer",
-    "backend.pro.version_manager",
+    "backend.pro.model_fit.store",
+    "backend.pro.org_policy.applied",
+    "backend.pro.org_policy.bundle",
+    "backend.pro.org_policy.inbox",
+    "backend.pro.org_policy.pack",
+    "backend.pro.retired_learning",
+    "backend.pro.signed_cartridges.trust_store",
+    "backend.pro.team_hub.publish_list",
+    "backend.pro.team_hub.subscription",
 )
 
 
@@ -104,6 +117,7 @@ def freeze_fixtures() -> list[Any]:
 
     データ根は台帳の完全性テストと同じ実際の書き手で作る (開発用。配布物には無い)。
     """
+    from backend.data_root import generation_root
     from backend.tests.golden_fixtures import freeze, frozen_formats
     from backend.tests.test_ledger_completeness import build_data_root
 
@@ -116,7 +130,8 @@ def freeze_fixtures() -> list[Any]:
         pass
     else:
         specs += frozen_formats("pro")
-    return freeze(specs, lambda tmp: build_data_root(tmp, write_pro=write_pro))
+    # fixture は世代フォルダからの相対 (``v1/store/...``) で凍結する (``files_of`` は世代フォルダを歩く)
+    return freeze(specs, lambda tmp: generation_root(build_data_root(tmp, write_pro=write_pro)))
 
 
 def main(argv: list[str] | None = None) -> int:

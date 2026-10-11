@@ -51,7 +51,6 @@ if TYPE_CHECKING:
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.rerank_llamacpp import RerankClient
     from backend.free.rag.rerank_selftest import RerankStatus
-    from backend.pro.learn_components import ProLearnComponents
 
 
 @dataclass
@@ -120,7 +119,7 @@ class LoopPillar:
 class LearnPillar:
     """EvorefLearn pillar — 学習サイクル / 最適化 (最上流)。
 
-    :class:`LearningScheduler` は Level 0.5 〜 Level 2 (Pro) の実行主体。
+    :class:`LearningScheduler` は Level 0.5 〜 Level 1 の実行主体。
     """
 
     scheduler: "LearningScheduler"
@@ -145,13 +144,11 @@ class ProGenPillar:
 
 @dataclass
 class ProLearnPillar:
-    """Pro 版 EvorefLearn 拡張。
+    """Pro 版 EvorefLearn 拡張のマーカー。
 
-    Attributes:
-        components: :class:`LearnComponentsProtocol` 準拠の集約コンポーネント。
+    Pro Level 2 (LoRA) の撤去 (2026-10-10) で保持するコンポーネントは無くなった。
+    Pro が ``learn`` の pillar setup フックを登録したときだけ作られる (f_04 §6.11)。
     """
-
-    components: "ProLearnComponents | None" = None
 
 
 @dataclass

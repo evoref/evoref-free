@@ -12,7 +12,7 @@ Level 1 採用ゲートの唯一の評価ケースになった (15 分のプロ�
   責任を負わない。チャット応答パスの軽い用途 (数値の保留 / few-shot 除外) は
   ここを見る。前ターンへの遡及 false_negative は検証の後
   (:func:`reconcile_false_negatives`) で付け外しする。
-- **消費前** = 検証 (本モジュール)。Level 1 / Level 2 が読み始める前に、
+- **消費前** = 検証 (本モジュール)。Level 1 が読み始める前に、
   (直前アシスタント応答, 訂正発話) の組を補助タスク (``correction_verify``、
   ``background_slot``) へ渡して帰属を判定し、``assistant`` のものだけを
   ``signals.user_correction`` へ昇格させる。

@@ -109,8 +109,6 @@ def _print_migrate_result(data: dict) -> None:
     ))
     print(f"{'=' * 50}")
 
-    print(f"\n  LoRA: {data['lora_action']}")
-
     summary = data.get("data_summary", {})
     print(f"\n  {msg('cli.migrate_model_data_kept')}:")
     print(f"    {msg('cli.migrate_model_memory_notes')}: {summary.get('memory_notes', 0)}")

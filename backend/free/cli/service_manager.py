@@ -139,7 +139,7 @@ def _build_serve_parser() -> argparse.ArgumentParser:
         "--no-learning", action="store_true",
         help=(
             "Disable self-learning cycle (Level 0 experience record / "
-            "Level 1 prompt evolution / Level 2 LoRA / Pro learn injection). "
+            "Level 1 prompt evolution / Pro learn pillar setup). "
             "All side-effecting writes become no-op; reads continue. "
             "Useful with --develop=evolve to observe initial behavior."
         ),
@@ -647,22 +647,12 @@ def _load_config(project_root: Path) -> dict:
 
 
 def _build_llama_cmd(project_root: Path, cfg: dict | None = None) -> list[str]:
-    """config.yaml から llama-server 起動コマンドを構築
-
-    学習済みアダプタ (Pro) は ``adapters_for_launch`` から得る (起動時モードは
-    既定の "chat"、Free では無し)。
-    """
-    from backend.free.core.launch_adapters import adapters_for_launch
+    """config.yaml から llama-server 起動コマンドを構築"""
     from scripts.launch_llama import build_llama_cmd
 
     if cfg is None:
         cfg = _load_config(project_root)
-    adapters = adapters_for_launch(cfg, project_root, "chat")
-    return build_llama_cmd(
-        cfg, project_root,
-        lora_override=adapters.lora,
-        control_vector_override=adapters.control_vector,
-    )
+    return build_llama_cmd(cfg, project_root)
 
 
 # ────────────────────────────────────────────

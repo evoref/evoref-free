@@ -26,9 +26,6 @@ from backend.free.api.learning._learning_schemas import (
     ExperienceByModeModel,
     FitnessPoint,
     Level1ResultEntry,
-    Level2GatesModel,
-    Level2StatusModel,
-    Level2TargetStatus,
     PolicyEvolverDomainStatus,
     PriorityRequestEntry,
 )
@@ -44,25 +41,6 @@ def ts_to_iso(ts: float | None) -> str | None:
     `None` / 0 以下の値は `None` を返す。
     """
     return epoch_to_utc(ts)
-
-
-def latest_level2_run(raw_last_level2_run: object) -> float:
-    """target 別 dict (``{"base": ts}``) から最新の実行時刻を取る。
-
-    ``LearningScheduler.get_status()`` の ``last_level2_run`` は 2026-07-18 の
-    修正で単一 float から target 別 dict へ変わった。API 層はまだ単一の
-    「最終 Level 2 実行時刻」表示のままなので、target 別の最大値に潰して返す
-    (旧フォーマットの単一 float / 未設定値との後方互換も保つ)。
-    """
-    if isinstance(raw_last_level2_run, dict):
-        values = [v for v in raw_last_level2_run.values() if isinstance(v, (int, float))]
-        return max(values) if values else 0.0
-    if isinstance(raw_last_level2_run, (int, float)):
-        return float(raw_last_level2_run)
-    return 0.0
-
-
-# ── Level 1 結果マッピング ────────────────────────────────────
 
 
 def map_level1_results(raw_l1: dict | None) -> dict[str, Level1ResultEntry]:
@@ -113,6 +91,9 @@ def map_level1_results(raw_l1: dict | None) -> dict[str, Level1ResultEntry]:
             sample_losses=val.get("sample_losses"),
             sample_ties=val.get("sample_ties"),
             excluded=val.get("excluded") or None,
+            guards_passed=val.get("guards_passed"),
+            guards_failed=val.get("guards_failed"),
+            proposal_id=val.get("proposal_id"),
         )
     return result
 
@@ -161,74 +142,6 @@ def map_policy_evolver_status(
             last_evolved_at=val.get("last_evolved_at"),
         )
     return result
-
-
-# ── Pro: Level 2 状態マッピング ────────────────
-
-
-def _map_level2_target(raw: object) -> Level2TargetStatus:
-    """raw target dict を `Level2TargetStatus` に変換する純粋関数。"""
-    if not isinstance(raw, dict):
-        return Level2TargetStatus()
-    return Level2TargetStatus(
-        method=str(raw.get("method", "")),
-        bootstrap_enabled=bool(raw.get("bootstrap_enabled", False)),
-        adapter_exists=bool(raw.get("adapter_exists", False)),
-        version=int(raw.get("version", 0) or 0),
-        experiences_current=int(raw.get("experiences_current", 0) or 0),
-        experiences_total=int(raw.get("experiences_total", 0) or 0),
-        bootstrap_min=int(raw.get("bootstrap_min", 0) or 0),
-        spsa_min=int(raw.get("spsa_min", 0) or 0),
-        cvector_min=int(raw.get("cvector_min", 0) or 0),
-        block_reason=str(raw.get("block_reason", "") or ""),
-    )
-
-
-def map_level2_status(raw: object | None) -> Level2StatusModel | None:
-    """raw `level2` dict を `Level2StatusModel` に変換する純粋関数。
-
-    `raw` が dict でない場合 (Free / Level2Runner 未注入) は `None`。
-    Pro/Free 判定は呼び出し側ではなく raw の有無で吸収する。
-    """
-    if not isinstance(raw, dict):
-        return None
-    raw_gates = raw.get("gates", {})
-    if isinstance(raw_gates, dict):
-        gates = Level2GatesModel(
-            active_minutes=float(raw_gates.get("active_minutes", 5.0) or 5.0),
-            overdue_hours=float(raw_gates.get("overdue_hours", 24.0) or 24.0),
-            recheck_interval_sec=float(
-                raw_gates.get("recheck_interval_sec", 300.0) or 300.0,
-            ),
-            cooldown_hours={
-                str(k): float(v)
-                for k, v in (raw_gates.get("cooldown_hours") or {}).items()
-            },
-            no_improve_streak={
-                str(k): int(v)
-                for k, v in (raw_gates.get("no_improve_streak") or {}).items()
-            },
-            stale_streak=int(raw_gates.get("stale_streak", 2) or 2),
-            overdue={
-                str(k): bool(v)
-                for k, v in (raw_gates.get("overdue") or {}).items()
-            },
-            seconds_since_run={
-                str(k): (None if v is None else float(v))
-                for k, v in (raw_gates.get("seconds_since_run") or {}).items()
-            },
-        )
-    else:
-        gates = Level2GatesModel()
-    return Level2StatusModel(
-        running_target=raw.get("running_target"),
-        next_target=str(raw.get("next_target", "base")),
-        base=_map_level2_target(raw.get("base")),
-        gates=gates,
-    )
-
-
-# ── Fitness 履歴マッピング ──────────────────────────────────────────────
 
 
 def map_fitness_history(

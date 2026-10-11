@@ -52,8 +52,8 @@ EMBEDDING_CACHE_META_FORMAT = register_format(FormatSpec(
 def _cache_key(text: str, model_name: str, identity: str = "") -> str:
     """テキスト + モデル名 (+ バックエンド識別) の SHA-256 ハッシュ（16文字）
 
-    ``identity`` はドキュメント側のベクトルを変える設定 (``doc_template`` /
-    LoRA 等) を表す文字列。空なら従来どおり ``model_name:text`` で、既存
+    ``identity`` はドキュメント側のベクトルを変える設定 (``doc_template`` 等)
+    を表す文字列。空なら従来どおり ``model_name:text`` で、既存
     エントリと互換。非空なら鍵に混ぜ、テンプレートを替えた後に旧ベクトルが
     ヒットし続ける (同じ本文 → 別ベクトルのはずが旧値を返す) のを防ぐ。
     """
@@ -345,9 +345,6 @@ class CachedEmbeddingBackend:
 
     def backend_type(self) -> str:
         return self._inner.backend_type()
-
-    def supports_lora(self) -> bool:
-        return self._inner.supports_lora()
 
     def supports_instructions(self) -> bool:
         return self._inner.supports_instructions()

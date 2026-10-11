@@ -14,7 +14,6 @@ from pydantic import BaseModel
 from backend.app_state import AppState, get_app_state
 from backend.error_handlers import ErrorResponse
 from backend.free.api.content._cartridge_serializers import (
-    attach_lora_impact,
     cartridge_detail_dict,
     cartridge_install_response,
     cartridge_rebuild_response,
@@ -210,9 +209,7 @@ async def unload_cartridge(cartridge_id: str, state: AppState = Depends(get_app_
     mgr = _get_manager(state)
     try:
         info = mgr.unload(cartridge_id)
-        result: dict = {"id": info.id, "status": "installed"}
-        # LoRA 影響度情報を付与（CartridgeChangeHandler が登録済みの場合）
-        return attach_lora_impact(result, state.cartridge_change_handler)
+        return {"id": info.id, "status": "installed"}
     except KeyError:
         raise _cartridge_error(
             404, "E0504", f"Cartridge '{cartridge_id}' not found",
@@ -263,9 +260,7 @@ async def delete_cartridge(cartridge_id: str, state: AppState = Depends(get_app_
             i18n_key="api.cartridge_not_found_id", cartridge_id=cartridge_id,
         )
 
-    result: dict = {"id": cartridge_id, "status": "uninstalled"}
-    # LoRA 影響度情報を付与
-    return attach_lora_impact(result, state.cartridge_change_handler)
+    return {"id": cartridge_id, "status": "uninstalled"}
 
 
 # ---------------------------------------------------------------------------

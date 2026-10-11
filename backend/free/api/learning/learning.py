@@ -5,17 +5,14 @@ import time
 from fastapi import APIRouter, Depends
 
 from backend.app_state import AppState, get_app_state
-from backend.edition import get_pro_handler, is_pro
 from backend.free.api._error_responses import api_error
 from backend.i18n_helper import msg
 from backend.free.api.learning._learning_collectors import (
     extract_executed_phases,
-    latest_level2_run,
     map_active_session,
     map_experience_by_mode,
     map_fitness_history,
     map_level1_results,
-    map_level2_status,
     map_policy_evolver_status,
     map_priority_queue,
     ts_to_iso,
@@ -23,13 +20,11 @@ from backend.free.api.learning._learning_collectors import (
 
 # Pydantic スキーマは _learning_schemas に集約
 # 外部 import 互換性のため re-export する。
+from backend.free.api.learning._growth_schemas import GrowthSummaryModel
 from backend.free.api.learning._learning_schemas import (
     ActiveSessionInfo,
-    EvalCaseInfo,
     ExperienceByModeModel,
     FitnessPoint,
-    ImprovementCurveResponse,
-    ImprovementPoint,
     LearningStatusResponse,
     Level1ResultEntry,
     PolicyEvolverDomainStatus,
@@ -51,11 +46,8 @@ __all__ = [
     "router",
     # 互換性のため re-export (テストや外部から import される)
     "ActiveSessionInfo",
-    "EvalCaseInfo",
     "ExperienceByModeModel",
     "FitnessPoint",
-    "ImprovementCurveResponse",
-    "ImprovementPoint",
     "LearningStatusResponse",
     "Level1ResultEntry",
     "PolicyEvolverDomainStatus",
@@ -161,54 +153,36 @@ async def trigger_learning(req: TriggerRequest, state: AppState = Depends(get_ap
     )
 
 
-@router.get("/improvement-curve", response_model=ImprovementCurveResponse)
-async def improvement_curve():
-    """改善カーブ用データを返す（LoRA バージョン別 eval_score 推移）
-
-    base (`lora_scores`) の 1 系列。
-    Pro 機能: Free 版では両方空配列を返す。
-    """
-    logger.debug("GET /api/learning/improvement-curve")
-
-    LoRAVersionManager = get_pro_handler("lora_version_manager")
-    pro_path = get_pro_handler("pro_learning_path")
-    if not is_pro() or LoRAVersionManager is None or pro_path is None:
-        return ImprovementCurveResponse()
-
-    # base は Pro の (モデル×モード) パーティション配下。
-    vmgr = LoRAVersionManager(pro_path("lora_versions_dir"), pro_path("lora_adapter"))
-    return ImprovementCurveResponse(
-        lora_scores=[
-            ImprovementPoint(
-                version=v.version,
-                eval_score=v.eval_score,
-                created_at=v.created_at,
-            )
-            for v in vmgr.list_versions()
-        ],
-    )
-
-
 @router.get("/status", response_model=LearningStatusResponse)
 async def learning_status(state: AppState = Depends(get_app_state)):
-    """学習状態と最新評価情報を取得
-
-    Mixed: LoRA/EvalCore 情報は Pro 時のみ返す。Free ではデフォルト値。
-    """
+    """学習スケジューラの状態を取得"""
     logger.debug("GET /api/learning/status")
 
-    pro_info = _get_pro_learning_info()
     sched_status = _build_scheduler_status(state.learning_scheduler)
     _annotate_level1_gate(sched_status, state.sleep_scheduler)
+    sched_status.growth = await _growth_summary(state.learning_scheduler)
 
-    return LearningStatusResponse(
-        lora_version=pro_info["lora_version"],
-        lora_adapter_exists=pro_info["lora_adapter_exists"],
-        eval_cases_count=pro_info["eval_cases_count"],
-        eval_pass_threshold=pro_info["eval_pass_threshold"],
-        eval_cases=pro_info["eval_cases"],
-        scheduler_status=sched_status,
-    )
+    return LearningStatusResponse(scheduler_status=sched_status)
+
+
+async def _growth_summary(scheduler: object | None) -> GrowthSummaryModel | None:
+    """Level 2 (成長) の要約。読めなければ ``None`` (``/api/learning/status`` を落とさない)。"""
+    growth = getattr(scheduler, "growth", None) if scheduler is not None else None
+    if growth is None:
+        return None
+    import asyncio
+
+    from backend.trace_context import run_in_executor_with_context
+
+    try:
+        # 自動採用の設定が真なら健康診断 (経験の全走査、5 分メモ化) を引くので executor で回す
+        summary = await run_in_executor_with_context(
+            asyncio.get_running_loop(), None, growth.summary,
+        )
+        return GrowthSummaryModel(**summary)
+    except Exception as exc:  # noqa: BLE001 - 観測の失敗で status を落とさない
+        logger.debug("growth summary unavailable: %r", exc)
+        return None
 
 
 def _annotate_level1_gate(
@@ -278,48 +252,6 @@ def _annotate_level1_gate(
         status.level1_blocked_reason = "waiting_for_idle"
 
 
-def _get_pro_learning_info() -> dict:
-    """Pro 固有の LoRA バージョン・Eval 情報を取得する。Free ではデフォルト値を返す。"""
-    result: dict = {
-        "lora_version": 0,
-        "lora_adapter_exists": False,
-        "eval_cases_count": 0,
-        "eval_pass_threshold": 0.0,
-        "eval_cases": [],
-    }
-
-    LoRAVersionManager = get_pro_handler("lora_version_manager")
-    EvalCoreManager = get_pro_handler("eval_core_manager")
-    pro_path = get_pro_handler("pro_learning_path")
-    if (
-        not is_pro() or LoRAVersionManager is None or EvalCoreManager is None
-        or pro_path is None
-    ):
-        return result
-
-    # 学習済みアダプタは Pro の (モデル×モード) パーティション配下にある。
-    # Level 2 が実際に書き出した版と同じ場所を見ないと、同じ応答の中の
-    # level2.base.version と食い違う (実機で version=0/exists=false vs v4)。
-    adapter_path = pro_path("lora_adapter")
-    vmgr = LoRAVersionManager(pro_path("lora_versions_dir"), adapter_path)
-    result["lora_version"] = vmgr.get_latest_version()
-    result["lora_adapter_exists"] = adapter_path.exists()
-
-    emgr = EvalCoreManager(pro_path("eval_core_file"))
-    eval_set = emgr.load()
-    result["eval_cases_count"] = len(eval_set.cases)
-    result["eval_pass_threshold"] = eval_set.pass_threshold
-    result["eval_cases"] = [
-        EvalCaseInfo(
-            id=c.id, mode=c.mode, query=c.query,
-            weight=c.weight, description=c.description,
-        )
-        for c in eval_set.cases
-    ]
-
-    return result
-
-
 def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
     """スケジューラの raw ステータスを SchedulerStatusModel に変換する。
 
@@ -354,9 +286,6 @@ def _build_scheduler_status(scheduler: object | None) -> SchedulerStatusModel:
         min_experiences=raw.get("min_experiences", 0),
         conditions_met=raw.get("conditions_met", False),
         last_level1_run=ts_to_iso(raw.get("last_level1_run", 0.0)),
-        last_level2_run=ts_to_iso(latest_level2_run(raw.get("last_level2_run", 0.0))),
-        running_target=raw.get("running_target"),
-        level2=map_level2_status(raw.get("level2")),
         # Level 0 詳細
         last_level0_record=raw.get("last_level0_record"),
         experience_by_mode=map_experience_by_mode(raw.get("experience_by_mode")),

@@ -115,6 +115,27 @@ def _sleep_exclusive(state: AppState) -> AbstractAsyncContextManager[None]:
     return scheduler.exclusive() if scheduler is not None else nullcontext()
 
 
+async def _reject_unallowed_model(model_path: str) -> None:
+    """組織ポリシーパックのモデル許可リストに無い GGUF へは切り替えない (docs/p_09 §4)。
+
+    判定器 (Pro) は GGUF 全体の SHA-256 を読むので executor で回す。登録が無ければ何もしない。
+    """
+    from backend.free.core.org_policy import TARGET_MODEL, policy_denial
+    from backend.trace_context import run_in_executor_with_context
+
+    path = Path(model_path)
+    if not path.is_absolute():
+        path = get_project_root() / path
+    denial = await run_in_executor_with_context(
+        asyncio.get_running_loop(), None,
+        lambda: policy_denial(TARGET_MODEL, path=str(path)),
+    )
+    if denial is not None:
+        from backend.free.api._error_responses import api_error
+
+        raise api_error(403, "E0403", denial.detail, "api.policy_denied", **denial.context())
+
+
 @router.post("/migrate", response_model=MigrateResponse)
 async def migrate_model(req: MigrateRequest, state: AppState = Depends(get_app_state)):
     """ベースモデル移行を実行（§22.8.1）"""
@@ -128,6 +149,7 @@ async def migrate_model(req: MigrateRequest, state: AppState = Depends(get_app_s
         MigrationError,
     )
 
+    await _reject_unallowed_model(req.new_model_path)
     try:
         migrator = _get_migrator(state)
         # 再生成印はエピソード記憶への書き込み (Light のスレッドと重ねない)。
@@ -146,7 +168,6 @@ async def migrate_model(req: MigrateRequest, state: AppState = Depends(get_app_s
         dry_run=result.dry_run,
         old_model=result.old_model,
         new_model=result.new_model,
-        lora_action=result.lora_action,
         data_summary=MigrateDataSummary(**result.data_summary),
         calibration=None,
         recommendations=result.recommendations,
@@ -334,7 +355,6 @@ async def migrate_component(
         dry_run=result.dry_run,
         old_model=result.old_model,
         new_model=result.new_model,
-        lora_action=result.lora_action,
         restarted=restarted,
         recommendations=recommendations,
     )

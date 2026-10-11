@@ -934,10 +934,6 @@ async def _learn_status(state: SessionState, console) -> CommandResult:
                 f"  {msg('cli.ls_conditions_met')}{sched.get('conditions_met', '?')}",
                 f"  {msg('cli.ls_running')}{sched.get('running', '?')}",
                 f"  {msg('cli.ls_last_level1')}{_fmt_time(sched.get('last_level1_run'))}",
-                f"  {msg('cli.ls_last_level2')}{_fmt_time(sched.get('last_level2_run'))}",
-                f"  {msg('cli.ls_lora_version')}{data.get('lora_version', '?')}",
-                f"  {msg('cli.ls_lora_adapter')}{data.get('lora_adapter_exists', '?')}",
-                f"  {msg('cli.ls_eval_cases')}{data.get('eval_cases_count', '?')}",
             ]
             render_info(console, "\n".join(lines))
     except (httpx.HTTPStatusError, httpx.ConnectError) as e:

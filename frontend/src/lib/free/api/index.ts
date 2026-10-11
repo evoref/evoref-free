@@ -25,5 +25,6 @@ export * from './history';
 export * from './model';
 export * from './develop';
 export * from './fewshot';
+export * from './growth';
 export * from './memory';
 export * from './createRuns';

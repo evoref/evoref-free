@@ -415,7 +415,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
     parser.add_argument(
         "--include-pro", action="store_true",
-        help="Also delete store/pro/ (Pro learning data such as LoRA adapters)",
+        help="Also delete store/pro/ (Pro data such as created packages and retired learning data)",
     )
     parser.add_argument(
         "--learning", action="store_true",

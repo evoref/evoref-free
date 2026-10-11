@@ -1,7 +1,7 @@
 """
 
 ラルフループ が SemMem に書く ``progress_marker`` / ``failure_pattern`` /
-``artifact`` を **Level 1 / Level 2 tick** の冒頭で走査し、以下の 3
+``artifact`` を **Level 1 tick** の冒頭で走査し、以下の 3
 経路で学習サイクル (FewShotPool / CritiqueSynthesizer / PolicyParamEvolver)
 へ自動還流する。
 

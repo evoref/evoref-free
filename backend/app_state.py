@@ -64,7 +64,6 @@ if TYPE_CHECKING:
         ProState,
     )
     from backend.pro.api.widgets import WidgetProxyManager
-    from backend.pro.learning.cartridge_change_handler import CartridgeChangeHandler
 
 SESSION_TTL_SEC = 3600  # 異常終了セッションの自動クリーンアップ: 1時間
 
@@ -224,7 +223,7 @@ class AppState:
     # 自己学習サイクルの無効化フラグ (SSOT)。CLI フラグ `--no-learning`
     # で起動時に True になり、``EVOREF_LEARNING_DISABLED=1`` 環境変数で
     # サブプロセスへ伝播する。True の場合、LearningScheduler tick /
-    # Level 1 独立ループ / Level 2 runner 注入 / Pro 学習コンポーネント注入 /
+    # Level 1 独立ループ / Pro learn pillar setup /
     # SleepTimeWorker 学習関連書戻し / FeedbackCollector.record が
     # すべて no-op となり、SemMem の読み込みやチャット応答は通常通り。
     learning_disabled: bool = False
@@ -246,7 +245,6 @@ class AppState:
 
     # ── Pro ──
     widget_proxy_manager: WidgetProxyManager | None = None
-    cartridge_change_handler: CartridgeChangeHandler | None = None
 
     # ── 4 pillar エントリポイント ──
     # wire_pillars() が依存順 (Gen → Mem → Loop → Learn) に構築して格納する。

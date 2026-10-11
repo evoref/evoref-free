@@ -85,28 +85,10 @@ export interface CartridgeRebuildResult {
 	embedder_used: string;
 }
 
-/** unload / delete の応答に付く LoRA 影響評価 (Pro で CartridgeChangeHandler が登録済みのときだけ)
- *
- * Free ではバックエンドが `lora_impact` を付けないので常に未定義。
- */
-export interface CartridgeLoraImpact {
-	cartridge_id: string;
-	/** LoRA が当該カートリッジ由来の学習を含み、古くなる場合 true */
-	has_impact: boolean;
-	/** 'none' / 'base_rollback_to_v<N>' (自動ロールバック済み) */
-	action_taken: string;
-	/** 学習中のため自動ロールバックを見送ったときの理由 */
-	rollback_skipped?: string;
-	/** 自動ロールバックに失敗したとき true */
-	rollback_failed?: boolean;
-	priority_learning_triggered?: boolean;
-}
-
 /** unload / delete の応答 */
 export interface CartridgeChangeResult {
 	id: string;
 	status: string;
-	lora_impact?: CartridgeLoraImpact | null;
 }
 
 /** カートリッジ一覧取得 */

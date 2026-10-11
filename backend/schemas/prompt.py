@@ -2,7 +2,9 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from backend.config_normalize import reject_retired_keys
 
 
 class PromptConfig(BaseModel):
@@ -21,8 +23,6 @@ class PromptConfig(BaseModel):
     #: モードの context_size に対する静的 system の上限比。レンダラは超える
     #: とき priority の低い非 protected 規則から落とす (f_03 §7.1.2)。
     system_max_share: float = Field(default=0.30, ge=0.05, le=0.6)
-    #: 静的接頭辞の末尾に置く few-shot コア集合の上限 (c_02 §6.3)。
-    fewshot_core_max_tokens: int = Field(default=300, ge=0)
     #: query 依存で最後の user へ前置する few-shot の最大例数。
     fewshot_dynamic_max: int = Field(default=1, ge=0)
     #: query 依存 few-shot ブロックのトークン上限 (旧 ``_FEWSHOT_TOKEN_CAP``)。
@@ -59,6 +59,14 @@ class PromptConfig(BaseModel):
     #: 抜き出して生クエリの直後へ注記するか (f_03 §7.1.1)。``on`` のときだけ補助タスク
     #: ``answer_conditions`` を撃つ。A/B で評価するまで既定は ``off``。
     answer_conditions: Literal["off", "on"] = "off"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_keys(cls, data: object) -> object:
+        """撤去したキーを normalize の案内付きで拒否する (f_04 §10.1)。"""
+        if isinstance(data, dict):
+            reject_retired_keys("prompt", data)
+        return data
 
     @field_validator("answer_conditions", mode="before")
     @classmethod

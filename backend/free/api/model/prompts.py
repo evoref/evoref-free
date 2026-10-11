@@ -52,6 +52,19 @@ def _reject_edit_while_learning(state: AppState) -> None:
         )
 
 
+def _reject_if_pinned(*modes: str) -> None:
+    """組織ポリシーパックで固定されたモードの本文は変えさせない (docs/p_09 §4)。
+
+    判定器は Pro が登録する (``core.org_policy``)。登録が無ければ何もしない。
+    """
+    from backend.free.core.org_policy import TARGET_PROMPT, policy_denial
+
+    for mode in modes:
+        denial = policy_denial(TARGET_PROMPT, mode=mode)
+        if denial is not None:
+            raise prompt_error(403, "E0403", denial.detail, "api.policy_denied", **denial.context())
+
+
 # --- locale エンドポイント（/{mode} より前に定義して FastAPI のルート優先順位を確保） ---
 
 
@@ -66,6 +79,8 @@ async def switch_prompt_locale(
 
     if body.locale not in ("ja", "en"):
         raise unsupported_locale_error(body.locale)
+
+    _reject_if_pinned(*mgr.MODES)
 
     # 学習実行中は切替不可
     scheduler = state.learning_scheduler
@@ -151,6 +166,7 @@ async def update_prompt(mode: str, body: PromptUpdateRequest, state: AppState = 
     """プロンプト更新 (そのモードのターンが読むパーティションへ、f_04 §1.2.0)"""
     logger.debug("PUT /api/prompts/%s: content_len=%d", mode, len(body.content))
     mgr = manager_for_mode(require_prompt_manager(state), mode)
+    _reject_if_pinned(mode)
     _reject_edit_while_learning(state)
 
     try:
@@ -166,6 +182,7 @@ async def reload_prompt(mode: str, state: AppState = Depends(get_app_state)):
     """ディスクから再読込み"""
     logger.debug("POST /api/prompts/%s/reload", mode)
     mgr = manager_for_mode(require_prompt_manager(state), mode)
+    _reject_if_pinned(mode)
 
     try:
         mgr.reload(mode)
@@ -194,6 +211,7 @@ async def rollback(mode: str, body: RollbackRequest, state: AppState = Depends(g
     """過去バージョンへのロールバック"""
     logger.debug("POST /api/prompts/%s/rollback: version=%d", mode, body.version)
     mgr = manager_for_mode(require_prompt_manager(state), mode)
+    _reject_if_pinned(mode)
     _reject_edit_while_learning(state)
 
     try:

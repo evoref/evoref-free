@@ -75,6 +75,8 @@ class PathResolver:
         "agent_trace_dir": "store/agent_trace/",
         "history_dir": "store/history/",
         "learned_patterns_file": "store/learning/shared/learned_patterns.json",
+        # Level 2 (成長) の回帰台帳 (モデル非依存、f_04 §6.2)。
+        "regression_cases_file": "store/learning/shared/growth/regression_cases.jsonl",
         "themes_dir": "themes/",
         # EvorefMem トリガ辞書 (pin / fact / classify) のユーザー上書き先。
         # 同梱 default は ``backend/free/memory/_defaults/triggers/``。
@@ -142,24 +144,12 @@ class PathResolver:
         # PolicyParamEvolver の進化対象ドメイン (agent / long_form) のポリシー。
         "evolved_policies_dir": "policies",
         "generation_deltas_file": "generation_deltas.json",
+        # Level 2 (成長) の回帰ケースの役割と収穫済みの経験 (derived、f_04 §6.2)。
+        "regression_status_file": "growth/regression_status.json",
+        # Level 2 (成長) の成長の台帳と未決の提案 (sot、f_04 §6.2 / §6.6)。
+        "growth_ledger_file": "growth/ledger.jsonl",
+        "growth_proposals_dir": "growth/proposals",
     }
-
-    # Pro の学習データ (c_05 §0.4.2 所有表)。``resolve_pro_learning`` が
-    # ``<pro_dir>/learning/<model_key>/`` の下に解決する。eval_core 以外は
-    # アダプタ系で、``<model_key>/<mode>/`` の mode パーティションに置く。
-    _PRO_LEARNING_SUBPATH = {
-        # Level 1 採用ゲート / Level 2 目的関数の合格基準。auto ケースは
-        # そのモデルの訂正から作られるので base 軸で分離する (書き手は Pro)。
-        "eval_core_file": "eval_core.json",
-        "lora_adapter": "adapter.gguf",
-        "lora_versions_dir": "lora_versions",
-        "lora_spsa_checkpoint": "lora_spsa_checkpoint.json",
-        "control_vector_adapter": "control_vector.gguf",
-        "control_vector_versions_dir": "control_vector_versions",
-        "cvector_work_dir": "cvector",
-    }
-    #: ``_PRO_LEARNING_SUBPATH`` のうち mode で分けないキー。
-    _PRO_MODELESS_KEYS = frozenset({"eval_core_file"})
 
     def __init__(self, config: dict, project_root: Path, data_root: Path | None = None):
         from backend.data_root import resolve_data_root
@@ -180,10 +170,7 @@ class PathResolver:
         # embed_instruction 系データの (embedding モデル) パーティション。
         # base 学習パーティションとは独立した軸。未束縛なら ``embed_model`` から導出。
         self._active_embed_key: str | None = None
-        # Level 2 アダプタの (mode) パーティション state。レガシー "model" では
-        # resolve_pro_learning は mode 引数を無視し、chat/create が "chat" の
-        # 1 つを共有する。AppState.current_mode の初期値と揃え、active_mode の
-        # 既定は "chat"。
+        # 稼働中のモード。AppState.current_mode の初期値と揃え、既定は "chat"。
         self._active_mode: str = "chat"
         # llama-server が実際に載せているモデルのパス (``/props`` の ``model_path``) を
         # 返す関数。学習データの置き場を「その生成を返したモデル」で決める
@@ -191,11 +178,6 @@ class PathResolver:
         self._served_model_source: Callable[[], str] | None = None
         #: ``/props`` の生の文字列 → model_key (``None`` = 宣言へ倒す)。束ね直しで捨てる。
         self._served_key_cache: dict[str, str | None] = {}
-        self._adapter_partition_mode: str = str(
-            (config.get("learning", {}) or {}).get(
-                "level2_adapter_partition", "model_mode",
-            ),
-        )
 
     def resolve_model(self, key: str) -> Path:
         """モデルパス解決
@@ -349,7 +331,7 @@ class PathResolver:
 
     @property
     def active_mode(self) -> str:
-        """Level 2 アダプタパーティションの active モード (``"chat"``/``"create"``)。"""
+        """稼働中のモード (``"chat"``/``"create"``)。"""
         return self._active_mode
 
     def set_active_mode(self, mode: str | None) -> None:
@@ -364,7 +346,6 @@ class PathResolver:
         active モデルが未束縛なら ``model_paths.base_model`` から導出する
         (:attr:`active_model_key`)。``learning_dir`` は ``resolve_local`` 経由で
         データ根の下に解決する (``--isolate-data`` は別のデータ根になる)。
-        Pro の学習データは :meth:`resolve_pro_learning`。
         """
         if key not in self._LEARNING_SUBPATH:
             return self.resolve_local(key)
@@ -379,32 +360,6 @@ class PathResolver:
         if key not in self._LEARNING_SUBPATH:
             return self.resolve_local(key)
         return self.resolve_local("learning_dir") / model_key / self._LEARNING_SUBPATH[key]
-
-    def resolve_pro_learning(self, key: str, mode: str | None = None) -> Path:
-        """Pro の学習データのパスを ``<pro_dir>/learning/<model_key>/`` の下に解決する。
-
-        ``eval_core_file`` は active モデルの ``<model_key>/`` 直下。アダプタ系
-        (LoRA / control vector / SPSA checkpoint / cvector 作業場) は
-        ``<model_key>/<mode>/`` で、``<model_key>`` は **そのモードが実際に
-        ロードするモデル** (アダプタは特定モデルの重みへの差分なので、「どの
-        モデル向けか」が保存先の第一キー)。create が別モデル (``create_model``)
-        を使う構成で chat の ``base_model`` を差し替えても、create のアダプタは
-        create のモデルの下に残る。
-
-        ``mode`` 省略時は :attr:`active_mode`。レガシー
-        ``learning.level2_adapter_partition == "model"`` では mode に依らず
-        active モデルの ``chat`` を chat/create で共有する。
-        """
-        sub = self._PRO_LEARNING_SUBPATH[key]
-        if key in self._PRO_MODELESS_KEYS:
-            return self._pro_learning_root(self.active_model_key) / sub
-        if self._adapter_partition_mode != "model_mode":
-            return self._pro_learning_root(self.active_model_key) / "chat" / sub
-        effective_mode = mode if mode in ("chat", "create") else self._active_mode
-        return self._pro_learning_root(self._mode_model_key(effective_mode)) / effective_mode / sub
-
-    def _pro_learning_root(self, model_key: str) -> Path:
-        return self.resolve_local("pro_dir") / "learning" / model_key
 
     def _mode_model_key(self, mode: str) -> str:
         """``mode`` が実際にロードするモデルの ``model_key`` (宣言が無ければ active)。"""

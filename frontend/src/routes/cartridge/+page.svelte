@@ -14,8 +14,17 @@
 	const proLoaders = import.meta.glob<{ default: Component }>(
 		'/src/lib/pro/components/CartridgeCreateDialog.svelte'
 	);
+	const trustLoaders = import.meta.glob<{ default: Component }>(
+		'/src/lib/pro/components/CartridgeTrustPanel.svelte'
+	);
+	// チーム知識ハブの状態 (docs/p_10 §8)。読むだけで、操作は CLI (`evoref hub ...`)
+	const hubLoaders = import.meta.glob<{ default: Component }>(
+		'/src/lib/pro/components/TeamHubPanel.svelte'
+	);
 
 	let CartridgeCreateDialog: Component | null = $state(null);
+	let CartridgeTrustPanel: Component | null = $state(null);
+	let TeamHubPanel: Component | null = $state(null);
 	let showCreateDialog = $state(false);
 
 	onMount(async () => {
@@ -24,6 +33,14 @@
 		if (entries.length > 0) {
 			const mod = await entries[0]();
 			CartridgeCreateDialog = mod.default;
+		}
+		const trust = Object.values(trustLoaders);
+		if (trust.length > 0) {
+			CartridgeTrustPanel = (await trust[0]()).default;
+		}
+		const hub = Object.values(hubLoaders);
+		if (hub.length > 0) {
+			TeamHubPanel = (await hub[0]()).default;
 		}
 	});
 </script>
@@ -46,6 +63,14 @@
 			{/if}
 		{/snippet}
 	</CartridgeManager>
+	{#if $proActive && CartridgeTrustPanel}
+		{@const TrustPanel = CartridgeTrustPanel}
+		<TrustPanel />
+	{/if}
+	{#if $proActive && TeamHubPanel}
+		{@const HubPanel = TeamHubPanel}
+		<HubPanel />
+	{/if}
 </PageLayout>
 
 <style>

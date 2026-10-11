@@ -49,6 +49,7 @@ OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
     ("change rate contradiction", "outcome_contradiction"),
     ("declared count mismatch", "outcome_contradiction"),
     ("false tool unavailability", "outcome_contradiction"),
+    ("weekday contradiction", "outcome_contradiction"),
     ("response retracts", "outcome_contradiction"),
     ("retracted by assistant", "outcome_contradiction"),
     ("measured value contradiction", "outcome_contradiction"),

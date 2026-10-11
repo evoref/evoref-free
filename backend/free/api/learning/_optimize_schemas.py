@@ -40,31 +40,16 @@ class Level1Status(BaseModel):
     min_experiences: int
 
 
-class Level2Status(BaseModel):
-    """Level 2 (SPSA LoRA 微調整) の状態"""
-    spsa_iterations: int
-    sparse_params: int
-    min_failures: int
-    lora_adapter_exists: bool
-    # #3a: 既定 (base=lora) は no-op でトリガ段階 skip される。UI が
-    # 「設定済・待機中」と誤解しないよう、有効メソッドと実行可否を明示する。
-    base_method: str = "lora"          # lora | cvector
-    active_method: str = "none"        # cvector | spsa-real-eval | none
-    will_run: bool = False             # 実メソッドが有効か (no-op skip でないか)
-
-
 class OptimizeStatusResponse(BaseModel):
     """最適化状態レスポンス"""
     running: bool
     last_level1_run: str | None = None
-    last_level2_run: str | None = None
     level1: Level1Status
-    level2: Level2Status
 
 
 class OptimizeTriggerRequest(BaseModel):
     """最適化トリガーリクエスト"""
-    level: str  # "level1" | "level2"
+    level: str  # "level1"
     mode: str | None = None  # Level 1 対象モード (省略時は全モード)
 
 
@@ -84,16 +69,6 @@ class PromptHistoryEntry(BaseModel):
     file: str
 
 
-class LoRAHistoryEntry(BaseModel):
-    """LoRA バージョン履歴エントリ"""
-    type: str = "lora_version"
-    version: int
-    eval_score: float
-    created_at: str
-    metadata: dict = Field(default_factory=dict)
-
-
 class OptimizeHistoryResponse(BaseModel):
     """最適化履歴レスポンス"""
     prompt_history: dict[str, list[PromptHistoryEntry]] = Field(default_factory=dict)
-    lora_history: list[LoRAHistoryEntry] = Field(default_factory=list)

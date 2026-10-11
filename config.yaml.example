@@ -7,9 +7,9 @@
 # 詳細は docs/02_system_architecture.md セクション 2.3 を参照。
 # ============================================================
 
-# 設定ファイルの版 (c_05 §7.6)。版の無い旧形式 (0.0.98 以前) の config.yaml は
+# 設定ファイルの版 (c_05 §7.6)。版の無い旧形式 (0.0.98 以前) と古い版の config.yaml は
 # `evoref config normalize` が一度だけ直してこの行を付ける。
-config_version: 1
+config_version: 3
 
 # ===== 個体名称 =====
 # PC単位で動作する個体としての設定。
@@ -193,7 +193,6 @@ llama:
                                   #   中間 checkpoint が生まれず、prompt が前回の最終 user 位置より手前で分岐すると system prompt ごと全量 re-prefill。
                                   #   256 なら user ターンごとに 1 つ置かれ、分岐コストは最後に一致したターン以降の窓だけになる
   max_tokens: 2048               # チャット応答の最大トークン数（0=無制限、暴走防止に設定推奨）
-  lora_target: auto               # LoRA ターゲット自動判定: auto | "q_proj,v_proj" | "linear_proj" 等（Pro 専用）
   enable_thinking: false          # 思考トークン制御。true/false=明示（プロファイルを上書き）
                                   # 未設定/コメントアウト時は arch プロファイル (models/profiles/<arch>.yaml)
                                   # の reasoning.mode/enable_thinking で決定。
@@ -938,16 +937,9 @@ schedule:
 # ===== 学習サイクル設定 =====
 learning:
   # base モデルの自己学習データは <data_root>/store/learning/<model_key>/ に分離される（モデル切替で差し替え、未知モデルはゼロから学習）。
-  level2_adapter_partition: model_mode # LoRA / control vector (Pro)。model_mode（既定=chat/createで別アダプタ・切替時に当てるアダプタが変わればサーバ再起動）/ model（レガシー=モデル単位でchat/create共有・mode切替で再起動なし）
   level1_min_experiences: 8       # Level 1 トリガーに必要な最小経験数 (前回実行以降の新規件数にも同じ値)
   level1_generations: 5           # Level 1 の世代数 (停滞 3 世代で打ち切り。選択圧は採用ゲート側)
   level1_population_size: 5       # Level 1 の集団サイズ
-  level2_min_failures: 25         # Level 2 トリガーに必要な最小失敗数
-  # モード別の Level 2 発火閾値。未指定のモードは level2_min_failures を使う。
-  # create は経験が溜まりにくいため個別に下げる用途を想定。
-  level2_min_failures_by_mode:
-    chat: 25
-    create: 12
   # アイドル判定タイマー
   full_idle_minutes: 10           # Trigger B: sleep-time Full の起動アイドル時間（分）
   full_max_defer_minutes: 30      # Trigger B: アイドルを待つ上限（分）。会話が続くと
@@ -957,29 +949,6 @@ learning:
   level1_recheck_interval_sec: 60 # Level 1 ループ再評価間隔（秒）
   priority_threshold_ratio: 0.5   # 優先 Level 1 の経験数閾値緩和率
   active_minutes: 5               # user_active 判定閾値（分）— Level 2 中断判定
-  level2_spsa_iterations: 500     # Level 2 SPSA の反復回数
-  level2_sparse_params: 200       # Level 2 のスパースパラメータ数
-  level2_schedule_hour: 3         # Level 2 の優先窓ヒント時刻（強制ではない）
-  level2_recheck_interval_sec: 300  # Level 2 常駐ループの再評価間隔（秒、再起動耐性）
-  level2_overdue_hours: 24.0      # 前回実行からこの時間超で overdue 発火
-  level2_stale_streak: 2          # 連続でこの回数だけ改善を採用できなければ延長クールダウンへ
-  level2_stale_backoff_hours: 72.0  # 延長クールダウン時間（探索が空振りし続ける局面の天井）
-  level2_min_improvement_ratio: 0.001  # 採用に必要な最小改善幅（baseline 比。0.1%未満は過適合として棄却）
-  level2_min_improvement_sigma: 1.0  # 反復間 loss の標準偏差 × この値も改善幅の下限に重ねる (0 で無効)
-  level2_early_stop_patience: 10  # SPSA の best がこの反復数だけ停滞したら打ち切り（0 で無効、実 eval 経路のみ）
-  level2_bootstrap_enabled: false # 初回 full-train（初期 LoRA 生成）。実 llama-server ロード検証後に true 推奨
-  level2_bootstrap_rank: 8        # bootstrap LoRA の rank
-  level2_bootstrap_init_sigma: 0.0001  # lora_a 初期ガウス標準偏差（lora_b=0）
-  level2_bootstrap_min_failures: 8     # 初回 bootstrap の最小失敗数（本学習 25 より低め）
-  # Level 2 base=C: ベースモデルを control vector で操舵 (Pro 限定)。実 --control-vector ロード検証後に cvector へ
-  level2_base_method: lora             # lora（既定=base は #3a で trigger-skip、何も起動しない）/ cvector（base 実学習）
-  cvector_method: pca                  # pca / mean (llama-cvector-generator --method)
-  cvector_pca_batch: 100               # --pca-batch
-  cvector_pca_iter: 1000               # --pca-iter
-  cvector_layer_range: ""              # 空=block_count から全層自動 / "START END" 指定可
-  cvector_scale: 0.2                   # --control-vector-scaled FNAME:SCALE（1.0 は応答が崩壊しやすい。0.3 以上は要確認）
-  cvector_seed_pairs_file: ""          # キュレーション種ペア JSON（空=組込デフォルト軸）
-  cvector_min_experiences: 40          # HYBRID 対照例（種＋経験）の最小数
   # パターン検出キーワード学習
   pattern_max_patterns: 200       # 学習済みパターンの最大数
   pattern_initial_weight: 0.5     # 新規パターンの初期重み
@@ -1037,6 +1006,25 @@ learning:
     failure_pattern_lookback: 30      # 経路 2 で走査する直近 failure_pattern 件数
     failure_cluster_min_size: 3       # 経路 2 でクラスタとして扱う最小件数
     weight_semmem_success: 0.3        # 経路 3 の fitness 重み w (0.0-1.0)
+  # Level 2 (成長): 回帰台帳・提案キュー・成長の台帳 (docs/f_04 §6)。実際に起きた失敗
+  # (検証済みの訂正・👎・決定論の検証器・会話の整合性) を問いごと保存し、学習の資産を
+  # 退行から守りながら育てる。重みは触らない。
+  growth:
+    enabled: true                     # false で収穫・再生・提案を止める
+    auto_adopt: false                 # 既定は提案のみ。true でも凍結条件とガード数を満たすまで効かない
+    min_guards_for_auto: 3            # 自動採用に要るそのモードの guard の件数
+    max_pending_proposals: 20         # 未決の提案の上限 (超えたら古い順に期限切れ)
+    proposal_ttl_days: 14             # 未決の提案の期限 (日)
+    regression:
+      max_cases: 200                  # 回帰台帳の件数上限 (同梱の種ケースは数えない)
+      max_guard_cases: 12             # 採用ゲートの標本に足す guard の上限 (同じモード)
+      max_cases_per_tick: 6           # Level 1 の 1 tick で再生するケースの上限
+      guard_min_pass_streak: 2        # guard とみなす連続合格の回数
+      use_seed: true                  # 同梱の種ケース (ガード専用) を読む
+    harvest:
+      consistency: true               # 会話の整合性検査の検出を収穫する (sleep-time Step 13.6)
+    recall_keys:
+      enabled: false                  # 段 3: episodic 想起の鍵 (条件付き・未実装)
 
 # ===== ストリーミング設定 =====
 streaming:
@@ -1046,7 +1034,6 @@ streaming:
 # 予算は 1 つの関数 (core.prompt_budget.resolve_budgets) が配る。ここは各「上限」の宣言。
 prompt:
   system_max_share: 0.30           # モードの context_size に対する静的 system の上限比 (現行台帳が収まる値。刈り込み後に下げる)
-  fewshot_core_max_tokens: 300     # 静的接頭辞末尾の few-shot コア集合の上限 (キャッシュに乗る)
   fewshot_dynamic_max: 1           # query 依存 few-shot の最大例数 (最後の user へ前置)
   fewshot_dynamic_max_tokens: 600  # 同ブロックのトークン上限
   semmem_max_tokens: 800           # [関連する記憶] ブロックの上限
@@ -1313,3 +1300,21 @@ pro:
     max_claims_per_item: 8             # 1 item から抜く claim の上限
     items_keep_days: 30                # expired/retracted な取得単位を items.jsonl から落とすまでの日数 (0=消さない)
     user_agent: evoref-knowledge/1.0   # 取得時に名乗る User-Agent
+  policy:
+    # Pro 限定: 組織ポリシーパック (docs/p_09)。起動時にこのパス (ファイルか、パックを置いた
+    # ディレクトリ。NAS 可) のパックを検証し、適用中のものより新しければ適用する。
+    # 空なら自動適用しない (`evoref policy apply <pack>` で手で適用)。Free build では効果なし。
+    pack_path: ""
+  hub:
+    # Pro 限定: チーム知識ハブ (docs/p_10)。公開の印 (`evoref hub publish`) を付けた know.* の
+    # claim と文書だけを、署名付き .evocart にして共有フォルダへ書き出す / 取り込む。
+    # データ根は共有しない (NAS に置くのは配布物だけ)。Free build では効果なし。
+    name: ""                    # ハブの名前 (パッケージ id は hub-<name>。最初の書き出しで固定)
+    auto_export: false          # true で sleep-time の Full が夜間に書き出す (既定オフ)
+    export_dir: ""              # 書き出し先 (データ根の外。NAS 可)
+    signing_key_path: ""        # Ed25519 秘密鍵 (PEM) のパス。データ根の中は拒否。鍵はここに書かない
+    signer: ""                  # 署名者名 (メンバーの信頼ストアの名前と一致させる)
+    export_interval_hours: 20   # 自動書き出しの最短間隔 (時間)。中身が変わらなければ書かない
+    subscribe_dirs: []          # メンバー側: 取り込む共有フォルダ (空なら購読しない)
+    subscribe_signer: ""        # メンバー側: 受け付ける署名者名 (空なら最初に取り込んだ署名者に固定)
+    sync_interval_hours: 24     # メンバー側: 取り込みの間隔 (時間)。0 は起動後の 1 回だけ

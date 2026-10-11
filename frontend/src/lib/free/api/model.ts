@@ -28,7 +28,6 @@ export interface BaseMigrateResponse {
 	dry_run: boolean;
 	old_model: string;
 	new_model: string;
-	lora_action: string;
 	data_summary: MigrateDataSummary;
 	calibration: { eval_questions: number; baseline_ppl_avg: number } | null;
 	recommendations: string[];

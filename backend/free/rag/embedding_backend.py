@@ -123,10 +123,6 @@ class EmbeddingBackend(Protocol):
         """バックエンド種別（"llama-cpp"）"""
         ...
 
-    def supports_lora(self) -> bool:
-        """LoRA 適用可能か"""
-        ...
-
     def supports_instructions(self) -> bool:
         """検索指示プレフィックスの動的変更が可能か"""
         ...

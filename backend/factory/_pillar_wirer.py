@@ -703,7 +703,7 @@ def _init_learning_core(
     if state.cartridge_manager is not None:
         state.cartridge_manager.set_learned_patterns(learned_patterns_store)
 
-    # 経験に表示用のモデル名 (GGUF ファイル名) を刻む。Level 2 の経験の絞り込みは
+    # 経験に表示用のモデル名 (GGUF ファイル名) を刻む。経験の絞り込みは
     # FeedbackCollector が記録時に解決する model_key で行う (c_05 §0.5.7)。
     _model_paths = cfg.get("model_paths", {})
     _base_model_name = Path(_model_paths.get("base_model") or "").name
@@ -1597,69 +1597,19 @@ def _wire_sleep_scheduler_models(
     state: AppState,
     sleep_scheduler: "SleepTimeScheduler",
     learning_scheduler: "LearningScheduler",
-    resolver: Any,
 ) -> None:
-    """7g (前半). SleepTimeScheduler に LLM クライアント / モデルパスを設定"""
+    """7g (前半). SleepTimeScheduler に LLM クライアント / LearningScheduler を設定"""
     # sleep-time / Level 1 の LLM ステージはベースモデルで回す。
     # is_user_active() の協調 yield 判定は chat_in_flight()/in_flight_chat_count を
     # 持つ LLMClient ファサード (state.llm_client) 前提。生の LocalClient
     # (state.local_client) にはこの属性が無くgetattrデフォルト(0)に落ちるため、
-    # フォアグラウンド生成中でも Level1/Level2 の yield ゲートが機能しなかった
-    # (2026-07-24 実機検証で判明、staged create 実行中も Level2 real-eval が
+    # フォアグラウンド生成中でも Level 1 の yield ゲートが機能しなかった
+    # (2026-07-24 実機検証で判明、staged create 実行中も背景の学習が
     # 抑止されず本番 llama-server とリソース競合していた)。
     if state.llm_client:
         sleep_scheduler.set_llm_client(state.llm_client)
 
     sleep_scheduler.set_learning_scheduler(learning_scheduler)
-
-    base_model_path = resolver.resolve_model("base_model")
-    if base_model_path.exists():
-        sleep_scheduler.set_base_model_path(base_model_path)
-
-    # Level 2 (base) の LoRA パス / version_manager / eval_core_manager を running
-    # scheduler に後注入する (Pro 限定、未注入だと _check_and_run_base が None で
-    # 停止する)。Pro のデータ (store/pro/) のパスは Pro のハンドラから引く。
-    from backend.edition import get_pro_handler
-
-    pro_path = get_pro_handler("pro_learning_path")
-    if pro_path is None:
-        return
-    # LoRA パスは不在でも常に設定する: Level 2 初回 full-train (bootstrap) が
-    # この位置に初期アダプタを書き込むため、存在判定は trainer 側で行う。
-    # mode は明示せず resolver.active_mode (起動時既定 "chat") に委ねる。
-    lora_path = pro_path("lora_adapter")
-    sleep_scheduler.set_lora_path(lora_path)
-
-    vm_cls = get_pro_handler("lora_version_manager")
-    if vm_cls is not None:
-        try:
-            learning_scheduler.set_version_manager(
-                vm_cls(pro_path("lora_versions_dir"), lora_path),
-            )
-        except Exception as e:
-            logger.debug("Base LoRA version_manager injection skipped: %s", e)
-
-    ecm_cls = get_pro_handler("eval_core_manager")
-    if ecm_cls is not None:
-        try:
-            learning_scheduler.set_eval_core_manager(ecm_cls(pro_path("eval_core_file")))
-        except Exception as e:
-            logger.debug("eval_core_manager injection skipped: %s", e)
-
-
-def _inject_level2_runner(
-    learning_scheduler: "LearningScheduler", debug_logger: "DebugLogger",
-) -> None:
-    """7h. Level2Runner 注入（Pro）"""
-    try:
-        from backend.pro.learning.level2_trainer import Level2Runner
-        runner = Level2Runner(learning_scheduler, debug_logger=debug_logger)
-        learning_scheduler.set_level2_runner(runner)
-        logger.info("Level 2 runner injected into LearningScheduler")
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning("Level 2 runner injection failed: %s", e)
 
 
 async def _inject_learn_components(
@@ -1669,10 +1619,11 @@ async def _inject_learn_components(
     project_root: Path,
     learn_pillar: "LearnPillar",
 ) -> None:
-    """7i. Pro Learn pillar setup を呼び出し、Pro 学習コンポーネントを注入する。
+    """7i. Pro Learn pillar setup (登録されていれば) を呼び出す。
 
-    (pro_pillar_setup("learn")) に全面委譲し、本関数は pillar 構築の薄い
-    ラッパに縮退した。結果は ``state.pro.learn`` へ載せるため戻り値は持たない。
+    (pro_pillar_setup("learn")) に全面委譲する薄いラッパ。結果は ``state.pro.learn``
+    へ載せるため戻り値は持たない。Pro Level 2 (LoRA) の撤去 (2026-10-10) 以降、
+    Pro はこのフックを登録していない (f_04 §6.11)。
     """
     from backend.edition import get_pro_pillar_setup
     from backend.pillars import ProGenPillar, ProState
@@ -1713,9 +1664,6 @@ def _start_level1_loop(
         )
     sleep_scheduler.start_level1_loop()
     logger.info("Level 1 independent loop started")
-    # Level 2 も再起動耐性のある独立常駐ループで起動する (overdue/idle 発火)。
-    sleep_scheduler.start_level2_loop()
-    logger.info("Level 2 independent loop started")
     logger.info("Learning cycle initialized")
 
 
@@ -2090,7 +2038,7 @@ def _validate_model_state(
             f"/api/model/migrate) to safely align model_state.json with "
             f"config.yaml. Alternatively, revert config.yaml model_paths."
             f"base_model to '{ms.current_filename}'. Skipping migration "
-            f"risks invalidating LoRA adapters and Level 1/2 evolution "
+            f"risks invalidating Level 1 evolution "
             f"parameters learned for the previous base model."
         )
         logger.error(
@@ -2228,7 +2176,7 @@ def _auto_migrate_base_model(
 
     logger.warning(
         "Auto-migrate on startup: %s -> %s. "
-        "Restart llama-server to unload stale LoRA/model.",
+        "Restart llama-server to unload the stale model.",
         old_filename, Path(new_model_path).name,
     )
     migrator = ModelMigrator(
@@ -2246,8 +2194,8 @@ def _auto_migrate_base_model(
         dry_run=False,
     )
     logger.info(
-        "Auto-migrate on startup completed: %s -> %s (lora=%s)",
-        result.old_model, result.new_model, result.lora_action,
+        "Auto-migrate on startup completed: %s -> %s",
+        result.old_model, result.new_model,
     )
 
 
@@ -2597,6 +2545,25 @@ def _wire_fewshot_pool_to_sleep_worker(
     logger.info("FewShotPool wired to SleepTimeWorker for embedding backfill")
 
 
+def _wire_growth_harvester(
+    mem: "MemPillar", exp_buf: Any, cfg: dict[str, Any], debug_logger: Any,
+) -> None:
+    """Step 13.6「回帰台帳の収穫」の収穫器を SleepTimeWorker へ渡す (f_04 §6.3)。
+
+    SleepTimeWorker (EvorefMem) は学習側を import しないので、ここで注入する。
+    ``learning.growth.enabled=false`` は収穫器の側が 0 件で返す。
+    """
+    scheduler = getattr(mem, "sleep_scheduler", None)
+    worker = getattr(scheduler, "_worker", None) if scheduler else None
+    setter = getattr(worker, "set_growth_harvester", None)
+    if setter is None or exp_buf is None:
+        return
+    from backend.free.learning.growth.harvest import GrowthHarvester
+
+    setter(GrowthHarvester(exp_buf, cfg, debug_logger=debug_logger))
+    logger.info("Growth harvester wired to SleepTimeWorker (Step 13.6)")
+
+
 def _wire_attribute_slot_gate(
     state: AppState,
     mem: "MemPillar",
@@ -2654,8 +2621,8 @@ async def _build_learn_pillar(
     """EvorefLearn pillar を構築する (experience / scheduler / evolver / Pro 拡張)。
 
     依存: Mem (SleepTimeScheduler / SemMem view) + Gen (aux_client)。
-    Pro エディションでは ``inject_learn_components`` 経由で Level 2 ランナーと
-    ``ProLearnComponents`` が注入され、``state.pro.learn`` に集約される。
+    Pro の ``learn`` pillar setup フックが登録されていれば呼び、結果を
+    ``state.pro.learn`` に集約する (Pro Level 2 の撤去以降は未登録、f_04 §6.11)。
 
     Returns:
         (learn_pillar, experience_file_path, learned_patterns_file_path)
@@ -2679,8 +2646,8 @@ async def _build_learn_pillar(
     # SleepTimeWorker を Mem の sleep_scheduler に注入 (Mem + Learn が連携するため
     # Learn フェーズで wire する — SleepTimeWorker 構築には Learn の exp_buf /
     # learned_patterns_store / aux_prompt_mgr が必要)
-    # --no-learning 時は SleepTimeWorker / Level1 loop / Level2 runner /
-    # Pro 学習コンポーネント注入をスキップする (LearningScheduler 本体は構築維持)
+    # --no-learning 時は Level1 loop / Pro learn pillar setup を
+    # スキップする (LearningScheduler 本体は構築維持)
     learning_disabled = state.learning_disabled
     # SleepTimeWorker は --no-learning でも構築する (記憶の書き手は sleep-time
     # だけなので、飛ばすと記憶抽出 / ノート化 / snapshot まで止まる)。学習に
@@ -2707,8 +2674,9 @@ async def _build_learn_pillar(
     # 同じ契約)。
     if not learning_disabled:
         _wire_fewshot_pool_to_sleep_worker(learning_scheduler, mem)
+        _wire_growth_harvester(mem, exp_buf, cfg, debug_logger)
     else:
-        logger.info("FewShotPool wiring skipped (learning disabled)")
+        logger.info("FewShotPool / growth harvester wiring skipped (learning disabled)")
 
     # 属性スロットの補完ゲートは --no-learning でも配線する (記憶側の判定で
     # あって学習ではない。SleepTimeWorker を構築するのと同じ理由)。
@@ -2813,13 +2781,7 @@ async def _build_learn_pillar(
     pseudo_query_gate.bind_debug_logger(debug_logger)
 
     with _timed(timings, "component_wiring"):
-        _wire_sleep_scheduler_models(
-            state, mem.sleep_scheduler, learning_scheduler, resolver,
-        )
-        if not learning_disabled:
-            _inject_level2_runner(learning_scheduler, debug_logger)
-        else:
-            logger.info("Level 2 runner injection skipped (learning disabled)")
+        _wire_sleep_scheduler_models(state, mem.sleep_scheduler, learning_scheduler)
 
     from backend.pillars import LearnPillar
     learn = LearnPillar(
@@ -2831,14 +2793,14 @@ async def _build_learn_pillar(
         feedback_collector=state.feedback_collector,
     )
 
-    # Pro Learn pillar setup (ProLearnComponents を LearningScheduler に注入する)
+    # Pro Learn pillar setup (登録されていれば)
     if not learning_disabled:
         with _timed(timings, "pro_learn_setup"):
             await _inject_learn_components(
                 state, cfg, resolver, project_root, learn,
             )
     else:
-        logger.info("Pro learn components injection skipped (learning disabled)")
+        logger.info("Pro learn pillar setup skipped (learning disabled)")
 
     # Level 1 独立常駐ループ起動
     if not learning_disabled:

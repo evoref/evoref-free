@@ -1,8 +1,7 @@
 """llama-server /v1/embeddings 経由の埋め込み生成（EmbeddingBackend 準拠）
 
 Qwen3-Embedding 等の GGUF モデルを llama-server 経由で使用する。
-LoRA 適用が可能なため、自己学習パイプラインの三角形フィードバックループに
-組み込める。ポート :8082 で独立した llama-server インスタンスとして起動する。
+ポート :8082 で独立した llama-server インスタンスとして起動する。
 
 Qwen3-Embedding 公式の instruction-aware フォーマットを実装する
 - ``is_query=True``: ``f"Instruct: {instructions[mode]}\\nQuery: {text}"`` に整形
@@ -336,8 +335,7 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         """ドキュメント側ベクトルを変える設定の識別子 (永続キャッシュの鍵用)。
 
         ``doc_template`` が空 (Qwen3 既定 = 素のテキスト) なら空文字列を返し、
-        既存キャッシュと鍵が変わらない。LoRA は llama-server 起動オプション側
-        なのでここでは表せない (モデル名で分かれる前提)。
+        既存キャッシュと鍵が変わらない。
         """
         return f"doc_template={self._doc_template}" if self._doc_template else ""
 
@@ -349,10 +347,6 @@ class LlamaCppEmbedder(QueryCacheMixin, BaseHTTPClient):
         になる。既定 (``doc_template=""``) は False で鍵は従来どおり。
         """
         return "{task}" in self._doc_template
-
-    def supports_lora(self) -> bool:
-        """llama-server は --lora オプションで LoRA 適用可能"""
-        return True
 
     def supports_instructions(self) -> bool:
         """検索指示プレフィックスの動的変更が可能"""

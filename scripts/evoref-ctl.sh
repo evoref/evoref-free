@@ -18,8 +18,8 @@ start_all() {
     activate_venv
     setup_utf8
 
-    # 版 (config_version) の無い旧形式の config.yaml は起動前に一度だけ直す
-    # (config.yaml.g0-<stamp> へ退避)。別の evoref がロックを持っていれば拒否。
+    # 版 (config_version) の無い・古い config.yaml は起動前に一度だけ直す
+    # (config.yaml.g0-<stamp> / .g1v1-<stamp> へ退避)。別の evoref がロックを持っていれば拒否。
     python -m backend.free.cli.main config normalize --if-needed || exit 1
 
     # PC の環境が変わっていれば llama-server を起こす前に 1 回だけ確認する
