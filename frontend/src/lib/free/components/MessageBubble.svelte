@@ -49,9 +49,6 @@
 	}
 	let isUser = $derived(message.role === 'user');
 	let isCreate = $derived(mode === 'create');
-	// クリエイトモードではコードをエディタへ流すため、チャット側は
-	// プレースホルダに置換する。'chat' 明示指示時のみコードを表示。
-	let suppressCode = $derived(isCreate && message.editor_route !== 'chat');
 	let showTimestamp = $derived($layout.chat.show_timestamps);
 	let showSpinner = $derived(!isUser && streaming && message.content === '');
 </script>
@@ -75,7 +72,7 @@
 			{#if isUser}
 				<p class="whitespace-pre-wrap">{message.content}</p>
 			{:else}
-				<MarkdownRenderer content={message.content} {suppressCode} />
+				<MarkdownRenderer content={message.content} />
 			{/if}
 		</div>
 	{/if}
@@ -158,11 +155,11 @@
 		gap: 6px;
 		margin-top: 6px;
 		font-size: 0.8rem;
-		color: var(--text-secondary, #888);
+		color: var(--text-secondary);
 	}
 	.feedback-btn {
 		background: transparent;
-		border: 1px solid var(--border, #ccc);
+		border: 1px solid var(--border);
 		border-radius: 4px;
 		padding: 1px 6px;
 		cursor: pointer;
@@ -175,7 +172,7 @@
 		flex: 1;
 		min-width: 120px;
 		padding: 2px 6px;
-		border: 1px solid var(--border, #ccc);
+		border: 1px solid var(--border);
 		border-radius: 4px;
 		background: var(--bg-primary, transparent);
 		color: var(--text-primary);

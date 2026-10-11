@@ -5,14 +5,12 @@
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 	import SettingsTabs from '$lib/free/components/settings/SettingsTabs.svelte';
 	import GeneralSettings from '$lib/free/components/settings/GeneralSettings.svelte';
-	import InferenceSettings from '$lib/free/components/settings/InferenceSettings.svelte';
 	import ModelSettings from '$lib/free/components/settings/ModelSettings.svelte';
 	import RagSettings from '$lib/free/components/settings/RagSettings.svelte';
 	import MemorySettings from '$lib/free/components/settings/MemorySettings.svelte';
 	import LearningSettings from '$lib/free/components/settings/LearningSettings.svelte';
 	import StorageSettings from '$lib/free/components/settings/StorageSettings.svelte';
 	import IntegrationSettings from '$lib/free/components/settings/IntegrationSettings.svelte';
-	import EditorSettings from '$lib/free/components/settings/EditorSettings.svelte';
 	import ModeGenerationSettings from '$lib/free/components/settings/ModeGenerationSettings.svelte';
 	import PromptSettings from '$lib/free/components/settings/PromptSettings.svelte';
 	import SystemSettings from '$lib/free/components/settings/SystemSettings.svelte';
@@ -24,7 +22,6 @@
 	 */
 	const TAB_COMPONENTS: Record<string, Component> = {
 		general: GeneralSettings,
-		inference: InferenceSettings,
 		model: ModelSettings,
 		rag: RagSettings,
 		memory: MemorySettings,
@@ -32,7 +29,6 @@
 		storage: StorageSettings,
 		integration: IntegrationSettings,
 		generation: ModeGenerationSettings,
-		editor: EditorSettings,
 		prompts: PromptSettings,
 		system: SystemSettings,
 		develop: DeveloperSettings

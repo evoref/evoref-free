@@ -11,9 +11,11 @@
 	 * (serverState / vramStatus / busyServer) を共有し、ポーリングは +layout 側で駆動する。
 	 * embed サーバーの ServerName は "embed" (埋め込みモデルの migrate 種別 "embedding"
 	 * とは別語) なので、埋め込みモデル欄では server="embed" を渡す。
+	 * リランカー (server="rerank") は /api/status の components に載らないので、接続は
+	 * rerank.connected (/api/status ごとの /health) で見る。
 	 */
 	import { t } from '$lib/i18n';
-	import { serverState, refreshServerStatus, busyServer } from '$lib/free/stores/server';
+	import { serverState, systemHealth, refreshServerStatus, busyServer } from '$lib/free/stores/server';
 	import { vramStatus, refreshVramStatus } from '$lib/free/stores/vram';
 	import { startServer, stopServer } from '$lib/free/api';
 	import type { ServerName, VramModelInfo } from '$lib/free/api';
@@ -27,9 +29,12 @@
 	// _collect_component_statuses は必ず base → embed の固定順で append するため、
 	// ロールは name 一致ではなく index で引く (旧 ServerStatus も同じ前提)。
 	// VRAM 側 (vram_monitor MODEL_NAMES) はロール名キーなので vramInline の find は name 一致で正しい。
-	const SERVER_INDEX: Record<ServerName, number> = { base: 0, embed: 1 };
-	let comp = $derived($serverState.components[SERVER_INDEX[server]]);
-	let connected = $derived(comp?.connected ?? false);
+	const SERVER_INDEX: Record<Exclude<ServerName, 'rerank'>, number> = { base: 0, embed: 1 };
+	let connected = $derived(
+		server === 'rerank'
+			? ($systemHealth?.rerank?.connected ?? false)
+			: ($serverState.components[SERVER_INDEX[server]]?.connected ?? false)
+	);
 	let busy = $derived($busyServer === server);
 
 	// 補助タスクのオンデマンド常駐 (docs/c_14 §1.2)。停止は設計どおりの状態なので、
@@ -159,11 +164,11 @@
 	}
 	.srv-label {
 		font-size: 0.85rem;
-		color: var(--text-secondary, #555);
+		color: var(--text-secondary);
 	}
 	.srv-offline {
 		font-size: 0.8rem;
-		color: var(--text-secondary, #555);
+		color: var(--text-secondary);
 		opacity: 0.7;
 	}
 	.status-dot {
@@ -175,11 +180,13 @@
 		opacity: 0.4;
 	}
 	.status-dot.connected {
-		background: #22c55e;
+		background: var(--color-success);
 		opacity: 1;
 	}
+	/* 失敗は中抜きの輪にして、色が灰色だけ (テーマなし) でも接続中と形で見分ける */
 	.status-dot.failed {
-		background: #ef4444;
+		background: transparent;
+		box-shadow: inset 0 0 0 2px var(--color-error);
 		opacity: 1;
 	}
 	.vram-cell {
@@ -202,7 +209,8 @@
 		opacity: 0.7;
 	}
 	.residency.failed {
-		color: #ef4444;
+		color: var(--color-error);
+		font-weight: 600;
 		opacity: 1;
 	}
 	.actions {
@@ -212,8 +220,8 @@
 		margin-left: auto;
 	}
 	.srv-btn {
-		background: var(--bg-secondary, #f5f5f5);
-		border: 1px solid var(--input-border, var(--border-color, #999));
+		background: var(--bg-secondary);
+		border: 1px solid var(--input-border);
 		border-radius: 4px;
 		color: var(--text-secondary);
 		cursor: pointer;
@@ -228,16 +236,17 @@
 		border-color: var(--accent);
 	}
 	.srv-btn.stop:hover:not(:disabled) {
-		color: #ef4444;
-		border-color: #ef4444;
+		color: var(--color-error);
+		border-color: var(--color-error);
 	}
 	.srv-btn.force {
-		color: #f59e0b;
-		border-color: #f59e0b;
+		color: var(--color-warning);
+		border-color: var(--color-warning);
+		font-weight: 600;
 	}
 	.srv-btn.force:hover:not(:disabled) {
-		color: #d97706;
-		border-color: #d97706;
+		color: var(--color-error);
+		border-color: var(--color-error);
 	}
 	.srv-btn:disabled {
 		opacity: 0.4;

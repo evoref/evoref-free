@@ -5,15 +5,26 @@
 	import type { FewShotAction, FewShotExample } from '$lib/free/api';
 	import { handleApiCall } from '$lib/free/utils/error';
 	import { formatDate } from '$lib/free/utils/format';
+	import { proActive } from '$lib/free/stores/server';
+	import Badge from './ui/Badge.svelte';
+	import Button from './ui/Button.svelte';
+	import Disclosure from './ui/Disclosure.svelte';
+	import EmptyState from './ui/EmptyState.svelte';
+	import Loading from './ui/Loading.svelte';
 
 	type ModeFilter = 'all' | 'chat' | 'create';
 
-	/** 例クエリの折りたたみ表示の最大文字数 */
+	const FILTERS: [ModeFilter, string][] = [
+		['all', 'fewshot.filter_all'],
+		['chat', 'fewshot.filter_chat'],
+		['create', 'fewshot.filter_create']
+	];
+
+	/** 一覧で見せる質問の要約の最大文字数 */
 	const QUERY_PREVIEW_CHARS = 80;
 
 	let examples = $state<FewShotExample[]>([]);
 	let archived = $state<FewShotExample[]>([]);
-	let poolSize = $state(0);
 	let writeback = $state('');
 	let modeFilter = $state<ModeFilter>('all');
 	let loading = $state(true);
@@ -35,7 +46,6 @@
 			const result = await listFewshot(mode);
 			examples = result.examples;
 			archived = result.archived;
-			poolSize = result.pool_size;
 			writeback = result.writeback;
 		} catch (e) {
 			if (e instanceof ApiError && e.code === 'E0409') {
@@ -83,325 +93,253 @@
 	}
 </script>
 
-<div class="fewshot-curator">
-	<div class="header">
-		<div class="filters">
+<!-- 1 件分の行。要約と状態を主に、数値の指標は展開した詳細にだけ出す -->
+{#snippet row(ex: FewShotExample, isArchived: boolean)}
+	{@const open = expandedId === ex.id}
+	<li class="fewshot-item">
+		<div class="row-main">
 			<button
-				class="filter-btn"
-				class:active={modeFilter === 'all'}
-				onclick={() => handleFilterChange('all')}
+				class="summary"
+				aria-expanded={open}
+				aria-controls="fewshot-detail-{ex.id}"
+				onclick={() => toggleExpand(ex.id)}
 			>
-				{$t('fewshot.filter_all')}
+				<span class="query">{truncate(ex.query)}</span>
+				<span class="toggle-label">{open ? $t('fewshot.hide_full') : $t('fewshot.show_full')}</span>
 			</button>
-			<button
-				class="filter-btn"
-				class:active={modeFilter === 'chat'}
-				onclick={() => handleFilterChange('chat')}
-			>
-				{$t('fewshot.filter_chat')}
-			</button>
-			<button
-				class="filter-btn"
-				class:active={modeFilter === 'create'}
-				onclick={() => handleFilterChange('create')}
-			>
-				{$t('fewshot.filter_create')}
-			</button>
-		</div>
-		{#if !loading && !errorMessage && !delegatedMessage}
-			<span class="pool-summary">
-				{$t('fewshot.pool_summary', { pool_size: poolSize, writeback })}
+			<span class="badges">
+				{#if isArchived}
+					<Badge tone="muted">{$t('fewshot.state_archived')}</Badge>
+				{:else}
+					<Badge tone="strong">{$t('fewshot.state_active')}</Badge>
+					{#if ex.state === 'stale'}
+						<Badge tone="muted">{$t('fewshot.state_stale')}</Badge>
+					{/if}
+					{#if ex.pinned}
+						<Badge>{$t('fewshot.pinned')}</Badge>
+					{/if}
+				{/if}
 			</span>
+			<span class="row-actions">
+				{#if isArchived}
+					<Button size="sm" disabled={actingId === ex.id} onclick={() => handleAction(ex.id, 'restore')}>
+						{$t('fewshot.restore')}
+					</Button>
+				{:else}
+					<Button
+						size="sm"
+						disabled={actingId === ex.id}
+						onclick={() => handleAction(ex.id, ex.pinned ? 'unpin' : 'pin')}
+					>
+						{ex.pinned ? $t('fewshot.unpin') : $t('fewshot.pin')}
+					</Button>
+					<Button
+						variant="ghost"
+						size="sm"
+						disabled={actingId === ex.id}
+						onclick={() => handleAction(ex.id, 'archive')}
+					>
+						{$t('fewshot.archive')}
+					</Button>
+				{/if}
+			</span>
+		</div>
+		{#if open}
+			<dl class="detail" id="fewshot-detail-{ex.id}">
+				<dt>{$t('fewshot.query_label')}</dt>
+				<dd class="pre">{ex.query}</dd>
+				<dt>{$t('fewshot.response_label')}</dt>
+				<dd class="pre">{ex.response}</dd>
+				<dt>{$t('fewshot.mode_label')}</dt>
+				<dd>{ex.mode}</dd>
+				<dt>{$t('fewshot.fitness')}</dt>
+				<dd>{ex.fitness.toFixed(2)}</dd>
+				<dt>{$t('fewshot.quality')}</dt>
+				<dd>{ex.quality_score !== null ? ex.quality_score.toFixed(2) : '-'}</dd>
+				<dt>{$t('fewshot.usage_label')}</dt>
+				<dd>
+					{$t('fewshot.usage', { use_count: ex.use_count, helpful: ex.helpful, harmful: ex.harmful })}
+				</dd>
+				<dt>{$t('fewshot.last_used')}</dt>
+				<dd>{formatLastUsed(ex.last_used_at)}</dd>
+			</dl>
 		{/if}
-	</div>
+	</li>
+{/snippet}
+
+<div class="fewshot-curator">
+	{#if $proActive}
+		<!-- チャット / クリエイトの絞り込みは、クリエイトモードがある Pro だけで意味を持つ -->
+		<div class="filters" role="group" aria-label={$t('fewshot.filter_label')}>
+			{#each FILTERS as [value, key] (value)}
+				<button
+					class="filter-btn"
+					class:active={modeFilter === value}
+					aria-pressed={modeFilter === value}
+					onclick={() => handleFilterChange(value)}
+				>
+					{$t(key)}
+				</button>
+			{/each}
+		</div>
+	{/if}
 
 	{#if loading}
-		<p class="hint">{$t('fewshot.loading')}</p>
+		<Loading />
 	{:else if delegatedMessage}
-		<p class="hint delegated">{delegatedMessage}</p>
+		<p class="notice">{delegatedMessage}</p>
 	{:else if errorMessage}
-		<p class="error">{errorMessage}</p>
+		<p class="error" role="alert">{errorMessage}</p>
 	{:else}
 		<section class="fewshot-section">
-			<h2 class="section-title">{$t('fewshot.section_pool')}</h2>
+			<h2 class="section-title">{$t('fewshot.section_pool', { count: examples.length })}</h2>
 			{#if examples.length === 0}
-				<p class="empty">{$t('fewshot.list_empty')}</p>
+				<EmptyState message={$t('fewshot.list_empty')} />
 			{:else}
 				<ul class="fewshot-list">
 					{#each examples as ex (ex.id)}
-						<li class="fewshot-item">
-							<div class="row-main">
-								<div class="badges">
-									<span class="badge state-{ex.state}">
-										{ex.state === 'active' ? $t('fewshot.state_active') : $t('fewshot.state_stale')}
-									</span>
-									{#if ex.pinned}
-										<span class="badge pinned">{$t('fewshot.pinned')}</span>
-									{/if}
-									<span class="badge mode">{ex.mode}</span>
-								</div>
-								<button class="query" onclick={() => toggleExpand(ex.id)}>
-									{expandedId === ex.id ? ex.query : truncate(ex.query)}
-								</button>
-								<div class="metrics">
-									<span>{$t('fewshot.fitness')}: {ex.fitness.toFixed(2)}</span>
-									<span
-										>{$t('fewshot.quality')}: {ex.quality_score !== null
-											? ex.quality_score.toFixed(2)
-											: '-'}</span
-									>
-									<span>{$t('fewshot.usage', { use_count: ex.use_count, helpful: ex.helpful, harmful: ex.harmful })}</span>
-									<span>{$t('fewshot.last_used')}: {formatLastUsed(ex.last_used_at)}</span>
-								</div>
-							</div>
-							{#if expandedId === ex.id}
-								<div class="response-block">
-									<span class="response-label">{$t('fewshot.response_label')}</span>
-									<p class="response-text">{ex.response}</p>
-								</div>
-							{/if}
-							<div class="actions">
-								<button
-									class="action-btn"
-									disabled={actingId === ex.id}
-									onclick={() => handleAction(ex.id, ex.pinned ? 'unpin' : 'pin')}
-								>
-									{ex.pinned ? $t('fewshot.unpin') : $t('fewshot.pin')}
-								</button>
-								<button
-									class="action-btn danger"
-									disabled={actingId === ex.id}
-									onclick={() => handleAction(ex.id, 'archive')}
-								>
-									{$t('fewshot.archive')}
-								</button>
-							</div>
-						</li>
+						{@render row(ex, false)}
 					{/each}
 				</ul>
 			{/if}
 		</section>
 
-		<section class="fewshot-section">
-			<h2 class="section-title">{$t('fewshot.section_archived')}</h2>
+		<Disclosure label={$t('fewshot.section_archived', { count: archived.length })}>
 			{#if archived.length === 0}
-				<p class="empty">{$t('fewshot.archived_empty')}</p>
+				<p class="muted">{$t('fewshot.archived_empty')}</p>
 			{:else}
 				<ul class="fewshot-list">
 					{#each archived as ex (ex.id)}
-						<li class="fewshot-item">
-							<div class="row-main">
-								<div class="badges">
-									<span class="badge state-archived">{$t('fewshot.state_archived')}</span>
-									<span class="badge mode">{ex.mode}</span>
-								</div>
-								<button class="query" onclick={() => toggleExpand(ex.id)}>
-									{expandedId === ex.id ? ex.query : truncate(ex.query)}
-								</button>
-								<div class="metrics">
-									<span>{$t('fewshot.fitness')}: {ex.fitness.toFixed(2)}</span>
-									<span>{$t('fewshot.last_used')}: {formatLastUsed(ex.last_used_at)}</span>
-								</div>
-							</div>
-							{#if expandedId === ex.id}
-								<div class="response-block">
-									<span class="response-label">{$t('fewshot.response_label')}</span>
-									<p class="response-text">{ex.response}</p>
-								</div>
-							{/if}
-							<div class="actions">
-								<button
-									class="action-btn"
-									disabled={actingId === ex.id}
-									onclick={() => handleAction(ex.id, 'restore')}
-								>
-									{$t('fewshot.restore')}
-								</button>
-							</div>
-						</li>
+						{@render row(ex, true)}
 					{/each}
 				</ul>
 			{/if}
-		</section>
+		</Disclosure>
+
+		{#if writeback}
+			<p class="muted writeback">{$t('fewshot.writeback_note', { writeback })}</p>
+		{/if}
 	{/if}
 </div>
 
 <style>
-	.fewshot-curator {
-		padding: 16px;
-	}
-	.header {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 12px;
-		margin-bottom: 16px;
-		flex-wrap: wrap;
-	}
 	.filters {
-		display: flex;
-		gap: 6px;
+		display: inline-flex;
+		margin-bottom: var(--space-4);
+		border: 1px solid var(--input-border);
+		border-radius: var(--border-radius);
+		overflow: hidden;
 	}
 	.filter-btn {
-		padding: 4px 12px;
-		font-size: 0.9rem;
+		padding: 4px 14px;
+		font-size: var(--font-size-sm);
+		font-family: inherit;
 		background: none;
-		border: 1px solid var(--border);
-		border-radius: var(--border-radius);
-		color: var(--text-primary);
+		border: none;
+		color: var(--text-secondary);
 		cursor: pointer;
+	}
+	.filter-btn + .filter-btn {
+		border-left: 1px solid var(--input-border);
 	}
 	.filter-btn.active {
 		background-color: var(--accent);
 		color: var(--text-on-accent);
-		border-color: var(--accent);
+		font-weight: 600;
 	}
-	.pool-summary {
-		font-size: 0.85rem;
-		color: var(--text-secondary);
-	}
-	.hint {
-		color: var(--text-secondary);
-	}
-	.hint.delegated {
-		background-color: var(--bg-secondary);
-		border: 0.5px solid var(--card-border);
+	.notice {
+		padding: var(--space-3) var(--space-4);
+		border: 1px solid var(--border);
 		border-radius: var(--border-radius);
-		padding: 10px 12px;
+		color: var(--text-secondary);
 	}
 	.error {
 		color: var(--color-error);
-		font-size: 0.95rem;
+		font-weight: 600;
 	}
-	.empty {
+	.muted {
 		color: var(--text-secondary);
-		font-style: italic;
+		font-size: var(--font-size-sm);
+	}
+	.writeback {
+		margin-top: var(--space-4);
+		color: var(--text-muted);
+		font-size: var(--font-size-xs);
 	}
 	.fewshot-section {
-		margin-bottom: 20px;
+		margin-bottom: var(--space-5);
 	}
 	.section-title {
-		font-size: 1rem;
+		font-size: var(--font-size-base);
 		font-weight: 600;
 		color: var(--text-primary);
-		margin: 0 0 8px;
+		margin: 0 0 var(--space-3);
 	}
 	.fewshot-list {
 		list-style: none;
 		padding: 0;
 		margin: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
+		border-top: 1px solid var(--border);
 	}
 	.fewshot-item {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-		padding: 10px 12px;
-		background-color: var(--bg-secondary);
-		border: 0.5px solid var(--card-border);
-		border-radius: 10px;
+		padding: var(--space-3) var(--space-1);
+		border-bottom: 1px solid var(--border);
 	}
 	.row-main {
 		display: flex;
-		flex-direction: column;
-		gap: 4px;
-	}
-	.badges {
-		display: flex;
-		gap: 6px;
+		align-items: center;
+		gap: var(--space-3);
 		flex-wrap: wrap;
 	}
-	.badge {
-		font-size: 0.75rem;
-		padding: 1px 8px;
-		border-radius: 10px;
-		border: 1px solid var(--border);
-		color: var(--text-secondary);
-	}
-	.badge.state-active {
-		color: var(--success, #22c55e);
-		border-color: var(--success, #22c55e);
-	}
-	.badge.state-stale,
-	.badge.state-archived {
-		color: var(--warning, #f59e0b);
-		border-color: var(--warning, #f59e0b);
-	}
-	.badge.pinned {
-		color: var(--accent);
-		border-color: var(--accent);
-	}
-	.badge.mode {
-		opacity: 0.8;
-	}
-	.query {
+	.summary {
+		flex: 1 1 280px;
+		min-width: 0;
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-2);
 		background: none;
 		border: none;
 		padding: 0;
 		text-align: left;
 		cursor: pointer;
 		font-family: inherit;
-		font-size: 0.95rem;
 		color: var(--text-primary);
 	}
-	.query:hover {
+	.query {
+		min-width: 0;
+	}
+	.summary:hover .query {
 		text-decoration: underline;
 	}
-	.metrics {
-		display: flex;
-		gap: 12px;
-		flex-wrap: wrap;
-		font-size: 0.8rem;
+	.toggle-label {
+		flex-shrink: 0;
+		font-size: var(--font-size-xs);
+		color: var(--text-muted);
+	}
+	.badges,
+	.row-actions {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-1);
+	}
+	.detail {
+		display: grid;
+		grid-template-columns: max-content 1fr;
+		gap: var(--space-1) var(--space-4);
+		margin: var(--space-3) 0 0;
+		padding: var(--space-3);
+		border-left: 2px solid var(--border);
+		font-size: var(--font-size-sm);
+	}
+	dt {
 		color: var(--text-secondary);
-		opacity: 0.8;
 	}
-	.response-block {
-		background-color: var(--bg-primary);
-		border-radius: var(--border-radius);
-		padding: 8px 10px;
-	}
-	.response-label {
-		font-size: 0.8rem;
-		font-weight: 600;
-		color: var(--text-secondary);
-	}
-	.response-text {
-		margin: 4px 0 0;
-		font-size: 0.9rem;
+	dd {
+		margin: 0;
 		color: var(--text-primary);
+	}
+	.pre {
 		white-space: pre-wrap;
-	}
-	.actions {
-		display: flex;
-		gap: 6px;
-	}
-	.action-btn {
-		padding: 4px 10px;
-		font-size: 0.85rem;
-		background: none;
-		border: 1px solid var(--border);
-		border-radius: var(--border-radius);
-		color: var(--text-primary);
-		cursor: pointer;
-	}
-	.action-btn:disabled {
-		opacity: 0.5;
-		cursor: default;
-	}
-	.action-btn.danger {
-		background-color: var(--color-error);
-		color: var(--text-on-accent);
-		border: 1px solid var(--color-error);
-	}
-	.action-btn:not(:disabled):hover {
-		opacity: 0.85;
-	}
-	@media (max-width: 700px) {
-		.metrics {
-			flex-direction: column;
-			gap: 2px;
-		}
+		overflow-wrap: anywhere;
 	}
 </style>

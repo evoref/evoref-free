@@ -11,7 +11,6 @@ from backend.log_config import get_logger
 from backend.schemas._common import (
     AgentConfig,
     CLIConfig,
-    EditorSettingsConfig,
     HistoryConfig,
     I18nConfig,
     InstanceConfig,
@@ -99,7 +98,6 @@ class EvorefConfig(BaseModel):
     widget_proxy: WidgetProxyConfig = Field(default_factory=WidgetProxyConfig)
     i18n: I18nConfig = Field(default_factory=I18nConfig)
     modes: ModesConfig = Field(default_factory=ModesConfig)
-    editor: EditorSettingsConfig = Field(default_factory=EditorSettingsConfig)
     model_migration: ModelMigrationConfig = Field(default_factory=ModelMigrationConfig)
     process_manager: ProcessManagerConfig = Field(default_factory=ProcessManagerConfig)
     auto_serve: AutoServeConfig = Field(default_factory=AutoServeConfig)

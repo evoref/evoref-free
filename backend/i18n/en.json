@@ -96,6 +96,8 @@
     "prompt_locale_learning_running": "Cannot switch locale while learning is running",
     "prompt_edit_learning_running": "Cannot edit or roll back the prompt while learning is running. Try again after learning finishes",
     "config_capability_key_protected": "These settings cannot be changed through the API: {keys}. Edit config.yaml directly.",
+    "config_launch_args_protected": "These launch option flags cannot be set from the settings screen: {flags}. Edit config.yaml directly.",
+    "config_launch_args_invalid": "The launch options could not be parsed: {error}",
     "config_unknown_runtime": "Unknown runtime: {name}",
     "runtime_path_invalid": {
       "empty": "The path is empty",
@@ -1037,7 +1039,7 @@
   },
   "create": {
     "replaced_existing": "Replaced existing {paths} (originals were backed up under {backup}).",
-    "editor_delivered": "Placed {count} file(s) in the editor: {names}. Not saved yet; use the editor save button, or ask \"save to {example}\".",
+    "editor_delivered": "Created {count} file(s): {names}. Not saved yet; ask \"save to {example}\" to save them.",
     "chat_delivered": "Showed {count} file(s) in the chat.",
     "needs_input_question": "I couldn't tell what to create. Please tell me what you want (its content or kind) and, if relevant, the language or where to save it.",
     "requested_tests_not_available": "The requested tests ({names}) were not created (this setup does not run the test stage).",

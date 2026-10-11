@@ -18,23 +18,6 @@ export type SlotName = 'chat_header' | 'message_prefix' | 'input_suffix' | 'side
 /** スロットコンポーネントの状態 */
 export type ThemeSlots = Record<SlotName, Component | null>;
 
-export interface EditorConfig {
-	show_line_numbers: boolean;
-	word_wrap: boolean;
-	tab_size: number;
-	font_family: string;
-	font_size: number;
-	line_height: number;
-	show_toolbar: boolean;
-	show_active_line: boolean;
-	/** 新規タブ / ファイル読込時の既定文字コード (config.editor 由来、テーマは持たない) */
-	default_encoding: string;
-	/** 新規タブの既定改行コード (config.editor 由来、テーマは持たない) */
-	default_line_ending: 'lf' | 'crlf' | 'cr';
-	/** シンタックスハイライトを有効にする言語 (config.editor 由来、テーマは持たない) */
-	highlight_languages: string[];
-}
-
 export interface LayoutConfig {
 	sidebar: {
 		position: 'left' | 'right' | 'hidden';
@@ -48,11 +31,6 @@ export interface LayoutConfig {
 		show_timestamps: boolean;
 		show_agentic_steps: 'expanded' | 'collapsed' | 'hidden';
 	};
-	create: {
-		pane_ratio: [number, number];
-		pane_direction: 'horizontal' | 'vertical';
-		editor: EditorConfig;
-	};
 	dashboard: {
 		panels: string[];
 		grid_columns: number;
@@ -64,23 +42,6 @@ export interface LayoutConfig {
 		animation: boolean;
 	};
 }
-
-export const defaultEditorConfig: EditorConfig = {
-	show_line_numbers: true,
-	word_wrap: false,
-	tab_size: 4,
-	font_family: 'monospace',
-	font_size: 14,
-	line_height: 1.5,
-	show_toolbar: true,
-	show_active_line: true,
-	default_encoding: 'utf-8',
-	default_line_ending: 'lf',
-	highlight_languages: [
-		'markdown', 'python', 'javascript', 'typescript',
-		'json', 'html', 'css', 'yaml', 'xml', 'sql', 'php'
-	]
-};
 
 const defaultLayout: LayoutConfig = {
 	sidebar: {
@@ -94,11 +55,6 @@ const defaultLayout: LayoutConfig = {
 		max_width: 800,
 		show_timestamps: true,
 		show_agentic_steps: 'collapsed'
-	},
-	create: {
-		pane_ratio: [50, 50],
-		pane_direction: 'horizontal',
-		editor: { ...defaultEditorConfig }
 	},
 	dashboard: {
 		panels: ['learning_status', 'rag_stats'],
@@ -155,20 +111,10 @@ export function setLayoutCssVariables(config: LayoutConfig): void {
 	root.style.setProperty('--font-size-base', config.global.font_size_base + 'px');
 	root.style.setProperty('--border-radius', config.global.border_radius + 'px');
 	root.style.setProperty('--spacing-unit', config.global.spacing_unit + 'px');
-
-	const ed = config.create.editor;
-	root.style.setProperty('--editor-font-family', ed.font_family);
-	root.style.setProperty('--editor-font-size', ed.font_size + 'px');
-	root.style.setProperty('--editor-line-height', String(ed.line_height));
-	root.style.setProperty('--editor-tab-size', String(ed.tab_size));
 }
 
 /** レイアウト設定をDOMに反映しストアを更新する */
 export function applyLayout(config: LayoutConfig): void {
-	// editor が省略されている場合はデフォルト値で補完
-	if (!config.create.editor) {
-		config.create.editor = { ...defaultEditorConfig };
-	}
 	setLayoutCssVariables(config);
 	layout.set(config);
 }
@@ -268,15 +214,7 @@ export async function activateTheme(
 	// レイアウト適用（slots キーを除外して LayoutConfig に変換）
 	if (result.gui_layout) {
 		const { slots: _slots, ...layoutFields } = result.gui_layout;
-		applyLayout({
-			...layoutFields,
-			create: {
-				...layoutFields.create,
-				// テーマは config.editor 由来のフィールド (encoding / line ending /
-				// highlight_languages) を持たないため、既定値を土台に重ねる。
-				editor: { ...defaultEditorConfig, ...layoutFields.create.editor },
-			},
-		});
+		applyLayout(layoutFields);
 	}
 
 	// ストア更新

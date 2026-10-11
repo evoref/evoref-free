@@ -6,7 +6,6 @@
 
 	const TAB_LABELS: Record<string, string> = {
 		general: 'settings.tab_general',
-		inference: 'settings.tab_inference',
 		model: 'settings.tab_model',
 		rag: 'settings.tab_rag',
 		memory: 'settings.tab_memory',
@@ -14,7 +13,6 @@
 		storage: 'settings.tab_storage',
 		integration: 'settings.tab_integration',
 		generation: 'settings.tab_generation',
-		editor: 'settings.tab_editor',
 		system: 'settings.tab_system',
 		prompts: 'settings.tab_prompts',
 		develop: 'settings.tab_develop'
@@ -22,7 +20,6 @@
 
 	/** Pro 機能を含むタブ (バッジ表示対象)
 	 *
-	 * - `editor`: エディタ機能自体が Pro ワークモード専用 (config.yaml の "Pro ワークモード" 区画 / CodeMirrorEditor 等は lib/pro/)
 	 * - `learning`: 上位オプティマイザが Pro 限定
 	 * - `integration`: widget_proxy が Pro 限定
 	 * - `generation`: modes.create (クリエイトモードの生成パラメータ) が Pro 限定
@@ -30,17 +27,13 @@
 	 *
 	 * ProSection を含まないタブ (memory 等) は Pro バッジ対象外。
 	 */
-	const PRO_TABS = new Set(['model', 'learning', 'integration', 'editor', 'generation', 'prompts']);
+	const PRO_TABS = new Set(['model', 'learning', 'integration', 'generation', 'prompts']);
 
-	/** タブ全体が Pro/Develop 専用で、Free では機能ごと存在しないタブ。
-	 * Free ビルドでは visibleTabs から完全に除外する。
-	 */
-	const PRO_ONLY_TABS = new Set(['editor']);
+	/** Develop 専用タブ。Develop ビルド以外では visibleTabs から除外する。 */
 	const DEVELOP_ONLY_TABS = new Set(['develop']);
 
 	let visibleTabs = $derived(
 		[...TAB_IDS, 'prompts', 'develop'].filter((tabId) => {
-			if (!isPro && PRO_ONLY_TABS.has(tabId)) return false;
 			if (!isDevelop && DEVELOP_ONLY_TABS.has(tabId)) return false;
 			return true;
 		})

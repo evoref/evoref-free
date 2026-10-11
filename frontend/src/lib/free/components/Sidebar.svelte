@@ -6,7 +6,7 @@
 	import { locale, availableLocales, switchLocale, promptLocaleSwitching } from '$lib/i18n';
 	import { isPro, isDevelop, edition } from '$lib/edition';
 	import { appVersion } from '$lib/free/stores/app';
-	import { currentMode, clearMessages, switchMode, modeRestartStatus, corpusMode, isStreaming } from '$lib/free/stores/chat';
+	import { currentMode, clearMessages, switchMode, modeRestartStatus, isStreaming } from '$lib/free/stores/chat';
 	import { addToast } from '$lib/free/stores/toast';
 	import { serverState, backendEdition } from '$lib/free/stores/server';
 
@@ -16,6 +16,18 @@
 	let debugEnabled = $derived($serverState.debug?.enabled === true);
 	// Pro ビルドでもバックエンドが Free なら Pro の導線を出さない (Pro の API が無い)
 	let showPro = $derived(isPro && $backendEdition !== 'free');
+
+	// 上から使う頻度の順。Pro 専用の画面はバックエンドも Pro のときだけ出す
+	let navItems = $derived([
+		{ href: '/history', labelKey: 'sidebar.history' },
+		{ href: '/dashboard', labelKey: 'sidebar.dashboard' },
+		{ href: '/learning', labelKey: 'sidebar.fewshot' },
+		{ href: '/cartridge', labelKey: 'sidebar.cartridges' },
+		...(showPro ? [{ href: '/knowledge', labelKey: 'sidebar.knowledge_sources' }] : []),
+		{ href: '/themes', labelKey: 'sidebar.themes' },
+		...(showPro ? [{ href: '/audit', labelKey: 'sidebar.audit_trail' }] : []),
+		{ href: '/settings', labelKey: 'sidebar.settings' }
+	]);
 
 	function isActive(href: string): boolean {
 		if (href === '/') return page.url.pathname === '/';
@@ -55,16 +67,14 @@
 					<a href="/" class="nav-item nav-chat-link" class:active={isActive('/')} aria-current={isActive('/') ? 'page' : undefined}>{$t('sidebar.chat')}</a>
 					<button class="new-chat-btn" onclick={handleNewChat} aria-label={$t('sidebar.new_chat')} title={$t('sidebar.new_chat')}>+</button>
 				</div>
-				<a href="/history" class="nav-item" class:active={isActive('/history')} aria-current={isActive('/history') ? 'page' : undefined}>{$t('sidebar.history')}</a>
-				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')} aria-current={isActive('/cartridge') ? 'page' : undefined}>{$t('sidebar.cartridges')}</a>
-				{#if showPro}
-					<a href="/knowledge" class="nav-item" class:active={isActive('/knowledge')} aria-current={isActive('/knowledge') ? 'page' : undefined}>{$t('sidebar.knowledge_sources')}</a>
-					<a href="/audit" class="nav-item" class:active={isActive('/audit')} aria-current={isActive('/audit') ? 'page' : undefined}>{$t('sidebar.audit_trail')}</a>
-				{/if}
-				<a href="/themes" class="nav-item" class:active={isActive('/themes')} aria-current={isActive('/themes') ? 'page' : undefined}>{$t('sidebar.themes')}</a>
-				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')} aria-current={isActive('/dashboard') ? 'page' : undefined}>{$t('sidebar.dashboard')}</a>
-				<a href="/learning" class="nav-item" class:active={isActive('/learning')} aria-current={isActive('/learning') ? 'page' : undefined}>{$t('sidebar.fewshot')}</a>
-				<a href="/settings" class="nav-item" class:active={isActive('/settings')} aria-current={isActive('/settings') ? 'page' : undefined}>{$t('sidebar.settings')}</a>
+				{#each navItems as item (item.href)}
+					<a
+						href={item.href}
+						class="nav-item"
+						class:active={isActive(item.href)}
+						aria-current={isActive(item.href) ? 'page' : undefined}>{$t(item.labelKey)}</a
+					>
+				{/each}
 				{#if debugEnabled}
 					<span class="debug-badge">{$t('sidebar.debug_mode')}</span>
 				{/if}
@@ -115,25 +125,6 @@
 							<option value={loc}>{loc.toUpperCase()}</option>
 						{/each}
 					</select>
-				</div>
-				<div class="footer-row">
-					<span class="footer-label">{$t('sidebar.documents')}</span>
-					<div class="corpus-mode-wrapper">
-						<select
-							class="footer-select corpus-mode-select"
-							value={$corpusMode}
-							aria-label={$t('sidebar.documents')}
-							title={$t('sidebar.documents_hint')}
-							onchange={(e) => {
-								const v = e.currentTarget.value;
-								corpusMode.set(v === 'on' || v === 'off' ? v : 'auto');
-							}}
-						>
-							<option value="auto">{$t('sidebar.documents_auto')}</option>
-							<option value="on">{$t('sidebar.documents_on')}</option>
-							<option value="off">{$t('sidebar.documents_off')}</option>
-						</select>
-					</div>
 				</div>
 				{#if showPro}
 					<div class="footer-row">
@@ -271,23 +262,28 @@
 		color: var(--text-primary);
 		border-color: var(--accent);
 	}
+	/* テキスト中心の縦リスト。現在地は太字 + 左の線で示す (色相に頼らない) */
 	.nav-item {
 		display: block;
-		padding: 7px 10px;
-		border-radius: 6px;
-		color: var(--text-primary);
+		padding: 7px 10px 7px 12px;
+		border-left: 2px solid transparent;
+		border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+		color: var(--text-secondary);
 		text-decoration: none;
-		font-size: 14px;
-		transition: all 0.15s;
+		font-size: var(--font-size-base);
+		transition:
+			background-color 0.15s,
+			color 0.15s;
 	}
 
 	.nav-item:hover {
 		color: var(--text-primary);
-		background: color-mix(in srgb, var(--accent) 8%, transparent);
+		background: color-mix(in srgb, var(--text-primary) 6%, transparent);
 	}
 	.nav-item.active {
-		background: color-mix(in srgb, var(--accent) 35%, transparent);
+		border-left-color: var(--text-primary);
 		color: var(--text-primary);
+		font-weight: 600;
 	}
 	.debug-badge {
 		display: block;
@@ -300,15 +296,9 @@
 		border-radius: 4px;
 		opacity: 0.85;
 	}
-	:global([data-theme='light']) .debug-badge {
-		background: var(--warning, #f59e0b);
-		color: var(--text-primary);
-		border: 1px solid var(--warning, #f59e0b);
-	}
-	:global([data-theme='dark']) .debug-badge {
-		background: transparent;
-		color: var(--warning, #f59e0b);
-		border: 1px solid var(--warning, #f59e0b);
+	.debug-badge {
+		color: var(--color-warning);
+		border: 1.5px solid var(--color-warning);
 	}
 	.sidebar-widget-slot {
 		padding: 8px 6px;
@@ -370,16 +360,16 @@
 		left: 2px;
 		width: 10px;
 		height: 10px;
-		background: #fff;
+		background: var(--text-secondary);
 		border-radius: 50%;
 		transition: transform 0.2s;
 		display: block;
 	}
 	.toggle-switch.on .knob {
 		transform: translateX(15px);
+		background: var(--text-on-accent);
 	}
-	.mode-select-wrapper,
-	.corpus-mode-wrapper {
+	.mode-select-wrapper {
 		display: flex;
 		align-items: center;
 		gap: 4px;
@@ -396,10 +386,11 @@
 		color: var(--text-secondary);
 	}
 	.mode-ready {
-		color: var(--success, #22c55e);
+		color: var(--color-success);
 	}
 	.mode-failed {
-		color: var(--error, #ef4444);
+		color: var(--color-error);
+		font-weight: 600;
 	}
 	.spinner {
 		display: inline-block;

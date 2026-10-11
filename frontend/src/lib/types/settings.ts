@@ -40,6 +40,8 @@ export interface LlamaConfig {
 	max_tokens: number;
 	enable_thinking: boolean | null;
 	extra_args: string[];
+	/** llama-server の起動オプション (例 `-c 8192 -ngl 99`)。同じフラグの自動の値と環境調整より優先 (c_16 §7.2.4) */
+	launch_args: string;
 	mtp?: MtpConfig;
 }
 
@@ -86,7 +88,7 @@ export interface RAGConfig {
 	confidence_threshold: number;
 	hysteresis_band: number;
 	/** off / on。YAML 1.1 の真偽値で来ることもある */
-	rerank?: { mode?: 'off' | 'on' | boolean };
+	rerank?: { mode?: 'off' | 'on' | boolean; launch_args?: string };
 	self_rag: {
 		quality_judge: {
 			enabled: boolean;
@@ -108,6 +110,8 @@ export interface EmbeddingConfig {
 	model_name: string;
 	cache_enabled: boolean;
 	cache_max_mb: number;
+	/** 埋め込み用 llama-server の起動オプション (c_16 §7.2.4) */
+	launch_args: string;
 }
 
 export interface MemoryConfig {
@@ -221,20 +225,6 @@ export interface ModesConfig {
 	create: CreateModeConfig;
 }
 
-export interface EditorSettingsConfig {
-	font_family: string;
-	font_size: number;
-	line_height: number;
-	tab_size: number;
-	word_wrap: boolean;
-	show_line_numbers: boolean;
-	show_active_line: boolean;
-	show_toolbar: boolean;
-	default_encoding: string;
-	default_line_ending: 'lf' | 'crlf' | 'cr';
-	highlight_languages: string[];
-}
-
 // ── トップレベル設定型 ──────────────────────────────────────
 
 /** config.yaml の全セクションに対応する型 */
@@ -256,6 +246,5 @@ export interface ConfigData {
 	widget_proxy: WidgetProxyConfig;
 	i18n: I18nConfig;
 	modes: ModesConfig;
-	editor: EditorSettingsConfig;
 	long_form: LongFormConfig;
 }

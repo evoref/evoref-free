@@ -107,6 +107,8 @@ export interface FormatHealthInfo {
 export interface RerankStatusInfo {
 	mode: string;
 	enabled: boolean;
+	/** rerank 用 llama-server が今 /health に応えるか (/api/status ごとに確かめる) */
+	connected: boolean;
 	placement: string;
 	ms_per_doc: number | null;
 	/** 自己テストの文書長 (1 組 約 390 トークン) で締切に収まる件数 (有効かどうかの判定) */

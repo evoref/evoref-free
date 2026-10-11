@@ -3,9 +3,12 @@
 	import type { CartridgeDetail } from '$lib/free/api';
 	import { rebuildCartridge } from '$lib/free/api';
 	import { handleApiCall } from '$lib/free/utils/error';
-	import { formatSize } from '$lib/free/utils/format';
+	import { formatDate, formatSize } from '$lib/free/utils/format';
 	import { addToast } from '$lib/free/stores/toast';
 	import DialogShell from './DialogShell.svelte';
+	import Badge from './ui/Badge.svelte';
+	import Button from './ui/Button.svelte';
+	import Disclosure from './ui/Disclosure.svelte';
 
 	interface Props {
 		detail: CartridgeDetail;
@@ -44,128 +47,99 @@
 	ariaLabel={$t('cartridge.detail_title')}
 	{onClose}
 	minWidth="400px"
-	maxWidth="520px"
+	maxWidth="560px"
 >
 	<div class="dialog-header">
-			<h3 class="dialog-title">{detail.name}</h3>
-			<span class="status-badge" class:loaded={detail.status === 'loaded'}>
-				{detail.status === 'loaded' ? $t('cartridge.status_loaded') : $t('cartridge.status_installed')}
-			</span>
-		</div>
+		<h3 class="dialog-title">{detail.name}</h3>
+		<Badge tone={detail.status === 'loaded' ? 'strong' : 'muted'}>
+			{detail.status === 'loaded'
+				? $t('cartridge.status_loaded')
+				: $t('cartridge.status_not_loaded')}
+		</Badge>
+	</div>
 
-		{#if detail.description}
-			<p class="description">{detail.description}</p>
+	{#if detail.description}
+		<p class="description">{detail.description}</p>
+	{/if}
+
+	<!-- 一般の利用者に要る項目だけ。索引の中身・互換性・ダイジェストは「詳細情報」へ -->
+	<dl class="detail-grid">
+		<dt>{$t('cartridge.version')}</dt>
+		<dd>v{detail.version}</dd>
+		<dt>{$t('cartridge.author')}</dt>
+		<dd>{detail.author || '—'}</dd>
+		<dt>{$t('cartridge.size_mb')}</dt>
+		<dd>{formatSize(detail.size_mb)}</dd>
+		{#if detail.provides.length > 0}
+			<dt>{$t('cartridge.provides')}</dt>
+			<dd class="tags">
+				{#each detail.provides as section (section)}
+					<Badge>{$t(`cartridge.provides_${section}`)}</Badge>
+				{/each}
+			</dd>
 		{/if}
+	</dl>
 
-		<div class="detail-grid">
-			<div class="info-row">
-				<span class="label">{$t('cartridge.version')}</span>
-				<span class="value">v{detail.version}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.active_version')}</span>
-				<span class="value">v{detail.active_version || detail.version}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.author')}</span>
-				<span class="value">{detail.author || '—'}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.language')}</span>
-				<span class="value">{detail.language}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.doc_count')}</span>
-				<span class="value">{detail.doc_count}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.chunks')}</span>
-				<span class="value">{detail.chunks}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.size_mb')}</span>
-				<span class="value">{formatSize(detail.size_mb)}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.license')}</span>
-				<span class="value">{detail.license || '—'}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.embedding_model')}</span>
-				<span class="value">{detail.embedding_model_id || '—'}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.content_digest')}</span>
-				<span class="value digest">{detail.content_digest.slice(0, 16) || '—'}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.compatibility')}</span>
-				<span class="value">{detail.compatibility}</span>
-			</div>
-			<div class="info-row">
-				<span class="label">{$t('cartridge.installed_at')}</span>
-				<span class="value">{detail.installed_at || '—'}</span>
-			</div>
+	{#if detail.language_pack.length > 0}
+		<div class="language-pack">
+			<h4 class="language-pack-title">{$t('cartridge.language_pack_title')}</h4>
+			<ul class="language-pack-list">
+				{#each detail.language_pack as entry (entry.id)}
+					<li class="language-pack-item">
+						<span class="lang-id">{entry.id}</span>
+						<Badge tone={entry.enabled ? 'default' : 'muted'}>
+							{entry.enabled
+								? $t('cartridge.language_pack_enabled')
+								: $t('cartridge.language_pack_disabled')}
+						</Badge>
+						{#if !entry.enabled && entry.reason}
+							<span class="lang-reason">{entry.reason}</span>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		</div>
+	{/if}
+
+	<Disclosure label={$t('cartridge.more_info')}>
+		<dl class="detail-grid technical">
+			<dt>{$t('cartridge.active_version')}</dt>
+			<dd>v{detail.active_version || detail.version}</dd>
+			<dt>{$t('cartridge.language')}</dt>
+			<dd>{detail.language}</dd>
+			<dt>{$t('cartridge.doc_count')}</dt>
+			<dd>{detail.doc_count}</dd>
+			<dt>{$t('cartridge.chunks')}</dt>
+			<dd>{detail.chunks}</dd>
+			<dt>{$t('cartridge.license')}</dt>
+			<dd>{detail.license || '—'}</dd>
+			<dt>{$t('cartridge.embedding_model')}</dt>
+			<dd>{detail.embedding_model_id || '—'}</dd>
+			<dt>{$t('cartridge.content_digest')}</dt>
+			<dd class="mono">{detail.content_digest.slice(0, 16) || '—'}</dd>
+			<dt>{$t('cartridge.compatibility')}</dt>
+			<dd>{detail.compatibility}</dd>
+			<dt>{$t('cartridge.installed_at')}</dt>
+			<dd>{detail.installed_at ? formatDate(detail.installed_at) : '—'}</dd>
 			{#if detail.tags.length > 0}
-				<div class="info-row tags-row">
-					<span class="label">{$t('cartridge.tags')}</span>
-					<span class="value tags">
-						{#each detail.tags as tag}
-							<span class="tag">{tag}</span>
-						{/each}
-					</span>
-				</div>
-			{/if}
-			{#if detail.provides.length > 0}
-				<div class="info-row tags-row">
-					<span class="label">{$t('cartridge.provides')}</span>
-					<span class="value tags">
-						{#each detail.provides as section}
-							<span class="tag">{$t(`cartridge.provides_${section}`)}</span>
-						{/each}
-					</span>
-				</div>
-			{/if}
-		</div>
-
-		{#if detail.language_pack.length > 0}
-			<div class="language-pack">
-				<h4 class="language-pack-title">{$t('cartridge.language_pack_title')}</h4>
-				<ul class="language-pack-list">
-					{#each detail.language_pack as entry}
-						<li class="language-pack-item">
-							<span class="lang-id" class:disabled={!entry.enabled}>{entry.id}</span>
-							<span class="lang-status" class:enabled={entry.enabled}>
-								{entry.enabled
-									? $t('cartridge.language_pack_enabled')
-									: $t('cartridge.language_pack_disabled')}
-							</span>
-							{#if !entry.enabled && entry.reason}
-								<span class="lang-reason">{entry.reason}</span>
-							{/if}
-						</li>
+				<dt>{$t('cartridge.tags')}</dt>
+				<dd class="tags">
+					{#each detail.tags as tag (tag)}
+						<Badge>{tag}</Badge>
 					{/each}
-				</ul>
-			</div>
-		{/if}
-
-		<!-- 操作ボタン (再構築は docs セクションの索引の操作。docs が無ければ出さない) -->
-		{#if !detail.provides || detail.provides.includes('docs')}
-			<div class="action-section">
-				<button
-					class="btn btn-action"
-					onclick={handleRebuild}
-					disabled={rebuilding}
-				>
-					{rebuilding ? $t('cartridge.rebuilding') : $t('cartridge.rebuild')}
-				</button>
-			</div>
-		{/if}
+				</dd>
+			{/if}
+		</dl>
+	</Disclosure>
 
 	<div class="dialog-actions">
-		<button class="btn btn-close" onclick={onClose}>
-			{$t('cartridge.close')}
-		</button>
+		<!-- 再構築は docs セクションの索引の操作。docs が無ければ出さない -->
+		{#if !detail.provides || detail.provides.includes('docs')}
+			<Button onclick={handleRebuild} disabled={rebuilding}>
+				{rebuilding ? $t('cartridge.rebuilding') : $t('cartridge.rebuild')}
+			</Button>
+		{/if}
+		<Button variant="primary" onclick={onClose}>{$t('cartridge.close')}</Button>
 	</div>
 </DialogShell>
 
@@ -173,78 +147,52 @@
 	.dialog-header {
 		display: flex;
 		align-items: center;
-		gap: 10px;
-		margin-bottom: 12px;
+		gap: var(--space-2);
+		margin-bottom: var(--space-3);
 	}
 	.dialog-title {
 		margin: 0;
-		font-size: 1.15rem;
+		font-size: var(--font-size-lg);
 		color: var(--text-primary);
 		flex: 1;
 	}
-	.status-badge {
-		padding: 2px 8px;
-		border-radius: 10px;
-		font-size: 0.8rem;
-		background-color: var(--bg-secondary);
-		color: var(--text-secondary);
-		border: 1px solid var(--border);
-	}
-	.status-badge.loaded {
-		background-color: var(--control-bg);
-		color: var(--text-primary);
-		border-color: var(--border);
-	}
 	.description {
 		color: var(--text-secondary);
-		font-size: 0.95rem;
 		line-height: 1.5;
-		margin: 0 0 16px;
+		margin: 0 0 var(--space-4);
 	}
 	.detail-grid {
-		background-color: var(--bg-secondary);
-		border-radius: var(--border-radius);
-		padding: 12px;
-		margin-bottom: 16px;
-		display: flex;
-		flex-direction: column;
-		gap: 6px;
+		display: grid;
+		grid-template-columns: max-content 1fr;
+		gap: var(--space-2) var(--space-4);
+		margin: 0 0 var(--space-4);
 	}
-	.info-row {
-		display: flex;
-		justify-content: space-between;
-		font-size: 0.95rem;
+	.detail-grid.technical {
+		margin: var(--space-2) 0 0;
+		font-size: var(--font-size-sm);
 	}
-	.label {
+	dt {
 		color: var(--text-secondary);
 	}
-	.value {
+	dd {
+		margin: 0;
 		color: var(--text-primary);
-		font-weight: 500;
-	}
-	.tags-row {
-		flex-wrap: wrap;
+		overflow-wrap: anywhere;
 	}
 	.tags {
 		display: flex;
-		gap: 4px;
+		gap: var(--space-1);
 		flex-wrap: wrap;
-		justify-content: flex-end;
 	}
-	.tag {
-		padding: 1px 6px;
-		background-color: var(--bg-primary);
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		font-size: 0.8rem;
-		font-weight: 400;
+	.mono {
+		font-family: monospace;
 	}
 	.language-pack {
-		margin-bottom: 16px;
+		margin-bottom: var(--space-4);
 	}
 	.language-pack-title {
-		margin: 0 0 8px;
-		font-size: 0.95rem;
+		margin: 0 0 var(--space-2);
+		font-size: var(--font-size-base);
 		color: var(--text-primary);
 	}
 	.language-pack-list {
@@ -253,68 +201,26 @@
 		margin: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 4px;
+		gap: var(--space-1);
 	}
 	.language-pack-item {
 		display: flex;
 		align-items: baseline;
-		gap: 8px;
-		font-size: 0.9rem;
+		gap: var(--space-2);
 		flex-wrap: wrap;
 	}
 	.lang-id {
 		font-weight: 500;
 		color: var(--text-primary);
 	}
-	.lang-id.disabled {
-		opacity: 0.6;
-	}
-	.lang-status {
-		color: var(--text-secondary);
-	}
-	.lang-status.enabled {
-		color: var(--text-primary);
-	}
 	.lang-reason {
-		color: var(--text-secondary);
-		font-size: 0.8rem;
-		opacity: 0.8;
-	}
-	.action-section {
-		display: flex;
-		gap: 8px;
-		margin-bottom: 16px;
-	}
-	.btn {
-		padding: 8px 16px;
-		border-radius: var(--border-radius);
-		font-size: 0.95rem;
-		cursor: pointer;
-		border: none;
-	}
-	.btn-action {
-		flex: 1;
-		background-color: var(--bg-secondary);
-		color: var(--text-primary);
-		border: 1px solid var(--border);
-	}
-	.btn-action:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-	.btn-action:hover:not(:disabled) {
-		opacity: 0.85;
+		color: var(--text-muted);
+		font-size: var(--font-size-xs);
 	}
 	.dialog-actions {
 		display: flex;
 		justify-content: flex-end;
-	}
-	.btn-close {
-		background-color: var(--bg-secondary);
-		color: var(--text-primary);
-		border: 1px solid var(--border);
-	}
-	.btn-close:hover {
-		opacity: 0.9;
+		gap: var(--space-2);
+		margin-top: var(--space-4);
 	}
 </style>

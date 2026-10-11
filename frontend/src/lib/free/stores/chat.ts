@@ -1,5 +1,5 @@
 import { writable, derived, get } from 'svelte/store';
-import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact, CorpusMode, TemplateHint } from '$lib/free/api';
+import type { TokenInfo, RagDebugInfo, SourcesInfo, EditorCodeArtifact, TemplateHint } from '$lib/free/api';
 import { switchModeApi } from '$lib/free/api';
 import { DEFAULT_TOKEN_LIMIT, MODE_RESTART_STATUS_TIMEOUT_MS } from '$lib/free/constants';
 
@@ -43,8 +43,6 @@ export interface ChatMessage {
 	sources?: SourcesInfo;
 	/** ユーザーの明示評価 (👎 / 👍)。UI の表示状態のみ (記録は /api/learning/feedback) */
 	feedback?: 'negative' | 'positive';
-	/** クリエイトモードでの生成コード出力先 ('editor' 既定 / 'chat' 明示指示時) */
-	editor_route?: 'editor' | 'chat';
 	/** long_form 生成の進捗 (ユニット i/total)。生成中のみセットされ常時表示される */
 	long_form_progress?: LongFormProgress;
 	/**
@@ -79,29 +77,10 @@ export const messages = writable<ChatMessage[]>([]);
 /** 現在のモード */
 export const currentMode = writable<string>('chat');
 
-/** 文書 (corpus) の参加モード。ロード状態はグローバルなので問い単位で切る (f_01 §8.1)。 */
-const CORPUS_MODE_KEY = 'evoref.corpus_mode';
-function loadCorpusMode(): CorpusMode {
-	try {
-		const v = typeof localStorage !== 'undefined' ? localStorage.getItem(CORPUS_MODE_KEY) : null;
-		return v === 'on' || v === 'off' ? v : 'auto';
-	} catch {
-		return 'auto';
-	}
-}
-export const corpusMode = writable<CorpusMode>(loadCorpusMode());
-corpusMode.subscribe((v) => {
-	try {
-		if (typeof localStorage !== 'undefined') localStorage.setItem(CORPUS_MODE_KEY, v);
-	} catch {
-		/* private window 等: 保持できなくても動作は変えない */
-	}
-});
-
 /**
  * 選択中の文書テンプレート鍵 (`<package_id>:<entry_id>`)。
  *
- * corpusMode と異なり **次の 1 回の送信にだけ効く** (c_16 §4.5.2)。選んだ
+ * **次の 1 回の送信にだけ効く** (c_16 §4.5.2)。選んだ
  * テンプレートが別の依頼にも貼り付いたままだと誤適用になるため、送信の
  * たびに `null` へ戻す (`ChatInput.handleSend`)。localStorage には持たない。
  */
@@ -210,55 +189,15 @@ export function setRagDebugToLastAssistant(ragDebug: RagDebugInfo): void {
 }
 
 /**
- * 出力先パス未指定時にエディタペインへ流す生成コード片の受け皿。
- *
- * バックエンドの `editor_code` SSE フレームを ChatInput が push し、Pro の
- * EditorPanel が購読して `loadGeneratedCode` へ渡す (Free→Pro 越境を作らない
- * ための共有ストア。`messages`/`isStreaming` を Pro が読む構図と同型)。
- * Free ビルドでは購読側が存在せず no-op。
+ * 生成コード (`editor_code` の確定フレーム) を最後のアシスタントメッセージへ
+ * フェンス付きコードブロックとして足す。エディタ撤去後の唯一の表示先。
+ * 本文に ``` が含まれても閉じ崩れしないよう、フェンスは本文より長く取る。
  */
-export const generatedEditorCode = writable<EditorCodeArtifact[]>([]);
-
-/** 生成コード片を 1 件追加する (editor_code SSE フレーム受信時) */
-export function pushGeneratedEditorCode(artifact: EditorCodeArtifact): void {
-	generatedEditorCode.update((list) => [...list, artifact]);
-}
-
-/** 生成コード片の受け皿をクリアする (消費後 / 新ターン開始時) */
-export function clearGeneratedEditorCode(): void {
-	generatedEditorCode.set([]);
-}
-
-/**
- * long_form 生成の逐次更新コード (ユニット完了ごとの累積本文)。
- *
- * `editor_code` SSE フレームの `partial=true` を ChatInput がここへ set し、Pro の
- * EditorPanel が購読して同一タブを上書き更新する (生成途中の経過を可視化)。
- * 終端の確定本文 (`partial=false`) も同経路で流し、最後に EditorPanel が clear する。
- * `generatedEditorCode` (確定本文を新規タブへ流す既存経路) とは独立。Free ビルドでは
- * 購読側が存在せず no-op。
- */
-export const streamingEditorCode = writable<EditorCodeArtifact | null>(null);
-
-/** 逐次更新コードを set する (partial / final 共通) */
-export function setStreamingEditorCode(artifact: EditorCodeArtifact): void {
-	streamingEditorCode.set(artifact);
-}
-
-/** 逐次更新コードの受け皿をクリアする (確定反映後 / 新ターン開始時) */
-export function clearStreamingEditorCode(): void {
-	streamingEditorCode.set(null);
-}
-
-/** 最後のアシスタントメッセージに生成コードの出力先をセット */
-export function setEditorRouteToLastAssistant(target: 'editor' | 'chat'): void {
-	messages.update((msgs) => {
-		const last = msgs[msgs.length - 1];
-		if (last?.role === 'assistant') {
-			return [...msgs.slice(0, -1), { ...last, editor_route: target }];
-		}
-		return msgs;
-	});
+export function appendGeneratedCodeToLastAssistant(artifact: EditorCodeArtifact): void {
+	const longest = Math.max(2, ...(artifact.content.match(/`+/g) ?? []).map((m) => m.length));
+	const fence = '`'.repeat(longest + 1);
+	const label = artifact.filename ? `\`${artifact.filename}\`\n\n` : '';
+	appendToLastAssistant(`${label}${fence}${artifact.language}\n${artifact.content}\n${fence}\n\n`);
 }
 
 /** 最後のアシスタントメッセージに long_form 進捗をセット (生成中の常時表示用) */

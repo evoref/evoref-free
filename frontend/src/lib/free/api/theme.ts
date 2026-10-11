@@ -41,20 +41,6 @@ export interface GuiLayoutResponse {
 		show_timestamps: boolean;
 		show_agentic_steps: 'expanded' | 'collapsed' | 'hidden';
 	};
-	create: {
-		pane_ratio: [number, number];
-		pane_direction: 'horizontal' | 'vertical';
-		editor?: {
-			show_line_numbers: boolean;
-			word_wrap: boolean;
-			tab_size: number;
-			font_family: string;
-			font_size: number;
-			line_height: number;
-			show_toolbar: boolean;
-			show_active_line: boolean;
-		};
-	};
 	dashboard: {
 		panels: string[];
 		grid_columns: number;

@@ -8,15 +8,21 @@
 	import NumberField from './fields/NumberField.svelte';
 	import ToggleField from './fields/ToggleField.svelte';
 	import SliderField from './fields/SliderField.svelte';
-	import RuntimeSettingsGroup from './RuntimeSettingsGroup.svelte';
 
+	// 応答の生成タブ: サンプリング (modes.*) と応答の長さ (llama.max_tokens)、長文の主要項目だけを出す。
+	// 長文の内部調整 (rolling_short_term_chars / max_revisions / rag_per_unit / rag_top_k_per_unit) は config.yaml で書く
 	let modes = $derived(configSection($configData, 'modes'));
+	let llama = $derived(configSection($configData, 'llama'));
 	let chat = $derived((modes.chat ?? {}) as ChatModeConfig);
 	let create = $derived((modes.create ?? {}) as CreateModeConfig);
 	let longForm = $derived(configSection($configData, 'long_form') as LongFormConfig);
 </script>
 
 <SettingsSection tabId="generation">
+	<FieldGroup label="settings.group_response_length">
+		<NumberField label="settings.llama.max_tokens" value={Number(llama.max_tokens ?? 2048)} min={0} description="settings.llama.max_tokens_desc" onchange={fieldUpdater('llama', 'max_tokens')} />
+	</FieldGroup>
+
 	<FieldGroup label="settings.group_mode_chat">
 		<SliderField label="settings.modes.temperature" value={Number(chat.temperature ?? 0.7)} min={0} max={2} step={0.05} description="settings.modes.temperature_desc" onchange={nestedFieldUpdater('modes', 'chat', 'temperature')} />
 		<SliderField label="settings.modes.top_p" value={Number(chat.top_p ?? 0.9)} min={0} max={1} step={0.01} description="settings.modes.top_p_desc" onchange={nestedFieldUpdater('modes', 'chat', 'top_p')} />
@@ -37,13 +43,6 @@
 	<FieldGroup label="settings.group_long_form">
 		<NumberField label="settings.long_form.max_units" value={Number(longForm.max_units ?? 20)} min={1} onchange={fieldUpdater('long_form', 'max_units')} />
 		<NumberField label="settings.long_form.unit_max_tokens" value={Number(longForm.unit_max_tokens ?? 2000)} min={100} onchange={fieldUpdater('long_form', 'unit_max_tokens')} />
-		<NumberField label="settings.long_form.rolling_short_term_chars" value={Number(longForm.rolling_short_term_chars ?? 1000)} min={100} onchange={fieldUpdater('long_form', 'rolling_short_term_chars')} />
 		<ToggleField label="settings.long_form.review_enabled" value={Boolean(longForm.review_enabled ?? true)} onchange={fieldUpdater('long_form', 'review_enabled')} />
-		<NumberField label="settings.long_form.max_revisions" value={Number(longForm.max_revisions ?? 1)} min={0} onchange={fieldUpdater('long_form', 'max_revisions')} />
-		<ToggleField label="settings.long_form.rag_per_unit" value={Boolean(longForm.rag_per_unit ?? true)} onchange={fieldUpdater('long_form', 'rag_per_unit')} />
-		<NumberField label="settings.long_form.rag_top_k_per_unit" value={Number(longForm.rag_top_k_per_unit ?? 3)} min={1} onchange={fieldUpdater('long_form', 'rag_top_k_per_unit')} />
 	</FieldGroup>
-
-	<!-- create の実行環境は専用 API で保存する (タブの「適用」には乗らない) -->
-	<RuntimeSettingsGroup />
 </SettingsSection>

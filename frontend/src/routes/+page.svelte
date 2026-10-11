@@ -4,28 +4,15 @@
 	import { messages, currentMode, switchMode } from '$lib/free/stores/chat';
 	import { activeCreateRun } from '$lib/free/stores/createRun';
 	import { get } from 'svelte/store';
-	import { themeSlots, layout } from '$lib/free/stores/theme';
+	import { themeSlots } from '$lib/free/stores/theme';
 	import { t } from '$lib/i18n';
 	import { instanceName } from '$lib/free/stores/app';
-	import { isPro } from '$lib/edition';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
 	import { onMount } from 'svelte';
-	import type { Component } from 'svelte';
 	import { reattachCreateRun } from '$lib/free/services/createReattach';
 
-	// エディション境界: Free 配下のコンポーネントは $lib/pro を参照できない。
-	// route 層 (ここ) が edition-aware composition 層として Pro 専用 CodeMirror UI を
-	// `import.meta.glob` で動的ロードする。Free ビルドでは Pro チャンクが entry に含まれない。
-	const proLoaders = import.meta.glob<{ default: Component }>(
-		'/src/lib/pro/components/{EditorPanel,SplitPane}.svelte'
-	);
-
-	let SplitPane: Component | null = $state(null);
-	let EditorPanel: Component | null = $state(null);
-
 	onMount(async () => {
-		// クリエイト run の再接続 (f_05 §4.5)。Pro の EditorPanel ロードとは独立
-		// (成果物は generatedEditorCode ストアへ流すだけで、Free ビルドでは no-op)。
+		// クリエイト run の再接続 (f_05 §4.5)。
 		// リロード後は既定の chat モードで開くので、保存された run があれば
 		// 先に create へ切り替える (バックエンドが既に create ならモデル入替は無い)。
 		if (get(activeCreateRun)) {
@@ -35,13 +22,6 @@
 			if (get(currentMode) === 'create') {
 				reattachCreateRun();
 			}
-		}
-		if (!isPro) return;
-		const entries = Object.entries(proLoaders);
-		for (const [path, loader] of entries) {
-			const mod = await loader();
-			if (path.endsWith('/SplitPane.svelte')) SplitPane = mod.default;
-			else if (path.endsWith('/EditorPanel.svelte')) EditorPanel = mod.default;
 		}
 	});
 </script>
@@ -66,30 +46,9 @@
 {/snippet}
 
 <PageLayout fullHeight>
-	{#if $currentMode === 'create' && isPro && SplitPane && EditorPanel}
-		{@const SP = SplitPane}
-		{@const EP = EditorPanel}
-		<SP
-			ratio={$layout.create.pane_ratio}
-			direction={$layout.create.pane_direction}
-			onResize={(newRatio: [number, number]) => {
-				layout.update(l => ({ ...l, create: { ...l.create, pane_ratio: newRatio } }));
-			}}
-		>
-			{#snippet left()}
-				<div class="chat-page">
-					{@render chatContent()}
-				</div>
-			{/snippet}
-			{#snippet right()}
-				<EP />
-			{/snippet}
-		</SP>
-	{:else}
-		<div class="chat-page">
-			{@render chatContent()}
-		</div>
-	{/if}
+	<div class="chat-page">
+		{@render chatContent()}
+	</div>
 </PageLayout>
 
 <style>

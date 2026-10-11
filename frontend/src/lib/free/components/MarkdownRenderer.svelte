@@ -8,7 +8,7 @@
 	 * これにより `<pre><code>` ベタ書きから CodeMirror の defaultHighlightStyle を
 	 * 通したシンタックスハイライト表示へ移行できる。
 	 *
-	 * Free 専用。Pro の CodeMirrorEditor とは依存独立 (Pro/Free 共通 import なし)。
+	 * Free 専用。
 	 */
 	import { untrack } from 'svelte';
 	import { marked, type Token } from 'marked';
@@ -17,7 +17,6 @@
 	import MermaidDiagram from './MermaidDiagram.svelte';
 	import { normalizeLanguage } from '$lib/free/utils/code_blocks';
 	import { installKatexExtension, KATEX_SANITIZE_OPTIONS } from '$lib/free/utils/katex_marked';
-	import { t } from '$lib/i18n';
 	import 'katex/dist/katex.min.css';
 
 	// marked シングルトンへの登録はモジュール初期化時に一度だけ行う。
@@ -60,9 +59,7 @@
 		renderCache.set(key, html);
 	}
 
-	// suppressCode: クリエイトモードでコードをエディタへ流す場合、チャット側の
-	// コードブロックを「エディタに出力」プレースホルダに置換する。
-	let { content, suppressCode = false }: { content: string; suppressCode?: boolean } = $props();
+	let { content }: { content: string } = $props();
 
 	/**
 	 * 描画をフレームへ合流させる。
@@ -140,10 +137,7 @@
 	{#each tokens as token, i (i)}
 		{#if token.type === 'code'}
 			{#if isMermaid(token.lang)}
-				<!-- 設計フローチャート等: suppressCode でも図は描画する -->
 				<MermaidDiagram code={token.text} />
-			{:else if suppressCode}
-				<div class="code-in-editor">{$t('chat.code_in_editor', { lang: normalizeLanguage(token.lang) })}</div>
 			{:else}
 				<CodeViewer content={token.text} language={normalizeLanguage(token.lang)} />
 			{/if}
@@ -167,18 +161,6 @@
 	}
 	.markdown-renderer :global(.katex) {
 		word-break: normal;
-	}
-	.code-in-editor {
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		margin: 6px 0;
-		padding: 4px 10px;
-		font-size: 0.85em;
-		color: var(--text-secondary);
-		background: var(--code-bg);
-		border: 1px dashed var(--border);
-		border-radius: var(--border-radius);
 	}
 	.markdown-renderer :global(code) {
 		background-color: var(--code-bg);

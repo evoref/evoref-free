@@ -180,7 +180,7 @@
 		font-weight: normal;
 	}
 	.lf-progress.failed {
-		color: #ef4444;
+		color: var(--color-error);
 		font-weight: normal;
 	}
 	.lf-icon {
@@ -263,12 +263,12 @@
 		gap: 4px;
 	}
 	.result-status {
-		color: #22c55e;
+		color: var(--color-success);
 		font-weight: 700;
 		flex-shrink: 0;
 	}
 	.result-status.failed {
-		color: #ef4444;
+		color: var(--color-error);
 	}
 	.result-text {
 		opacity: 0.85;

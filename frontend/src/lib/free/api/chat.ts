@@ -134,9 +134,6 @@ export interface ChatStreamEvent {
 	template_hint?: TemplateHint;
 }
 
-/** 文書 (corpus パッケージ) の参加モード。auto = 問いと較正で決める / on = 問い側の抑止を掛けない / off = このターンは引かない */
-export type CorpusMode = 'auto' | 'on' | 'off';
-
 /** SSE ストリーミングチャット */
 export async function* chatStream(
 	message: string,
@@ -145,7 +142,6 @@ export async function* chatStream(
 	/** 添付から抽出したチャンク (`extractFile` の応答)。バックエンドが本文に注入する */
 	fileContexts?: FileContext[],
 	signal?: AbortSignal,
-	corpusMode: CorpusMode = 'auto',
 	/** 選択中の文書テンプレート鍵 (`<package_id>:<entry_id>`)。このターンだけ効く */
 	template: string | null = null
 ): AsyncGenerator<ChatStreamEvent> {
@@ -167,7 +163,6 @@ export async function* chatStream(
 				mode,
 				session_id: sessionId,
 				file_contexts: fileContexts,
-				corpus_mode: corpusMode,
 				template
 			}),
 			signal

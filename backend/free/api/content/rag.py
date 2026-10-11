@@ -191,7 +191,7 @@ async def ingest_document(
 async def get_rag_stats(state: AppState = Depends(get_app_state)):
     """corpus (文書由来チャンク) の統計情報。
 
-    フィールド名は frontend (`RAGStats.svelte` / `stores/dashboard.ts`) が
+    フィールド名は frontend (`stores/dashboard.ts`、表示は `DocumentSummary.svelte` / `RagDetail.svelte`) が
     そのまま読むので据え置き、中身だけ corpus 由来へ移した:
 
     - ``total_chunks`` / ``total_vectors``: 全パッケージのチャンク数の合計

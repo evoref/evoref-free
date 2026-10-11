@@ -8,12 +8,8 @@
 		addStepResultToLastAssistant,
 		setRagDebugToLastAssistant,
 		setSourcesToLastAssistant,
-		setEditorRouteToLastAssistant,
 		setLongFormProgressToLastAssistant,
-		pushGeneratedEditorCode,
-		clearGeneratedEditorCode,
-		setStreamingEditorCode,
-		clearStreamingEditorCode,
+		appendGeneratedCodeToLastAssistant,
 		markLastUserTruncated,
 		markLastAssistantTruncated,
 		nextMessageId,
@@ -23,7 +19,7 @@
 		currentMode,
 		modeRestartStatus,
 		attachedFiles,
-		clearFiles, corpusMode, selectedTemplate, templatesRevision, templateHint
+		clearFiles, selectedTemplate, templatesRevision, templateHint
 	} from '$lib/free/stores/chat';
 	import {
 		chatStream,
@@ -119,10 +115,6 @@
 	let cancelled = false;
 	/** 進行中ターンの request_id (`agent_layer` フレームで届く)。キャンセルの宛先 */
 	let activeRequestId: string | undefined;
-	/** このターンで partial editor_code を受信したか (final を streaming タブへ確定するため) */
-	let sawPartialEditor = false;
-	/** このターンでエディタへコードを出力したか (editor_code 受信)。完了通知の発火条件 */
-	let sawEditorCode = false;
 	/** このターンで needs_input を受信したか (再接続用 run 記録を残すかの判定) */
 	let sawNeedsInput = false;
 	/** 制作中で受け付けられなかったとき (E0409) の走っている run。後始末の後で再接続する */
@@ -183,10 +175,6 @@
 		clearFiles();
 		selectedTemplate.set(null);
 		templateHint.set(null);
-		clearGeneratedEditorCode();
-		clearStreamingEditorCode();
-		sawPartialEditor = false;
-		sawEditorCode = false;
 		sawNeedsInput = false;
 		busyRun = null;
 		isStreaming.set(true);
@@ -208,7 +196,7 @@
 		});
 
 		try {
-			for await (const event of chatStream(text, mode, turnSessionId, fileContexts, abortController.signal, get(corpusMode), templateKey)) {
+			for await (const event of chatStream(text, mode, turnSessionId, fileContexts, abortController.signal, templateKey)) {
 				if (event.type === 'token' && event.token) {
 					appendToLastAssistant(event.token);
 				} else if (event.type === 'agent_layer') {
@@ -265,21 +253,9 @@
 					setSourcesToLastAssistant(event.sources);
 				} else if (event.type === 'template_hint' && event.template_hint) {
 					templateHint.set(event.template_hint);
-				} else if (event.type === 'editor_route' && event.editor_route) {
-					setEditorRouteToLastAssistant(event.editor_route.target);
 				} else if (event.type === 'editor_code' && event.editor_code) {
-					sawEditorCode = true;
-					// partial=true: long_form 生成途中の逐次更新 → streaming タブへ上書き。
-					// final: partial を受けていれば streaming タブを確定、そうでなければ
-					// (meta_cognitive 等の単発出力) 従来通り新規タブへ流す。
-					if (event.editor_code.partial) {
-						sawPartialEditor = true;
-						setStreamingEditorCode(event.editor_code);
-					} else if (sawPartialEditor) {
-						setStreamingEditorCode(event.editor_code);
-					} else {
-						pushGeneratedEditorCode(event.editor_code);
-					}
+					// long_form の途中経過 (partial) は表示しない。終端の確定本文だけをチャットへ出す
+					if (!event.editor_code.partial) appendGeneratedCodeToLastAssistant(event.editor_code);
 				} else if (event.type === 'error') {
 					// 別の制作が走っていて受け付けられなかった (f_10 §3)。run が分かれば
 					// 後始末の後で再接続し、進捗の表示と中止をそこから行う (f_05 §4.5)。
@@ -304,10 +280,6 @@
 							: event.error;
 					appendToLastAssistant(`\n\n**${$t('common.error')}:** ${detail}`);
 				}
-			}
-			// クリエイトモードでエディタへコードを出力したターンの完了通知
-			if (!cancelled && mode === 'create' && sawEditorCode) {
-				addStepResultToLastAssistant($t('chat.code_output_done'), 'done');
 			}
 		} catch (e) {
 			if (!cancelled) {
@@ -595,7 +567,7 @@
 	.readonly-note {
 		padding-bottom: 8px;
 		font-size: 12px;
-		color: var(--error, #c0392b);
+		color: var(--color-error);
 	}
 
 	.reembed-confirm {

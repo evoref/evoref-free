@@ -2,7 +2,7 @@
 
 import { request } from './_client';
 
-export type ServerName = 'base' | 'embed';
+export type ServerName = 'base' | 'embed' | 'rerank';
 
 export interface ServerActionResponse {
 	name: string;

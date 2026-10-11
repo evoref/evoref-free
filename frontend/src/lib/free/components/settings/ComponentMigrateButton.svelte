@@ -11,6 +11,8 @@
 	 *     無く、再起動は別途手動で行うため結果に「手動で再起動してください」バッジを出す。
 	 *   - create: migrate API 無し (model_state 非追跡)。`onApply` 経由で
 	 *     config を即保存する (実際の切替は POST /api/mode/switch がモード遷移時に行う)。
+	 *   - rerank: migrate API 無し (model_state 非追跡)。create と同じく `onApply` で config を即保存し、
+	 *     反映は rerank サーバーの再起動 (結果に「手動で再起動」バッジ)。
 	 *
 	 * UI は apply ボタン (disabled / loading) → 結果表示 (成功 / エラー) の一発適用で、
 	 * ロールバックボタン・再起動ボタンは持たない (#198 で UI から廃止)。再起動状態バッジは
@@ -25,8 +27,8 @@
 		type ModelComponent
 	} from '$lib/free/api';
 
-	/** UI レベルの種別。API の ModelComponent (embedding) を base/create へ拡張 */
-	type ModelKind = ModelComponent | 'base' | 'create';
+	/** UI レベルの種別。API の ModelComponent (embedding) を base/create/rerank へ拡張 */
+	type ModelKind = ModelComponent | 'base' | 'create' | 'rerank';
 
 	/** base/embedding/create のレスポンス差を吸収した共通結果形 */
 	type MigrateResult = {
@@ -79,7 +81,7 @@
 					restarted: false,
 					recommendations: r.recommendations
 				};
-			} else if (component === 'create') {
+			} else if (component === 'create' || component === 'rerank') {
 				await onApply?.(newPath);
 				result = {
 					old_model: currentModel || '—',
@@ -168,14 +170,14 @@
 	}
 	.current {
 		font-size: 0.85rem;
-		color: var(--text-secondary, #555);
+		color: var(--text-secondary);
 	}
 	.path-input {
 		padding: 0.4rem 0.6rem;
 		border-radius: 4px;
-		border: 1px solid var(--border-color, #999);
-		background: var(--bg-primary, #fff);
-		color: var(--text-primary, #222);
+		border: 1px solid var(--input-border);
+		background: var(--bg-primary);
+		color: var(--text-primary);
 		font-size: 0.9rem;
 	}
 	.actions {
@@ -187,9 +189,9 @@
 	button {
 		padding: 0.4rem 0.8rem;
 		border-radius: 4px;
-		border: 1px solid var(--border-color, #999);
-		background: var(--bg-secondary, #f5f5f5);
-		color: var(--text-primary, #222);
+		border: 1px solid var(--input-border);
+		background: var(--bg-secondary);
+		color: var(--text-primary);
 		cursor: pointer;
 		font-size: 0.9rem;
 	}
@@ -198,9 +200,9 @@
 		cursor: not-allowed;
 	}
 	button.apply-btn {
-		background: var(--accent-bg, #2563eb);
-		color: var(--accent-text, #fff);
-		border-color: var(--accent-bg, #2563eb);
+		background: var(--accent);
+		color: var(--text-on-accent);
+		border-color: var(--accent);
 	}
 	.result {
 		padding: 0.5rem 0.75rem;
@@ -208,14 +210,14 @@
 		font-size: 0.85rem;
 	}
 	.result.success {
-		background: var(--bg-success-soft, #ecfdf5);
-		color: var(--text-success, #065f46);
-		border: 1px solid var(--border-success, #6ee7b7);
+		background: var(--bg-secondary);
+		color: var(--text-primary);
+		border: 1px solid var(--color-success);
 	}
 	.result.error {
-		background: var(--bg-error-soft, #fef2f2);
-		color: var(--text-error, #991b1b);
-		border: 1px solid var(--border-error, #fca5a5);
+		background: var(--bg-secondary);
+		color: var(--color-error);
+		border: 1px solid var(--color-error);
 	}
 	.badge {
 		display: inline-block;
@@ -225,12 +227,12 @@
 		font-size: 0.75rem;
 	}
 	.badge.restarted {
-		background: var(--accent-bg, #2563eb);
-		color: var(--accent-text, #fff);
+		background: var(--accent);
+		color: var(--text-on-accent);
 	}
 	.badge.manual {
-		background: var(--bg-warning-soft, #fef3c7);
-		color: var(--text-warning, #92400e);
+		background: var(--bg-secondary);
+		color: var(--text-primary);
 	}
 	ul {
 		margin: 0.25rem 0 0 1rem;

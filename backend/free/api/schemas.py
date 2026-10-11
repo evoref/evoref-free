@@ -216,6 +216,8 @@ class RerankStatusInfo(BaseModel):
     """
     mode: str = "off"
     enabled: bool = False
+    #: rerank 用 llama-server が今 ``/health`` に応えるか (``/api/status`` ごとに確かめる。設定画面の状態表示用)。
+    connected: bool = False
     placement: str = ""
     ms_per_doc: float | None = None
     #: 自己テストの文書長 (1 組 約 390 トークン) で締切に収まる件数 (有効かどうかの判定に使う)。

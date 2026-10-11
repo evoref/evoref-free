@@ -2,6 +2,7 @@
 	/** 履歴の統計 (件数・容量) と、圧縮 / 絞り込み結果の一括削除ボタン */
 	import { t } from '$lib/i18n';
 	import type { HistoryStats } from '$lib/free/api';
+	import Button from '../ui/Button.svelte';
 
 	interface Props {
 		stats: HistoryStats;
@@ -24,10 +25,10 @@
 		})}
 	</span>
 	<div class="stats-actions">
-		<button class="stats-btn" onclick={oncompact}>{$t('history_page.compact')}</button>
-		<button class="stats-btn danger" onclick={onbulkdelete} disabled={matchedTotal === 0}>
+		<Button size="sm" onclick={oncompact}>{$t('history_page.compact')}</Button>
+		<Button size="sm" variant="danger" onclick={onbulkdelete} disabled={matchedTotal === 0}>
 			{$t('history_page.bulk_delete', { count: matchedTotal })}
-		</button>
+		</Button>
 	</div>
 </div>
 
@@ -37,30 +38,14 @@
 		flex-wrap: wrap;
 		align-items: center;
 		justify-content: space-between;
-		gap: 8px;
-		padding: 6px 16px;
-		font-size: 12px;
+		gap: var(--space-2);
+		padding: var(--space-2) var(--space-5);
+		font-size: var(--font-size-xs);
 		color: var(--text-secondary);
 		border-bottom: 0.5px solid var(--border);
 	}
 	.stats-actions {
 		display: flex;
-		gap: 8px;
-	}
-	.stats-btn {
-		padding: 4px 10px;
-		border: 0.5px solid var(--input-border);
-		border-radius: 6px;
-		background: var(--control-bg);
-		color: var(--text-primary);
-		font-size: 12px;
-		cursor: pointer;
-	}
-	.stats-btn.danger {
-		color: var(--error, #c0392b);
-	}
-	.stats-btn:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
+		gap: var(--space-2);
 	}
 </style>

@@ -278,6 +278,14 @@ llama:
   # false: 本機構を完全 OFF にし、従来どおり extra_args 手動指定のみで運用する。
   auto_model_flags: true
   extra_args: []                  # 上記以外の任意オプションを文字列リストで追加 (auto_model_flags より優先)
+  # 起動オプション (llama-server の引数を 1 行の文字列で、c_16 §7.2.4)。設定画面の「モデル」から編集できる。
+  # ここで指定したフラグは自動で組み立てた同じフラグ (短縮 / 長形の別名も同じとみなす) を置き換え、
+  # 環境調整 (auto) より優先する。-c / -ngl / -np / -t / -b / -ub / --cache-ram / --ctx-checkpoints /
+  # --kv-unified は上のキーへ写る。-m / --port / --host は書けない (model_paths と port が正本)。
+  # 空白を含む値は "..." か '...' で囲む。設定画面から書けるのは性能・メモリの調整フラグだけ
+  # (ファイル・ネットワークに触れるフラグはこのファイルを直接編集する)。create_model もこの値で起動する。
+  #   例: launch_args: "-c 16384 -ngl 99 -fa on"
+  launch_args: ""
   # --- RoPE スケーリング（モデルの学習時コンテキスト長を超える場合）---
   # linear: シンプル、短〜中距離向け
   #   例: ["--rope-scaling", "linear", "--rope-scale", "2"]  # context_size × 2
@@ -617,6 +625,7 @@ rag:
     max_candidates: 12            # 1 回に並べ替える候補数の上限 (実際に送る量はこれと自己テストの速度から決まるトークン予算の早い方)
     min_candidates: 3             # 締切に収まる候補数がこれ未満なら無効 (too_slow)
     threads: 0                    # -t (0 = 自動: GPU 配置は 2、CPU 配置は環境調整が決めた物理コアの 1/4 (下限 1)。物理コア数が推定値なら付けない)
+    launch_args: ""               # 起動オプション (llama.launch_args と同じ規則)。既定の -c 8192 -b 8192 -ub 2048 -np 1 --cache-ram 0 等の同じフラグを置き換える。-ngl / -t は gpu_layers / threads へ写る
 
 # ===== 埋め込みモデル設定 =====
 embedding:
@@ -682,6 +691,9 @@ embedding:
   # idle slot offload。埋め込みは chat slots を使わないため
   # 上流既定 8192 MiB の RAM 予約は無意味。0 で明示 disable する。
   cache_ram_mib: 0
+  # 起動オプション (llama.launch_args と同じ規則)。-c / -ngl / -np / -t / -b / -ub / --cache-ram は上のキーへ写る
+  #   例: launch_args: "-ngl 99 -ub 8192"
+  launch_args: ""
   # instruction-aware モデル (Qwen3 等) 用の mode 別 task description。
   # mode は chat / create のいずれか。
   instructions:
@@ -1175,31 +1187,6 @@ i18n:
 #
 # 通常起動 (--develop 未指定) では backend.log が INFO+ で固定されます。
 
-
-# ===== エディタ設定（Pro ワークモード）=====
-editor:
-  font_family: monospace            # フォントファミリー
-  font_size: 14                     # フォントサイズ（8〜48）
-  line_height: 1.5                  # 行高（1.0〜3.0）
-  tab_size: 4                       # タブサイズ（1〜8）
-  word_wrap: false                  # 折り返し
-  show_line_numbers: true           # 行番号表示
-  show_active_line: true            # アクティブ行ハイライト
-  show_toolbar: true                # ツールバー表示
-  default_encoding: utf-8           # デフォルトエンコーディング: utf-8 / shift_jis / euc-jp / iso-2022-jp
-  default_line_ending: lf           # 改行コード: lf / crlf / cr
-  highlight_languages:              # シンタックスハイライト対応言語
-    - markdown
-    - python
-    - javascript
-    - typescript
-    - json
-    - html
-    - css
-    - yaml
-    - xml
-    - sql
-    - php
 
 # ===== 長文生成設定 =====
 # 長文生成エンジン。詳細は docs/f_08_long_form_generation.md 参照。

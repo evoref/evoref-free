@@ -16,11 +16,17 @@
 	--border: rgba(64, 64, 64, 0.35);
 	--code-bg: #e8e8e8;
 	--code-text: #2a2a2a;
-	--color-success: #555555;
-	--color-warning: #555555;
-	--color-error: #1a1a1a;
-	--color-info: #555555;
+	/* 意味色。テーマなしでは灰色の濃淡だけで表し、区別は記号・ラベルで補う。
+	 * テーマは --success / --warning / --error / --info (docs/c_11 §2.2) か
+	 * --color-* のどちらを定義してもよい。 */
+	--success: #555555;
+	--warning: #555555;
 	--error: #1a1a1a;
+	--info: #555555;
+	--color-success: var(--success);
+	--color-warning: var(--warning);
+	--color-error: var(--error);
+	--color-info: var(--info);
 	--text-on-accent: #ffffff;
 	--overlay-bg: rgba(0, 0, 0, 0.3);
 	--shadow-dialog: rgba(0, 0, 0, 0.12);
@@ -72,11 +78,14 @@
 	--border: rgba(160, 160, 160, 0.30);
 	--code-bg: #1f1f1f;
 	--code-text: #d0d0d0;
-	--color-success: #b0b0b0;
-	--color-warning: #b0b0b0;
-	--color-error: #f5f5f5;
-	--color-info: #b0b0b0;
+	--success: #b0b0b0;
+	--warning: #b0b0b0;
 	--error: #f5f5f5;
+	--info: #b0b0b0;
+	--color-success: var(--success);
+	--color-warning: var(--warning);
+	--color-error: var(--error);
+	--color-info: var(--info);
 	--text-on-accent: #000000;
 	--overlay-bg: rgba(0, 0, 0, 0.5);
 	--shadow-dialog: rgba(0, 0, 0, 0.4);
@@ -123,6 +132,21 @@
 	--font-size-base: 14px;
 	--border-radius: 8px;
 	--spacing-unit: 4px;
+
+	/* 余白・文字・角丸のスケール。--font-size-base / --border-radius はテーマが上書きする */
+	--space-1: 4px;
+	--space-2: 8px;
+	--space-3: 12px;
+	--space-4: 16px;
+	--space-5: 24px;
+	--space-6: 32px;
+	--font-size-xs: calc(var(--font-size-base) - 2px);
+	--font-size-sm: calc(var(--font-size-base) - 1px);
+	--font-size-lg: calc(var(--font-size-base) + 2px);
+	--font-size-xl: calc(var(--font-size-base) + 4px);
+	--radius-sm: calc(var(--border-radius) / 2);
+	--radius-lg: calc(var(--border-radius) * 1.5);
+	--focus-ring: 2px solid var(--text-primary);
 }
 
 body {
@@ -136,6 +160,12 @@ body {
 
 a {
 	color: var(--accent);
+}
+
+/* キーボード操作の位置を常に見せる。:where で詳細度 0 にし、部品側の指定を優先する */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+	outline: var(--focus-ring);
+	outline-offset: 2px;
 }
 
 /* Scrollbar — テーマ連動 */

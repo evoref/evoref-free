@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from backend.config_normalize import reject_retired_keys
+from backend.llama_launch_args import derive_into
 
 
 def _int_or_auto(v: object, name: str, minimum: int) -> int | str | None:
@@ -282,6 +283,11 @@ class LlamaConfig(BaseModel):
     # 解決する。false で全機構 OFF (従来挙動)。
     auto_model_flags: bool = True
     extra_args: list[str] = Field(default_factory=list)
+    # llama-server の起動オプション (例 ``-c 8192 -ngl 99 -fa on``、c_16 §7.2.4)。ここで指定した
+    # フラグは自動で組み立てた同じフラグを置き換え (別名も同じとみなす)、環境調整より優先する。
+    # ``-c`` / ``-ngl`` / ``-np`` 等は上のキー (context_size / gpu_layers / slots …) へ写す (読み手は
+    # 従来どおりキーを読む)。``-m`` / ``--port`` / ``--host`` は不可。create_model もこの値で起動する。
+    launch_args: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -290,6 +296,12 @@ class LlamaConfig(BaseModel):
         if isinstance(data, dict):
             reject_retired_keys("llama", data)
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_from_launch_args(cls, data: object) -> object:
+        """``launch_args`` の ``-c`` / ``-ngl`` / ``-np`` 等を対応するキーへ写す (c_16 §7.2.4)。"""
+        return derive_into(data, "llama")
 
     @model_validator(mode="after")
     def warn_idle_slot_cache_without_ram_budget(self) -> "LlamaConfig":

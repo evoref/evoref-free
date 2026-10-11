@@ -8,17 +8,25 @@
 		clearThemeColors,
 		type ThemeInfo
 	} from '$lib/free/stores/theme';
-	import { getThemes, installThemeApi, uninstallThemeApi } from '$lib/free/api';
+	import { getThemes, uninstallThemeApi } from '$lib/free/api';
 	import { get } from 'svelte/store';
 	import { onMount } from 'svelte';
 	import ThemeTrustDialog from './ThemeTrustDialog.svelte';
 	import { handleApiCall } from '$lib/free/utils/error';
-
-	let fileInput: HTMLInputElement | undefined = $state();
-	let installing = $state(false);
+	import Badge from './ui/Badge.svelte';
+	import Button from './ui/Button.svelte';
+	import ConfirmDialog from './ui/ConfirmDialog.svelte';
+	import EmptyState from './ui/EmptyState.svelte';
 
 	// 信頼確認ダイアログの状態
 	let trustDialogTheme: ThemeInfo | null = $state(null);
+	let pendingDelete: ThemeInfo | null = $state(null);
+	let deleting = $state(false);
+
+	let activeTheme = $derived($availableThemes.find((th) => th.active) ?? null);
+	let hasUntrustedCode = $derived(
+		$availableThemes.some((th) => th.has_components && !th.trusted && !th.builtin)
+	);
 
 	onMount(() => {
 		refreshThemes();
@@ -32,22 +40,6 @@
 		if (data) {
 			availableThemes.set(data.themes ?? []);
 		}
-	}
-
-	async function handleInstall(e: Event) {
-		const input = e.target as HTMLInputElement;
-		const file = input.files?.[0];
-		if (!file) return;
-
-		installing = true;
-		const result = await handleApiCall(() => installThemeApi(file), {
-			fallbackKey: 'theme_manager.install_failed'
-		});
-		if (result) {
-			await refreshThemes();
-		}
-		installing = false;
-		input.value = '';
 	}
 
 	async function handleActivate(theme: ThemeInfo) {
@@ -70,10 +62,6 @@
 		}
 	}
 
-	function handleTrustCancel() {
-		trustDialogTheme = null;
-	}
-
 	async function doActivate(id: string) {
 		await handleApiCall(
 			async () => {
@@ -84,26 +72,34 @@
 		);
 	}
 
-	async function handleDelete(id: string) {
+	async function confirmDelete() {
+		if (!pendingDelete) return;
+		const id = pendingDelete.theme_id;
 		const wasActive = get(themeId) === id;
-		await handleApiCall(
-			async () => {
-				await uninstallThemeApi(id);
-				const data = await getThemes();
-				availableThemes.set(data.themes ?? []);
+		deleting = true;
+		try {
+			await handleApiCall(
+				async () => {
+					await uninstallThemeApi(id);
+					const data = await getThemes();
+					availableThemes.set(data.themes ?? []);
 
-				if (wasActive) {
-					if (data.active_theme_id) {
-						await activateTheme(data.active_theme_id, get(colorMode));
-					} else {
-						// テーマなし状態: CSS除去、app.css のデフォルトで表示
-						clearThemeColors();
-						themeId.set('');
+					if (wasActive) {
+						if (data.active_theme_id) {
+							await activateTheme(data.active_theme_id, get(colorMode));
+						} else {
+							// テーマなし状態: CSS除去、app.css のデフォルトで表示
+							clearThemeColors();
+							themeId.set('');
+						}
 					}
-				}
-			},
-			{ fallbackKey: 'theme_manager.uninstall_failed' }
-		);
+				},
+				{ fallbackKey: 'theme_manager.uninstall_failed' }
+			);
+		} finally {
+			deleting = false;
+			pendingDelete = null;
+		}
 	}
 </script>
 
@@ -115,247 +111,173 @@
 		themeVersion={trustDialogTheme.version}
 		componentCount={trustDialogTheme.component_count}
 		onApplyWithoutCode={handleApplyWithoutCode}
-		onCancel={handleTrustCancel}
+		onCancel={() => (trustDialogTheme = null)}
+	/>
+{/if}
+
+{#if pendingDelete}
+	<ConfirmDialog
+		title={$t('theme_manager.uninstall_confirm_title')}
+		message={$t('theme_manager.uninstall_confirm_message', { name: pendingDelete.name })}
+		confirmLabel={$t('theme_manager.uninstall')}
+		busy={deleting}
+		onConfirm={confirmDelete}
+		onCancel={() => (pendingDelete = null)}
 	/>
 {/if}
 
 <div class="theme-manager">
-	<div class="header">
-		<button class="install-btn" onclick={() => fileInput?.click()} disabled={installing}>
-			{installing ? $t('theme_manager.installing') : $t('theme_manager.install')}
-		</button>
-		<input
-			bind:this={fileInput}
-			type="file"
-			accept=".zip"
-			class="hidden"
-			onchange={handleInstall}
-		/>
-	</div>
+	<p class="current" data-testid="current-theme">
+		<span class="current-label">{$t('theme_manager.current')}</span>
+		<strong>{activeTheme ? activeTheme.name : $t('theme_manager.none')}</strong>
+	</p>
 
+	<h2 class="list-title">
+		{$t('theme_manager.installed_heading', { count: $availableThemes.length })}
+	</h2>
 	{#if $availableThemes.length === 0}
-		<p class="empty">{$t('theme_manager.no_themes')}</p>
+		<EmptyState message={$t('theme_manager.no_themes')} />
 	{:else}
 		<ul class="theme-list">
-			{#each $availableThemes as theme}
-				<li class="theme-item" class:active={theme.active}>
+			{#each $availableThemes as theme (theme.theme_id)}
+				<li class="theme-item">
 					{#if theme.has_preview}
 						<img
-							class="preview-img"
+							class="preview"
 							src="/api/themes/{theme.theme_id}/preview"
 							alt={$t('theme_manager.preview_alt', { name: theme.name })}
 							loading="lazy"
 						/>
 					{:else}
-						<div class="preview-placeholder">
-							<span class="preview-placeholder-text">{$t('theme_manager.no_preview')}</span>
-						</div>
+						<div class="preview preview-placeholder">{$t('theme_manager.no_preview')}</div>
 					{/if}
 					<div class="info">
-						<span class="name">
-							{theme.name}
+						<span class="title-line">
+							<span class="name">{theme.name}</span>
 							{#if theme.active}
-								<span class="badge active-badge">{$t('theme_manager.active')}</span>
+								<Badge tone="strong">{$t('theme_manager.active')}</Badge>
 							{/if}
-							{#if theme.has_components && theme.trusted}
-								<span class="badge trusted">{$t('theme_manager.trusted')}</span>
+							{#if theme.has_components && !theme.builtin}
+								<Badge tone={theme.trusted ? 'default' : 'muted'}>
+									{theme.trusted ? $t('theme_manager.trusted') : $t('theme_manager.untrusted_code')}
+								</Badge>
 							{/if}
 						</span>
 						<span class="meta">
-							{theme.author}
-							{#if theme.description}
-								— {theme.description}
-							{/if}
-							<span class="version">v{theme.version}</span>
+							{theme.author ? `${theme.author} · ` : ''}v{theme.version}
 						</span>
-					</div>
-					<div class="actions">
-						{#if !theme.active}
-							<button
-								class="action-btn primary"
-								onclick={() => handleActivate(theme)}
-							>
-								{$t('theme_manager.activate')}
-							</button>
+						{#if theme.description}
+							<span class="desc">{theme.description}</span>
 						{/if}
-						<button
-							class="action-btn danger"
-							onclick={() => handleDelete(theme.theme_id)}
-						>
+					</div>
+					<div class="row-actions">
+						{#if !theme.active}
+							<Button size="sm" onclick={() => handleActivate(theme)}>
+								{$t('theme_manager.activate')}
+							</Button>
+						{/if}
+						<Button variant="ghost" size="sm" onclick={() => (pendingDelete = theme)}>
 							{$t('theme_manager.uninstall')}
-						</button>
+						</Button>
 					</div>
 				</li>
 			{/each}
 		</ul>
+		{#if hasUntrustedCode}
+			<p class="trust-hint">{$t('theme_manager.trust_hint')}</p>
+		{/if}
 	{/if}
 </div>
 
 <style>
-	.theme-manager {
-		padding: 16px;
-	}
-	.header {
+	.current {
 		display: flex;
-		align-items: center;
-		justify-content: flex-end;
-		gap: 12px;
-		margin-bottom: 16px;
-	}
-	.install-btn {
-		padding: 6px 14px;
-		background-color: var(--accent);
-		color: var(--text-on-accent);
-		border: none;
+		align-items: baseline;
+		gap: var(--space-2);
+		margin: 0 0 var(--space-5);
+		padding: var(--space-3) var(--space-4);
+		border: 1px solid var(--border);
 		border-radius: var(--border-radius);
-		cursor: pointer;
-		font-size: 0.95rem;
+		color: var(--text-primary);
 	}
-	.install-btn:disabled {
-		opacity: 0.5;
-	}
-	.hidden {
-		display: none;
-	}
-	.empty {
+	.current-label {
 		color: var(--text-secondary);
+		font-size: var(--font-size-sm);
+	}
+	.list-title {
+		margin: 0 0 var(--space-3);
+		font-size: var(--font-size-base);
+		font-weight: 600;
+		color: var(--text-primary);
 	}
 	.theme-list {
 		list-style: none;
 		padding: 0;
 		margin: 0;
-		display: grid;
-		grid-template-columns: 1fr;
-		gap: 8px;
+		border-top: 1px solid var(--border);
 	}
 	.theme-item {
 		display: flex;
-		align-items: flex-start;
-		gap: 12px;
-		padding: 10px 12px;
-		background-color: var(--bg-secondary);
-		border: 0.5px solid var(--card-border);
-		border-radius: 10px;
+		align-items: center;
+		gap: var(--space-3);
+		padding: var(--space-3) var(--space-1);
+		border-bottom: 1px solid var(--border);
 	}
-	.theme-item.active {
-		background-color: var(--bg-primary);
-		border-width: 2px;
-	}
-	.preview-img {
-		width: 160px;
-		height: 100px;
+	.preview {
+		width: 96px;
+		height: 60px;
 		object-fit: cover;
-		border-radius: 6px;
+		border-radius: var(--radius-sm);
 		border: 1px solid var(--border);
 		flex-shrink: 0;
 	}
 	.preview-placeholder {
-		width: 160px;
-		height: 100px;
-		border-radius: 6px;
-		border: 1px solid var(--border);
-		background-color: var(--bg-primary);
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		flex-shrink: 0;
-	}
-	.preview-placeholder-text {
-		font-size: 0.75rem;
-		color: var(--text-secondary);
+		font-size: var(--font-size-xs);
+		color: var(--text-muted);
 		text-align: center;
-		line-height: 1.2;
 	}
 	.info {
 		flex: 1;
+		min-width: 0;
 		display: flex;
 		flex-direction: column;
 		gap: 2px;
 	}
+	.title-line {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		flex-wrap: wrap;
+	}
 	.name {
 		font-weight: 600;
 		color: var(--text-primary);
-		display: flex;
-		align-items: center;
-		gap: 8px;
-	}
-	.theme-item:not(.active) .name {
-		color: var(--text-secondary);
-		opacity: 0.6;
-	}
-	.theme-item:not(.active) .meta {
-		opacity: 0.6;
-	}
-	.badge {
-		font-size: 0.8rem;
-		padding: 1px 6px;
-		background-color: var(--accent);
-		color: var(--text-on-accent);
-		border-radius: 4px;
-		font-weight: 400;
-	}
-	.badge.trusted {
-		background-color: var(--color-success);
-	}
-	.badge.active-badge {
-		background-color: var(--color-success);
-		color: var(--text-on-accent);
 	}
 	.meta {
-		font-size: 0.9rem;
+		font-size: var(--font-size-xs);
+		color: var(--text-muted);
+	}
+	.desc {
+		font-size: var(--font-size-sm);
 		color: var(--text-secondary);
 	}
-	.version {
-		margin-left: 4px;
-		opacity: 0.7;
-	}
-	.actions {
+	.row-actions {
 		display: flex;
-		flex-direction: column;
-		gap: 6px;
-		align-self: flex-start;
+		align-items: center;
+		gap: var(--space-1);
 		flex-shrink: 0;
-		width: 140px;
 	}
-	.action-btn {
-		padding: 4px 10px;
-		width: 100%;
-		text-align: center;
-		font-size: 0.9rem;
-		background: none;
-		border: 1px solid var(--border);
-		border-radius: var(--border-radius);
-		color: var(--text-primary);
-		cursor: pointer;
+	.trust-hint {
+		margin: var(--space-3) 0 0;
+		color: var(--text-secondary);
+		font-size: var(--font-size-sm);
 	}
-	.action-btn.primary {
-		background: none;
-		color: var(--text-primary);
-		border: 1.5px solid var(--border);
-	}
-	.action-btn.danger {
-		background-color: var(--color-error);
-		color: var(--text-on-accent);
-		border: 1px solid var(--color-error);
-	}
-	.action-btn:hover {
-		opacity: 0.85;
-	}
-	@media (max-width: 900px) {
-		.theme-list {
-			grid-template-columns: 1fr;
-		}
+	@media (max-width: 600px) {
 		.theme-item {
-			flex-direction: column;
-			align-items: flex-start;
-		}
-		.actions {
-			flex-direction: column;
-			width: 100%;
-		}
-		.action-btn {
-			width: 100%;
-			text-align: center;
+			flex-wrap: wrap;
 		}
 	}
 </style>

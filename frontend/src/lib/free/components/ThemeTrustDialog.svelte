@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { t } from '$lib/i18n';
 	import DialogShell from './DialogShell.svelte';
+	import Button from './ui/Button.svelte';
 
 	interface Props {
 		themeId: string;
@@ -59,12 +60,10 @@
 	<p class="confirm-message">{$t('theme_manager.trust_cli_restart')}</p>
 
 	<div class="dialog-actions">
-		<button class="btn btn-cancel" onclick={onCancel}>
-			{$t('common.cancel')}
-		</button>
-		<button class="btn btn-trust" onclick={onApplyWithoutCode}>
+		<Button onclick={onCancel}>{$t('common.cancel')}</Button>
+		<Button variant="primary" onclick={onApplyWithoutCode}>
 			{$t('theme_manager.trust_apply_without_code')}
-		</button>
+		</Button>
 	</div>
 </DialogShell>
 
@@ -114,24 +113,5 @@
 		display: flex;
 		justify-content: flex-end;
 		gap: 8px;
-	}
-	.btn {
-		padding: 8px 16px;
-		border-radius: var(--border-radius);
-		font-size: 0.95rem;
-		cursor: pointer;
-		border: none;
-	}
-	.btn-cancel {
-		background-color: var(--bg-secondary);
-		color: var(--text-primary);
-		border: 1px solid var(--border);
-	}
-	.btn-trust {
-		background-color: var(--accent);
-		color: var(--text-on-accent);
-	}
-	.btn:hover {
-		opacity: 0.9;
 	}
 </style>

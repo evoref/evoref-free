@@ -8,10 +8,6 @@ import { addToast } from './toast';
 import { instanceName } from './app';
 import { colorMode } from './theme';
 import { setLocale, promptLocale } from '$lib/i18n';
-import { layout, setLayoutCssVariables } from './theme';
-import type { EditorConfig } from './theme';
-
-type LineEndingSetting = EditorConfig['default_line_ending'];
 
 // ── TAB_SECTIONS（イミュータブル） ──
 
@@ -24,15 +20,15 @@ type LineEndingSetting = EditorConfig['default_line_ending'];
  */
 const BASE_TAB_SECTIONS: Readonly<Record<string, readonly string[]>> = {
 	general: ['instance', 'server', 'theme', 'i18n'],
-	inference: ['llama'],
-	model: ['model_paths', 'embedding'],
+	// モデル画面はカードごとに即保存する (パスは切替ボタン、起動オプションは saveLaunchArgs)。タブの「適用」は無い
+	model: [],
 	rag: ['rag'],
 	memory: ['memory'],
 	learning: ['learning', 'agent', 'schedule'],
 	storage: ['local_paths', 'history'],
 	integration: ['tools'],
-	generation: ['modes', 'long_form'],
-	editor: ['editor'],
+	// llama は最大応答トークン数 (max_tokens) だけを画面に出す
+	generation: ['modes', 'llama', 'long_form'],
 	// config を編集しないタブ (環境調整の実行・確認だけ)。セクション無し
 	system: []
 } as const;
@@ -135,41 +131,6 @@ const syncHandlers = new Map<string, SyncHandler>([
 				setLocale(locale);
 			}
 		}
-	],
-	[
-		'editor',
-		(config) => {
-			const ed = config.editor;
-			if (ed && typeof ed === 'object') {
-				layout.update((l) => {
-					const next = {
-						...l,
-						create: {
-							...l.create,
-							editor: {
-								show_line_numbers: ed.show_line_numbers as boolean ?? l.create.editor.show_line_numbers,
-								word_wrap: ed.word_wrap as boolean ?? l.create.editor.word_wrap,
-								tab_size: ed.tab_size as number ?? l.create.editor.tab_size,
-								font_family: ed.font_family as string ?? l.create.editor.font_family,
-								font_size: ed.font_size as number ?? l.create.editor.font_size,
-								line_height: ed.line_height as number ?? l.create.editor.line_height,
-								show_toolbar: ed.show_toolbar as boolean ?? l.create.editor.show_toolbar,
-								show_active_line: ed.show_active_line as boolean ?? l.create.editor.show_active_line,
-								default_encoding: ed.default_encoding as string ?? l.create.editor.default_encoding,
-								default_line_ending: ed.default_line_ending as LineEndingSetting
-									?? l.create.editor.default_line_ending,
-								highlight_languages: ed.highlight_languages as string[]
-									?? l.create.editor.highlight_languages,
-							}
-						}
-					};
-					// font_size / line_height / tab_size は CSS 変数経由で効くため、
-					// ストア更新だけでは反映されない。ここで変数も張り替える。
-					setLayoutCssVariables(next);
-					return next;
-				});
-			}
-		}
 	]
 ]);
 
@@ -218,6 +179,36 @@ promptLocale.subscribe((newLocale) => {
 export async function saveModelPathsField(key: string, value: string | null): Promise<void> {
 	const current = { ...(get(configData).model_paths ?? {}), [key]: value };
 	await saveSection('model_paths', current);
+}
+
+/** 起動オプション (launch_args) の置き場。rerank は rag.rerank の下 (c_16 §7.2.4) */
+export type LaunchArgsTarget = 'llama' | 'embedding' | 'rerank';
+
+/**
+ * 起動オプションを即保存する (モデル画面のカードの「保存」)。
+ *
+ * 送るのは launch_args だけ (節の他のキーは config.yaml に書き戻さない)。成功したら configData と
+ * dirty 判定の snapshot の launch_args だけを差し替える — 同じ節を持つ別タブの未保存の編集を消さない。
+ * 反映には該当サーバーの再起動が要る。
+ */
+export async function saveLaunchArgs(target: LaunchArgsTarget, value: string): Promise<void> {
+	const [section, path]: [string, string[]] =
+		target === 'rerank' ? ['rag', ['rerank', 'launch_args']] : [target, ['launch_args']];
+	await saveSection(section, withPath({}, path, value));
+
+	configData.update((config) => ({ ...config, [section]: withPath(config[section] ?? {}, path, value) }));
+	const existing = originalSnapshot[section];
+	const snapshotObj: Record<string, unknown> = existing ? JSON.parse(existing) : {};
+	originalSnapshot[section] = JSON.stringify(withPath(snapshotObj, path, value));
+	checkDirty(section);
+}
+
+/** ``obj`` の ``path`` に ``value`` を置いたコピー (途中の dict もコピーする) */
+function withPath(obj: Record<string, unknown>, path: string[], value: unknown): Record<string, unknown> {
+	const [head, ...rest] = path;
+	if (rest.length === 0) return { ...obj, [head]: value };
+	const child = (obj[head] as Record<string, unknown> | undefined) ?? {};
+	return { ...obj, [head]: withPath(child, rest, value) };
 }
 
 /** フィールド値を更新 */
