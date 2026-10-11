@@ -1,8 +1,7 @@
-"""LearningScheduler: Level 1〜2 の学習サイクルを管理
+"""LearningScheduler: Level 1 の学習サイクルを管理
 
 Level 1: アイドル時のモード別システムプロンプト進化（Darwinian Evolver）
          + 補助タスクのタスク別プロンプト進化（§7.1.2, Pro 以上）
-Level 2: 夜間 SPSA による LoRA 微調整（Pro 専用、Level2Runner で注入）
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from backend.constants import SECONDS_PER_HOUR
 from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.i18n_helper import msg
 from backend.io import atomic_write_text
@@ -76,13 +74,50 @@ def _prompt_version_of(experience: dict) -> int | None:
     return version if isinstance(version, int) else None
 
 
+def _rules_hash_of(experience: dict) -> str | None:
+    """経験を生んだ静的 system のレンダの内容ハッシュ (``gen_config._extra.rules_hash``)。"""
+    from backend.free.learning.level0_instant import RULES_HASH_KEY
+
+    gen_config = experience.get("gen_config")
+    if isinstance(gen_config, dict):
+        value = gen_config.get(RULES_HASH_KEY)
+    else:
+        value = (getattr(gen_config, "_extra", None) or {}).get(RULES_HASH_KEY)
+    return value if isinstance(value, str) and value else None
+
+
 #: ``improved`` / ``skipped`` を持たない Level 1 の付随記録のうち、件数 (int) を
 #: 返す段と、その効果として足し合わせるキー (``_record_level1_liveness``)。
 _LEVEL1_COUNT_KEYS: dict[str, tuple[str, ...]] = {
     "fewshot_gc": ("removed_total",),
     "tool_routing_patterns": ("boosted", "decayed"),
     "long_form_patterns": ("decayed",),
+    # Level 2 (成長) の段 ``phase8_growth_regression`` (f_04 §6.4)。効果 = 再生したケース数。
+    "growth_regression": ("regression_cases_run",),
+    # Level 2 (成長) の提案キュー (f_04 §6.6)。効果 = この回に作った提案の数。
+    "growth_proposals": ("growth_proposals_created",),
 }
+
+#: 件数を足し合わせず **キーごとの段** (``learn.level1.<段>.<キー>``) として台帳化する
+#: 付随記録。guard / pressure / flaky は「いま何件あるか」で、再生した件数と足すと
+#: 意味を失うので分ける (効果 = その件数。``stalled`` へは数えない)。
+_LEVEL1_GAUGE_KEYS: dict[str, tuple[str, ...]] = {
+    "growth_regression": ("regression_guards", "regression_pressure", "regression_flaky"),
+    "growth_proposals": ("growth_proposals_pending",),
+}
+
+#: ``growth_proposals`` の結果辞書のキー (常に整数で返す)。
+GROWTH_PROPOSAL_KEYS: tuple[str, ...] = (
+    "growth_proposals_created", "growth_proposals_expired", "growth_proposals_pending",
+)
+
+#: ``phase8_growth_regression`` の結果辞書のキー (常に整数で返す)。
+GROWTH_REGRESSION_KEYS: tuple[str, ...] = (
+    "regression_cases_run", "regression_guards", "regression_pressure", "regression_flaky",
+)
+#: 採用した版の guard 監視 (f_04 §6.6) を回した回だけ ``growth_regression`` に足すキー
+#: (自動で巻き戻した数 / 巻き戻しを提案した数)。
+GROWTH_MONITOR_KEYS: tuple[str, ...] = ("growth_rollbacks", "growth_rollback_suggestions")
 
 
 def _schema_default(key: str) -> Any:
@@ -233,105 +268,6 @@ class LearningScheduler:
             "priority_threshold_ratio", 0.5,
         )
 
-    def _init_level2_params(self, learning: dict) -> None:
-        """Level 2 (ベースモデル §7.5.1) パラメータを設定する。"""
-        self.min_failures: int = learning.get(
-            "level2_min_failures", _schema_default("level2_min_failures"),
-        )
-        # モード別の発火閾値 (未指定モードは min_failures にフォールバック)。
-        # create は経験が溜まりにくく、chat と同じ閾値だと永久に発火しないか、
-        # chat が回るたび無駄に評価されるかのどちらかになる。
-        self.min_failures_by_mode: dict[str, int] = {
-            str(k): int(v)
-            for k, v in (learning.get("level2_min_failures_by_mode") or {}).items()
-        }
-        self.spsa_iterations: int = learning.get("level2_spsa_iterations", 500)
-        self.sparse_params: int = learning.get("level2_sparse_params", 200)
-        self.active_minutes: float = learning.get("active_minutes", 5)
-        # Level 2 自動発火のタイミングゲート (SleepTimeWorker と同一 config 由来)。
-        # ダッシュボードの発火条件表示で参照する (get_level2_status 経由)。
-        self.level2_overdue_hours: float = float(
-            learning.get("level2_overdue_hours", 24.0),
-        )
-        self.level2_recheck_interval_sec: float = float(
-            learning.get("level2_recheck_interval_sec", 300),
-        )
-        # 連続で改善が採用されなかった target を延長クールダウンへ落とす閾値と、
-        # そのときに使う待機時間。1 サイクル 1 時間規模の実推論最適化が空振りし
-        # 続ける局面 (探索が局所最適に張り付いた状態) で 24h 間隔を回し続けても
-        # 得るものが無いため、間隔を伸ばして次のデータ蓄積を待つ。
-        self.level2_stale_streak: int = max(
-            1, int(learning.get("level2_stale_streak", 2)),
-        )
-        self.level2_stale_backoff_hours: float = float(
-            learning.get("level2_stale_backoff_hours", 72.0),
-        )
-        # 採用に必要な最小改善幅 (baseline_loss に対する相対比)。実推論 eval は
-        # 決定論的なので微小差も「実差」ではあるが、少数ケースの held-out に対する
-        # 0.0x% の改善は汎化ではなく当該ケースへの過適合で、版だけが増える。
-        self.level2_min_improvement_ratio: float = max(
-            0.0, float(learning.get("level2_min_improvement_ratio", 0.001)),
-        )
-        # 反復間の loss 標準偏差 × sigma も改善幅の下限に重ねる (0 で無効)。
-        self.level2_min_improvement_sigma: float = max(
-            0.0, float(learning.get("level2_min_improvement_sigma", 1.0)),
-        )
-        # SPSA の best が更新されないまま何反復続いたら打ち切るか (0 で無効)。
-        # 実推論 eval は 1 反復 = 候補サーバ 2 起動と高価なため、空振りが確定
-        # している探索を最後まで回さない。
-        self.level2_early_stop_patience: int = max(
-            0, int(learning.get("level2_early_stop_patience", 10)),
-        )
-        # 候補評価用の使い捨てサーバに --no-warmup を付けるか (旧 llama.cpp で
-        # 非対応の場合のみ false)。
-        self.level2_eval_no_warmup: bool = bool(
-            learning.get("level2_eval_no_warmup", True),
-        )
-        # Level 2 最適化器切替
-        self.optimizer_type: str = learning.get("optimizer", "spsa")
-        self.cma_sigma0: float = learning.get("cma_sigma0", 0.1)
-        self.cma_popsize: int = learning.get("cma_popsize", 0)
-        # Level 2 初回 full-train (bootstrap)。既定 OFF (実 llama-server ロード検証後に有効化)
-        self.bootstrap_enabled: bool = bool(learning.get("level2_bootstrap_enabled", False))
-        self.bootstrap_rank: int = int(learning.get("level2_bootstrap_rank", 8))
-        self.bootstrap_init_sigma: float = float(
-            learning.get("level2_bootstrap_init_sigma", 1e-4)
-        )
-        self.bootstrap_min_failures: int = int(
-            learning.get("level2_bootstrap_min_failures", 20)
-        )
-        # Level 2 base=C: control vector (既定 'lora' = 既存 SPSA/LoRA 経路、挙動変更なし)
-        self.level2_base_method: str = learning.get("level2_base_method", "lora")
-        # Level 2 base アダプタの (mode) パーティション粒度。既定 "model_mode"
-        # (chat/create で 1 アダプタ共有、挙動変更なし)。"model_mode" で
-        # Level2Runner が chat/create を交互に別サイクルとして訓練する。
-        self.level2_adapter_partition: str = learning.get(
-            "level2_adapter_partition", "model_mode",
-        )
-        # base=spsa-real-eval: 候補 LoRA を ephemeral サーバで実推論評価する
-        self.base_realeval_spsa_iterations: int = int(
-            learning.get("base_realeval_spsa_iterations", 30)
-        )
-        self.base_eval_scratch_port: int = int(
-            learning.get("base_eval_scratch_port", 8091)
-        )
-        self.base_eval_loss_w1: float = float(learning.get("base_eval_loss_w1", 0.7))
-        self.base_eval_loss_w2: float = float(learning.get("base_eval_loss_w2", 0.3))
-        self.base_eval_max_tokens: int = int(learning.get("base_eval_max_tokens", 64))
-        self.base_eval_max_cases: int = int(learning.get("base_eval_max_cases", 20))
-        self.base_eval_health_timeout: int = int(
-            learning.get("base_eval_health_timeout", 120)
-        )
-        self.cvector_method: str = learning.get("cvector_method", "pca")
-        self.cvector_pca_batch: int = int(learning.get("cvector_pca_batch", 100))
-        self.cvector_pca_iter: int = int(learning.get("cvector_pca_iter", 1000))
-        # cvector_scale は適用時に scripts/launch_llama.py が config から直接読むため、
-        # scheduler 属性としては保持しない (runtime reader 不在)。
-        self.cvector_seed_pairs_file: str = learning.get("cvector_seed_pairs_file", "")
-        self.cvector_min_experiences: int = int(
-            learning.get("cvector_min_experiences", 40)
-        )
-
     def _init_phase4_and_mutator_config(self, learning: dict) -> None:
         """トークン予算進化 (phase4) の設定。
 
@@ -381,7 +317,14 @@ class LearningScheduler:
         # ランタイム注入用 callable / runner
         self._task: asyncio.Task | None = None
         self._user_active_checker = None  # callable: () -> bool
-        self._level2_runner = None  # Pro: Level2Runner インスタンス
+        #: 学習の健康診断 (``health_report.health_snapshot`` の形) を返す関数。未注入なら
+        #: データ根の経験を 5 分メモ化で走査する (``GrowthPolicy``、f_04 §6.6)。
+        self._growth_health_provider: Callable[[], dict | None] | None = None
+        #: この Level 1 の回に作った / 期限切れにした提案の数 (結果辞書 ``growth_proposals``)。
+        self._growth_proposals_created = 0
+        self._growth_proposals_expired = 0
+        #: この回の ``phase8`` の guard 監視がプロンプトを巻き戻したモード (finalize で採用しない)。
+        self._growth_rolled_back_modes: set[str] = set()
 
     def _prompt_rule_delete_gate(self, line: str) -> bool:
         """Level 1 の delete を台帳の計数で裁く (f_04 §4.5.2)。"""
@@ -395,20 +338,7 @@ class LearningScheduler:
         """ランタイム mutable state + パス + Level1Session 関連の初期化。"""
         self._cancelled = False
         self._running = False
-        # Level 2 学習タスク実行中の対象 ("base" | None)。
-        # 「学習中」表示用に Level2Runner が set/clear する。
-        self._running_target: str | None = None
         self._last_run: float = 0.0
-        # target 別の最終 Level 2 実行時刻 (現在は "base" のみ)。単一 float 共有
-        # だった旧仕様では、base (cvector) の失敗が別 target の overdue
-        # 判定まで巻き込み、経験が閾値を超えていても 24h ブロックしていた
-        # 回帰 (2026-07-18) の修正で target 別 dict に分離した。
-        self._last_level2_run: dict[str, float] = {}
-        # target 別の「連続で改善が採用されなかった回数」。`is_level2_overdue`
-        # が延長クールダウンへ落とす判断に使う (採用成功で 0 へリセット)。
-        self._level2_no_improve_streak: dict[str, int] = {}
-        # 環境不調時の短い見送り (defer_level2)。target -> 再試行可能 epoch 秒。
-        self._level2_not_before: dict[str, float] = {}
         self._level1_run_count: int = 0
         self._last_level1_results: dict = {}
         self._fitness_history: dict[str, list[dict]] = {}
@@ -457,8 +387,6 @@ class LearningScheduler:
         experience_buf: ExperienceBuffer,
         prompt_manager: SystemPromptManager,
         cartridge_mgr=None,
-        version_manager=None,
-        eval_core_manager=None,
         debug_logger=None,
         policy: PolicyInterpreter | None = None,
         disabled: bool = False,
@@ -472,7 +400,6 @@ class LearningScheduler:
 
         # 設定値ロード (4 グループ)
         self._init_level1_params(learning)
-        self._init_level2_params(learning)
         self._init_phase4_and_mutator_config(learning)
 
         # 必須コンポーネント参照を保持
@@ -480,8 +407,6 @@ class LearningScheduler:
         self.experience_buf = experience_buf
         self.prompt_manager = prompt_manager
         self.cartridge_mgr = cartridge_mgr
-        self.version_manager = version_manager
-        self.eval_core_manager = eval_core_manager
         self._debug_logger = debug_logger
         self._evolver = PromptEvolver()
         prompt_cfg = config.get("prompt") or {}
@@ -494,13 +419,13 @@ class LearningScheduler:
                 Path(prompt_manager.prompt_dir) / CANDIDATES_FILE
             )
 
-        # 自己学習無効化フラグ (--no-learning 経由)。True の場合 Level 1/2 サイクルは
+        # 自己学習無効化フラグ (--no-learning 経由)。True の場合 Level 1 サイクルは
         # 全て早期 return し副作用なし。get_status は ``is_disabled: True`` を返す
         self._disabled = disabled
         if disabled:
             logger.info(
                 "LearningScheduler initialized in disabled mode "
-                "(Level 1/2 tick / cancel are no-op)",
+                "(Level 1 tick / cancel are no-op)",
             )
 
         # 後注入スロットとランタイム状態
@@ -514,11 +439,41 @@ class LearningScheduler:
         """``llama.slots`` の現在値を返す呼び出し可能物を注入する (遅延接続でも毎回引き直す)。"""
         self._slots_provider = provider
 
+    def set_growth_health_provider(self, provider: Callable[[], dict | None] | None) -> None:
+        """自動採用の条件 2 (学習の健康診断) の取得関数を差し替える (f_04 §6.6)。"""
+        self._growth_health_provider = provider
+
+    def _growth_health(self) -> dict | None:
+        """学習の健康診断 (``verdict`` を持つ dict)。読めなければ ``None`` (= 自動採用しない)。"""
+        if self._growth_health_provider is not None:
+            return self._growth_health_provider()
+        try:
+            from backend.free.learning.health_report import cached_health_snapshot
+
+            resolver = self._resolver
+            if resolver is None:
+                from backend.config import get_path_resolver
+
+                resolver = get_path_resolver()
+            return cached_health_snapshot(
+                resolver.data_root, active_model_key=resolver.active_model_key,
+            )
+        except Exception as exc:  # noqa: BLE001 - 読めなければ自動採用しない
+            logger.debug("learning health unavailable for the growth policy: %r", exc)
+            return None
+
+    @property
+    def growth(self) -> Any:
+        """Level 2 (成長) の提案・採用・巻き戻し (:class:`~backend.free.learning.growth.service.GrowthService`)。"""
+        from backend.free.learning.growth.service import GrowthService
+
+        return GrowthService(self)
+
     @property
     def single_slot(self) -> bool:
         """``slots < 2`` が確定しているか (未解決・未注入は False = 止めない)。
 
-        背景の生成が chat と同じスロットを塞ぐため、Level 1 / Level 2 はここで止める
+        背景の生成が chat と同じスロットを塞ぐため、Level 1 はここで止める
         (sleep-time は待ち・打ち切りが効くので止めない、f_04 §10.1 #15)。
         """
         if self._slots_provider is None:
@@ -532,7 +487,7 @@ class LearningScheduler:
         if not self._single_slot_warned:
             self._single_slot_warned = True
             logger.warning(
-                "llama.slots=%d: Level 1 / Level 2 self-learning is stopped because "
+                "llama.slots=%d: Level 1 self-learning is stopped because "
                 "background generation would block chat on the single slot "
                 "(set llama.slots >= 2 to enable it)", n,
             )
@@ -557,8 +512,6 @@ class LearningScheduler:
             logger.info("Learning state file not found: %s", self._state_file)
             return
         self._last_run = state.last_level1_run
-        self._last_level2_run = dict(state.last_level2_run)
-        self._level2_no_improve_streak = dict(state.level2_no_improve_streak)
         self._level1_run_count = state.level1_run_count
         self._last_level1_results = state.last_level1_results
         self._fitness_history = state.fitness_history
@@ -569,9 +522,8 @@ class LearningScheduler:
         # 優先キューを復元
         self._priority_queue = state.priority_queue
         logger.info(
-            "Learning state loaded: L1=%.0f, L2=%s, runs=%d, path=%s",
-            self._last_run, self._last_level2_run,
-            self._level1_run_count, self._state_file,
+            "Learning state loaded: L1=%.0f, runs=%d, path=%s",
+            self._last_run, self._level1_run_count, self._state_file,
         )
 
     def _save_state(self) -> None:
@@ -580,8 +532,6 @@ class LearningScheduler:
             LearningStateStore.save(
                 LearningState(
                     last_level1_run=self._last_run,
-                    last_level2_run=self._last_level2_run,
-                    level2_no_improve_streak=self._level2_no_improve_streak,
                     level1_run_count=self._level1_run_count,
                     last_level1_results=self._last_level1_results,
                     fitness_history=self._fitness_history,
@@ -595,21 +545,6 @@ class LearningScheduler:
             )
         except OSError as e:
             logger.warning("Failed to save learning state: %s (path=%s)", e, self._state_file)
-
-    def _eval_set_version(self) -> str:
-        """採用判定に使った eval セットの版 (取れなければ空)。
-
-        版は有効ケースと合格基準の内容ハッシュで、Pro の ``EvalCoreManager.version``
-        が計算する (Free は eval_core のファイルを読まない)。
-        """
-        manager = getattr(self, "eval_core_manager", None)
-        if manager is None:
-            return ""
-        try:
-            return str(manager.version())
-        except Exception as exc:
-            logger.debug("eval set version unavailable: %s", exc)
-            return ""
 
     def _save_policy_evolver_state(self) -> None:
         """PolicyEvolver + ExplorationController の状態を永続化する。
@@ -676,8 +611,6 @@ class LearningScheduler:
 
         # learning_state: 永続化対象フィールドを初期値へ戻してから新パスを読む
         self._last_run = 0.0
-        self._last_level2_run = {}
-        self._level2_no_improve_streak = {}
         self._level1_run_count = 0
         self._last_level1_results = {}
         self._fitness_history = {}
@@ -725,113 +658,9 @@ class LearningScheduler:
             model_stem, base_model_id, prompt_dir,
         )
 
-    def record_level2_run(
-        self, target: str = "base", *, improved: bool | None = None,
-    ) -> None:
-        """target ("base") の Level 2 実行時刻を記録して永続化する。
-
-        Args:
-            target: "base"
-            improved: そのサイクルで改善版を採用できたか。``True`` で連続無改善
-                ストリークをリセット、``False`` でインクリメントする。``None``
-                (既定) は判定不能 (early return / 例外 / 手動記録) を意味し、
-                ストリークを触らない — 空振りと区別できない事象でクールダウンを
-                伸ばすと、データが揃った直後の 1 回目まで巻き添えで待たされる。
-        """
-        self._last_level2_run[target] = time.time()
-        if improved is True:
-            self._level2_no_improve_streak[target] = 0
-        elif improved is False:
-            self._level2_no_improve_streak[target] = (
-                self._level2_no_improve_streak.get(target, 0) + 1
-            )
-        self._save_state()
-        # 死活監視 (c_07 §7.1)。判定不能 (None = early return / 例外) は失敗として
-        # 数える — cvector 生成がクラッシュし続けても成功扱いのまま気づけなかった。
-        ledger = liveness_ledger()
-        stage = f"learn.level2.{target}"
-        if improved is None:
-            ledger.record_error(stage, code="no_outcome")
-        else:
-            ledger.record_run(stage, effect=1 if improved else 0)
-        ledger.flush()
-
-    def defer_level2(self, target: str = "base", *, seconds: float = 3600.0) -> None:
-        """target の Level 2 を ``seconds`` 後まで見送る (環境不調の短い再試行間隔)。
-
-        候補サーバが起動できない等の **環境不調** は探索の結論ではないので
-        ``record_level2_run`` (= 24h クールダウン) を打たない。ただし 5 分間隔の
-        常駐ループがそのまま再試行すると毎 tick 候補サーバ起動 (health timeout
-        120s) を空回しするため、短い見送りだけ置く。永続化しない — 再起動は
-        stale プロセスが片付く契機なので、起動直後は即再試行してよい。
-        """
-        self._level2_not_before[target] = time.time() + max(0.0, seconds)
-        logger.info(
-            "Level 2 (%s) deferred for %.0f s (environment unavailable)",
-            target, seconds,
-        )
-
-    def level2_no_improve_streak(self, target: str = "base") -> int:
-        """target の連続無改善回数 (採用に成功すると 0 に戻る)。"""
-        return self._level2_no_improve_streak.get(target, 0)
-
-    def level2_cooldown_hours(self, target: str = "base") -> float:
-        """target に現在適用される Level 2 クールダウン時間 (h)。
-
-        連続無改善が ``level2_stale_streak`` 回に達した target は
-        ``level2_stale_backoff_hours`` へ落ちる。
-        """
-        if self.level2_no_improve_streak(target) >= self.level2_stale_streak:
-            return max(self.level2_overdue_hours, self.level2_stale_backoff_hours)
-        return self.level2_overdue_hours
-
-    def is_level2_overdue(self, target: str = "base") -> bool:
-        """target の Level 2 が overdue (クールダウン経過済み) か。
-
-        Level 2 発火のタイミングゲートの **単一の述語**。常駐ループ
-        (`SleepTimeScheduler._schedule_level2_loop`) の安価な事前チェックと、
-        Level2Runner が実際に起動する target ごとの本ゲートの双方がこれを使う。
-
-        両者が別々の判定を持っていた旧実装では、ループが「次に試す target」
-        (= 実行されない target) で判定する一方で実際に走るのは base だったため、
-        一度も実行されない target の経過時間が恒久的に ``inf`` となりゲートが
-        開きっぱなしになっていた (実機で Level 2 が 10 時間連続稼働)。判定を
-        実行 target と同じ軸へ揃えるのが本メソッドの存在理由。
-        """
-        if time.time() < self._level2_not_before.get(target, 0.0):
-            return False
-        return self.seconds_since_level2_run(target) >= (
-            self.level2_cooldown_hours(target) * SECONDS_PER_HOUR
-        )
-
-    def seconds_since_level2_run(self, target: str = "base") -> float:
-        """target の前回 Level 2 実行からの経過秒。未実行は inf。
-
-        `_last_level2_run` は learning_state に永続化されるため、再起動を跨いで
-        overdue 判定が継続する (SleepTimeScheduler の Level 2 常駐ループが参照)。
-        target 別に分離しているため、一方の失敗がもう一方の overdue 判定を
-        巻き込まない (2026-07-18 修正: 以前は単一値を共有していた)。
-        """
-        last = self._last_level2_run.get(target, 0.0)
-        if last <= 0:
-            return float("inf")
-        return max(0.0, time.time() - last)
-
     def set_user_active_checker(self, checker) -> None:
-        """ユーザーアクティブ判定関数を設定（Level 2 中断用）"""
+        """ユーザーアクティブ判定関数を設定（協調 yield 用）"""
         self._user_active_checker = checker
-
-    def set_version_manager(self, version_manager) -> None:
-        """ベースモデル LoRA バージョンマネージャを設定（Pro、lifespan から注入）。
-
-        構築時は None 既定で、Pro ハンドラ登録後に running scheduler へ後注入する。
-        未注入だと Level 2 (base) は version_manager is None で停止する。
-        """
-        self.version_manager = version_manager
-
-    def set_eval_core_manager(self, eval_core_manager) -> None:
-        """評価コアマネージャを設定（Pro、lifespan から注入）。"""
-        self.eval_core_manager = eval_core_manager
 
     def set_embedder(self, embedder) -> None:
         """embed instruction 進化用のエンベッダを設定（lifespan から注入）
@@ -959,43 +788,6 @@ class LearningScheduler:
             pipe.weight_semmem_success,
         )
 
-    def set_level2_runner(self, runner) -> None:
-        """Level 2 Runner を設定する（Pro プラグインから注入）
-
-        Args:
-            runner: Level2Runner インスタンス（check_and_run メソッドを持つ）
-        """
-        self._level2_runner = runner
-        logger.info("Level 2 runner set")
-
-    def set_learn_components(self, components) -> None:
-        """補助タスク + Level 2 拡張コンポーネントを一括注入する
-
-        旧 ``inject_learn_components(scheduler, buf, vm, eval_mgr, ...)`` の
-        位置引数 7 本を :class:`~backend.free.learning.protocols.LearnComponentsProtocol`
-        インスタンス 1 本に集約する。Protocol の各 Property から
-        scheduler の個別フィールドに hydrate する。Protocol の契約どおり、
-        Free 版 (:class:`~backend.free.learning.protocols.NoopLearnComponents`)
-        では全 Property が ``None`` を返すため本メソッドは no-op に近い動作
-        となる。
-
-        Args:
-            components: :class:`LearnComponentsProtocol` 準拠インスタンス
-                (Pro 版は ``backend.pro.learn_components.ProLearnComponents``,
-                Free 版は ``NoopLearnComponents``)。
-        """
-        if components.version_manager is not None:
-            self.version_manager = components.version_manager
-        # Level 2 拡張 (Pro 専用): level2_runner は従来の setter 経由でも
-        # 注入可能。ここで Protocol 側の値が非 None であれば優先する。
-        if components.level2_runner is not None:
-            self._level2_runner = components.level2_runner
-        logger.info(
-            "Learn components injected: vm=%s, l2_runner=%s",
-            self.version_manager is not None,
-            self._level2_runner is not None,
-        )
-
     def resolve_idle_task_client(self, llm_client=None):
         """批評合成 / few-shot 品質採点に使うクライアントを解決する。
 
@@ -1018,7 +810,7 @@ class LearningScheduler:
 
         **全ての消費側より前** に呼ぶ。記録時の字句検出は候補
         (``signals.correction_candidate``) 止まりで、Level 1 の採用ゲート /
-        few-shot / 訂正ペア / eval_core / Level 2 の失敗プールが読む
+        few-shot / 訂正ペアが読む
         ``user_correction`` はここでしか立たない。
 
         ``--no-learning`` 中は no-op。補助クライアント不在時は候補は候補の
@@ -1385,13 +1177,20 @@ class LearningScheduler:
                     result.initial_fitness, result.final_fitness,
                 )
                 continue
+            if mode in getattr(self, "_growth_rolled_back_modes", ()):
+                # この回の guard 監視が巻き戻した: 候補は巻き戻した版から作ったもの
+                verdict.update({"adopt": False, "reason": "rolled_back_by_monitor"})
+                logger.info("Level 1 %s: no adoption (rolled_back_by_monitor)", mode)
+                continue
+            # Level 2 (成長): 自動採用が効かなければ採用せず提案にする (f_04 §6.6)
+            if not self._auto_adopt_or_propose_prompt(session, mode, result, verdict):
+                continue
             try:
                 rollback_to = self.prompt_manager.get_meta(mode).version
                 written = self.prompt_manager.update_evolved(
                     mode,
                     result.best_candidate.text,
                     result.final_fitness,
-                    eval_set_version=self._eval_set_version(),
                 )
                 if not written:
                     # 正規化 (名前プレフィックス除去・段落の重複除去・保護節の復元)
@@ -1409,14 +1208,28 @@ class LearningScheduler:
                 self._record_prompt_adoption(
                     mode, rollback_to, experiences, case_ids=verdict.get("case_ids"),
                 )
-                self._append_adoption_ledger(
+                adopted_version = self.prompt_manager.get_meta(mode).version
+                adoption = self._append_adoption_ledger(
                     op="adopt", mode=mode,
-                    version=self.prompt_manager.get_meta(mode).version,
+                    version=adopted_version,
                     parent_version=rollback_to,
                     level1_session_id=session.session_id,
                     cases=verdict.get("case_refs"),
                     wins=verdict.get("wins"), losses=verdict.get("losses"),
                     ties=verdict.get("ties"),
+                )
+                from backend.free.learning.growth.ledger import ASSET_PROMPT
+                from backend.free.learning.growth.proposals import ProposalCandidate
+
+                self.growth.record_auto_adoption(
+                    ASSET_PROMPT, mode, verdict=verdict,
+                    parent_version=str(rollback_to), adopted_version=str(adopted_version),
+                    rollback_to=int(rollback_to),
+                    candidate=ProposalCandidate(prompt_text=result.best_candidate.text),
+                    cases=verdict.get("case_refs") or (),
+                    guard_ids=verdict.get("guard_ids") or (),
+                    adoption_id=getattr(adoption, "adoption_id", None),
+                    level1_session_id=session.session_id,
                 )
                 # 一対比較ゲート (f_04 §4.5) は ``measured_before/after`` を
                 # 持たない (勝敗しか測らない)。以前はここが ``%.3f`` で
@@ -1455,6 +1268,10 @@ class LearningScheduler:
                 "sample_losses": verdict.get("sample_losses"),
                 "sample_ties": verdict.get("sample_ties"),
                 "excluded": verdict.get("excluded"),
+                # 標本に足した回帰台帳の guard の合否 (f_04 §6.5) と、提案にした回の提案 ID
+                "guards_passed": verdict.get("guards_passed"),
+                "guards_failed": verdict.get("guards_failed"),
+                "proposal_id": verdict.get("proposal_id"),
                 "gate": "pairwise" if verdict.get("wins") is not None else "absolute",
                 "reason": verdict.get("reason"),
                 "mutation_attempts": getattr(result, "mutation_attempts", 0),
@@ -1465,6 +1282,7 @@ class LearningScheduler:
             stats.update(skipped_modes)
         if extra_results:
             stats.update(extra_results)
+        stats["growth_proposals"] = self._growth_proposal_counts()
         self._level1_finalize(
             experiences, stats,
             advance_cursor=not skipped_phases,
@@ -1475,6 +1293,98 @@ class LearningScheduler:
             "Level 1 session completed and archived: %s", archived_path,
         )
         return archived_path
+
+    # ── Level 2 (成長): 提案キュー (f_04 §6.6) ──
+
+    def _auto_adopt_or_propose_prompt(
+        self, session: Level1Session, mode: str, result: Any, verdict: dict,
+    ) -> bool:
+        """採用ゲートを通ったプロンプト候補を自動採用してよいか。よくなければ提案にする。
+
+        Returns:
+            ``True`` なら呼出側がそのまま採用する。``False`` なら ``verdict`` の ``adopt`` を
+            落とし、``reason`` を ``proposed`` (提案した) / ``proposal_withheld`` (止める基準) /
+            ``proposal_error`` にする。
+        """
+        from backend.free.learning.growth.ledger import ASSET_PROMPT
+        from backend.free.learning.growth.proposals import ProposalCandidate
+
+        differs = getattr(self.prompt_manager, "evolved_differs", None)
+        if callable(differs) and differs(mode, result.best_candidate.text) is False:
+            # 正規化後に現行と同一: 採用も提案もできない (``update_evolved`` が書かない)
+            verdict.update({"adopt": False, "reason": "identical_after_normalization"})
+            logger.info(
+                "Level 1 %s: no adoption (identical_after_normalization; %s)",
+                mode, _fmt_adoption_measure(verdict),
+            )
+            return False
+        try:
+            growth = self.growth
+            decision = growth.auto_adopt(mode, verdict)
+        except Exception as exc:  # noqa: BLE001 - 方針が読めなければ採用しない
+            logger.warning("Level 1 %s: growth policy unavailable: %r", mode, exc)
+            verdict.update({"adopt": False, "reason": "growth_policy_error"})
+            return False
+        verdict["auto_adopt"] = decision.as_dict()
+        if decision.effective:
+            return True
+        verdict["adopt"] = False
+        try:
+            proposal = growth.propose(
+                ASSET_PROMPT, mode,
+                candidate=ProposalCandidate(prompt_text=result.best_candidate.text),
+                verdict=verdict,
+                parent_version=str(self.prompt_manager.get_meta(mode).version),
+                cases=verdict.get("case_refs") or (),
+                case_ids=verdict.get("case_ids") or (),
+                guard_ids=verdict.get("guard_ids") or (),
+                fitness=result.final_fitness,
+                level1_session_id=session.session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - 提案が書けなくても採用はしない
+            logger.warning(
+                "Level 1 %s: failed to write the growth proposal: %r", mode, exc, exc_info=True,
+            )
+            verdict["reason"] = "proposal_error"
+            return False
+        if proposal is None:
+            verdict["reason"] = "proposal_withheld"
+            return False
+        verdict["reason"] = "proposed"
+        verdict["proposal_id"] = proposal.proposal_id
+        self._growth_proposals_created += 1
+        logger.info(
+            "Level 1 %s: candidate proposed instead of adopted (%s; %s; auto-adopt off: %s)",
+            mode, proposal.proposal_id, _fmt_adoption_measure(verdict), decision.reason,
+        )
+        return False
+
+    def _growth_proposal_counts(self) -> dict[str, int]:
+        """結果辞書 ``growth_proposals`` (常に整数、c_07 §7.1)。"""
+        pending = 0
+        try:
+            pending = len(self.growth.queue().pending())
+        except Exception as exc:  # noqa: BLE001 - 読めなくても 0 で返す
+            logger.debug("growth proposals unavailable: %r", exc)
+        return {
+            "growth_proposals_created": int(self._growth_proposals_created),
+            "growth_proposals_expired": int(self._growth_proposals_expired),
+            "growth_proposals_pending": int(pending),
+        }
+
+    def _sweep_growth_proposals(self) -> None:
+        """Level 1 の入口: 回の数を 0 に戻し、期限切れ・上限超過の提案を ``expire`` する。"""
+        from backend.io.readonly import is_readonly
+
+        self._growth_proposals_created = 0
+        self._growth_proposals_expired = 0
+        self._growth_rolled_back_modes = set()
+        if is_readonly():
+            return
+        try:
+            self._growth_proposals_expired = self.growth.sweep()
+        except Exception as exc:  # noqa: BLE001 - 掃除の失敗で学習を止めない
+            logger.warning("Growth proposal sweep failed: %r", exc)
 
     # ── 採用ゲート (実測、f_04 §4.5) ──
 
@@ -1505,6 +1415,78 @@ class LearningScheduler:
     def _min_net_wins(self) -> int:
         prompt_cfg = self._config.get("prompt") or {}
         return max(1, int(prompt_cfg.get("adoption_min_net_wins", 2)))
+
+    # ── Level 2 (成長): 回帰台帳と再生 (f_04 §6.4 / §6.5) ──
+
+    def _growth_settings(self) -> Any:
+        from backend.free.learning.growth.harvest import _growth_settings
+
+        return _growth_settings(self._config)
+
+    def _regression_status_path(self) -> Path:
+        """束ねたパーティションの ``regression_status.json`` (プロンプトの置き場の隣)。"""
+        from backend.config import PathResolver
+
+        return Path(self.prompt_manager.prompt_dir).parent / PathResolver._LEARNING_SUBPATH[
+            "regression_status_file"
+        ]
+
+    def _regression_ledger(self, settings: Any) -> Any:
+        from backend.free.learning.growth.regression import RegressionLedger
+
+        resolver = self._resolver
+        if resolver is None:
+            from backend.config import get_path_resolver
+
+            resolver = get_path_resolver()
+        return RegressionLedger(
+            resolver.resolve_local("regression_cases_file"),
+            use_seed=settings.regression.use_seed,
+            max_cases=settings.regression.max_cases,
+        )
+
+    def _growth_gate_cases(self, mode: str) -> tuple[list, list]:
+        """採用ゲートへ足す同じモードの ``(guard, pressure)`` (無効・読めなければ空)。"""
+        try:
+            settings = self._growth_settings()
+            if not settings.enabled:
+                return [], []
+            from backend.free.learning.growth.regression import load_status
+            from backend.free.learning.growth.replay import gate_cases
+
+            status = load_status(self._regression_status_path())
+            if not status.cases:
+                return [], []
+            return gate_cases(self._regression_ledger(settings).cases(), status, mode)
+        except Exception as exc:  # noqa: BLE001 - 台帳が読めなくても採用ゲートは従来どおり
+            logger.warning("Level 1 %s: regression cases unavailable for the gate: %r", mode, exc)
+            return [], []
+
+    def _select_gate_cases(
+        self, experiences: list[dict], mode: str, limit: int,
+    ) -> Any:
+        """採用ゲートの評価ケース (経験から選んだ失敗・標本 + 回帰台帳の pressure・guard)。
+
+        guard は ``selection.samples`` (無退行の検査) へ最大 ``max_guard_cases`` 件、pressure は
+        ``selection.failures`` へ ``limit`` の枠の空きに足す (f_04 §6.5)。標本を使わない
+        絶対採点の評価器と、guard / pressure が無いときは経験の選定のまま (既存の挙動)。
+        """
+        from backend.free.optimizer.prompt_eval import select_prompt_eval_case_sets
+
+        selection = select_prompt_eval_case_sets(
+            experiences, mode, limit, sample_cases=self._sample_cases(),
+        )
+        if not self._pairwise_gate_available():
+            return selection
+        guards, pressure = self._growth_gate_cases(mode)
+        if not guards and not pressure:
+            return selection
+        from backend.free.learning.growth.replay import augment_selection
+
+        return augment_selection(
+            selection, guards=guards, pressure=pressure, limit=limit,
+            max_guards=self._growth_settings().regression.max_guard_cases,
+        )
 
     async def _skip_without_selection_pressure(
         self, session: Level1Session, llm_client,
@@ -1552,6 +1534,12 @@ class LearningScheduler:
             fewshot_saved = bool(self._step14_fewshot_gc(side_results, durations))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Step 14 few-shot GC failed (no-pressure skip): %r", exc)
+        # Level 2 (成長) の再生は選択圧が無い回にも回す — guard は失敗の無い利用でこそ
+        # 育てる必要があり、標本 0 件 (``no_regression_samples``) で落ちたモードを次の
+        # tick で guard が救う (f_04 §6.4 / §6.5)。
+        if not (self.should_yield() or self._cancelled):
+            await self._level1_phase8_growth_regression(side_results, durations)
+        side_results["growth_proposals"] = self._growth_proposal_counts()
         self.discard_active_session()
         self._last_run = time.time()
         self._last_level1_results = {
@@ -1572,7 +1560,10 @@ class LearningScheduler:
                     mode: info for mode, info in skipped.items()
                     if isinstance(info, dict)
                 },
-                **{k: v for k, v in side_results.items() if k == "policy_params"},
+                **{
+                    k: v for k, v in side_results.items()
+                    if k in ("policy_params", "growth_regression", "growth_proposals")
+                },
             },
         )
         # 「更新した」と書くのは実際に保存したときだけ (以前は Step 14 が
@@ -1643,8 +1634,6 @@ class LearningScheduler:
         採用ゲートは無退行を測れない候補を必ず不採用にするので、走らせても
         採用され得ない。絶対採点の評価器は標本を使わないので外さない。
         """
-        from backend.free.optimizer.prompt_eval import select_prompt_eval_case_sets
-
         threshold = max(1, self.min_experiences // 2)
         max_cases, _, min_cases = self._prompt_gate_config()
         # 標本が勝てない一対比較でだけ、純勝ちの上限で到達可能性を見る。
@@ -1661,10 +1650,9 @@ class LearningScheduler:
             ]
             # 圧の有無は失敗由来のケースだけで決める (標本は除く)。件数の枠は
             # 採用ゲートと同じ ``adoption_eval_cases`` にする — ここで狭い枠を
-            # 使うと、ゲートが実際に見る失敗ケース数を過小に数えてしまう。
-            selection = select_prompt_eval_case_sets(
-                mode_exp, mode, max(1, max_cases), sample_cases=self._sample_cases(),
-            )
+            # 使うと、ゲートが実際に見る失敗ケース数を過小に数えてしまう。回帰台帳の
+            # guard / pressure もゲートと同じく足す (f_04 §6.5)。
+            selection = self._select_gate_cases(mode_exp, mode, max(1, max_cases))
             pressure_cases = selection.failures
             if len(mode_exp) < threshold:
                 reason = "insufficient_experiences"
@@ -1784,6 +1772,8 @@ class LearningScheduler:
                 "sample_wins": verdict.get("sample_wins"),
                 "sample_losses": verdict.get("sample_losses"),
                 "sample_ties": verdict.get("sample_ties"),
+                "guards_passed": verdict.get("guards_passed"),
+                "guards_failed": verdict.get("guards_failed"),
                 "excluded": verdict.get("excluded", {}),
                 "adopt": verdict["adopt"], "reason": verdict["reason"],
                 "cases": [
@@ -1826,6 +1816,17 @@ class LearningScheduler:
             "sample_losses": sample_losses,
             "sample_ties": sample_measured - sample_wins - sample_losses,
         })
+        # 標本に足した回帰台帳の guard の合否 (f_04 §6.5、成長の台帳の ``gate`` へ)
+        from backend.free.learning.growth.replay import guard_ids_of
+        from backend.free.learning.pairwise_gate import guard_tally
+
+        guard_ids = guard_ids_of(samples)
+        if guard_ids:
+            verdict["guards_passed"], verdict["guards_failed"] = guard_tally(
+                sample_outcomes, guard_ids,
+            )
+            # 採用した版の guard 監視の対象 (f_04 §6.6)
+            verdict["guard_ids"] = sorted(guard_ids)
         if (
             sample_measured < max(1, (len(samples) + 1) // 2)
             or measured + sample_measured < min_cases
@@ -1853,7 +1854,7 @@ class LearningScheduler:
         ケース 0 件 / ケース不足 / 採点不足 / 候補が現行と同文 は全て不採用
         (実測できないものは採用しない — f_04 §8 禁則 7)。
         """
-        from backend.free.optimizer.prompt_eval import select_prompt_eval_case_sets
+        from backend.free.optimizer.prompt_eval import _case_id
 
         max_cases, min_gain, min_cases = self._prompt_gate_config()
         verdicts: dict[str, dict] = {}
@@ -1874,9 +1875,7 @@ class LearningScheduler:
             if max_cases <= 0:
                 verdict["reason"] = "gate_disabled"
                 continue
-            selection = select_prompt_eval_case_sets(
-                experiences, mode, max_cases, sample_cases=self._sample_cases(),
-            )
+            selection = self._select_gate_cases(experiences, mode, max_cases)
             verdict["excluded"] = dict(selection.excluded)
             cases = selection.cases
             # 純勝ちは失敗ケースでしか数えないので、失敗ケースが無ければ測らない
@@ -1886,7 +1885,8 @@ class LearningScheduler:
                 continue
             # 採用後監視の基準値からゲートの題材を除く (採用の契機になった失敗を
             # 基準に含めると、旧版の欠陥率が実際より悪く見え巻き戻しが鈍る)。
-            verdict["case_ids"] = [c.case_id for c in cases]
+            # 経験と突き合わせる鍵は問いの ID (回帰台帳のケースの ``rgc_`` は経験に無い)。
+            verdict["case_ids"] = [_case_id(c.query) for c in cases]
             # 採用台帳 (版 → 根拠になった経験、c_05 §0.6) へ渡すケースの参照
             verdict["case_refs"] = case_refs(cases)
             if len(cases) < min_cases:
@@ -2006,6 +2006,11 @@ class LearningScheduler:
         経験も除く — 採用の契機になった失敗で基準を下げると巻き戻しが鈍る。
         残りが ``min_experiences // 2`` 件未満なら基準なし (``None``) とし、
         監視は巻き戻さない。
+
+        同じ版でも、もう一方のモードの採用 (共通箇条の寄せ・予算の削り込み) で
+        レンダは変わる。版の経験のうち最も新しいレンダ (``gen_config.rules_hash``)
+        で生まれたものが ``min_experiences // 2`` 件以上あれば、基準はそれだけで測る
+        (採用の直前まで使われていた規則集合)。足りなければ版だけで絞った集合のまま。
         """
         from backend.free.optimizer.prompt_eval import _case_id
 
@@ -2017,6 +2022,14 @@ class LearningScheduler:
             and _case_id(str(e.get("query", "") or "")) not in excluded
         ]
         min_samples = max(1, self.min_experiences // 2)
+        hashed = [e for e in mode_exp if _rules_hash_of(e) is not None]
+        baseline_rules_hash: str | None = None
+        if hashed:
+            latest = _rules_hash_of(max(hashed, key=lambda e: _parsed_time(e.get("timestamp"))))
+            same_render = [e for e in hashed if _rules_hash_of(e) == latest]
+            if len(same_render) >= min_samples:
+                mode_exp = same_render
+                baseline_rules_hash = latest
         baseline = (
             defect_rate_fitness(mode_exp, weights=PROMPT_DEFECT_WEIGHTS)
             if len(mode_exp) >= min_samples else None
@@ -2035,24 +2048,57 @@ class LearningScheduler:
             # されるので、採用後も旧版のセッションが続く。f_04 §4.5)
             "adopted_version": int(self.prompt_manager.get_meta(mode).version),
             "baseline": round(baseline, 4) if baseline is not None else None,
+            # 基準を測ったレンダ (版だけで絞ったときは None)
+            "baseline_rules_hash": baseline_rules_hash,
             "adopted_at": now,
             "window_since": now,
             "windows": [],
         }
 
-    def _append_adoption_ledger(self, **row: Any) -> None:
-        """採用台帳 (``learning.prompt_adoption``) へ 1 行追記する。
+    def _append_adoption_ledger(self, **row: Any) -> Any:
+        """採用台帳 (``learning.prompt_adoption``) へ 1 行追記し、その行を返す (書けなければ ``None``)。
 
         版は既に上がっている / 戻っているので、台帳に書けなくても (readonly・
         版が新しい行・I/O) 採用・巻き戻しは取り消さず WARNING に留める。
         """
         try:
-            append_adoption(Path(self.prompt_manager.prompt_dir), **row)
+            return append_adoption(Path(self.prompt_manager.prompt_dir), **row)
         except Exception as exc:  # noqa: BLE001 - 台帳の失敗で採用を巻き戻さない
             logger.warning(
                 "Level 1 %s: failed to append the prompt adoption ledger (%s): %s",
                 row.get("mode"), row.get("op"), exc,
             )
+            return None
+
+    def _suggest_instead_of_rollback(self, asset_kind: str, mode: str, adopted: Any) -> bool:
+        """利用者が採用した版なら巻き戻さず ``rollback_suggested`` を立てる (f_04 §6.6)。"""
+        try:
+            growth = self.growth
+            if adopted is None or not growth.decided_by_user(asset_kind, mode, str(adopted)):
+                return False
+            growth.suggest_rollback(asset_kind, mode, "defect_rate_regression")
+            return True
+        except Exception as exc:  # noqa: BLE001 - 読めなければ従来どおり (監視が巻き戻す)
+            logger.debug("growth adoption record unavailable: %r", exc)
+            return False
+
+    def _growth_monitor_rollback_row(
+        self, asset_kind: str, mode: str, from_version: Any, adoption_id: str | None,
+    ) -> None:
+        """欠陥率の採用後監視が巻き戻したことを成長の台帳に残す (``decided_by=monitor``)。"""
+        try:
+            from backend.free.learning.growth.service import REASON_DEFECT_RATE
+
+            growth = self.growth
+            rec = growth.adoption_of(asset_kind, mode) or {}
+            growth.append_row(
+                op="rollback", proposal_id=str(rec.get("proposal_id") or ""),
+                asset_kind=asset_kind, mode=mode, parent_version=str(from_version),
+                decided_by="monitor", reason=REASON_DEFECT_RATE, adoption_id=adoption_id,
+            )
+            growth._drop_adoption(asset_kind, mode)
+        except Exception as exc:  # noqa: BLE001 - 台帳の失敗で巻き戻しを取り消さない
+            logger.debug("growth ledger unavailable for the monitor rollback: %r", exc)
 
     def _adoption_superseded(self, mode: str, adopted: Any) -> str:
         """採用した版が現行でなくなっていれば理由を返す (現行のままなら空)。
@@ -2121,14 +2167,27 @@ class LearningScheduler:
                 continue
             baseline = rec.get("baseline")
             mean = sum(windows) / len(windows)
-            if baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON:
+            if (
+                baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON
+                and self._suggest_instead_of_rollback("prompt", mode, adopted)
+            ):
+                logger.warning(
+                    "Level 1 %s: user-adopted prompt v%s regressed (post-adoption fitness "
+                    "%.4f < baseline %.4f - %.2f); rollback suggested, not applied",
+                    mode, adopted, mean, baseline, PROMPT_ROLLBACK_EPSILON,
+                )
+            elif baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON:
                 try:
+                    from_version = self.prompt_manager.get_meta(mode).version
                     self.prompt_manager.rollback(mode, int(rec["rollback_to"]))
                     rolled_back.add(mode)
-                    self._append_adoption_ledger(
+                    adoption = self._append_adoption_ledger(
                         op="rollback", mode=mode,
                         version=self.prompt_manager.get_meta(mode).version,
                         parent_version=int(rec["rollback_to"]),
+                    )
+                    self._growth_monitor_rollback_row(
+                        "prompt", mode, from_version, getattr(adoption, "adoption_id", None),
                     )
                     logger.warning(
                         "Level 1 %s: evolved prompt rolled back to v%03d "
@@ -2244,6 +2303,13 @@ class LearningScheduler:
         await _phase("step14_fewshot_gc", lambda: self._step14_fewshot_gc(
             results, phase_durations,
         ))
+        # Level 2 (成長) — 回帰ケースを現行の資産で再生して guard / pressure を更新する
+        # (f_04 §6.4)。採用の後に走らせ、次の tick の採用ゲートが新しい役割を使う。
+        # ``_phase`` を通さない — 段の中でケースごとに ``should_yield`` を見て、進捗は
+        # ケースの ``last_run_at`` に残るので、打ち切っても session を持ち越さない
+        # (持ち越すと再開で phase3〜step14 をやり直す)。
+        if not (self.should_yield() or self._cancelled):
+            await self._level1_phase8_growth_regression(results, phase_durations)
         if skipped:
             logger.info("Level 1 extra optimizations skipped (cancelled): %s", skipped)
         return skipped
@@ -2322,6 +2388,7 @@ class LearningScheduler:
                 "Correction verification failed before Level 1: %r", exc,
             )
         self._run_post_adoption_check()
+        self._sweep_growth_proposals()
 
         session_or_skip = self._load_or_create_level1_session(reason, relax_threshold)
         if isinstance(session_or_skip, dict):
@@ -2643,25 +2710,6 @@ class LearningScheduler:
         except Exception as exc:
             logger.warning("feedback_pipe.run failed: %s", exc)
 
-    def _filter_experiences_for_level2(
-        self,
-        experiences: list[dict],
-        model_key: str,
-        mode: str | None = None,
-    ) -> list[dict]:
-        """Level 2 用: 学習対象モデルで収集された経験だけに絞る（§22.5.4）
-
-        旧モデルで収集された経験は新モデルの LoRA 微調整に適さないため、
-        ``model_key`` (c_05 §0.5.7) が一致する経験のみを使う。ファイル名では
-        照合しない (量子化違い・同名の別モデルを区別できない)。``model_key`` の
-        無い経験は使わない。``mode`` 指定時はさらにそのモード ("chat"/"create")
-        の経験のみに絞る (省略時は全モード横断)。
-        """
-        filtered = [e for e in experiences if e.get("model_key") == model_key]
-        if mode is not None:
-            filtered = [e for e in filtered if e.get("mode") == mode]
-        return filtered
-
     def _get_filtered_experiences(self) -> list[dict]:
         """経験バッファを dict リストに変換する。
 
@@ -2813,15 +2861,6 @@ class LearningScheduler:
             "min_experiences": self.min_experiences,
             "conditions_met": new_count >= self.min_experiences,
             "last_level1_run": self._last_run,
-            "last_level2_run": self._last_level2_run,
-            # 実行中の Level 2 対象 ("base"/None) と base の状態。
-            # level2 は Pro (Level2Runner 注入時) のみ非 None。
-            "running_target": self._running_target,
-            "level2": (
-                self._level2_runner.get_level2_status()
-                if self._level2_runner is not None
-                else None
-            ),
             # Level 0 詳細
             "last_level0_record": last_level0_record,
             "experience_by_mode": {"chat": chat_count, "create": create_count},
@@ -2898,6 +2937,8 @@ class LearningScheduler:
             for mk in (
                 "gate", "wins", "losses", "ties", "noise_floor",
                 "sample_wins", "sample_losses", "sample_ties",
+                # 回帰台帳の guard の合否と提案 ID (f_04 §6.5 / §6.6)
+                "guards_passed", "guards_failed", "proposal_id",
             ):
                 mv = val.get(mk)
                 if mv is not None:
@@ -3033,7 +3074,7 @@ class LearningScheduler:
         if added:
             logger.info("Fewshot pool updated: %d new examples added", added)
         # 訂正で確定した「元の問い → 訂正後の回答」も手本に流す。失敗経験の
-        # 唯一の受け皿 (Level 2 の重み学習は on-device では動かない、2026-09-05)。
+        # 唯一の受け皿。
         from backend.free.learning.corrected_pairs import (
             build_corrected_pairs,
             build_demoted_pairs,
@@ -3216,7 +3257,8 @@ class LearningScheduler:
         """
         if self._cancelled or self._generation_param_evolver is None:
             return
-        from backend.free.optimizer.prompt_eval import select_prompt_eval_case_sets
+        from backend.free.learning.growth.replay import guard_ids_of
+        from backend.free.optimizer.prompt_eval import _case_id
 
         def _base_generation_params(mode: str) -> dict:
             """config の既定 sampling (学習デルタ適用 **前**)。未ロードなら空。"""
@@ -3245,11 +3287,13 @@ class LearningScheduler:
             if measured:
                 max_cases, _, _ = self._prompt_gate_config()
                 # 純勝ちは失敗ケースだけで数え、標本は無退行の検査に回す
-                # (プロンプト側のゲートと同じ分け方、f_04 §10.1 #2 後半)。
-                selection = select_prompt_eval_case_sets(
-                    mode_exp, mode, max(1, max_cases),
-                    sample_cases=self._sample_cases(),
-                )
+                # (プロンプト側のゲートと同じ分け方、f_04 §10.1 #2 後半)。回帰台帳の
+                # guard は標本へ、pressure は失敗ケースへ足す (f_04 §6.5)。
+                selection = self._select_gate_cases(mode_exp, mode, max(1, max_cases))
+                guard_kwargs: dict[str, Any] = {}
+                guard_ids = guard_ids_of(selection.samples)
+                if guard_ids:
+                    guard_kwargs["guard_ids"] = guard_ids
                 previous = self._generation_param_evolver.get_deltas(mode)
                 gen_result = await self._generation_param_evolver.evolve_measured(
                     mode,
@@ -3260,11 +3304,18 @@ class LearningScheduler:
                     cases=selection.failures,
                     samples=selection.samples,
                     min_net_wins=self._min_net_wins(),
+                    defer_adoption=True,
+                    **guard_kwargs,
                 )
+                if gen_result.pop("gate_passed", False):
+                    # Level 2 (成長): 自動採用が効かなければ採用せず提案にする (f_04 §6.6)
+                    self._adopt_or_propose_generation(
+                        mode, gen_result, previous, selection, guard_ids,
+                    )
                 if gen_result.get("improved"):
                     self._record_generation_adoption(
                         mode, previous, gen_result["deltas"], mode_exp,
-                        case_ids=[c.case_id for c in selection.cases],
+                        case_ids=[_case_id(c.query) for c in selection.cases],
                     )
             else:
                 gen_result = self._generation_param_evolver.evolve(
@@ -3295,6 +3346,73 @@ class LearningScheduler:
         """監視中の生成デルタの採用記録 (``learning_state._extra`` の中、無ければ空)。"""
         records = (self._state_extra or {}).get(GENERATION_ADOPTIONS_KEY)
         return records if isinstance(records, dict) else {}
+
+    def _adopt_or_propose_generation(
+        self,
+        mode: str,
+        gen_result: dict,
+        previous: dict,
+        selection: Any,
+        guard_ids: frozenset[str],
+    ) -> None:
+        """ゲートを通った生成デルタを、``GrowthPolicy`` が認めれば採用し、認めなければ提案にする。
+
+        採用したら ``gen_result`` の ``improved`` / ``deltas`` を立てる (監視の記録は呼出側の
+        ``_record_generation_adoption``)。提案なら ``reason="proposed"`` と ``proposal_id``。
+        """
+        from backend.free.learning.generation_delta_store import delta_version
+        from backend.free.learning.growth.ledger import ASSET_GENERATION_PARAMS
+        from backend.free.learning.growth.proposals import ProposalCandidate
+        from backend.free.learning.prompt_adoption_ledger import case_refs
+        from backend.free.optimizer.prompt_eval import _case_id
+
+        candidate = {str(k): float(v) for k, v in (gen_result.get("candidate") or {}).items()}
+        refs = case_refs(selection.cases)
+        verdict = {**gen_result, "gate": "pairwise"}
+        try:
+            growth = self.growth
+            decision = growth.auto_adopt(mode, gen_result, asset_kind=ASSET_GENERATION_PARAMS)
+        except Exception as exc:  # noqa: BLE001 - 方針が読めなければ採用しない
+            logger.warning("Level 1 %s: growth policy unavailable: %r", mode, exc)
+            gen_result["reason"] = "growth_policy_error"
+            return
+        gen_result["auto_adopt"] = decision.as_dict()
+        if decision.effective:
+            self._generation_param_evolver.restore_deltas(mode, candidate)
+            gen_result.update({"improved": True, "deltas": candidate})
+            growth.record_auto_adoption(
+                ASSET_GENERATION_PARAMS, mode, verdict=verdict,
+                parent_version=delta_version(previous), adopted_version=delta_version(candidate),
+                rollback_to=dict(previous), candidate=ProposalCandidate(deltas=candidate),
+                cases=refs, guard_ids=guard_ids,
+            )
+            return
+        try:
+            proposal = growth.propose(
+                ASSET_GENERATION_PARAMS, mode,
+                candidate=ProposalCandidate(deltas=candidate),
+                verdict=verdict,
+                parent_version=delta_version(previous),
+                cases=refs,
+                case_ids=[_case_id(c.query) for c in selection.cases],
+                guard_ids=guard_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - 提案が書けなくても採用はしない
+            logger.warning(
+                "Level 1 %s: failed to write the generation params proposal: %r", mode, exc,
+                exc_info=True,
+            )
+            gen_result["reason"] = "proposal_error"
+            return
+        if proposal is None:
+            gen_result["reason"] = "proposal_withheld"
+            return
+        gen_result.update({"reason": "proposed", "proposal_id": proposal.proposal_id})
+        self._growth_proposals_created += 1
+        logger.info(
+            "Level 1 %s: generation delta %s proposed instead of adopted (%s; auto-adopt off: %s)",
+            mode, candidate, proposal.proposal_id, decision.reason,
+        )
 
     def _record_generation_adoption(
         self, mode: str, rollback_to: dict, adopted: dict, experiences: list[dict],
@@ -3407,9 +3525,19 @@ class LearningScheduler:
                 continue
             baseline = rec.get("baseline")
             mean = sum(windows) / len(windows)
-            if baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON:
+            if (
+                baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON
+                and self._suggest_instead_of_rollback("generation_params", mode, adopted)
+            ):
+                logger.warning(
+                    "Level 1 %s: user-adopted generation delta %s regressed (post-adoption "
+                    "fitness %.4f < baseline %.4f - %.2f); rollback suggested, not applied",
+                    mode, adopted, mean, baseline, PROMPT_ROLLBACK_EPSILON,
+                )
+            elif baseline is not None and mean < baseline - PROMPT_ROLLBACK_EPSILON:
                 evolver.restore_deltas(mode, dict(rec.get("rollback_to") or {}))
                 rolled_back.add(mode)
+                self._growth_monitor_rollback_row("generation_params", mode, adopted, None)
                 logger.warning(
                     "Level 1 %s: generation delta rolled back to %s "
                     "(post-adoption fitness %.4f < baseline %.4f - %.2f)",
@@ -3631,6 +3759,151 @@ class LearningScheduler:
         results["fewshot_gc"] = gc_summary
         return saved
 
+    def _current_replay_assets(self, mode: str) -> tuple[str, dict[str, float], str]:
+        """``(system の最終レンダ, sampling, 資産束の digest)`` = 現行の資産 (f_04 §6.4)。
+
+        system は採用ゲートと同じ最終レンダ、sampling は config の既定に学習デルタを
+        掛けたもの (チャットが使う値)。config 未ロードなら sampling は空 (greedy)。
+        """
+        from backend.free.learning.generation_param_evolver import apply_deltas
+        from backend.free.learning.growth.replay import asset_digest
+
+        raw = self.prompt_manager.get_raw_prompt(mode)
+        system = self._gate_system_texts(mode, raw, raw)[0]
+        try:
+            from backend.config import get_mode_generation_params
+
+            base = get_mode_generation_params(mode)
+        except Exception as exc:  # noqa: BLE001 - config 未ロードは greedy で縮退
+            logger.debug("base generation params unavailable: %r", exc)
+            base = {}
+        evolver = self._generation_param_evolver
+        deltas = evolver.get_deltas(mode) if evolver is not None else {}
+        params = apply_deltas(base, deltas or {})
+        sampling = {
+            k: params[k] for k in ("temperature", "top_p", "top_k", "presence_penalty")
+            if params.get(k) is not None
+        }
+        return system, sampling, asset_digest(system, sampling)
+
+    async def _level1_phase8_growth_regression(
+        self,
+        results: dict[str, dict],
+        phase_durations: dict[str, float],
+    ) -> None:
+        """Level 2 (成長) の段: 回帰ケースを現行の資産で再生し役割を更新する (f_04 §6.4)。
+
+        ``regression_status.json`` の ``last_run_at`` の古い順に、1 tick 最大
+        ``learning.growth.regression.max_cases_per_tick`` 件。ケース間で ``should_yield``
+        を見て打ち切る — 進捗はケースごとの ``last_run_at`` に残るので、次の tick が続きから
+        回す (session を持ち越さない)。``learning_disabled`` / ``single_slot`` / readonly /
+        ``learning.growth.enabled=false`` / 評価器なしでは skip する。結果辞書
+        ``results["growth_regression"]`` は :data:`GROWTH_REGRESSION_KEYS` を常に整数で持つ
+        (skip・失敗でも 0、c_07 §7.1)。書き先は学習ストア (状態ファイル) だけ。
+        """
+        tp = time.monotonic()
+        out: dict[str, Any] = dict.fromkeys(GROWTH_REGRESSION_KEYS, 0)
+        results["growth_regression"] = out
+        try:
+            reason = await self._run_growth_regression(out)
+        except Exception as exc:  # noqa: BLE001 - 段の失敗で学習を止めない
+            logger.warning("Level 1 growth regression failed: %r", exc, exc_info=True)
+            reason = "error"
+        if reason is not None:
+            out.update({"skipped": True, "reason": reason})
+            logger.debug("Level 1 growth regression skipped (%s)", reason)
+        phase_durations["phase8_growth_regression"] = round(time.monotonic() - tp, 3)
+
+    async def _run_growth_regression(self, out: dict[str, Any]) -> str | None:
+        """``_level1_phase8_growth_regression`` の本体。skip したら理由を返す。"""
+        from backend.free.learning.growth.regression import (
+            SOURCE_SEED,
+            load_status,
+            save_status,
+        )
+        from backend.free.learning.growth.replay import (
+            ReplayHarness,
+            count_roles,
+            due_cases,
+            record_result,
+        )
+        from backend.io.readonly import is_readonly
+
+        if self._disabled:
+            return "learning_disabled"
+        if self.single_slot:
+            return "single_slot"
+        if is_readonly():
+            return "readonly"
+        settings = self._growth_settings()
+        if not settings.enabled:
+            return "growth_disabled"
+        harness = ReplayHarness(self._prompt_eval)
+        if self._prompt_eval is None or not harness.available:
+            return "no_prompt_eval"
+        cases = self._regression_ledger(settings).cases()
+        status_path = self._regression_status_path()
+        status = load_status(status_path)
+        try:
+            monitored = self.growth.monitored_guard_ids()
+        except Exception as exc:  # noqa: BLE001 - 監視の記録が読めなくても再生は回す
+            logger.debug("growth adoption records unavailable: %r", exc)
+            monitored = frozenset()
+        due = due_cases(
+            cases, status, limit=settings.regression.max_cases_per_tick, prefer=monitored,
+        )
+        assets: dict[str, tuple[str, dict[str, float], str]] = {}
+        updated: dict[str, Any] = {}
+        yielded = False
+        for case in due:
+            if self.should_yield() or self._cancelled:
+                yielded = True
+                break
+            if case.mode not in assets:
+                try:
+                    assets[case.mode] = self._current_replay_assets(case.mode)
+                except ValueError:  # プロンプトの無いモード
+                    continue
+            system, sampling, digest = assets[case.mode]
+            outcome = await harness.replay(case, system, sampling)
+            if outcome is None:
+                continue  # 生成できなかった (欠測。状態は変えない)
+            out["regression_cases_run"] += 1
+            updated[case.case_id] = record_result(
+                status.cases.get(case.case_id),
+                passed=outcome.passed, asset=digest, at=utc_now(),
+                is_seed=case.source == SOURCE_SEED,
+                guard_min_pass_streak=settings.regression.guard_min_pass_streak,
+            )
+        if updated:
+            # sleep-time の収穫 (Step 13.6) が同じファイルの ``harvested`` を書くので、
+            # 保存の直前に読み直して自分の更新した ``cases`` だけを重ねる。
+            status = load_status(status_path)
+            status.cases.update(updated)
+            save_status(status_path, status)
+        if monitored:
+            # 採用した版の guard を採用後の資産の合否で数える (退行なら巻き戻し / 提案)
+            try:
+                out.update(self.growth.monitor_guards(cases, status))
+                self._save_state()
+            except Exception as exc:  # noqa: BLE001 - 監視の失敗で学習を止めない
+                logger.warning("Level 1 growth adoption monitor failed: %r", exc, exc_info=True)
+        counts = count_roles(cases, status)
+        out.update({
+            "regression_guards": counts.guards,
+            "regression_pressure": counts.pressure,
+            "regression_flaky": counts.flaky,
+        })
+        if yielded:
+            out["yielded"] = True
+        logger.info(
+            "Level 1 growth regression: replayed %d/%d due case(s)%s; "
+            "guards=%d pressure=%d flaky=%d",
+            out["regression_cases_run"], len(due), " (yielded)" if yielded else "",
+            counts.guards, counts.pressure, counts.flaky,
+        )
+        return None
+
     def _level1_finalize(
         self,
         experiences: list[dict],
@@ -3686,6 +3959,10 @@ class LearningScheduler:
                     ledger.record_run(
                         f"learn.level1.{phase}", effect=sum(counts),
                     )
+                for key in _LEVEL1_GAUGE_KEYS.get(phase, ()):
+                    gauge = val.get(key)
+                    if isinstance(gauge, int) and not isinstance(gauge, bool):
+                        ledger.record_run(f"learn.level1.{phase}.{key}", effect=gauge)
                 continue
             if "improved" in val or val.get("skipped"):
                 entries = {f"learn.level1.{phase}": val}
@@ -3922,41 +4199,3 @@ class LearningScheduler:
             "decayed": decayed,
             "total": store.count,
         }
-
-    # ── Level 2: Pro プラグインに委譲 ──
-
-    def check_level2(
-        self,
-        is_user_active: bool,
-        lora_path: Path | None = None,
-        base_model_path: Path | None = None,
-        force: bool = False,
-    ) -> bool:
-        """Level 2 トリガー判定と実行開始（ベースモデル）
-
-        Pro 版: Level2Runner に委譲。
-        Free 版: _level2_runner が None のため常に False。
-
-        Args:
-            is_user_active: ユーザーがアクティブかどうか
-            lora_path: ベースモデル LoRA アダプタパス
-            base_model_path: ベースモデル GGUF パス（LoRA ターゲット自動判定用。
-                経験の絞り込みに使う ``model_key`` もこのモデルから導く）
-            force: overdue クールダウンを無視して即時試行する（手動トリガ用）。
-                データ量・実行中・アダプタ互換の各ゲートは維持する。
-
-        Returns:
-            学習を開始したかどうか
-        """
-        if self._disabled or self.single_slot:
-            return False
-        if self._level2_runner is None:
-            logger.debug("Level 2 runner not set (Free edition)")
-            return False
-
-        return self._level2_runner.check_and_run(
-            is_user_active=is_user_active,
-            lora_path=lora_path,
-            base_model_path=base_model_path,
-            force=force,
-        )

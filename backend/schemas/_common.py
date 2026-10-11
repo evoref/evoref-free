@@ -593,6 +593,43 @@ class ProKnowledgeConfig(BaseModel):
     user_agent: str = "evoref-knowledge/1.0"
 
 
+class ProPolicyConfig(BaseModel):
+    """Pro 組織ポリシーパックの起動時の自動適用 (docs/p_09 §4.3)。
+
+    ``pack_path`` (ファイルかディレクトリ。ディレクトリなら版の最も新しいパック) を起動時に
+    検証し、適用中のものより新しければ適用する。空なら自動適用しない (``evoref policy apply``
+    で手で適用する)。Free には適用器が無いので効果はない。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pack_path: str = ""
+
+
+class ProHubConfig(BaseModel):
+    """Pro チーム知識ハブ (docs/p_10)。どちらの自動処理も opt-in (既定オフ)。
+
+    ハブ側: ``auto_export`` が真で ``export_dir`` / ``signing_key_path`` / ``signer`` が揃えば、
+    sleep-time の Full (Step 5.89) が ``export_interval_hours`` ごとに公開リストの中身を署名付き
+    ``.evocart`` にして ``export_dir`` (NAS 等の配布物置き場) へ書く。秘密鍵はパスだけを持ち、
+    データ根の中の鍵は拒否する。メンバー側: ``subscribe_dirs`` が空でなければ、起動後と
+    ``sync_interval_hours`` ごと (0 = 起動後の 1 回だけ) にそのフォルダの新しい版を取り込む。
+    Free にはハブの実体が無いので効果はない。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = ""
+    auto_export: bool = False
+    export_dir: str = ""
+    signing_key_path: str = ""
+    signer: str = ""
+    export_interval_hours: float = Field(default=20.0, ge=0.0)
+    subscribe_dirs: list[str] = Field(default_factory=list)
+    subscribe_signer: str = ""
+    sync_interval_hours: float = Field(default=24.0, ge=0.0)
+
+
 class ProConfig(BaseModel):
     """Pro 専用機能の設定ルート
 
@@ -604,6 +641,8 @@ class ProConfig(BaseModel):
 
     url_recall: ProUrlRecallConfig = Field(default_factory=ProUrlRecallConfig)
     knowledge: ProKnowledgeConfig = Field(default_factory=ProKnowledgeConfig)
+    policy: ProPolicyConfig = Field(default_factory=ProPolicyConfig)
+    hub: ProHubConfig = Field(default_factory=ProHubConfig)
 
 
 class ModelMigrationConfig(BaseModel):

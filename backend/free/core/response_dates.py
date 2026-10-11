@@ -26,6 +26,7 @@ __all__ = [
     "YMD_NUMERIC_PATTERN",
     "WEEKDAY_SUFFIX_RE",
     "WeekdayClaim",
+    "calendar_weekday",
     "complete_years",
     "extract_tool_anchor",
     "extract_tool_now_date",
@@ -290,6 +291,12 @@ def extract_tool_anchor(text: str) -> str | None:
     """
     m = _ANCHOR_LINE_RE.search(text or "")
     return m["kind"] if m else None
+
+
+def calendar_weekday(year: int, month: int, day: int) -> str | None:
+    """暦の曜日の 1 字 (``月``〜``日``)。あり得ない日付なら ``None`` (純粋関数)。"""
+    d = _safe_date(year, month, day)
+    return _WEEKDAY_CHARS[d.weekday()] if d is not None else None
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:

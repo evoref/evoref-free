@@ -28,6 +28,7 @@ from backend.free.core.response_arithmetic import (
     normalize_numerals,
 )
 from backend.free.core.response_verifiers import (
+    contradicted_weekday,
     declared_count_mismatch,
     mask_item_numbers,
     misstated_change_rate,
@@ -3546,6 +3547,7 @@ def count_response_defects(
         "declared_count_mismatch": int(
             not is_create_mode(mode) and declared_count_mismatch(text) is not None,
         ),
+        "contradicted_weekday": int(contradicted_weekday(text, query) is not None),
     }
 
 

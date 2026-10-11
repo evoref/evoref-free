@@ -16,14 +16,15 @@ import math
 import re
 
 from backend.free.core.response_arithmetic import JaNumber, iter_ja_numbers
+from backend.free.core.response_dates import calendar_weekday, weekday_claims
 from backend.free.core.script_ranges import HIRAGANA
 from backend.log_config import get_logger
 
 logger = get_logger("core.response_verifiers")
 
 __all__ = [
-    "declared_count_mismatch", "false_tool_unavailability", "mask_item_numbers",
-    "misstated_change_rate",
+    "contradicted_weekday", "declared_count_mismatch", "false_tool_unavailability",
+    "mask_item_numbers", "misstated_change_rate",
 ]
 
 #: 走査する本文の上限 (文字)。計算量を入力長に線形で抑え、巨大な応答でも止まらない。
@@ -516,4 +517,51 @@ def false_tool_unavailability(
                 return f"said {m.group(0)} is unavailable but {tool} is always registered"
     except Exception:  # noqa: BLE001 — 検証器は成否の導出を止めない
         logger.warning("false_tool_unavailability failed; treating as not detected", exc_info=True)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 西暦つきの月日に添えた曜日が暦と食い違う
+# ---------------------------------------------------------------------------
+#
+# 監査で繰り返し出た型 (2026-08 ライブ監査「2026-08-04 → 月曜 (実際は火曜)」、
+# 2026-09-26 C08#2「10 月 15 日（火）」(実際は木曜))。ストリームの ``WeekdayFilter`` は
+# **月日がユーザーの発話にある** ときだけ曜日を書き換え、モデルが自分で書いた月日は
+# 日付そのものが誤りうるので触らない。その残りは、西暦・月・日・曜日が 1 つの表記に
+# そろっていれば、どちらが誤りでも本文の中の矛盾として決定論に言える。
+#
+# 年を書いていない月日は判定しない (どの年の話かが本文から決まらない)。月日と曜日の
+# 読み取りは ``response_dates.weekday_claims`` (曜日の照合の SSOT) をそのまま使う。
+
+
+def contradicted_weekday(response: str, query: str = "") -> str | None:
+    """西暦つきの月日に添えた曜日が暦と食い違っていれば理由を返す。
+
+    条件をすべて満たしたときだけ報告する:
+
+    1. 月日の直後に曜日を添えている (「2026年10月15日（火）」「2026年10月15日火曜」)。
+       「…は火曜日です」のような述語の形は読まない (否定・仮定の文が混ざる)
+    2. その月日に西暦が書いてある (年の無い月日・和暦は判定しない)
+    3. 鉤括弧・コード片の引用の中でない
+    4. 依頼 (``query``) がその月日に曜日を書いていない — 利用者の書いた曜日を
+       なぞった応答はモデルの誤りと言えない
+    """
+    try:
+        text = _blank_code(_head_sentences(response or ""))
+        user_dated = {(c.month, c.day) for c in weekday_claims(query or "")}
+        for claim in weekday_claims(text):
+            if claim.year is None or (claim.month, claim.day) in user_dated:
+                continue
+            pos = claim.weekday_pos
+            if text.count("「", 0, pos) > text.count("」", 0, pos):
+                continue
+            actual = calendar_weekday(claim.year, claim.month, claim.day)
+            if actual is None or actual == claim.weekday:
+                continue
+            return (
+                f"{claim.year}-{claim.month:02d}-{claim.day:02d} written as "
+                f"{claim.weekday} but the calendar says {actual}"
+            )
+    except Exception:  # noqa: BLE001 — 検証器は成否の導出を止めない
+        logger.warning("contradicted_weekday failed; treating as not detected", exc_info=True)
     return None

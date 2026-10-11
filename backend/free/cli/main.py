@@ -61,7 +61,8 @@ logger = get_logger("cli.main")
 # - "create": 対話モード (Pro はクリエイト、Free は警告 + chat フォールバック)
 _SUBCOMMANDS = {
     "serve", "chat", "create", "gui", "export", "import", "reindex", "projectmap", "theme",
-    "config", "reset", "forget", "doctor", "backups", "tune", "lora", "rag", "knowledge", "model", "learn",
+    "config", "reset", "forget", "doctor", "backups", "tune", "rag", "knowledge", "model",
+    "growth", "audit", "cartridge", "policy", "airgap", "hub", "modelfit",
 }
 
 #: 値を 1 つ取るオプション。直後の語はサブコマンド判定から外す。
@@ -455,30 +456,30 @@ def _get_subcommand_handler(name: str):
     if name == "tune":
         from backend.free.cli.tune_command import run_tune
         return run_tune
-    if name == "lora":
-        return _run_lora_subcmd
     if name == "rag":
         from backend.free.cli.rag_command import run_rag
         return run_rag
     if name == "knowledge":
         return _run_knowledge_subcmd
+    if name == "audit":
+        return _run_audit_subcmd
+    if name == "cartridge":
+        return _run_cartridge_subcmd
+    if name == "policy":
+        return _run_policy_subcmd
+    if name == "airgap":
+        return _run_airgap_subcmd
+    if name == "hub":
+        return _run_hub_subcmd
+    if name == "modelfit":
+        return _run_modelfit_subcmd
     if name == "model":
         from backend.free.cli.model_commands import run_model
         return run_model
-    if name == "learn":
-        return _run_learn_subcmd
+    if name == "growth":
+        from backend.free.cli.growth_command import run_growth
+        return run_growth
     return None
-
-
-def _run_lora_subcmd(argv: list[str]) -> int:
-    """lora サブコマンド (Pro 専用)。Free には Pro モジュールが無いので案内して終える。"""
-    try:
-        from backend.pro.cli.lora_command import run_lora
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="lora"), file=sys.stderr)
-        return 1
-    return run_lora(argv)
 
 
 def _run_knowledge_subcmd(argv: list[str]) -> int:
@@ -492,15 +493,70 @@ def _run_knowledge_subcmd(argv: list[str]) -> int:
     return run_knowledge(argv)
 
 
-def _run_learn_subcmd(argv: list[str]) -> int:
-    """learn サブコマンド (Pro 専用)。Free には Pro モジュールが無いので案内して終える。"""
+def _run_audit_subcmd(argv: list[str]) -> int:
+    """audit サブコマンド (Pro 専用、docs/p_07)。Free には Pro モジュールが無いので案内して終える。"""
     try:
-        from backend.pro.cli.learn_command import run_learn
+        from backend.pro.cli.audit_command import run_audit
     except ImportError:
         init_i18n()
-        print(msg("cli.pro_only_command", command="learn"), file=sys.stderr)
+        print(msg("cli.pro_only_command", command="audit"), file=sys.stderr)
         return 1
-    return run_learn(argv)
+    return run_audit(argv)
+
+
+def _run_cartridge_subcmd(argv: list[str]) -> int:
+    """cartridge サブコマンド (Pro 専用、署名付きカートリッジ docs/p_06)。Free は案内して終える。"""
+    try:
+        from backend.pro.cli.cartridge_command import run_cartridge
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="cartridge"), file=sys.stderr)
+        return 1
+    return run_cartridge(argv)
+
+
+def _run_policy_subcmd(argv: list[str]) -> int:
+    """policy サブコマンド (Pro 専用、組織ポリシーパック docs/p_09)。Free は案内して終える。"""
+    try:
+        from backend.pro.cli.policy_command import run_policy
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="policy"), file=sys.stderr)
+        return 1
+    return run_policy(argv)
+
+
+def _run_hub_subcmd(argv: list[str]) -> int:
+    """hub サブコマンド (Pro 専用、チーム知識ハブ docs/p_10)。Free は案内して終える。"""
+    try:
+        from backend.pro.cli.hub_command import run_hub
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="hub"), file=sys.stderr)
+        return 1
+    return run_hub(argv)
+
+
+def _run_modelfit_subcmd(argv: list[str]) -> int:
+    """modelfit サブコマンド (Pro 専用、モデル適合ラボ docs/p_11)。Free は案内して終える。"""
+    try:
+        from backend.pro.cli.modelfit_command import run_modelfit
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="modelfit"), file=sys.stderr)
+        return 1
+    return run_modelfit(argv)
+
+
+def _run_airgap_subcmd(argv: list[str]) -> int:
+    """airgap サブコマンド (Pro 専用、エアギャップ導入キット docs/p_08)。Free は案内して終える。"""
+    try:
+        from backend.pro.cli.airgap_command import run_airgap
+    except ImportError:
+        init_i18n()
+        print(msg("cli.pro_only_command", command="airgap"), file=sys.stderr)
+        return 1
+    return run_airgap(argv)
 
 
 # ────────────────────────────────────────────

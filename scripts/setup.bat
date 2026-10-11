@@ -156,7 +156,7 @@ if defined SHARED_PATH if exist "config.yaml" (
     echo   Updated config.yaml with shared paths
 )
 
-rem An old config.yaml without config_version is rewritten once
+rem An old config.yaml (no or outdated config_version) is rewritten once
 rem (backup config.yaml.g0-<stamp>); evoref-ctl start retries if this fails.
 if exist "config.yaml" (
     python -m backend.free.cli.main config normalize --if-needed

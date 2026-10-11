@@ -2131,10 +2131,6 @@ _SELF_LEARNING_FACT_HEAD = (
     "- 会話の結末は経験として記録される (Level 0)。\n"
     "- 蓄積した経験から応答方針そのものが変異・選択で更新される (Level 1)。\n"
 )
-#: Pro のみ。Free には Level 2 が無いので、有ると答えさせない。
-_SELF_LEARNING_FACT_LEVEL2 = (
-    "- 学習サイクルが LoRA を訓練し、ベースモデルの応答を更新する (Level 2)。\n"
-)
 _SELF_LEARNING_FACT_TAIL = (
     "- アイドル時間に会話が整理され、属性ごとの現在値が SemMem へ書き戻される"
     " (sleep-time)。\n"
@@ -2160,12 +2156,9 @@ def _self_learning_fact() -> str:
     """
     import os
 
-    from backend.edition import is_pro
-
     if os.environ.get("EVOREF_LEARNING_DISABLED") == "1":
         return _SELF_LEARNING_DISABLED_FACT
-    level2 = _SELF_LEARNING_FACT_LEVEL2 if is_pro() else ""
-    return _SELF_LEARNING_FACT_HEAD + level2 + _SELF_LEARNING_FACT_TAIL
+    return _SELF_LEARNING_FACT_HEAD + _SELF_LEARNING_FACT_TAIL
 
 
 #: モデル識別の確定事実。``{model}`` に **実測** のモデル名が入る。

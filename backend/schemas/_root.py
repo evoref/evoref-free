@@ -75,8 +75,8 @@ class EvorefConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    # 設定ファイルの版 (c_05 §7.6)。版の無い G0 の config は
-    # ``evoref config normalize`` が一度だけ直して ``1`` を付ける。
+    # 設定ファイルの版 (c_05 §7.6)。版の無い G0 の config と古い版の config は
+    # ``evoref config normalize`` が一度だけ直して現行の版を付ける。
     config_version: int = Field(default=CONFIG_VERSION, ge=1)
     instance: InstanceConfig = Field(default_factory=InstanceConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -217,7 +217,6 @@ class EvorefConfig(BaseModel):
         判定対象:
 
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
-        - ``learning.optimizer == "full-cma-es"`` (Pro CMA-ES オプティマイザ)
         - ``create.staged.profile == "v1"`` (staged の v1 工程は Pro 限定。v2 は Free でも使う)
         - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
 
@@ -235,17 +234,12 @@ class EvorefConfig(BaseModel):
         triggers: list[tuple[str, bool]] = [
             ("widget_proxy.enabled", bool(self.widget_proxy.enabled)),
             (
-                "learning.optimizer",
-                self.learning.optimizer == "full-cma-es",
-            ),
-            (
-                "learning.level2_base_method",
-                self.learning.level2_base_method == "cvector",
-            ),
-            (
                 "pro.url_recall.team_profile_ids",
                 bool(self.pro.url_recall.team_profile_ids),
             ),
+            ("pro.policy.pack_path", bool(self.pro.policy.pack_path.strip())),
+            ("pro.hub.auto_export", bool(self.pro.hub.auto_export)),
+            ("pro.hub.subscribe_dirs", bool(self.pro.hub.subscribe_dirs)),
             # staged の v1 工程は Pro 限定 (_staged_stage_base_enabled がゲート)。
             # Free は v2 だけを使うので、v1 を指定しても longform のまま無効に
             # なることを警告する (f_10 §11.3)。staged_enabled は intra-staged の

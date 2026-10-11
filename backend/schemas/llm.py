@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
+from backend.config_normalize import reject_retired_keys
+
 
 def _int_or_auto(v: object, name: str, minimum: int) -> int | str | None:
     """環境調整 (c_16 §7.2.3) が決めるキーの値: ``"auto"`` / ``None`` (どちらも自動) か ``minimum`` 以上の整数。"""
@@ -232,7 +234,6 @@ class LlamaConfig(BaseModel):
     # ``LocalClient._build_payload`` が context_size からプロンプト推定を引いた
     # 残量 (下限 256) へクランプして送る。
     max_tokens: int = Field(default=2048, ge=0)
-    lora_target: str = "auto"
     # None = 未指定 (arch プロファイルの reasoning.enable_thinking / 能力判定で決定。
     # 非対応 arch には送らない)。True/False = ユーザー明示でプロファイルを上書き。
     enable_thinking: bool | None = None
@@ -281,6 +282,14 @@ class LlamaConfig(BaseModel):
     # 解決する。false で全機構 OFF (従来挙動)。
     auto_model_flags: bool = True
     extra_args: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_level2(cls, data: object) -> object:
+        """撤去した ``lora_target`` に移行の案内を付けて拒否する (f_04 §6.7)。"""
+        if isinstance(data, dict):
+            reject_retired_keys("llama", data)
+        return data
 
     @model_validator(mode="after")
     def warn_idle_slot_cache_without_ram_budget(self) -> "LlamaConfig":

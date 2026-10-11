@@ -156,4 +156,31 @@ class SemanticFactStoreProtocol(Protocol):
         ...
 
 
-__all__ = ["SemanticFactStoreProtocol"]
+#: sleep-time Step 13.6「回帰台帳の収穫」の結果辞書のキー (docs/f_04 §6.3)。Full の結果辞書へ
+#: **常に整数で** 載せる (届かなかった回と「到達したが効果 0」を死活監視が分けられるように、
+#: c_07 §7.1)。``growth_harvest_input`` は段 ``growth_harvest`` の入力件数 (``_input`` 接尾辞の
+#: 約束)、``growth_harvest`` はその効果 (ケースに結び付いた候補 = 追加 + 重複)。
+GROWTH_HARVEST_KEYS: tuple[str, ...] = (
+    "growth_harvest_input",
+    "growth_harvest",
+    "growth_cases_added",
+    "growth_cases_rejected",
+    "growth_cases_duplicate",
+    "growth_consistency_findings",
+)
+
+
+@runtime_checkable
+class GrowthHarvesterProtocol(Protocol):
+    """Step 13.6 の収穫器 (実体は EvorefLearn の ``learning.growth.harvest.GrowthHarvester``)。
+
+    SleepTimeWorker は学習側を import しない — 配線 (``_pillar_wirer``) が注入する。
+    書き先は学習ストア (回帰台帳) で、Evidence Store には書かない (不変則 #2)。
+    """
+
+    def run(self) -> dict[str, int]:
+        """1 回収穫して :data:`GROWTH_HARVEST_KEYS` の件数を返す。"""
+        ...
+
+
+__all__ = ["GROWTH_HARVEST_KEYS", "GrowthHarvesterProtocol", "SemanticFactStoreProtocol"]

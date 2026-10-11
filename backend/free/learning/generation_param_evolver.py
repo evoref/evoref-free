@@ -14,6 +14,7 @@ from backend.free.learning.fitness import (
 from backend.free.learning.generation_delta_store import GenerationDeltaStore
 from backend.free.learning.pairwise_gate import (
     PAIRWISE_NET_WINS,
+    guard_tally,
     net_wins,
     noise_floor,
     pairwise_verdict,
@@ -207,8 +208,13 @@ class GenerationParamEvolver:
         samples: list | None = None,
         min_net_wins: int = 1,
         rng: random.Random | None = None,
+        guard_ids: frozenset[str] = frozenset(),
+        defer_adoption: bool = False,
     ) -> dict:
         """候補デルタを **実生成で比べて** 採否を決める (f_04 §4.7)。
+
+        ``defer_adoption=True`` ならゲートを通っても書かず、``gate_passed=True`` を返す
+        (採用するか提案にするかは呼出側の ``GrowthPolicy`` が決める、f_04 §6.6)。
 
         ``evolve`` が候補生成を止めていた理由は「経験レコードに生成時の
         パラメータが残っていないので候補ごとの fitness を出せない」だった。
@@ -226,7 +232,8 @@ class GenerationParamEvolver:
         純勝ちは ``cases`` (**失敗ケースだけ**) で数え、``samples`` (成功ターンの
         標本) は無退行の検査に使う (プロンプト側と同じ、f_04 §10.1 #2 後半)。
         標本が 0 件なら ``no_regression_samples``、標本で 1 敗なら
-        ``sample_regression`` で採用しない。
+        ``sample_regression`` で採用しない。``guard_ids`` (標本のうち回帰台帳の guard、
+        f_04 §6.5) を渡せば、その合否を ``guards_passed`` / ``guards_failed`` に残す。
 
         Returns:
             ``{"improved": bool, "skipped": bool, "reason": str, "deltas": dict,
@@ -312,9 +319,11 @@ class GenerationParamEvolver:
         if out["reason"] == PAIRWISE_NET_WINS:
             out["reason"] = await self._check_sample_regression(
                 mode, evaluator, prompt_text, current_params, candidate_params,
-                samples, out,
+                samples, out, guard_ids=guard_ids,
             )
-        if out["reason"] == PAIRWISE_NET_WINS:
+        if out["reason"] == PAIRWISE_NET_WINS and defer_adoption:
+            out["gate_passed"] = True
+        elif out["reason"] == PAIRWISE_NET_WINS:
             self._deltas[mode] = candidate
             self.save_deltas()
             out.update({"improved": True, "deltas": candidate})
@@ -330,6 +339,7 @@ class GenerationParamEvolver:
     async def _check_sample_regression(
         mode: str, evaluator, prompt_text: str, current_params: dict,
         candidate_params: dict, samples: list, out: dict,
+        *, guard_ids: frozenset[str] = frozenset(),
     ) -> str:
         """失敗側で採用候補になった候補を標本で再生成し、無退行かを判定する。
 
@@ -351,6 +361,8 @@ class GenerationParamEvolver:
         if second is not None:
             losses = max(losses, tally(second)[1])
         out.update({"sample_wins": wins, "sample_losses": losses, "sample_ties": ties})
+        if guard_ids:
+            out["guards_passed"], out["guards_failed"] = guard_tally(first, guard_ids, second)
         if len(first) < max(1, (len(samples) + 1) // 2):
             return "insufficient_measured_cases"
         if losses > 0:

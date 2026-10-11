@@ -295,19 +295,17 @@ def setup_logging(
         console.setLevel(level)
         root.addHandler(console)
 
-    # learning.log ハンドラ（学習サイクル Level 0.5〜2 専用）
+    # learning.log ハンドラ（学習サイクル Level 0.5〜1 専用）
     # 設計書 c_07_error_handling_and_observability.md §6.2 に従い独立ファイルへ出力する
     _setup_learning_logging(log_dir, formatter, level, max_bytes)
 
 
-# 学習サイクル系ロガー（学習サイクル Level 0.5〜2 を learning.log に集約する対象）
+# 学習サイクル系ロガー（学習サイクル Level 0.5〜1 を learning.log に集約する対象）
 # - backend.learning.*       : Free 版の学習サイクル
-# - backend.pro.learning.*   : Pro 版の Level 2 トレーナー等
 # - backend.memory.sleep_update : Sleep-time update（Level 0.5）
-# - backend.optimizer.*      : Level 1 進化アルゴリズム (prompt/embed_instruction/spsa)
+# - backend.optimizer.*      : Level 1 進化アルゴリズム (prompt/embed_instruction)
 _LEARNING_LOGGER_NAMES: tuple[str, ...] = (
     "backend.learning",
-    "backend.pro.learning",
     "backend.memory.sleep_update",
     "backend.optimizer",
 )

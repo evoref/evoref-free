@@ -36,7 +36,6 @@ WORKING_MIN_TOKENS = 512
 #: ``prompt`` セクション未ロード時の既定 (schemas/prompt.py と同値)。
 _PROMPT_DEFAULTS: dict[str, int | float] = {
     "system_max_share": 0.30,
-    "fewshot_core_max_tokens": 300,
     "fewshot_dynamic_max_tokens": 600,
     "semmem_max_tokens": 800,
     "rag_max_tokens": 200,

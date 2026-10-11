@@ -27,8 +27,8 @@
 - 計算量は総文字数に線形 (1 本文の上限 :data:`MAX_TEXT_CHARS`、追跡する訂正の上限
   :data:`MAX_ACTIVE_CORRECTIONS`、文の長さの上限 :data:`MAX_SENTENCE_CHARS`)。
 
-配線 (睡眠時の段への組み込み) はまだしていない。測定は
-``scripts/bench/consistency_eval/eval_on_replay.py``。
+配線は sleep-time Step 13.6 の回帰台帳の収穫 (``learning.growth.harvest``、docs/f_04 §6.3)。
+測定は ``scripts/bench/consistency_eval/eval_on_replay.py``。
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 /** ダッシュボード関連の型定義 (関数なし)
  *
- * 学習スケジューラ・LoRA・改善カーブ等のフロントエンド状態用型を集約。
+ * 学習スケジューラ等のフロントエンド状態用型を集約。
  * これらの型は対応する API エンドポイント (status / learning) のレスポンスや
  * dashboard ストアで使用される。
  */
@@ -35,6 +35,22 @@ export interface Level1ResultEntry {
 	sample_ties?: number | null;
 	/** 失敗の証拠があったのに評価ケースにしなかった件数 (除外理由 → 件数) */
 	excluded?: Record<string, number> | null;
+	/** 標本に足した回帰台帳の guard の合否 */
+	guards_passed?: number | null;
+	guards_failed?: number | null;
+	/** ゲートを通ったが自動採用が効かず提案にした回の提案 ID (reason === 'proposed') */
+	proposal_id?: string | null;
+}
+
+/** Level 2 (成長) の要約 (`/api/learning/status` の scheduler_status.growth) */
+export interface GrowthSummary {
+	auto_adopt_configured: boolean;
+	auto_adopt_effective: boolean;
+	auto_adopt_reason: string;
+	pending_proposals: number;
+	guards: number;
+	pressure: number;
+	rollback_suggested: number;
 }
 
 /** ポリシー進化ドメインの状態（Pro） */
@@ -75,54 +91,6 @@ export interface ActiveSessionInfo {
 	experience_count: number;
 }
 
-/** Level 2 の状態 + 発火条件（Pro） */
-export interface Level2TargetStatus {
-	method: string;
-	bootstrap_enabled: boolean;
-	adapter_exists: boolean;
-	version: number;
-	/** 蓄積中の発火データ数（失敗数） */
-	experiences_current: number;
-	/** 総経験数 */
-	experiences_total?: number;
-	bootstrap_min: number;
-	spsa_min: number;
-	cvector_min: number;
-	/** 発火しない理由コード（"" = 発火可能）。表示は i18n でラベル化する */
-	block_reason: string;
-}
-
-/** Level 2 自動発火の共通タイミングゲート（Pro） */
-export interface Level2Gates {
-	active_minutes: number;
-	overdue_hours: number;
-	recheck_interval_sec: number;
-	/**
-	 * target ごとの **実効** クールダウン時間（h）。連続無改善が stale_streak に
-	 * 達した target は延長クールダウンへ落ちるため overdue_hours とは一致しない。
-	 */
-	cooldown_hours?: Record<string, number>;
-	/** target ごとの連続無改善回数（採用成功で 0 に戻る） */
-	no_improve_streak?: Record<string, number>;
-	/** 延長クールダウンへ落ちる連続無改善回数の閾値 */
-	stale_streak?: number;
-	/**
-	 * target ごとの「クールダウンを過ぎているか」。データ充足（block_reason==""）
-	 * と AND を取って初めて実際に発火する。未提供（旧バックエンド）は true 扱い。
-	 */
-	overdue?: Record<string, boolean>;
-	/** target ごとの前回実行からの経過秒。未実行は null */
-	seconds_since_run?: Record<string, number | null>;
-}
-
-/** Level 2 (LoRA) の状態（Pro のみ非 null） */
-export interface Level2Status {
-	running_target: string | null;
-	next_target: string;
-	base: Level2TargetStatus;
-	gates: Level2Gates;
-}
-
 /** スケジューラ状態（バックエンド SchedulerStatusModel 準拠） */
 export interface SchedulerStatus {
 	running: boolean;
@@ -147,11 +115,6 @@ export interface SchedulerStatus {
 	/** 延期が始まった時刻 (ISO 8601 UTC)。延期していなければ null */
 	deferred_since?: string | null;
 	last_level1_run: string | null;
-	last_level2_run: string | null;
-	/** 実行中の Level 2 対象（"base"/null） */
-	running_target: string | null;
-	/** Level 2 (LoRA) の状態（Pro のみ非 null） */
-	level2: Level2Status | null;
 	last_level0_record: string | null;
 	experience_by_mode: ExperienceByMode;
 	correction_rate: number;
@@ -176,6 +139,8 @@ export interface SchedulerStatus {
 	priority_queue: PriorityRequestEntry[];
 	/** SUSPENDED な Level1Session（無ければ null） */
 	active_session: ActiveSessionInfo | null;
+	/** Level 2 (成長) の要約 (読めなければ null) */
+	growth?: GrowthSummary | null;
 }
 
 /** ダッシュボード学習データ（フロントエンド状態用） */
@@ -195,17 +160,8 @@ export interface DashboardLearningData {
 	/** waiting_for_idle のとき、アイドル成立までの残り秒数 */
 	level1_seconds_until_idle: number | null;
 	last_level1_run: string | null;
-	last_level2_run: string | null;
-	/** 実行中の Level 2 対象（"base"/null） */
-	running_target: string | null;
-	/** Level 2 (LoRA) の状態（Pro のみ非 null） */
-	level2: Level2Status | null;
 	/** `--no-learning` 起動中 (true の間は学習が no-op) */
 	is_disabled: boolean;
-	lora_version: number;
-	lora_adapter_exists: boolean;
-	eval_cases_count: number;
-	eval_pass_threshold: number;
 	last_level0_record: string | null;
 	experience_by_mode: ExperienceByMode;
 	correction_rate: number;
@@ -243,21 +199,4 @@ export interface DashboardRagStats {
 	lastReindexAt: string | null;
 	embeddingModel: string | null;
 	embeddingBackend: string | null;
-}
-
-/** 改善カーブのポイント */
-export interface ImprovementScore {
-	version: number;
-	eval_score: number;
-	created_at: string;
-}
-
-/** LoRA バージョン情報 */
-export interface LoRAVersion {
-	version: number;
-	name: string;
-	date: string;
-	current: boolean;
-	/** スナップショットの実バイト数 (不明時は null)。日時と併せて表示する */
-	sizeBytes?: number | null;
 }

@@ -12,6 +12,7 @@ from typing import Any
 
 from backend.log_config import get_logger
 
+from backend.free.core.org_policy import TARGET_TOOL, policy_denial, tool_allowed
 from backend.free.agent.meta_cognitive_tool_io import (
     tool_result_lacks_information,
     tool_result_succeeded,
@@ -479,7 +480,8 @@ class ToolsRegistry:
         (2026-07-18 レビューで指摘)。
         """
         tool_def = self._tools.get(name)
-        return tool_def is not None and mode in tool_def.modes
+        # 組織ポリシーパックの許可リスト (docs/p_09 §4)。登録が無ければ常に真。
+        return tool_def is not None and mode in tool_def.modes and tool_allowed(name)
 
     def list_names(self) -> list[str]:
         """登録済みツール名を登録順で返す。
@@ -516,7 +518,7 @@ class ToolsRegistry:
                 continue
             if mode and mode not in tool.modes:
                 continue
-            if tool.name in exclude:
+            if tool.name in exclude or not tool_allowed(tool.name):
                 continue
             required = self._required_param_names(tool)
             sig_parts = []
@@ -546,7 +548,7 @@ class ToolsRegistry:
         """
         lines = []
         for tool in self._tools.values():
-            if not tool.listed_in(mode):
+            if not tool.listed_in(mode) or not tool_allowed(tool.name):
                 continue
             lines.append(f"- {tool.name}: {tool.description}")
         return "\n".join(lines)
@@ -567,6 +569,15 @@ class ToolsRegistry:
         tool = self._tools.get(name)
         if tool is None:
             raise ValueError(f"Unknown tool: {name}")
+
+        # 組織ポリシーパックの許可リストに無いツールは実行しない (docs/p_09 §4)。
+        # 選択側 (``is_available``) で外していても、近道や直接の呼出しがここへ来うる。
+        denial = policy_denial(TARGET_TOOL, name=name)
+        if denial is not None:
+            logger.warning("Tool %s blocked by the organization policy: %s", name, denial.detail)
+            record_current(name, False, reason="policy_denied")
+            _record_tool_issue(name, False, denial.detail)
+            return f"Error: {denial.detail}"
 
         # 引数のバリデーション（全ツール共通）。未知引数の除去と型寄せは
         # kwargs をその場で書き換える。

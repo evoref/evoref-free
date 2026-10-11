@@ -271,7 +271,7 @@ class CartridgeManager:
     def loaded(self) -> dict[str, CorpusPackage]:
         """検索対象のパッケージ (id → パッケージ)。
 
-        呼出側 (``chat_recorder`` / ``LearningScheduler`` / Level 2 trainer) が
+        呼出側 (``chat_recorder`` / ``LearningScheduler``) が
         使うのは **キー (= id)** だけ。
         """
         return self._corpus.loaded

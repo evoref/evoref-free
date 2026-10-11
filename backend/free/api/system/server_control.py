@@ -20,7 +20,6 @@ from pydantic import BaseModel
 from backend.app_state import AppState, get_app_state
 from backend.config import get_config
 from backend.constants import DEFAULT_LLAMA_PORT
-from backend.free.core.launch_adapters import LaunchAdapters, adapters_for_launch
 from backend.log_config import get_logger
 
 logger = get_logger("api.server_control")
@@ -98,7 +97,6 @@ def _build_cmd(
     project_root: Path,
     *,
     model_override: str | None = None,
-    adapters: LaunchAdapters | None = None,
     allow_decide: bool = False,
 ) -> tuple[list[str], str, int] | None:
     """サーバー名から起動コマンドと (host, port) を構築 (ブロッキング。async からは executor で呼ぶ)
@@ -111,7 +109,7 @@ def _build_cmd(
     from backend.free.core.tuning.resolve import launch_scope
 
     with launch_scope(allow_decide):
-        return _compose_cmd(name, cfg, project_root, model_override=model_override, adapters=adapters)
+        return _compose_cmd(name, cfg, project_root, model_override=model_override)
 
 
 def _compose_cmd(
@@ -120,13 +118,8 @@ def _compose_cmd(
     project_root: Path,
     *,
     model_override: str | None = None,
-    adapters: LaunchAdapters | None = None,
 ) -> tuple[list[str], str, int] | None:
     """サーバー名から起動コマンドと (host, port) を構築
-
-    ``adapters`` は base のみ有効 (``build_llama_cmd`` にそのまま透過する)。
-    モード切替 (``mode.py``) は新モードの分を渡す。省略時は現在のモードの
-    アダプタを ``adapters_for_launch`` から得る (Free では無し)。
 
     Returns:
         (cmd, host, port) or None（設定なし / モデル未指定）
@@ -142,19 +135,7 @@ def _compose_cmd(
         llama_cfg = cfg.get("llama", {})
         host = llama_cfg.get("host", "127.0.0.1")
         port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
-        if adapters is None:
-            from backend.config import get_path_resolver
-
-            try:
-                mode = get_path_resolver().active_mode
-            except RuntimeError:
-                mode = "chat"  # config 未ロード (単体テスト等)
-            adapters = adapters_for_launch(cfg, project_root, mode)
-        cmd = build_llama_cmd(
-            cfg, project_root, model_override=model_override,
-            lora_override=adapters.lora,
-            control_vector_override=adapters.control_vector,
-        )
+        cmd = build_llama_cmd(cfg, project_root, model_override=model_override)
         return (cmd, host, port)
 
     if name == "embed":
@@ -264,14 +245,13 @@ def _spawn_server_with_override(
     cfg: dict,
     *,
     model_override: str | None = None,
-    adapters: LaunchAdapters | None = None,
     allow_decide: bool = False,
 ) -> ManagedProcess | None:
-    """model_override / adapters 対応版の llama-server プロセス起動 (``allow_decide`` は :func:`_build_cmd`)"""
+    """model_override 対応版の llama-server プロセス起動 (``allow_decide`` は :func:`_build_cmd`)"""
     project_root = _find_project_root()
     result = _build_cmd(
         name, cfg, project_root, model_override=model_override,
-        adapters=adapters, allow_decide=allow_decide,
+        allow_decide=allow_decide,
     )
     if result is None:
         logger.warning("server_control: no config for %s", name)

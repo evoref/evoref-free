@@ -332,7 +332,6 @@ class MigrationResult:
     dry_run: bool = False
     old_model: str = ""
     new_model: str = ""
-    lora_action: str = "archived"
     data_summary: dict = field(default_factory=dict)
     calibration: dict | None = None
     recommendations: list[str] = field(default_factory=list)
@@ -408,10 +407,9 @@ class ModelMigrator:
         # データ集計
         result.data_summary = self._gather_data_summary()
 
-        # 学習データ (LoRA・経験・プロンプト) は model_key ごとのパーティションで
+        # 学習データ (経験・プロンプト) は model_key ごとのパーティションで
         # 保全される (c_05 §0.5.12)。旧モデルのものを退避・初期化する処理は無い —
         # 新しいモデルのパーティションは起動時 / rebind で束ねられ、空なら一から学習する。
-        result.lora_action = "kept"
         if dry_run:
             result.recommendations = (
                 self._known_issue_recommendations(resolved_path)
@@ -444,8 +442,8 @@ class ModelMigrator:
                 new_model_filename, issue,
             )
         logger.info(
-            "Migration completed: %s -> %s (lora: %s)",
-            old_model_filename, new_model_filename, result.lora_action,
+            "Migration completed: %s -> %s",
+            old_model_filename, new_model_filename,
         )
         return result
 
@@ -506,8 +504,7 @@ class ModelMigrator:
         base モデルと違い、経験バッファ・プロンプトメタなどのパーティション系
         付帯処理は不要 (embed の学習データは f_04_self_learning.md
         §1.2 のとおり元々 flat 共有でモデル別パーティション化されない)。
-        埋め込みモデルは LoRA を持たない (embed LoRA は G1 で撤去) ので
-        ``lora_action`` は常に ``"n/a"``。config.yaml 更新と model_state 記録を行う。
+        config.yaml 更新と model_state 記録を行う。
         実際の llama-server 再起動とクライアント差し替えは L2 で対応する。
         """
         if component not in ALL_COMPONENTS:
@@ -527,7 +524,6 @@ class ModelMigrator:
             dry_run=dry_run,
             old_model=old_filename,
             new_model=new_filename,
-            lora_action="n/a",
         )
 
         # 検証

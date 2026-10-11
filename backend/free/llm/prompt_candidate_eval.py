@@ -399,11 +399,14 @@ class PromptCandidateEval:
         *,
         params: dict[str, float] | None = None,
         tool_context: str = "",
+        history: list[dict[str, str]] | None = None,
     ) -> str | None:
         """``prompt_text`` で query を再生成する (既定は greedy、背景スロット)。
 
         ``tool_context`` (記録したツール結果ブロック) があれば、本番と同じく
         user の末尾に連ねる (``turn_text.append_to_last_user`` の区切り無し)。
+        ``history`` (直前の会話の user / assistant) は system と問いの間に置く
+        (回帰台帳の ``consistency`` ケースの再生、f_04 §6.4)。
         """
         sampling: dict[str, float] = {"temperature": 0.0}
         if params:
@@ -416,6 +419,7 @@ class PromptCandidateEval:
             result = await self._llm_client.generate(
                 messages=[
                     {"role": "system", "content": prompt_text},
+                    *(history or ()),
                     {"role": "user", "content": query + tool_context},
                 ],
                 stream=False,

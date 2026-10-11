@@ -945,8 +945,7 @@ class DebugLogger:
                 - ``"chat_response"`` (chat エンドポイントの SSE 終端)
                 - ``"learning_cycle_l05"`` / ``"learning_cycle_l05_full"``
                   (sleep-time worker Light/Full 完了)
-                - ``"learning_cycle_l1"`` / ``"learning_cycle_l2"``
-                  (LearningScheduler / Level2Trainer 完了)
+                - ``"learning_cycle_l1"`` (LearningScheduler 完了)
                 - ``"loop_iter"`` (loop driver の 1 iteration 完了)
                 - ``"sleep_worker"`` (sleep-time worker の最終 step 完了)
                 - ``"bg_task"`` (asyncio.create_task 配下の任意 background)

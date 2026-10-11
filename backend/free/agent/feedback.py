@@ -48,6 +48,7 @@ from backend.free.core.response_arithmetic import (
     iter_ja_numbers,
 )
 from backend.free.core.response_verifiers import (
+    contradicted_weekday,
     declared_count_mismatch,
     false_tool_unavailability,
     misstated_change_rate,
@@ -1003,6 +1004,7 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("fabricated entity", "content.fabricated_entity", "content_contradiction"),
     ("declared count mismatch", "content.declared_count", "content_contradiction"),
     ("false tool unavailability", "content.tool_unavailable", "content_contradiction"),
+    ("weekday contradiction", "content.weekday", "content_contradiction"),
 )
 
 
@@ -1910,7 +1912,7 @@ class FeedbackCollector:
         # 既存の検証器がどれも印を付けなかったターンにだけ掛ける追加の検証器
         # (2026-10-07)。既存の結果と優先順位は変えない。
         extra = FeedbackCollector._find_additional_failure_reason(
-            text, mode=mode, tool_uses=tool_uses,
+            text, mode=mode, tool_uses=tool_uses, query=query,
         )
         if extra is not None:
             logger.info("Turn marked failed (%s)", extra)
@@ -1920,6 +1922,7 @@ class FeedbackCollector:
     @staticmethod
     def _find_additional_failure_reason(
         text: str, *, mode: str = "chat", tool_uses: list[dict] | None = None,
+        query: str = "",
     ) -> str | None:
         """既存の検証器で無印だったターンの決定論の破綻を返す (無ければ ``None``)。
 
@@ -1936,6 +1939,9 @@ class FeedbackCollector:
         unavailable = false_tool_unavailability(text, tool_uses)
         if unavailable is not None:
             return f"false tool unavailability: {unavailable}"
+        weekday = contradicted_weekday(text, query)
+        if weekday is not None:
+            return f"weekday contradiction: {weekday}"
         return None
 
     @staticmethod

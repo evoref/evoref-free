@@ -98,7 +98,6 @@ CAPABILITY_KEYS: dict[str, tuple[str, ...]] = {
     "llama": ("extra_args", "speculative.draft_model_path"),
     "theme": ("trusted",),
     "rag": ("project_map.roots",),
-    "learning": ("cvector_seed_pairs_file",),
     "agent": ("dangerous_command_block",),
     "tools": ("fetch_url_allow_private_ip",),
     "widget_proxy": ("apis",),

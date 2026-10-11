@@ -14,7 +14,6 @@ readonly にして止める)。serve の稼働中でも動く (書き手ロッ�
   取り消し / 置き換え済み / 未知の列挙値)、id の一意性、active 版の COMPLETE と
   offsets の行数、ぶら下がった参照 (gc_log の墓標は許容)
 - 履歴のセッション id と経験の id の一意性、未知の列挙値の経験 (計数だけ)
-- スコープを跨ぐ参照 (Pro の LoRA meta → 共有の経験) は弱い参照で、欠けは計数だけ (§15.3)
 - 世代印・世代フォルダ (``g<N>/``)・データ根の置き場
 
 ``--bundle`` の束 (:func:`write_bundle`) は報告・形式表・版・redact 済みのログの末尾だけで、
@@ -37,7 +36,7 @@ from typing import Any, Literal
 from backend.data_root import DATA_GENERATION, generation_dirs, generation_root, store_root
 from backend.io import jsoncodec, ledger_files
 from backend.io.format_registry import FORMATS, FormatSpec
-from backend.io.generation_seal import check_seal
+from backend.io.generation_seal import GITKEEP_FILENAME, check_seal
 from backend.io.readonly import disable_readonly, enable_readonly, is_readonly
 from backend.io.versioned import producer_edition, read_versioned
 from backend.io.writer_lock import lock_held
@@ -58,8 +57,8 @@ _EVIDENCE_MANIFEST = "evidence.manifest"
 _HISTORY_SESSION = "history.session"
 _HISTORY_TURNS = "history.turns"
 _EXPERIENCE = "learning.experience"
-_ADAPTER_META = "pro.adapter_versions"
 _PROMPT_ADOPTION = "learning.prompt_adoption"
+_REGRESSION_CASE = "learning.regression_case"
 _TURNS_SUFFIX = ".turns.jsonl"
 
 
@@ -190,10 +189,6 @@ def _check_json(
         return
     if spec.format_id == _HISTORY_SESSION and payload is not None:
         collected["session_ids"].append((str(payload.get("session_id") or ""), rel))
-    elif spec.format_id == _ADAPTER_META and payload is not None:
-        window = payload.get("experience_window")
-        if isinstance(window, list):
-            collected["weak_experience_refs"].extend(str(i) for i in window if i)
 
 
 def _row_version(obj: dict[str, Any]) -> int | None:
@@ -210,6 +205,7 @@ def _check_jsonl(
     torn = newer = unversioned = 0
     experience = spec.format_id == _EXPERIENCE
     adoption = spec.format_id == _PROMPT_ADOPTION
+    regression = spec.format_id == _REGRESSION_CASE
     ids: Counter[str] = Counter()
     try:
         f = path.open("rb")
@@ -241,6 +237,8 @@ def _check_jsonl(
                 ids[str(obj["id"])] += 1
             if adoption and version is not None and version <= spec.version:
                 _collect_adoption_refs(obj, collected)
+            if regression and version is not None and version <= spec.version:
+                _collect_regression_refs(obj, collected)
     stats.torn += torn
     stats.newer_rows += newer
     stats.unversioned_rows += unversioned
@@ -485,12 +483,30 @@ def _check_adoption_refs(report: _Report, collected: dict[str, Any]) -> None:
         report.add("info", "adoption_reference_missing", format_id=_PROMPT_ADOPTION, count=missing)
 
 
-def _check_weak_refs(report: _Report, collected: dict[str, Any]) -> None:
-    refs = collected["weak_experience_refs"]
+def _collect_regression_refs(row: dict[str, Any], collected: dict[str, Any]) -> None:
+    """回帰台帳の 1 行が指す経験 ID を ``case_id`` ごとに集める (後勝ち、tombstone で外す)。"""
+    cases: dict[str, list[str]] = collected["regression_cases"]
+    if row.get("_tombstone"):
+        cases.pop(str(row.get("_key") or ""), None)
+        return
+    case_id = row.get("case_id")
+    if not isinstance(case_id, str) or not case_id:
+        return
+    refs = row.get("experience_ids")
+    cases.pop(case_id, None)
+    cases[case_id] = [str(i) for i in refs if i] if isinstance(refs, list) else []
+
+
+def _check_regression_refs(report: _Report, collected: dict[str, Any]) -> None:
+    """回帰台帳の経験 ID のうち経験ファイルに無いものを数える (ローテーションで宙に浮いても誤りではない)。"""
+    cases: dict[str, list[str]] = collected["regression_cases"]
+    refs = [ref for ids in cases.values() for ref in ids]
     missing = sum(1 for ref in refs if ref not in collected["experience_ids"])
-    report.sections["weak_references"] = {"checked": len(refs), "missing": missing}
+    report.sections["regression_references"] = {
+        "cases": len(cases), "checked": len(refs), "missing": missing,
+    }
     if missing:
-        report.add("info", "weak_reference_missing", format_id=_ADAPTER_META, count=missing)
+        report.add("info", "regression_reference_missing", format_id=_REGRESSION_CASE, count=missing)
 
 
 # ── 世代印・置き場・世代フォルダ ──
@@ -601,9 +617,9 @@ def run_doctor(
         "active_sessions": [],
         "experience_ids": Counter(),
         "experience": {"files": 0, "records": 0, "ignored": 0},
-        "weak_experience_refs": [],
         "adoption_rows": 0,
         "adoption_experience_refs": [],
+        "regression_cases": {},
     }
     with _no_store_writes(store_dir):
         _check_location(report, data_root)
@@ -612,6 +628,8 @@ def run_doctor(
         for path, spec in ledger_files.walk(generation_root(data_root)):
             rel = _rel(path, data_root)
             if spec is None:
+                if path.name == GITKEEP_FILENAME:
+                    continue  # ディレクトリ構成の印 (リポジトリで追跡する) はデータとみなさない (c_03 §10.1)
                 report.add("error", "unledgered_file", path=rel)
                 continue
             report.stats(spec).files += 1
@@ -630,8 +648,8 @@ def run_doctor(
     _check_history(report, collected)
     report.sections["experience"] = collected["experience"]
     report.sections["learning_health"] = _learning_health(data_root, active_model_key)
-    _check_weak_refs(report, collected)
     _check_adoption_refs(report, collected)
+    _check_regression_refs(report, collected)
     return report.to_dict()
 
 

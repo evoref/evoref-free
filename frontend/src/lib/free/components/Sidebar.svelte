@@ -59,6 +59,7 @@
 				<a href="/cartridge" class="nav-item" class:active={isActive('/cartridge')} aria-current={isActive('/cartridge') ? 'page' : undefined}>{$t('sidebar.cartridges')}</a>
 				{#if showPro}
 					<a href="/knowledge" class="nav-item" class:active={isActive('/knowledge')} aria-current={isActive('/knowledge') ? 'page' : undefined}>{$t('sidebar.knowledge_sources')}</a>
+					<a href="/audit" class="nav-item" class:active={isActive('/audit')} aria-current={isActive('/audit') ? 'page' : undefined}>{$t('sidebar.audit_trail')}</a>
 				{/if}
 				<a href="/themes" class="nav-item" class:active={isActive('/themes')} aria-current={isActive('/themes') ? 'page' : undefined}>{$t('sidebar.themes')}</a>
 				<a href="/dashboard" class="nav-item" class:active={isActive('/dashboard')} aria-current={isActive('/dashboard') ? 'page' : undefined}>{$t('sidebar.dashboard')}</a>

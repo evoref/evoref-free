@@ -16,12 +16,15 @@ from backend.io.format_registry import FormatSpec, register_format
 from backend.io.id_registry import is_valid_id, new_id
 from backend.io.readonly import DataReadonlyError
 from backend.io.writer_thread import ChatWriter, default_writer
+from backend.liveness import ledger as liveness_ledger
 from backend.log_config import get_logger
 from backend.utils import parse_utc, utc_now
 
 logger = get_logger("learning.level0")
 
 MAX_ENTRIES = 1000
+#: 経験の保存が readonly で拒否された回を数える死活監視の段 (c_07 §7.1)。
+EXPERIENCE_SAVE_STAGE = "learn.experience.save"
 
 #: バッファ表示・集計用の応答要約の最大長 (従来の response[:200])。
 RESPONSE_SUMMARY_CAP = 200
@@ -912,6 +915,7 @@ class ExperienceBuffer:
             )
         except DataReadonlyError:
             logger.debug("Experience buffer not saved to %s: data root is read-only", target)
+            liveness_ledger().record_readonly(EXPERIENCE_SAVE_STAGE)
             return
         logger.info("Saved %d experience entries to %s", len(own), target)
 
@@ -1021,8 +1025,10 @@ class ExperienceBuffer:
                     self.writer.append(target, lines, format_id=EXPERIENCE_FORMAT.format_id)
                 except DataReadonlyError:
                     # readonly は起動側で学習を止めている。ここは最後の砦で、ターンごとに
-                    # WARNING を出さない (G1 設計 §16.2 #14)。
+                    # WARNING を出さない (G1 設計 §16.2 #14)。死活監視には readonly と
+                    # して数える (失敗の連続にしない、c_07 §7.1)。
                     logger.debug("Experience not saved: data root is read-only")
+                    liveness_ledger().record_readonly(EXPERIENCE_SAVE_STAGE)
                     return
                 if home is None:
                     self._lines += len(lines)
@@ -1166,7 +1172,7 @@ class ExperienceBuffer:
         return None
 
     def get_failures(self, mode: str | None = None) -> list[ExperienceEntry]:
-        """失敗エントリ抽出 (Level 2 の失敗プール / 訂正ペアの母集団)。
+        """失敗エントリ抽出 (失敗の定義の SSOT。Level 2 (LoRA) の撤去後は主に検査用)。
 
         失敗の語彙は :data:`backend.free.learning.fitness.DEFECT_WEIGHTS` を
         SSOT にする (2026-09-21)。旧実装はここに 4 条件を手で並べており、

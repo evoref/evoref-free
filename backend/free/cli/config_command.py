@@ -1,12 +1,12 @@
 """evoref config サブコマンド (c_05 §7.6)。
 
-``normalize``: 版 (``config_version``) の無い G0 の ``config.yaml`` を G1 の形へ
-一度だけ直す (実体は :mod:`backend.config_normalize`)。単一書き手ロック
+``normalize``: 版 (``config_version``) の古い ``config.yaml`` (と ``config.pro.yaml``)
+を現行の形へ一度だけ直す (実体は :mod:`backend.config_normalize`)。単一書き手ロック
 (``<data_root>/g1/store/.writer.lock``) の下で動かし、serve の稼働中 (ロックが
 取られている) は書き換えずに拒否する。
 
 ``evoref serve`` / ``evoref-ctl start`` / setup は起動前に
-``config normalize --if-needed`` を呼ぶ (版のある config には何もしない)。
+``config normalize --if-needed`` を呼ぶ (現行の版の config には何もしない)。
 
 ``show [section]`` / ``get <section.key>`` / ``set <section.key> <value>``: GUI の
 設定画面と同じ操作。backend が動いていれば ``/api/config`` 系 (能力キーの保護・
@@ -28,7 +28,7 @@ import yaml
 from pydantic import ValidationError
 from rich.console import Console
 
-from backend.config_normalize import NormalizeReport, normalize_config
+from backend.config_normalize import NormalizeReport, needs_normalize, normalize_config
 from backend.data_root import DataRootError, resolve_data_root, store_root
 from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.config_loader import _find_project_root, _setup_encoding
@@ -49,11 +49,8 @@ _PRO_ONLY_SECTIONS = frozenset({"widget_proxy", "mode_models", "pro"})
 
 
 def config_needs_normalize(config_path: Path) -> bool:
-    """``config_path`` が版を持たない (G0 の) config か。無ければ ``False``。"""
-    if not config_path.is_file():
-        return False
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    return not (isinstance(raw, dict) and "config_version" in raw)
+    """``config_path`` (と隣の ``config.pro.yaml``) が現行より古い版か。無ければ ``False``。"""
+    return needs_normalize(config_path)
 
 
 def normalize_under_lock(config_path: Path, data_root: Path) -> NormalizeReport:
@@ -75,7 +72,10 @@ def render_normalize_report(console: Console, report: NormalizeReport) -> None:
     if not report.changed:
         render_info(console, msg("cli.config_normalize_unchanged"))
         return
-    render_info(console, msg("cli.config_normalize_done", backup=str(report.backup)))
+    if report.backup is not None:
+        render_info(console, msg("cli.config_normalize_done", backup=str(report.backup)))
+    if report.pro_backup is not None:
+        render_info(console, msg("cli.config_normalize_pro_done", backup=str(report.pro_backup)))
     if report.renamed:
         render_info(
             console,
@@ -104,7 +104,7 @@ def render_normalize_report(console: Console, report: NormalizeReport) -> None:
 
 
 def normalize_before_start(project_root: Path, console: Console) -> int | None:
-    """起動前の正規化 (版のある config には何もしない)。
+    """起動前の正規化 (現行の版の config には何もしない)。
 
     Returns:
         続行できるなら ``None``。serve の稼働中・書き換えの失敗は終了コード ``1``。
@@ -140,7 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--if-needed", action="store_true",
-        help="Do nothing (and take no lock) when config.yaml already has config_version",
+        help="Do nothing (and take no lock) when config.yaml already has the current config_version",
     )
     parser.add_argument(
         "--data-root", default=None, metavar="PATH",

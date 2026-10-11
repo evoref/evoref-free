@@ -154,8 +154,8 @@ if [[ -n "$SHARED_PATH" ]] && [ -f "config.yaml" ]; then
     echo "  Updated config.yaml with shared paths"
 fi
 
-# 版 (config_version) の無い旧形式の config.yaml は一度だけ直す
-# (config.yaml.g0-<stamp> へ退避)。失敗しても evoref-ctl start が再試行する。
+# 版 (config_version) の無い・古い config.yaml は一度だけ直す
+# (config.yaml.g0-<stamp> / .g1v1-<stamp> へ退避)。失敗しても evoref-ctl start が再試行する。
 if [ -f "config.yaml" ]; then
     python -m backend.free.cli.main config normalize --if-needed \
         || echo "  WARNING: config.yaml was not normalized; evoref-ctl start will retry"

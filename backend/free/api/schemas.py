@@ -526,7 +526,6 @@ class MigrateResponse(BaseModel):
     dry_run: bool
     old_model: str
     new_model: str
-    lora_action: str
     data_summary: MigrateDataSummary
     calibration: MigrateCalibration | None = None
     recommendations: list[str] = Field(default_factory=list)
@@ -567,9 +566,6 @@ class ComponentMigrateResponse(BaseModel):
     dry_run: bool
     old_model: str
     new_model: str
-    # 新モデルと既存 LoRA の arch 整合性判定結果 ("kept" / "archived" / "n/a")。
-    # base の MigrateResponse.lora_action に相当。
-    lora_action: str = "n/a"
     # L2: 自動再起動 + クライアント差し替えが成功したか
     restarted: bool = False
     recommendations: list[str] = Field(default_factory=list)

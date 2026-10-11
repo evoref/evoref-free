@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from backend.free.api.learning._learning_collectors import latest_level2_run
 from backend.free.api.learning._optimize_schemas import (
     AuxTaskStatus,
     PromptHistoryEntry,
@@ -40,9 +39,6 @@ SCHEDULER_DEFAULTS: dict[str, int] = {
     "generations": 10,
     "population_size": 5,
     "min_experiences": 20,
-    "spsa_iterations": 500,
-    "sparse_params": 200,
-    "min_failures": 50,
 }
 
 
@@ -108,11 +104,8 @@ def collect_aux_task_statuses(
 
 
 def extract_scheduler_params(scheduler: object | None) -> dict[str, int]:
-    """`LearningScheduler` から Level 1/2 設定値を取り出し、未初期化時は
+    """`LearningScheduler` から Level 1 設定値を取り出し、未初期化時は
     既定値で埋めた dict を返す。
-
-    元 handler では if scheduler is not None: の中で 6 個の値を上書き代入
-    していたが、純粋なマージ操作として抽出。
     """
     params = dict(SCHEDULER_DEFAULTS)
     if scheduler is None:
@@ -132,17 +125,13 @@ def _format_iso_or_none(epoch_seconds: float) -> str | None:
     return epoch_to_utc(epoch_seconds)
 
 
-def format_run_timestamps(
-    scheduler_status: dict | None,
-) -> tuple[str | None, str | None]:
-    """`scheduler.get_status()` の結果から `(last_l1_iso, last_l2_iso)` を
-    返す。未存在 / 0 値は `None`。
+def format_last_level1_run(scheduler_status: dict | None) -> str | None:
+    """`scheduler.get_status()` の結果から Level 1 の最終実行時刻 (ISO) を返す。
+    未存在 / 0 値は `None`。
     """
     if not scheduler_status:
-        return None, None
-    last_l1 = _format_iso_or_none(float(scheduler_status.get("last_level1_run", 0.0) or 0.0))
-    last_l2 = _format_iso_or_none(latest_level2_run(scheduler_status.get("last_level2_run")))
-    return last_l1, last_l2
+        return None
+    return _format_iso_or_none(float(scheduler_status.get("last_level1_run", 0.0) or 0.0))
 
 
 # ── プロンプト履歴の収集 (optimize_history 用) ──────────────────────────

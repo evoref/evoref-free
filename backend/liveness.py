@@ -9,7 +9,7 @@
 
 - 段 (stage) ごとに「届いたか」「何件の効果を生んだか」「判定点がどちらに倒れたか」
   を数える。各段に手を入れず、結果が 1 箇所に集まる出口 (sleep-time の入口、
-  Level 1 の後処理、Level 2 の記録、判定点の記録) で読む。
+  Level 1 の後処理、判定点の記録) で読む。
 - 警告の状態は保存しない。読むたびに台帳から導出する (保存した状態と台帳が
   食い違う余地を作らない)。
 - 警告は状態に入った時点で 1 回だけ WARNING を出す。同じ WARNING が 700 行
@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.io.format_registry import FormatSpec, register_format
+from backend.io.readonly import is_readonly
 from backend.io.versioned import JsonPayload, VersionedJsonFile
 from backend.log_config import get_logger
 from backend.utils import format_utc, utc_now_dt
@@ -60,6 +61,8 @@ RARE_EVENT_GATES = frozenset({
 })
 
 FAILURE_CLASSES = ("transient", "unrecoverable")
+#: readonly の間は readonly に分類して出さない警告 (書き込みを止めた結果として当然起きる)。
+_READONLY_SUPPRESSED = frozenset({"starved", "stalled", "failing"})
 _BAND_CODES = {"fire": "f", "abstain": "a", "skip": "s"}
 
 
@@ -159,6 +162,7 @@ class LivenessLedger(VersionedJsonFile):
             rec.pop("missed_since", None)
             rec["error_streak"] = 0
             rec.pop("error_since", None)
+            rec.pop("readonly_since", None)
             if effect is None:
                 return
             rec["effect_total"] = int(rec.get("effect_total", 0)) + int(effect)
@@ -211,6 +215,19 @@ class LivenessLedger(VersionedJsonFile):
             rec.setdefault("error_since", now)
             rec["last_error"] = {"class": failure_class, "code": code, "at": now}
 
+    def record_readonly(self, stage: str) -> None:
+        """段の書き込みが readonly (``DataReadonlyError``) で拒否された。
+
+        失敗ではなく拒否なので ``error_streak`` には数えず、ログも出さない (経験の
+        保存はターンごとに当たるので、ここで出すとログが溢れる。c_07 §7.1)。
+        件数と始まりだけを残し、readonly の間は :meth:`alerts` が ``starved`` /
+        ``stalled`` / ``failing`` を出さない。
+        """
+        with self._lock:
+            rec = self._stage(stage)
+            rec["readonly_rejections"] = int(rec.get("readonly_rejections", 0)) + 1
+            rec.setdefault("readonly_since", self._now())
+
     def clear_errors(self, stage: str) -> None:
         """失敗が観測されなかった (成功を直接観測できない段の、連続失敗を切る)。"""
         with self._lock:
@@ -260,12 +277,21 @@ class LivenessLedger(VersionedJsonFile):
             return {name: dict(rec) for name, rec in self._stages.items()}
 
     def alerts(self) -> list[LivenessAlert]:
-        """現在立っている警告。状態は保存せず、ここで台帳から導出する。"""
+        """現在立っている警告。状態は保存せず、ここで台帳から導出する。
+
+        readonly 起動中 (``backend.io.readonly.is_readonly``) は書き込み段・Level 1 を
+        スケジュールしないので、未到達・効果ゼロ・連続失敗は readonly に分類して
+        ``starved`` / ``stalled`` / ``failing`` を出さない (c_07 §7.1)。
+        """
+        readonly = is_readonly()
         with self._lock:
             snapshot = {name: dict(rec) for name, rec in self._stages.items()}
         found: list[LivenessAlert] = []
         for stage, rec in sorted(snapshot.items()):
-            found.extend(_alerts_for(stage, rec))
+            alerts = _alerts_for(stage, rec)
+            if readonly:
+                alerts = [a for a in alerts if a.kind not in _READONLY_SUPPRESSED]
+            found.extend(alerts)
         return found
 
     # ── 通知と永続化 ───────────────────────────────────────────

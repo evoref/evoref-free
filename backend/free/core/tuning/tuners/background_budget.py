@@ -12,8 +12,6 @@ sleep-time の各段 (疑似クエリ・要約・競合解決・ノート進化�
   みなして不変。``tps_calibration.is_explicit_agent_timeout`` と同じ流儀)。
 - backend (sleep-time) は **サイクルの開始時** に :func:`background_scale` で
   プロセスの実測の台帳から引き直す (tps は走りながら貯まるので起動時 1 回にしない)。測りも書きもしない。
-- 学習 (Level 2 の SPSA 反復数・評価件数) は **伸縮しない**。LoRA の学習・評価の所要時間は decode tps と
-  比例せず、サイクルごとに評価件数が変わると候補間・サイクル間の評価の比較可能性が下がる。
 
 この項目の ``run`` は画面 / CLI 向けの要約で、保存済みの実測 (``cache/tps_calibration.json``) から
 ``{scale, decode_tps, samples}`` を返すだけ (サーバを起こさない)。

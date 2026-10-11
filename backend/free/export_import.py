@@ -93,6 +93,7 @@ CATEGORY_PREFIXES: tuple[tuple[str, str], ...] = (
     (f"{PRO_STORE_PREFIX}learning/", "learning"),
     (_LAYOUT["corpus_dir"], "corpus"),
     (f"{PRO_STORE_PREFIX}created/", "corpus"),
+    (f"{PRO_STORE_PREFIX}cartridges/", "corpus"),
     (str(PurePosixPath(_LAYOUT["triggers_dir"]).parent) + "/", "overrides"),
 )
 _LEARNING_ROOTS: tuple[str, ...] = (_LAYOUT["learning_dir"], f"{PRO_STORE_PREFIX}learning/")

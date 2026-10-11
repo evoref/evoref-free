@@ -284,7 +284,6 @@ def _warn_edition_downgrade(previous: str) -> None:
         return
     logger.warning("Edition downgrade detected: %s -> %s", previous, current)
     logger.warning(msg("warning.edition.downgrade", old=previous.upper(), new=current.upper()))
-    logger.warning(msg("warning.edition.lora_unavailable"))
 
 
 def report_data_gate(state: Any) -> None:

@@ -14,7 +14,6 @@ from backend.config import (
     get_path_resolver,
     get_project_root,
 )
-from backend.free.core.launch_adapters import LaunchAdapters, adapters_for_launch
 from backend.free.llm._base_client import health_wait_for_cfg
 from backend.log_config import get_logger
 
@@ -31,7 +30,6 @@ class ModeSwitchResponse(BaseModel):
     mode: str
     model_changed: bool
     restart_initiated: bool
-    lora_changed: bool = False
     message: str = ""
 
 
@@ -61,15 +59,7 @@ async def switch_mode(
     new_params = get_mode_generation_params(new_mode)
     model_changed = old_params["model"] != new_params["model"]
 
-    # 当てるアダプタ (Pro の LoRA / control vector) の比較。Free では常に無し
-    # なので差が出ず、再起動トリガーに影響しない。
-    cfg = get_config()
-    new_adapters = adapters_for_launch(cfg, get_project_root(), new_mode)
-    lora_changed = adapters_for_launch(cfg, get_project_root(), old_mode) != new_adapters
-
-    # モード状態を更新。resolver 側の active_mode も同期する (ダッシュボード等の
-    # 「現在モードのアダプタ」既定表示に使われる、Level2Runner は mode を明示
-    # 引数で受け取るためこれには依存しない)。
+    # モード状態を更新。resolver 側の active_mode も同期する。
     # 学習パーティション全体の束ね直しはしない (f_04 §1.2.0)。経験・プロンプト・
     # aux 較正は書込み・読込みのたびに「載っているモデル」(/props) の model_key で
     # 置き場を決める — チャットと create の並行、Level 1 実行中、書き手スレッドに
@@ -80,35 +70,28 @@ async def switch_mode(
     restart_initiated = False
     message = f"switched from {old_mode} to {new_mode}"
 
-    if model_changed or lora_changed:
-        restart_initiated = await _restart_base_server(
-            state, new_params["model"], adapters=new_adapters,
-        )
+    if model_changed:
+        restart_initiated = await _restart_base_server(state, new_params["model"])
         message += (
             ", server restart initiated" if restart_initiated
             else ", server restart failed"
         )
 
     logger.info(
-        "Mode switched: %s -> %s (model_changed=%s, lora_changed=%s, restart=%s)",
-        old_mode, new_mode, model_changed, lora_changed, restart_initiated,
+        "Mode switched: %s -> %s (model_changed=%s, restart=%s)",
+        old_mode, new_mode, model_changed, restart_initiated,
     )
 
     return ModeSwitchResponse(
         mode=new_mode,
         model_changed=model_changed,
         restart_initiated=restart_initiated,
-        lora_changed=lora_changed,
         message=message,
     )
 
 
-async def _restart_base_server(
-    state: AppState, model_path: str, adapters: LaunchAdapters,
-) -> bool:
+async def _restart_base_server(state: AppState, model_path: str) -> bool:
     """ベースサーバーを新モデルで再起動する
-
-    ``adapters`` は新モードの ``adapters_for_launch`` の結果 (存在・互換確認済み)。
 
     Returns:
         再起動が成功したかどうか
@@ -146,7 +129,7 @@ async def _restart_base_server(
     #    旧サーバの 200 を拾う窓を潰す)。
     await asyncio.to_thread(wait_port_released, "base", cfg, 10.0)
 
-    # 3. model_override / adapters 付きで新プロセス起動。base は止めたので環境調整の予約の再計算・
+    # 3. model_override 付きで新プロセス起動。base は止めたので環境調整の予約の再計算・
     #    その場の見積りを許す (ブロッキングなので executor で、c_16 §7.2.3)
     from functools import partial
 
@@ -154,7 +137,7 @@ async def _restart_base_server(
 
     managed = await run_in_executor_with_context(
         asyncio.get_running_loop(), None, partial(
-            _spawn_server_with_override, "base", cfg, model_override=model_path, adapters=adapters,
+            _spawn_server_with_override, "base", cfg, model_override=model_path,
             allow_decide=True,
         ),
     )

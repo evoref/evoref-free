@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from backend.free.memory.episodic.workspace import EpisodicWorkspace
     from backend.free.memory.semantic.store import SemanticFactStore
     from backend.free.memory.notes.subject_canonicalizer import SubjectCanonicalizer
+    from backend.free.memory.protocols import GrowthHarvesterProtocol
     from backend.free.rag.embedding_backend import EmbeddingBackend
     from backend.free.rag.vector_store import VectorStore
     from backend.free.rag.cartridge_manager import CartridgeManager
@@ -275,6 +276,8 @@ class SleepTimeWorker:
         #: 取消された Step 5.9 の件数の持ち越し (次に Step 5.9 を終えた Full の結果辞書に足す)。
         self._pq_rerank_carry: dict[str, int] = {}
         self._pq_activity: dict[str, int] = {}
+        #: Step 13.6 の収穫器 (EvorefLearn が配線で注入する。未注入なら 0 件で通過)。
+        self._growth_harvester: "GrowthHarvesterProtocol | None" = None
 
     def set_fewshot_pool(self, pool) -> None:
         """FewShotPool を設定 (手本の埋め込み backfill に使用)。"""
@@ -1133,6 +1136,14 @@ class SleepTimeWorker:
         if self._check_cancelled():
             return result
 
+        # Step 13.6: 回帰台帳の収穫 (Level 2 (成長)、f_04 §6.3)。Step 8.0 の訂正検証の後に
+        # 置く。書き先は学習ストアで Evidence Store には書かない。件数は常に整数で載せる。
+        ts = time.monotonic()
+        result.update(self._step13_6_harvest_regression_cases())
+        step_durations["step13_6_growth_harvest"] = round(time.monotonic() - ts, 3)
+        if self._check_cancelled():
+            return result
+
         # Step 9: 履歴要約を SemMem に decision/commitment として昇格
         ts = time.monotonic()
         result["semmem_promoted"] = self._step9_promote_summaries_to_semmem()
@@ -1227,6 +1238,15 @@ class SleepTimeWorker:
         ts = time.monotonic()
         result["corpus_versions_gc"] = self._step5_88_gc_corpus_versions()
         step_durations["step5_88_corpus_gc"] = round(time.monotonic() - ts, 3)
+
+        # 5.885: チーム知識ハブの夜間書き出し (Pro、docs/p_10 §5.2)。公開リストに印を付けた
+        # claim / 文書だけを署名付き .evocart にしてデータ根の外へ書く。Evidence Store は読むだけ。
+        # 登録が無ければ (Free・自動書き出しが無効) 0 で通過する。
+        ts = time.monotonic()
+        from backend.free.core.team_hub import run_team_hub_export
+
+        result["team_hub_exported"] = await run_team_hub_export()
+        step_durations["step5_885_team_hub_export"] = round(time.monotonic() - ts, 3)
 
         # 永続化 + 完了ログ
         # Step 5.9: corpus 疑似クエリ生成 (f_01 §6.4)。**Full の最後** に置く —
@@ -2084,6 +2104,38 @@ class SleepTimeWorker:
             config=self.config,
             current_project_id=self._current_project_id,
         )
+
+    # ── Step 13.6 (回帰台帳の収穫) ─────────────────
+
+    def set_growth_harvester(self, harvester: "GrowthHarvesterProtocol | None") -> None:
+        """Step 13.6 の収穫器を注入する (実体は EvorefLearn、配線は ``_pillar_wirer``)。"""
+        self._growth_harvester = harvester
+
+    def _step13_6_harvest_regression_cases(self) -> dict[str, int]:
+        """Step 13.6: 回帰台帳の収穫 (f_04 §6.3)。
+
+        結果辞書の :data:`GROWTH_HARVEST_KEYS` を **常に整数で** 返す — ``--no-learning``・
+        収穫器が未注入・失敗した回も 0 で (死活監視が「到達したが効果 0」と「届かなかった」を
+        分けられるように、c_07 §7.1)。``learning.growth.enabled=false`` と readonly は収穫器の
+        側が 0 で返す。
+        """
+        from backend.free.memory.protocols import GROWTH_HARVEST_KEYS
+
+        counts = dict.fromkeys(GROWTH_HARVEST_KEYS, 0)
+        if self._skip_for_learning("Step 13.6 (growth harvest)"):
+            return counts
+        harvester = getattr(self, "_growth_harvester", None)
+        if harvester is None:
+            return counts
+        try:
+            harvested = harvester.run()
+        except Exception as e:  # noqa: BLE001 - 収穫の失敗で記憶の段を止めない
+            logger.warning("Step 13.6 (growth harvest) failed: %s", e, exc_info=True)
+            return counts
+        for key in GROWTH_HARVEST_KEYS:
+            value = harvested.get(key, 0) if isinstance(harvested, dict) else 0
+            counts[key] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+        return counts
 
     def _step10_compact_sessions(self) -> int:
         """Step 10b (補助): 保持ポリシーに基づく履歴圧縮処理。

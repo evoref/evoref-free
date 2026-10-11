@@ -710,138 +710,13 @@ def build_mtp_args(
     return ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(draft_n_max)]
 
 
-def lora_compatible_with_model(
-    model_path: Path,
-    lora_path: Path,
-) -> tuple[bool, str]:
-    """LoRA アダプタがモデルに適用可能かを GGUF メタデータから判定する。
-
-    判定は 3 段階:
-
-    1. ``general.architecture`` の一致。どちらか読めない場合も不適合扱い
-       (fail-closed) — arch すら読めないファイルはアダプタとして信用
-       できないため。
-    2. 全テンソル形状突合 (:func:`_lora_shape_mismatch`): アダプタの全
-       ``*.lora_a`` / ``*.lora_b`` をモデル側の対応 weight テンソルの
-       実形状と照合する。同一 arch でもサイズ違い (例: gemma-4-E2B 1536
-       vs E4B 2560) や head 構成違い、block 数を超えるターゲットは
-       llama-server が "tensor has incorrect shape" でコンテキスト生成に
-       失敗しプロセスごと落ちるため、arch 一致だけでは適合と言えない。
-    3. 系統 (lineage) チェック: アダプタに ``evoref.trained_on_model_key``
-       (学習元モデルの ``model_key``、c_05 §0.5.7。Level 2 トレーナーが刻む)
-       がある場合、現モデルの ``model_key`` との一致を要求する。
-       LoRA は特定の重みへの差分なので、同一 arch・同一形状でも別モデル
-       (例: Qwen3.5-9B と同 arch の別 finetune) に当てると silent な品質
-       摂動になる。model_key は重みの標本から導くので、ファイル名が同じ
-       別モデルも、再量子化した同じモデルも別の系統になる (誤って捨てる
-       実害は次の Level 2 サイクルで再学習される軽微なもの、誤って適用する
-       実害は診断困難な品質摂動であるため)。
-
-    形状が判定不能 (LoRA テンソル無し / どちらかのテンソル情報節が
-    読めない) の場合、および stamp が無いレガシーアダプタの系統は
-    fail-open (arch + 形状のみで判定)。arch 側の fail-closed との非対称は
-    意図的 — テンソル命名の異なる正当なアダプタを誤って捨てないため。
-    起動側 (``backend.pro.adapters``) と LoRA 一覧 API
-    (``backend.pro.api.lora``) で共有する単一の述語。
-
-    Returns:
-        ``(compatible, reason)``。reason はログ向けの英語短文。
-    """
-    model_meta = read_gguf_metadata(model_path)
-    model_arch = model_meta.get("architecture")
-    lora_meta = read_gguf_metadata(lora_path)
-    lora_arch = lora_meta.get("architecture")
-    if not model_arch or not lora_arch:
-        return False, (
-            f"architecture unreadable (model={model_arch or '?'}, "
-            f"lora={lora_arch or '?'})"
-        )
-    if model_arch != lora_arch:
-        return False, (
-            f"architecture mismatch (model={model_arch}, lora={lora_arch})"
-        )
-
-    mismatch = _lora_shape_mismatch(model_path, lora_path)
-    if mismatch is not None:
-        return False, mismatch
-
-    stamp = lora_meta.get("trained_on_model_key")
-    if stamp:
-        from backend.model_key import model_key_for
-
-        model_key = model_key_for(model_path)
-        if stamp != model_key:
-            return False, (
-                f"lineage mismatch (adapter trained on {stamp}, "
-                f"model {model_path.name} is {model_key})"
-            )
-    return True, f"architecture={model_arch}"
-
-
-def _cvector_compatible(
-    model_path: Path,
-    cvec_path: Path,
-    *,
-    warn: Callable[[str], None] | None = None,
-) -> bool:
-    """control vector の direction 次元とモデルの ``embedding_length`` を照合する。
-
-    次元不一致の control vector を ``--control-vector`` で渡すと llama-server
-    がロード失敗でプロセスごと落ちる (LoRA の形状不一致と同型)。cvector GGUF
-    は ``general.architecture`` を持たないことがあるため arch 照合はせず、
-    ``direction.<n>`` テンソルの ne0 とモデル ``embedding_length`` の比較のみ
-    行う。判定不能 (テンソル情報不読 / direction テンソル無し /
-    embedding_length 不明) は従来どおり適用する (fail-open)。
-    """
-    cvec_shapes = read_gguf_tensor_shapes(cvec_path)
-    if not cvec_shapes:
-        return True
-    model_emb = read_gguf_metadata(model_path).get("embedding_length")
-    if model_emb is None:
-        return True
-    for name, dims in sorted(cvec_shapes.items()):
-        if name.startswith("direction.") and dims and dims[0] != model_emb:
-            if warn is not None:
-                warn(
-                    "[launch] WARNING: incompatible control vector "
-                    f"(direction dim={dims[0]}, model embedding_length="
-                    f"{model_emb}): {cvec_path.name}. "
-                    "Skipping --control-vector."
-                )
-            return False
-    return True
-
-
 def build_llama_cmd(
     cfg: dict,
     project_root: Path | None = None,
     *,
     model_override: str | None = None,
-    lora_override: str | Path | None = None,
-    control_vector_override: str | Path | None = None,
-    port_override: int | None = None,
-    context_override: int | None = None,
-    slots_override: int | None = None,
-    no_warmup: bool = False,
 ) -> list[str]:
-    """config.yaml の llama セクションから起動コマンドを生成
-
-    Level 2 base=spsa-real-eval の候補評価では ``lora_override`` (候補 GGUF LoRA
-    パス) と ``port_override`` (スクラッチポート) を指定して ephemeral サーバを
-    起動する。いずれも未指定 (通常運用) の
-    ときは従来挙動と完全に等価。
-
-    通常運用のアダプタ (``lora_override`` / ``control_vector_override``) は
-    呼出元が Pro のハンドラ ``adapter_paths_for_launch`` から得て渡す
-    (``backend.free.core.launch_adapters``)。このモジュールは config から
-    アダプタを解決しない — ``None`` なら付けない (Free は常に無し)。
-
-    ``context_override`` / ``slots_override`` / ``no_warmup`` は Level 2 候補評価
-    のような **使い捨てサーバ** 用。通常運用の値 (base は既定 8192 × 2 slot) を
-    そのまま継承すると、64 トークンの応答を数件取るためだけに本番同等の KV
-    キャッシュを確保・解放する動作を候補ごと (1 サイクル数十回) 繰り返すことに
-    なる。未指定 (通常運用) のときは従来挙動と完全に等価。
-    """
+    """config.yaml の llama セクションから起動コマンドを生成"""
     if "llama" not in cfg:
         raise ValueError("config.yaml に 'llama' セクションがありません")
     lc = cfg["llama"]
@@ -856,7 +731,7 @@ def build_llama_cmd(
     if not base_model_path.is_absolute():
         base_model_path = project_root / base_model_path
 
-    port = port_override if port_override is not None else lc.get("port", 8080)
+    port = lc.get("port", 8080)
 
     # 環境調整の値 (ngl / b・ub / threads / RAM 系) は ``model_paths.base_model`` について決めたもの。
     # 別モデルの ``model_override`` (create_model 等) には持ち込まず、config の明示値と従来の既定で組む
@@ -872,7 +747,7 @@ def build_llama_cmd(
         "llama-server",
         "-m", str(base_model_path),
         "--port", str(port),
-        "-c", str(context_override or resolve_context_size_for(
+        "-c", str(resolve_context_size_for(
             cfg, "base", project_root, model_override=model_override,
         )),
         "-ngl", str(ngl),
@@ -885,47 +760,6 @@ def build_llama_cmd(
         cmd += ["-b", str(_explicit_int(lc.get("batch_size")) or 512)]
         if _explicit_int(lc.get("ubatch_size")):
             cmd += ["-ub", str(lc["ubatch_size"])]
-
-    # LoRA アダプタ。呼出元が解決・検証済み (Level 2 候補評価の GGUF は harness が
-    # 起動直前に書き出すため exists チェックしない)。
-    if lora_override is not None:
-        cmd += ["--lora", str(Path(lora_override))]
-
-    # Level 2 base=C: control vector (残差ストリーム操舵)。呼出元が解決・検証済み。
-    # scale / 層範囲は config (learning.cvector_*) から読む。
-    if control_vector_override is not None:
-        learning_cfg = cfg.get("learning", {}) or {}
-        cvec_full = Path(control_vector_override)
-        # 既定 1.0。``or`` フォールバックは使わない (0.0 は診断用の正当な値で、
-        # falsy 畳み込みすると 1.0=full strength に化けるため)。dict 既定が欠損を
-        # 補い、schema が非 Optional float なので None は来ない。
-        scale = float(learning_cfg.get("cvector_scale", 1.0))
-        if scale == 1.0:
-            # --control-vector は FNAME のみ取るため、Windows のドライブレター
-            # (E:) のコロンとも衝突しない (絶対パスで安全)。
-            cmd += ["--control-vector", str(cvec_full)]
-        else:
-            # スケール指定時のみ --control-vector-scaled FNAME:SCALE。FNAME に
-            # Windows 絶対パス (E:\...) を渡すとドライブレターのコロンが FNAME:SCALE
-            # のセパレータと衝突するため、project_root 相対 POSIX パスを渡す
-            # (llama-server は CWD=project_root 基準で解決; standalone 起動は
-            # _start_and_wait が cwd=project_root を設定)。project_root 外の絶対
-            # パスは衝突を避けられないため fail-fast する。
-            try:
-                rel = cvec_full.relative_to(project_root).as_posix()
-            except ValueError as e:
-                raise ValueError(
-                    "cvector_scale != 1.0 requires the control vector to "
-                    "resolve under project_root (relative path); an absolute path "
-                    "outside project_root collides with the --control-vector-scaled "
-                    "FNAME:SCALE separator.",
-                ) from e
-            cmd += ["--control-vector-scaled", f"{rel}:{scale}"]
-        layer_range = str(learning_cfg.get("cvector_layer_range", "") or "").strip()
-        if layer_range:
-            parts = layer_range.replace(",", " ").split()
-            if len(parts) == 2:
-                cmd += ["--control-vector-layer-range", parts[0], parts[1]]
 
     # オプション
     # -t / -tb: 明示の正の整数はそのまま (-tb は付けない)、0 は環境調整の項目 threads の配分 (c_16 §7.2.3)
@@ -946,12 +780,10 @@ def build_llama_cmd(
     # slots は常に ``-np`` で明示する。未指定だと新しい llama-server が
     # n_parallel=auto (=4) を選び、slots=1 (単一スロット = 省メモリ) の意図が
     # 効かなくなるため (slots レバーが slots=1 で no-op 化していた)。
-    slots = max(1, int(slots_override or resolve_base_slots(
+    slots = max(1, int(resolve_base_slots(
         cfg, project_root, model_override=model_override,
     )))
     cmd += ["-np", str(slots)]
-    if no_warmup:
-        cmd += ["--no-warmup"]
     cache_type_k = lc.get("cache_type_k")
     if cache_type_k and cache_type_k != "f16":
         cmd += ["--cache-type-k", str(cache_type_k)]
@@ -1048,8 +880,7 @@ def build_llama_cmd(
         fixed_flags={
             "-m", "--port", "-c", "-ngl", "-b", "-ub", "-t", "-tb", "-fa", "--mlock",
             "-np", "--cache-type-k", "--cache-type-v", "--cache-reuse", "--cache-ram",
-            "--kv-unified", "--lora", "--reasoning-budget", "--reasoning-budget-message",
-            "--control-vector", "--control-vector-scaled", "--control-vector-layer-range",
+            "--kv-unified", "--reasoning-budget", "--reasoning-budget-message",
         },
         project_root=project_root,
         warn=lambda m: print(m, file=sys.stderr),
@@ -1561,12 +1392,8 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
            "expert_count": int, "nextn_predict_layers": int,
            "has_chat_template": bool,
            "block_count" / "head_count_kv" / "head_count" / "key_length" /
-           "value_length" / "embedding_length": int | None,
-           "trained_on_model_key": str | None}``
+           "value_length" / "embedding_length": int | None}``
 
-    ``trained_on_model_key`` は evoref 独自 KV ``evoref.trained_on_model_key``
-    (Level 2 トレーナーが LoRA アダプタに刻む学習元モデルの ``model_key``)。
-    :func:`lora_compatible_with_model` の系統チェックに使う。
     後半 6 キーは KV キャッシュ VRAM 推定 (``estimate_kv_cache_mb``) 用。
     ``expert_count`` は対応キーが無い dense モデルで 0。パース失敗・I/O
     エラーは安全な既定値を返し、呼び出し側 (default プロファイル /
@@ -1602,8 +1429,6 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
         "ssm_group_count": None,
         # SWA の窓 (``<arch>.attention.sliding_window``)。不在 = SWA なし。
         "sliding_window": None,
-        # LoRA アダプタ専用の evoref 独自 KV (学習元モデルの model_key)
-        "trained_on_model_key": None,
     }
     try:
         with gguf_path.open("rb") as f:
@@ -1704,11 +1529,6 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
                 elif key == "tokenizer.chat_template":
                     result["has_chat_template"] = True
                     _gguf_skip_value(f, vtype)
-                elif key == "evoref.trained_on_model_key":
-                    val = _gguf_read_scalar_or_skip(f, vtype)
-                    result["trained_on_model_key"] = (
-                        str(val) if val is not None else None
-                    )
                 else:
                     _gguf_skip_value(f, vtype)
     except (OSError, struct.error, UnicodeDecodeError, ValueError, MemoryError):
@@ -1718,99 +1538,6 @@ def read_gguf_metadata(gguf_path: Path) -> dict:
     return result
 
 
-def read_gguf_tensor_shapes(gguf_path: Path) -> dict[str, tuple[int, ...]] | None:
-    """GGUF のテンソル情報節から ``{name: dims}`` を読む。
-
-    テンソル情報 (name / n_dims / dims / type / offset) はヘッダ内
-    (KV 節の直後) にあるため、数 GB のモデルでも読むのは先頭の数十 KB のみ。
-    dims は ggml の ne 順 (ne0=in_features, ne1=out_features)。
-
-    LoRA アダプタの GGUF は KV メタデータに次元情報を持たない
-    (``general.architecture`` / ``general.type`` / ``adapter.*`` のみ) ため、
-    モデルとの形状互換はここから判定するしかない。パース失敗・I/O エラーは
-    ``None`` を返し、呼び出し側は「判定不能」として扱う。
-    """
-    try:
-        with gguf_path.open("rb") as f:
-            magic = f.read(4)
-            if magic != _GGUF_MAGIC:
-                return None
-            (version,) = struct.unpack("<I", f.read(4))
-            if version < 2:
-                return None
-            n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
-            # KV 節を正確に消費してテンソル情報節の先頭に位置合わせする
-            for _ in range(n_kv):
-                (key_len,) = struct.unpack("<Q", f.read(8))
-                f.seek(key_len, 1)
-                (vtype,) = struct.unpack("<I", f.read(4))
-                _gguf_skip_value(f, vtype)
-            shapes: dict[str, tuple[int, ...]] = {}
-            for _ in range(n_tensors):
-                (name_len,) = struct.unpack("<Q", f.read(8))
-                name = f.read(name_len).decode("utf-8", errors="replace")
-                (n_dims,) = struct.unpack("<I", f.read(4))
-                dims = struct.unpack(f"<{n_dims}Q", f.read(8 * n_dims))
-                f.seek(12, 1)  # type (uint32) + offset (uint64)
-                shapes[name] = tuple(int(d) for d in dims)
-            return shapes
-    except (OSError, struct.error, UnicodeDecodeError, ValueError, MemoryError):
-        return None
-
-
-_LORA_SUFFIX_A = ".lora_a"
-_LORA_SUFFIX_B = ".lora_b"
-
-
-def _lora_shape_mismatch(model_path: Path, lora_path: Path) -> str | None:
-    """LoRA の全ターゲットテンソルをモデル実形状と突合し、不一致理由を返す。
-
-    ggml の行列は ne0=in_features, ne1=out_features で格納される。対象
-    weight W (in, out) に対し lora_a は (in, r)、lora_b は (r, out) なので、
-    全ターゲットについて ``lora_a.ne0 == W.ne0`` かつ ``lora_b.ne1 == W.ne1``
-    を要求する。ターゲットがモデルに存在しない (block 数の少ないモデルへ
-    深い層の adapter を当てる等) 場合も不一致。hidden size 違いだけでなく
-    head 構成違い (out_features) も検出できる。
-
-    ``None`` は「不一致の証拠なし」— 全ターゲット照合済みで一致したか、
-    判定不能 (どちらかのテンソル情報が読めない / LoRA テンソルが無い) かの
-    いずれか。判定不能を fail-open にする理由は
-    :func:`lora_compatible_with_model` の docstring 参照。
-    """
-    lora_shapes = read_gguf_tensor_shapes(lora_path)
-    if not lora_shapes:
-        return None
-    targets: dict[str, dict[str, tuple[int, ...]]] = {}
-    for name, dims in lora_shapes.items():
-        if name.endswith(_LORA_SUFFIX_A):
-            targets.setdefault(name[: -len(_LORA_SUFFIX_A)], {})["a"] = dims
-        elif name.endswith(_LORA_SUFFIX_B):
-            targets.setdefault(name[: -len(_LORA_SUFFIX_B)], {})["b"] = dims
-    if not targets:
-        return None
-    model_shapes = read_gguf_tensor_shapes(model_path)
-    if model_shapes is None:
-        return None
-    for target, ab in sorted(targets.items()):
-        model_dims = model_shapes.get(target)
-        if model_dims is None:
-            return f"lora target tensor not in model: {target}"
-        a = ab.get("a")
-        b = ab.get("b")
-        if a and model_dims and a[0] != model_dims[0]:
-            return (
-                f"in_features mismatch at {target} "
-                f"(lora_a={a[0]}, model={model_dims[0]})"
-            )
-        if b and len(b) >= 2 and len(model_dims) >= 2 and b[-1] != model_dims[-1]:
-            return (
-                f"out_features mismatch at {target} "
-                f"(lora_b={b[-1]}, model={model_dims[-1]})"
-            )
-    return None
-
-
-# モデルプロファイル: arch 単位 + GGUF ファイル名単位の起動フラグ / sampling 既定。
 # 同梱ベース (tracked, models/profiles/) + データ根の override (<data_root>/profiles/)
 # の 2 段階 × arch 層 /
 # モデル別層 (by-model/) の 2 スコープ。default フォールバックは持たない
@@ -4286,14 +4013,6 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--lora", default=None, metavar="PATH",
-        help="base に当てる LoRA (呼出元が解決・検証済み。backend.free.cli.llama_launcher が渡す)",
-    )
-    parser.add_argument(
-        "--control-vector", default=None, metavar="PATH",
-        help="base に当てる control vector (呼出元が解決・検証済み)",
-    )
-    parser.add_argument(
         "--print-health-ports",
         action="store_true",
         help=(
@@ -4455,11 +4174,7 @@ if __name__ == "__main__":
     try:
         # ベースモデル
         if launch_base:
-            cmd = build_llama_cmd(
-                cfg, project_root,
-                lora_override=args.lora,
-                control_vector_override=args.control_vector,
-            )
+            cmd = build_llama_cmd(cfg, project_root)
             host = cfg["llama"].get("host", "localhost")
             port = cfg["llama"].get("port", 8080)
             # health 待ちは process_manager.health_timeout (整数は明示値、auto / 無しは GGUF サイズ連動)

@@ -17,6 +17,7 @@ from backend.free.core.turn_text import TOOL_RESULT_HEADER
 from backend.free.core.text_quality import strip_system_notes
 from backend.free.api.chat._artifact import remember_artifact
 from backend.free.api.chat.chat_types import ChatMessage
+from backend.free.api.chat.turn_audit import TurnAuditEvent, emit_turn_audit
 from backend.free.history import history_manager as _history_manager_module
 from backend.free.history.history_manager import (
     active_base_model_key,
@@ -1411,6 +1412,7 @@ def _record_turn(
 
     # 経験バッファに記録 (Level 0) — private / キャンセルは学習対象外
     fc = state.feedback_collector
+    recorded_gen_config: GenerationConfigRef | None = None
     if fc and cancelled and not private:
         logger.info(
             "Skipping experience record for cancelled turn (%s, session=%s)",
@@ -1454,6 +1456,7 @@ def _record_turn(
             gen_config = getattr(entry, "gen_config", None)
             if gen_config is not None:
                 defer_template_provenance(gen_config)
+                recorded_gen_config = gen_config
             record_pq_misses_if_abstained(state, entry, session_id, user_query)
         except Exception as e:
             # 経験記録の失敗でチャットを壊さない方針は維持するが、**握り潰さない**。
@@ -1465,9 +1468,58 @@ def _record_turn(
                 exc_info=True,
             )
 
+    # 監査の受け口 (Pro が登録したときだけ。docs/p_07)。帳簿の end_turn より前に積み、
+    # 監査の行もこのターンの fsync に乗せる。
+    emit_turn_audit(lambda: _turn_audit_event(
+        state, full_response, session_id, user_query, mode, assistant_turn_id,
+        layer=layer, private=private, cancelled=cancelled, truncated=truncated,
+        generation_failed=generation_failed, template=template,
+        gen_config=recorded_gen_config,
+    ))
+
     _finish_turn_bookkeeping(
         state, full_response, session_id, user_query, mode, private=private,
         turn_id=assistant_turn_id,
+    )
+
+
+def _turn_audit_event(
+    state: AppState, full_response: str, session_id: str, user_query: str,
+    mode: str, turn_id: str,
+    *,
+    layer: str,
+    private: bool,
+    cancelled: bool,
+    truncated: bool,
+    generation_failed: bool,
+    template: str,
+    gen_config: GenerationConfigRef | None,
+) -> TurnAuditEvent:
+    """監査の受け口へ渡すイベント (sink が登録されているときだけ組み立てる)。
+
+    構成は経験に刻んだものを使い、経験を記録しなかったターン (private・キャンセル・
+    学習停止) だけここで引き直す。
+    """
+    from backend.free.core.verifier_events import current_tool_uses, current_verifier_mode
+    from backend.free.learning.level0_instant import GenerationConfigRef
+    from backend.io.codec import codec_for
+
+    ref = gen_config or _gen_config_with_template(state, mode, session_id, template)
+    return TurnAuditEvent(
+        session_id=session_id,
+        turn_id=turn_id,
+        trace_id=get_trace_id(),
+        mode=mode,
+        layer=layer,
+        private=private,
+        cancelled=cancelled,
+        truncated=truncated,
+        generation_failed=generation_failed or not full_response.strip(),
+        gen_config=codec_for(GenerationConfigRef).encode(ref),
+        tool_uses=tuple(current_tool_uses()),
+        tools_observed=current_verifier_mode() is not None,
+        query=user_query,
+        response=_recorded_body(full_response),
     )
 
 

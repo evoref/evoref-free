@@ -418,6 +418,15 @@ def compute_content_digest(docs_dir: Path | str) -> str:
     return _dir_content_digest(Path(docs_dir))
 
 
+def compute_prebuilt_digest(root: Path | str) -> str:
+    """``prebuilt/`` の内容ダイジェスト (:func:`_dir_content_digest`)。
+
+    ``content_digest`` / ``section_digests`` は ``prebuilt/`` を含まないので、
+    署名が派生物まで束ねるときに使う (docs/p_06)。無ければ空文字。
+    """
+    return _dir_content_digest(Path(root) / PREBUILT_DIR)
+
+
 def discover_sections(root: Path | str) -> list[str]:
     """展開済みパッケージのうち、ファイルを持つ既知セクション名を返す (昇順)。
 
@@ -887,6 +896,7 @@ __all__ = [
     "PackageMeta",
     "PrebuiltInfo",
     "compute_content_digest",
+    "compute_prebuilt_digest",
     "compute_section_digests",
     "discover_sections",
     "has_any_section_content",

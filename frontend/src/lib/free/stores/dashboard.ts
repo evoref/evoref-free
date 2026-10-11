@@ -15,14 +15,7 @@ export const DEFAULT_LEARNING_DATA: DashboardLearningData = {
 	level1_blocked_reason: null,
 	level1_seconds_until_idle: null,
 	last_level1_run: null,
-	last_level2_run: null,
-	running_target: null,
-	level2: null,
 	is_disabled: false,
-	lora_version: 0,
-	lora_adapter_exists: false,
-	eval_cases_count: 0,
-	eval_pass_threshold: 0.0,
 	last_level0_record: null,
 	experience_by_mode: { chat: 0, create: 0 },
 	correction_rate: 0,
@@ -55,7 +48,7 @@ export const DEFAULT_RAG_STATS: DashboardRagStats = {
 
 // ── データ取得 ──
 
-export async function safeFetch<T>(url: string): Promise<T | null> {
+async function safeFetch<T>(url: string): Promise<T | null> {
 	try {
 		const resp = await fetch(url);
 		return resp.ok ? await resp.json() : null;
@@ -76,14 +69,7 @@ export function buildLearningData(data: Record<string, unknown>): DashboardLearn
 		level1_blocked_reason: (sched.level1_blocked_reason as string) ?? null,
 		level1_seconds_until_idle: (sched.level1_seconds_until_idle as number) ?? null,
 		last_level1_run: (sched.last_level1_run as string) ?? null,
-		last_level2_run: (sched.last_level2_run as string) ?? null,
-		running_target: (sched.running_target as string) ?? null,
-		level2: (sched.level2 as import('$lib/free/api').Level2Status) ?? null,
 		is_disabled: (sched.is_disabled as boolean) ?? false,
-		lora_version: (data.lora_version as number) ?? 0,
-		lora_adapter_exists: (data.lora_adapter_exists as boolean) ?? false,
-		eval_cases_count: (data.eval_cases_count as number) ?? 0,
-		eval_pass_threshold: (data.eval_pass_threshold as number) ?? 0.0,
 		last_level0_record: (sched.last_level0_record as string) ?? null,
 		experience_by_mode: { chat: byMode.chat ?? 0, create: byMode.create ?? 0 },
 		correction_rate: (sched.correction_rate as number) ?? 0,

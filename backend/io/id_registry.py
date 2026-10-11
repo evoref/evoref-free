@@ -72,9 +72,20 @@ ID_PREFIXES: tuple[IdPrefix, ...] = (
     IdPrefix("ki_", "knowledge item"),
     IdPrefix("pc_", "prompt candidate"),
     IdPrefix("pad_", "prompt adoption ledger row (adopt / rollback)"),
+    IdPrefix("rgc_", "growth regression case (learning.regression_case)"),
+    IdPrefix("gro_", "growth ledger row (learning.growth_ledger)"),
+    IdPrefix("gpp_", "growth proposal (learning.growth_proposal)"),
     IdPrefix("file_", "uploaded session file"),
+    IdPrefix("aud_", "audit ledger row (pro.audit_ledger, Pro)"),
+    IdPrefix("opk_", "organization policy pack (pro.policy_pack, Pro)"),
+    IdPrefix("opb_", "organization policy proposal bundle (pro.policy_bundle, Pro)"),
+    IdPrefix("kit_", "airgap install kit (pro.airgap_manifest, Pro)"),
+    IdPrefix("agh_", "airgap kit apply history entry (pro.airgap_history, Pro)"),
+    IdPrefix("hd_", "team hub published document (pro.hub_publish_list, Pro)"),
+    IdPrefix("mfr_", "model fit lab evaluation run (pro.model_fit_run, Pro)"),
     IdPrefix("pq_", "corpus pseudo query (target chunk + position + text)", random=False, derived=True),
     IdPrefix("mk_", "model key (compat + weight sample digest)", random=False, derived=True),
+    IdPrefix("sk_", "cartridge signing key (sha256 of the Ed25519 public key, Pro)", random=False, derived=True),
 )
 
 _BY_PREFIX: dict[str, IdPrefix] = {p.prefix: p for p in ID_PREFIXES}

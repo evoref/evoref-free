@@ -2,7 +2,6 @@
 	import { configData } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import SettingsSection from './SettingsSection.svelte';
-	import ProSection from './ProSection.svelte';
 	import FieldGroup from './fields/FieldGroup.svelte';
 	import NumberField from './fields/NumberField.svelte';
 	import TextField from './fields/TextField.svelte';
@@ -24,12 +23,6 @@
 		<NumberField label="settings.learning.level1_recheck_interval_sec" value={Number(learning.level1_recheck_interval_sec ?? 60)} min={1} onchange={fieldUpdater('learning', 'level1_recheck_interval_sec')} />
 		<NumberField label="settings.learning.priority_threshold_ratio" value={Number(learning.priority_threshold_ratio ?? 0.5)} min={0} max={1} step={0.05} onchange={fieldUpdater('learning', 'priority_threshold_ratio')} />
 		<NumberField label="settings.learning.active_minutes" value={Number(learning.active_minutes ?? 5)} min={1} onchange={fieldUpdater('learning', 'active_minutes')} />
-		<ProSection>
-			<NumberField label="settings.learning.level2_min_failures" value={Number(learning.level2_min_failures ?? 50)} min={1} onchange={fieldUpdater('learning', 'level2_min_failures')} />
-			<NumberField label="settings.learning.level2_spsa_iterations" value={Number(learning.level2_spsa_iterations ?? 500)} min={1} onchange={fieldUpdater('learning', 'level2_spsa_iterations')} />
-			<NumberField label="settings.learning.level2_sparse_params" value={Number(learning.level2_sparse_params ?? 200)} min={1} onchange={fieldUpdater('learning', 'level2_sparse_params')} />
-			<NumberField label="settings.learning.level2_schedule_hour" value={Number(learning.level2_schedule_hour ?? 3)} min={0} max={23} onchange={fieldUpdater('learning', 'level2_schedule_hour')} />
-		</ProSection>
 	</FieldGroup>
 
 	<!-- Free: Pattern Detection -->

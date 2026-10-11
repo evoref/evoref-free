@@ -73,8 +73,8 @@ def load_mode_partitions(resolver: "PathResolver", buffer: Any) -> None:
     """設定上のモードのモデルのうち active 以外のパーティションの経験をバッファへ足す。
 
     create を別モデル (create_model) で回す構成で、その経験は create_model の
-    パーティションにある (f_04 §1.2.0)。Pro の Level 2 が mode 別に model_key で
-    絞るので、再起動後もメモリに載せる。Level 1 は束ねたファイルの分だけを見る。
+    パーティションにある (f_04 §1.2.0)。再起動後もメモリに載せる。Level 1 は
+    束ねたファイルの分だけを見る。
     """
     load_partition = getattr(buffer, "load_partition", None)
     # chat は active のモデルで回る。create が別モデルを宣言しているときだけ足す
@@ -231,8 +231,6 @@ def rebind_base_learning(
         if pool is not None:
             fewshot_total = pool.total_count
 
-    _rebind_lora_partition(state, scheduler)
-
     learn = getattr(state, "learn", None)
     adjuster = getattr(learn, "policy_adjuster", None) if learn is not None else None
     if adjuster is not None:
@@ -252,42 +250,6 @@ def rebind_base_learning(
         "experience_file": str(exp_file),
         "fewshot_total": fewshot_total,
     }
-
-
-def _rebind_lora_partition(state: "AppState", scheduler: Any) -> None:
-    """base LoRA のパスをキャッシュしている保持者を新パーティションへ向け直す。
-
-    起動時は ``_pillar_wirer._wire_sleep_scheduler_models`` が Pro のパスを
-    SleepTimeScheduler と Level 2 の version_manager に焼き込むため、
-    切替後に呼び直さないと旧モデルのアダプタを指したままになる。Pro が保持する
-    :class:`LoRAVersionManager` (CartridgeChangeHandler / ProLearnComponents 経由)
-    は Free から import できないので、Pro が登録したハンドラへ委譲する。
-    """
-    from backend.edition import get_pro_handler
-
-    pro_path = get_pro_handler("pro_learning_path")
-    if pro_path is None:
-        return
-    lora_path = pro_path("lora_adapter")
-    versions_dir = pro_path("lora_versions_dir")
-
-    sleep_scheduler = getattr(state, "sleep_scheduler", None)
-    if sleep_scheduler is not None:
-        sleep_scheduler.set_lora_path(lora_path)
-
-    vm_cls = get_pro_handler("lora_version_manager")
-    if vm_cls is not None and scheduler is not None:
-        try:
-            scheduler.set_version_manager(vm_cls(versions_dir, lora_path))
-        except Exception as exc:
-            logger.warning("Base LoRA version_manager rebind skipped: %s", exc)
-
-    rebind_pro_vm = get_pro_handler("rebind_lora_version_manager")
-    if rebind_pro_vm is not None:
-        try:
-            rebind_pro_vm(state, versions_dir, lora_path)
-        except Exception as exc:
-            logger.warning("Pro LoRA version_manager rebind skipped: %s", exc)
 
 
 def install_rebind_hook(state: "AppState") -> None:

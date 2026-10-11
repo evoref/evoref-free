@@ -7,7 +7,7 @@
 	 * 振り分ける:
 	 *   - embedding: `POST /api/model/{component}/migrate` (auto_restart で自動再起動。
 	 *     rebind 失敗時はバックエンドが旧モデルへ自動ロールバック)。
-	 *   - base: `POST /api/model/migrate` (LoRA アーカイブ等の付帯処理あり)。auto_restart 相当は
+	 *   - base: `POST /api/model/migrate` (学習データの付帯処理あり)。auto_restart 相当は
 	 *     無く、再起動は別途手動で行うため結果に「手動で再起動してください」バッジを出す。
 	 *   - create: migrate API 無し (model_state 非追跡)。`onApply` 経由で
 	 *     config を即保存する (実際の切替は POST /api/mode/switch がモード遷移時に行う)。

@@ -77,15 +77,11 @@ async def _shutdown_sleep_quiesce(sleep_scheduler: "SleepTimeScheduler | None") 
 
 
 async def _shutdown_level1_loop(sleep_scheduler: "SleepTimeScheduler") -> None:
-    """Level 1 / Level 2 常駐ループ停止（新規起動を防ぐ）"""
+    """Level 1 常駐ループ停止（新規起動を防ぐ）"""
     try:
         await sleep_scheduler.stop_level1_loop()
     except Exception as e:
         logger.warning("Level 1 loop stop failed: %s", e)
-    try:
-        await sleep_scheduler.stop_level2_loop()
-    except Exception as e:
-        logger.warning("Level 2 loop stop failed: %s", e)
 
 
 async def _shutdown_learning_cancel(learning_scheduler: "LearningScheduler") -> None:

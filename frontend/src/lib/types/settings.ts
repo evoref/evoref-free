@@ -38,7 +38,6 @@ export interface LlamaConfig {
 	cache_type_k: string;
 	cache_type_v: string;
 	max_tokens: number;
-	lora_target: string;
 	enable_thinking: boolean | null;
 	extra_args: string[];
 	mtp?: MtpConfig;
@@ -142,15 +141,11 @@ export interface LearningConfig {
 	level1_min_experiences: number;
 	level1_generations: number;
 	level1_population_size: number;
-	level2_min_failures: number;
 	full_idle_minutes: number;
 	level1_idle_minutes: number;
 	level1_recheck_interval_sec: number;
 	priority_threshold_ratio: number;
 	active_minutes: number;
-	level2_spsa_iterations: number;
-	level2_sparse_params: number;
-	level2_schedule_hour: number;
 	pattern_max_patterns: number;
 	pattern_initial_weight: number;
 	pattern_decay_rate: number;
