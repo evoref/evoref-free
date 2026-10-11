@@ -28,7 +28,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from backend.free.core.verifier_events import decided_by_shortcut
 from backend.free.learning.case_filters import (
+    MODEL_ORIGIN_PREFIXES,
     REASON_SHORTCUT_TOOL,
+    is_model_origin,
     regeneration_mismatch_reason,
     replay_context,
 )
@@ -71,9 +73,9 @@ _KNOWN_STATUSES = frozenset(EVICTION_ORDER)
 PRIOR_TURNS_MAX = 4
 PRIOR_TURNS_MAX_CHARS = 2000
 
-#: モデル由来の失敗理由の接頭辞 (``foreign_script_leak``)。プロンプトでは直らない崩れなので
-#: pressure にせず ``quarantined`` で登録する。``scripts/growth_signal_report.py`` も同じ表を使う。
-MODEL_ORIGIN_PREFIXES: tuple[str, ...] = ("Chinese token leaked", "Hangul token leaked")
+#: モデル由来の失敗理由 (``MODEL_ORIGIN_PREFIXES``、表は case_filters が持つ)。プロンプトでは
+#: 直らない崩れなので pressure にせず ``quarantined`` で登録する。
+#: ``scripts/growth_signal_report.py`` も同じ表を使う。
 
 #: 再生できない理由 (:mod:`backend.free.learning.case_filters` の理由に足すもの)。
 REASON_NO_QUERY = "no_query"
@@ -274,11 +276,6 @@ def replay_exclusion(exp: Mapping[str, Any]) -> str | None:
     if decided_by_shortcut(decided_by if isinstance(decided_by, dict) else None):
         return REASON_SHORTCUT_TOOL
     return regeneration_mismatch_reason(dict(exp)) or replay_context(dict(exp))[1]
-
-
-def is_model_origin(reason: str) -> bool:
-    """モデル由来の失敗理由か (プロンプトでは直らない崩れ)。"""
-    return str(reason or "").startswith(MODEL_ORIGIN_PREFIXES)
 
 
 def make_case(

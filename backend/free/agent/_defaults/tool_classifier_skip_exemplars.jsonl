@@ -125,3 +125,7 @@
 {"text": "以前おすすめしてもらった本のタイトルを、過去のやり取りから見つけて。", "label": "tool", "id": "t-hist-07", "source": "human:written"}
 {"text": "Search our past conversations for what I said about my car.", "label": "tool", "id": "t-hist-08", "source": "human:written"}
 {"text": "車の保険について話した回があったか、会話の記録を調べて。", "label": "tool", "id": "t-hist-09", "source": "human:written"}
+{"text": "今日の会話の内容をまとめて、チェックリストにして。", "label": "tool", "id": "t-hist-10", "source": "human:written"}
+{"text": "さっきまでの話をもとにやることリストを作って。", "label": "tool", "id": "t-hist-11", "source": "human:written"}
+{"text": "昨日話した内容を箇条書きでまとめ直して。", "label": "tool", "id": "t-hist-12", "source": "human:written"}
+{"text": "この前の相談の続きから、要点だけ書き出して。", "label": "tool", "id": "t-hist-13", "source": "human:written"}

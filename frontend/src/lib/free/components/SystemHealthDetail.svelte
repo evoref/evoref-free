@@ -26,6 +26,13 @@
 			: '-'
 	);
 	let learningValue = $derived(health?.learningHealth?.verdict ?? '-');
+	let modelOriginValue = $derived(
+		health?.learningHealth
+			? `${health.learningHealth.model_origin_failures ?? 0} (${(
+					(health.learningHealth.model_origin_rate ?? 0) * 100
+				).toFixed(1)}%)`
+			: '-'
+	);
 </script>
 
 <DashboardCard title={$t('dashboard.health.title')}>
@@ -34,6 +41,7 @@
 			<StatusRow label={$t('dashboard.health.rerank')} value={rerankValue} />
 			<StatusRow label={$t('dashboard.health.embed_placement')} value={embedValue} />
 			<StatusRow label={$t('dashboard.health.learning_verdict')} value={learningValue} />
+			<StatusRow label={$t('dashboard.health.model_origin')} value={modelOriginValue} />
 		</div>
 		{#if dataNotes.length > 0}
 			<StatusSection label={$t('dashboard.health.data')}>

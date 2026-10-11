@@ -169,6 +169,9 @@ class LlamaConfig(BaseModel):
     flash_attn: bool = True
     mlock: bool = False
     cache_prompt: bool = True
+    #: 日本語チャット応答への簡体字・ハングル混入を、生成時に ``logit_bias`` で禁止する
+    #: (実機 2026-10-11: 混入 4.3% → 0%、速度 −0.8%)。載っているモデルの語彙から作る。
+    leak_bias: bool = True
     # "auto" (既定) = 3 か 4 を起動時に決める (scripts/launch_llama.py
     # resolve_base_slots)。3 = チャット (0) / バックグラウンド (1: 学習 /
     # sleep-time) / 分類器 (2: ツール分類器 + チャット応答パスの補助判定)。

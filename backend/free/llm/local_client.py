@@ -618,6 +618,7 @@ class LocalClient(BaseHTTPClient):
         client_think_budget: int = 0,
         on_runaway: str = "fallback",
         context_size: int | None = None,
+        leak_bias=None,
     ):
         super().__init__(timeout=_HTTP_TIMEOUT_SEC)
         # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
@@ -633,6 +634,9 @@ class LocalClient(BaseHTTPClient):
         # 送信前コンテキスト超過ガード用の n_ctx (config llama.context_size)。
         # None なら無効 (テスト経路 / 旧呼出互換)。
         self._context_size = context_size
+        # 日本語チャット応答への簡体字・ハングル混入を生成時に禁止する (llm.leak_bias)。
+        # ``bias_for(messages)`` を持つ物。None なら無効。
+        self._leak_bias = leak_bias
         # 暴走 reasoning watchdog (docs/c_15 B3)。profile.reasoning から解決。
         # client_think_budget>0 のとき、未閉じ <think> がこの chunk 数を超えたら
         # ストリームを中断する (thinking=0 モデルの runaway 上限化)。サーバ側で
@@ -1156,6 +1160,17 @@ class LocalClient(BaseHTTPClient):
             }
 
         payload.update(extra)
+
+        # ユーザー応答パス (チャットスロット) だけ、日本語に現れない字のトークンを禁止する。
+        # 補助タスク・分類・create (別モデル) には送らない。
+        if (
+            self._leak_bias is not None
+            and "logit_bias" not in payload
+            and self._is_chat_slot(id_slot)
+        ):
+            bias = self._leak_bias.bias_for(messages)
+            if bias:
+                payload["logit_bias"] = bias
 
         # chat_template_kwargs は extra ではなく payload へ直接入るため、
         # extra_keys だけを出すと enable_thinking を送ったのかが分からない

@@ -150,7 +150,8 @@
 			"rerank": "Reranker",
 			"rerank_on": "Enabled",
 			"embed_placement": "Embedding placement",
-			"learning_verdict": "Learning verdict"
+			"learning_verdict": "Learning verdict",
+			"model_origin": "Language leakage (model)"
 		},
 		"learning_status": "Learning details",
 		"rag_stats": "Search (RAG) details",

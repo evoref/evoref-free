@@ -32,15 +32,22 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 
+from backend.free.core.leak_reasons import LEAK_REASON_PREFIXES
+
+#: モデル由来の失敗のチャネル。
+OUTCOME_CHANNEL_MODEL_ORIGIN = "outcome_model_origin"
+
 #: ``turn_outcome_reason`` の接頭辞 → 欠陥チャネル。理由文字列を組むのは
 #: :meth:`FeedbackCollector._derive_turn_outcome_with_reason` と
 #: :meth:`FeedbackCollector._apply_self_retraction` の 2 箇所だけで、ここは
 #: その語彙に追従する。**前方一致**で引く (理由は ``"<接頭辞>: <詳細>"``)。
 OUTCOME_REASON_CHANNELS: tuple[tuple[str, str], ...] = (
+    # (0) モデル自身の崩れ (他言語トークンの混入)。プロンプトでも方針でも直らず、
+    # sampling だけが効く。``DEFECT_WEIGHTS`` には載せず、生成パラメータ専用の
+    # ``GENERATION_DEFECT_WEIGHTS`` だけが重みを持つ (2026-10-11)。
+    *((p, OUTCOME_CHANNEL_MODEL_ORIGIN) for p in LEAK_REASON_PREFIXES),
     # (1) 出力そのものが壊れた。sampling パラメータの寄与が大きい。
     ("broken JA spacing", "outcome_broken_output"),
-    ("Chinese token leaked", "outcome_broken_output"),
-    ("Hangul token leaked", "outcome_broken_output"),
     ("answer cut off", "outcome_broken_output"),
     # (2) 本文が自分自身 / 手元の事実と食い違う。プロンプトと推論の寄与が大きい。
     ("arithmetic contradiction", "outcome_contradiction"),
@@ -86,6 +93,7 @@ OUTCOME_CHANNEL_OTHER = "outcome_other"
 
 #: 失敗チャネルの全体。``DEFECT_WEIGHTS`` 系の表を組む側が参照する。
 OUTCOME_CHANNELS: tuple[str, ...] = (
+    OUTCOME_CHANNEL_MODEL_ORIGIN,
     "outcome_broken_output",
     "outcome_contradiction",
     "outcome_instruction",
@@ -164,6 +172,7 @@ DEFECT_WEIGHTS: dict[str, float] = {
 #: — 責任のない失敗で温度を動かすと、直らないまま端まで振れる。
 GENERATION_DEFECT_WEIGHTS: dict[str, float] = {
     **DEFECT_WEIGHTS,
+    OUTCOME_CHANNEL_MODEL_ORIGIN: 1.0,
     "outcome_broken_output": 1.0,
     "outcome_execution": 0.3,
     "tool_routing_false_negative": 0.2,

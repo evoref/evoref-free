@@ -26,7 +26,9 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from backend.free.learning.case_filters import (
+    REASON_MODEL_ORIGIN,
     has_failure_evidence,
+    is_model_origin,
     regeneration_mismatch_reason,
     replay_context,
 )
@@ -245,6 +247,9 @@ def select_prompt_eval_case_sets(
       新しい順にその件数まで標本ケース (``CASE_KIND_SAMPLE``、ヒント無し) を
       足す。絶対採点では意味を持たないが、一対比較 (現行 vs 候補) の
       ゲートなら成功ターンでも選択圧になる (f_04 §4.5)。
+    - 他言語トークンの混入 (``turn_outcome_reason`` が ``MODEL_ORIGIN_PREFIXES``) だけが
+      根拠の失敗は外す (``model_origin``、2026-10-11)。プロンプトでは直らず、貪欲な
+      再生成では再現しないので同点にしかならない。👎 / 言い直しが付いたターンは残す。
     - 文書チャンクを根拠にしたターンと長文の経路を通ったターンは種別を問わず
       外す (:func:`~backend.free.learning.case_filters.
       regeneration_mismatch_reason`)。
@@ -325,6 +330,18 @@ def select_prompt_eval_case_sets(
                 # このゲートでは再現できず枠を無駄にする (docs/f_04 §2.5)。以前は
                 # failed のときだけ外し、👎・言い直しの長文はケースにしていた。
                 mismatched[mismatch] = mismatched.get(mismatch, 0) + 1
+                continue
+            # 他言語トークンの混入だけが失敗の根拠のターンは、プロンプトでは直らない
+            # モデルの崩れで、貪欲な再生成では再現せず現行・候補とも同点になる
+            # (2026-10-11 実機: 失敗ケース 6/6 が混入で全て引き分け、評価に約 7 分)。
+            # 👎 / 言い直しも付いたターンは別の根拠があるので残す。
+            if (
+                signals.get("turn_outcome") == "failed"
+                and is_model_origin(signals.get("turn_outcome_reason"))
+                and signals.get("user_negative") is not True
+                and not signals.get("rephrased_query")
+            ):
+                mismatched[REASON_MODEL_ORIGIN] = mismatched.get(REASON_MODEL_ORIGIN, 0) + 1
                 continue
             ids = _merged_ids(picked, _case_id(query), exp.get("id"))
             if signals.get("user_negative") is True:

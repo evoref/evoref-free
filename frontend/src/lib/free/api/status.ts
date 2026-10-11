@@ -146,6 +146,10 @@ export interface LearningHealthInfo {
 	verdict: string;
 	reasons: string[];
 	detected_failures: number;
+	/** 他言語トークンの混入で failed になったターン数 (モデル由来) */
+	model_origin_failures: number;
+	/** 全ターンに対する混入の率 (0〜1) */
+	model_origin_rate: number;
 	verified_corrections: number;
 	active_days: number;
 	span_days: number;
