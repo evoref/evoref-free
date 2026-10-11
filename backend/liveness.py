@@ -50,15 +50,23 @@ GATE_WINDOW = 200
 #: この件数に満たない判定点は ``degenerate`` にしない (希少事象の判定点を誤報しない)。
 GATE_MIN_DECISIONS = 100
 
-#: 稀な事象だけを拒む判定点 (発話の全体が挨拶のときだけ発火する等)。入力に該当が無い間は
-#: 何百回でも ``none`` のままで正常なので、「いつも否定ラベル」は恒偽として警告しない。
-#: 警告するのは **いつも否定でない** (恒真) とき。2026-10-06 ライブ監査: 91 件の実質的な依頼の
-#: 間 ``none`` だけで退化と出た。名前の実在は test_liveness の検査が固定する。
-#: ``speaker_own_statement`` (例文・虚構・他者の話の値を拒む、2026-10-10) も同じ形。
-RARE_EVENT_GATES = frozenset({
-    "gate.contentless_social_formula",
-    "gate.speaker_own_statement",
-})
+#: 同じラベルが続いても正常な判定点 → 続いてよいラベル。そのラベル以外で 1 種類に張り付いたとき
+#: だけ ``degenerate`` にする。
+#: - ``none``: 稀な事象だけを拒む判定点 (発話の全体が挨拶のときだけ発火する等)。入力に該当が無い
+#:   間は何百回でも ``none`` のままで正常。2026-10-06 ライブ監査: 91 件の実質的な依頼の間
+#:   ``none`` だけで退化と出た。``speaker_own_statement`` (例文・虚構・他者の話の値を拒む、
+#:   2026-10-10) も同じ形。
+#: - ``tool``: ``tool_classifier_skip`` は shadow 方針で、返り値は常に字句段の定数 ``tool``
+#:   (= 近道は効かず分類器へ進む、c_17 §3.22)。事例段の状態は shadow として別に記録される。
+#: - ``plain_statement`` / ``recent_file_reference`` は「該当する発話のときだけ発火」する否定側固定。
+#: 名前の実在は test_predicate_liveness の検査が固定する。
+EXPECTED_CONSTANT_LABELS: Mapping[str, str] = {
+    "gate.contentless_social_formula": "none",
+    "gate.speaker_own_statement": "none",
+    "gate.plain_statement": "none",
+    "gate.recent_file_reference": "none",
+    "gate.tool_classifier_skip": "tool",
+}
 
 FAILURE_CLASSES = ("transient", "unrecoverable")
 #: readonly の間は readonly に分類して出さない警告 (書き込みを止めた結果として当然起きる)。
@@ -371,10 +379,8 @@ def _alerts_for(stage: str, rec: Mapping[str, Any]) -> list[LivenessAlert]:
         ))
 
     labels = rec.get("labels") or []
-    always_negative = (
-        stage in RARE_EVENT_GATES and len(set(labels)) == 1 and labels[0] == "none"
-    )
-    if len(labels) >= GATE_MIN_DECISIONS and len(set(labels)) == 1 and not always_negative:
+    expected = len(set(labels)) == 1 and EXPECTED_CONSTANT_LABELS.get(stage) == labels[0]
+    if len(labels) >= GATE_MIN_DECISIONS and len(set(labels)) == 1 and not expected:
         bands = str(rec.get("bands") or "")
         out.append(LivenessAlert(
             stage, "degenerate", "",

@@ -22,6 +22,9 @@
 		detail?: string;
 	}
 
+	/** 開発機で常に出る既知の情報 (exFAT 等)。件数からは外す (詳細・doctor には残る)。backend/factory/_data_gate.py の文言と揃える */
+	const WEAK_FS_NOTE = /rename\/fsync ordering is weak/;
+
 	const MARKS: Record<Level, string> = { ok: '✓', warn: '!', error: '✕', unknown: '…' };
 
 	let data = $derived($serverState.dataHealth);
@@ -46,7 +49,9 @@
 				})
 			});
 		}
-		const notes = (data?.warnings.length ?? 0) + (data?.degraded.length ?? 0);
+		const notes =
+				(data?.warnings.filter((w) => !WEAK_FS_NOTE.test(w)).length ?? 0) +
+				(data?.degraded.length ?? 0);
 		if (notes > 0) {
 			list.push({ level: 'warn', text: $t('dashboard.overview.data_warnings', { count: notes }) });
 		}

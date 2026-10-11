@@ -104,6 +104,13 @@ def _tool_result_defects(case: Any, response: str) -> int:
     return defects
 
 
+def _defect_total(case: Any, response: str) -> int:
+    """応答の欠陥数 (``_rank`` と同じ計数: 決定論の欠陥 + ツール結果との矛盾)。"""
+    return response_defect_total(
+        response, case.query, mode=getattr(case, "mode", "chat"),
+    ) + _tool_result_defects(case, response)
+
+
 def _sampled(*params: dict[str, float] | None) -> bool:
     """どれかの構成の温度が 0 より大きいか (``_regenerate`` の既定は greedy)。"""
     return any(float((p or {}).get("temperature") or 0.0) > 0.0 for p in params)
@@ -308,10 +315,7 @@ class PromptCandidateEval:
             bool(wrong_value) and not correct
             and response_already_states(wrong_value, response)
         )
-        defects = response_defect_total(
-            response, case.query, mode=getattr(case, "mode", "chat"),
-        ) + _tool_result_defects(case, response)
-        return int(wrong), -int(correct), defects
+        return int(wrong), -int(correct), _defect_total(case, response)
 
     @classmethod
     def _verdicts(
@@ -372,15 +376,26 @@ class PromptCandidateEval:
     def _log_replay_reproduction(
         cases: list[Any], current: dict[str, str | None],
     ) -> None:
-        """ツール根拠のケースで、現行の再生成が記録された失敗を再現した率を出す。
+        """現行の再生成が欠陥を持つ率と、ツール根拠のケースで記録された失敗を再現した率を出す。
 
         再生が元の失敗 (ツール結果の無視) を再現しなければ、ブロックを添えた
         再生 (f_04 §4.5、案 A1) は規則の効き目を測れていない — その観測。
         """
-        replayed = [
-            c for c in cases
-            if getattr(c, "tool_context", "") and current.get(c.case_id) is not None
-        ]
+        generated = [c for c in cases if current.get(c.case_id) is not None]
+        # 標本 (成功ターン、無退行の検査用) は欠陥の再現を問わないので数えない。
+        failures = [c for c in generated if getattr(c, "kind", "") != "sample"]
+        if failures:
+            # 現行の再生成が欠陥を再現しないケースは、候補との比較が同点になる
+            # (引き分けの内訳が「両方とも欠陥あり」か「両方とも健全」かを分ける観測)。
+            defective = sum(
+                1 for c in failures
+                if _defect_total(c, current[c.case_id] or "") > 0
+            )
+            logger.info(
+                "prompt candidate eval: current prompt regenerated a defective "
+                "response in %d/%d failure case(s)", defective, len(failures),
+            )
+        replayed = [c for c in generated if getattr(c, "tool_context", "")]
         if not replayed:
             return
         reproduced = sum(

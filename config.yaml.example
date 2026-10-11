@@ -150,6 +150,7 @@ llama:
   flash_attn: true               # -fa / Flash Attention の有効化
   mlock: false                    # --mlock / モデルを RAM に固定
   cache_prompt: true              # KVキャッシュ再利用（共通プレフィックスの再計算をスキップ）
+  leak_bias: true                # 日本語チャット応答への簡体字・ハングル混入を、生成時に logit_bias で禁止する（載っているモデルの語彙から作る。実機で混入 4.3%→0%、速度 -0.8%）
   slots: auto                     # -np / 並列スロット数（auto | 1=単一, 2=チャット+背景, 3=+ツール分類器, 4=+長文）
                                   # auto: 既定。起動時に 3 か 4 を決める (scripts/launch_llama.py)。
                                   #    4 本目 (slot3) は long_form のユニット生成専用で、長文ターンの後も

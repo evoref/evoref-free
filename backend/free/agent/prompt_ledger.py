@@ -376,6 +376,7 @@ DEFAULT_RULE_VERIFIERS: dict[str, str] = {
     "等のラベルを使わない": "head_label",
     "Do not use labels such as": "head_label",
     "自体を話題にしない": "internal_frame",
+    "Do not make the presence or absence of": "internal_frame",
     "自分自身の過去の発言をそのまま繰り返さない": "repetition",
     "Do not repeat your own past reply verbatim": "repetition",
     # 「本人が言っていない人数・件数・数量・順序を補って言い直さない」。
@@ -387,6 +388,7 @@ DEFAULT_RULE_VERIFIERS: dict[str, str] = {
     # 「〜するツールが利用できない」等の道具立ての説明を理由にしない。検証器は
     # 常に登録されているツール (calculate) の名指しだけを見る (規則より狭い)。
     "自分の道具立てについての説明は根拠を持たない": "content.tool_unavailable",
+    "statements about your own toolset": "content.tool_unavailable",
 }
 
 

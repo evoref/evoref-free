@@ -58,6 +58,7 @@ from backend.free.core.relative_date import (
     DATE_RESULT_IGNORED,
     date_result_use,
 )
+from backend.free.core.leak_reasons import LEAK_REASON_PREFIXES, leak_reason_for
 from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
 from backend.free.core.response_dates import extract_tool_anchor
 from backend.free.core.verifier_events import (
@@ -78,7 +79,6 @@ from backend.free.core.text_quality import (
     claims_completed_state_change,
     contradicts_measured_values,
     fabricated_household_count,
-    foreign_script_leak,
     has_broken_ja_spacing,
     is_cut_off_answer,
     ungrounded_answer_names,
@@ -992,8 +992,7 @@ _OUTCOME_REASON_CHANNELS: tuple[tuple[str, str, str], ...] = (
     ("sign contradiction", "content.sign", "content_contradiction"),
     ("change rate contradiction", "content.arithmetic", "content_contradiction"),
     ("broken JA spacing", "content.broken_text", "output_broken"),
-    ("Chinese token leaked", "content.broken_text", "output_broken"),
-    ("Hangul token leaked", "content.broken_text", "output_broken"),
+    *((p, "content.broken_text", "output_broken") for p in LEAK_REASON_PREFIXES),
     ("response retracts", "content.self_retraction", "content_contradiction"),
     ("measured value contradiction", "content.measured", "content_contradiction"),
     ("tool result ignored", "content.tool_result", "tool_result_ignored"),
@@ -1995,11 +1994,9 @@ class FeedbackCollector:
             return f"sign contradiction: {sign}"
         if has_broken_ja_spacing(text):
             return "broken JA spacing"
-        leak = foreign_script_leak(text, query=query)
-        if leak == "chinese":
-            return "Chinese token leaked into JA response"
-        if leak == "hangul":
-            return "Hangul token leaked into response"
+        leak = leak_reason_for(text, query=query)
+        if leak is not None:
+            return leak
         if retracts_own_conclusion(text):
             return "response retracts its own conclusion mid-answer"
         if is_cut_off_answer(text):

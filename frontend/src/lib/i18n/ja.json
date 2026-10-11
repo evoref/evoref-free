@@ -150,7 +150,8 @@
 			"rerank": "リランカー",
 			"rerank_on": "有効",
 			"embed_placement": "埋め込みの配置",
-			"learning_verdict": "学習の判定"
+			"learning_verdict": "学習の判定",
+			"model_origin": "モデルの言語混入"
 		},
 		"learning_status": "学習の詳細",
 		"rag_stats": "検索 (RAG) の詳細",

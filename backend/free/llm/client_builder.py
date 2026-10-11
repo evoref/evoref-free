@@ -78,6 +78,7 @@ def build_local_client(
     return LocalClient(
         llama_url,
         metadata,
+        leak_bias=_build_leak_bias(cfg, llama_cfg),
         cache_prompt=llama_cfg.get("cache_prompt", True),
         slots=slots,
         enable_thinking=base_enable_thinking,
@@ -93,4 +94,17 @@ def build_local_client(
         # ``.get(..., 4096)`` では None が入ってガードが無効化されていた。
         # 起動フラグ ``-c`` と同じ優先順位で解決し、実際の n_ctx (/props) を超えない。
         context_size=resolve_context_size(cfg, "base"),
+    )
+
+
+def _build_leak_bias(cfg: dict[str, Any], llama_cfg: dict[str, Any]):
+    """日本語チャットへの他言語混入を生成時に禁止する守り (``llama.leak_bias``)。"""
+    from backend.config import get_path_resolver
+    from backend.free.llm.leak_bias import LeakBiasGuard
+
+    return LeakBiasGuard(
+        enabled=bool(llama_cfg.get("leak_bias", True)),
+        locale=str((cfg.get("i18n") or {}).get("locale") or "ja"),
+        mode_getter=lambda: get_path_resolver().active_mode,
+        served_model_getter=lambda: get_path_resolver().served_model_path(),
     )

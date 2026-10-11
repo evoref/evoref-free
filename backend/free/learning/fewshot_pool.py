@@ -44,6 +44,7 @@ from backend.free.agent.prompt_utils import (
     FewShotExample,
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
+from backend.free.core.leak_reasons import LEAK_REASON_PREFIXES, leak_reason
 from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
 from backend.utils import parse_utc, utc_now, utc_now_dt
 from backend.free.core.intent_vocab import (
@@ -589,11 +590,9 @@ def find_content_rejection(
     if _response_has_broken_ja_spacing(response):
         return "broken JA spacing"
     # 日本語に中国語・ハングルの語彙が紛れた応答も同じ理由で手本にしない。
-    leak = _response_script_leak(response, query=query)
-    if leak == "chinese":
-        return "Chinese token leaked into JA response"
-    if leak == "hangul":
-        return "Hangul token leaked into response"
+    leak = leak_reason(_response_script_leak(response, query=query))
+    if leak is not None:
+        return leak
     # 質問を逐語で繰り返しただけの応答は「問いをそのまま返すのが正解」という
     # バイアスを注入する (2026-08-04 ライブ監査: 同文 5 回で答えが出なくなった)。
     if is_query_echo(response, query):
@@ -687,6 +686,9 @@ _HARMFUL_RATE_MULTIPLIER = 2.0
 _HARMFUL_RATE_FLOOR = 0.2
 #: ``turn_outcome_reason`` のうち **手本に帰属できる** 失敗 (前方一致)。出力の
 #: 破綻・形式違反・自己撤回は手本が教えた形の可能性がある。生成失敗 / 打ち切り /
+#: 他言語トークンの混入 (``LEAK_REASON_PREFIXES``) は載せない: モデル自身の崩れで、
+#: 手本のせいではない (手本に載せた時点で混入した例は棄却済み)。載せると良い手本が
+#: 有害印を積まれて退役する (2026-10-11)。
 #: ルーティング誤り / ツール・日付結果の無視 / 計測値矛盾は例と無関係な失敗なので
 #: 帰属しない (良い例を殺さない)。ツールを「使えない」と述べた断り
 #: (``false tool unavailability``) もツールを撃たなかった判定の側の失敗で帰属しない。
@@ -697,8 +699,6 @@ FEWSHOT_ATTRIBUTABLE_REASONS: tuple[str, ...] = (
     "change rate contradiction",
     "declared count mismatch",
     "broken JA spacing",
-    "Chinese token leaked",
-    "Hangul token leaked",
     "response retracts",
     "retracted by assistant",
     "user echo",

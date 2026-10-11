@@ -241,6 +241,23 @@ def _script_leak_scan_body(text: str) -> str:
     return mask_quoted_speech(body)
 
 
+def scripts_allowed_by_query(query: str) -> frozenset[str]:
+    """問いが当該の文字種を求めている / 含んでいるために、応答に現れてよい文字種 (純粋関数)。
+
+    ``"hangul"`` (問いにハングルがある / 韓国語を名指ししている) と ``"chinese"``
+    (中国語を名指ししている / 問いに簡体字専用字がある)。混入の判定
+    (:func:`foreign_script_leak`) と、生成時の禁止 (``llm.leak_bias``) が同じ除外を
+    読む (不変則 #14 (a))。
+    """
+    q = query or ""
+    allowed: set[str] = set()
+    if _HANGUL_RE.search(q) or _ASKS_KOREAN_RE.search(q):
+        allowed.add("hangul")
+    if _ASKS_CHINESE_RE.search(q) or any(ch in simplified_only_hanzi() for ch in q):
+        allowed.add("chinese")
+    return frozenset(allowed)
+
+
 def foreign_script_leak(text: str, *, query: str = "") -> str | None:
     """ja / en の応答に紛れた他言語のトークンの種別を返す (純粋関数)。
 
@@ -259,14 +276,10 @@ def foreign_script_leak(text: str, *, query: str = "") -> str | None:
     除外: 問いに同じ文字種があるか、問いがその言語を名指ししているとき
     (翻訳・語学の依頼。応答に当該文字が出るのが正解)。
     """
-    q = query or ""
-    if _HANGUL_RE.search(_script_leak_scan_body(text)) and not (
-        _HANGUL_RE.search(q) or _ASKS_KOREAN_RE.search(q)
-    ):
+    allowed = scripts_allowed_by_query(query)
+    if "hangul" not in allowed and _HANGUL_RE.search(_script_leak_scan_body(text)):
         return "hangul"
-    if has_chinese_token_leak(text) and not (
-        _ASKS_CHINESE_RE.search(q) or any(ch in simplified_only_hanzi() for ch in q)
-    ):
+    if "chinese" not in allowed and has_chinese_token_leak(text):
         return "chinese"
     return None
 
@@ -1670,6 +1683,7 @@ __all__ = [
     "has_broken_ja_spacing",
     "has_chinese_token_leak",
     "foreign_script_leak",
+    "scripts_allowed_by_query",
     "is_japanese_text",
     "labeled_numeric_claims",
     "strip_system_notes",

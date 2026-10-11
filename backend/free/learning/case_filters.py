@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from backend.free.core.leak_reasons import LEAK_REASON_PREFIXES, is_model_origin_reason
 from backend.free.core.verifier_events import decided_by_shortcut
 from backend.free.learning.corrected_pairs import resolve_corrected_turn
 from backend.free.learning.level0_instant import (
@@ -39,6 +40,12 @@ REASON_TOOL_CONTEXT_MISSING = "tool_context_missing"
 REASON_TOOL_CONTEXT_TRUNCATED = "tool_context_truncated"
 #: ツールを近道 (recall / learned) が選んだ。結果そのものが誤りでありうる (不変則 #15)。
 REASON_SHORTCUT_TOOL = "shortcut_tool"
+#: 失敗の原因がモデル自身の崩れ (他言語トークンの混入) で、プロンプトでは直らない。
+#: ``turn_outcome_reason`` の接頭辞 (``text_quality.foreign_script_leak`` の失敗ラベル)。
+#: 回帰台帳 (``growth.regression``) と採用ゲートが同じ表を使う。
+MODEL_ORIGIN_PREFIXES: tuple[str, ...] = LEAK_REASON_PREFIXES
+#: 除外理由: モデル由来の崩れだけが失敗の根拠 (採用ゲートの再生成は貪欲で再現せず引き分けになる)。
+REASON_MODEL_ORIGIN = "model_origin"
 
 
 def grounding_reason(exp: dict) -> str | None:
@@ -95,6 +102,11 @@ def replay_context(exp: dict) -> tuple[str, str | None]:
     return context, None
 
 
+def is_model_origin(reason: object) -> bool:
+    """モデル由来の失敗理由か (プロンプトでは直らない崩れ)。"""
+    return is_model_origin_reason(reason)
+
+
 def has_failure_evidence(signals: Mapping[str, Any]) -> bool:
     """訂正以外の失敗の証拠 (👎 / ``failed`` / 言い直し) があるか。
 
@@ -132,6 +144,9 @@ def case_eligible_ids(experiences: list[dict]) -> set[str]:
 
 
 __all__ = [
+    "MODEL_ORIGIN_PREFIXES",
+    "REASON_MODEL_ORIGIN",
+    "is_model_origin",
     "REASON_CORPUS_GROUNDED",
     "REASON_LONG_FORM",
     "REASON_SHORTCUT_TOOL",

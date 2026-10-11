@@ -17,6 +17,7 @@ from typing import Any
 
 from backend.constants import SECONDS_PER_DAY
 from backend.data_root import store_root
+from backend.free.core.leak_reasons import is_model_origin_reason
 from backend.free.learning.level0_instant import fold_experience_file
 from backend.utils import parse_utc, utc_now_dt
 
@@ -189,7 +190,10 @@ def summarize(
         outcome = str(sig.get("turn_outcome") or "unlabeled")
         outcomes[outcome] += 1
         if outcome == "failed":
-            failed_reasons[str(sig.get("turn_outcome_reason") or "(理由なし)")] += 1
+            reason = str(sig.get("turn_outcome_reason") or "(理由なし)")
+            failed_reasons[reason] += 1
+            if is_model_origin_reason(reason):
+                counts["model_origin_failures"] += 1
         if sig.get("user_correction"):
             counts["verified_corrections"] += 1
         if sig.get("correction_candidate"):
@@ -222,6 +226,11 @@ def summarize(
         "outcomes": dict(outcomes),
         "failed_reasons": dict(failed_reasons.most_common(10)),
         "detected_failures": outcomes.get("failed", 0),
+        # モデル自身の崩れ (他言語トークンの混入)。プロンプトでは直らない健全性の信号
+        "model_origin_failures": counts.get("model_origin_failures", 0),
+        "model_origin_rate": (
+            round(counts.get("model_origin_failures", 0) / len(stamped), 4) if stamped else 0.0
+        ),
         "verified_corrections": counts.get("verified_corrections", 0),
         "correction_candidates": counts.get("correction_candidates", 0),
         "rephrased_queries": counts.get("rephrased_queries", 0),
@@ -316,7 +325,8 @@ def _judge(summary: dict[str, Any]) -> dict[str, Any]:
 #: ``/api/status`` が全走査を毎回走らせないためのキャッシュ寿命 (秒)。
 SNAPSHOT_TTL_SECONDS = 300.0
 _SNAPSHOT_KEYS = (
-    "detected_failures", "verified_corrections", "active_days", "span_days", "turns",
+    "detected_failures", "model_origin_failures", "model_origin_rate",
+    "verified_corrections", "active_days", "span_days", "turns",
     "history_days", "window_turns", "natural_days", "burst_days",
     "natural_failures", "natural_corrections", "level1_scope", "unlearned_partitions",
 )

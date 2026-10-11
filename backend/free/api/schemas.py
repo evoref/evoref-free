@@ -286,6 +286,9 @@ class LearningHealthInfo(BaseModel):
     verdict: str = "hold"
     reasons: list[str] = Field(default_factory=list)
     detected_failures: int = 0
+    #: 他言語トークンの混入で failed になったターン数と全ターンに対する率 (モデル由来)
+    model_origin_failures: int = 0
+    model_origin_rate: float = 0.0
     verified_corrections: int = 0
     active_days: int = 0
     span_days: float = 0.0
