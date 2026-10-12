@@ -226,11 +226,7 @@ def _theme_info(backend_url: str, console, theme_id: str) -> int:
         render_info(console, f"  {msg('cli.theme_info_author')}: {theme['author']}")
     if theme.get("description"):
         render_info(console, f"  {msg('cli.theme_info_description')}: {theme['description']}")
-    render_info(console, f"  {msg('cli.theme_info_builtin')}: {'✓' if theme.get('builtin') else '✗'}")
-    render_info(console, f"  {msg('cli.theme_info_trusted')}: {'✓' if theme.get('trusted') else '✗'}")
     render_info(console, f"  {msg('cli.theme_info_cli')}: {'✓' if theme.get('has_cli_theme') else '✗'}")
-    render_info(console, f"  {msg('cli.theme_info_cli_modules')}: {theme.get('cli_module_count', 0)}")
-    render_info(console, f"  {msg('cli.theme_info_gui_components')}: {theme.get('component_count', 0)}")
     return 0
 
 
@@ -301,11 +297,7 @@ def _is_url(target: str) -> bool:
 
 
 def theme_install(backend_url: str, console, target: str) -> int:
-    """ZIP ファイルまたは URL からテーマをインストールする。
-
-    インストールしたテーマは常に未信頼 (信頼は ``evoref theme trust`` だけが付ける、
-    docs/c_11 §1)。JS コンポーネントと CLI モジュールは信頼するまで無効のまま。
-    """
+    """ZIP ファイルまたは URL からテーマをインストールする。"""
     target = target.strip()
     if not target:
         render_error(console, msg("cli.theme_install_usage"))
@@ -349,15 +341,11 @@ def theme_install(backend_url: str, console, target: str) -> int:
         "cli.theme_install_done",
         id=theme_id, name=result.get("name", theme_id), version=result.get("version", ""),
     ))
-    apis = (result.get("widget_manifest") or {}).get("required_apis") or []
-    if apis:
-        render_info(console, msg("cli.theme_install_required_apis", apis=", ".join(apis)))
-    render_error(console, msg("cli.theme_install_untrusted_hint", id=theme_id), level="hint")
     return 0
 
 
 def theme_uninstall(backend_url: str, console, theme_id: str) -> int:
-    """テーマを削除する (信頼リストからも外れる。有効なテーマなら残りのテーマへ切り替わる)。"""
+    """テーマを削除する (有効なテーマなら残りのテーマへ切り替わる)。"""
     theme_id = theme_id.strip()
     if not theme_id:
         render_error(console, msg("cli.theme_uninstall_usage"))

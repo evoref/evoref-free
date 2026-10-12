@@ -8,13 +8,26 @@ from backend.config_normalize import reject_retired_keys
 from backend.llama_launch_args import derive_into
 
 
+def _as_int(v: object, name: str, expected: str) -> int:
+    """整数へ。bool・小数部のある数・数値でない型は ``ValueError`` (pydantic が検証エラーに変える)。
+
+    ``int(v)`` は None / リストで ``TypeError`` (pydantic は変換しない) を投げ、
+    ``1024.9`` を黙って 1024 に、``True`` を 1 に読んでしまう。
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"{name} must be {expected}, got {v!r}")
+    if isinstance(v, float):
+        if not v.is_integer():
+            raise ValueError(f"{name} must be {expected}, got non-integer {v!r}")
+        return int(v)
+    return v
+
+
 def _int_or_auto(v: object, name: str, minimum: int) -> int | str | None:
     """環境調整 (c_16 §7.2.3) が決めるキーの値: ``"auto"`` / ``None`` (どちらも自動) か ``minimum`` 以上の整数。"""
     if v is None or v == "auto":
         return v  # type: ignore[return-value]
-    if isinstance(v, str) or isinstance(v, bool):
-        raise ValueError(f"{name} must be an int (>={minimum}), 'auto' or null, got {v!r}")
-    iv = int(v)  # type: ignore[call-overload]
+    iv = _as_int(v, name, f"an int (>={minimum}), 'auto' or null")
     if iv < minimum:
         raise ValueError(f"{name} must be >= {minimum}, got {iv}")
     return iv
@@ -133,7 +146,7 @@ class LlamaConfig(BaseModel):
             if v == "auto":
                 return v
             raise ValueError(f"context_size must be an int (>=512), 'auto' or null, got string {v!r}")
-        iv = int(v)  # type: ignore[call-overload]
+        iv = _as_int(v, "context_size", "an int (>=512), 'auto' or null")
         if iv < 512:
             raise ValueError(f"context_size must be >= 512, got {iv}")
         return iv
@@ -148,7 +161,7 @@ class LlamaConfig(BaseModel):
             raise ValueError(
                 f"gpu_layers must be an int (>=-1) or 'auto', got string {v!r}"
             )
-        iv = int(v)
+        iv = _as_int(v, "gpu_layers", "an int (>=-1) or 'auto'")
         if iv < -1:
             raise ValueError(f"gpu_layers must be >= -1, got {iv}")
         return iv
@@ -199,7 +212,7 @@ class LlamaConfig(BaseModel):
             raise ValueError(
                 f"slots must be an int (1..16) or 'auto', got string {v!r}"
             )
-        iv = int(v)
+        iv = _as_int(v, "slots", "an int (1..16) or 'auto'")
         if not 1 <= iv <= 16:
             raise ValueError(f"slots must be within 1..16, got {iv}")
         return iv

@@ -92,20 +92,43 @@ def _get_embedder(state: AppState):
     return embedder
 
 
-def _check_upload_size(content: bytes, mgr) -> None:
-    """アップロードされたパッケージのサイズを入口検査する (c_16 §4.3)。
+#: アップロードを一時ファイルへ書く単位。
+_UPLOAD_CHUNK = 1024 * 1024
 
-    展開前後のサイズ上限は :class:`CorpusStore.install` 側でも検査するが、
-    zip 本体は一時ファイルへ書く前に弾いた方が安い。
+
+def _package_too_large(size: int, max_bytes: int) -> HTTPException:
+    return _cartridge_error(
+        413, "E0513",
+        f"Package too large: {size} bytes (max {max_bytes})",
+        i18n_key="api.cartridge_package_too_large",
+        size=str(size), max_size=str(max_bytes),
+    )
+
+
+async def _spool_upload(file: UploadFile, mgr) -> tuple[str, int]:
+    """アップロードを上限付きで一時ファイルへ書き、``(パス, バイト数)`` を返す (c_16 §4.3)。
+
+    展開前後のサイズ上限は :class:`CorpusStore.install` 側でも検査するが、zip 本体は
+    メモリへ丸ごと読む前に弾く。申告サイズ (``file.size``) で先に断り、申告が無い・
+    偽りでも上限 + 1 バイトまでしか読まない。
     """
     max_bytes = mgr.max_package_bytes
-    if len(content) > max_bytes:
-        raise _cartridge_error(
-            413, "E0513",
-            f"Package too large: {len(content)} bytes (max {max_bytes})",
-            i18n_key="api.cartridge_package_too_large",
-            size=str(len(content)), max_size=str(max_bytes),
-        )
+    if file.size is not None and file.size > max_bytes:
+        raise _package_too_large(file.size, max_bytes)
+    written = 0
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp_path = tmp.name
+        try:
+            while chunk := await file.read(min(_UPLOAD_CHUNK, max_bytes + 1 - written)):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise _package_too_large(written, max_bytes)
+                tmp.write(chunk)
+        except BaseException:
+            tmp.close()
+            Path(tmp_path).unlink(missing_ok=True)
+            raise
+    return tmp_path, written
 
 
 @router.post("/install", status_code=201)
@@ -118,14 +141,8 @@ async def install_cartridge(
     mgr = _get_manager(state)
     embedder = _get_embedder(state)
 
-    content = await file.read()
-    _check_upload_size(content, mgr)
-
-    # 一時ファイルに保存
-    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    logger.debug("Saved upload to temp: %s (%d bytes)", tmp_path, len(content))
+    tmp_path, size = await _spool_upload(file, mgr)
+    logger.debug("Saved upload to temp: %s (%d bytes)", tmp_path, size)
 
     start = time.time()
     try:
@@ -288,13 +305,8 @@ async def install_cartridge_stream(
     mgr = _get_manager(state)
     embedder = _get_embedder(state)
 
-    content = await file.read()
-    _check_upload_size(content, mgr)
-
     # アップロードを一時ファイルに保存（mgr.install は Path を要求）
-    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+    tmp_path, _size = await _spool_upload(file, mgr)
 
     queue: asyncio.Queue[dict | None] = asyncio.Queue()
     _SENTINEL: dict = {"__done__": True}

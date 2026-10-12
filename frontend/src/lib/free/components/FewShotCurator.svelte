@@ -25,11 +25,9 @@
 
 	let examples = $state<FewShotExample[]>([]);
 	let archived = $state<FewShotExample[]>([]);
-	let writeback = $state('');
 	let modeFilter = $state<ModeFilter>('all');
 	let loading = $state(true);
 	let errorMessage = $state('');
-	let delegatedMessage = $state('');
 	let expandedId = $state<string | null>(null);
 	let actingId = $state<string | null>(null);
 
@@ -40,21 +38,13 @@
 	async function refresh() {
 		loading = true;
 		errorMessage = '';
-		delegatedMessage = '';
 		try {
 			const mode = modeFilter === 'all' ? undefined : modeFilter;
 			const result = await listFewshot(mode);
 			examples = result.examples;
 			archived = result.archived;
-			writeback = result.writeback;
 		} catch (e) {
-			if (e instanceof ApiError && e.code === 'E0409') {
-				delegatedMessage = e.i18nKey ? $t(e.i18nKey) : e.message;
-				examples = [];
-				archived = [];
-			} else {
-				errorMessage = e instanceof ApiError && e.i18nKey ? $t(e.i18nKey) : $t('fewshot.list_failed');
-			}
+			errorMessage = e instanceof ApiError && e.i18nKey ? $t(e.i18nKey) : $t('fewshot.list_failed');
 		} finally {
 			loading = false;
 		}
@@ -111,9 +101,10 @@
 				{#if isArchived}
 					<Badge tone="muted">{$t('fewshot.state_archived')}</Badge>
 				{:else}
-					<Badge tone="strong">{$t('fewshot.state_active')}</Badge>
 					{#if ex.state === 'stale'}
 						<Badge tone="muted">{$t('fewshot.state_stale')}</Badge>
+					{:else}
+						<Badge tone="strong">{$t('fewshot.state_active')}</Badge>
 					{/if}
 					{#if ex.pinned}
 						<Badge>{$t('fewshot.pinned')}</Badge>
@@ -186,8 +177,6 @@
 
 	{#if loading}
 		<Loading />
-	{:else if delegatedMessage}
-		<p class="notice">{delegatedMessage}</p>
 	{:else if errorMessage}
 		<p class="error" role="alert">{errorMessage}</p>
 	{:else}
@@ -215,10 +204,6 @@
 				</ul>
 			{/if}
 		</Disclosure>
-
-		{#if writeback}
-			<p class="muted writeback">{$t('fewshot.writeback_note', { writeback })}</p>
-		{/if}
 	{/if}
 </div>
 
@@ -247,12 +232,6 @@
 		color: var(--text-on-accent);
 		font-weight: 600;
 	}
-	.notice {
-		padding: var(--space-3) var(--space-4);
-		border: 1px solid var(--border);
-		border-radius: var(--border-radius);
-		color: var(--text-secondary);
-	}
 	.error {
 		color: var(--color-error);
 		font-weight: 600;
@@ -260,11 +239,6 @@
 	.muted {
 		color: var(--text-secondary);
 		font-size: var(--font-size-sm);
-	}
-	.writeback {
-		margin-top: var(--space-4);
-		color: var(--text-muted);
-		font-size: var(--font-size-xs);
 	}
 	.fewshot-section {
 		margin-bottom: var(--space-5);

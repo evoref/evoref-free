@@ -16,18 +16,11 @@ export interface ThemeListItem {
 	author: string;
 	description: string;
 	active: boolean;
-	trusted: boolean;
-	has_components: boolean;
-	component_count: number;
-	builtin: boolean;
 	has_preview: boolean;
 	has_cli_theme: boolean;
-	has_cli_modules: boolean;
-	cli_module_count: number;
-	features: Record<string, boolean> | null;
 }
 
-/** GUI レイアウト + スロット情報（activate レスポンス用） */
+/** GUI レイアウト（activate レスポンス用） */
 export interface GuiLayoutResponse {
 	sidebar: {
 		position: 'left' | 'right' | 'hidden';
@@ -51,7 +44,6 @@ export interface GuiLayoutResponse {
 		spacing_unit: number;
 		animation: boolean;
 	};
-	slots?: Record<string, string | null>;
 }
 
 /** CLI テーマ設定（cli-theme.json の構造） */
@@ -70,10 +62,6 @@ export interface ThemeActivateResponse {
 	colors: string;
 	gui_layout: GuiLayoutResponse | null;
 	cli_theme: CliThemeConfig | null;
-	slots: Record<string, string | null> | null;
-	cli_modules: Record<string, string> | null;
-	trusted: boolean;
-	features: Record<string, boolean> | null;
 }
 
 /** テーマインストールレスポンス */
@@ -82,8 +70,6 @@ export interface ThemeInstallResponse {
 	name: string;
 	version: string;
 	author: string;
-	trusted: boolean;
-	widget_manifest?: { required_apis: string[] };
 }
 
 /** テーマ一覧取得 */

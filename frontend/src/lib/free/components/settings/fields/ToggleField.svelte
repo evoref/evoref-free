@@ -26,7 +26,7 @@
 		aria-label={$t(label)}
 	>
 		<span class="toggle-knob"></span>
-		<span class="toggle-label">{value ? 'ON' : 'OFF'}</span>
+		<span class="toggle-label">{value ? $t('settings.field.on') : $t('settings.field.off')}</span>
 	</button>
 </FieldShell>
 

@@ -64,6 +64,7 @@ from backend.free.api.chat.chat_recorder import (
     set_turn_evidence_ids,
     set_turn_rag_meta,
     set_turn_fewshot_ids,
+    keep_injected_fewshot_ids,
 )
 from backend.free.memory.pipeline.search_pipeline import PREVIOUS_CONTEXT_MARK, SearchUsage
 from backend.free.api.chat.chat_service import (
@@ -122,7 +123,7 @@ from backend.free.agent.deliberative import (
 )
 from backend.free.agent.meta_cognitive import MetaCognitiveAgent
 from backend.free.agent.prompt_manager import ensure_static_directives
-from backend.free.agent.prompt_utils import format_fewshot_section
+from backend.free.agent.prompt_utils import fewshot_example_text, format_fewshot_section
 from backend.free.agent.reactive import ReactiveAgent
 from backend.free.agent.statement_gate import statement_note_for
 from backend.free.agent.router import (
@@ -512,7 +513,10 @@ def _resolve_fewshot_block(
             examples = get_examples(mode, query, query_vec)
         except TypeError:
             examples = get_examples(mode, query)
-        set_turn_fewshot_ids(session_id, [ex.id for ex in examples])
+        set_turn_fewshot_ids(
+            session_id, [ex.id for ex in examples],
+            [fewshot_example_text(ex) for ex in examples],
+        )
         return format_fewshot_section(examples) if examples else ""
     get_block = getattr(prompt_mgr, "get_fewshot_block", None)
     if get_block is None:
@@ -1952,6 +1956,14 @@ async def _build_messages_with_search(
         )
     if session_id:
         set_turn_evidence_ids(session_id, injected_evidence_ids)
+        if layer != "meta_cognitive":
+            # 予算の切り詰め / 会話中の値との食い違いで落ちた例は注入していない。
+            # meta は messages を使わず、エージェントが注入の有無を返す。
+            last_user = next(
+                (m.get("content") for m in reversed(messages) if m.get("role") == "user"),
+                "",
+            )
+            keep_injected_fewshot_ids(session_id, str(last_user or ""))
     # 注入を組んだので、見せた id を「使った」へ積む (f_01 §8.1 Step 7.7)。
     # 検索側では積まない — 投機検索を捨てた回 (reactive / 軽量パス) を汚さない。
     if usage is not None:
@@ -2399,6 +2411,9 @@ async def _dispatch_long_form(
     ``brief`` は ProductionBrief (f_08 §2.2)。create モード限定で呼出側
     (``_dispatch``) が組み、空文字なら create 以外 (通常の長文生成) を意味する。
     """
+    # 長文生成は few-shot を注入しない。選んだ id を残すと使用と成否が帰属される。
+    if session_id:
+        set_turn_fewshot_ids(session_id, [])
     base_ok, client = await ensure_base_model_health(client, state, cfg)
     if not base_ok:
         return _llm_unavailable(req)

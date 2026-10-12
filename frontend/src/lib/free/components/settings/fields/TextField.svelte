@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { t } from '$lib/i18n';
 	import FieldShell from './FieldShell.svelte';
+	import { errorAria } from './fieldA11y';
 
 	interface Props {
 		label: string;
@@ -39,6 +40,7 @@
 			{disabled}
 			{placeholder}
 			oninput={(e) => onchange(e.currentTarget.value)}
+			{...errorAria(fieldId, error)}
 			class="field-input"
 			class:field-error={!!error}
 		/>

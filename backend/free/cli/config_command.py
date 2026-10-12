@@ -22,16 +22,24 @@ import datetime
 import json
 import re
 from pathlib import Path
+from types import UnionType
+from typing import Literal, Union, get_args, get_origin
 
 import httpx
 import yaml
 from pydantic import ValidationError
 from rich.console import Console
 
-from backend.config_normalize import NormalizeReport, needs_normalize, normalize_config
+from backend.config_normalize import (
+    CONFIG_VERSION,
+    NewerConfigVersionError,
+    NormalizeReport,
+    needs_normalize,
+    normalize_config,
+)
 from backend.data_root import DataRootError, resolve_data_root, store_root
 from backend.free.cli.backend_headers import backend_headers
-from backend.free.cli.config_loader import _find_project_root, _setup_encoding
+from backend.free.cli.config_loader import _find_project_root, _load_yaml_section, _setup_encoding
 from backend.free.cli.renderer import create_console, render_error, render_info
 from backend.i18n_helper import init_i18n, msg
 from backend.io.writer_lock import WriterLockHeld, acquire_config_write_lock, acquire_writer_lock
@@ -148,8 +156,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "(default: EVOREF_DATA_ROOT or <install_root>/userdata)",
     )
     parser.add_argument(
-        "--backend-url", default=_DEFAULT_BACKEND,
-        help="Backend URL (default: http://localhost:8000)",
+        "--backend-url", default=None,
+        help="Backend URL (default: http://localhost:<server.port in config.yaml, else 8000>)",
     )
     parser.add_argument("--json", action="store_true", help="Print values as JSON")
     return parser
@@ -231,7 +239,15 @@ def _request(client: httpx.Client, method: str, url: str, **kwargs) -> dict | No
 
 
 def parse_value(raw: str) -> object:
-    """``set`` の値を YAML として読む (``true`` / ``0.3`` / ``[a, b]``)。読めなければ文字列のまま。"""
+    """``set`` の値を YAML として読む (``true`` / ``0.3`` / ``[a, b]``)。読めなければ文字列のまま。
+
+    空文字は空文字のまま (YAML では null)。先頭が 0 の整数 (``010``) は 10 進で読む
+    (YAML 1.1 では 8 進の 8)。
+    """
+    if raw == "":
+        return raw
+    if re.fullmatch(r"[-+]?0[0-9]+", raw):
+        return int(raw, 10)
     try:
         value = yaml.safe_load(raw)
     except yaml.YAMLError:
@@ -244,6 +260,60 @@ def parse_value(raw: str) -> object:
     return value
 
 
+_NULL_LITERALS = frozenset({"null", "Null", "NULL", "~"})
+
+
+def _leaf_annotation(section: str, path: list[str]) -> object | None:
+    """スキーマで ``section.path`` のフィールドの型注釈 (辿れなければ ``None``)。"""
+    from pydantic import BaseModel
+
+    from backend.schemas import EvorefConfig
+
+    model: type[BaseModel] = EvorefConfig
+    keys = [section, *path]
+    for i, key in enumerate(keys):
+        field = model.model_fields.get(key)
+        if field is None:
+            return None
+        if i == len(keys) - 1:
+            return field.annotation
+        nested = [
+            c for c in (field.annotation, *get_args(field.annotation))
+            if isinstance(c, type) and issubclass(c, BaseModel)
+        ]
+        if not nested:
+            return None
+        model = nested[0]
+    return None
+
+
+def _text_field(annotation: object) -> tuple[bool, bool]:
+    """(文字列だけを取るフィールドか, ``None`` も取るか)。``Literal`` の文字列も文字列とみなす。"""
+    args = get_args(annotation) if get_origin(annotation) in (Union, UnionType) else (annotation,)
+    nullable = type(None) in args
+    rest = [a for a in args if a is not type(None)]
+
+    def is_text(a: object) -> bool:
+        return a is str or (get_origin(a) is Literal and all(isinstance(x, str) for x in get_args(a)))
+
+    return bool(rest) and all(is_text(a) for a in rest), nullable
+
+
+def parse_value_for(section: str, path: list[str], raw: str) -> object:
+    """``set`` の値をスキーマのフィールド型に合わせて読む。
+
+    文字列だけを取るフィールドでは YAML として読まない (``instance.name 123`` は ``"123"``、
+    ``off`` は ``False`` にしない)。``str | None`` の ``null`` / ``~`` は ``None``。
+    それ以外は :func:`parse_value`。
+    """
+    annotation = _leaf_annotation(section, path) if path else None
+    if annotation is not None:
+        text, nullable = _text_field(annotation)
+        if text:
+            return None if nullable and raw in _NULL_LITERALS else raw
+    return parse_value(raw)
+
+
 def split_key(dotted: str) -> tuple[str, list[str]]:
     """``section.a.b`` を ``("section", ["a", "b"])`` に分ける。空の成分は ValueError。"""
     parts = dotted.split(".")
@@ -253,9 +323,12 @@ def split_key(dotted: str) -> tuple[str, list[str]]:
 
 
 def dig(data: object, path: list[str]) -> object:
-    """入れ子の dict を辿る。無ければ ``_MISSING``。"""
+    """入れ子の dict を辿る (リストは数字の添字で辿る)。無ければ ``_MISSING``。"""
     node = data
     for key in path:
+        if isinstance(node, list) and key.isdigit() and int(key) < len(node):
+            node = node[int(key)]
+            continue
         if not isinstance(node, dict) or key not in node:
             return _MISSING
         node = node[key]
@@ -285,8 +358,19 @@ def _local_config(root: Path) -> dict:
     return read_config_file(root / "config.yaml", root)
 
 
+def _default_backend_url(root: Path) -> str:
+    """``config.yaml`` の ``server.port`` を見た既定の backend URL (読めなければ 8000)。"""
+    try:
+        port = _load_yaml_section(root, "server").get("port")
+    except (AttributeError, yaml.YAMLError):
+        return _DEFAULT_BACKEND
+    if isinstance(port, int) and not isinstance(port, bool):
+        return f"http://localhost:{port}"
+    return _DEFAULT_BACKEND
+
+
 def _run_value_action(args: argparse.Namespace, root: Path, console: Console) -> int:
-    base = args.backend_url.rstrip("/")
+    base = (args.backend_url or _default_backend_url(root)).rstrip("/")
     try:
         with httpx.Client(headers=backend_headers(), timeout=_TIMEOUT) as client:
             if args.action == "set":
@@ -347,7 +431,7 @@ def _run_set(
     except ValueError:
         render_error(console, msg("cli.config_set_usage"))
         return 1
-    value = parse_value(args.value)
+    value = parse_value_for(section, path, args.value)
     if not path and not isinstance(value, dict):
         render_error(console, msg("cli.config_set_usage"))
         return 1
@@ -355,6 +439,14 @@ def _run_set(
     shown = _format_value(value, as_json=False)
 
     try:
+        overridden = _launch_args_overrides(client, base, root, section, data)
+        if overridden:
+            render_error(console, msg(
+                "cli.config_set_launch_args_override",
+                keys=", ".join(name for name, _launch in overridden),
+                launch=", ".join(dict.fromkeys(launch for _name, launch in overridden)),
+            ))
+            return 1
         checked = _request(
             client, "POST", f"{base}/api/config/{section}/validate", json={"data": data},
         )
@@ -387,6 +479,57 @@ def _run_set(
         else "cli.config_set_applied_live",
     ))
     return 0
+
+
+def _launch_args_overrides(
+    client: httpx.Client, base: str, root: Path, section: str, data: object,
+) -> list[tuple[str, str]]:
+    """書こうとするキーのうち、``launch_args`` が写すために書いても効かないもの。
+
+    ``launch_args`` の ``-c`` / ``-ngl`` / ``-np`` 等は対応するキーを上書きする (c_16 §7.2.4)。
+    稼働中の API はそのキーを黙って落とし、停止中に書いても起動時に launch_args が勝つ。
+    どちらも成功と表示して効かないので、CLI で先に止める。
+
+    Returns:
+        ``(書こうとしたキー, その launch_args のキー)`` の一覧。
+    """
+    from backend.llama_launch_args import LAUNCH_ARGS_SECTIONS, derived_keys
+
+    full = {section: data}
+    wanted: list[tuple[str, tuple[str, ...], dict]] = []
+    for kind, kpath in LAUNCH_ARGS_SECTIONS.items():
+        node = dig(full, list(kpath))
+        if isinstance(node, dict) and set(node) - {"launch_args"}:
+            wanted.append((kind, kpath, node))
+    if not wanted:
+        return []
+
+    current: object = None
+    out: list[tuple[str, str]] = []
+    for kind, kpath, node in wanted:
+        if "launch_args" in node:
+            text = node["launch_args"]
+        else:
+            if current is None:
+                remote = _request(client, "GET", f"{base}/api/config")
+                current = (remote.get("config") or {}) if remote is not None else _raw_config(root)
+            text = dig(current, [*kpath, "launch_args"])
+        if not isinstance(text, str) or not text:
+            continue
+        derived = derived_keys(kind, text)
+        launch = ".".join((*kpath, "launch_args"))
+        out.extend((".".join((*kpath, key)), launch) for key in node if key in derived)
+    return out
+
+
+def _raw_config(root: Path) -> dict:
+    """停止中の ``launch_args`` の読み手: 検証前の ``config.yaml`` (と Pro の上書き)。"""
+    from backend.config import _read_raw_config_file
+
+    try:
+        return _read_raw_config_file(root / "config.yaml", root) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
 
 
 def _set_offline(
@@ -424,6 +567,11 @@ def _set_offline(
         return 1
     try:
         save_config_section(section, data, project_root=root, reload=False)
+    except NewerConfigVersionError as e:
+        render_error(console, msg(
+            "cli.config_newer_version", version=e.version, current=CONFIG_VERSION,
+        ))
+        return 1
     except ValidationError as e:
         errors = "; ".join(str(err["msg"]) for err in e.errors())
         render_error(console, msg("cli.config_set_invalid", name=args.key, errors=errors))

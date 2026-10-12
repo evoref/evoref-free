@@ -770,12 +770,7 @@ def _drop_superseded_fewshot(block: str, keep: Callable[[str], bool]) -> str | N
     kept = [ex for ex in examples if keep(ex)]
     if not kept:
         return None
-    # 落とした後も Example 番号を 1 から振り直す (欠番は手本として不自然)。
-    renumbered = [
-        re.sub(r"^### Example\s+\d+", f"### Example {i}", ex, count=1)
-        for i, ex in enumerate(kept, 1)
-    ]
-    return header + "".join(renumbered)
+    return _renumber_fewshot(header, kept)
 
 
 def _drop_superseded_context(
@@ -1474,22 +1469,33 @@ _FEWSHOT_EXAMPLE_SPLIT_RE = re.compile(r"(?=^### Example \d+$)", re.MULTILINE)
 def _truncate_fewshot_to_budget(block: str, budget: int) -> str | None:
     """few-shot ブロックを例単位で budget token 内に切り詰める。
 
-    ヘッダ (## Few-shot Examples) + 先頭から入る分の例だけを残す。
+    ヘッダ + 予算に入る例だけを残す。長い例 1 つで止めず、後ろの短い例は
+    入れる (選択は関連度順なので、先頭が長いだけで残りを全部捨てない)。
     1 例も入らない場合は None。
     """
     parts = _FEWSHOT_EXAMPLE_SPLIT_RE.split(block)
     if len(parts) <= 1:
         return block if _estimate_tokens(block) <= budget else None
     header, examples = parts[0], parts[1:]
-    kept = header
+    kept: list[str] = []
+    used = _estimate_tokens(header)
     for ex in examples:
-        candidate = kept + ex
-        if _estimate_tokens(candidate) > budget:
-            break
-        kept = candidate
-    if kept.strip() == header.strip():
+        cost = _estimate_tokens(ex)
+        if used + cost > budget:
+            continue
+        kept.append(ex)
+        used += cost
+    if not kept:
         return None
-    return kept.rstrip() + "\n"
+    return _renumber_fewshot(header, kept).rstrip() + "\n"
+
+
+def _renumber_fewshot(header: str, examples: list[str]) -> str:
+    """残った例の Example 番号を 1 から振り直して連結する (欠番は手本として不自然)。"""
+    return header + "".join(
+        re.sub(r"^### Example\s+\d+", f"### Example {i}", ex, count=1)
+        for i, ex in enumerate(examples, 1)
+    )
 
 
 def _select_artifact_block(

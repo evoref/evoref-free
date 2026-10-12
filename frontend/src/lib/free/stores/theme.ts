@@ -1,5 +1,4 @@
-import { writable, derived, get, type Writable } from 'svelte/store';
-import type { Component } from 'svelte';
+import { writable, get } from 'svelte/store';
 import type { ThemeActivateResponse, ThemesListResponse, ThemeListItem } from '$lib/free/api';
 
 export type ColorMode = 'light' | 'dark';
@@ -11,12 +10,6 @@ export type ThemeInfo = ThemeListItem;
 export function isColorMode(v: string): v is ColorMode {
 	return v === 'light' || v === 'dark';
 }
-
-/** スロット名の型 */
-export type SlotName = 'chat_header' | 'message_prefix' | 'input_suffix' | 'sidebar_widget';
-
-/** スロットコンポーネントの状態 */
-export type ThemeSlots = Record<SlotName, Component | null>;
 
 export interface LayoutConfig {
 	sidebar: {
@@ -83,15 +76,6 @@ export const themeId = writable<string>('');
 /** テーマ一覧 */
 export const availableThemes = writable<ThemeInfo[]>([]);
 
-/** サイドバー幅（CSS用） */
-export const sidebarWidth = derived(
-	[layout, sidebarCollapsed],
-	([$layout, $collapsed]) => {
-		if ($layout.sidebar.position === 'hidden' || $collapsed) return 0;
-		return $layout.sidebar.width;
-	}
-);
-
 /** カラーモードの切り替え（現在のテーマを���しいカラーモードで再���用） */
 export async function toggleColorMode(): Promise<void> {
 	const newMode: ColorMode = get(colorMode) === 'dark' ? 'light' : 'dark';
@@ -111,6 +95,64 @@ export function setLayoutCssVariables(config: LayoutConfig): void {
 	root.style.setProperty('--font-size-base', config.global.font_size_base + 'px');
 	root.style.setProperty('--border-radius', config.global.border_radius + 'px');
 	root.style.setProperty('--spacing-unit', config.global.spacing_unit + 'px');
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+	return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** gui-layout.json (一部のキーだけでもよい) を既定値と節ごとに深くマージする */
+export function mergeLayout(partial: unknown): LayoutConfig {
+	const src = isRecord(partial) ? partial : {};
+	const section = <K extends keyof LayoutConfig>(key: K): LayoutConfig[K] => {
+		const value = src[key];
+		return { ...defaultLayout[key], ...(isRecord(value) ? value : {}) } as LayoutConfig[K];
+	};
+	return {
+		...src,
+		sidebar: section('sidebar'),
+		chat: section('chat'),
+		dashboard: section('dashboard'),
+		global: section('global')
+	} as LayoutConfig;
+}
+
+/** CSS のエスケープ (`\69` / `\i` / 行継続) を文字に戻す。判定用 */
+function decodeCssEscapes(text: string): string {
+	return text.replace(/\\(?:([0-9a-fA-F]{1,6})\s?|(\r\n|[\n\r\f])|([\s\S]))/g, (_m, hex, nl, ch) => {
+		if (hex) {
+			const cp = parseInt(hex, 16);
+			return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '�';
+		}
+		return nl ? '' : ch;
+	});
+}
+
+/** 文 / 宣言 1 つ分の CSS が外部を読む参照 (@import・data: 以外の url() / image-set()) を含むか */
+function hasExternalReference(segment: string): boolean {
+	const text = decodeCssEscapes(segment);
+	if (/@import/i.test(text)) return true;
+	for (const m of text.matchAll(/url\(\s*(['"]?)\s*([^'")]*)/gi)) {
+		if (!/^data:/i.test(m[2].trim())) return true;
+	}
+	if (/image-set\(/i.test(text)) {
+		for (const m of text.matchAll(/(['"])([^'"]*)\1/g)) {
+			if (!/^data:/i.test(m[2].trim())) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * テーマの CSS から外部を読む参照を落とす (@import と data: 以外の url() / image-set())。
+ * テーマはすべて同じ扱いで、例外は設けない (docs/c_11 §1)。
+ * `;` `{` `}` で区切った 1 片ずつ判定し、該当する片だけを除く (区切りは残す)。
+ */
+export function sanitizeThemeCss(cssText: string): string {
+	return cssText
+		.split(/([;{}])/)
+		.map((part) => (part === ';' || part === '{' || part === '}' || !hasExternalReference(part) ? part : ''))
+		.join('');
 }
 
 /** レイアウト設定をDOMに反映しストアを更新する */
@@ -142,64 +184,8 @@ export function clearThemeColors(): void {
 	}
 }
 
-// ── スロットコンポーネント管理 ──
-
-const defaultSlots: ThemeSlots = {
-	chat_header: null,
-	message_prefix: null,
-	input_suffix: null,
-	sidebar_widget: null
-};
-
-/** テーマスロットコンポーネント */
-export const themeSlots: Writable<ThemeSlots> = writable({ ...defaultSlots });
-
-/** 全スロットをクリア */
-export function clearSlotComponents(): void {
-	themeSlots.set({ ...defaultSlots });
-}
-
 /**
- * テーマのスロットコンポーネントを動的ロード
- * trusted でない場合は全スロットを null にする
- */
-export async function loadSlotComponents(
-	currentThemeId: string,
-	slotsConfig: Record<string, string | null>,
-	trusted: boolean
-): Promise<void> {
-	if (!trusted) {
-		clearSlotComponents();
-		return;
-	}
-
-	const loaded: ThemeSlots = { ...defaultSlots };
-	const slotNames: SlotName[] = ['chat_header', 'message_prefix', 'input_suffix', 'sidebar_widget'];
-
-	for (const slot of slotNames) {
-		const componentFile = slotsConfig[slot];
-		if (!componentFile) continue;
-
-		// .svelte → .js に変換（プリコンパイル済み規約）
-		const jsFile = componentFile.replace(/\.svelte$/, '.js');
-		try {
-			const module = await import(
-				/* @vite-ignore */ `/api/themes/${currentThemeId}/components/${jsFile}`
-			);
-			if (module.default) {
-				loaded[slot] = module.default;
-			}
-		} catch (e) {
-			console.warn(`Failed to load slot component: ${slot} (${jsFile})`, e);
-		}
-	}
-
-	themeSlots.set(loaded);
-}
-
-/**
- * テーマをアクティベートし、CSS / レイアウト / スロットコンポーネントを一括適用
- * @returns アクティベート結果。信頼確認が必要な場合は呼び出し元で処理する
+ * テーマをアクティベートし、CSS / レイアウトを一括適用
  */
 export async function activateTheme(
 	targetThemeId: string,
@@ -208,25 +194,17 @@ export async function activateTheme(
 	const { activateThemeApi } = await import('$lib/free/api');
 	const result: ThemeActivateResponse = await activateThemeApi(targetThemeId, targetColorMode);
 
-	// CSS 適用
-	applyThemeColors(result.colors);
+	// CSS 適用 (外部へ通信する参照は常に落とす)
+	applyThemeColors(sanitizeThemeCss(result.colors));
 
-	// レイアウト適用（slots キーを除外して LayoutConfig に変換）
+	// レイアウト適用（欠けたキーは既定値で埋める）
 	if (result.gui_layout) {
-		const { slots: _slots, ...layoutFields } = result.gui_layout;
-		applyLayout(layoutFields);
+		applyLayout(mergeLayout(result.gui_layout));
 	}
 
 	// ストア更新
 	themeId.set(result.theme_id);
 	colorMode.set(result.color_mode);
-
-	// スロットコンポーネントロード
-	if (result.slots) {
-		await loadSlotComponents(result.theme_id, result.slots, true);
-	} else {
-		clearSlotComponents();
-	}
 }
 
 /**
@@ -245,15 +223,14 @@ export async function initTheme(): Promise<void> {
 		// active_theme_id は config の `theme.active` をそのまま返すため、該当テーマが
 		// 未インストールでも空にならない (テーマ 0 件でも既定の "fallback" が返る)。
 		// 存在確認をせずに activateTheme を呼ぶと 404 で throw し、catch へ抜けて
-		// 下の「テーマなし」処理ごとスキップされる (= 旧テーマの CSS/スロットが残る)。
+		// 下の「テーマなし」処理ごとスキップされる (= 旧テーマの CSS が残る)。
 		const installed = data.themes.some((t) => t.theme_id === activeId);
 		if (activeId && installed) {
-			// テーマがアクティブな場合は CSS / layout / スロットを適用
+			// テーマがアクティブな場合は CSS / layout を適用
 			await activateTheme(activeId, isColorMode(initialMode) ? initialMode : 'dark');
 		} else {
 			// テーマなし状態: 動的CSS注入を除去し app.css のデフォルトで表示
 			clearThemeColors();
-			clearSlotComponents();
 			themeId.set('');
 		}
 	} catch (e) {

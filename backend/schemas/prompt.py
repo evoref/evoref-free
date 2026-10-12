@@ -23,8 +23,6 @@ class PromptConfig(BaseModel):
     #: モードの context_size に対する静的 system の上限比。レンダラは超える
     #: とき priority の低い非 protected 規則から落とす (f_03 §7.1.2)。
     system_max_share: float = Field(default=0.30, ge=0.05, le=0.6)
-    #: query 依存で最後の user へ前置する few-shot の最大例数。
-    fewshot_dynamic_max: int = Field(default=1, ge=0)
     #: query 依存 few-shot ブロックのトークン上限 (旧 ``_FEWSHOT_TOKEN_CAP``)。
     fewshot_dynamic_max_tokens: int = Field(default=600, ge=0)
     #: ``[関連する記憶]`` ブロックの上限 (MemoryInjector の tier 予算と揃える)。

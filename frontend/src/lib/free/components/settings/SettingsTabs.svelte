@@ -40,10 +40,14 @@
 	);
 </script>
 
-<nav class="tabs-nav">
+<div class="tabs-nav" role="tablist" aria-orientation="vertical">
 	{#each visibleTabs as tabId}
 		<button
 			type="button"
+			role="tab"
+			id="settings-tab-{tabId}"
+			aria-selected={$activeTab === tabId}
+			aria-controls="settings-tabpanel"
 			class="tab-btn"
 			class:tab-active={$activeTab === tabId}
 			onclick={() => activeTab.set(tabId)}
@@ -55,11 +59,11 @@
 				{/if}
 			</span>
 			{#if tabId === 'prompts' ? $promptDirty : $dirtyTabs[tabId]}
-				<span class="tab-dirty" aria-label="unsaved"></span>
+				<span class="tab-dirty" role="img" aria-label={$t('settings.unsaved_changes')}></span>
 			{/if}
 		</button>
 	{/each}
-</nav>
+</div>
 
 <style>
 	.tabs-nav {

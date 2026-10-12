@@ -66,7 +66,7 @@ def teaches_via_verified_correction(signals: Mapping[str, Any]) -> bool:
     :func:`teaches_success` の例外 (docs/f_04 §2.5)。手本の中身はユーザーの **検証済み**
     の訂正 (``user_correction``、不変則 #12) であって元の回答ではないので、訂正ターンが
     ラベル無しや ``partial`` でもよい。訂正ターン自身が ``failed`` (別の欠陥を持ち込んだ)
-    なら使わない。eval_core の期待値にするかは別 (ラベル無しは ``grounding_suspect``)。
+    なら使わない。
     """
     return bool(signals.get("user_correction")) and signals.get("turn_outcome") != "failed"
 

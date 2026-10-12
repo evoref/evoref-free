@@ -1419,51 +1419,8 @@ def _init_learning_scheduler(
     )
 
     # 7f-2. PolicyParamEvolver + ExplorationController
-    # learning.policy.evolve_writeback=semmem の場合は
-    # SemMem ストアを注入し、進化結果を policy ファクトとして書き戻す。
-    # 旧 ``harness:`` セクションから ``learning.policy.*`` へ移行済
     from backend.free.learning.exploration_controller import ExplorationController
     from backend.free.learning.policy_evolver import PolicyParamEvolver
-
-    learning_policy_cfg = ((cfg or {}).get("learning") or {}).get("policy") or {}
-    evolve_writeback = learning_policy_cfg.get("evolve_writeback", "yaml")
-    learn_view: Any | None = None
-    semmem_writeback_scope: str = "global"
-    if evolve_writeback == "semmem":
-        try:
-            from backend.free.memory.views.learn import LearnFactView
-
-            global_store = state.get_semantic_store("global")
-            stores: list[Any] = [global_store]
-            writeback_store: Any = global_store
-            semmem_writeback_scope = "global"
-            try:
-                from pathlib import Path as _Path
-
-                from backend.free.memory.project_resolver import resolve_project_id
-                project_id = resolve_project_id(_Path.cwd()).project_id
-            except Exception as exc:
-                logger.warning(
-                    "policy_evolver semmem wiring: project_id resolution failed: %s",
-                    exc,
-                )
-                project_id = None
-            if project_id:
-                project_store = state.get_semantic_store(f"project:{project_id}")
-                stores.append(project_store)
-                writeback_store = project_store
-                semmem_writeback_scope = f"project:{project_id}"
-            learn_view = LearnFactView(
-                stores=stores, writeback_store=writeback_store,
-            )
-        except Exception as exc:
-            logger.warning(
-                "policy_evolver semmem wiring failed: %s "
-                "(falling back to evolve_writeback=yaml)", exc,
-            )
-            learn_view = None
-            semmem_writeback_scope = "global"
-            evolve_writeback = "yaml"
 
     exploration_controller = ExplorationController(debug_logger=debug_logger)
     exploration_controller.load(prompt_mgr.prompt_dir / "exploration_state.json")
@@ -1471,26 +1428,10 @@ def _init_learning_scheduler(
         policy=policy_interpreter,
         exploration=exploration_controller,
         debug_logger=debug_logger,
-        learn_view=learn_view,
-        semmem_writeback_scope=semmem_writeback_scope,
-        evolve_writeback=evolve_writeback,
-        # #8: proven delta 昇格の目標 confidence (PolicyInterpreter の適用閾値と一致)。
-        activation_min_confidence=float(
-            learning_policy_cfg.get("activation_min_confidence", 0.7),
-        ),
-        # base 学習パーティションの active モデル: policy 書き戻し subject へ
-        # ``learn.policy.<model>.*`` としてモデル次元を埋め込む (partition 無効時は空)。
-        base_model_id=state.active_base_model_slug,
     )
-    # 旧 JSON ステートが残っていれば読み込みのみ行う (semmem モードでも
-    # fitness 履歴の継続性を保つため)。書き出しは scheduler 側で
-    # is_semmem_writeback_active() を見て分岐する。
     policy_evolver.load(prompt_mgr.prompt_dir / "policy_evolver_state.json")
     learning_scheduler.set_policy_param_evolver(policy_evolver)
-    logger.info(
-        "PolicyParamEvolver initialized (evolve_writeback=%s, scope=%s, view=%s)",
-        evolve_writeback, semmem_writeback_scope, learn_view is not None,
-    )
+    logger.info("PolicyParamEvolver initialized")
 
     # 7f-3. CritiqueSynthesizer
     # 批評はアイドル窓 (Level 1) の処理なのでベースモデルで回す。
@@ -1509,12 +1450,7 @@ def _init_learning_scheduler(
         type(critique_client).__name__ if critique_client else "none",
     )
 
-    # 7f-4. FewShotPool
-    # learning.policy.evolve_writeback=semmem
-    # の場合は SemMem ストアを注入し、新規 example を ``learn.fewshot.<mode>.<id>`` の
-    # fewshot ファクトとして書き戻す。bootstrap 時に SemMem 上の active
-    # ファクトから in-memory プールを再構築する。
-    # 旧 ``harness:`` セクションから ``learning.policy.*`` へ移行済
+    # 7f-4. FewShotPool (永続化は ``fewshot_pool.json``)
     from backend.free.learning.fewshot_pool import FewShotPool
 
     learning_cfg = cfg.get("learning", {})
@@ -1527,19 +1463,8 @@ def _init_learning_scheduler(
         debug_logger=debug_logger,
         stale_after_days=learning_cfg.get("fewshot_stale_after_days", 30),
         harmful_min_uses=learning_cfg.get("fewshot_harmful_min_uses", 10),
-        learn_view=learn_view,
-        semmem_writeback_scope=semmem_writeback_scope,
-        evolve_writeback=evolve_writeback,
-        # active モデル: fewshot 書き戻し / bootstrap を ``learn.fewshot.<model>.*``
-        # にスコープする (partition 無効時は空でレガシー全件)。
-        base_model_id=state.active_base_model_slug,
     )
-    if fewshot_pool.is_semmem_writeback_active():
-        # SemMem を source of truth として in-memory プールを再構築。
-        # 旧 JSON ステートが残っていても上書きされる。
-        fewshot_pool.bootstrap_from_semmem()
-    else:
-        fewshot_pool.load(prompt_mgr.prompt_dir / "fewshot_pool.json")
+    fewshot_pool.load(prompt_mgr.prompt_dir / "fewshot_pool.json")
     learning_scheduler.set_fewshot_pool(fewshot_pool)
     # 推論時 query 依存 few-shot 選択器を prompt_manager に注入 (Loop→Learn は
     # FewShotSelector Protocol + duck-typing で境界を保つ)。読み込み系のため
@@ -1547,12 +1472,7 @@ def _init_learning_scheduler(
     prompt_mgr.set_fewshot_selector(
         fewshot_pool, k=learning_cfg.get("fewshot_max_examples", 3),
     )
-    logger.info(
-        "FewShotPool initialized (evolve_writeback=%s, scope=%s, total=%d)",
-        fewshot_pool.evolve_writeback,
-        semmem_writeback_scope,
-        fewshot_pool.total_count,
-    )
+    logger.info("FewShotPool initialized (total=%d)", fewshot_pool.total_count)
     # 手本の埋め込みを背景で張る。埋め込みが載るまでは従来の文字 bi-gram で
     # 選ぶので、起動を待たせる必要はない (tool_gate_warmup と同じ扱い)。
     # 永続化しない設計なので、毎起動ここで張り直す (pool_size 件だけ)。
@@ -1567,27 +1487,6 @@ def _init_learning_scheduler(
             logger.info("Fewshot embedding warmup deferred: no running event loop")
 
     _wire_context_bound_gate(state, learning_scheduler, debug_logger)
-
-    # 7f-5. FeedbackPipe — 品質ゲート結果 → 学習サイクル 還流
-    from backend.free.learning.feedback_pipe import FeedbackPipe
-
-    feedback_cfg = (learning_cfg or {}).get("feedback_pipe", {}) or {}
-    feedback_pipe = FeedbackPipe(
-        feedback_cfg,
-        learn_view=learn_view,
-        writeback_scope=semmem_writeback_scope,
-        fewshot_pool=fewshot_pool,
-        critique_synthesizer=critique_synthesizer,
-        debug_logger=debug_logger,
-    )
-    # critique policy の subject を PolicyInterpreter が読む ``learn.policy.<model>.`` 前置に揃える
-    feedback_pipe.set_base_model_id(getattr(state, "active_base_model_slug", "") or "")
-    learning_scheduler.set_feedback_pipe(feedback_pipe)
-    logger.info(
-        "FeedbackPipe initialized (enabled=%s, weight=%.2f)",
-        feedback_pipe.enabled,
-        feedback_pipe.weight_semmem_success,
-    )
 
     state.learning_scheduler = learning_scheduler
     return learning_scheduler
@@ -2894,8 +2793,7 @@ async def _init_evolve_pipeline(
     1. LogIngestor: ``debug_log_dir`` = ``<data_root>/logs/debug/``、``state_path``
        = ``<data_root>/g1/store/state/log_ingestor.json``
     2. LearnFactView: ``global`` + ``project:<id>`` (解決可能なら) を読み、
-       writeback は ``project:<id>`` (なければ ``global``) — PolicyParamEvolver
-       の semmem 経路と同じ scope 戦略
+       writeback は ``project:<id>`` (なければ ``global``)
     3. PolicyAdjuster: 上記 view を注入
     4. bridge bg task: ``_bridge_log_ingestor_to_policy_adjuster`` を
        ``asyncio.create_task`` で起動
@@ -2920,7 +2818,7 @@ async def _init_evolve_pipeline(
     debug_log_dir = _paths.resolve_local("logs_dir") / "debug"
     state_path = _paths.resolve_local("log_ingestor_file")
 
-    # LearnFactView: PolicyParamEvolver と同じ scope 戦略 (global + project)
+    # LearnFactView: global + project の scope 戦略
     global_store = state.get_semantic_store("global")
     stores: list[Any] = [global_store]
     writeback_store: Any = global_store

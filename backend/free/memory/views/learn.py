@@ -226,25 +226,6 @@ class LearnFactView(FactViewBase):
             )
         self._writeback_store.supersede(old_id, new_id)
 
-    def promote_policy_confidence(
-        self, *, fact_id: str, confidence: float,
-    ) -> SemanticFact | None:
-        """active policy fact の confidence を単調増加で昇格する (in-place)。
-
-        自動進化 policy ファクトは初期 confidence (0.5) で書かれ、PolicyInterpreter の
-        ``activation_min_confidence`` (0.7) 未満のため適用されない。一定サイクル生存した
-        proven な delta をこのメソッドで昇格し、活性化させる。新規 fact を作らず in-place
-        更新するため supersede チェーンを膨らませない。confidence が現在値以下 / type が
-        policy でない / superseded 済 の場合は no-op。
-        """
-        self._assert_write("policy")
-        f = self._writeback_store.get_fact(fact_id)
-        if f is None or f.type != "policy" or f.superseded_by:
-            return f
-        if confidence <= f.confidence:
-            return f  # 単調増加のみ
-        return self._writeback_store.update_fact(fact_id, confidence=float(confidence))
-
     # ──────────────────────────────────────────────────────────────────
     # 書込系 — fewshot
     # ──────────────────────────────────────────────────────────────────
@@ -449,33 +430,6 @@ class LearnFactView(FactViewBase):
                 continue
         return total
 
-    def search_fewshot_by_prefix(
-        self,
-        prefix: str,
-    ) -> list[SemanticFact]:
-        """``prefix`` で始まる subject を持つ fewshot (または旧 policy) を全ストアから収集する。
-
-        ``learn.fewshot.*`` prefix に移行済。``type="fewshot"``
-        と legacy の ``type="policy"`` を両方受容する
-        """
-        self._assert_read("fewshot")
-        self._assert_read("policy")
-        seen: set[str] = set()
-        out: list[SemanticFact] = []
-        for store in self._stores:
-            try:
-                facts = store.search_by_pillar_prefix(prefix)
-            except (ValueError, AttributeError):
-                continue
-            for fact in facts:
-                if fact.id in seen or fact.superseded_by:
-                    continue
-                if fact.type not in ("fewshot", "policy"):
-                    continue
-                out.append(fact)
-                seen.add(fact.id)
-        return out
-
     def find_active_policy_by_subject(
         self,
         subject: str,
@@ -498,30 +452,6 @@ class LearnFactView(FactViewBase):
                 latest = fact
         return latest
 
-    def add_policy_fact(self, fact: SemanticFact) -> SemanticFact:
-        """既製の policy ``SemanticFact`` を writeback_store に書き込む。
-
-        ``make_fact`` で組み立てた legacy ファクトを投入する経路。ownership
-        と subject namespace は呼出側で :meth:`write_policy` 等を使うか、
-        呼出前に整合性が保証されていること。本メソッドでは owner 違反のみ
-        ガードする。
-
-        Raises:
-            WriteOwnershipError: ``fact.type`` が Learn pillar 所有でない。
-            ValueError: 既存 ID と衝突 (ストア側 raise)。
-        """
-        self._assert_write(fact.type)  # type: ignore[arg-type]
-        return self._writeback_store.add_fact(fact)
-
-    def add_fewshot_fact(self, fact: SemanticFact) -> SemanticFact:
-        """既製の fewshot ``SemanticFact`` を writeback_store に書き込む。
-
-        Raises:
-            WriteOwnershipError: ``fact.type`` が Learn pillar 所有でない。
-        """
-        self._assert_write(fact.type)  # type: ignore[arg-type]
-        return self._writeback_store.add_fact(fact)
-
     def supersede_policy(self, *, old_id: str, new_id: str) -> None:
         """policy ファクトの supersedes チェーンを構築する (存在は呼出側保証)。
 
@@ -541,7 +471,7 @@ class LearnFactView(FactViewBase):
         """**テスト / 低レベル検査用** の writeback_store 参照。
 
         本番コードは書込系メソッド (:meth:`write_policy` /
-        :meth:`write_fewshot` / :meth:`add_policy_fact` 等) 経由で使うこと。
+        :meth:`write_fewshot` 等) 経由で使うこと。
         """
         return self._writeback_store
 

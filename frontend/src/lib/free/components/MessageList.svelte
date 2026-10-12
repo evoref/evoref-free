@@ -2,7 +2,6 @@
 	import { t } from '$lib/i18n';
 	import MessageBubble from './MessageBubble.svelte';
 	import { messages, isStreaming, currentMode } from '$lib/free/stores/chat';
-	import { themeSlots } from '$lib/free/stores/theme';
 
 	let { instanceName = 'evoref' }: { instanceName?: string } = $props();
 	let container: HTMLDivElement | undefined = $state();
@@ -28,11 +27,6 @@
 	bind:this={container}
 >
 	{#each $messages as message, index (message.id)}
-		<!-- message_prefix スロット -->
-		{#if $themeSlots.message_prefix}
-			{@const MessagePrefix = $themeSlots.message_prefix}
-			<MessagePrefix {message} />
-		{/if}
 		<MessageBubble {message} {instanceName} streaming={$isStreaming && message === $messages[$messages.length - 1]} mode={$currentMode} prevUserQuery={index > 0 && $messages[index - 1].role === 'user' ? $messages[index - 1].content : ''} />
 	{/each}
 </div>

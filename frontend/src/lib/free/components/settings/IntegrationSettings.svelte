@@ -11,12 +11,20 @@
 
 	let tools = $derived(configSection($configData, 'tools'));
 	let widgetProxy = $derived(configSection($configData, 'widget_proxy'));
+	let fetchUrlEnabled = $derived(Boolean(tools.fetch_url_enabled ?? true));
 </script>
 
 <SettingsSection tabId="integration">
 	<!-- Free: Tools -->
 	<FieldGroup label="settings.group_tools">
-		<ToggleField label="settings.tools.fetch_url_enabled" value={Boolean(tools.fetch_url_enabled ?? true)} onchange={fieldUpdater('tools', 'fetch_url_enabled')} />
+		<!-- 能力キー: API からはオフにする変更だけ許される (オンへの変更は 403)。オフからは config.yaml で戻す -->
+		<ToggleField
+			label="settings.tools.fetch_url_enabled"
+			value={fetchUrlEnabled}
+			disabled={!fetchUrlEnabled}
+			description={fetchUrlEnabled ? '' : 'settings.tools.fetch_url_reenable_note'}
+			onchange={fieldUpdater('tools', 'fetch_url_enabled')}
+		/>
 		<NumberField label="settings.tools.fetch_url_timeout" value={Number(tools.fetch_url_timeout ?? 10)} min={1} onchange={fieldUpdater('tools', 'fetch_url_timeout')} />
 	</FieldGroup>
 

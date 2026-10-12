@@ -2,7 +2,7 @@
 	/**
 	 * モーダルダイアログの共通シェル
 	 *
-	 * CartridgeDetailDialog / CartridgeCreateDialog (pro) / ThemeTrustDialog で
+	 * CartridgeDetailDialog / CartridgeCreateDialog (pro) で
 	 * 重複していた以下のロジックを集約する:
 	 *
 	 * - overlay (`<div class="overlay" role="dialog" aria-modal="true">`) と

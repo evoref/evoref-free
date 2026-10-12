@@ -53,6 +53,8 @@ from backend.embed_priority import P3_BULK, with_embed_priority
 from backend.free.rag.corpus.chunking import CHUNKER_VERSION, chunk_documents
 from backend.free.rag.corpus.office_inspect import inspect_office_file
 from backend.free.rag.corpus.package import (
+    DEFAULT_MAX_PACKAGE_BYTES,
+    DEFAULT_MAX_UNPACKED_BYTES,
     DOCS_DIR,
     LANGUAGE_DIR,
     LANGUAGE_VERIFY_FEATURE,
@@ -73,6 +75,7 @@ from backend.free.rag.corpus.package import (
     iter_prebuilt_chunks,
     read_package,
     read_package_meta,
+    top_level_violations,
     validate_requires,
     write_package_meta,
     write_prebuilt_build,
@@ -115,6 +118,7 @@ from backend.io.format_registry import FormatSpec, register_format
 from backend.io.versioned import VersionedJsonFile
 from backend.free.rag.evidence.config import merge_rag_evidence_config
 from backend.free.rag.evidence.ranking import RankColumns, score_rows
+from backend.free.rag.evidence.snapshot import list_versions
 from backend.free.rag.evidence.snapshot_build import ConstantShardKey
 from backend.free.rag.embedding_backend import embedding_store_id
 from backend.free.rag.evidence.store import EvidenceStore, UsageBuffer
@@ -159,11 +163,6 @@ DEFAULT_CARTRIDGE_GATE_THRESHOLD = 0.3
 
 #: 保持するパッケージ版数 (c_16 §5.4)。
 DEFAULT_VERSIONS_KEEP = 2
-
-#: ``rag.packages.max_package_bytes`` / ``max_unpacked_bytes`` が未指定のときの既定
-#: (c_16 §4.3 の install 入口検査)。
-DEFAULT_MAX_PACKAGE_BYTES = 268_435_456
-DEFAULT_MAX_UNPACKED_BYTES = 1_073_741_824
 
 #: 版 GC の改名先の接頭辞 (c_16 §5.4)。``installed_versions`` はこれを版として数えない。
 TRASH_PREFIX = ".trash-"
@@ -739,14 +738,6 @@ class CorpusStore:
         except (TypeError, ValueError):
             return DEFAULT_CORPUS_STORE_PRIOR
 
-    def set_store_prior_override(self, package_id: str, prior: float | None) -> None:
-        """PC 固有の ``store_prior`` 上書き (``None`` で解除)。"""
-        if prior is None:
-            self.manifest.store_prior_overrides.pop(package_id, None)
-        else:
-            self.manifest.store_prior_overrides[package_id] = float(prior)
-        self.manifest.save()
-
     # ── install の入口検査 (c_16 §4.3) ──
 
     @property
@@ -1320,7 +1311,9 @@ class CorpusStore:
 
         同じ (id, 版) が既に active なら版ディレクトリには触らない — 版は不変
         なので、中身が同じなら no-op、違えば :class:`CorpusVersionConflictError`
-        (:meth:`_reinstall_active_version`)。
+        (:meth:`_reinstall_active_version`)。active でない同じ版のディレクトリが
+        あるときは、完成済みで中身が違えば同じく拒否し、中身が同じ (旧版への巻き
+        戻し) か未完成 (落ちた install の残骸) なら消して入れ直す。
 
         ``internal=True`` はこのプロセスが自分で作ったパッケージ (手動取り込み・
         テンプレート登録) だけが渡す。外から持ち込んだパッケージ (既定) は、予約された
@@ -1343,14 +1336,51 @@ class CorpusStore:
         directory = self.package_dir(meta.id, meta.version)
         if directory.exists():
             # active でない同じ版 (途中で落ちた install の残骸 / 旧版への巻き戻し)。
+            # 版は不変なので、完成済みの版を別の中身で置き換えることはしない。
+            installed = _completed_version_meta(directory)
+            if installed is not None and self._incoming_digests(source, meta) != (
+                installed.content_digest, installed.section_digests,
+            ):
+                logger.warning(
+                    "Refused to install corpus package %s v%s: a completed copy of "
+                    "this version with different content is on disk",
+                    meta.id, meta.version,
+                )
+                raise CorpusVersionConflictError(meta.id, meta.version)
             # active は最後まで別の版を指しているので、消しても検索は生きている。
             shutil.rmtree(str(directory), ignore_errors=True)
+        first = meta
         contents = read_package(
             source, directory,
             max_package_bytes=self._max_package_bytes,
             max_unpacked_bytes=self._max_unpacked_bytes,
         )
         meta = contents.meta
+        # zip は 2 回読むので、間に差し替えられていれば 1 回目の判定 (予約 id・active
+        # との比較・展開先) が効かない。
+        if (meta.id, meta.version, meta.kind) != (first.id, first.version, first.kind):
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise PackageError(
+                f"package '{first.id}' v{first.version} changed while installing "
+                f"(now '{meta.id}' v{meta.version}, kind {meta.kind!r})",
+            )
+        if not internal:
+            try:
+                _reject_reserved_identity(meta)
+            except PackageError:
+                shutil.rmtree(str(directory), ignore_errors=True)
+                raise
+        # 上の rmtree は掴まれたファイルがあると黙って残す。派生物が 1 つでも残って
+        # いれば索引として読まれてしまうので、組む前に確かめる。
+        leftovers = top_level_violations(
+            (child.name, child.is_dir()) for child in directory.iterdir()
+        )
+        if leftovers:
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise PackageError(
+                f"package '{meta.id}' v{meta.version}: the version directory has "
+                f"disallowed top-level entries: {', '.join(leftovers)}",
+            )
         await _emit(
             progress_cb,
             {"phase": "extract", "status": "done", "detail": meta.id},
@@ -1430,10 +1460,15 @@ class CorpusStore:
                 "Ignoring prebuilt embeddings of external package %s (signature: %s)",
                 meta.id, "no verifier" if signature is None else signature.status,
             )
-        result = await self._build_version(
-            directory, meta, contents.prebuilt if adopt_prebuilt else None,
-            progress_cb=progress_cb, cancel_check=cancel_check,
-        )
+        try:
+            result = await self._build_version(
+                directory, meta, contents.prebuilt if adopt_prebuilt else None,
+                progress_cb=progress_cb, cancel_check=cancel_check,
+            )
+        except BaseException:
+            # active は別の版を指したままなので、作りかけの版は消してよい。
+            shutil.rmtree(str(directory), ignore_errors=True)
+            raise
         result.signature = signature
 
         previous = self.manifest.active.get(meta.id)
@@ -1445,8 +1480,13 @@ class CorpusStore:
         package = result.package
         package.loaded = True
         self._evict_before_insert(meta.id)
+        replaced = self._packages.get(meta.id)
         self._packages[meta.id] = package
         self._packages.move_to_end(meta.id)
+        if replaced is not None:
+            # 差し替えた後に手放す (検索は辞書から引き直すので新しい版を見る)。
+            # 閉じないと旧版の memmap が残り、版の GC が Windows で黙って失敗する。
+            _release_package(replaced)
         self._warn_if_large(package)
         self._push_language_overlay()
 
@@ -1465,20 +1505,7 @@ class CorpusStore:
         他セクションのダイジェストを取り、active 版と同じなら何もしない。
         違えば (active 版を開けていない場合も) 拒否する。
         """
-        incoming = self.packages_dir / meta.id / f"{INCOMING_PREFIX}{meta.version}"
-        shutil.rmtree(str(incoming), ignore_errors=True)
-        try:
-            read_package(
-                source, incoming,
-                max_package_bytes=self._max_package_bytes,
-                max_unpacked_bytes=self._max_unpacked_bytes,
-            )
-            digests = (
-                compute_content_digest(incoming / DOCS_DIR),
-                compute_section_digests(incoming),
-            )
-        finally:
-            shutil.rmtree(str(incoming), ignore_errors=True)
+        digests = self._incoming_digests(source, meta)
         package = self._packages.get(meta.id)
         if package is None or digests != (
             package.meta.content_digest, package.meta.section_digests,
@@ -1493,6 +1520,28 @@ class CorpusStore:
             "nothing to do", meta.id, meta.version,
         )
         return InstallResult(package=package, already_installed=True)
+
+    def _incoming_digests(
+        self, source: Path, meta: PackageMeta,
+    ) -> tuple[str, dict[str, str]]:
+        """入れようとしている zip の ``(content_digest, section_digests)`` を取る。
+
+        版ディレクトリの外 (``.trash-incoming-<版>``) へ展開して計算し、展開物は消す。
+        """
+        incoming = self.packages_dir / meta.id / f"{INCOMING_PREFIX}{meta.version}"
+        shutil.rmtree(str(incoming), ignore_errors=True)
+        try:
+            read_package(
+                source, incoming,
+                max_package_bytes=self._max_package_bytes,
+                max_unpacked_bytes=self._max_unpacked_bytes,
+            )
+            return (
+                compute_content_digest(incoming / DOCS_DIR),
+                compute_section_digests(incoming),
+            )
+        finally:
+            shutil.rmtree(str(incoming), ignore_errors=True)
 
     @staticmethod
     def _inspect_templates(directory: Path) -> str | None:
@@ -1586,31 +1635,36 @@ class CorpusStore:
             )
 
         store = self._make_store(directory, meta.id)
-        store.load()
-        # 版ディレクトリの manifest に「どの chunker 版で作ったか」を刻む
-        # (c_16 §5.1)。刻んでおかないと、規則を変えたあとに再構築が要る版を
-        # 見分けられない。
-        store.manifest.chunker_version = CHUNKER_VERSION
-        store.put_many(records, by="corpus_install")
-        await _emit(
-            progress_cb,
-            {
-                "phase": "chunk_embed", "status": "done",
-                "current": len(records), "total": len(records),
-            },
-        )
+        try:
+            store.load()
+            # 版ディレクトリの manifest に「どの chunker 版で作ったか」を刻む
+            # (c_16 §5.1)。刻んでおかないと、規則を変えたあとに再構築が要る版を
+            # 見分けられない。
+            store.manifest.chunker_version = CHUNKER_VERSION
+            store.put_many(records, by="corpus_install")
+            await _emit(
+                progress_cb,
+                {
+                    "phase": "chunk_embed", "status": "done",
+                    "current": len(records), "total": len(records),
+                },
+            )
 
-        _check_cancel(cancel_check)
-        await _emit(progress_cb, {"phase": "index", "status": "running"})
-        await store.create_snapshot()
-        # corpus は事象ログを持たない (c_16 §2.1) — 版が履歴そのもので内容は
-        # 不変なので、畳み込んだ後の events/ は本文の二重持ちにしかならない。
-        # manifest の folded_through は残るが、読み手は「その位置以降の事象は
-        # 無い」と見るだけなので整合する。
-        shutil.rmtree(str(directory / "events"), ignore_errors=True)
-        await _emit(progress_cb, {"phase": "index", "status": "done"})
+            _check_cancel(cancel_check)
+            await _emit(progress_cb, {"phase": "index", "status": "running"})
+            await store.create_snapshot()
+            # corpus は事象ログを持たない (c_16 §2.1) — 版が履歴そのもので内容は
+            # 不変なので、畳み込んだ後の events/ は本文の二重持ちにしかならない。
+            # manifest の folded_through は残るが、読み手は「その位置以降の事象は
+            # 無い」と見るだけなので整合する。
+            shutil.rmtree(str(directory / "events"), ignore_errors=True)
+            await _emit(progress_cb, {"phase": "index", "status": "done"})
 
-        centroid = _save_centroid(directory, store)
+            centroid = _save_centroid(directory, store)
+        except BaseException:
+            # 呼出側が版ディレクトリを消せるよう memmap を手放す (Windows)。
+            _release_store(store)
+            raise
         package = CorpusPackage(
             meta=meta,
             directory=directory,
@@ -1637,8 +1691,8 @@ class CorpusStore:
 
         採用条件は **chunker 版と埋め込みモデルの両方一致** (c_16 §4.3)。
         どちらか違えば ``docs/`` から作り直す — チャンクの id は
-        ``(content_digest, chunker_version, doc_id, position)`` の決定論
-        ハッシュなので、作り直しても同じ id に落ち着く。
+        ``chunking.chunk_evidence_id`` (chunker 版・doc_id・本文の sha256・
+        出現番号) の決定論ハッシュなので、作り直しても同じ id に落ち着く。
 
         埋め込みは ``embeddings/<model_id>/`` へ複写しておくだけでよい。
         :meth:`EvidenceStore.embed_and_index_snapshot` が ``text_hash`` の
@@ -2756,6 +2810,23 @@ def _installed_at(directory: Path) -> str:
     except OSError:
         return ""
     return format_utc(datetime.fromtimestamp(stamp, tz=UTC))
+
+
+def _completed_version_meta(directory: Path) -> PackageMeta | None:
+    """完成済みの版ディレクトリなら ``package.json`` の meta、残骸なら ``None`` (c_16 §4.3)。
+
+    完成済み = ``package.json`` が読めて、``COMPLETE`` の付いた snapshot がある。
+    install は検証済みの digest で ``package.json`` を書き直してから snapshot を
+    確定させるので、両方揃っていれば digest は版の中身そのもの。展開途中や
+    索引を組む前に落ちた残骸はどちらかが欠ける。``docs/`` を持たない版は
+    snapshot を作らないので、ここでは常に残骸扱いになる。
+    """
+    if not list_versions(directory):
+        return None
+    try:
+        return read_package_meta(directory)
+    except PackageError:
+        return None
 
 
 def _release_store(store: EvidenceStore) -> None:

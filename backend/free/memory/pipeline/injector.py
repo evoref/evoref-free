@@ -503,12 +503,17 @@ def past_answer_lead(observed_at: str, question: str, *, other_session: bool = F
 
 
 def _corroboration_count(fact: SemanticFact) -> int:
-    """独立出所数 (裏取り件数) を provenance から数える (c_16 §3.1)。
+    """独立出所数 (裏取り件数) を数える (c_16 §3.1)。
 
-    保存しない値なので毎回数える。``source_id`` があればそれを、無ければ
-    ``session_id`` を出所とみなす。どちらも無いエントリは数えない
-    (出所が特定できない = 裏取りにならない)。
+    ``know.*`` の claim は取得単位 (``item:``) を取得元へ畳んだ件数を
+    ``attrs.independent_sources`` に持つので、それを優先する (同じフィードの
+    別 entry を別の裏取りに数えない)。無ければ provenance から数える —
+    ``source_id`` があればそれを、無ければ ``session_id`` を出所とみなし、
+    どちらも無いエントリは数えない (出所が特定できない = 裏取りにならない)。
     """
+    stored = (fact._extra or {}).get("independent_sources")
+    if isinstance(stored, int) and not isinstance(stored, bool):
+        return stored
     sources: set[str] = set()
     for prov in fact.provenances or ():
         key = prov.source_id or prov.session_id

@@ -74,13 +74,26 @@ def emit_turn_audit(build: Callable[[], TurnAuditEvent]) -> bool:
     """登録された sink があれば ``build()`` のイベントを渡す。渡したら ``True``。
 
     sink が無ければ ``build`` を呼ばずに ``False``。``build`` / sink の例外は
-    握り潰して ``False`` (チャットを止めない)。
+    握り潰して ``False`` (チャットを止めない)。``build`` が失敗したときは、sink が
+    ``on_turn_failed(exc)`` を持っていればそれを呼ぶ (Protocol には含めない任意の口)。
     """
     sink = get_pro_handler(TURN_AUDIT_HANDLER)
     if sink is None:
         return False
     try:
-        sink.on_turn(build())
+        event = build()
+    except Exception as exc:  # noqa: BLE001 — 監査の失敗で応答の記録を壊さない
+        logger.warning("Turn audit event could not be built: %s", exc, exc_info=True)
+        # 組めなかった回答も痕跡を残せるよう、受け口が望めば知らせる (任意のメソッド)。
+        on_failed = getattr(sink, "on_turn_failed", None)
+        if callable(on_failed):
+            try:
+                on_failed(exc)
+            except Exception as hook_exc:  # noqa: BLE001
+                logger.warning("Turn audit sink failed to record a build failure: %s", hook_exc)
+        return False
+    try:
+        sink.on_turn(event)
     except Exception as exc:  # noqa: BLE001 — 監査の失敗で応答の記録を壊さない
         logger.warning("Turn audit sink failed: %s", exc, exc_info=True)
         return False

@@ -13,21 +13,18 @@ ACE (arXiv:2510.04618) のデルタ更新パターンを参考に、
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from backend.constants import FLOAT_EPS
-from backend.free.core.session_mode import normalize_session_mode
 from backend.free.learning.fitness import DEFECT_WEIGHTS, defect_rate_fitness
 from backend.io.codec import codec_for, persisted
 from backend.io.format_registry import FormatSpec, register_format
 from backend.io.versioned import JsonPayload, VersionedJsonFile
-from backend.free.memory.types import make_fact
 from backend.log_config import get_logger
 from backend.utils import parse_utc
 
@@ -35,8 +32,6 @@ if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
     from backend.free.core.policy_interpreter import PolicyInterpreter
     from backend.free.learning.exploration_controller import ExplorationController
-    from backend.free.memory.types import SemanticFact
-    from backend.free.memory.views.learn import LearnFactView
 
 logger = get_logger("learning.policy_evolver")
 
@@ -272,27 +267,6 @@ MONOTONE_PARAMS: dict[str, frozenset[str]] = {
 #: :data:`EVOLVABLE_DOMAINS` から外した** (2026-09-07)。
 FULLY_FROZEN_DOMAINS: frozenset[str] = frozenset({"agent"})
 
-# SemMem 書き戻し時の subject prefix と初期値。owner pillar は EvorefLearn。
-LEARN_POLICY_SUBJECT_PREFIX: str = "learn.policy."
-"""SemMem 上のポリシーファクト subject prefix。
-``learn.policy.<mode>.<domain>.<param_path>`` の形式で書き出す。"""
-
-DEFAULT_AUTO_EVOLVED_CONFIDENCE: float = 0.5
-"""自動進化された policy ファクトの初期 confidence。
-``learning.policy.activation_min_confidence`` (デフォルト 0.7) より低くする
-ことで、評価期間中は active 化されない (旧 ``harness.*`` から移行済)。"""
-
-DEFAULT_ACTIVATION_MIN_CONFIDENCE: float = 0.7
-"""PolicyInterpreter が policy ファクトを適用する最小 confidence のデフォルト。
-昇格 (promotion) 時の目標値として使う (``learning.policy.activation_min_confidence``)。"""
-
-PROMOTION_SURVIVAL_CYCLES: int = 2
-"""rollback されずに連続生存した evolve サイクル数がこの値に達したら、active な
-policy ファクトを activation_min まで昇格する (proven とみなす評価期間)。"""
-
-EvolveWriteback = Literal["yaml", "semmem"]
-
-
 def is_degenerate_fitness(history: list[float]) -> bool:
     """直近 :data:`DEGENERATE_WINDOW` 件の fitness が実質同一かを返す。
 
@@ -370,51 +344,16 @@ class PolicyParamEvolver(VersionedJsonFile):
         policy: PolicyInterpreter,
         exploration: ExplorationController,
         debug_logger: DebugLogger | None = None,
-        *,
-        learn_view: LearnFactView | None = None,
-        semmem_writeback_scope: str = "global",
-        evolve_writeback: EvolveWriteback = "yaml",
-        policy_confidence_init: float = DEFAULT_AUTO_EVOLVED_CONFIDENCE,
-        activation_min_confidence: float = DEFAULT_ACTIVATION_MIN_CONFIDENCE,
-        base_model_id: str = "",
     ) -> None:
         """
         Args:
             policy: PolicyInterpreter インスタンス
             exploration: ExplorationController インスタンス
             debug_logger: DebugLogger (任意)
-            learn_view: EvorefLearn pillar の Fact View
-                書き戻し時に同一 ``subject`` の prior fact を
-                :meth:`LearnFactView.find_active_policy_by_subject` で探索し、
-                新規追加後に :meth:`LearnFactView.supersede_policy` で
-                チェーン構築する。``None`` 時は SemMem 書き戻しを行わない。
-            semmem_writeback_scope: 書き込み先 scope (``global`` または
-                ``project:<id>``)
-            evolve_writeback: ``"yaml"`` (従来動作) / ``"semmem"``
-                (SemMem に新規 policy ファクトを書き込み、supersedes チェーン
-                を構築する)
-            policy_confidence_init: 自動進化ファクトの初期 confidence
-                (デフォルト 0.5)。``learning.policy.activation_min_confidence``
-                ``harness.*`` から移行済)。
         """
         self._policy = policy
         self._exploration = exploration
         self._debug_logger = debug_logger
-
-        # LearnFactView 経由の writeback に一本化
-        self._learn_view: LearnFactView | None = learn_view
-        self._semmem_writeback_scope: str = semmem_writeback_scope
-        self._evolve_writeback: EvolveWriteback = evolve_writeback
-        self._policy_confidence_init: float = float(policy_confidence_init)
-        self._activation_min_confidence: float = float(activation_min_confidence)
-        # base 学習パーティションの active モデルスラグ。空 = partition 無効
-        # (subject はレガシー ``learn.policy.<mode>.<domain>.<key>`` に縮退)。
-        self._base_model_id: str = base_model_id
-
-        # 経路 3: 実環境成功率プロバイダ
-        # callable(domain: str, mode: str) -> float | None
-        self._semmem_success_provider: Callable[[str, str], float | None] | None = None
-        self._semmem_success_weight: float = 0.0
 
         # (domain, mode) → fitness 履歴
         self._fitness_history: dict[tuple[str, str], list[float]] = {}
@@ -430,7 +369,8 @@ class PolicyParamEvolver(VersionedJsonFile):
         self._best_params: dict[tuple[str, str], dict] = {}
 
         # (domain, mode) → rollback されずに連続生存した evolve サイクル数 (#8)。
-        # PROMOTION_SURVIVAL_CYCLES 到達で active fact を昇格する。rollback でリセット。
+        # 読み手だった SemMem の policy ファクト昇格は 2026-10-12 に撤去した。形式の版を
+        # 上げないよう永続化だけ残す (rollback でリセット)。
         self._survived_count: dict[tuple[str, str], int] = {}
 
         # (domain, mode) → 直近に params を動かした (evolved / rollback) 時点で
@@ -456,45 +396,6 @@ class PolicyParamEvolver(VersionedJsonFile):
         """適用中の params の世代 (0 = このパーティションでまだ動かしていない)。"""
         return self._generation
 
-    # ── SemMem 書き戻しヘルパ ───────────────────────────
-
-    @property
-    def evolve_writeback(self) -> EvolveWriteback:
-        """現在の書き戻しモード"""
-        return self._evolve_writeback
-
-    def is_semmem_writeback_active(self) -> bool:
-        """SemMem 書き戻しが有効かつ LearnFactView が注入済か"""
-        return (
-            self._evolve_writeback == "semmem"
-            and self._learn_view is not None
-        )
-
-    def set_learn_view(
-        self,
-        learn_view: LearnFactView | None,
-        *,
-        writeback_scope: str | None = None,
-        evolve_writeback: EvolveWriteback | None = None,
-    ) -> None:
-        """LearnFactView を動的に差し替える (テスト・lifespan 後注入用)。"""
-        if learn_view is not None:
-            self._learn_view = learn_view
-        if writeback_scope is not None:
-            self._semmem_writeback_scope = writeback_scope
-        if evolve_writeback is not None:
-            self._evolve_writeback = evolve_writeback
-
-    def set_base_model_id(self, base_model_id: str) -> None:
-        """base 学習パーティションの active モデルスラグを差し替える。
-
-        以後の policy 書き戻し subject に当該モデルを埋め込む。空文字でレガシー
-        縮退。呼出元は構築時 (``_pillar_wirer``) と、ランタイム base 切替の
-        ``backend.factory._learning_rebind.rebind_base_learning`` (評価状態は
-        :meth:`reset_evaluation_state` → 新パーティションの ``load`` で張り直す)。
-        """
-        self._base_model_id = base_model_id or ""
-
     def reset_evaluation_state(self) -> None:
         """永続化対象の評価状態 (fitness 履歴 / best / survived 等) を空にする。
 
@@ -509,97 +410,6 @@ class PolicyParamEvolver(VersionedJsonFile):
         self._last_evolved_at.clear()
         self._generation = 0
         self._payload_extra = None
-
-    @staticmethod
-    def _build_subject(base_model_id: str, mode: str, domain: str, key: str) -> str:
-        """``learn.policy.<model>.<mode>.<domain>.<key>`` 形式の subject を構築する。
-
-        ``base_model_id`` が空のときは partition 無効としてレガシー
-        ``learn.policy.<mode>.<domain>.<key>`` (model セグメント無し) へ縮退する。
-        """
-        if base_model_id:
-            return f"{LEARN_POLICY_SUBJECT_PREFIX}{base_model_id}.{mode}.{domain}.{key}"
-        return f"{LEARN_POLICY_SUBJECT_PREFIX}{mode}.{domain}.{key}"
-
-    def _find_active_fact_in_writeback_store(
-        self,
-        subject: str,
-    ) -> SemanticFact | None:
-        """LearnFactView 経由で同一 subject の active policy を返す。
-
-        supersession チェーンの末端 (= ``superseded_by is None``) のうち、最も
-        新しい (``created_at`` 最大) ものを返す。
-        """
-        view = self._learn_view
-        if view is None:
-            return None
-        return view.find_active_policy_by_subject(subject)
-
-    def _writeback_evolved_fact(
-        self,
-        domain: str,
-        mode: str,
-        key: str,
-        new_value,
-        fitness: float,
-        sigma: float,
-        phase: str,  # noqa: ARG002
-        *,
-        rollback: bool = False,
-    ) -> SemanticFact | None:
-        """進化結果を SemMem に新規 policy ファクトとして書き出す。
-
-        SemMem writeback のコア処理。同一 ``subject`` の prior active fact が
-        存在する場合は supersedes チェーンに連結する。
-        書き込み先ストアが未設定 / writeback モードが ``yaml`` の場合は
-        ``None`` を返して no-op する。
-        """
-        if not self.is_semmem_writeback_active():
-            return None
-        view = self._learn_view
-        assert view is not None  # is_semmem_writeback_active で保証
-
-        subject = self._build_subject(self._base_model_id, mode, domain, key)
-        fact_mode: str = normalize_session_mode(mode)
-        eval_metric = {
-            "fitness": float(fitness),
-            "sigma": float(sigma),
-        }
-        if rollback:
-            eval_metric["rollback"] = 1.0
-
-        # prior を新規追加前に捕捉 (追加後だと自身も候補に入るため)
-        prior = view.find_active_policy_by_subject(subject)
-
-        new_fact = make_fact(
-            subject=subject,
-            predicate="value",
-            object_=json.dumps(new_value),
-            type="policy",
-            scope=self._semmem_writeback_scope,
-            mode_origin=fact_mode,  # type: ignore[arg-type]
-            confidence=self._policy_confidence_init,
-            auto_evolved=True,
-            eval_metric=eval_metric,
-        )
-        try:
-            added = view.add_policy_fact(new_fact)
-        except ValueError as exc:
-            logger.warning(
-                "policy_evolver semmem writeback failed: subject=%s err=%s",
-                subject, exc,
-            )
-            return None
-
-        if prior is not None and prior.id != added.id:
-            view.supersede_policy(old_id=prior.id, new_id=added.id)
-        logger.debug(
-            "policy_evolver semmem writeback: subject=%s value=%r "
-            "rollback=%s prior_id=%s new_id=%s",
-            subject, new_value, rollback,
-            prior.id if prior else None, added.id,
-        )
-        return added
 
     def _maybe_rollback(
         self,
@@ -650,9 +460,6 @@ class PolicyParamEvolver(VersionedJsonFile):
                 self._policy.save()
         if rolled_back:
             self._generation += 1
-        if rolled_back and self.is_semmem_writeback_active():
-            # SemMem 履歴を evolved → rollback のチェーンとして残す。
-            self._writeback_rollback_facts(domain, mode, fitness, sigma, phase)
         self._decline_count[key] = 0
         # rollback したので生存カウントをリセット (#8: 評価期間を最初からやり直す)。
         self._survived_count[key] = 0
@@ -673,43 +480,6 @@ class PolicyParamEvolver(VersionedJsonFile):
             "sigma": sigma,
             "phase": phase,
         }
-
-    def _writeback_rollback_facts(
-        self,
-        domain: str,
-        mode: str,
-        fitness: float,
-        sigma: float,
-        phase: str,
-    ) -> int:
-        """ロールバック後の値で SemMem に rollback ファクトを書き戻す。
-
-        書き込み対象は「書き込み先ストアに同一 subject の active fact が
-        既に存在するキー」のみ。これにより SemMem 履歴に存在しないキーまで
-        勝手に追加してしまうのを防ぐ。
-
-        Returns:
-            書き出した rollback ファクト数
-        """
-        if self._learn_view is None:
-            return 0
-        try:
-            params = self._policy.get_all(domain, mode)
-        except KeyError:
-            return 0
-        count = 0
-        for key, value in params.items():
-            subject = self._build_subject(self._base_model_id, mode, domain, key)
-            prior = self._find_active_fact_in_writeback_store(subject)
-            if prior is None:
-                continue
-            written = self._writeback_evolved_fact(
-                domain, mode, key, value, fitness, sigma, phase,
-                rollback=True,
-            )
-            if written is not None:
-                count += 1
-        return count
 
     def _apply_evolved_step(
         self,
@@ -744,32 +514,6 @@ class PolicyParamEvolver(VersionedJsonFile):
         self._generation += 1
         delta_keys = list(delta.keys())
 
-        # SemMem に新規 policy ファクトを書き戻し
-        # 同一 subject の prior fact を supersede する。
-        if self.is_semmem_writeback_active():
-            try:
-                applied_params = self._policy.get_all(domain, mode)
-            except KeyError:
-                applied_params = {}
-            for key in delta_keys:
-                if key not in applied_params:
-                    continue
-                self._writeback_evolved_fact(
-                    domain, mode, key, applied_params[key],
-                    fitness, sigma, phase,
-                )
-
-        # 生存カウント更新 + proven 昇格 (#8、semmem モードのみ)。rollback されずに
-        # PROMOTION_SURVIVAL_CYCLES 連続で evolved できた = proven とみなし、今書いた
-        # active fact を activation_min まで昇格して PolicyInterpreter が適用できるように
-        # する。次サイクルの摂動が新 0.5 fact で supersede するため適用は断続的だが、
-        # 安定領域では周期的に活性化される (conservative)。
-        if self.is_semmem_writeback_active():
-            key = (domain, mode)
-            self._survived_count[key] = self._survived_count.get(key, 0) + 1
-            if self._survived_count[key] >= PROMOTION_SURVIVAL_CYCLES:
-                self._promote_active_facts(domain, mode, delta_keys)
-
         logger.info(
             "Policy evolved: domain=%s, mode=%s, fitness=%.4f, "
             "sigma=%.4f, phase=%s, cost_observed=%s, delta_keys=%s",
@@ -787,77 +531,6 @@ class PolicyParamEvolver(VersionedJsonFile):
             "phase": phase,
             "cost_observed": cost_observed,
         }
-
-    def _promote_active_facts(
-        self, domain: str, mode: str, keys: list[str],
-    ) -> None:
-        """指定 delta キーの active policy fact を activation_min まで昇格する (#8)。"""
-        view = self._learn_view
-        if view is None:
-            return
-        target = self._activation_min_confidence
-        for key in keys:
-            subject = self._build_subject(self._base_model_id, mode, domain, key)
-            fact = self._find_active_fact_in_writeback_store(subject)
-            if fact is not None and fact.confidence < target:
-                view.promote_policy_confidence(fact_id=fact.id, confidence=target)
-                logger.info(
-                    "Policy fact promoted: subject=%s, confidence=%.2f->%.2f",
-                    subject, fact.confidence, target,
-                )
-
-    def set_semmem_success_provider(
-        self,
-        provider: Callable[[str, str], float | None] | None,
-        weight: float,
-    ) -> None:
-        """SemMem 由来の実環境成功率プロバイダを設定する
-
-        Args:
-            provider: ``(domain, mode) -> success_rate | None`` を返す callable。
-                ``None`` を返すか、本メソッドに ``None`` を渡すと補正を無効化する。
-            weight: ``[0.0, 1.0]`` の重み。最終 fitness は
-                ``(1-w) * calc_fitness + w * success_rate`` で混合される。
-        """
-        self._semmem_success_provider = provider
-        self._semmem_success_weight = max(0.0, min(1.0, float(weight)))
-
-    def _blend_semmem_success_rate(
-        self,
-        domain: str,
-        mode: str,
-        base: float | None,
-    ) -> float | None:
-        """calc_fitness に SemMem 成功率項を加重合成する。
-
-        プロバイダ未設定 / 重み 0 / プロバイダが ``None`` を返した場合は
-        ``base`` をそのまま返す。``base`` が ``None`` (無情報) なら素通し。
-        """
-        if base is None:
-            return None
-        if (
-            self._semmem_success_provider is None
-            or self._semmem_success_weight <= 0.0
-        ):
-            return base
-        try:
-            rate = self._semmem_success_provider(domain, mode)
-        except Exception as exc:
-            logger.warning(
-                "semmem_success_provider failed (domain=%s mode=%s): %s",
-                domain, mode, exc,
-            )
-            return base
-        if rate is None:
-            return base
-        rate = max(0.0, min(1.0, float(rate)))
-        w = self._semmem_success_weight
-        blended = (1.0 - w) * base + w * rate
-        logger.debug(
-            "policy fitness blended: domain=%s mode=%s base=%.3f rate=%.3f w=%.2f -> %.3f",
-            domain, mode, base, rate, w, blended,
-        )
-        return blended
 
     def evolve(
         self,
@@ -912,8 +585,8 @@ class PolicyParamEvolver(VersionedJsonFile):
 
         # 1. 現在の fitness を算出。無情報 (該当シグナルゼロ) なら None が返る。
         # この場合は履歴に積まず摂動もせず即 skip し、無情報ドメインの乱歩を防ぐ。
-        base_fitness = calc_fitness(domain, experiences)
-        if base_fitness is None:
+        fitness = calc_fitness(domain, experiences)
+        if fitness is None:
             sigma = self._exploration.get_mutation_scale(domain, mode)
             phase = self._exploration.get_phase(domain, mode)
             self._log_evolution(
@@ -926,7 +599,6 @@ class PolicyParamEvolver(VersionedJsonFile):
                 "cost_observed": cost_observed,
             }
 
-        fitness = self._blend_semmem_success_rate(domain, mode, base_fitness)
         history = self._fitness_history.setdefault(key, [])
         history.append(fitness)
         if len(history) > _FITNESS_HISTORY_CAP:

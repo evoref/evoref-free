@@ -6,8 +6,9 @@ import { refreshServerStatus } from './server';
 import { refreshVramStatus } from './vram';
 import { addToast } from './toast';
 import { instanceName } from './app';
-import { colorMode } from './theme';
-import { setLocale, promptLocale } from '$lib/i18n';
+import { colorMode, themeId } from './theme';
+import { setLocale, promptLocale, t } from '$lib/i18n';
+import { ApiError } from '$lib/free/api';
 
 // ── TAB_SECTIONS（イミュータブル） ──
 
@@ -95,9 +96,146 @@ function snapshotAll(config: Record<string, Record<string, unknown>>): void {
 	}
 }
 
+/** セクションの保存済みの値 (スナップショット)。無ければ null */
+function snapshotOf(section: string): Record<string, unknown> | null {
+	const raw = originalSnapshot[section];
+	return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+	return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/**
+ * ``original`` から ``current`` で変わったキーだけを入れ子のまま返す (dict は再帰、配列などは値ごと)。
+ *
+ * PUT /api/config/{section} はサーバ側で deep merge されるので、変えたキーだけを送れば足りる。
+ * GET は schema 既定で補完した全キーを返すため、丸ごと送ると触っていないキーまで config.yaml で
+ * 明示扱いになる (例: modes.* を固定するとモデルプロファイルの推奨サンプリングが効かなくなる)。
+ */
+export function sectionDiff(
+	original: Record<string, unknown>,
+	current: Record<string, unknown>
+): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(current)) {
+		const before = original[key];
+		if (isPlainObject(value) && isPlainObject(before)) {
+			const sub = sectionDiff(before, value);
+			if (Object.keys(sub).length > 0) out[key] = sub;
+		} else if (JSON.stringify(value) !== JSON.stringify(before)) {
+			out[key] = value;
+		}
+	}
+	return out;
+}
+
+/** ``base`` に ``diff`` を重ねたコピー (サーバの _deep_merge と同じ規則) */
+function mergeDiff(
+	base: Record<string, unknown>,
+	diff: Record<string, unknown>
+): Record<string, unknown> {
+	const out: Record<string, unknown> = { ...base };
+	for (const [key, value] of Object.entries(diff)) {
+		const prev = out[key];
+		out[key] = isPlainObject(value) && isPlainObject(prev) ? mergeDiff(prev, value) : value;
+	}
+	return out;
+}
+
+/** セクションの未保存の編集 (スナップショットからの差分)。スナップショットが無ければ空 */
+function pendingDiff(
+	section: string,
+	config: Record<string, Record<string, unknown>>
+): Record<string, unknown> {
+	const original = snapshotOf(section);
+	const current = config[section];
+	if (!original || !isPlainObject(current)) return {};
+	return sectionDiff(original, current);
+}
+
+/**
+ * 未保存の編集 ``diff`` から、基準 ``before`` 以降にサーバ側 (``after``) で値が変わったキーを除く。
+ * 除いたキーは ``conflicts`` に ``prefix.key`` で積む。
+ */
+function dropServerChanged(
+	diff: Record<string, unknown>,
+	before: Record<string, unknown>,
+	after: Record<string, unknown>,
+	prefix: string,
+	conflicts: string[]
+): Record<string, unknown> {
+	const out: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(diff)) {
+		const b = before[key];
+		const a = after[key];
+		if (isPlainObject(value) && isPlainObject(b) && isPlainObject(a)) {
+			const sub = dropServerChanged(value, b, a, `${prefix}.${key}`, conflicts);
+			if (Object.keys(sub).length > 0) out[key] = sub;
+		} else if (JSON.stringify(b) !== JSON.stringify(a)) {
+			if (JSON.stringify(value) !== JSON.stringify(a)) conflicts.push(`${prefix}.${key}`);
+		} else {
+			out[key] = value;
+		}
+	}
+	return out;
+}
+
+/**
+ * サーバの最新値を基準 (スナップショット) にし、その上に未保存の編集を重ね直す。
+ *
+ * 再読込 (モデル切替後・保存後・ページ再表示) で未保存の編集を黙って消さないため。
+ * ただし基準以降にサーバ側で変わったキー (モデル切替・閾値の推定・CLI 等の明示操作の結果) は
+ * サーバ値を採り、捨てた編集を通知する。編集を残すと次の適用でサーバ側の変更を黙って巻き戻す。
+ */
+function rebaseOnServer(server: Record<string, Record<string, unknown>>): void {
+	const current = get(configData);
+	const next: Record<string, Record<string, unknown>> = {};
+	const conflicts: string[] = [];
+	for (const [section, data] of Object.entries(server)) {
+		if (!isPlainObject(data)) {
+			next[section] = data;
+			continue;
+		}
+		const before = snapshotOf(section) ?? {};
+		const diff = dropServerChanged(pendingDiff(section, current), before, data, section, conflicts);
+		next[section] = Object.keys(diff).length > 0 ? mergeDiff(data, diff) : data;
+	}
+	configData.set(next);
+	snapshotAll(server);
+	recomputeDirtyTabs();
+	if (conflicts.length > 0) {
+		addToast({
+			type: 'warning',
+			i18nKey: 'settings.server_changed_discarded',
+			params: { keys: conflicts.join(', ') },
+			duration: 10000
+		});
+	}
+}
+
+function isSectionDirty(section: string, config: Record<string, Record<string, unknown>>): boolean {
+	const current = JSON.stringify(config[section] || {});
+	const original = originalSnapshot[section] || '{}';
+	return current !== original;
+}
+
+/** 全タブの dirty を現在値とスナップショットから引き直す */
+function recomputeDirtyTabs(): void {
+	const config = get(configData);
+	const dirty: Record<string, boolean> = {};
+	for (const [tabId, sections] of Object.entries(get(tabSections))) {
+		dirty[tabId] = sections.some((s) => isSectionDirty(s, config));
+	}
+	dirtyTabs.set(dirty);
+}
+
 // ── syncAppStores レジストリ ──
 
-type SyncHandler = (config: Record<string, Record<string, unknown>>) => void | Promise<void>;
+type SyncHandler = (
+	config: Record<string, Record<string, unknown>>,
+	diff: Record<string, unknown>
+) => void | Promise<void>;
 
 /** セクション → 同期ハンドラのレジストリ */
 const syncHandlers = new Map<string, SyncHandler>([
@@ -116,7 +254,9 @@ const syncHandlers = new Map<string, SyncHandler>([
 	],
 	[
 		'theme',
-		(config) => {
+		(config, diff) => {
+			// 変えていないキーで他ストアを巻き戻さない (サイドバーで切り替えた値を保つ)
+			if (!('color_mode' in diff)) return;
 			const mode = config.theme?.color_mode;
 			if (mode === 'light' || mode === 'dark') {
 				colorMode.set(mode);
@@ -125,7 +265,8 @@ const syncHandlers = new Map<string, SyncHandler>([
 	],
 	[
 		'i18n',
-		(config) => {
+		(config, diff) => {
+			if (!('locale' in diff)) return;
 			const locale = config.i18n?.locale;
 			if (typeof locale === 'string') {
 				setLocale(locale);
@@ -141,14 +282,14 @@ export async function loadConfig(): Promise<void> {
 	configLoadError.set(false);
 	try {
 		const resp = await fetchConfig();
-		configData.set(resp.config as Record<string, Record<string, unknown>>);
 		configEdition.set(resp.edition);
 		tabSections.set(buildTabSections(resp.edition));
-		snapshotAll(resp.config as Record<string, Record<string, unknown>>);
+		// 未保存の編集は温存する (呼び出し元: ページ表示・モデル切替後・再構築後・閾値の適用後)
+		rebaseOnServer(resp.config as Record<string, Record<string, unknown>>);
 
 		configLoaded.set(true);
-		dirtyTabs.set({});
-		tabErrors.set({});
+		const dirty = get(dirtyTabs);
+		tabErrors.update((e) => Object.fromEntries(Object.entries(e).filter(([tab]) => dirty[tab])));
 	} catch {
 		configLoadError.set(true);
 		addToast({ type: 'error', i18nKey: 'settings.load_failed' });
@@ -165,6 +306,20 @@ promptLocale.subscribe((newLocale) => {
 	const config = get(configData);
 	if (config.i18n && config.i18n.prompt_locale !== newLocale) {
 		syncPersistedField('i18n', 'prompt_locale', newLocale);
+	}
+});
+
+/**
+ * サイドバーのカラーモード切替を configData.theme.color_mode に追随させる。
+ *
+ * テーマが有効なときの切替は POST /api/themes/activate が config.yaml へ保存するので、
+ * 基準 (snapshot) も同じ値にして偽の dirty を出さない。テーマ無しの切替は
+ * config.yaml に書かれないので触らない (Apply は変えたキーだけを送るので巻き戻さない)。
+ */
+colorMode.subscribe((mode) => {
+	const config = get(configData);
+	if (config.theme && get(themeId) && config.theme.color_mode !== mode) {
+		syncPersistedField('theme', 'color_mode', mode);
 	}
 });
 
@@ -250,6 +405,16 @@ function syncPersistedField(section: string, key: string, value: unknown): void 
 	checkDirty(section);
 }
 
+/**
+ * 設定画面の「適用」以外で保存した値 (閾値の推定の適用等) を configData と基準の両方へ反映する。
+ * 書いたキーの未保存の編集は捨てて保存した値を採る (同じセクションの他の編集は残す)。
+ */
+export function syncPersistedFields(section: string, data: Record<string, unknown>): void {
+	for (const [key, value] of Object.entries(data)) {
+		syncPersistedField(section, key, value);
+	}
+}
+
 /** ネストされたフィールド値を更新 */
 export function updateNestedField(
 	section: string,
@@ -326,37 +491,82 @@ function findTabForSection(section: string): string | null {
 
 // ── applySection 分割 ──
 
-/** セクション群を順次保存し、エラーのメッセージ配列と再起動要否を返す */
-async function saveSections(
-	sections: string[],
-	config: Record<string, Record<string, unknown>>
-): Promise<{ errors: string[]; restartRequired: boolean }> {
-	const errors: string[] = [];
-	let restartRequired = false;
-	for (const section of sections) {
-		const data = config[section];
-		if (!data || typeof data !== 'object') continue;
+/** Pydantic の検証メッセージの定型の前置き */
+const PYDANTIC_PREFIX = /^(Value error|Assertion failed), /;
 
-		try {
-			const res = await saveSection(section, data);
-			if (res?.restart_required === true) restartRequired = true;
-			snapshotSection(section, data);
-		} catch (e: unknown) {
-			const msg = e instanceof Error ? e.message : String(e);
-			errors.push(`${section}: ${msg}`);
+/**
+ * 保存失敗を画面に出す短い文言にする。
+ *
+ * 訳のある i18n_key → 検証エラー (422 の errors) → エラーコード別の定型文の順。
+ * バックエンドの英語のメッセージ (pydantic の全文等) はそのまま出さない。
+ */
+export function describeSaveError(e: unknown): string {
+	const translate = get(t);
+	if (e instanceof ApiError) {
+		if (e.i18nKey) {
+			const params = Object.fromEntries(
+				Object.entries(e.context ?? {}).map(([k, v]) => [k, String(v)])
+			);
+			const text = translate(e.i18nKey, Object.keys(params).length > 0 ? params : undefined);
+			if (!text.startsWith(e.i18nKey)) return text;
+		}
+		if (e.errors.length > 0) {
+			return e.errors.map((m) => m.replace(PYDANTIC_PREFIX, '')).join(' / ');
+		}
+		switch (e.code) {
+			case 'E0423':
+				return translate('settings.error.readonly');
+			case 'E0403':
+				return translate('settings.error.forbidden');
+			case 'E0404':
+				return translate('settings.error.not_found');
+			case 'E0422':
+				return translate('settings.error.invalid');
+			default:
+				return translate('settings.error.server', { code: e.code });
 		}
 	}
-	return { errors, restartRequired };
+	return translate('settings.error.network');
 }
 
-/** バックエンドから最新設定を再取得してストアに反映 */
+interface SaveOutcome {
+	errors: string[];
+	restartRequired: boolean;
+	/** 保存できたセクション → 送った差分 */
+	saved: Record<string, Record<string, unknown>>;
+}
+
+/** セクション群の未保存の編集 (差分) を順次保存する。変更の無いセクションは送らない */
+async function saveSections(sections: string[]): Promise<SaveOutcome> {
+	const errors: string[] = [];
+	const saved: Record<string, Record<string, unknown>> = {};
+	let restartRequired = false;
+	for (const section of sections) {
+		// 各回で読み直す: 前のセクションの保存中にサイドバー等で同期された値を古い値で巻き戻さない
+		const diff = pendingDiff(section, get(configData));
+		if (Object.keys(diff).length === 0) continue;
+
+		try {
+			const res = await saveSection(section, diff);
+			if (res?.restart_required === true) restartRequired = true;
+			// 基準は「送った時点の値」。保存中に入力された値は差分として残る
+			snapshotSection(section, mergeDiff(snapshotOf(section) ?? {}, diff));
+			saved[section] = diff;
+		} catch (e: unknown) {
+			errors.push(`${section}: ${describeSaveError(e)}`);
+		}
+	}
+	return { errors, restartRequired, saved };
+}
+
+/** バックエンドから最新設定を再取得し、未保存の編集を重ね直す */
 async function refreshConfig(): Promise<void> {
 	try {
 		const resp = await fetchConfig();
-		configData.set(resp.config as Record<string, Record<string, unknown>>);
-		snapshotAll(resp.config as Record<string, Record<string, unknown>>);
+		rebaseOnServer(resp.config as Record<string, Record<string, unknown>>);
 	} catch {
-		// リロード失敗は無視（保存自体は成功済み）
+		// リロード失敗は無視（保存自体は成功済み）。dirty は保存後の基準で引き直す
+		recomputeDirtyTabs();
 	}
 }
 
@@ -364,13 +574,13 @@ async function refreshConfig(): Promise<void> {
  * 設定変更後にアプリ全体のストアを同期する
  *
  * config.yaml の変更が他のストア（instanceName, colorMode, locale 等）に
- * 反映されるよう、変更されたセクションに応じて各ストアを更新する。
+ * 反映されるよう、保存したキーに応じて各ストアを更新する。
  */
-async function syncAppStores(changedSections: string[]): Promise<void> {
+async function syncAppStores(saved: Record<string, Record<string, unknown>>): Promise<void> {
 	const config = get(configData);
-	for (const section of changedSections) {
+	for (const [section, diff] of Object.entries(saved)) {
 		const handler = syncHandlers.get(section);
-		if (handler) await handler(config);
+		if (handler) await handler(config, diff);
 	}
 }
 
@@ -399,20 +609,27 @@ export async function applySection(tabId: string): Promise<boolean> {
 	tabErrors.update((e) => ({ ...e, [tabId]: [] }));
 
 	try {
-		const config = get(configData);
-		const { errors, restartRequired } = await saveSections(sections, config);
+		const { errors, restartRequired, saved } = await saveSections(sections);
+		const savedSections = Object.keys(saved);
+
+		if (savedSections.length > 0) {
+			await refreshConfig();
+			await syncAppStores(saved);
+			await refreshSidebarIfServerSections(savedSections);
+		} else {
+			recomputeDirtyTabs();
+		}
 
 		if (errors.length > 0) {
 			tabErrors.update((e) => ({ ...e, [tabId]: errors }));
 			addToast({ type: 'error', i18nKey: 'settings.apply_failed' });
+			// 先に保存できたセクションの再起動要否を捨てない
+			if (restartRequired) {
+				addToast({ type: 'warning', i18nKey: 'settings.applied_partial_restart_required' });
+			}
 			return false;
 		}
 
-		await refreshConfig();
-		await syncAppStores(sections);
-		await refreshSidebarIfServerSections(sections);
-
-		dirtyTabs.update((d) => ({ ...d, [tabId]: false }));
 		addToast({
 			type: 'success',
 			i18nKey: restartRequired ? 'settings.applied_restart_required' : 'settings.applied'
@@ -441,4 +658,18 @@ export function resetSection(tabId: string): void {
 
 	dirtyTabs.update((d) => ({ ...d, [tabId]: false }));
 	tabErrors.update((e) => ({ ...e, [tabId]: [] }));
+}
+
+/** 全タブの未保存の編集を捨てる (未保存のまま設定画面を離れるとき) */
+export function discardAllChanges(): void {
+	configData.update((config) => {
+		const updated = { ...config };
+		for (const section of Object.keys(originalSnapshot)) {
+			const original = snapshotOf(section);
+			if (original) updated[section] = original;
+		}
+		return updated;
+	});
+	recomputeDirtyTabs();
+	tabErrors.set({});
 }

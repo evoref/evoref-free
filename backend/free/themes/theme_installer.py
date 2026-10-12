@@ -5,16 +5,20 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import socket
 import tempfile
 import zipfile
-from ipaddress import ip_address
+import zlib
 from pathlib import Path, PurePosixPath
-from typing import NotRequired, TypedDict
-from urllib.parse import urlparse
+from typing import TypedDict
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from backend.free.core.url_guard import (
+    MAX_REDIRECTS,
+    avalidate_public_url,
+    public_only_transport,
+)
 from backend.io.safe_extract import (
     ExtractBudget,
     ExtractLimits,
@@ -29,7 +33,7 @@ logger = get_logger("themes.installer")
 
 # ZIP アップロードサイズ上限 (10MB)
 MAX_ZIP_SIZE = 10 * 1024 * 1024
-#: 展開の上限。テーマは CSS / JS / 画像の小さな束なので狭くする。
+#: 展開の上限。テーマは CSS / JSON / 画像の小さな束なので狭くする。
 THEME_LIMITS = ExtractLimits(
     max_entries=2_000, max_member_bytes=16 << 20, max_total_bytes=64 << 20, max_ratio=200.0,
 )
@@ -50,15 +54,6 @@ def is_valid_theme_id(theme_id: object) -> bool:
     except UnsafeArchiveError:
         return False
 
-# 組み込みテーマディレクトリ名（現在は制約なし — 全テーマ削除可能）
-BUILTIN_THEMES: set[str] = set()
-
-
-class WidgetManifest(TypedDict):
-    """widget-manifest.json の required_apis 部分"""
-
-    required_apis: list[str]
-
 
 class ThemeInstallResult(TypedDict):
     """install_theme() / install_from_url() の戻り値型"""
@@ -67,8 +62,51 @@ class ThemeInstallResult(TypedDict):
     name: str
     version: str
     author: str
-    trusted: bool
-    widget_manifest: NotRequired[WidgetManifest]
+
+
+def _http_client() -> httpx.AsyncClient:
+    """ダウンロード用のクライアント。公開アドレスにしか繋がず、リダイレクトは自分で追う。"""
+    return httpx.AsyncClient(
+        transport=public_only_transport(),
+        follow_redirects=False,
+        timeout=httpx.Timeout(30.0),
+    )
+
+
+def _too_large(size: int) -> ValueError:
+    return ValueError(f"Downloaded file too large: {size} bytes (max {MAX_ZIP_SIZE})")
+
+
+async def _download(url: str) -> bytes:
+    """``url`` を取る。リダイレクトはホップごとに宛先を検査し、本文は受信しながら上限で切る。
+
+    ``follow_redirects=True`` に任せると、検査した URL が 302 で内部アドレスへ
+    飛ばされたときに素通りする (SSRF)。
+    """
+    current = url
+    async with _http_client() as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            await avalidate_public_url(current)
+            async with client.stream("GET", current) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        raise ValueError("Download failed: redirect without location")
+                    current = urljoin(current, location)
+                    continue
+                resp.raise_for_status()
+                declared = resp.headers.get("content-length", "")
+                if declared.isdigit() and int(declared) > MAX_ZIP_SIZE:
+                    raise _too_large(int(declared))
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_ZIP_SIZE:
+                        raise _too_large(total)
+                    chunks.append(chunk)
+                return b"".join(chunks)
+    raise ValueError(f"Download failed: too many redirects (> {MAX_REDIRECTS})")
 
 
 async def install_from_url(url: str, themes_dir: Path) -> ThemeInstallResult:
@@ -78,35 +116,13 @@ async def install_from_url(url: str, themes_dir: Path) -> ThemeInstallResult:
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
 
-    # SSRF 対策: プライベート IP へのアクセスをブロック
+    # ダウンロード (SSRF 検査は backend.free.core.url_guard。UnsafeUrlError は ValueError)
     try:
-        resolved = socket.getaddrinfo(parsed.hostname, None)
-        for _, _, _, _, sockaddr in resolved:
-            addr = ip_address(sockaddr[0])
-            if addr.is_private or addr.is_loopback or addr.is_reserved:
-                raise ValueError("Access to private/reserved addresses is not allowed")
-    except socket.gaierror:
-        raise ValueError(f"Failed to resolve hostname: {parsed.hostname}")
-
-    # ダウンロード
-    try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            max_redirects=5,
-            timeout=httpx.Timeout(30.0),
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
+        content = await _download(url)
     except httpx.HTTPStatusError as e:
         raise ValueError(f"Download failed: HTTP {e.response.status_code}")
     except httpx.HTTPError as e:
         raise ValueError(f"Download failed: {e}")
-
-    content = resp.content
-    if len(content) > MAX_ZIP_SIZE:
-        raise ValueError(
-            f"Downloaded file too large: {len(content)} bytes (max {MAX_ZIP_SIZE})"
-        )
 
     # 一時ファイルに保存して install_theme() に委譲
     with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
@@ -132,108 +148,110 @@ def install_theme(zip_path: Path, themes_dir: Path) -> ThemeInstallResult:
     if not zipfile.is_zipfile(str(zip_path)):
         raise ValueError("Not a valid ZIP file")
 
-    with zipfile.ZipFile(str(zip_path), "r") as zf:
-        # 全エントリを先に検査する (パスの逃げ・予約名・シンボリックリンク・展開後サイズ)。
-        # エントリ名をそのまま展開先に連結しない (docs/c_06 §1.5)。
-        members = check_zip_members(zf, THEME_LIMITS)
-        names = [str(member) for _, member in members]
-
-        # theme.json を探す
-        meta_file = _find_file_in_zip(names, "theme.json")
-        if meta_file is None:
-            raise ValueError("theme.json not found in ZIP")
-
-        meta = json.loads(zf.read(meta_file))
-
-        # バリデーション
-        if not meta.get("name"):
-            raise ValueError("theme.json missing 'name' field")
-        if not meta.get("colors") or not isinstance(meta["colors"], dict):
-            raise ValueError("theme.json missing 'colors' field")
-
-        # theme_id の決定（ZIP 内のルートディレクトリ名、またはメタデータの name を slug 化）
-        theme_id = _detect_theme_id(names, meta)
-
-        if not is_valid_theme_id(theme_id):
-            raise ValueError(f"Invalid theme id: {theme_id!r}")
-
-        # 組み込みテーマと同名は禁止
-        if theme_id in BUILTIN_THEMES:
-            raise ValueError(f"Cannot overwrite builtin theme '{theme_id}'")
-
-        # 重複チェック
-        target_dir = themes_dir / theme_id
-        if target_dir.exists():
-            raise FileExistsError(f"Theme '{theme_id}' already exists")
-
-        # CSS ファイルの存在確認
-        colors = meta.get("colors", {})
-        light_css = colors.get("light", "colors-light.css")
-        dark_css = colors.get("dark", "colors-dark.css")
-        if not _find_file_in_zip(names, light_css):
-            raise ValueError(f"{light_css} not found in ZIP")
-        if not _find_file_in_zip(names, dark_css):
-            raise ValueError(f"{dark_css} not found in ZIP")
-
-        # 展開は一時ディレクトリへ行い、全ファイル書き終えてから rename する。
-        # 直接 target_dir へ書くと途中で落ちたとき半端なテーマが残り、しかも
-        # 上の重複チェック (target_dir.exists()) が以後の再インストールを
-        # 永久に拒否する (2026-09-05 監査)。
-        staging_dir = themes_dir / f".{theme_id}.installing"
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir, ignore_errors=True)
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        prefix = _detect_zip_prefix(names)
-
-        budget = ExtractBudget(THEME_LIMITS)
-        try:
-            for info, member in members:
-                # ZIP 内のプレフィックスを除去して展開
-                parts = member.parts
-                if prefix and parts[0] == prefix.rstrip("/"):
-                    parts = parts[1:]
-                if not parts:
-                    continue
-                out_path = resolve_under(staging_dir, PurePosixPath(*parts))
-                with zf.open(info) as src:
-                    budget.copy(src, out_path, compressed_size=info.compress_size)
-            staging_dir.rename(target_dir)
-        except Exception:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            raise
-
-    # widget-manifest.json のパース
-    widget_manifest = None
-    manifest_path = target_dir / "widget-manifest.json"
-    if manifest_path.exists():
-        try:
-            widget_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
+    try:
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            theme_id, meta, target_dir = _extract_theme(zf, themes_dir)
+    except (zipfile.BadZipFile, zlib.error, EOFError) as e:
+        raise ValueError(f"Corrupted ZIP file: {e}") from e
 
     result = ThemeInstallResult(
         theme_id=theme_id,
         name=meta.get("name", theme_id),
         version=meta.get("version", "1.0.0"),
         author=meta.get("author", ""),
-        trusted=False,
     )
-    if widget_manifest and "required_apis" in widget_manifest:
-        result["widget_manifest"] = WidgetManifest(
-            required_apis=widget_manifest["required_apis"],
-        )
 
     logger.info("Theme installed: id=%s, name=%s", theme_id, meta.get("name"))
     return result
 
 
-def _detect_theme_id(names: list[str], meta: dict) -> str:
+def _extract_theme(zf: zipfile.ZipFile, themes_dir: Path) -> tuple[str, dict, Path]:
+    """検査してから一時ディレクトリへ展開し、``themes_dir/<theme_id>`` へ rename する。"""
+    # 全エントリを先に検査する (パスの逃げ・予約名・シンボリックリンク・展開後サイズ)。
+    # エントリ名をそのまま展開先に連結しない (docs/c_06 §1.5)。
+    members = [
+        (info, member) for info, member in check_zip_members(zf, THEME_LIMITS)
+        if not _is_os_metadata(member)
+    ]
+    names = [str(member) for _, member in members]
+    prefix = _detect_zip_prefix(names)
+
+    # theme.json はテーマの根 (プレフィックス直下) のものだけを読む
+    meta_file = prefix + "theme.json"
+    if meta_file not in names:
+        raise ValueError("theme.json not found in ZIP")
+
+    meta = json.loads(zf.read(meta_file))
+
+    # バリデーション
+    if not isinstance(meta, dict):
+        raise ValueError("theme.json must be a JSON object")
+    if not meta.get("name") or not isinstance(meta["name"], str):
+        raise ValueError("theme.json missing 'name' field")
+    colors = meta.get("colors")
+    if not colors or not isinstance(colors, dict):
+        raise ValueError("theme.json missing 'colors' field")
+    if not all(isinstance(v, str) for v in colors.values()):
+        raise ValueError("theme.json 'colors' values must be file names")
+
+    # theme_id の決定（ZIP 内のルートディレクトリ名、またはメタデータの name を slug 化）
+    theme_id = _detect_theme_id(prefix, meta)
+
+    if not is_valid_theme_id(theme_id):
+        raise ValueError(f"Invalid theme id: {theme_id!r}")
+
+    # 重複チェック
+    target_dir = themes_dir / theme_id
+    if target_dir.exists():
+        raise FileExistsError(f"Theme '{theme_id}' already exists")
+
+    # CSS ファイルの存在確認 (activate はテーマの根からの相対で読む)
+    for css in (colors.get("light", "colors-light.css"), colors.get("dark", "colors-dark.css")):
+        rel = normalize_member_name(css)
+        if rel is None or prefix + str(rel) not in names:
+            raise ValueError(f"{css} not found in ZIP")
+
+    # 展開は一時ディレクトリへ行い、全ファイル書き終えてから rename する。
+    # 直接 target_dir へ書くと途中で落ちたとき半端なテーマが残り、しかも
+    # 上の重複チェック (target_dir.exists()) が以後の再インストールを
+    # 永久に拒否する (2026-09-05 監査)。作業ディレクトリは要求ごとに一意にする
+    # (固定名だと同じ ID の同時インストールが互いの展開を消す)。
+    themes_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{theme_id}.", suffix=".installing", dir=themes_dir))
+
+    budget = ExtractBudget(THEME_LIMITS)
+    try:
+        for info, member in members:
+            # ZIP 内のプレフィックスを除去して展開
+            parts = member.parts
+            if prefix:
+                parts = parts[1:]
+            if not parts:
+                continue
+            out_path = resolve_under(staging_dir, PurePosixPath(*parts))
+            with zf.open(info) as src:
+                try:
+                    budget.copy(src, out_path, compressed_size=info.compress_size)
+                except FileExistsError as e:
+                    # ZIP 内でファイルとディレクトリが同名。既存テーマとの衝突 (409) ではない
+                    raise UnsafeArchiveError(f"conflicting entries in archive: {member}") from e
+        staging_dir.rename(target_dir)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    return theme_id, meta, target_dir
+
+
+def _is_os_metadata(member: PurePosixPath) -> bool:
+    """macOS の Finder が足す ``__MACOSX/`` と ``._*`` (テーマの中身ではない)。"""
+    return member.parts[0] == "__MACOSX" or member.name.startswith("._")
+
+
+def _detect_theme_id(prefix: str, meta: dict) -> str:
     """ZIP からテーマ ID を推定"""
     # ZIP 内のルートディレクトリ名を使用
-    for name in names:
-        parts = name.replace("\\", "/").split("/")
-        if len(parts) >= 2 and parts[0]:
-            return parts[0]
+    if prefix:
+        return prefix.rstrip("/")
 
     # フォールバック: メタデータの name を slug 化
     name = meta.get("name", "unknown")
@@ -241,22 +259,8 @@ def _detect_theme_id(names: list[str], meta: dict) -> str:
 
 
 def _detect_zip_prefix(names: list[str]) -> str:
-    """ZIP 内の共通プレフィックスを検出"""
-    dirs = set()
-    for name in names:
-        parts = name.replace("\\", "/").split("/")
-        if len(parts) >= 2 and parts[0]:
-            dirs.add(parts[0])
-
-    if len(dirs) == 1:
-        return list(dirs)[0] + "/"
+    """全エントリが 1 つのディレクトリの下にあれば、そのディレクトリ (``"<dir>/"``)。無ければ ``""``"""
+    tops = {name.split("/")[0] for name in names}
+    if len(tops) == 1 and all("/" in name for name in names):
+        return tops.pop() + "/"
     return ""
-
-
-def _find_file_in_zip(names: list[str], filename: str) -> str | None:
-    """ZIP 内でファイル名を検索"""
-    for name in names:
-        basename = name.replace("\\", "/").split("/")[-1]
-        if basename == filename:
-            return name
-    return None

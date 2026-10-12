@@ -311,9 +311,6 @@ class LearningScheduler:
         self._fewshot_pool = None
         #: few-shot の「文脈依存」棄却を覆せる事例ゲート (任意、背景でのみ使う)。
         self._context_bound_gate = None
-        # 品質ゲート 還流パイプ
-        self._feedback_pipe = None
-        self._last_feedback_summary: dict = {}
         # ランタイム注入用 callable / runner
         self._task: asyncio.Task | None = None
         self._user_active_checker = None  # callable: () -> bool
@@ -550,10 +547,7 @@ class LearningScheduler:
         """PolicyEvolver + ExplorationController の状態を永続化する。
 
         ``policy_evolver_state.json`` は **ランタイム評価状態** (fitness_history /
-        decline_count / best_params / survived_count) であり、SemMem の policy ファクト
-        (= 活性化された policy 値) とは別物。semmem モードでも保存する (#8 Part B)。
-        従来は semmem モードでスキップしていたため、rollback の best_params 復元先や
-        昇格用 survived_count が再起動ごとにリセットされていた。
+        decline_count / best_params / survived_count)。
         """
         if self._policy_param_evolver is None:
             return
@@ -575,7 +569,7 @@ class LearningScheduler:
     def save_partition_state(self) -> None:
         """現在のパーティションへ学習状態を書き出す (rebind 前の退避)。
 
-        learning_state / policy_evolver_state / exploration_state / (yaml モードの)
+        learning_state / policy_evolver_state / exploration_state /
         fewshot_pool を ``prompt_manager.prompt_dir`` 配下へ保存する。prompt_dir を
         差し替えた後では旧パスが分からなくなるため、rebind は「退避 → prompt_dir
         差替え → :meth:`rebind_learning_partition`」の順で呼ぶ。
@@ -583,7 +577,7 @@ class LearningScheduler:
         self._save_state()
         self._save_policy_evolver_state()
         pool = self._fewshot_pool
-        if pool is not None and not pool.is_semmem_writeback_active():
+        if pool is not None:
             pool.save(self.prompt_manager.prompt_dir / "fewshot_pool.json")
 
     def rebind_learning_partition(
@@ -599,7 +593,7 @@ class LearningScheduler:
         ``prompt_manager.rebind_prompt_dir`` で prompt_dir を新パーティションへ
         差し替え済であること。ここでは prompt_dir から状態パスを再導出し、
         learning_state / PolicyParamEvolver (+ExplorationController) /
-        FewShotPool / FeedbackPipe / GenerationParamEvolver を新モデルへ再スコープ
+        FewShotPool / GenerationParamEvolver を新モデルへ再スコープ
         して再ロードする。新パーティションが空なら各状態は初期値 (ゼロから学習)。
         Level 1 実行中は呼ばない (``running`` を呼出側で確認する)。
         """
@@ -625,7 +619,6 @@ class LearningScheduler:
 
         evolver = self._policy_param_evolver
         if evolver is not None:
-            evolver.set_base_model_id(base_model_id)
             evolver.reset_evaluation_state()
             evolver.load(prompt_dir / "policy_evolver_state.json")
             exploration = getattr(evolver, "_exploration", None)
@@ -635,15 +628,8 @@ class LearningScheduler:
 
         pool = self._fewshot_pool
         if pool is not None:
-            pool.set_base_model_id(base_model_id)
             pool.reset()
-            if pool.is_semmem_writeback_active():
-                pool.bootstrap_from_semmem()
-            else:
-                pool.load(prompt_dir / "fewshot_pool.json")
-
-        if self._feedback_pipe is not None:
-            self._feedback_pipe.set_base_model_id(base_model_id)
+            pool.load(prompt_dir / "fewshot_pool.json")
 
         if (
             self._generation_param_evolver is not None
@@ -754,39 +740,6 @@ class LearningScheduler:
         """ポリシーパラメータ進化器を設定"""
         self._policy_param_evolver = evolver
         logger.info("Policy param evolver enabled")
-        # 経路 3: feedback_pipe が先に設定済なら即プロバイダを結線
-        self._wire_feedback_success_provider()
-
-    def set_feedback_pipe(self, pipe) -> None:
-        """品質ゲート 還流パイプを設定"""
-        self._feedback_pipe = pipe
-        logger.info(
-            "Feedback pipe enabled=%s", getattr(pipe, "enabled", False),
-        )
-        # FewShotPool / CritiqueSynthesizer が先に注入されていれば同期
-        if pipe is not None:
-            pipe.set_components(
-                fewshot_pool=self._fewshot_pool,
-                critique_synthesizer=self._critique_synthesizer,
-            )
-        self._wire_feedback_success_provider()
-
-    def _wire_feedback_success_provider(self) -> None:
-        """feedback_pipe と policy_param_evolver の両方が揃ったら fitness プロバイダを結線する"""
-        pipe = self._feedback_pipe
-        evolver = self._policy_param_evolver
-        if pipe is None or evolver is None:
-            return
-        if not getattr(pipe, "enabled", False):
-            return
-        evolver.set_semmem_success_provider(
-            pipe.compute_semmem_success_rate,
-            pipe.weight_semmem_success,
-        )
-        logger.info(
-            "Wired feedback_pipe -> policy_evolver success provider (weight=%.2f)",
-            pipe.weight_semmem_success,
-        )
 
     def resolve_idle_task_client(self, llm_client=None):
         """批評合成 / few-shot 品質採点に使うクライアントを解決する。
@@ -1568,11 +1521,8 @@ class LearningScheduler:
         )
         # 「更新した」と書くのは実際に保存したときだけ (以前は Step 14 が
         # ``_cancelled`` で黙って抜けても常に "few-shot pool updated" と出ていた)。
-        gc_summary = side_results.get("fewshot_gc")
         if fewshot_saved:
             fewshot_state = "few-shot pool saved"
-        elif isinstance(gc_summary, dict) and gc_summary.get("delegated_to_semmem"):
-            fewshot_state = "few-shot pool GC delegated to SemMem"
         else:
             fewshot_state = "few-shot pool not saved"
         logger.info(
@@ -2413,9 +2363,6 @@ class LearningScheduler:
             self.reset_yield_event()
             # per-run の critique キャッシュを毎回リセット
             self._last_critique_result = None
-            # Level 1 tick 冒頭で feedback_pipe を実行し、品質ゲート結果を
-            # FewShotPool / 失敗クリティーク / policy fitness プロバイダへ還流する
-            await self._run_feedback_pipe()
             # 進化前に経験から few-shot プールを補充する (f_04 §3)。session
             # snapshot は応答本文を持たない圧縮射影 (L-D3) なので live バッファ
             # から読む。resume 時は同一データの再投入になるが FewShotPool 側の
@@ -2694,21 +2641,6 @@ class LearningScheduler:
                 self._model_stem_at_init, current_stem,
             )
         return True
-
-    async def _run_feedback_pipe(self) -> None:
-        """品質ゲート 還流パイプを実行する
-
-        パイプが未設定 / disabled の場合は何もしない。例外は握り潰して
-        学習サイクル本体の継続を保証する。
-        """
-        pipe = self._feedback_pipe
-        if pipe is None or not getattr(pipe, "enabled", False):
-            return
-        try:
-            summary = await pipe.run(cycle_num=self._level1_run_count)
-            self._last_feedback_summary = summary
-        except Exception as exc:
-            logger.warning("feedback_pipe.run failed: %s", exc)
 
     def _get_filtered_experiences(self) -> list[dict]:
         """経験バッファを dict リストに変換する。
@@ -3673,8 +3605,6 @@ class LearningScheduler:
         """Step 12: PolicyEvolver 評価/書き戻し
 
         ``PolicyParamEvolver.evolve_all()`` を呼び
-        evolve_writeback=semmem の場合は SemMem に新規 ``policy`` ファクト
-        を書き戻す。yaml モードでは
         ``policy_evolver_state.json`` への永続化を行う。
 
         ``_cancelled`` は見ない。全体経路では ``_run_extra_optimizations`` の
@@ -3693,8 +3623,7 @@ class LearningScheduler:
 
         if any(c >= min_for_policy for c in mode_counts.values()):
             logger.info(
-                "Step 12 policy evolver: evolving (experiences: %s, writeback=%s)",
-                mode_counts, self._policy_param_evolver.evolve_writeback,
+                "Step 12 policy evolver: evolving (experiences: %s)", mode_counts,
             )
             policy_results = self._policy_param_evolver.evolve_all(
                 experiences=experiences,
@@ -3719,19 +3648,16 @@ class LearningScheduler:
     ) -> bool:
         """Step 14: Few-shot プール GC
 
-        ``FewShotPool.garbage_collect()`` を呼ぶ。SemMem writeback モード
- では SemMem 側 ``semmem_limits.policy`` +
-        ``gc_strategy=lowest_score`` に GC を委譲するため in-memory プールは
-        触らず、``delegated_to_semmem=True`` を返す。yaml モードではモード別
-        プールを fitness 昇順でソートし ``pool_size`` 超過分を除去する。
+        ``FewShotPool.garbage_collect()`` を呼ぶ。モード別プールを fitness 昇順で
+        ソートし ``pool_size`` 超過分を除去する。
 
-        GC 実行後、yaml モードでは fewshot プールを ``fewshot_pool.json``
+        GC 実行後、fewshot プールを ``fewshot_pool.json``
         へ保存する (旧 ``_level1_finalize`` で行っていた永続化を移動)。
         ``_cancelled`` を見ない理由は :meth:`_step12_policy_evolver` と同じ
         (few-shot プールの保存はここだけなので、飛ばすと補充分が失われる)。
 
         Returns:
-            ``fewshot_pool.json`` へ保存したか (SemMem 委譲・保存失敗・プール無しは False)。
+            ``fewshot_pool.json`` へ保存したか (保存失敗・プール無しは False)。
         """
         if self._fewshot_pool is None:
             return False
@@ -3742,17 +3668,15 @@ class LearningScheduler:
         curate_summary = self._fewshot_pool.curate(self._get_filtered_experiences())
         gc_summary = self._fewshot_pool.garbage_collect()
         gc_summary["curate"] = curate_summary
-        # SemMem 書き戻しモードでは fewshot_pool.json への保存は廃止 (D-3)
-        if not self._fewshot_pool.is_semmem_writeback_active():
-            try:
-                self._fewshot_pool.save(
-                    self.prompt_manager.prompt_dir / "fewshot_pool.json",
-                )
-                saved = True
-            except OSError as exc:
-                logger.warning(
-                    "Step 14 fewshot pool save failed: %s", exc,
-                )
+        try:
+            self._fewshot_pool.save(
+                self.prompt_manager.prompt_dir / "fewshot_pool.json",
+            )
+            saved = True
+        except OSError as exc:
+            logger.warning(
+                "Step 14 fewshot pool save failed: %s", exc,
+            )
         phase_durations["step14_fewshot_gc"] = round(
             time.monotonic() - tp, 3,
         )

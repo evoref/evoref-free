@@ -8,9 +8,10 @@ from pydantic import ValidationError
 
 from backend.app_state import AppState, get_app_state
 from backend.config import get_config, save_config_section
+from backend.config_normalize import NewerConfigVersionError
 from backend.schemas import EvorefConfig
 from backend.edition import current_edition, Edition
-from backend.free.api._error_responses import api_error
+from backend.free.api._error_responses import api_error, api_error_detail
 from backend.free.api.schemas import (
     ConfigFullResponse,
     ConfigUpdateRequest,
@@ -34,11 +35,16 @@ router = APIRouter(prefix="/api/config", tags=["config"])
 # Pro 専用セクション（Free では読み書き不可）
 PRO_ONLY_SECTIONS = {"widget_proxy", "mode_models", "pro"}
 
+#: スキーマに節を持たない透過キー (``extra="allow"``) のうち設定 API が知っている節。
+#: ``mode_models`` は未実装でモデルのパスを値に持つため、Pro でも API からは書けない
+#: (検証だけはできる)。Free では他の Pro 節と同じく 403 ``api.config_pro_only``。
+_API_UNWRITABLE_SECTIONS = frozenset({"mode_models"})
+
 # 機密フィールド（GET 時にマスク）。現状マスク対象なし。
 SENSITIVE_FIELDS: dict[str, list[str]] = {}
 
-# EvorefConfig で定義されたセクション名
-VALID_SECTIONS = set(EvorefConfig.model_fields.keys())
+# EvorefConfig で定義されたセクション名 + 透過キーの節
+VALID_SECTIONS = set(EvorefConfig.model_fields.keys()) | _API_UNWRITABLE_SECTIONS
 
 
 def _mask_sensitive(config: dict) -> dict:
@@ -95,22 +101,29 @@ def _guard_model_paths_immutable(data: dict) -> None:
 CAPABILITY_KEYS: dict[str, tuple[str, ...]] = {
     "local_paths": ("",),
     "runtime": ("fit_params_binary",),
-    "llama": ("extra_args", "speculative.draft_model_path"),
-    "theme": ("trusted",),
+    # host: 推論の送り先 (会話・記憶の本文が載る) を外へ向けられる
+    "llama": ("extra_args", "speculative.draft_model_path", "host"),
+    "embedding": ("llama_host",),
+    # server.host は設定画面が編集する (待ち受けの変更)。到達範囲を開く allow_remote だけ守る
+    "server": ("allow_remote",),
     "rag": ("project_map.roots",),
     "agent": ("dangerous_command_block",),
-    "tools": ("fetch_url_allow_private_ip",),
+    "tools": ("fetch_url_allow_private_ip", "fetch_url_enabled"),
     "widget_proxy": ("apis",),
     "create": ("staged.verify", "runtimes"),
+    "pro": ("hub.export_dir", "hub.signing_key_path", "hub.subscribe_dirs", "policy.pack_path"),
 }
 #: 安全側と見なす真偽値 (この値への変更は許す)。
 _SAFE_BOOL_VALUES: dict[tuple[str, str], bool] = {
     ("agent", "dangerous_command_block"): True,
     ("tools", "fetch_url_allow_private_ip"): False,
+    ("tools", "fetch_url_enabled"): False,
+    ("server", "allow_remote"): False,
 }
 #: 要素を減らす変更だけ許すリスト (信頼の取り消し・許可の縮小)。
 _SHRINK_ONLY_LISTS = frozenset({
-    ("theme", "trusted"), ("llama", "extra_args"), ("rag", "project_map.roots"), ("widget_proxy", "apis"),
+    ("llama", "extra_args"), ("rag", "project_map.roots"), ("widget_proxy", "apis"),
+    ("pro", "hub.subscribe_dirs"),
 })
 _MISSING = object()
 
@@ -239,6 +252,16 @@ def _drop_launch_derived(section: str, data: dict) -> dict:
     return out
 
 
+def _validation_error(e: ValidationError) -> HTTPException:
+    """保存時の検証失敗を 422 ``api.config_validation_failed`` にする (``errors`` は従来の形のまま)。"""
+    errors = [str(err["msg"]) for err in e.errors()]
+    detail = api_error_detail(
+        "E0422", str(e), "api.config_validation_failed", errors="; ".join(errors),
+    )
+    detail["errors"] = errors
+    return HTTPException(status_code=422, detail=detail)
+
+
 # ── 固定パスのエンドポイント（{section} より先に定義） ──
 
 
@@ -324,12 +347,9 @@ async def update_runtime_path(name: str, req: RuntimePathRequest):
     try:
         save_config_section("create", {"runtimes": {name: value}})
     except ValidationError as e:
-        errors = [str(err["msg"]) for err in e.errors()]
-        raise HTTPException(status_code=422, detail={
-            "code": "E0422", "message": str(e),
-            "i18n_key": "", "context": {},
-            "errors": errors,
-        })
+        raise _validation_error(e) from e
+    except NewerConfigVersionError as e:
+        raise _newer_version_error(e) from e
     except Exception as e:
         logger.error("Failed to save create.runtimes.%s: %s", name, e)
         raise api_error(500, "E0500", str(e))
@@ -372,18 +392,13 @@ async def update_config_section(
     section: str, req: ConfigUpdateRequest, state: AppState = Depends(get_app_state),
 ):
     """設定セクション更新"""
-    # セクション名チェック
-    if section not in VALID_SECTIONS:
-        raise api_error(
-            404, "E0404", f"Unknown config section: {section}",
-            "api.config_unknown_section", section=section,
-        )
+    _check_section(section)
 
-    # Free で Pro 専用セクションへの書き込みを拒否
-    if not _is_pro() and section in PRO_ONLY_SECTIONS:
+    if section in _API_UNWRITABLE_SECTIONS:
         raise api_error(
-            403, "E0403", f"Section '{section}' requires Pro edition",
-            "api.config_pro_only", section=section,
+            403, "E0403",
+            f"capability keys cannot be changed via the API: {section}. Edit config.yaml directly.",
+            "api.config_capability_key_protected", keys=section,
         )
 
     # model_paths の model_state 追跡キーは migrate 専用 (config 直書きを遮断)
@@ -402,37 +417,53 @@ async def update_config_section(
             if field in data and data[field] == "***":
                 data[field] = current.get(field, "")
 
+    before = copy.deepcopy(get_config().get(section))
     try:
         save_config_section(section, data)
     except ValidationError as e:
-        errors = [str(err["msg"]) for err in e.errors()]
-        raise HTTPException(status_code=422, detail={
-            "code": "E0422", "message": str(e),
-            "i18n_key": "", "context": {},
-            "errors": errors,
-        })
+        raise _validation_error(e) from e
+    except NewerConfigVersionError as e:
+        raise _newer_version_error(e) from e
     except Exception as e:
         logger.error("Failed to save config section '%s': %s", section, e)
         raise api_error(500, "E0500", str(e))
 
     logger.info("Config section '%s' updated", section)
 
-    # コンポーネント再生成（設定変更を即座に反映）
-    await _reload_components_if_needed(section, state)
+    # コンポーネント再生成（設定変更を即座に反映）。反映できなければ再起動を求める
+    applied = await _reload_components_if_needed(section, state, before)
 
     return ConfigUpdateResponse(
-        section=section, updated=True, restart_required=section not in _RELOAD_HANDLERS,
+        section=section, updated=True,
+        restart_required=section not in _RELOAD_HANDLERS or applied is False,
     )
 
 
-@router.post("/{section}/validate", response_model=ConfigValidateResponse)
-async def validate_config_section(section: str, req: ConfigUpdateRequest):
-    """設定セクションのバリデーションのみ（保存しない）"""
+def _newer_version_error(e: NewerConfigVersionError) -> HTTPException:
+    """新しい版の config.yaml は書き戻さない (409)。"""
+    return api_error(
+        409, "E0409", str(e), "api.config_newer_version", version=e.version,
+    )
+
+
+def _check_section(section: str) -> None:
+    """未知の節は 404、Free の Pro 専用節は 403 (PUT と validate で同じ応答にする)。"""
     if section not in VALID_SECTIONS:
         raise api_error(
             404, "E0404", f"Unknown config section: {section}",
             "api.config_unknown_section", section=section,
         )
+    if not _is_pro() and section in PRO_ONLY_SECTIONS:
+        raise api_error(
+            403, "E0403", f"Section '{section}' requires Pro edition",
+            "api.config_pro_only", section=section,
+        )
+
+
+@router.post("/{section}/validate", response_model=ConfigValidateResponse)
+async def validate_config_section(section: str, req: ConfigUpdateRequest):
+    """設定セクションのバリデーションのみ（保存しない）"""
+    _check_section(section)
 
     # 現在の設定に対象セクションだけマージして検証
     from backend.config import _deep_merge
@@ -460,12 +491,41 @@ _RELOAD_HANDLERS: dict[str, str] = {
     "i18n": "reload_i18n",
 }
 
+#: 埋め込み用 llama-server の起動 (``scripts/launch_llama.py`` の ``_embed_cmd``) に効くキー。
+#: 変わったらクライアントを作り直しても稼働中のサーバとずれるだけなので、差し替えずに再起動を求める。
+_EMBED_SERVER_KEYS = frozenset({
+    "backend", "llama_host", "llama_port", "context_size", "max_length", "pooling", "gpu_layers",
+    "batch_size", "ubatch_size", "threads", "slots", "cache_ram_mib", "launch_args",
+})
 
-async def _reload_components_if_needed(section: str, state: AppState) -> None:
-    """セクション名に応じてコンポーネントを再生成する"""
+
+def _changed_keys(before: object, after: object) -> set[str]:
+    old = before if isinstance(before, dict) else {}
+    new = after if isinstance(after, dict) else {}
+    return {k for k in old.keys() | new.keys() if old.get(k) != new.get(k)}
+
+
+async def _reload_components_if_needed(
+    section: str, state: AppState, before: object = None,
+) -> bool:
+    """セクション名に応じてコンポーネントを再生成する。
+
+    Returns:
+        その場で反映できたか。False なら呼出側は ``restart_required`` を立てる
+        (再生成の失敗・埋め込みサーバの起動に効くキーの変更)。
+    """
     handler_name = _RELOAD_HANDLERS.get(section)
     if handler_name is None:
-        return
+        return False
+
+    if section == "embedding":
+        server_keys = _changed_keys(before, get_config().get("embedding")) & _EMBED_SERVER_KEYS
+        if server_keys:
+            logger.warning(
+                "Embedding server settings changed (%s); restart is required to apply them",
+                ", ".join(sorted(server_keys)),
+            )
+            return False
 
     from backend.free.api.config.component_reload import (
         reload_embedder,
@@ -483,3 +543,5 @@ async def _reload_components_if_needed(section: str, state: AppState) -> None:
         await handler(state)
     except Exception as e:
         logger.error("Component reload failed for section '%s': %s", section, e)
+        return False
+    return True

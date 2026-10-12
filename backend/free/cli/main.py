@@ -436,7 +436,7 @@ def _get_subcommand_handler(name: str):
         from backend.free.cli.projectmap_command import run_projectmap
         return run_projectmap
     if name == "theme":
-        from backend.free.cli.theme_trust_command import run_theme
+        from backend.free.cli.theme_command import run_theme
         return run_theme
     if name == "config":
         from backend.free.cli.config_command import run_config

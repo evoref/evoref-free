@@ -31,7 +31,6 @@ export interface FewShotListResponse {
 	examples: FewShotExample[];
 	archived: FewShotExample[];
 	pool_size: number;
-	writeback: string;
 }
 
 /** `POST /api/learning/fewshot/{id}/{action}` のレスポンス */

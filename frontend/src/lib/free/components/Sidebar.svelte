@@ -2,7 +2,7 @@
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { t } from '$lib/i18n';
-	import { colorMode, toggleColorMode, sidebarCollapsed, layout, themeSlots } from '$lib/free/stores/theme';
+	import { colorMode, toggleColorMode, sidebarCollapsed, layout } from '$lib/free/stores/theme';
 	import { locale, availableLocales, switchLocale, promptLocaleSwitching } from '$lib/i18n';
 	import { isPro, isDevelop, edition } from '$lib/edition';
 	import { appVersion } from '$lib/free/stores/app';
@@ -80,14 +80,6 @@
 				{/if}
 			</nav>
 
-
-			<!-- sidebar_widget スロット -->
-			{#if $themeSlots.sidebar_widget}
-				{@const SidebarWidget = $themeSlots.sidebar_widget}
-				<div class="sidebar-widget-slot">
-					<SidebarWidget />
-				</div>
-			{/if}
 
 			<div class="sidebar-footer">
 				<div class="footer-row">
@@ -299,10 +291,6 @@
 	.debug-badge {
 		color: var(--color-warning);
 		border: 1.5px solid var(--color-warning);
-	}
-	.sidebar-widget-slot {
-		padding: 8px 6px;
-		border-top: 1px solid color-mix(in srgb, var(--sidebar-border) 50%, transparent);
 	}
 	.sidebar-footer {
 		border-top: 1px solid color-mix(in srgb, var(--sidebar-border) 50%, transparent);

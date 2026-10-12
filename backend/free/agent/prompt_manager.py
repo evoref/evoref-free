@@ -508,7 +508,7 @@ class SystemPromptManager:
         初回は既定プロンプトを書く (6 ファイル)。チャット経路で書かないよう、
         宣言済みのモデルの分は配線時にここで作っておく (レビュー L3)。
         few-shot の選択器は引き継がない — 手本はパーティションの学習データで、
-        プールは束ねたモデルの ``learn.fewshot.<model_key>`` にスコープされている
+        プールは束ねたモデルのパーティションの ``fewshot_pool.json`` にある
         (f_04 §1.2.0、別モデルの手本を流用しない)。
         """
         key = os.path.normcase(os.path.abspath(prompt_dir))

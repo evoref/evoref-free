@@ -119,6 +119,11 @@ class FewShotSelector(Protocol):
 FEWSHOT_BLOCK_HEADING = "[参考例]"
 
 
+def fewshot_example_text(example: FewShotExample) -> str:
+    """1 例の本文 (見出しを除く)。注入後に残ったかの照合もこの形で行う。"""
+    return f"User: {example.query}\nAssistant: {example.response}"
+
+
 def format_fewshot_section(examples: list[FewShotExample]) -> str:
     """Few-shot 例をシステムプロンプトに埋め込むテキストにフォーマットする"""
     if not examples:
@@ -126,8 +131,7 @@ def format_fewshot_section(examples: list[FewShotExample]) -> str:
     lines = [f"\n{FEWSHOT_BLOCK_HEADING}\n"]
     for i, ex in enumerate(examples, 1):
         lines.append(f"### Example {i}")
-        lines.append(f"User: {ex.query}")
-        lines.append(f"Assistant: {ex.response}")
+        lines.append(fewshot_example_text(ex))
         lines.append("")
     return "\n".join(lines)
 

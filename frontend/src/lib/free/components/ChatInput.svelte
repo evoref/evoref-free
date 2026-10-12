@@ -32,7 +32,6 @@
 	import { prepareAttachments } from '$lib/free/services/attachments';
 	import { handleApiCall } from '$lib/free/utils/error';
 	import { get } from 'svelte/store';
-	import { themeSlots } from '$lib/free/stores/theme';
 	import { setActiveCreateRun, clearActiveCreateRun } from '$lib/free/stores/createRun';
 	import { reattachCreateRun } from '$lib/free/services/createReattach';
 	import { addToast } from '$lib/free/stores/toast';
@@ -475,11 +474,6 @@
 			>
 				{$t('chat.send')}
 			</button>
-		{/if}
-		<!-- input_suffix スロット -->
-		{#if $themeSlots.input_suffix}
-			{@const InputSuffix = $themeSlots.input_suffix}
-			<InputSuffix />
 		{/if}
 	</div>
 </div>

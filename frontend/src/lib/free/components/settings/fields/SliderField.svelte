@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { t } from '$lib/i18n';
 	import FieldShell from './FieldShell.svelte';
+	import { errorAria } from './fieldA11y';
 
 	interface Props {
 		label: string;
@@ -44,6 +46,7 @@
 			{step}
 			{disabled}
 			oninput={handleInput}
+			{...errorAria(fieldId, error)}
 			class="slider-input"
 		/>
 		<input
@@ -54,6 +57,8 @@
 			{step}
 			{disabled}
 			oninput={handleInput}
+			aria-label={$t(label)}
+			{...errorAria(fieldId, error)}
 			class="number-input"
 			class:field-error={!!error}
 		/>

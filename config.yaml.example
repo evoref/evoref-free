@@ -333,7 +333,6 @@ cli:
 theme:
   active: ''                      # 有効なテーマ ID（空文字列ならテーマ未適用、frontend 既定 CSS で描画）
   color_mode: dark                # dark / light
-  trusted: []                     # 信頼済み外部テーマ ID リスト（slots / cli-modules を有効化したい ID を明示登録）
   cli_layout_mode: auto           # auto / split / sequential
                                   # auto: テーマの cli-theme.json に従う
                                   # split: 画面分割（上部スクロール出力 + 下部固定入力）
@@ -423,7 +422,7 @@ rag:
   # 順位式は 3 ストア (episodic / semantic / corpus) 共通の 1 本:
   #   score = cos × freshness × confidence × store_prior
   # 係数は memory.evidence.ranking.store_prior、corpus のパッケージ別上書きは
-  # <data_root>/store/corpus/manifest.json の store_prior_overrides。
+  # <data_root>/g1/store/corpus/manifest.json の store_prior_overrides。
   # ゲートは **素の cosine のみ** (合成スコアを閾値に流すと store_prior が閾値を
   # 偽装する)。語彙側は numpy CSR の転置索引 (memory.evidence.lexical) が
   # **候補生成器としてだけ** 働き、スコアを持ち込まない。
@@ -1002,23 +1001,9 @@ learning:
   #   見なす最小 confidence。これ未満は YAML 値が温存される。
   #   PolicyInterpreter / LoopFactView / MetaCognitiveAgent / SelfCartridge /
   #   bootstrap_loop_context_at_startup が共通参照する。
-  # - evolve_writeback: 進化結果の書き戻し先
-  #     yaml   : <prompts_dir>/policy_evolver_state.json / fewshot_pool.json (既定)
-  #     semmem : SemMem の policy / fewshot ファクトに書き戻し
   policy:
     source: yaml                      # yaml | hybrid | semmem
     activation_min_confidence: 0.7
-    evolve_writeback: yaml            # yaml | semmem (D-2 で semmem 化予定)
-  # 品質ゲート結果 → 学習サイクル 還流パイプ。ラルフループが SemMem に書く
-  # progress_marker / failure_pattern / artifact を Level 1/2 tick 時に走査し、
-  # FewShotPool / CritiqueSynthesizer / PolicyParamEvolver の fitness へ還流する。
-  feedback_pipe:
-    enabled: false                    # 全経路の ON/OFF (false で走査自体をスキップ)
-    max_scan_per_tick: 50             # 1 tick で走査する SemMem ファクト数上限 (暴走防止)
-    progress_marker_lookback: 20      # 経路 1 で走査する直近 progress_marker 件数
-    failure_pattern_lookback: 30      # 経路 2 で走査する直近 failure_pattern 件数
-    failure_cluster_min_size: 3       # 経路 2 でクラスタとして扱う最小件数
-    weight_semmem_success: 0.3        # 経路 3 の fitness 重み w (0.0-1.0)
   # Level 2 (成長): 回帰台帳・提案キュー・成長の台帳 (docs/f_04 §6)。実際に起きた失敗
   # (検証済みの訂正・👎・決定論の検証器・会話の整合性) を問いごと保存し、学習の資産を
   # 退行から守りながら育てる。重みは触らない。
@@ -1047,8 +1032,7 @@ streaming:
 # 予算は 1 つの関数 (core.prompt_budget.resolve_budgets) が配る。ここは各「上限」の宣言。
 prompt:
   system_max_share: 0.30           # モードの context_size に対する静的 system の上限比 (現行台帳が収まる値。刈り込み後に下げる)
-  fewshot_dynamic_max: 1           # query 依存 few-shot の最大例数 (最後の user へ前置)
-  fewshot_dynamic_max_tokens: 600  # 同ブロックのトークン上限
+  fewshot_dynamic_max_tokens: 600  # query 依存 few-shot ブロック (最後の user へ前置) のトークン上限。例数は learning.fewshot_max_examples
   semmem_max_tokens: 800           # [関連する記憶] ブロックの上限
   rag_max_tokens: 200              # [参考情報] ブロックの上限
   fact_slate_max_tokens: 200       # 押し出したターンの事実スレート (0 で無効)
@@ -1127,6 +1111,7 @@ tools:
   fetch_url_enabled: true         # fetch_url ツールの有効化（true で URL フェッチを許可）
   fetch_url_timeout: 10           # fetch_url のタイムアウト（秒）
   fetch_url_allow_private_ip: false  # true で localhost / private IP / link-local への接続を許可（既定 false で SSRF 対策）
+  # CGNAT (100.64.0.0/10, Tailscale 等) も遮断対象。社内/自宅網の機器を取るときは true
   # ── URL リコール (Phase 1) ──
   # 過去質問で正しく fetch_url できた URL を新規の類似質問で再利用する。
   # 書込は sleep-time の url_curator が担当（補助タスク自己採点）、引き当ては

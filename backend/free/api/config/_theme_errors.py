@@ -2,7 +2,7 @@
 
 `backend/free/api/themes.py` の各ハンドラに散在していた `HTTPException` 構築
 ロジックを集約。元コードでは以下の重複が顕著だった:
-- `KeyError → 404 api.theme_not_found` (3 ハンドラ: activate / delete / trust)
+- `KeyError → 404 api.theme_not_found` (2 ハンドラ: activate / delete)
 - `RuntimeError → 500 api.config_persist_failed` (5 ハンドラ)
 - 各種 ValueError → 400 with i18n key
 
@@ -60,7 +60,7 @@ def theme_error(
 
 
 def theme_not_found_error(theme_id: str) -> HTTPException:
-    """404 `api.theme_not_found` (activate / delete / trust 等で再利用)。"""
+    """404 `api.theme_not_found` (activate / delete で再利用)。"""
     return theme_error(
         status_code=404,
         code="E0404",
@@ -71,7 +71,7 @@ def theme_not_found_error(theme_id: str) -> HTTPException:
 
 
 def config_persist_error(message: str) -> HTTPException:
-    """500 `api.config_persist_failed` (activate / delete / trust / untrust 等)。"""
+    """500 `api.config_persist_failed` (activate / delete 等)。"""
     return theme_error(
         status_code=500,
         code="E0500",
@@ -80,11 +80,13 @@ def config_persist_error(message: str) -> HTTPException:
     )
 
 
-def theme_not_trusted_error() -> HTTPException:
-    """403 `api.theme_not_trusted` (component / cli-module ファイル配信用)。"""
+def config_newer_version_error(version: int) -> HTTPException:
+    """409 `api.config_newer_version` (config.yaml の版がアプリより新しく書き戻さない)。"""
     return theme_error(
-        status_code=403,
-        code="E0403",
-        message="Theme is not trusted",
-        i18n_key="api.theme_not_trusted",
+        status_code=409,
+        code="E0409",
+        message=f"config.yaml has config_version {version}, newer than this evoref; not rewritten",
+        i18n_key="api.config_newer_version",
+        version=version,
     )
+
