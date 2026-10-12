@@ -332,6 +332,9 @@ class MetaCognitiveAgent(
         # user メッセージへ前置できない。ツールループ / コンテンツ生成 / fallback
         # の system に [参考例] として注入し、進化を create 生成へ効かせる。
         self._fewshot_block = fewshot_block
+        # few-shot をどこかのプロンプトへ実際に入れたか。入れなかったターン
+        # (関連度で弾いた / 制作ステージへ委譲した) の経験に選んだ id を刻まない。
+        self.fewshot_injected = False
         # create の制作 (staged/longform) を meta の 1 タスクとして実行する
         # ステージ (f_03 §4.4)。None (chat モード) なら従来の単一ショット生成
         # (``_execute_editor_task`` の単発 ``_generate_content`` フォールバック)。
@@ -2213,6 +2216,7 @@ class MetaCognitiveAgent(
             system_content = system_prompt
             if self._fewshot_block:
                 system_content = f"{system_content}\n\n[参考例]\n{self._fewshot_block}"
+                self.fewshot_injected = True
             messages = [
                 {"role": "system", "content": system_content},
                 *conversation[-4:],

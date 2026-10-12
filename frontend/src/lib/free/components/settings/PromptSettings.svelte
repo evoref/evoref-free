@@ -39,10 +39,8 @@
 		await selectPrompt({ category, id });
 	}
 
-	/** ロールバック実行 */
+	/** ロールバック実行 (確認は executeRollback が 1 回だけ出す) */
 	async function handleRollback(version: number): Promise<void> {
-		const ok = confirm($t('settings.prompts.rollback_confirm', { version }));
-		if (!ok) return;
 		await executeRollback(version);
 	}
 

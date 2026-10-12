@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
@@ -14,6 +16,7 @@ from backend.config import (
     get_path_resolver,
     get_project_root,
 )
+from backend.free.api._error_responses import api_error
 from backend.free.llm._base_client import health_wait_for_cfg
 from backend.log_config import get_logger
 
@@ -33,6 +36,10 @@ class ModeSwitchResponse(BaseModel):
     message: str = ""
 
 
+#: モード切替を直列化する (再起動の途中に別の切替が状態とサーバを取り違えないように)。
+_switch_lock = asyncio.Lock()
+
+
 @router.post("/switch", response_model=ModeSwitchResponse)
 async def switch_mode(
     req: ModeSwitchRequest,
@@ -42,9 +49,15 @@ async def switch_mode(
 
     旧モードと新モードのモデルパスを比較し、異なる場合は
     ``model_changed=True`` を返してベース llama-server を再起動する。
+    再起動に失敗したらモードを旧モードへ戻して 503 ``api.mode_switch_failed`` を返す
+    (同じ切替をもう一度要求できる)。
     """
+    async with _switch_lock:
+        return await _switch_mode_locked(req.mode, state)
+
+
+async def _switch_mode_locked(new_mode: str, state: AppState) -> ModeSwitchResponse:
     old_mode = state.current_mode
-    new_mode = req.mode
 
     if old_mode == new_mode:
         return ModeSwitchResponse(
@@ -71,11 +84,31 @@ async def switch_mode(
     message = f"switched from {old_mode} to {new_mode}"
 
     if model_changed:
-        restart_initiated = await _restart_base_server(state, new_params["model"])
-        message += (
-            ", server restart initiated" if restart_initiated
-            else ", server restart failed"
-        )
+        try:
+            restart_initiated = await _restart_base_server(state, new_params["model"])
+        except Exception as e:
+            logger.error("Base server restart raised during mode switch: %s", e)
+            restart_initiated = False
+        if not restart_initiated:
+            state.current_mode = old_mode
+            get_path_resolver().set_active_mode(old_mode)
+            # 旧サーバは新モデルの起動前に止めている。旧モデルで 1 回だけ起動し直す
+            # (失敗しても再試行・再ロールバックはしない。停止中は server_running=false で返す)
+            server_running = await _restore_previous_server(state, old_params["model"])
+            logger.error(
+                "Mode switch %s -> %s failed (base server restart failed); rolled back to %s "
+                "(previous model server running=%s)",
+                old_mode, new_mode, old_mode, server_running,
+            )
+            raise api_error(
+                503, "E0503",
+                f"Mode switch to {new_mode} failed: base server restart failed. "
+                f"Mode was rolled back to {old_mode}; "
+                f"the {old_mode} model server is {'running' if server_running else 'stopped'}.",
+                "api.mode_switch_failed",
+                mode=new_mode, previous=old_mode, server_running=server_running,
+            )
+        message += ", server restart initiated"
 
     logger.info(
         "Mode switched: %s -> %s (model_changed=%s, restart=%s)",
@@ -90,14 +123,21 @@ async def switch_mode(
     )
 
 
+async def _restore_previous_server(state: AppState, model_path: str) -> bool:
+    """切替の失敗後に旧モードのモデルで base を起動し直す (1 回だけ。例外は False)。"""
+    try:
+        return bool(await _restart_base_server(state, model_path))
+    except Exception as e:
+        logger.error("Restarting the previous base model failed: %s", e)
+        return False
+
+
 async def _restart_base_server(state: AppState, model_path: str) -> bool:
     """ベースサーバーを新モデルで再起動する
 
     Returns:
         再起動が成功したかどうか
     """
-    import asyncio
-
     from backend.free.api.system.server_control import (
         stop_server_process,
         wait_port_released,

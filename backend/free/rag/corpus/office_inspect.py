@@ -25,6 +25,27 @@ _TEMPLATE_MAIN_PARTS: dict[str, tuple[str, str, str]] = {
 }
 
 
+#: 検査で読む 1 パートの展開後の上限。中身を全部メモリへ読むので、zip bomb で止めない。
+_MAX_PART_BYTES = 64 * 1024 * 1024
+
+
+class _PartTooLarge(Exception):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
+def _read_part(zf: zipfile.ZipFile, name: str) -> bytes:
+    """パートを読む。展開後の申告サイズが上限を超えれば :class:`_PartTooLarge`。
+
+    ``ZipExtFile`` は申告サイズより多くは返さない (超えた分は CRC エラー) ので、
+    申告値で断れば実際に読む量も抑えられる。
+    """
+    if zf.getinfo(name).file_size > _MAX_PART_BYTES:
+        raise _PartTooLarge(name)
+    return zf.read(name)
+
+
 def convert_template_extension(content: bytes, ext: str) -> tuple[bytes, str]:
     """``.dotx`` 等を本体形式のバイト列へ変換する (c_16 §4.5.2)。
 
@@ -88,7 +109,7 @@ def inspect_office_file(path: Path | str) -> str | None:
 
             content_types_name = "[Content_Types].xml"
             if content_types_name in names:
-                content_types = zf.read(content_types_name).decode(
+                content_types = _read_part(zf, content_types_name).decode(
                     "utf-8", errors="replace",
                 )
                 if "macroEnabled" in content_types:
@@ -97,6 +118,8 @@ def inspect_office_file(path: Path | str) -> str | None:
             return _external_reference_reason(zf)
     except zipfile.BadZipFile:
         return "not a valid Office (zip) file"
+    except _PartTooLarge as e:
+        return f"part is too large to inspect ({e.name})"
 
 
 #: ``TargetMode="External"`` のとき宛先を問わず拒否する関係の種別 (Type の末尾)
@@ -127,9 +150,9 @@ def _external_reference_reason(zf: zipfile.ZipFile) -> str | None:
         if lowered.startswith(_EXTERNAL_LINK_PART_PREFIX):
             return f"contains an external workbook link part ({name})"
         if lowered.endswith(".rels"):
-            reason = _rels_reason(zf.read(name))
+            reason = _rels_reason(_read_part(zf, name))
         elif lowered.startswith("word/") and lowered.endswith(".xml"):
-            reason = _field_reason(zf.read(name))
+            reason = _field_reason(_read_part(zf, name))
         else:
             continue
         if reason is not None:

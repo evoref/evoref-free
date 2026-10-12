@@ -10,13 +10,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from math import sqrt
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -45,8 +44,7 @@ from backend.free.agent.prompt_utils import (
     format_fewshot_section,  # noqa: F401  (re-export for tests)
 )
 from backend.free.core.leak_reasons import LEAK_REASON_PREFIXES, leak_reason
-from backend.free.core.session_mode import is_valid_session_mode, normalize_session_mode
-from backend.utils import parse_utc, utc_now, utc_now_dt
+from backend.utils import estimate_tokens, parse_utc, utc_now, utc_now_dt
 from backend.free.core.intent_vocab import (
     NUMBER_LITERAL_RE,
     asks_quantity_without_operands,
@@ -80,15 +78,12 @@ from backend.free.core.response_arithmetic import (
     find_sign_contradiction,
 )
 from backend.free.llm.json_schemas import FewShotQualityJudgement
-from backend.free.memory.types import make_fact
 from backend.free.learning.case_filters import grounding_reason
 from backend.free.learning.level0_instant import teaches_success
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
     from backend.debug_logger import DebugLogger
-    from backend.free.memory.types import SemanticFact
-    from backend.free.memory.views.learn import LearnFactView
 
 logger = get_logger("learning.fewshot_pool")
 
@@ -102,13 +97,17 @@ DEFAULT_MIN_FITNESS = 0.7         # プール追加の最低 fitness
 #: 下位切りしか無かった。結果、低品質と採点された例がプールに滞留する
 #: (実データ 2026-08-19、chat 50 件: ``quality_score`` は 0.9 が 28 件 /
 #: 0.95 が 14 件 / 1.0 が 5 件 / **0.1 が 3 件**)。プールが上限に達するまで
-#: 0.1 の 3 件も選択候補に残り、``select`` の重み付きサンプリングでも引かれうる。
+#: 0.1 の 3 件も選択候補に残り、``select_top_k`` の fitness 重み付けでも引かれうる。
 #:
 #: 0.5 は「採点器が明確に低いと言った」帯だけを切る位置。実データの分布は
 #: 0.1 と 0.9 に二極化しており、中間帯を巻き込まない。
 DEFAULT_MIN_QUALITY_SCORE = 0.5
 DEFAULT_MAX_EXAMPLES = 3          # プロンプトに埋め込む最大 Few-shot 数
 DEFAULT_DIVERSITY_THRESHOLD = 0.8  # コサイン類似度の上限（これ以上は重複とみなす）
+#: 1 例 (``User: … / Assistant: …``) のトークン上限。few-shot ブロックの上限
+#: (``prompt.fewshot_dynamic_max_tokens`` の既定 600) を 1 例で超える手本は、注入時に
+#: 必ず切り落とされて選ばれても使われない — それでいて使用実績には数えられていた。
+MAX_EXAMPLE_TOKENS = 600
 
 # _calc_experience_fitness の生スコア = 共有欠陥率 fitness (``fitness.
 # defect_rate_fitness``、[0,1]、1.0 = 欠陥なし) + few-shot 固有ボーナス
@@ -139,7 +138,7 @@ _FITNESS_HI = 1.59
 
 #: few-shot 固有のボーナス項 (共有 ``DEFECT_WEIGHTS`` に無い加減点)。
 #: 手本としての価値 = 「根拠が強い / 停滞せず / 成果物が完走した」を段階的に
-#: 表す連続値で、プールの fitness が 1 点に縮退しないようにする (select の
+#: 表す連続値で、プールの fitness が 1 点に縮退しないようにする (select_top_k の
 #: 重み付け / garbage_collect の lowest-fitness eviction が意味を持つ)。
 #: 欠損シグナル (None / 0 / False) は加点も減点もせず中立。
 FEWSHOT_BONUS_WEIGHTS: dict[str, float] = {
@@ -525,17 +524,38 @@ def _response_carries_system_note(response: str) -> bool:
 #: なので、文字列を各所に散らさず定数で持つ (綴り違いで静かに外れる)。
 REASON_CONTEXT_BOUND = "query depends on the previous turn (anaphora / continuation)"
 
+#: 事例ゲートが :data:`REASON_CONTEXT_BOUND` を覆した例の印 (``FewShotExample._extra``)。
+#: 再判定 (GC / 読込) は埋め込みを呼べないので、採用時の覆しを例に
+#: 持たせて渡す。形式の版を上げないよう未知キーの通路で運ぶ (c_05 §0.4.4)。
+_CONTEXT_BOUND_CLEARED_KEY = "context_bound_cleared"
+
+
+def _context_bound_cleared(example: FewShotExample) -> bool:
+    """採用時に事例ゲートが文脈依存の棄却を覆した例か。"""
+    return bool((example._extra or {}).get(_CONTEXT_BOUND_CLEARED_KEY))
+
+
+def _mark_context_bound_cleared(example: FewShotExample) -> None:
+    example._extra = {**(example._extra or {}), _CONTEXT_BOUND_CLEARED_KEY: True}
+
+
+def _recheck_content(example: FewShotExample) -> str | None:
+    """採用済みの例へ現行の内容ゲートを掛け直す (採用時の覆しを引き継ぐ)。"""
+    return find_content_rejection(
+        example.query, example.response,
+        context_bound_cleared=_context_bound_cleared(example),
+    )
+
 
 def find_content_rejection(
     query: str, response: str, *, context_bound_cleared: bool = False,
 ) -> str | None:
     """few-shot 手本として不適な内容を決定論で判定する (純粋関数)。
 
-    採用経路は 2 つ (``add_from_experiences`` / ``accept_from_artifact``) あり、
-    さらに読込時の浄化 (``_from_payload``) も同じ判定を要る。片方にだけ置くと
-    もう一方が抜け道になる (2026-08-07 監査時点で ``accept_from_artifact`` は
-    全内容ゲートを迂回していた) ため、判定はここに集約して 3 箇所から呼ぶ。
-    ``TestArtifactPathSharesContentGates`` /
+    採用経路 (経験 / 訂正の組) に加えて読込時の浄化 (``_from_payload``) も
+    同じ判定を要る。片方にだけ置くともう一方が抜け道になる (2026-08-07 監査
+    時点で、撤去済みの成果物経路は全内容ゲートを迂回していた) ため、判定は
+    ここに集約して各入口から呼ぶ。
     ``TestBrokenJaSpacingGate::test_load_applies_every_content_gate``
     (:mod:`backend.free.learning.tests.test_fewshot_pool`) が経路ごとに固定する。
 
@@ -654,8 +674,13 @@ def find_content_rejection(
 #: few-shot の目的に直結させることで、正しいが一般化できない例 (その場限りの
 #: 固有値回答等) も相対的に下がる。算術の正誤は決定論側が担当するため、ここでは
 #: 検算を求めない (求めても小型モデルは実行できず、誤答に満点を付ける)。
-#: JSON が壊れた応答から採点値を拾う救済用 (先頭の数値)。
-_BARE_SCORE_RE = re.compile(r"-?\d+(?:\.\d+)?")
+#: JSON が壊れた応答から採点値を拾う救済用。
+#: 「評価軸 (1)…」の番号を採らないよう、``score`` / ``評価`` / ``スコア`` の直後の
+#: 数値だけを拾う。応答が数値だけなら ``_BARE_NUMBER_RE`` で採る。
+_BARE_SCORE_RE = re.compile(
+    r"(?:score|スコア|評価)\s*(?:[:：=は]\s*)?(-?\d+(?:\.\d+)?)", re.IGNORECASE,
+)
+_BARE_NUMBER_RE = re.compile(r"\s*(-?\d+(?:\.\d+)?)\s*")
 
 _QUALITY_SYSTEM_PROMPT = (
     "あなたは few-shot 手本の品質評価者です。"
@@ -676,6 +701,11 @@ _EVICTED_CAP = 2000
 #: 退避した例 (本文ごと保持、``restore`` で戻せる) の上限 (モード別 FIFO)。
 #: 追い出しは削除ではない (f_04 §3.2.2)。墓標は従来どおり立てて自動再採用を防ぐ。
 _ARCHIVED_CAP = 500
+#: curate が訂正から harmful を帰属した訂正ターンの記録の上限 (FIFO)。経験バッファ
+#: (1000 件) から溢れた訂正は格下げを観測できないので、これより多くは要らない。
+_ATTRIBUTED_CORRECTIONS_CAP = 1000
+#: ``_curation._extra`` で運ぶ、帰属済みの訂正ターン id の列のキー。
+_ATTRIBUTED_CORRECTIONS_KEY = "attributed_corrections"
 
 #: 使用実績からの遷移 (f_04 §3.2.2)。
 DEFAULT_STALE_AFTER_DAYS = 30
@@ -705,17 +735,6 @@ FEWSHOT_ATTRIBUTABLE_REASONS: tuple[str, ...] = (
     "length constraint",
     "output form",
 )
-
-# SemMem 書き戻し時の subject prefix
-# ``harness.fewshot.*`` から ``learn.fewshot.*`` に移行済。owner は EvorefLearn。
-LEARN_FEWSHOT_SUBJECT_PREFIX: str = "learn.fewshot."
-"""SemMem 上の Few-shot ファクト subject prefix。
-``learn.fewshot.<mode>.<example_id>`` の形式で書き出す。"""
-
-DEFAULT_FEWSHOT_PREDICATE: str = "example_for"
-"""Few-shot ファクトの predicate (常に固定)"""
-
-EvolveWriteback = Literal["yaml", "semmem"]
 
 
 
@@ -878,28 +897,15 @@ class FewShotPool(VersionedJsonFile):
         *,
         stale_after_days: int = DEFAULT_STALE_AFTER_DAYS,
         harmful_min_uses: int = DEFAULT_HARMFUL_MIN_USES,
-        learn_view: LearnFactView | None = None,
-        semmem_writeback_scope: str = "global",
-        evolve_writeback: EvolveWriteback = "yaml",
-        base_model_id: str = "",
     ) -> None:
         """
         Args:
-            pool_size: モード別最大プールサイズ (yaml モード時のみ有効。
-                semmem モードではプール側 GC を停止し、SemMem 側
-                ``semmem_limits.policy`` + ``gc_strategy=lowest_score`` に委譲)
+            pool_size: モード別最大プールサイズ
             min_fitness: プール追加の最低 fitness
             min_quality_score: GC で無条件に破棄する quality_score の下限
             max_examples: プロンプトに埋め込む最大 Few-shot 数
             diversity_threshold: コサイン類似度の上限
             debug_logger: DebugLogger (任意)
-                bootstrap / SemMem 書込の経路は全て本 view 経由に一本化される。
-                ``evolve_writeback="semmem"`` 時に必須。
-            semmem_writeback_scope: 書き込み先 scope (``global`` または
-                ``project:<id>``)
-            evolve_writeback: ``"yaml"`` (従来動作) / ``"semmem"``
-                (SemMem に新規 fewshot ファクトを書き込み、永続化を SemMem に
-                委譲する)
         """
         self.pool_size = pool_size
         self.min_fitness = min_fitness
@@ -909,14 +915,6 @@ class FewShotPool(VersionedJsonFile):
         self.stale_after_days = max(1, int(stale_after_days))
         self.harmful_min_uses = max(1, int(harmful_min_uses))
         self._debug_logger = debug_logger
-
-        # LearnFactView 経由の writeback に一本化
-        self._learn_view: LearnFactView | None = learn_view
-        self._semmem_writeback_scope: str = semmem_writeback_scope
-        self._evolve_writeback: EvolveWriteback = evolve_writeback
-        # base 学習パーティションの active モデルスラグ。空 = partition 無効
-        # (subject はレガシー ``learn.fewshot.<mode>.<id>`` 形式に縮退)。
-        self._base_model_id: str = base_model_id
 
         # モード別のプール: mode → list[FewShotExample]
         self._pools: dict[str, list[FewShotExample]] = {}
@@ -940,58 +938,18 @@ class FewShotPool(VersionedJsonFile):
         self._archived: dict[str, list[FewShotExample]] = {}
         # curate が最後に集計した経験の timestamp (ISO 8601 UTC)。空 = 未集計。
         self._curation_watermark: str = ""
+        # 訂正から harmful を帰属した訂正ターンの経験 id (挿入順 = FIFO)。
+        # recheck で格下げされたら帰属を戻すために覚えておく。
+        self._attributed_corrections: dict[str, None] = {}
         # 読んだファイルの未知キー (トップ / ``_curation``)。書き戻しで元の位置へ戻す。
         self._payload_extra: dict[str, Any] | None = None
         self._curation_extra: dict[str, Any] | None = None
-
-    # ── SemMem 書き戻しヘルパ ───────────────────────────
-
-    @property
-    def evolve_writeback(self) -> EvolveWriteback:
-        """現在の書き戻しモード"""
-        return self._evolve_writeback
-
-    def is_semmem_writeback_active(self) -> bool:
-        """SemMem 書き戻しが有効かつ LearnFactView が注入済か"""
-        return (
-            self._evolve_writeback == "semmem"
-            and self._learn_view is not None
-        )
-
-    def set_learn_view(
-        self,
-        learn_view: LearnFactView | None,
-        *,
-        writeback_scope: str | None = None,
-        evolve_writeback: EvolveWriteback | None = None,
-    ) -> None:
-        """LearnFactView を動的に差し替える (テスト・lifespan 後注入用)。"""
-        if learn_view is not None:
-            self._learn_view = learn_view
-        if writeback_scope is not None:
-            self._semmem_writeback_scope = writeback_scope
-        if evolve_writeback is not None:
-            self._evolve_writeback = evolve_writeback
-
-    def set_base_model_id(self, base_model_id: str) -> None:
-        """base 学習パーティションの active モデルスラグを差し替える。
-
-        起動時の ``_activate_learning_partition`` と、ランタイム base 切替の
-        ``backend.factory._learning_rebind.rebind_base_learning`` から呼ばれ、以後の
-        writeback / bootstrap が当該モデルの fewshot ファクト
-        (``learn.fewshot.<model>.*``) のみを対象にする。空文字でレガシー縮退。
-        プール内容は差し替えないので、切替時は :meth:`reset` → bootstrap / load
-        で新モデル分を張り直す。
-        """
-        self._base_model_id = base_model_id or ""
 
     def reset(self) -> None:
         """in-memory プールを空にする (パーティション切替で新モデル分を読み直す前に呼ぶ)。
 
         追い出し / 棄却の tombstone も落とす。**残すと前モデルの判定が新モデルの
-        候補を抑止し続ける** — `evolve_writeback="semmem"` 構成の再バインドは
-        `reset()` + `bootstrap_from_semmem()` だけで `load()` を通らないため、
-        tombstone を初期化する経路が他に無い (2026-09-05 監査)。
+        候補を抑止し続ける** (2026-09-05 監査)。
         """
         self._pools = {}
         self._bigram_cache = {}
@@ -1000,192 +958,14 @@ class FewShotPool(VersionedJsonFile):
         self._rejected_hashes = {}
         self._archived = {}
         self._curation_watermark = ""
+        self._attributed_corrections = {}
         self._payload_extra = None
         self._curation_extra = None
-
-    @staticmethod
-    def _build_subject(base_model_id: str, mode: str, example_id: str) -> str:
-        """``learn.fewshot.<model>.<mode>.<example_id>`` 形式の subject を構築する。
-
-        ``base_model_id`` が空のときは partition 無効としてレガシー
-        ``learn.fewshot.<mode>.<example_id>`` (2 段) へ縮退する。
-        """
-        if base_model_id:
-            return f"{LEARN_FEWSHOT_SUBJECT_PREFIX}{base_model_id}.{mode}.{example_id}"
-        return f"{LEARN_FEWSHOT_SUBJECT_PREFIX}{mode}.{example_id}"
-
-    @staticmethod
-    def _example_to_object(example: FewShotExample) -> str:
-        """FewShotExample を SemMem ファクトの object 用 JSON 文字列に変換"""
-        # quality_score も載せる。落とすと再起動ごとに未採点へ戻り、毎回
-        # 採点し直すうえ ``min_quality_score`` の GC が効かなかった
-        # (2026-09-02 監査 R-D3)。
-        return json.dumps(
-            {
-                "query": example.query,
-                "response": example.response,
-                "mode": example.mode,
-                "fitness": float(example.fitness),
-                "added_at": example.added_at,
-                "quality_score": example.quality_score,
-                "quality_scorer_version": example.quality_scorer_version,
-                "source_experience_id": example.source_experience_id,
-                "lang": example.lang,
-            },
-            ensure_ascii=False,
-        )
-
-    @staticmethod
-    def _example_from_fact(fact: SemanticFact) -> FewShotExample | None:
-        """SemMem ファクトから FewShotExample を復元する。
-
-        破損ファクトは ``None`` を返してスキップする。
-        ``id`` は subject 末尾セグメント (``learn.fewshot.<mode>.<id>``) を
-        信頼する
-        """
-        try:
-            payload = json.loads(fact.object)
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        # subject 末尾セグメントを ID として採用
-        subject = fact.subject
-        if not subject.startswith(LEARN_FEWSHOT_SUBJECT_PREFIX):
-            return None
-        rest = subject[len(LEARN_FEWSHOT_SUBJECT_PREFIX):]
-        # rest は新形式 "<model>.<mode>.<id>" または レガシー "<mode>.<id>"。
-        # mode は {chat, create} に限られるため先頭/2 番目セグメントで判別する。
-        segs = rest.split(".")
-        if len(segs) >= 2 and is_valid_session_mode(segs[0]):
-            mode_part, id_part = segs[0], ".".join(segs[1:])
-        elif len(segs) >= 3 and is_valid_session_mode(segs[1]):
-            mode_part, id_part = segs[1], ".".join(segs[2:])
-        else:
-            return None
-        if not id_part:
-            return None
-        raw_score = payload.get("quality_score")
-        quality_score = (
-            float(raw_score) if isinstance(raw_score, (int, float)) else None
-        )
-        return FewShotExample(
-            id=id_part,
-            query=str(payload.get("query") or ""),
-            response=str(payload.get("response") or ""),
-            mode=str(payload.get("mode") or mode_part),
-            fitness=float(payload.get("fitness", 0.0)),
-            added_at=str(payload.get("added_at") or ""),
-            quality_score=quality_score,
-            quality_scorer_version=payload.get("quality_scorer_version"),
-            source_experience_id=str(payload.get("source_experience_id") or ""),
-            lang=str(payload.get("lang") or ""),
-        )
-
-    def _writeback_example_fact(
-        self,
-        example: FewShotExample,
-    ) -> SemanticFact | None:
-        """新規 FewShotExample を SemMem に fewshot ファクトとして書き出す。
-
-        LearnFactView が未注入 / writeback モードが ``yaml`` の場合は
-        ``None`` を返して no-op する。``type="policy"``
-        → ``type="fewshot"`` に変更 (FACT_OWNERSHIP の fewshot 所有権に整合)。
-        """
-        if not self.is_semmem_writeback_active():
-            return None
-        view = self._learn_view
-        assert view is not None  # is_semmem_writeback_active で保証
-
-        subject = self._build_subject(self._base_model_id, example.mode, example.id)
-        fact_mode: str = normalize_session_mode(example.mode)
-        new_fact = make_fact(
-            subject=subject,
-            predicate=DEFAULT_FEWSHOT_PREDICATE,
-            object_=self._example_to_object(example),
-            type="fewshot",
-            scope=self._semmem_writeback_scope,
-            mode_origin=fact_mode,  # type: ignore[arg-type]
-            confidence=float(example.fitness),
-            auto_evolved=True,
-            eval_metric={"fitness": float(example.fitness)},
-        )
-        try:
-            added = view.add_fewshot_fact(new_fact)
-        except ValueError as exc:
-            logger.warning(
-                "fewshot_pool semmem writeback failed: subject=%s err=%s",
-                subject, exc,
-            )
-            return None
-        logger.debug(
-            "fewshot_pool semmem writeback: subject=%s id=%s fitness=%.3f",
-            subject, added.id, example.fitness,
-        )
-        return added
-
-    def bootstrap_from_semmem(self) -> int:
-        """SemMem の ``learn.fewshot.*`` ファクトから in-memory プールを再構築する
-
-        LearnFactView 経由で active な fewshot (legacy の type="policy" も
-        受容) を集め、subject 末尾の ``<mode>.<id>`` をキーにモード別プール
-        へ展開する。同一 ``id`` が複数ストアにあれば最初に見つけたものを
-        優先する。
-
-        Returns:
-            復元した FewShotExample 数の合計
-        """
-        view = self._learn_view
-        if view is None:
-            return 0
-        seen_ids: set[str] = set()
-        loaded = 0
-        # partition 有効時は active モデルの fewshot ファクトのみを hydrate する
-        # (``learn.fewshot.<model>.``)。未知モデルは 0 件 = 空プール = ゼロから学習。
-        # partition 無効時は従来どおり全 fewshot を対象 (レガシー縮退)。
-        prefix = (
-            f"{LEARN_FEWSHOT_SUBJECT_PREFIX}{self._base_model_id}."
-            if self._base_model_id
-            else LEARN_FEWSHOT_SUBJECT_PREFIX
-        )
-        try:
-            facts = view.search_fewshot_by_prefix(prefix)
-        except ValueError:
-            return 0
-        dropped: Counter[str] = Counter()
-        for fact in facts:
-            example = self._example_from_fact(fact)
-            if example is None:
-                continue
-            if example.id in seen_ids:
-                continue
-            # 採用時 / JSON 読込時と同じ内容ゲートを通す。SemMem 経由の復元だけ
-            # 素通しだと、ゲートを増やしても過去分が手本として蘇る
-            # (2026-09-02 監査 R-D3)。
-            reject = find_content_rejection(example.query, example.response)
-            self._log_content_gate(example.query, reject, "semmem_restore")
-            if reject is not None:
-                dropped[reject.split(":")[0]] += 1
-                continue
-            seen_ids.add(example.id)
-            pool = self._pools.setdefault(example.mode, [])
-            pool.append(example)
-            # dedup ハッシュをプールと同期 (#6 整合)
-            self._seen_hashes.setdefault(example.mode, set()).add(
-                self._content_hash(example.query, example.response),
-            )
-            loaded += 1
-        if dropped:
-            logger.warning(
-                "Dropped %d stale fewshot example(s) on semmem bootstrap: %s",
-                sum(dropped.values()), dict(dropped),
-            )
-        if loaded:
-            logger.info(
-                "fewshot_pool bootstrap_from_semmem: loaded=%d pools=%s",
-                loaded, {m: len(p) for m, p in self._pools.items()},
-            )
-        return loaded
+        # 前パーティションのファイルの readonly を新パーティションへ持ち越さない
+        # (持ち越すと新パーティションの保存が黙って拒否され続ける)。
+        self.readonly = False
+        self._readonly_transient = False
+        self.last_status = None
 
     @property
     def total_count(self) -> int:
@@ -1299,8 +1079,10 @@ class FewShotPool(VersionedJsonFile):
             # ような散文を返す。裸の数値から拾う (sleep-time キュレーターの
             # coerce_bare_score と同じ救済。pillar 境界 (learn → mem 配下の
             # _curator_common) を越えられないため最小実装を持つ)。
-            m = _BARE_SCORE_RE.search(content or "")
-            raw = m.group(0) if m else None
+            m = _BARE_SCORE_RE.search(content or "") or _BARE_NUMBER_RE.fullmatch(
+                content or "",
+            )
+            raw = m.group(1) if m else None
         if raw is None:
             logger.debug(
                 "fewshot quality scoring: unparseable response: %s", content[:120],
@@ -1313,10 +1095,6 @@ class FewShotPool(VersionedJsonFile):
         if not 0.0 <= score <= 1.0:
             return None
         return score
-
-    def get_pool(self, mode: str) -> list[FewShotExample]:
-        """指定モードのプール全体を返す"""
-        return list(self._pools.get(mode, []))
 
     @staticmethod
     def _dense_similarities(
@@ -1353,7 +1131,8 @@ class FewShotPool(VersionedJsonFile):
         if embedder is None:
             return 0
         filled = 0
-        for mode, pool in self._pools.items():
+        # 埋め込みを await する間に採用 / reset でプールの dict が変わりうる
+        for mode, pool in list(self._pools.items()):
             targets = [ex for ex in pool if not ex.embedding and ex.query.strip()]
             if not targets:
                 continue
@@ -1372,6 +1151,23 @@ class FewShotPool(VersionedJsonFile):
         if filled:
             logger.info("fewshot embedding backfill: %d example(s) embedded", filled)
         return filled
+
+    def drop_embeddings(self) -> int:
+        """全例の埋め込みを捨てる (埋め込みモデルの差し替え時)。
+
+        旧モデルの空間のベクトルが残ると、次元が同じなら縮退にも掛からず
+        類似度だけが狂う。捨てた例は ``backfill_embeddings`` まで bi-gram で選ばれる。
+
+        Returns:
+            埋め込みを捨てた例の数。
+        """
+        dropped = 0
+        for bucket in (*self._pools.values(), *self._archived.values()):
+            for ex in bucket:
+                if ex.embedding is not None:
+                    ex.embedding = None
+                    dropped += 1
+        return dropped
 
     def _get_bigrams(self, example: FewShotExample) -> Counter:
         """例の bi-gram を取得（キャッシュ付き）"""
@@ -1405,8 +1201,8 @@ class FewShotPool(VersionedJsonFile):
     def _try_accept(self, example: FewShotExample) -> FewShotExample | None:
         """候補 1 件の採否判定 + 採用処理を一手に行う (両投入経路で共有)。
 
-        手順: 厳密重複 dedup → 多様性チェック → append → SemMem 書き戻し →
-        プールサイズ GC (yaml モードのみ)。採用なら ``example`` を、棄却なら
+        手順: 厳密重複 dedup → 多様性チェック → append →
+        プールサイズ GC。採用なら ``example`` を、棄却なら
         ``None`` を返す。``_seen_hashes`` はプール内 example と 1:1 に保つ。
         """
         pool = self._pools.setdefault(example.mode, [])
@@ -1418,16 +1214,17 @@ class FewShotPool(VersionedJsonFile):
             return None
         if not self._is_diverse(example, pool):
             return None
+        if estimate_tokens(
+            f"User: {example.query}\nAssistant: {example.response}",
+        ) > MAX_EXAMPLE_TOKENS:
+            return None
 
         if not example.state_since:
             example.state_since = utc_now()
         pool.append(example)
         seen.add(h)
-        self._writeback_example_fact(example)
 
-        # プールサイズ制限: SemMem 書き戻しモードでは GC を SemMem 側
-        # (semmem_limits.policy + gc_strategy=lowest_score) に委譲し局所 GC を停止。
-        if len(pool) > self.pool_size and not self.is_semmem_writeback_active():
+        if len(pool) > self.pool_size:
             self._trim_to_size(example.mode, pool, reason="size")
         return example
 
@@ -1490,8 +1287,8 @@ class FewShotPool(VersionedJsonFile):
         ファイル生成を誘発した)。したがって「何を通し、何を落としたか」を
         記録しておく価値が最も高い。
 
-        入口は 4 つあり (``experience`` / ``corrected_pair`` / ``artifact`` /
-        ``semmem_restore``)、どれか 1 つが抜け道になる事故を過去に起こして
+        入口は複数あり (``experience`` / ``corrected_pair`` など)、どれか 1 つが
+        抜け道になる事故を過去に起こして
         いるので、``entry_point`` を context に載せて入口別に数えられるように
         する。
         """
@@ -1512,6 +1309,38 @@ class FewShotPool(VersionedJsonFile):
             )
         except Exception as e:  # pragma: no cover - ログで採否を落とさない
             logger.debug("fewshot content gate decision log failed: %s", e)
+
+    def _archive_revoked_sources(
+        self, experiences: list[dict], corrected_ids: set[str],
+    ) -> int:
+        """採用後に誤りと分かった経験 (検証済みの訂正の宛先 / 👎) の手本を退避する。
+
+        採用時の門は採用の瞬間の経験しか見ないので、後から付いた訂正・👎 は
+        ``source_experience_id`` を辿らない限り手本に届かない。pinned は残す
+        (自動の遷移をすべてバイパスする、f_04 §3.2.2)。
+
+        Returns:
+            退避した件数。
+        """
+        negative_ids = {
+            str(exp.get("id") or "")
+            for exp in experiences
+            if exp.get("id") and (exp.get("signals") or {}).get("user_negative") is True
+        }
+        reasons = {str(i): "corrected" for i in corrected_ids}
+        reasons.update({i: "user_negative" for i in negative_ids if i not in reasons})
+        if not reasons:
+            return 0
+        archived = 0
+        for mode, pool in self._pools.items():
+            for ex in list(pool):
+                reason = reasons.get(ex.source_experience_id)
+                if reason is None or ex.pinned:
+                    continue
+                pool.remove(ex)
+                self._archive(mode, ex, reason)
+                archived += 1
+        return archived
 
     def add_from_experiences(
         self,
@@ -1540,11 +1369,14 @@ class FewShotPool(VersionedJsonFile):
         # 参照できないため…」という注記込みの応答をユーザーが「その注記は間違い」
         # と訂正したのに、その応答が正例としてプールに残り、訂正後の正解は GC で
         # 消えていた。宛先は記録時に ``corrected_entry_id`` で確定している。
+        # 宛先にするのは検証済みの訂正だけ (候補の段階では使わない、不変則 #12)。
         corrected_ids = {
             (exp.get("signals") or {}).get("corrected_entry_id")
             for exp in experiences
+            if (exp.get("signals") or {}).get("user_correction")
         }
         corrected_ids.discard(None)
+        self._archive_revoked_sources(experiences, corrected_ids)
         for exp in experiences:
             signals = exp.get("signals", {})
             fitness = _calc_experience_fitness(signals)
@@ -1615,9 +1447,9 @@ class FewShotPool(VersionedJsonFile):
             ):
                 continue
 
+            bound_cleared = query in cleared
             reject = find_content_rejection(
-                query, response,
-                context_bound_cleared=query.strip() in cleared,
+                query, response, context_bound_cleared=bound_cleared,
             )
             self._log_content_gate(query, reject, "experience")
             if reject is not None:
@@ -1625,7 +1457,10 @@ class FewShotPool(VersionedJsonFile):
                     "Rejecting fewshot candidate (%s): query=%s",
                     reject, query[:50],
                 )
-                self._rejected_hashes.setdefault(mode, set()).add(h)
+                # 文脈依存の棄却は事例ゲートの確認しだいで覆る (warmup 前・未配線の
+                # tick がある) ので、内容だけで決まる棄却のキャッシュに入れない。
+                if reject != REASON_CONTEXT_BOUND:
+                    self._rejected_hashes.setdefault(mode, set()).add(h)
                 continue
 
             example = FewShotExample(
@@ -1639,6 +1474,8 @@ class FewShotPool(VersionedJsonFile):
                 source_experience_id=str(exp.get("id") or ""),
                 lang=str(exp.get("lang") or ""),
             )
+            if bound_cleared and refers_to_previous_turn(query):
+                _mark_context_bound_cleared(example)
 
             if self._try_accept(example) is not None:
                 added += 1
@@ -1704,8 +1541,23 @@ class FewShotPool(VersionedJsonFile):
                 mode=pair.mode,
                 fitness=self._CORRECTED_PAIR_FITNESS,
                 added_at=pair.timestamp,
-                source_experience_id=getattr(pair, "experience_id", "") or "",
+                source_experience_id=pair.experience_id,
             )
+            # 同じ問いの既存例は訂正で誤りと確定した側なので、多様性で弾かれる
+            # のではなく置き換える。別の問いの近似重複は従来どおり弾く。
+            pool = self._pools.get(pair.mode, [])
+            key = query.lower()
+            same_query = [
+                ex for ex in pool
+                if ex.query.strip().lower() == key and not ex.pinned
+            ]
+            if same_query:
+                others = [ex for ex in pool if ex not in same_query]
+                if not self._is_diverse(example, others):
+                    continue
+                for ex in same_query:
+                    pool.remove(ex)
+                    self._archive(pair.mode, ex, "superseded")
             if self._try_accept(example) is not None:
                 added += 1
         if added:
@@ -1752,119 +1604,6 @@ class FewShotPool(VersionedJsonFile):
                 keep.append(ex)
             self._pools[pair.mode] = keep
         return removed
-
-    def accept_from_artifact(
-        self,
-        *,
-        query: str,
-        response: str,
-        mode: str = "create",
-        fitness: float,
-        added_at: str = "",
-    ) -> FewShotExample | None:
-        """ラルフループの成果物 (task.content + artifact) を Few-shot 候補として採否判定する。
-
-        シグナルから fitness を計算するのに対し、本メソッドは SemMem の
-        ``progress_marker`` (gate_passed=true) + ``task`` + ``artifact`` から
-        算出された fitness を外部から受け取り、閾値・多様性・プールサイズ
-        制限・SemMem 書き戻しを既存ロジックで共有する。
-
-        Returns:
-            採用された ``FewShotExample``。閾値未達 / 多様性不足時は ``None``。
-        """
-        query = (query or "").strip()
-        response = (response or "").strip()
-        if not query or not response:
-            return None
-        if fitness < self.min_fitness:
-            return None
-        # 内容ゲートは経験経路と共有する。こちらだけ素通りにすると、同じ崩れが
-        # ラルフループ経由でプールに入る抜け道になる (2026-08-07 監査で発見)。
-        reject = find_content_rejection(query, response)
-        self._log_content_gate(query, reject, "artifact")
-        if reject is not None:
-            logger.info(
-                "Rejecting fewshot artifact candidate (%s): query=%s",
-                reject, query[:50],
-            )
-            return None
-
-        example = FewShotExample(
-            query=query,
-            response=response,
-            mode=mode,
-            fitness=float(fitness),
-            added_at=added_at,
-        )
-        accepted = self._try_accept(example)
-        if accepted is None:
-            return None
-
-        dl = self._debug_logger
-        if dl:
-            dl.log_learning_cycle(cycle_num=0, data={
-                "component": "fewshot_pool",
-                "op": "accept_from_artifact",
-                "mode": mode,
-                "fitness": float(fitness),
-                "example_id": accepted.id,
-                "pool_size": len(self._pools.get(mode, [])),
-            })
-        return accepted
-
-    def select(
-        self,
-        mode: str,
-        n: int | None = None,
-        seed: int | None = None,
-    ) -> list[FewShotExample]:
-        """指定モードから多様な候補をランダム選択する
-
-        Args:
-            mode: 対象モード
-            n: 選択数（デフォルト: max_examples）
-            seed: 乱数シード
-
-        Returns:
-            選択された候補リスト
-        """
-        n = n or self.max_examples
-        pool = self._pools.get(mode, [])
-        if not pool:
-            return []
-        if len(pool) <= n:
-            return list(pool)
-
-        rng = np.random.default_rng(seed)
-        # fitness による重み付きサンプリング（高 fitness を優先）。
-        # 全ゼロ fitness (bootstrap で fitness 欠損=0.0 復元等) だと sum=0 →
-        # 0/0=NaN で rng.choice がクラッシュする。非ゼロ重み数 < size でも
-        # replace=False で ValueError。これらを一様重みにフォールバックして防ぐ。
-        size = min(n, len(pool))
-        fitnesses = np.array([ex.fitness for ex in pool], dtype=float)
-        fitnesses = np.nan_to_num(fitnesses, nan=0.0, posinf=0.0, neginf=0.0)
-        fitnesses = np.clip(fitnesses, 0.0, None)
-        total = float(fitnesses.sum())
-        nonzero = int((fitnesses > 0).sum())
-        if total <= 0.0 or nonzero < size:
-            weights = np.full(len(pool), 1.0 / len(pool))
-        else:
-            weights = fitnesses / total
-        indices = rng.choice(len(pool), size=size, replace=False, p=weights)
-        selected = [pool[i] for i in indices]
-
-        dl = self._debug_logger
-        if dl:
-            dl.log_learning_cycle(cycle_num=0, data={
-                "component": "fewshot_pool",
-                "op": "select",
-                "mode": mode,
-                "pool_size": len(pool),
-                "requested": n,
-                "selected_ids": [ex.id for ex in selected],
-                "selected_fitnesses": [ex.fitness for ex in selected],
-            })
-        return selected
 
     def select_top_k(
         self,
@@ -1971,6 +1710,48 @@ class FewShotPool(VersionedJsonFile):
         reason = str(signals.get("turn_outcome_reason") or "")
         return any(reason.startswith(p) for p in FEWSHOT_ATTRIBUTABLE_REASONS)
 
+    def _remember_attributed_correction(self, exp_id: str) -> None:
+        self._attributed_corrections[exp_id] = None
+        while len(self._attributed_corrections) > _ATTRIBUTED_CORRECTIONS_CAP:
+            del self._attributed_corrections[next(iter(self._attributed_corrections))]
+
+    def _revert_demoted_corrections(
+        self,
+        exp_by_id: dict[str, dict],
+        by_id: dict[str, tuple[str, FewShotExample]],
+    ) -> int:
+        """帰属後に検証の再チェック (``recheck_promoted``) で格下げされた訂正の
+        harmful を戻す。訂正ターンがバッファから溢れたものは戻せないので忘れる。
+
+        Returns:
+            harmful を戻した例の延べ数。
+        """
+        reverted = 0
+        for exp_id in list(self._attributed_corrections):
+            exp = exp_by_id.get(exp_id)
+            if exp is None:
+                del self._attributed_corrections[exp_id]
+                continue
+            signals = exp.get("signals") or {}
+            if signals.get("user_correction"):
+                continue
+            del self._attributed_corrections[exp_id]
+            target = exp_by_id.get(str(signals.get("corrected_entry_id") or ""))
+            ids = ((target or {}).get("gen_config") or {}).get("fewshot_ids") or []
+            if len(ids) > self.max_examples:
+                continue
+            for eid in ids:
+                hit = by_id.get(str(eid))
+                if hit is not None and hit[1].harmful > 0:
+                    hit[1].harmful -= 1
+                    reverted += 1
+        if reverted:
+            logger.info(
+                "Fewshot curate: reverted %d harmful mark(s) from demoted corrections",
+                reverted,
+            )
+        return reverted
+
     def curate(self, experiences: list[dict], now: str | None = None) -> dict:
         """経験から使用実績を導出し、stale / archived の遷移を掛ける (Step 14)。
 
@@ -1992,16 +1773,12 @@ class FewShotPool(VersionedJsonFile):
 
         Returns:
             件数の dict (``scanned`` / ``attributed`` / ``marked_stale`` /
-            ``reactivated`` / ``archived_harmful`` / ``delegated_to_semmem``)。
+            ``reactivated`` / ``archived_harmful``)。
         """
         counts = {
             "scanned": 0, "attributed": 0, "marked_stale": 0,
             "reactivated": 0, "archived_harmful": 0,
-            "delegated_to_semmem": False,
         }
-        if self.is_semmem_writeback_active():
-            counts["delegated_to_semmem"] = True
-            return counts
 
         by_id: dict[str, tuple[str, FewShotExample]] = {
             ex.id: (mode, ex)
@@ -2013,31 +1790,65 @@ class FewShotPool(VersionedJsonFile):
         exp_by_id = {
             str(exp.get("id") or ""): exp for exp in experiences if exp.get("id")
         }
+        now_dt = parse_utc(now) if now else utc_now_dt()
+        now_iso = now or utc_now()
+        cutoff = now_dt.timestamp() - self.stale_after_days * 86400
 
-        def _attribute(exp: dict, *, verdict: str | None, ts: str) -> None:
-            """``verdict``: "helpful" / "harmful" / None (使用だけ数える)。"""
+        def _attribute(
+            exp: dict, *, verdict: str | None, ts: str, count_use: bool = True,
+        ) -> int:
+            """``verdict``: "helpful" / "harmful" / None (使用だけ数える)。
+
+            ``count_use=False`` は使用を数えず ``harmful`` だけを積む (訂正からの
+            帰属: そのターンの使用は訂正された側の走査で数え済み)。
+            """
             ids = (exp.get("gen_config") or {}).get("fewshot_ids") or []
             # 旧レコードはプール全体 (50 件) を刻んでいた。注入数を超える列は
             # 帰属できないので飛ばす (c_05 §5.2)。
             if not ids or len(ids) > self.max_examples:
-                return
+                return 0
+            hits = 0
             for eid in ids:
                 hit = by_id.get(str(eid))
                 if hit is None:
                     continue
                 _, ex = hit
-                ex.use_count += 1
-                if not ex.last_used_at or (
-                    (a := parse_utc(ts)) is not None
-                    and (b := parse_utc(ex.last_used_at)) is not None
-                    and a > b
-                ):
-                    ex.last_used_at = ts
+                if count_use:
+                    ex.use_count += 1
+                    if not ex.last_used_at or (
+                        (a := parse_utc(ts)) is not None
+                        and (b := parse_utc(ex.last_used_at)) is not None
+                        and a > b
+                    ):
+                        ex.last_used_at = ts
                 if verdict == "harmful":
                     ex.harmful += 1
                 elif verdict == "helpful":
                     ex.helpful += 1
                 counts["attributed"] += 1
+                hits += 1
+            return hits
+
+        # 訂正からの harmful は検証の後でしか決まらない。未検証の訂正候補を走査
+        # 済みにすると、後で昇格しても帰属されない — 最古の候補の手前で止める。
+        # 検証されないまま ``stale_after_days`` を過ぎた候補は待たない (aux が
+        # 無い構成で集計が止まり続けないように)。
+        hold_dt = None
+        for exp in experiences:
+            signals = exp.get("signals") or {}
+            if (
+                signals.get("correction_candidate") is None
+                or signals.get("correction_verified_at")
+                or signals.get("user_correction")
+            ):
+                continue
+            ts_dt = parse_utc(str(exp.get("timestamp") or ""))
+            if ts_dt is None or ts_dt.timestamp() <= cutoff:
+                continue
+            if watermark_dt is not None and ts_dt <= watermark_dt:
+                continue
+            if hold_dt is None or ts_dt < hold_dt:
+                hold_dt = ts_dt
 
         for exp in experiences:
             ts = str(exp.get("timestamp") or "")
@@ -2045,6 +1856,8 @@ class FewShotPool(VersionedJsonFile):
             if ts_dt is None:
                 continue
             if watermark_dt is not None and ts_dt <= watermark_dt:
+                continue
+            if hold_dt is not None and ts_dt >= hold_dt:
                 continue
             counts["scanned"] += 1
             if latest_dt is None or ts_dt > latest_dt:
@@ -2065,15 +1878,15 @@ class FewShotPool(VersionedJsonFile):
             if signals.get("user_correction") and target_id:
                 target = exp_by_id.get(str(target_id))
                 if target is not None:
-                    _attribute(target, verdict="harmful", ts=ts)
+                    hits = _attribute(target, verdict="harmful", ts=ts, count_use=False)
+                    if hits and exp.get("id"):
+                        self._remember_attributed_correction(str(exp["id"]))
 
         if latest_raw:
             self._curation_watermark = latest_raw
+        self._revert_demoted_corrections(exp_by_id, by_id)
 
         # 遷移
-        now_dt = parse_utc(now) if now else utc_now_dt()
-        now_iso = now or utc_now()
-        cutoff = now_dt.timestamp() - self.stale_after_days * 86400
         for mode, pool in list(self._pools.items()):
             total_uses = sum(ex.use_count for ex in pool)
             total_harmful = sum(ex.harmful for ex in pool)
@@ -2152,12 +1965,14 @@ class FewShotPool(VersionedJsonFile):
             for ex in bucket:
                 if ex.id != example_id:
                     continue
-                bucket.remove(ex)
                 h = self._content_hash(ex.query, ex.response)
-                self._evicted_hashes.get(mode, {}).pop(h, None)
                 seen = self._seen_hashes.setdefault(mode, set())
+                # 同じ内容が既にプールにあるなら戻さない。退避と墓標は残す
+                # (先に退避から外すと、戻せなかった例が消える)。
                 if h in seen:
                     return False
+                bucket.remove(ex)
+                self._evicted_hashes.get(mode, {}).pop(h, None)
                 ex.state, ex.state_since = "active", utc_now()
                 self._pools.setdefault(mode, []).append(ex)
                 seen.add(h)
@@ -2167,42 +1982,15 @@ class FewShotPool(VersionedJsonFile):
     def garbage_collect(self) -> dict:
         """Few-shot プール全体に対する明示的 GC を実行する。
 
-        sleep-time scheduler の **Step 14** から呼び出される。動作モードは
-        ``evolve_writeback`` 設定で切り替わる:
-
-        - ``yaml`` (従来動作): (1) ``quality_score`` が
-          ``min_quality_score`` 未満の example を **サイズに関わらず** 除去し、
-          (2) 残りが ``pool_size`` を超える分を実効 fitness の低い順に除去する。
-          除去した example は ``_bigram_cache`` からも追い出す。
-        - ``semmem``: GC は SemMem 側 ``semmem_limits.policy``
-          + ``gc_strategy=lowest_score`` に委譲されるため、本メソッドは
-          in-memory プールに触れず ``delegated_to_semmem=True`` を返す
-          (no-op + ログのみ)。
+        sleep-time scheduler の **Step 14** から呼び出される。(1) ``quality_score`` が
+        ``min_quality_score`` 未満の example を **サイズに関わらず** 除去し、
+        (2) 残りが ``pool_size`` を超える分を実効 fitness の低い順に除去する。
+        除去した example は ``_bigram_cache`` からも追い出す。
 
         Returns:
             ``{"removed_per_mode": {mode: int}, "removed_total": int,
-              "remaining_per_mode": {mode: int}, "delegated_to_semmem": bool}``
+              "remaining_per_mode": {mode: int}}``
         """
-        if self.is_semmem_writeback_active():
-            remaining = {m: len(p) for m, p in self._pools.items()}
-            logger.info(
-                "Step 14 fewshot GC: delegated to SemMem (semmem_limits.policy)",
-            )
-            dl = self._debug_logger
-            if dl:
-                dl.log_learning_cycle(cycle_num=0, data={
-                    "component": "fewshot_pool",
-                    "op": "garbage_collect",
-                    "delegated_to_semmem": True,
-                    "remaining_per_mode": remaining,
-                })
-            return {
-                "removed_per_mode": {},
-                "removed_total": 0,
-                "remaining_per_mode": remaining,
-                "delegated_to_semmem": True,
-            }
-
         removed_per_mode: dict[str, int] = {}
         for mode, pool in self._pools.items():
             removed_count = 0
@@ -2212,15 +2000,14 @@ class FewShotPool(VersionedJsonFile):
             #    浄化 (``_from_payload``) と同じ判定で、再起動を待たずに効かせる。
             stale = [
                 ex for ex in pool
-                if not ex.pinned
-                and find_content_rejection(ex.query, ex.response) is not None
+                if not ex.pinned and _recheck_content(ex) is not None
             ]
             for ex in stale:
                 pool.remove(ex)
                 self._archive(mode, ex, "content_gate")
                 logger.info(
                     "Step 14 fewshot GC: evicted by content gate (%s): query=%s",
-                    find_content_rejection(ex.query, ex.response), ex.query[:50],
+                    _recheck_content(ex), ex.query[:50],
                 )
             removed_count += len(stale)
 
@@ -2261,7 +2048,6 @@ class FewShotPool(VersionedJsonFile):
             dl.log_learning_cycle(cycle_num=0, data={
                 "component": "fewshot_pool",
                 "op": "garbage_collect",
-                "delegated_to_semmem": False,
                 "removed_per_mode": removed_per_mode,
                 "removed_total": removed_total,
                 "remaining_per_mode": remaining,
@@ -2270,7 +2056,6 @@ class FewShotPool(VersionedJsonFile):
             "removed_per_mode": removed_per_mode,
             "removed_total": removed_total,
             "remaining_per_mode": remaining,
-            "delegated_to_semmem": False,
         }
 
     # ── 永続化 (VersionedJsonFile) ──
@@ -2284,9 +2069,15 @@ class FewShotPool(VersionedJsonFile):
         unknown = sorted(set(self._pools) - set(_POOL_MODES))
         if unknown:
             logger.warning("Fewshot pool has undeclared mode(s) %s; they are not saved", unknown)
+        curation_extra = dict(self._curation_extra or {})
+        if self._attributed_corrections:
+            # 形式の版を上げないよう未知キーの通路で運ぶ (c_05 §0.4.4)。
+            curation_extra[_ATTRIBUTED_CORRECTIONS_KEY] = list(self._attributed_corrections)
         curation = (
-            FewShotCuration(watermark=self._curation_watermark, _extra=self._curation_extra)
-            if self._curation_watermark or self._curation_extra else None
+            FewShotCuration(
+                watermark=self._curation_watermark, _extra=curation_extra or None,
+            )
+            if self._curation_watermark or curation_extra else None
         )
         return codec_for(FewShotPoolFile).encode(FewShotPoolFile(
             chat=self._pools.get("chat", []),
@@ -2325,6 +2116,8 @@ class FewShotPool(VersionedJsonFile):
         new_pools: dict[str, list[FewShotExample]] = {}
         new_hashes: dict[str, set[str]] = {}
         dropped: Counter[str] = Counter()
+        # ゲートに落ちた例は消さずに退避へ回す (UI から restore できる、f_04 §3.2.2)。
+        gate_archived: dict[str, list[FewShotExample]] = {}
         # 初見の時計は now (f_04 §3.2.2): 旧ファイルの例は使用実績を持たないので、
         # ``added_at`` を anchor にすると最初の tick で一斉に stale になる。
         loaded_at = utc_now()
@@ -2342,10 +2135,12 @@ class FewShotPool(VersionedJsonFile):
                 # 自然に消えるよう、採用時と同じ判定を通す。件数と理由を必ず
                 # ログへ出す (黙って削らない)。
                 reject = (
-                    None if ex.pinned else find_content_rejection(ex.query, ex.response)
+                    None if ex.pinned else _recheck_content(ex)
                 )
                 if reject is not None:
                     dropped[reject.split(":")[0]] += 1
+                    ex.state, ex.state_since = "archived", loaded_at
+                    gate_archived.setdefault(mode, []).append(ex)
                     continue
                 if not ex.state_since:
                     ex.state_since = loaded_at
@@ -2360,6 +2155,8 @@ class FewShotPool(VersionedJsonFile):
             bucket = examples(entries)
             if bucket:
                 archived[str(mode)] = bucket[-_ARCHIVED_CAP:]
+        for mode, moved in gate_archived.items():
+            archived[mode] = (archived.get(mode, []) + moved)[-_ARCHIVED_CAP:]
         # 二重 load / bootstrap 後 load で旧モードが残らないよう全状態を差し替える。
         self._pools = new_pools
         self._seen_hashes = new_hashes
@@ -2368,10 +2165,21 @@ class FewShotPool(VersionedJsonFile):
             mode: {h: None for h in hashes[-_EVICTED_CAP:]}
             for mode, hashes in head._evicted.items()
         }
+        for mode, moved in gate_archived.items():
+            tomb = self._evicted_hashes.setdefault(mode, {})
+            for ex in moved:
+                tomb[self._content_hash(ex.query, ex.response)] = None
+            while len(tomb) > _EVICTED_CAP:
+                del tomb[next(iter(tomb))]
         self._archived = archived
         curation = head._curation
         self._curation_watermark = curation.watermark if curation is not None else ""
-        self._curation_extra = curation._extra if curation is not None else None
+        curation_extra = dict(curation._extra or {}) if curation is not None else {}
+        attributed = curation_extra.pop(_ATTRIBUTED_CORRECTIONS_KEY, None)
+        self._attributed_corrections = {
+            str(i): None for i in attributed[-_ATTRIBUTED_CORRECTIONS_CAP:]
+        } if isinstance(attributed, list) else {}
+        self._curation_extra = curation_extra or None
         self._payload_extra = head._extra
         if malformed:
             logger.warning(
@@ -2379,7 +2187,7 @@ class FewShotPool(VersionedJsonFile):
             )
         if dropped:
             logger.warning(
-                "Dropped %d stale fewshot example(s) on load: %s",
+                "Archived %d stale fewshot example(s) on load: %s",
                 sum(dropped.values()), dict(dropped),
             )
 

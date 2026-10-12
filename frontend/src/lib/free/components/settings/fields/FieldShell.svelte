@@ -12,9 +12,11 @@
 	 * @param error - エラーメッセージ (空文字なら非表示)
 	 * @param forId - <label for> に渡す ID。指定なしなら <span> でレンダリングする
 	 *                (ToggleField のように label が input と紐づかないケース用)
+	 *                エラー行の ID は `${forId}-error` (コントロールの aria-describedby が指す。fieldErrorId)
 	 */
 	import type { Snippet } from 'svelte';
 	import { t } from '$lib/i18n';
+	import { fieldErrorId } from './fieldA11y';
 
 	interface Props {
 		label: string;
@@ -38,7 +40,7 @@
 		<span class="field-desc">{$t(description)}</span>
 	{/if}
 	{#if error}
-		<span class="field-error-msg">{error}</span>
+		<span class="field-error-msg" role="alert" id={forId ? fieldErrorId(forId) : undefined}>{error}</span>
 	{/if}
 </div>
 

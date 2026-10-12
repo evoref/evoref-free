@@ -21,7 +21,7 @@
 	</div>
 
 	{#if errors.length > 0}
-		<div class="section-errors">
+		<div class="section-errors" role="alert">
 			{#each errors as err}
 				<p class="error-line">{err}</p>
 			{/each}

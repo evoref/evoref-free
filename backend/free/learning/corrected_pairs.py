@@ -44,7 +44,7 @@ from backend.free.core.intent_vocab import (
     asks_quantity_without_operands,
     is_plain_statement,
 )
-from backend.free.learning.level0_instant import is_unlabeled, teaches_via_verified_correction
+from backend.free.learning.level0_instant import teaches_via_verified_correction
 
 #: 訂正後の回答の先頭に付く謝罪・受諾の前置き。1 文単位で繰り返し剥がす。
 _PREAMBLE_SENTENCE_RE = re.compile(
@@ -101,16 +101,12 @@ class CorrectedPair:
     correction: str
     mode: str
     timestamp: str = ""
-    #: 訂正前の (誤った) 回答。判定・ログ用で、手本には使わない。
-    wrong_response: str = ""
     #: 検証器 (``learning.correction_verifier``) が確定した「正しい値」の逐語
     #: span。空でなければ期待語はここから採る (字句の否定境界に頼らない)。
     correct_value: str = ""
-    #: 訂正後の回答に **接地の疑義** がある (根拠台帳 f_04 §2.2: calculate の式に
-    #: 問い・文脈に無い数値 / 式の構造的疑義 / 根拠の無い日付演算)。手本には
-    #: 従来どおり流すが、eval_core (期待値) には採らない — 局所の検証を
-    #: 全体の正しさへ昇格させない。
-    grounding_suspect: bool = False
+    #: 訂正ターン (訂正後の回答を返したターン) の ``ExperienceEntry.id``。手本の
+    #: ``source_experience_id`` になり、手本から会話へ戻る ID 連鎖を繋ぐ (c_05 §0.6)。
+    experience_id: str = ""
 
     @property
     def pair_id(self) -> str:
@@ -118,21 +114,6 @@ class CorrectedPair:
             f"{self.query.strip()}\x00{self.response.strip()}".encode("utf-8"),
             digest_size=6,
         ).hexdigest()
-
-
-def grounding_is_suspect(signals: dict) -> bool:
-    """根拠台帳 (``FeedbackSignals``) に接地の疑義があるか。未判定 (None) は疑わない。
-
-    ラベル無し (理由付きの success、docs/f_04 §2.5 — 未実行の変更操作・create の
-    未検査を含む) も疑う: 訂正ペアとして手本にはしてよいが、eval_core の期待値には
-    しない。
-    """
-    return bool(
-        signals.get("unexplained_numbers")
-        or signals.get("expression_issues")
-        or signals.get("unexplained_date_math")
-        or is_unlabeled(signals)
-    )
 
 
 def strip_correction_preamble(response: str) -> str:
@@ -330,8 +311,11 @@ def build_corrected_pairs(
     評価ケースにもしない。訂正で 1 つ直しても別の欠陥を持ち込んだ回答を
     「正しい回答」として再生産すると、few-shot が壊れた形を増幅する
     (2026-09-06 監査 F-05)。ラベル無しの訂正ターンはペアにする (手本は検証済みの
-    訂正) が ``grounding_suspect`` にして eval_core へは渡さない (docs/f_04 §2.5)。
+    訂正、docs/f_04 §2.5)。
     """
+    # case_filters が本モジュールを import するので関数内で読む (循環 import)。
+    from backend.free.learning.case_filters import grounding_reason
+
     pairs: dict[str, CorrectedPair] = {}
     scoped = [
         e for e in experiences
@@ -344,6 +328,10 @@ def build_corrected_pairs(
             continue
         correction = signals.get("user_correction")
         if signals.get("truncated", False):
+            continue
+        # 訂正後の回答がツール結果 / 文書チャンクを根拠にしていれば、値はその問いの
+        # もので文体ではない。成功経験の経路 (``add_from_experiences``) と同じ門。
+        if grounding_reason(exp) is not None:
             continue
         prev = resolve_corrected_turn(scoped, i)
         if prev is None:
@@ -365,11 +353,8 @@ def build_corrected_pairs(
             correction=str(correction).strip(),
             mode=str(exp.get("mode") or "chat"),
             timestamp=str(exp.get("timestamp") or ""),
-            wrong_response=str(
-                prev.get("response_full") or prev.get("response_summary") or ""
-            ),
             correct_value=correct_value,
-            grounding_suspect=grounding_is_suspect(signals),
+            experience_id=str(exp.get("id") or ""),
         )
         pairs[pair.pair_id] = pair
     return list(pairs.values())
@@ -421,6 +406,7 @@ def build_demoted_pairs(experiences: list[dict], mode: str | None = None) -> lis
             mode=str(exp.get("mode") or "chat"),
             timestamp=str(exp.get("timestamp") or ""),
             correct_value=str(signals.get("correction_correct_value") or "").strip(),
+            experience_id=str(exp.get("id") or ""),
         )
         pairs[pair.pair_id] = pair
     return list(pairs.values())

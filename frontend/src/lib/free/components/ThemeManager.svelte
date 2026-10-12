@@ -11,22 +11,16 @@
 	import { getThemes, uninstallThemeApi } from '$lib/free/api';
 	import { get } from 'svelte/store';
 	import { onMount } from 'svelte';
-	import ThemeTrustDialog from './ThemeTrustDialog.svelte';
 	import { handleApiCall } from '$lib/free/utils/error';
 	import Badge from './ui/Badge.svelte';
 	import Button from './ui/Button.svelte';
 	import ConfirmDialog from './ui/ConfirmDialog.svelte';
 	import EmptyState from './ui/EmptyState.svelte';
 
-	// 信頼確認ダイアログの状態
-	let trustDialogTheme: ThemeInfo | null = $state(null);
 	let pendingDelete: ThemeInfo | null = $state(null);
 	let deleting = $state(false);
 
 	let activeTheme = $derived($availableThemes.find((th) => th.active) ?? null);
-	let hasUntrustedCode = $derived(
-		$availableThemes.some((th) => th.has_components && !th.trusted && !th.builtin)
-	);
 
 	onMount(() => {
 		refreshThemes();
@@ -39,26 +33,6 @@
 		});
 		if (data) {
 			availableThemes.set(data.themes ?? []);
-		}
-	}
-
-	async function handleActivate(theme: ThemeInfo) {
-		// 外部テーマでコンポーネントを含み、未信頼 → 信頼確認ダイアログを表示
-		if (theme.has_components && !theme.trusted && !theme.builtin) {
-			trustDialogTheme = theme;
-			return;
-		}
-		await doActivate(theme.theme_id);
-	}
-
-	// 信頼の付与は API からはできない (docs/c_11 §1)。ダイアログは端末での手順を案内し、
-	// ここでは「コードなしで適用」と「キャンセル」だけを扱う。
-	function handleApplyWithoutCode() {
-		const themeToApply = trustDialogTheme;
-		trustDialogTheme = null;
-		// 信頼なしでアクティベート（colors + layout のみ、スロット無効）
-		if (themeToApply) {
-			doActivate(themeToApply.theme_id);
 		}
 	}
 
@@ -103,18 +77,6 @@
 	}
 </script>
 
-{#if trustDialogTheme}
-	<ThemeTrustDialog
-		themeId={trustDialogTheme.theme_id}
-		themeName={trustDialogTheme.name}
-		themeAuthor={trustDialogTheme.author}
-		themeVersion={trustDialogTheme.version}
-		componentCount={trustDialogTheme.component_count}
-		onApplyWithoutCode={handleApplyWithoutCode}
-		onCancel={() => (trustDialogTheme = null)}
-	/>
-{/if}
-
 {#if pendingDelete}
 	<ConfirmDialog
 		title={$t('theme_manager.uninstall_confirm_title')}
@@ -157,11 +119,6 @@
 							{#if theme.active}
 								<Badge tone="strong">{$t('theme_manager.active')}</Badge>
 							{/if}
-							{#if theme.has_components && !theme.builtin}
-								<Badge tone={theme.trusted ? 'default' : 'muted'}>
-									{theme.trusted ? $t('theme_manager.trusted') : $t('theme_manager.untrusted_code')}
-								</Badge>
-							{/if}
 						</span>
 						<span class="meta">
 							{theme.author ? `${theme.author} · ` : ''}v{theme.version}
@@ -172,7 +129,7 @@
 					</div>
 					<div class="row-actions">
 						{#if !theme.active}
-							<Button size="sm" onclick={() => handleActivate(theme)}>
+							<Button size="sm" onclick={() => doActivate(theme.theme_id)}>
 								{$t('theme_manager.activate')}
 							</Button>
 						{/if}
@@ -183,9 +140,6 @@
 				</li>
 			{/each}
 		</ul>
-		{#if hasUntrustedCode}
-			<p class="trust-hint">{$t('theme_manager.trust_hint')}</p>
-		{/if}
 	{/if}
 </div>
 
@@ -269,11 +223,6 @@
 		align-items: center;
 		gap: var(--space-1);
 		flex-shrink: 0;
-	}
-	.trust-hint {
-		margin: var(--space-3) 0 0;
-		color: var(--text-secondary);
-		font-size: var(--font-size-sm);
 	}
 	@media (max-width: 600px) {
 		.theme-item {

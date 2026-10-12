@@ -17,13 +17,13 @@
 
 	/** 入力中の値 (null = 編集していない → 保存済みの値を出す) */
 	let edited = $state<string | null>(null);
-	/** この欄から保存した値 (設定の再読込を待たずに基準にする) */
-	let lastSaved = $state<string | null>(null);
 	let busy = $state(false);
 	let error = $state<string | null>(null);
 	let justSaved = $state(false);
 
-	let current = $derived(lastSaved ?? value);
+	// 基準は常に props の値 (saveLaunchArgs が保存後に configData を更新する)。
+	// 保存した値を別に握ると、別経路の更新 (再読込・環境調整) の後も古い値を出し続ける
+	let current = $derived(value);
 	let draft = $derived(edited ?? current);
 	let changed = $derived(draft.trim() !== current.trim());
 
@@ -47,7 +47,6 @@
 		const next = draft.trim();
 		try {
 			await saveLaunchArgs(target, next);
-			lastSaved = next;
 			edited = null;
 			justSaved = true;
 		} catch (e) {

@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { t } from '$lib/i18n';
 	import FieldShell from './FieldShell.svelte';
+	import { errorAria } from './fieldA11y';
 
 	interface Props {
 		label: string;
@@ -29,9 +31,65 @@
 	}: Props = $props();
 
 	const fieldId = `nf-${Math.random().toString(36).slice(2, 10)}`;
+
+	/** 入力中の値が範囲外のときのエラー (確定 (change) で範囲内へ丸めて消す) */
+	let rangeError = $state('');
+	let shownError = $derived(error || rangeError);
+
+	function parse(text: string): number {
+		const raw = parseFloat(text);
+		return step === 1 ? Math.round(raw) : raw;
+	}
+
+	function inRange(v: number): boolean {
+		return (min === undefined || v >= min) && (max === undefined || v <= max);
+	}
+
+	function clamp(v: number): number {
+		if (min !== undefined && v < min) return min;
+		if (max !== undefined && v > max) return max;
+		return v;
+	}
+
+	function rangeMessage(): string {
+		if (min !== undefined && max !== undefined) return $t('settings.field.range_between', { min, max });
+		if (min !== undefined) return $t('settings.field.range_min', { min });
+		return $t('settings.field.range_max', { max: max ?? '' });
+	}
+
+	/** 入力中: 範囲内の数値だけを反映する (空欄・範囲外は dirty にしない) */
+	function handleInput(e: Event & { currentTarget: HTMLInputElement }) {
+		const v = parse(e.currentTarget.value);
+		if (isNaN(v)) {
+			rangeError = '';
+			return;
+		}
+		if (!inRange(v)) {
+			rangeError = rangeMessage();
+			return;
+		}
+		rangeError = '';
+		onchange(v);
+	}
+
+	/** 確定: 空欄は元の値へ戻し、範囲外は範囲内へ丸めて反映する */
+	function handleCommit(e: Event & { currentTarget: HTMLInputElement }) {
+		const input = e.currentTarget;
+		const v = parse(input.value);
+		rangeError = '';
+		if (isNaN(v)) {
+			input.value = value === null ? '' : String(value);
+			return;
+		}
+		if (!inRange(v)) {
+			const clamped = clamp(v);
+			input.value = String(clamped);
+			onchange(clamped);
+		}
+	}
 </script>
 
-<FieldShell {label} {description} {error} forId={fieldId}>
+<FieldShell {label} {description} error={shownError} forId={fieldId}>
 	<input
 		id={fieldId}
 		type="number"
@@ -41,13 +99,11 @@
 		{min}
 		{max}
 		{step}
-		oninput={(e) => {
-			const raw = parseFloat(e.currentTarget.value);
-			const v = step === 1 ? Math.round(raw) : raw;
-			if (!isNaN(v)) onchange(v);
-		}}
+		oninput={handleInput}
+		onchange={handleCommit}
+		{...errorAria(fieldId, shownError)}
 		class="field-input"
-		class:field-error={!!error}
+		class:field-error={!!shownError}
 	/>
 </FieldShell>
 

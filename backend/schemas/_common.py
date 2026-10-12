@@ -9,6 +9,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.config_normalize import reject_retired_keys
 from backend.log_config import get_logger
 
 logger = get_logger("config")
@@ -135,8 +136,15 @@ class ThemeConfig(BaseModel):
 
     active: str = ""
     color_mode: str = Field(default="dark", pattern=r"^(dark|light)$")
-    trusted: list[str] = Field(default_factory=list)
     cli_layout_mode: str = Field(default="auto", pattern=r"^(auto|split|sequential)$")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_keys(cls, data: object) -> object:
+        """撤去したキー (``trusted``) を normalize の案内付きで拒否する (c_05 §7.6)。"""
+        if isinstance(data, dict):
+            reject_retired_keys("theme", data)
+        return data
 
 
 class CLITimeoutsConfig(BaseModel):
@@ -509,7 +517,7 @@ class ProcessManagerConfig(BaseModel):
     #: GGUF のサイズ連動 (15 秒/GB、下限 120・上限 600、c_16 §7.2.3)。
     health_timeout: int | Literal["auto"] | None = "auto"
     #: SIGTERM 後のグレースフル終了待機 (秒)。
-    stop_timeout: int = 10
+    stop_timeout: int = Field(default=10, ge=1, le=600)
 
 
 class AutoServeConfig(BaseModel):

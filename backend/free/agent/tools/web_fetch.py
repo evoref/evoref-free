@@ -7,15 +7,14 @@
 from __future__ import annotations
 
 import asyncio
-import socket
 
-from ipaddress import ip_address
 from urllib.parse import urljoin, urlparse
 from backend.free.constants import (
     FETCH_BLOCKED_PREFIX,
     FETCH_ERROR_PREFIX,
     FETCH_UNRESOLVED_HOST_PREFIX,
 )
+from backend.free.core.url_guard import UnresolvedHostError, UnsafeUrlError, public_addresses
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
 
@@ -55,28 +54,30 @@ _FETCH_URL_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 async def _validate_fetch_url(url: str, *, allow_private_ip: bool) -> str | None:
     """fetch_url の URL を検証する。エラー時はユーザー向け文字列、安全なら None。
 
-    theme_installer.install_from_url の検証パターンをミラー。名前解決は
-    イベントループの executor で行い、応答パスをブロックしない。
+    宛先の判定は共通部品 :func:`~backend.free.core.url_guard.public_addresses`
+    (``is_global``。CGNAT / NAT64 / IPv4-mapped も落とす、解決できない名前は拒否)。
+    名前解決はワーカースレッドで行い、応答パスをブロックしない。
     """
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+    except ValueError as e:  # 角括弧の中が IP でない等
+        return f"Error: Invalid URL: {e}"
     if parsed.scheme not in _FETCH_URL_ALLOWED_SCHEMES:
         return f"Error: Unsupported URL scheme: {parsed.scheme!r}"
-    if not parsed.hostname:
+    if not hostname:
         return "Error: URL has no hostname"
     if allow_private_ip:
         return None
     try:
-        loop = asyncio.get_running_loop()
-        resolved = await loop.getaddrinfo(parsed.hostname, None)
-    except socket.gaierror as e:
-        return f"{FETCH_UNRESOLVED_HOST_PREFIX} {parsed.hostname!r}: {e}"
-    for _, _, _, _, sockaddr in resolved:
-        addr = ip_address(sockaddr[0])
-        if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
-            return (
-                f"{FETCH_BLOCKED_PREFIX} "
-                "(set tools.fetch_url_allow_private_ip: true to override)"
-            )
+        await asyncio.to_thread(public_addresses, hostname)
+    except UnresolvedHostError as e:
+        return f"{FETCH_UNRESOLVED_HOST_PREFIX} {hostname!r}: {e.__cause__ or e}"
+    except UnsafeUrlError:
+        return (
+            f"{FETCH_BLOCKED_PREFIX} "
+            "(set tools.fetch_url_allow_private_ip: true to override)"
+        )
     return None
 
 

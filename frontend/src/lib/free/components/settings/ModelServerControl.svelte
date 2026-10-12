@@ -8,14 +8,14 @@
 	 * 行えるようにするのが目的 (旧: 開発ページの ServerStatus を種別ごとに分割移設)。
 	 *
 	 * 状態・操作中スピナーは ServerStatus と同じグローバルストア
-	 * (serverState / vramStatus / busyServer) を共有し、ポーリングは +layout 側で駆動する。
+	 * (serverState / vramStatus / busyServers) を共有し、ポーリングは +layout 側で駆動する。
 	 * embed サーバーの ServerName は "embed" (埋め込みモデルの migrate 種別 "embedding"
 	 * とは別語) なので、埋め込みモデル欄では server="embed" を渡す。
 	 * リランカー (server="rerank") は /api/status の components に載らないので、接続は
 	 * rerank.connected (/api/status ごとの /health) で見る。
 	 */
 	import { t } from '$lib/i18n';
-	import { serverState, systemHealth, refreshServerStatus, busyServer } from '$lib/free/stores/server';
+	import { serverState, systemHealth, refreshServerStatus, busyServers } from '$lib/free/stores/server';
 	import { vramStatus, refreshVramStatus } from '$lib/free/stores/vram';
 	import { startServer, stopServer } from '$lib/free/api';
 	import type { ServerName, VramModelInfo } from '$lib/free/api';
@@ -35,7 +35,7 @@
 			? ($systemHealth?.rerank?.connected ?? false)
 			: ($serverState.components[SERVER_INDEX[server]]?.connected ?? false)
 	);
-	let busy = $derived($busyServer === server);
+	let busy = $derived($busyServers[server] ?? false);
 
 	// 補助タスクのオンデマンド常駐 (docs/c_14 §1.2)。停止は設計どおりの状態なので、
 	// 未接続 (灰ランプ) を「異常」と読み違えないようラベルで理由を添える。
@@ -66,7 +66,7 @@
 	}
 
 	async function handleStart(force: boolean) {
-		busyServer.set(server);
+		busyServers.update((b) => ({ ...b, [server]: true }));
 		try {
 			const result = await handleApiCall(() => startServer(server, force), {
 				fallbackKey: 'sidebar.start_failed',
@@ -74,12 +74,12 @@
 			startFailed = Boolean(result && !result.success);
 			await refresh();
 		} finally {
-			busyServer.set(null);
+			busyServers.update((b) => ({ ...b, [server]: false }));
 		}
 	}
 
 	async function handleStop() {
-		busyServer.set(server);
+		busyServers.update((b) => ({ ...b, [server]: true }));
 		try {
 			await handleApiCall(() => stopServer(server), {
 				fallbackKey: 'sidebar.stop_failed',
@@ -87,7 +87,7 @@
 			startFailed = false;
 			await refresh();
 		} finally {
-			busyServer.set(null);
+			busyServers.update((b) => ({ ...b, [server]: false }));
 		}
 	}
 </script>

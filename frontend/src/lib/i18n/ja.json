@@ -89,7 +89,6 @@
 		"knowledge_sources": "知識取得元",
 		"audit_trail": "監査証跡",
 		"themes": "テーマ管理",
-		"knowledge": "知識ベース",
 		"settings": "設定",
 		"dashboard": "ダッシュボード",
 		"fewshot": "学習手本",
@@ -501,6 +500,7 @@
 			"distribution": "{n} 件のベクトルに基づく。マッチ top1 p50={matchp50}、無関係 p95={bgp95}。",
 			"apply": "適用",
 			"applied": "閾値を適用しました。",
+			"applied_restart_required": "閾値を保存しました。反映にはバックエンドの再起動が必要です。",
 			"dismiss": "閉じる",
 			"insufficient": "較正に必要なベクトル数が不足しています（{n}）。先に reindex してください。",
 			"no_vectors": "ベクトルがありません。先に reindex してください。"
@@ -595,7 +595,8 @@
 		},
 		"tools": {
 			"fetch_url_enabled": "URL取得",
-			"fetch_url_timeout": "URLタイムアウト (秒)"
+			"fetch_url_timeout": "URLタイムアウト (秒)",
+			"fetch_url_reenable_note": "画面からは再び有効にできません。有効にするには config.yaml の tools.fetch_url_enabled を true に変更してください。"
 		},
 		"widget_proxy": {
 			"enabled": "有効",
@@ -627,6 +628,7 @@
 			"history": "履歴",
 			"rollback": "ロールバック",
 			"rollback_confirm": "バージョン {version} にロールバックしますか？",
+			"rollback_discard_confirm": "未保存の編集を破棄して、バージョン {version} にロールバックしますか？",
 			"rolled_back": "バージョン {version} にロールバックしました",
 			"rollback_failed": "ロールバックに失敗しました",
 			"no_history": "履歴がありません",
@@ -655,7 +657,25 @@
 			"save": "保存",
 			"saved_restart": "保存しました。サーバーを再起動すると反映されます。",
 			"create_shared_note": "クリエイトモデルはベースモデルと同じサーバーで動き、起動オプションもベースモデルのものを使います。"
-		}
+		},
+		"leave_confirm": "未保存の変更があります。破棄してこのページを離れますか？",
+		"applied_partial_restart_required": "一部の設定は保存しました。反映にはバックエンドの再起動が必要です",
+		"error": {
+			"readonly": "データが読み取り専用のため保存できません",
+			"forbidden": "この設定は画面から変更できません (config.yaml で変更してください)",
+			"not_found": "この設定セクションは保存できません (バックエンドのエディションが違う可能性があります)",
+			"invalid": "値が正しくありません",
+			"server": "保存に失敗しました ({code})",
+			"network": "バックエンドに接続できませんでした"
+		},
+		"field": {
+			"on": "オン",
+			"off": "オフ",
+			"range_between": "{min} から {max} の範囲で入力してください",
+			"range_min": "{min} 以上で入力してください",
+			"range_max": "{max} 以下で入力してください"
+		},
+		"server_changed_discarded": "別の操作でサーバ側の値が変わったため、次の未保存の編集を破棄しました: {keys}"
 	},
 	"file": {
 		"attach": "ファイル追加",
@@ -674,19 +694,10 @@
 		"installing": "インストール中...",
 		"uninstall": "アンインストール",
 		"activate": "適用",
-		"trusted": "コードあり・信頼済み",
 		"no_themes": "テーマがありません。右上の「インストール」から .zip のテーマを追加できます。",
 		"install_failed": "テーマのインストールに失敗しました",
 		"activate_failed": "テーマの適用に失敗しました",
 		"uninstall_failed": "テーマのアンインストールに失敗しました",
-		"trust_title": "テーマの信頼確認",
-		"trust_theme_name": "テーマ名",
-		"trust_author": "作者",
-		"trust_version": "バージョン",
-		"trust_components": "コンポーネント数",
-		"trust_cli_required": "このテーマはカスタムコードを含みます。コードを有効にするには、ターミナルで次のコマンドを実行してください (画面からは信頼を付与できません)。",
-		"trust_cli_restart": "実行後、evoref を再起動すると有効になります。今はコードなしで色とレイアウトだけを適用できます。",
-		"trust_apply_without_code": "コードなしで適用",
 		"active": "適用中",
 		"preview_alt": "{name} のプレビュー",
 		"no_preview": "プレビューなし",
@@ -694,8 +705,6 @@
 		"current": "現在のテーマ",
 		"none": "テーマなし (標準)",
 		"installed_heading": "インストール済みのテーマ ({count})",
-		"untrusted_code": "コードあり・未信頼",
-		"trust_hint": "「未信頼」のテーマは色とレイアウトだけが適用されます。コードも有効にするには、端末で evoref theme trust <テーマ ID> を実行してから evoref を再起動してください。",
 		"uninstall_confirm_title": "テーマのアンインストール",
 		"uninstall_confirm_message": "「{name}」をアンインストールします。適用中のテーマなら標準の表示に戻ります。"
 	},
@@ -807,10 +816,8 @@
 		"template_aliases_hint": "カンマ区切り (任意)",
 		"template_lang": "言語",
 		"template_registering": "登録中...",
-		"template_register_success": "テンプレート「{doc_type}」を登録しました",
 		"template_register_failed": "テンプレートの登録に失敗しました",
 		"progress": {
-			"title": "進行中",
 			"phase_extract": "ドキュメント抽出",
 			"phase_chunk_embed": "チャンク化・埋め込み生成",
 			"phase_index": "インデックス構築",
@@ -821,9 +828,7 @@
 			"done": "完了",
 			"cancel": "キャンセル",
 			"cancelling": "キャンセル中…",
-			"cancelled": "キャンセルされました",
-			"install_title": "カートリッジをインストール中",
-			"create_title": "カートリッジを作成中"
+			"install_title": "カートリッジをインストール中"
 		},
 		"page_description": "カートリッジは、回答に使う文書・様式・言語パックをまとめたパッケージです。読み込んだカートリッジの文書が検索の対象になります。",
 		"installed_heading": "インストール済み ({count})",
@@ -886,7 +891,6 @@
 		"learning_cycle_running": "学習サイクルが既に実行中です",
 		"data_readonly": "データが読み取り専用のため保存できません。記憶・学習・履歴・設定は保存されません。",
 		"learning_llm_unavailable": "LLM クライアントが利用できません",
-		"fewshot_delegated_to_semmem": "few-shot プールは SemMem に委譲されています (evolve_writeback=semmem)",
 		"fewshot_not_found": "few-shot 手本が見つかりません: {example_id}",
 		"optimize_invalid_level": "level には 'level1' を指定してください",
 		"optimize_invalid_mode": "mode は 'create' または 'chat' のいずれかを指定してください",
@@ -897,6 +901,7 @@
 		"cartridge_manager_not_initialized": "カートリッジマネージャーが初期化されていません",
 		"cartridge_embedder_not_initialized": "埋め込みバックエンドが初期化されていません",
 		"cartridge_not_found_id": "カートリッジが見つかりません: {cartridge_id}",
+		"cartridge_invalid_id": "パッケージ ID が不正です: {cartridge_id} (英小文字・数字・ハイフン・アンダースコアで 2〜40 文字。先頭は英小文字か数字)",
 		"cartridge_busy": "カートリッジの別の操作 (インストール・再構築・削除) が実行中です。終わってからもう一度試してください。",
 		"export_unsupported_format": "非対応のフォーマットです: {ext}。対応形式: {supported}",
 		"export_missing_content": "'content' または 'data' のいずれかが必要です",
@@ -931,21 +936,22 @@
 		"theme_zip_too_large": "ZIP ファイルが大きすぎます: {size} バイト (最大 {max_size})",
 		"theme_not_found": "テーマが見つかりません: {theme_id}",
 		"theme_preview_not_found": "プレビュー画像が見つかりません",
-		"theme_cli_preview_not_found": "CLI プレビュー画像が見つかりません",
-		"theme_not_trusted": "テーマが信頼されていません",
-		"theme_component_not_found": "コンポーネントが見つかりません",
-		"theme_cli_module_not_found": "CLI モジュールが見つかりません",
 		"theme_install_invalid": "テーマのインストールに失敗しました: パッケージが不正です",
 		"theme_already_exists": "テーマは既にインストールされています",
 		"theme_css_not_found": "テーマの CSS ファイルが見つかりません",
 		"theme_activate_invalid": "テーマの適用に失敗しました",
 		"theme_uninstall_invalid": "このテーマはアンインストールできません",
+		"config_persist_failed": "設定ファイル (config.yaml) へ保存できませんでした",
 		"model_health_check_failed": "llama-server ヘルスチェックに失敗しました",
 		"prompt_manager_not_initialized": "プロンプトマネージャーが初期化されていません",
 		"prompt_locale_unsupported": "非対応のプロンプトロケールです: {locale}",
 		"prompt_locale_learning_running": "学習実行中はプロンプト言語を切り替えられません",
 		"config_launch_args_protected": "起動オプションのうち設定画面からは指定できないフラグです: {flags}。config.yaml を直接編集してください。",
-		"config_launch_args_invalid": "起動オプションを解釈できません: {error}"
+		"config_launch_args_invalid": "起動オプションを解釈できません: {error}",
+		"config_capability_key_protected": "画面からは変更できない項目です: {keys}。config.yaml を直接編集してください。",
+		"config_newer_version": "設定ファイルの config_version ({version}) がこの evoref より新しいため保存しませんでした。evoref を更新するか、config.yaml を手で編集してください。",
+		"config_validation_failed": "設定値が不正なため保存しませんでした: {errors}",
+		"mode_switch_failed": "モード {mode} のモデルでサーバーを起動できなかったため、モードを {previous} に戻しました。"
 	},
 	"sources": {
 		"title": "参考にした資料",
@@ -1086,9 +1092,10 @@
 		"add": "追加",
 		"enable": "有効化",
 		"disable": "無効化",
-		"delete": "削除",
+		"delete": "除外",
+		"unblock": "除外を解除",
+		"unblocked_notice": "「{name}」の除外を解除しました。取得を再開するには有効化してください。",
 		"fetch_now": "今すぐ取得",
-		"fetch_done": "取得完了 (新規 {added} 件)",
 		"fetch_requested": "取得を受け付けました (バックグラウンドで実行中)",
 		"sources_empty": "取得元が登録されていません",
 		"recent_items": "最近の取得単位 ({count})",
@@ -1102,8 +1109,8 @@
 		"status_blocked": "除外",
 		"last_fetched": "最終取得 {at}",
 		"never_fetched": "未取得",
-		"delete_confirm_title": "取得元の削除",
-		"delete_confirm_message": "「{name}」を台帳から削除します。これまでに取得した内容は残ります。"
+		"delete_confirm_title": "取得元の除外",
+		"delete_confirm_message": "「{name}」を除外します。取得済みの情報も次の整理で参照から外れます。除外は後から解除できます。"
 	},
 	"fewshot": {
 		"title": "学習手本",
@@ -1137,8 +1144,7 @@
 		"filter_label": "モードで絞り込む",
 		"usage_label": "使用実績",
 		"query_label": "質問",
-		"mode_label": "モード",
-		"writeback_note": "保存方式: {writeback}"
+		"mode_label": "モード"
 	},
 	"audit": {
 		"hint": "回答ごとに、使った資料の ID・カートリッジ・モデル・プロンプトの版・外部通信の件数をハッシュ連鎖の台帳に記録しています。本文は記録しません。改ざんを防ぐものではなく、検出できるものです。",

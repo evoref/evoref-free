@@ -14,6 +14,7 @@ import {
 	type PromptDetailWithScore
 } from '$lib/free/services/promptService';
 import { addToast } from './toast';
+import { t } from '$lib/i18n';
 
 /** 選択中のプロンプト識別子 */
 export interface PromptSelection {
@@ -89,24 +90,41 @@ export async function loadPromptList(): Promise<void> {
 	}
 }
 
-/** プロンプトを選択して詳細を読み込む */
+/** selectPrompt の要求番号 (連打したとき古い応答で新しい選択を上書きしない) */
+let selectSeq = 0;
+
+/**
+ * プロンプトを選択して詳細を読み込む。
+ *
+ * 選択は本文を取れてから切り替える。失敗時に選択だけが新しく本文が旧いままだと、
+ * 旧本文を新しいプロンプトへ保存できてしまう。
+ */
 export async function selectPrompt(selection: PromptSelection): Promise<void> {
-	selectedPrompt.set(selection);
+	const seq = ++selectSeq;
 	promptsLoading.set(true);
-	historyOpen.set(false);
 
 	try {
 		const adapter = getPromptAdapter(selection.category);
 		const detail = await adapter.fetchDetail(selection.id);
+		if (seq !== selectSeq) return;
+		selectedPrompt.set(selection);
+		historyOpen.set(false);
 		currentDetail.set(detail);
 		editContent.set(detail.content);
 		originalContent = detail.content;
 		promptDirty.set(false);
 	} catch {
+		if (seq !== selectSeq) return;
 		addToast({ type: 'error', i18nKey: 'settings.prompts.load_failed' });
 	} finally {
-		promptsLoading.set(false);
+		if (seq === selectSeq) promptsLoading.set(false);
 	}
+}
+
+/** 未保存の編集があれば破棄してよいか確かめる (無ければ true) */
+function confirmDiscardEdits(): boolean {
+	if (!get(promptDirty)) return true;
+	return confirm(get(t)('settings.prompts.unsaved_changes'));
 }
 
 /** 編集内容を更新 */
@@ -144,6 +162,7 @@ export async function savePrompt(): Promise<boolean> {
 export async function reloadFromDisk(): Promise<void> {
 	const sel = get(selectedPrompt);
 	if (!sel) return;
+	if (!confirmDiscardEdits()) return;
 
 	try {
 		const adapter = getPromptAdapter(sel.category);
@@ -174,6 +193,12 @@ export async function loadHistory(): Promise<void> {
 export async function executeRollback(version: number): Promise<boolean> {
 	const sel = get(selectedPrompt);
 	if (!sel) return false;
+	// 確認はここで 1 回だけ (未保存の編集があれば破棄も含めて尋ねる)
+	const translate = get(t);
+	const question = get(promptDirty)
+		? translate('settings.prompts.rollback_discard_confirm', { version })
+		: translate('settings.prompts.rollback_confirm', { version });
+	if (!confirm(question)) return false;
 
 	promptSaving.set(true);
 	try {

@@ -27,14 +27,15 @@ export interface MtpConfig {
 export interface LlamaConfig {
 	host: string;
 	port: number;
-	context_size: number;
-	gpu_layers: number;
+	/** null / "auto" は自動 (環境調整・プロファイルが決める) */
+	context_size: number | 'auto' | null;
+	gpu_layers: number | 'auto';
 	threads: number;
-	batch_size: number;
+	batch_size: number | 'auto' | null;
 	flash_attn: boolean;
 	mlock: boolean;
 	cache_prompt: boolean;
-	slots: number;
+	slots: number | 'auto';
 	cache_type_k: string;
 	cache_type_v: string;
 	max_tokens: number;
@@ -48,7 +49,6 @@ export interface LlamaConfig {
 export interface ThemeConfig {
 	active: string;
 	color_mode: 'dark' | 'light';
-	trusted: string[];
 	cli_layout_mode: 'auto' | 'split' | 'sequential';
 }
 
@@ -79,7 +79,6 @@ export interface RAGConfig {
 	semantic_min_chunk: number;
 	semantic_max_chunk: number;
 	top_k: number;
-	embedding_dim: number;
 	quantization: 'none' | 'int8';
 	rescore_candidates: number;
 	memmap_threshold: number;
@@ -89,13 +88,12 @@ export interface RAGConfig {
 	hysteresis_band: number;
 	/** off / on。YAML 1.1 の真偽値で来ることもある */
 	rerank?: { mode?: 'off' | 'on' | boolean; launch_args?: string };
-	self_rag: {
-		quality_judge: {
-			enabled: boolean;
-			max_per_session: number;
-			max_per_query: number;
-			only_when_quality: string[];
-		};
+	self_rag?: {
+		low_quality_keep_floor?: number;
+		relative_keep_ratio?: number;
+		other_session_margin?: number;
+		threshold_mode?: 'auto' | 'manual';
+		content_gate?: Record<string, unknown>;
 	};
 }
 
@@ -104,8 +102,10 @@ export interface EmbeddingConfig {
 	llama_host: string;
 	llama_port: number;
 	dim: number;
-	timeout: number;
-	model_path: string;
+	/** null / "auto" は自動 */
+	timeout: number | 'auto' | null;
+	/** null は CPU、"auto" は CPU と GPU を測って決める (c_16 §7.2.2) */
+	gpu_layers: number | 'auto' | null;
 	max_length: number;
 	model_name: string;
 	cache_enabled: boolean;
@@ -116,7 +116,7 @@ export interface EmbeddingConfig {
 
 export interface MemoryConfig {
 	working_max_turns: number;
-	working_max_tokens: number;
+	working_max_tokens: number | 'auto';
 	short_term_max_notes: number;
 	conflict_similarity_threshold: number;
 	conflict_batch_size: number;
@@ -216,6 +216,7 @@ export interface ChatModeConfig {
 	top_p: number;
 	top_k: number;
 	presence_penalty: number;
+	frequency_penalty: number;
 }
 
 export type CreateModeConfig = ChatModeConfig;

@@ -10,7 +10,10 @@ from typing import (
     TYPE_CHECKING,
 )
 from backend.app_state import AppState
-from backend.free.api.chat.chat_recorder import record_meta_cognitive_response
+from backend.free.api.chat.chat_recorder import (
+    record_meta_cognitive_response,
+    set_turn_fewshot_ids,
+)
 from backend.free.api.chat.chat_service import make_token_info
 from backend.free.api.chat.chat_types import (
     ChatMessage,
@@ -545,6 +548,10 @@ async def stream_meta_cognitive(
                 async for frame in _emit_meta_cognitive_result_frames(resp):
                     yield frame
 
+            # 選んだ few-shot をどのプロンプトにも入れなかった (関連度で弾いた /
+            # 制作ステージへ委譲した) なら、経験に id を刻まない (f_04 §3.2.2)。
+            if session_id and not getattr(agent, "fewshot_injected", True):
+                set_turn_fewshot_ids(session_id, [])
             ti = _finalize_meta_cognitive_stream(
                 resp,
                 state=state, messages=messages, session_id=session_id,

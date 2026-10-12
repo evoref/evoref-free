@@ -297,8 +297,11 @@ class RerankConfig(BaseModel):
     @field_validator("mode", mode="before")
     @classmethod
     def coerce_yaml_bool_mode(cls, value: object) -> object:
-        """YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す"""
-        if isinstance(value, bool):
+        """YAML 1.1 で引用符無しの ``off`` / ``on`` は真偽値になるので文字列へ戻す。
+
+        明示の ``null`` も起動スクリプトと同じ :func:`normalize_rerank_mode` で ``off``。
+        """
+        if value is None or isinstance(value, bool):
             return normalize_rerank_mode(value)
         return value
 
@@ -331,6 +334,14 @@ class QueryDecomposeConfig(BaseModel):
             "応答と並走させ、空いた枠に入る id を記録だけする"
         ),
     )
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def coerce_yaml_bool_mode(cls, value: object) -> object:
+        """YAML 1.1 で引用符無しの ``off`` は ``False`` になるので文字列へ戻す (``rerank.mode`` と同じ作法)。"""
+        if value is False:
+            return "off"
+        return value
 
 
 class RAGConfig(BaseModel):

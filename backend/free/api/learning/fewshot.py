@@ -4,8 +4,7 @@
 無かった (監査で繰り返し「誤答が few-shot 手本になる」が出ている)。自動の
 検証より人手の 1 クリック削除が確実なので、一覧 + pin / unpin / archive /
 restore を提供する。操作は in-memory プールに効き、その場で
-``fewshot_pool.json`` へ保存する (yaml モードのみ。semmem モードは SemMem が
-SSOT なので 409)。
+``fewshot_pool.json`` へ保存する。
 """
 from __future__ import annotations
 
@@ -16,6 +15,7 @@ from pydantic import BaseModel
 
 from backend.app_state import AppState, get_app_state
 from backend.free.api._error_responses import api_error
+from backend.io.readonly import is_readonly
 from backend.log_config import get_logger
 
 logger = get_logger("api")
@@ -46,7 +46,6 @@ class FewShotListResponse(BaseModel):
     examples: list[FewShotExampleModel]
     archived: list[FewShotExampleModel]
     pool_size: int
-    writeback: str
 
 
 class FewShotActionResponse(BaseModel):
@@ -62,11 +61,6 @@ def _pool(state: AppState):
         raise api_error(
             503, "E0503", "Learning scheduler not initialized",
             "api.learning_scheduler_not_initialized",
-        )
-    if pool.is_semmem_writeback_active():
-        raise api_error(
-            409, "E0409", "Few-shot pool is delegated to SemMem (evolve_writeback=semmem)",
-            "api.fewshot_delegated_to_semmem",
         )
     return pool
 
@@ -102,7 +96,6 @@ async def list_fewshot(
         examples=[_to_model(ex) for ex in pool.list_examples(mode)],
         archived=[_to_model(ex) for ex in pool.list_archived(mode)],
         pool_size=int(pool.pool_size),
-        writeback=str(pool.evolve_writeback),
     )
 
 
@@ -113,8 +106,15 @@ Action = Literal["pin", "unpin", "archive", "restore"]
 async def act_on_fewshot(
     example_id: str, action: Action, state: AppState = Depends(get_app_state),
 ) -> FewShotActionResponse:
-    """pin / unpin / archive / restore。対象が無ければ 404。"""
+    """pin / unpin / archive / restore。対象が無ければ 404、保存できなければ 423。"""
     pool = _pool(state)
+    # 保存できない状態でメモリだけ変えると、画面は変わったのに再起動で戻る。
+    # 変更の前に断る (データ根の readonly と、プールのファイル単位の readonly)。
+    if pool.readonly or is_readonly():
+        raise api_error(
+            423, "E0423", "Few-shot pool is read-only; nothing was changed",
+            "api.data_readonly",
+        )
     if action == "pin":
         ok = pool.set_pinned(example_id, True)
     elif action == "unpin":

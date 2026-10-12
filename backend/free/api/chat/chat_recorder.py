@@ -394,6 +394,9 @@ class TurnRecord:
     evidence_ids: list[str] = field(default_factory=list)
     rag_meta: dict | None = None
     fewshot_ids: list[str] = field(default_factory=list)
+    #: id → 例の本文 (``prompt_utils.fewshot_example_text``)。組み立て後に
+    #: 実際に残った例へ絞る照合用 (:func:`keep_injected_fewshot_ids`)。
+    fewshot_texts: dict[str, str] = field(default_factory=dict)
 
 
 _turn_var: ContextVar[TurnRecord | None] = ContextVar("chat_turn_record", default=None)
@@ -557,13 +560,35 @@ def session_sources(session_id: str) -> list[dict]:
     return [dict(e) for e in (led.sources if led is not None else ())]
 
 
-def set_turn_fewshot_ids(session_id: str, example_ids: list[str]) -> None:
+def set_turn_fewshot_ids(
+    session_id: str, example_ids: list[str], texts: list[str] | None = None,
+) -> None:
     """このターンで注入した few-shot 例の id を置く (f_04 §3.2.2)。
 
     以前の ``gen_config.fewshot_ids`` はプール全体 (50 件) を刻んでおり、
-    手本へ成否を帰属する道が無かった。
+    手本へ成否を帰属する道が無かった。``texts`` (各例の本文) を渡すと、
+    組み立て後に :func:`keep_injected_fewshot_ids` で実際に残った例へ絞れる。
     """
-    _turn(session_id, create=True).fewshot_ids = list(example_ids)
+    rec = _turn(session_id, create=True)
+    rec.fewshot_ids = list(example_ids)
+    rec.fewshot_texts = dict(zip(example_ids, texts)) if texts is not None else {}
+
+
+def keep_injected_fewshot_ids(session_id: str, injected_text: str) -> list[str]:
+    """選んだ例のうち、組み立て後のプロンプトに本文が残った例の id だけを残す。
+
+    選択した例は予算の切り詰め・会話中の値との食い違いで落ちうる。選んだ id の
+    まま刻むと、注入していない例へ使用と成否が帰属される。本文を持たない id
+    (照合できない) は残す。
+    """
+    rec = _turn(session_id, create=False)
+    if rec is None or not rec.fewshot_ids:
+        return []
+    rec.fewshot_ids = [
+        eid for eid in rec.fewshot_ids
+        if eid not in rec.fewshot_texts or rec.fewshot_texts[eid] in injected_text
+    ]
+    return list(rec.fewshot_ids)
 
 
 def turn_fewshot_ids(session_id: str) -> list[str]:

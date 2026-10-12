@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from backend.config import get_config, get_path_resolver
+from backend.config import get_config
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -42,6 +42,17 @@ def follow_embedder_rebind(state: "AppState") -> None:
         judge.rebind_embedder(state.embedder)
         if state.embedder is not None:
             asyncio.create_task(judge.warmup_tool_gate(), name="tool_gate_rewarmup")
+
+    # few-shot 手本の埋め込みも旧モデルの空間のもの。捨てて張り直す。
+    scheduler = getattr(state, "learning_scheduler", None)
+    fewshot_pool = getattr(scheduler, "_fewshot_pool", None) if scheduler else None
+    if fewshot_pool is not None:
+        fewshot_pool.drop_embeddings()
+        if state.embedder is not None:
+            asyncio.create_task(
+                fewshot_pool.backfill_embeddings(state.embedder),
+                name="fewshot_embedding_rewarmup",
+            )
 
     for attr, task_name in (
         ("attribute_slot_gate", "attribute_gate_rewarmup"),
@@ -89,32 +100,45 @@ def follow_base_model_rebind(state: "AppState", new_model_filename: str) -> dict
 
 
 async def reload_embedder(state: AppState) -> None:
-    """embedding セクション変更時に embedder を再生成して差し替える"""
+    """embedding セクション変更時に embedder を再生成して差し替える。
+
+    新しい embedder を作れてから差し替え、旧 embedder はその後で閉じる。作れなければ
+    旧 embedder を残したまま例外を送出する (呼出側が ``restart_required`` を立てる)。
+    """
     from backend.free.rag.embedding_factory import create_embedding_backend
 
     cfg = get_config()
-
-    # 旧 embedder を閉じる
+    embedder = create_embedding_backend(
+        cfg, _PROJECT_ROOT, debug_logger=state.debug_logger,
+    )
     old = state.embedder
-    if old is not None and hasattr(old, "aclose"):
+    state.embedder = embedder
+    try:
+        follow_embedder_rebind(state)
+    except Exception:
+        # 追随が途中で止まると事例ゲートが新旧どちらの空間を握るか定まらない。旧へ戻して
+        # 追随し直し、新しい方は閉じる (旧は閉じない)
+        state.embedder = old
+        try:
+            follow_embedder_rebind(state)
+        except Exception as e:
+            logger.warning("Re-binding the previous embedder failed: %s", e)
+        if embedder is not old and hasattr(embedder, "aclose"):
+            try:
+                await embedder.aclose()
+            except Exception as e:
+                logger.warning("Failed to close the new embedder: %s", e)
+        raise
+    logger.info(
+        "Embedder reloaded: backend=%s, model=%s",
+        embedder.backend_type(), embedder.model_name(),
+    )
+
+    if old is not None and old is not embedder and hasattr(old, "aclose"):
         try:
             await old.aclose()
         except Exception as e:
             logger.warning("Failed to close old embedder: %s", e)
-
-    try:
-        embedder = create_embedding_backend(
-            cfg, _PROJECT_ROOT, debug_logger=state.debug_logger,
-        )
-        state.embedder = embedder
-        logger.info(
-            "Embedder reloaded: backend=%s, model=%s",
-            embedder.backend_type(), embedder.model_name(),
-        )
-    except Exception as e:
-        logger.error("Failed to reload embedder: %s", e)
-        state.embedder = None
-    follow_embedder_rebind(state)
 
     # 次元整合性を再評価
     try:
@@ -125,16 +149,21 @@ async def reload_embedder(state: AppState) -> None:
 
 
 async def reload_prompt_manager(state: AppState) -> None:
-    """instance セクション変更時に SystemPromptManager を再生成して差し替える"""
-    from backend.free.agent.prompt_manager import SystemPromptManager
+    """instance セクション変更時にインスタンス名を稼働中の SystemPromptManager へ写す。
 
-    cfg = get_config()
-    resolver = get_path_resolver()
-    # base システムプロンプトは (model_key×mode) パーティション配下 (resolve_learning)。
-    prompt_dir = resolver.resolve_learning("prompts_dir")
-    instance_name = cfg.get("instance", {}).get("name", "evoref")
-    state.prompt_manager = SystemPromptManager(prompt_dir, instance_name=instance_name)
-    logger.info("PromptManager reloaded: instance_name=%s", instance_name)
+    マネージャは作り直さない — LearningScheduler / LearnPillar が同じオブジェクトを握り、
+    few-shot の選択器とパーティションの解決 (``wire_generating_partitions``) も
+    配線時にこのオブジェクトへ注入されている。作り直すと参照が割れ、それらが外れる。
+    """
+    mgr = state.prompt_manager
+    if mgr is None:
+        raise RuntimeError("prompt manager is not initialized")
+    instance_name = get_config().get("instance", {}).get("name", "evoref")
+    for manager in (mgr, *list(getattr(mgr, "_partition_managers", {}).values())):
+        manager.instance_name = instance_name
+        # セッションに凍結した静的 system は旧い名前を含むので捨てる (名前の変更を即時に効かせる)
+        manager._drop_frozen()
+    logger.info("PromptManager instance name updated: instance_name=%s", instance_name)
 
 
 async def reload_i18n(state: AppState) -> None:  # noqa: ARG001

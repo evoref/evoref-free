@@ -44,7 +44,6 @@ from backend.schemas._common import (
 from backend.schemas._root import EvorefConfig, validate_config
 from backend.schemas.create import CreateConfig, CreateStagedConfig, StagedVerifyConfig
 from backend.schemas.learning import (
-    FeedbackPipeConfig,
     LearningConfig,
     LearningPolicyConfig,
     ScheduleConfig,
@@ -96,7 +95,6 @@ __all__ = [
     "EvorefConfig",
     "FactsConfig",
     "FactsExtractionMaxPerSession",
-    "FeedbackPipeConfig",
     "HistoryConfig",
     "I18nConfig",
     "InjectionConfig",

@@ -22,6 +22,8 @@ export interface ApiErrorDetail {
 	message: string;
 	i18n_key: string;
 	context: Record<string, unknown>;
+	/** 検証エラー (422) の項目ごとのメッセージ。PUT /api/config/{section} が返す */
+	errors?: string[];
 }
 
 /** 構造化 API エラー — catch ブロックで instanceof 判定可能 */
@@ -29,6 +31,7 @@ export class ApiError extends Error {
 	code: string;
 	i18nKey: string;
 	context: Record<string, unknown>;
+	errors: string[];
 
 	constructor(detail: ApiErrorDetail) {
 		super(detail.message);
@@ -36,6 +39,7 @@ export class ApiError extends Error {
 		this.code = detail.code;
 		this.i18nKey = detail.i18n_key;
 		this.context = detail.context;
+		this.errors = Array.isArray(detail.errors) ? detail.errors.map(String) : [];
 	}
 }
 

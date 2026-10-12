@@ -15,7 +15,17 @@
 	import PromptSettings from '$lib/free/components/settings/PromptSettings.svelte';
 	import SystemSettings from '$lib/free/components/settings/SystemSettings.svelte';
 	import DeveloperSettings from '$lib/free/components/settings/DeveloperSettings.svelte';
-	import { loadConfig, activeTab, configLoaded, configLoadError } from '$lib/free/stores/settings';
+	import { get } from 'svelte/store';
+	import { beforeNavigate } from '$app/navigation';
+	import {
+		loadConfig,
+		activeTab,
+		configLoaded,
+		configLoadError,
+		dirtyTabs,
+		discardAllChanges
+	} from '$lib/free/stores/settings';
+	import { promptDirty, resetEdit } from '$lib/free/stores/prompts';
 
 	/** タブID → コンポーネントのレジストリ
 	 * `--develop=<level>` の SSOT に集約された (詳細 docs/f_06_cli.md §6)。
@@ -39,13 +49,35 @@
 	onMount(() => {
 		loadConfig();
 	});
+
+	// 未保存の変更があるまま離れるときは確認する。タブを閉じる / 再読込 (leave) は
+	// cancel() でブラウザ標準の確認ダイアログに任せる
+	beforeNavigate(({ type, cancel }) => {
+		const unsaved = Object.values(get(dirtyTabs)).some(Boolean) || get(promptDirty);
+		if (!unsaved) return;
+		if (type === 'leave') {
+			cancel();
+			return;
+		}
+		if (!confirm($t('settings.leave_confirm'))) {
+			cancel();
+			return;
+		}
+		discardAllChanges();
+		resetEdit();
+	});
 </script>
 
 <PageLayout title={$t('sidebar.settings')} fullHeight={true}>
 	{#if $configLoaded}
 		<div class="settings-container">
 			<SettingsTabs />
-			<div class="settings-content">
+			<div
+				class="settings-content"
+				role="tabpanel"
+				id="settings-tabpanel"
+				aria-labelledby="settings-tab-{$activeTab}"
+			>
 				{#if ActiveTab}
 					<ActiveTab />
 				{/if}

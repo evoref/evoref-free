@@ -4,7 +4,6 @@
 	import { messages, currentMode, switchMode } from '$lib/free/stores/chat';
 	import { activeCreateRun } from '$lib/free/stores/createRun';
 	import { get } from 'svelte/store';
-	import { themeSlots } from '$lib/free/stores/theme';
 	import { t } from '$lib/i18n';
 	import { instanceName } from '$lib/free/stores/app';
 	import PageLayout from '$lib/free/components/PageLayout.svelte';
@@ -27,14 +26,6 @@
 </script>
 
 {#snippet chatContent()}
-	<!-- chat_header スロット -->
-	{#if $themeSlots.chat_header}
-		{@const ChatHeader = $themeSlots.chat_header}
-		<div class="slot-chat-header">
-			<ChatHeader />
-		</div>
-	{/if}
-
 	{#if $messages.length === 0}
 		<div class="empty-state">
 			<p>{$t('chat.input_placeholder')}</p>
@@ -66,8 +57,5 @@
 		font-size: calc(var(--font-size-base) + 6px);
 		font-weight: 500;
 		letter-spacing: -0.01em;
-	}
-	.slot-chat-header {
-		flex-shrink: 0;
 	}
 </style>

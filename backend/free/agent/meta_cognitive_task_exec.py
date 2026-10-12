@@ -1246,6 +1246,7 @@ class _TaskExecutionMixin:
         # Level 1 で進化した few-shot を参考例として維持する
         if self._fewshot_block:
             prompt = f"{prompt}\n\n[参考例]\n{self._fewshot_block}"
+            self.fewshot_injected = True
         return prompt
 
     def _rebuild_loop_messages(

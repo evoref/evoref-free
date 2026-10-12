@@ -12,7 +12,7 @@
 	 * いずれも reindex 後に実行するのが前提 (新しいインデックスに対してのみ意味を持つ)。
 	 */
 	import { t } from '$lib/i18n';
-	import { loadConfig } from '$lib/free/stores/settings';
+	import { loadConfig, describeSaveError, syncPersistedFields } from '$lib/free/stores/settings';
 	import {
 		updateConfigSection,
 		calibrateThresholds,
@@ -51,12 +51,19 @@
 		busy = true;
 		error = null;
 		try {
-			await updateConfigSection('rag', { ...calib.suggestions });
+			const suggestions = { ...calib.suggestions };
+			const res = await updateConfigSection('rag', suggestions);
+			// 推定で書いたキーは手入力の未保存の編集を捨てて推定値を採る (他の編集は再読込でも残る)
+			syncPersistedFields('rag', suggestions);
 			await loadConfig();
-			message = $t('settings.threshold.applied');
+			message = $t(
+				res.restart_required
+					? 'settings.threshold.applied_restart_required'
+					: 'settings.threshold.applied'
+			);
 			calib = null;
 		} catch (e) {
-			error = toError(e);
+			error = describeSaveError(e);
 		} finally {
 			busy = false;
 		}

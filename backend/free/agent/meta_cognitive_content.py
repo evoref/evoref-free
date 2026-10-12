@@ -259,6 +259,7 @@ class _ContentGenerationMixin:
             and not fewshot_contains_task_log(self._fewshot_block)
         ):
             system_content = f"{system_content}\n\n[参考例]\n{self._fewshot_block}"
+            self.fewshot_injected = True
 
         messages = [
             {"role": "system", "content": system_content},

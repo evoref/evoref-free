@@ -1,5 +1,6 @@
 """設定管理とパス解決"""
 
+import re
 import yaml
 from collections.abc import Callable
 from pathlib import Path
@@ -542,7 +543,8 @@ def _read_raw_config_file(path: str | Path | None, project_root: Path) -> dict:
         raise FileNotFoundError(f"Config file not found: {path}")
 
     with open(path, encoding="utf-8") as f:
-        _config = yaml.safe_load(f)
+        # 空のファイル (コメントだけ) は None。Pro の上書きを重ねられるよう {} として扱う
+        _config = yaml.safe_load(f) or {}
 
     # Pro 設定: backend/pro/ が存在する場合のみ読込み
     pro_cfg_path = project_root / "config.pro.yaml"
@@ -625,17 +627,122 @@ def get_project_root() -> Path:
     return Path(__file__).parent.parent
 
 
+_YAML_KEY_LINE = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_][A-Za-z0-9_.\-]*):(?P<rest>(?:[ \t].*)?)$")
+
+
+def _scalar_changes(old: object, new: object, path: tuple[str, ...]) -> list[tuple[tuple[str, ...], object]] | None:
+    """``old`` → ``new`` が既存キーのスカラー値の置換だけなら、その (パス, 新しい値) の一覧。それ以外は ``None``。"""
+    if isinstance(old, dict) and isinstance(new, dict):
+        if set(old) != set(new):
+            return None
+        out: list[tuple[tuple[str, ...], object]] = []
+        for key in old:
+            if not isinstance(key, str):
+                return None
+            sub = _scalar_changes(old[key], new[key], (*path, key))
+            if sub is None:
+                return None
+            out.extend(sub)
+        return out
+    if old == new and type(old) is type(new):
+        return []
+    scalar = (str, int, float, bool, type(None))
+    if isinstance(old, scalar) and isinstance(new, scalar) and path:
+        return [(path, new)]
+    return None
+
+
+def _split_value_comment(rest: str) -> tuple[str, str]:
+    """``: `` より後ろを (値, 後ろの空白とコメント) に分ける。引用符の中の ``#`` はコメントにしない。"""
+    quote = ""
+    for i, ch in enumerate(rest):
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "#" and (i == 0 or rest[i - 1] in " \t"):
+            value = rest[:i].rstrip()
+            return value, rest[len(value):]
+    value = rest.rstrip()
+    return value, rest[len(value):]
+
+
+def _patch_scalar_values(text: str, old: dict, new: dict) -> str | None:
+    """既存のスカラー値の置換だけなら、該当行の値だけを書き換えた ``text`` (コメントを残す)。
+
+    行を特定できない・置換の結果を読み戻して ``new`` と一致しないときは ``None``
+    (呼出側が全体を書き直す)。
+    """
+    changes = _scalar_changes(old, new, ())
+    if not changes:
+        return None
+    targets = dict(changes)
+    lines = text.splitlines(keepends=True)
+    stack: list[tuple[int, str]] = []
+    hits: dict[tuple[str, ...], int] = {}
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        stripped = body.lstrip(" ")
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = _YAML_KEY_LINE.match(body)
+        indent = len(body) - len(stripped)
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if m is None:
+            continue
+        stack.append((indent, m.group("key")))
+        path = tuple(key for _indent, key in stack)
+        if path in targets:
+            if path in hits:
+                return None
+            hits[path] = i
+    if set(hits) != set(targets):
+        return None
+    for path, i in hits.items():
+        line = lines[i]
+        newline = line[len(line.rstrip("\r\n")):]
+        m = _YAML_KEY_LINE.match(line.rstrip("\r\n"))
+        if m is None:
+            return None
+        value, tail = _split_value_comment(m.group("rest"))
+        if not value.strip() or value.strip()[0] in "|>[{&*!":
+            return None
+        dumped = yaml.safe_dump(targets[path], allow_unicode=True, default_flow_style=True, width=1 << 30)
+        dumped = dumped.removesuffix("\n").removesuffix("\n...").strip()
+        lines[i] = f"{m.group('indent')}{m.group('key')}: {dumped}{tail}{newline}"
+    patched = "".join(lines)
+    try:
+        if yaml.safe_load(patched) != new:
+            return None
+    except yaml.YAMLError:
+        return None
+    return patched
+
+
 def save_config_section(
     section: str, data: dict, *, project_root: Path | None = None, reload: bool = True,
 ) -> dict:
     """設定セクションを保存してリロード
 
     1. config.yaml を読み込み
-    2. config.yaml.bak にバックアップ
-    3. 対象セクションを更新
-    4. バリデーション
+    2. 対象セクションを更新
+    3. バリデーション (失敗したらファイルにもバックアップにも触らない)
+    4. config.yaml.bak にバックアップ
     5. 書き込み + リロード (``reload=False`` ならグローバル設定は触らない)
+
+    既存のスカラー値を置き換えるだけの変更は該当行だけを書き換えてコメントを残す
+    (:func:`_patch_scalar_values`)。キーの追加・削除や入れ子の値の変更は従来どおり
+    全体を書き直す (コメントは消える。直前の版は config.yaml.bak に残る)。
+
+    ``config_version`` がアプリより新しいファイルは書き戻さず
+    :class:`~backend.config_normalize.NewerConfigVersionError` を送出する。
     """
+    import copy
+    import shutil
+
+    from backend.config_normalize import ensure_writable_version
     from backend.io.readonly import guard_write
     from backend.schemas import validate_config
 
@@ -650,13 +757,11 @@ def save_config_section(
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     # 読み込み
-    with open(config_path, encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-
-    # バックアップ
-    backup_path = project_root / "config.yaml.bak"
-    import shutil
-    shutil.copy2(config_path, backup_path)
+    text = config_path.read_text(encoding="utf-8")
+    raw = yaml.safe_load(text) or {}
+    # アプリより新しい版のファイルは書き戻さない (未知キーを落として書くと新しい版の設定が消える)
+    ensure_writable_version(config_path, raw)
+    before = copy.deepcopy(raw)
 
     # セクション更新
     if section in raw and isinstance(raw[section], dict):
@@ -675,13 +780,15 @@ def save_config_section(
 
     validated = validate_config(merged)
 
+    # 検証を通ってから直前の版を退避する (失敗した変更で 1 つ前の版を消さない)
+    shutil.copy2(config_path, project_root / "config.yaml.bak")
+
     # config.yaml に書き込み（Pro マージ前の raw を保存）
     # config.yaml が truncate 途中で壊れると起動不能になる。atomic + fsync。
-    atomic_write_text(
-        config_path,
-        yaml.dump(raw, default_flow_style=False, allow_unicode=True, sort_keys=False),
-        fsync=True,
-    )
+    body = _patch_scalar_values(text, before, raw)
+    if body is None:
+        body = yaml.dump(raw, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    atomic_write_text(config_path, body, fsync=True)
 
     logger.info("Config section '%s' saved to %s", section, config_path)
 

@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.config_normalize import reject_retired_keys
 
@@ -23,41 +23,22 @@ class ScheduleConfig(BaseModel):
         description="ZoneInfo で解決可能な IANA tz 名 (例: Asia/Tokyo, UTC)",
     )
 
+    @field_validator("local_tz")
+    @classmethod
+    def _warn_unknown_tz(cls, value: str) -> str:
+        """解決できない tz 名は警告だけ出して残す (読み手がそれぞれ既定の tz へ倒す。起動は止めない)。"""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-class FeedbackPipeConfig(BaseModel):
-    """品質ゲート結果 → 学習サイクル 還流パイプ設定
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError):
+            from backend.log_config import get_logger
 
-    ラルフループが SemMem に書く ``progress_marker`` / ``failure_pattern`` /
-    ``artifact`` を Level 1/2 tick 時に走査し、以下 3 経路で学習サイクルへ
-    還流する:
-
-    - 経路 1: 成功 ``progress_marker`` + ``task`` + ``artifact`` → FewShotPool
-    - 経路 2: 連続 ``failure_pattern`` クラスタ → CritiqueSynthesizer →
-      ``policy`` ファクト書き戻し
-    - 経路 3: ``progress_marker`` / ``failure_pattern`` 比率 →
-      PolicyParamEvolver の fitness に実環境成功率項を加重合成
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-    """全経路の ON/OFF。``false`` 時は走査自体をスキップする。"""
-
-    max_scan_per_tick: int = Field(default=50, ge=1)
-    """1 tick で走査する SemMem ファクト数上限 (暴走防止)"""
-
-    progress_marker_lookback: int = Field(default=20, ge=1)
-    """経路 1 で走査する直近 progress_marker 件数"""
-
-    failure_pattern_lookback: int = Field(default=30, ge=1)
-    """経路 2 で走査する直近 failure_pattern 件数"""
-
-    failure_cluster_min_size: int = Field(default=3, ge=2)
-    """経路 2 でクラスタとして扱う最小件数 (これ未満は critique しない)"""
-
-    weight_semmem_success: float = Field(default=0.3, ge=0.0, le=1.0)
-    """経路 3 の fitness 重み ``w``。
-    最終 fitness = ``(1-w) * calc_fitness(...) + w * semmem_success_rate``"""
+            get_logger("config").warning(
+                "schedule.local_tz=%r is not a known IANA time zone; local-time features will use a fallback zone.",
+                value,
+            )
+        return value
 
 
 class LearningPolicyConfig(BaseModel):
@@ -74,16 +55,14 @@ class LearningPolicyConfig(BaseModel):
         - ``semmem`` : 導入予定 (現状は ``hybrid`` と同等動作)
     - ``activation_min_confidence`` : SemMem 上の policy ファクトを active
       と見なす最小 ``confidence``。これ未満は YAML 値が温存される
-    - ``evolve_writeback`` : 進化結果書き戻し先
-      ``yaml`` (従来動作) / ``semmem`` (PolicyParamEvolver / FewShotPool で
-      SemMem へ書き戻し)。
+    進化結果 (手本プール・進化した policy 値) の書き戻し先は policy ファイルだけ。
+    SemMem へ書き戻す ``evolve_writeback`` は 2026-10-12 に撤去した (f_04 §3.2)。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     source: Literal["yaml", "semmem", "hybrid"] = "yaml"
     activation_min_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
-    evolve_writeback: Literal["yaml", "semmem"] = "yaml"
 
 
 class GrowthRegressionConfig(BaseModel):
@@ -146,7 +125,9 @@ class GrowthConfig(BaseModel):
 class LearningConfig(BaseModel):
     """学習サイクル設定"""
 
-    model_config = ConfigDict(extra="allow")  # Pro 拡張フィールドを許可
+    # 未知のキーは typo とみなして拒否する。``extra="allow"`` は Pro Level 2 の
+    # 拡張キーのためだったが、それは撤去した (撤去キーは normalize が先に落とす)。
+    model_config = ConfigDict(extra="forbid")
 
     # base モデルの自己学習データは常に ``store/learning/<model_key>/`` で
     # パーティション化する (c_05 §0.5.12)。flat に戻すキー
@@ -215,8 +196,6 @@ class LearningConfig(BaseModel):
     budget_sigma: float = Field(default=0.05, ge=0.0, le=1.0)
     # 各戦略の比率合計の上限 (generation 余地を確保するため 1.0 未満に抑える)
     budget_max_total_ratio: float = Field(default=0.7, gt=0.0, le=1.0)
-    # 品質ゲート結果 還流パイプ
-    feedback_pipe: FeedbackPipeConfig = Field(default_factory=FeedbackPipeConfig)
     # ポリシー / 進化結果書き戻し設定
     policy: LearningPolicyConfig = Field(default_factory=LearningPolicyConfig)
     # Level 2 (成長) (f_04 §6.7)
@@ -225,7 +204,7 @@ class LearningConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _reject_flat_layout(cls, data: object) -> object:
-        """撤去した ``partition_by_base_model`` を扱う (``extra="allow"`` を素通りさせない)。
+        """撤去した ``partition_by_base_model`` を扱う (未知キーの一般の拒否より先に理由を付ける)。
 
         ``true`` は現行の挙動そのものなので黙って落とす。``false`` (flat
         レイアウト) はもう無いので起動時に拒否する — 設定したのに効かない
@@ -243,12 +222,21 @@ class LearningConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _drop_tolerated_removed_keys(cls, data: object) -> object:
+        """PR #952 で廃止した ``long_form_pattern_boost_success`` は既存 config を止めないよう黙って落とす。"""
+        if isinstance(data, dict) and "long_form_pattern_boost_success" in data:
+            data = {k: v for k, v in data.items() if k != "long_form_pattern_boost_success"}
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def _reject_retired_level2(cls, data: object) -> object:
-        """撤去した Pro Level 2 のキーを拒否する (``extra="allow"`` を素通りさせない)。
+        """撤去した Pro Level 2 のキーを normalize の案内付きで拒否する (未知キーの一般の拒否より先)。
 
         設定したのに効かない状態を作らない。``evoref config normalize`` が
         config.yaml を退避してから落とす (f_04 §6.7)。
         """
         if isinstance(data, dict):
-            reject_retired_keys("learning", data)
+            # partition_by_base_model は _reject_flat_layout が扱う (true は黙って落とす)
+            reject_retired_keys("learning", {k: v for k, v in data.items() if k != "partition_by_base_model"})
         return data

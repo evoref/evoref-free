@@ -10,6 +10,7 @@ import {
 } from '$lib/free/api';
 import { handleApiCall } from '$lib/free/utils/error';
 import { refreshServerStatus } from './server';
+import { addToast } from './toast';
 
 /** GET /api/system/auto-tune の最新値 (未取得なら null) */
 export const autoTuneDetail = writable<AutoTuneResponse | null>(null);
@@ -35,14 +36,33 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 let watching: Promise<void> | null = null;
 
-/** state が running でなくなるまで間隔を置いて取得し、終わったら /api/status も更新する */
+/** 取得が続けて失敗したときに見届けを諦めるまでの回数 */
+export const AUTO_TUNE_MAX_POLL_FAILURES = 5;
+
+/**
+ * state が running でなくなるまで間隔を置いて取得し、終わったら /api/status も更新する。
+ *
+ * 一度の取得失敗では止めない (止めると楽観的に立てた running のまま固まる)。続けて
+ * 失敗したら諦め、手元の running を下ろして再実行できるようにする (走っていれば 409 で見届けに戻る)。
+ */
 export function watchAutoTune(intervalMs: number = AUTO_TUNE_POLL_MS): Promise<void> {
 	if (watching) return watching;
 	watching = (async () => {
 		try {
+			let failures = 0;
 			for (;;) {
 				const r = await refreshAutoTune();
-				if (!r || r.state !== 'running') break;
+				if (!r) {
+					failures += 1;
+					if (failures >= AUTO_TUNE_MAX_POLL_FAILURES) {
+						autoTuneDetail.update((d) => (d && d.state === 'running' ? { ...d, state: 'idle' } : d));
+						addToast({ type: 'error', i18nKey: 'autotune.load_failed' });
+						break;
+					}
+				} else {
+					failures = 0;
+					if (r.state !== 'running') break;
+				}
 				await sleep(intervalMs);
 			}
 			await refreshServerStatus();

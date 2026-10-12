@@ -3,17 +3,18 @@
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, field_validator
 from urllib.parse import urlparse
 
 from backend.app_state import AppState, get_app_state
+from backend.config_normalize import NewerConfigVersionError
 from backend.free.api.config._theme_errors import (
+    config_newer_version_error,
     config_persist_error,
     theme_error,
     theme_not_found_error,
-    theme_not_trusted_error,
 )
 from backend.log_config import get_logger
 from backend.free.themes.theme_installer import MAX_ZIP_SIZE
@@ -74,32 +75,46 @@ async def list_themes(state: AppState = Depends(get_app_state)):
     }
 
 
+#: アップロードを一時ファイルへ写すときの 1 回の読み取り量
+_UPLOAD_CHUNK = 1024 * 1024
+
+
+def _zip_too_large(size: int) -> HTTPException:
+    return theme_error(
+        status_code=400,
+        code="E0400",
+        message=f"ZIP file too large: {size} bytes (max {MAX_ZIP_SIZE})",
+        i18n_key="api.theme_zip_too_large",
+        size=str(size),
+        max_size=str(MAX_ZIP_SIZE),
+    )
+
+
 @router.post("/install", status_code=201)
 async def install_theme(state: AppState = Depends(get_app_state), file: UploadFile = File(...)):
     """ZIP パッケージからテーマをインストール"""
     logger.debug("POST /api/themes/install: filename=%s", file.filename)
     mgr = _get_manager(state)
 
-    # サイズチェック
-    content = await file.read()
-    if len(content) > MAX_ZIP_SIZE:
-        raise theme_error(
-            status_code=400,
-            code="E0400",
-            message=f"ZIP file too large: {len(content)} bytes (max {MAX_ZIP_SIZE})",
-            i18n_key="api.theme_zip_too_large",
-            size=str(len(content)),
-            max_size=str(MAX_ZIP_SIZE),
-        )
+    # サイズチェック: 申告サイズで先に断り、読みながらも上限で止める (全体をメモリに載せない)
+    declared = getattr(file, "size", None)
+    if declared is not None and declared > MAX_ZIP_SIZE:
+        raise _zip_too_large(declared)
 
-    # 一時ファイルに保存
-    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    logger.debug("Saved upload to temp: %s (%d bytes)", tmp_path, len(content))
-
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp_path = tmp.name
     try:
+        with tmp:
+            total = 0
+            while chunk := await file.read(_UPLOAD_CHUNK):
+                total += len(chunk)
+                if total > MAX_ZIP_SIZE:
+                    raise _zip_too_large(total)
+                tmp.write(chunk)
+        logger.debug("Saved upload to temp: %s (%d bytes)", tmp_path, total)
         result = mgr.install(Path(tmp_path))
+    except NewerConfigVersionError as e:
+        raise config_newer_version_error(e.version)
     except ValueError as e:
         raise theme_error(400, "E0400", str(e), "api.theme_install_invalid")
     except FileExistsError as e:
@@ -120,20 +135,14 @@ async def install_theme_from_url(req: InstallUrlRequest, state: AppState = Depen
 
     try:
         result = await mgr.install_from_url(req.url)
+    except NewerConfigVersionError as e:
+        raise config_newer_version_error(e.version)
     except ValueError as e:
         raise theme_error(400, "E0400", str(e), "api.theme_install_invalid")
     except FileExistsError as e:
         raise theme_error(409, "E0409", str(e), "api.theme_already_exists")
 
     return result
-
-
-@router.get("/active-cli")
-async def get_active_cli_theme(state: AppState = Depends(get_app_state)):
-    """アクティブテーマの CLI テーマ設定を返す"""
-    logger.debug("GET /api/themes/active-cli")
-    mgr = _get_manager(state)
-    return mgr.get_active_cli_theme()
 
 
 @router.post("/activate")
@@ -145,6 +154,8 @@ async def activate_theme(req: ActivateRequest, state: AppState = Depends(get_app
         result = mgr.activate(req.theme_id, req.color_mode)
     except KeyError:
         raise theme_not_found_error(req.theme_id)
+    except NewerConfigVersionError as e:
+        raise config_newer_version_error(e.version)
     except ValueError as e:
         raise theme_error(400, "E0400", str(e), "api.theme_activate_invalid")
     except RuntimeError as e:
@@ -162,41 +173,21 @@ async def delete_theme(theme_id: str, state: AppState = Depends(get_app_state)):
         mgr.uninstall(theme_id)
     except KeyError:
         raise theme_not_found_error(theme_id)
+    except NewerConfigVersionError as e:
+        raise config_newer_version_error(e.version)
     except ValueError as e:
         raise theme_error(400, "E0400", str(e), "api.theme_uninstall_invalid")
     except RuntimeError as e:
         raise config_persist_error(str(e))
 
 
-@router.post("/{theme_id}/trust")
-async def trust_theme(theme_id: str, state: AppState = Depends(get_app_state)):
-    """テーマの信頼は API から付与しない (docs/c_11 §1)。
-
-    信頼済みテーマの JS はアプリのオリジン内で動くので、付与できる経路を API に置くと
-    オリジン内のコードが別のテーマを信頼させられる。付与は PC の持ち主が端末で
-    ``evoref theme trust <id>`` を実行する経路だけにし、ここでは案内付きで 403 を返す。
-    取り消し (DELETE) は安全側の操作なので API に残す。
-    """
-    logger.debug("POST /api/themes/%s/trust (refused: CLI only)", theme_id)
-    mgr = _get_manager(state)
-    if not mgr.theme_exists(theme_id):
-        raise theme_not_found_error(theme_id)
-    raise theme_error(
-        403, "E0403", f"Theme trust is granted only from the CLI: evoref theme trust {theme_id}",
-        "api.theme_trust_cli_only", theme_id=theme_id,
-    )
-
-
-@router.delete("/{theme_id}/trust", status_code=200)
-async def untrust_theme(theme_id: str, state: AppState = Depends(get_app_state)):
-    """テーマの信頼を取り消し"""
-    logger.debug("DELETE /api/themes/%s/trust", theme_id)
-    mgr = _get_manager(state)
-    try:
-        mgr.untrust_theme(theme_id)
-    except RuntimeError as e:
-        raise config_persist_error(str(e))
-    return {"theme_id": theme_id, "trusted": False}
+#: プレビューはテーマ作者の任意ファイル。SVG を直接開かれてもスクリプトを動かさず、
+#: 宣言と違う型として解釈させない
+_PREVIEW_HEADERS = {
+    "Cache-Control": "public, max-age=3600",
+    "Content-Security-Policy": "sandbox; default-src 'none'",
+    "X-Content-Type-Options": "nosniff",
+}
 
 
 @router.get("/{theme_id}/preview")
@@ -217,74 +208,5 @@ async def get_preview(theme_id: str, state: AppState = Depends(get_app_state)):
     return FileResponse(
         path=str(preview_path),
         media_type=media_type,
-        headers={"Cache-Control": "public, max-age=3600"},
-    )
-
-
-@router.get("/{theme_id}/preview-cli")
-async def get_cli_preview(theme_id: str, state: AppState = Depends(get_app_state)):
-    """CLI プレビュー画像を配信"""
-    logger.debug("GET /api/themes/%s/preview-cli", theme_id)
-    mgr = _get_manager(state)
-
-    preview_path = mgr.get_cli_preview_path(theme_id)
-    if preview_path is None:
-        raise theme_error(
-            404, "E0404", "CLI preview image not found",
-            "api.theme_cli_preview_not_found",
-        )
-
-    suffix = preview_path.suffix.lower()
-    media_type = _PREVIEW_MIME.get(suffix, "application/octet-stream")
-
-    return FileResponse(
-        path=str(preview_path),
-        media_type=media_type,
-        headers={"Cache-Control": "public, max-age=3600"},
-    )
-
-
-@router.get("/{theme_id}/components/{filename}")
-async def get_component(theme_id: str, filename: str, state: AppState = Depends(get_app_state)):
-    """テーマコンポーネントファイルを配信"""
-    logger.debug("GET /api/themes/%s/components/%s", theme_id, filename)
-    mgr = _get_manager(state)
-
-    # 信頼チェック
-    if not mgr.is_trusted(theme_id):
-        raise theme_not_trusted_error()
-
-    comp_path = mgr.get_component_path(theme_id, filename)
-    if comp_path is None:
-        raise theme_error(
-            404, "E0404", "Component not found", "api.theme_component_not_found",
-        )
-
-    return FileResponse(
-        path=str(comp_path),
-        media_type="application/javascript",
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-@router.get("/{theme_id}/cli-modules/{filename}")
-async def get_cli_module(theme_id: str, filename: str, state: AppState = Depends(get_app_state)):
-    """CLI モジュール Python ファイルを配信（信頼チェック付き）"""
-    logger.debug("GET /api/themes/%s/cli-modules/%s", theme_id, filename)
-    mgr = _get_manager(state)
-
-    # 信頼チェック
-    if not mgr.is_trusted(theme_id):
-        raise theme_not_trusted_error()
-
-    mod_path = mgr.get_cli_module_path(theme_id, filename)
-    if mod_path is None:
-        raise theme_error(
-            404, "E0404", "CLI module not found", "api.theme_cli_module_not_found",
-        )
-
-    return FileResponse(
-        path=str(mod_path),
-        media_type="text/x-python",
-        headers={"Cache-Control": "no-cache"},
+        headers=_PREVIEW_HEADERS,
     )

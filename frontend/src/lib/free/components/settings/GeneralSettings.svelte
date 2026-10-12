@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { configData, updateField } from '$lib/free/stores/settings';
+	import { configData } from '$lib/free/stores/settings';
 	import { configSection, fieldUpdater } from '$lib/free/stores/settingsHelpers';
 	import { t, promptLocale as promptLocaleCache, promptLocaleSwitching } from '$lib/i18n';
 	import { performPromptLocaleSwitch } from '$lib/free/services/configService';
@@ -40,7 +40,8 @@
 		promptLocaleSwitching.set(true);
 		try {
 			const { relearning } = await performPromptLocaleSwitch(newLocale);
-			updateField('i18n', 'prompt_locale', newLocale);
+			// 切替 API が config.yaml へ保存済み。promptLocale の購読 (settings ストア) が
+			// configData と dirty 判定の基準を同時に更新する (updateField だと基準が旧値のまま dirty になる)
 			promptLocaleCache.set(newLocale);
 			const key = relearning
 				? 'settings.i18n.prompt_locale_switched_with_relearn'

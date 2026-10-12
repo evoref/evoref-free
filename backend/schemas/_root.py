@@ -116,6 +116,27 @@ class EvorefConfig(BaseModel):
         return data
 
     @model_validator(mode="after")
+    def validate_ports_are_unique(self) -> "EvorefConfig":
+        """常に起動するサーバ (backend / Web UI / base / 埋め込み) のポートが重ならない。
+
+        重なると後から起動した方が bind に失敗し、起動の途中で原因の分かりにくい失敗になる。
+        rerank は起動条件があるので :meth:`validate_rerank_port_is_unique` が別に見る。
+        """
+        ports = {
+            "server.port": self.server.port,
+            "server.frontend_port": self.server.frontend_port,
+            "llama.port": self.llama.port,
+            "embedding.llama_port": self.embedding.llama_port,
+        }
+        by_port: dict[int, list[str]] = {}
+        for key, port in ports.items():
+            by_port.setdefault(port, []).append(key)
+        clash = [f"{' / '.join(keys)} ({port})" for port, keys in by_port.items() if len(keys) > 1]
+        if clash:
+            raise ValueError(f"ポートが重複しています: {', '.join(clash)}")
+        return self
+
+    @model_validator(mode="after")
     def validate_rerank_port_is_unique(self) -> "EvorefConfig":
         """rerank (off 以外・モデル設定済み) のポートが他のサーバのポートと重ならない (c_16 §7.2.1)
 
@@ -127,6 +148,7 @@ class EvorefConfig(BaseModel):
             "llama.port": self.llama.port,
             "embedding.llama_port": self.embedding.llama_port,
             "server.port": self.server.port,
+            "server.frontend_port": self.server.frontend_port,
         }
         clash = [key for key, port in others.items() if port == self.rag.rerank.port]
         if clash:
@@ -215,8 +237,11 @@ class EvorefConfig(BaseModel):
         判定対象:
 
         - ``widget_proxy.enabled = True``  (Pro Widget Proxy / 汎用 Web API プロキシ)
+        - ``llama.speculative.enabled = True`` (self-speculative decoding)
+        - ``pro.url_recall.team_profile_ids`` / ``pro.policy.pack_path`` が空でない
+        - ``pro.hub.*`` を既定から変えた (チーム知識ハブ)
         - ``create.staged.profile == "v1"`` (staged の v1 工程は Pro 限定。v2 は Free でも使う)
-        - 未定義トップレベルキー ``mode_models`` (Pro ローカルモデル切替)
+        - 未定義トップレベルキー ``mode_models`` の ``enabled`` が真 (Pro ローカルモデル切替)
 
         過去存在した ``external_api.enabled`` / 補助タスク関連の判定対象は
         削除済。
@@ -236,8 +261,8 @@ class EvorefConfig(BaseModel):
                 bool(self.pro.url_recall.team_profile_ids),
             ),
             ("pro.policy.pack_path", bool(self.pro.policy.pack_path.strip())),
-            ("pro.hub.auto_export", bool(self.pro.hub.auto_export)),
-            ("pro.hub.subscribe_dirs", bool(self.pro.hub.subscribe_dirs)),
+            # self-speculative decoding は Free の起動スクリプトが無効化する
+            ("llama.speculative.enabled", bool(self.llama.speculative.enabled)),
             # staged の v1 工程は Pro 限定 (_staged_stage_base_enabled がゲート)。
             # Free は v2 だけを使うので、v1 を指定しても longform のまま無効に
             # なることを警告する (f_10 §11.3)。staged_enabled は intra-staged の
@@ -247,13 +272,20 @@ class EvorefConfig(BaseModel):
                 self.create.pipeline == "staged" and self.create.staged.profile == "v1",
             ),
         ]
+        # チーム知識ハブ (docs/p_10) は Free に実体が無い。雛形は既定値で書いてあるので、
+        # 既定から変えたキーだけを明示設定とみなす。
+        for name, field in type(self.pro.hub).model_fields.items():
+            triggers.append((f"pro.hub.{name}", getattr(self.pro.hub, name) != field.get_default(call_default_factory=True)))
 
         # extra="allow" で透過する未定義トップレベルキー (Pro 拡張)。
         # 現状は ``mode_models`` のみ明示。新しい Pro 専用トップレベルキーが
-        # 増えたらここに追加する。
+        # 増えたらここに追加する。``enabled: false`` (Pro の雛形どおり) は何も効かせていない。
         extras = self.__pydantic_extra__ or {}
-        if "mode_models" in extras:
-            triggers.append(("mode_models", True))
+        mode_models = extras.get("mode_models")
+        if isinstance(mode_models, dict):
+            triggers.append(("mode_models", bool(mode_models.get("enabled"))))
+        elif "mode_models" in extras:
+            triggers.append(("mode_models", bool(mode_models)))
 
         for key, fired in triggers:
             if not fired:
@@ -270,11 +302,69 @@ class EvorefConfig(BaseModel):
         return self
 
 
+#: 新しい版の config で無視したキーの警告のデデュープ (同じ組は 1 回だけ出す)。
+_WARNED_NEWER_KEYS: set[tuple[str, ...]] = set()
+
+
+def _pop_loc(data: object, loc: tuple) -> bool:
+    """``loc`` (検証エラーの位置。リストの添字を含む) のキーを ``data`` から取り除く。"""
+    node = data
+    for part in loc[:-1]:
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and isinstance(part, int) and 0 <= part < len(node):
+            node = node[part]
+        else:
+            return False
+    if isinstance(node, dict) and loc and loc[-1] in node:
+        node.pop(loc[-1])
+        return True
+    return False
+
+
+def _drop_keys_unknown_to_this_version(raw: dict, version: int) -> dict:
+    """アプリより新しい版の config から、この版が知らないキーを取り除いた写しを返す (c_05 §7.6)。
+
+    ダウングレードで起動不能にしない。取り除くのは未知キー (``extra_forbidden``) と
+    この版の撤去キー (新しい版での意味を知らない) だけで、値・型の誤りは残して通常どおり拒否する。
+    """
+    import copy
+
+    from pydantic import ValidationError
+
+    from backend.config_normalize import G0_REMOVED_KEYS, G1_RETIRED_KEYS
+
+    data = copy.deepcopy(raw)
+    ignored: list[str] = []
+    for dotted in (*G0_REMOVED_KEYS, *G1_RETIRED_KEYS):
+        if _pop_loc(data, tuple(dotted)):
+            ignored.append(".".join(dotted))
+    for _ in range(20):
+        try:
+            EvorefConfig.model_validate(copy.deepcopy(data))
+            break
+        except ValidationError as e:
+            locs = [tuple(err["loc"]) for err in e.errors() if err.get("type") == "extra_forbidden"]
+        popped = [loc for loc in locs if _pop_loc(data, loc)]
+        if not popped:
+            break
+        ignored.extend(".".join(str(p) for p in loc) for loc in popped)
+    key = tuple(sorted(ignored))
+    if ignored and key not in _WARNED_NEWER_KEYS:
+        _WARNED_NEWER_KEYS.add(key)
+        logger.warning(
+            "config_version %d is newer than this evoref (%d); ignoring keys this version does not know: %s",
+            version, CONFIG_VERSION, ", ".join(ignored),
+        )
+    return data
+
+
 def validate_config(raw: dict) -> dict:
     """config dict を Pydantic スキーマで検証し、デフォルト値を補完した dict を返す
 
     G0 の撤去キー・旧名キーはここでは扱わない (``evoref config normalize`` が
-    設定ファイルから落とす、:mod:`backend.config_normalize`)。
+    設定ファイルから落とす、:mod:`backend.config_normalize`)。``config_version`` が
+    アプリより新しいときだけ、未知キーと撤去キーを WARNING を出して無視する (c_05 §7.6)。
 
     Args:
         raw: YAML から読み込んだ生の設定辞書
@@ -285,6 +375,11 @@ def validate_config(raw: dict) -> dict:
     Raises:
         pydantic.ValidationError: 設定値が不正な場合
     """
+    from backend.config_normalize import stored_config_version
+
+    version = stored_config_version(raw) if isinstance(raw, dict) else None
+    if version is not None and version > CONFIG_VERSION:
+        raw = _drop_keys_unknown_to_this_version(raw, version)
     validated = EvorefConfig.model_validate(raw)
     logger.info("Config validation passed")
     return validated.model_dump()

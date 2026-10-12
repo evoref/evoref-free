@@ -35,7 +35,6 @@ from backend.free.rag.evidence import (
     derive_confidence,
     new_evidence_id,
 )
-from backend.free.rag.evidence.types import corroboration_count
 from backend.io import JSONLAppendStore
 from backend.io.codec import codec_for, persisted
 from backend.io.format_registry import FormatSpec, register_format
@@ -94,9 +93,8 @@ class FetchPolicy:
     enabled: bool = False
     #: 取得の当て方。``KnowledgeSource.kind`` (出所の種別 = 確度の根拠) とは別軸。
     kind: FetchKind = "page"
-    #: 実際に叩く URL。``url_pattern`` はワイルドカードを許す照合用なので、
-    #: 取得先はここで別に持つ (空なら ``url_pattern`` にワイルドカードが
-    #: 無いときだけそれを使う)。
+    #: 実際に叩く URL。``url_pattern`` は予約フィールドで照合は未実装 —
+    #: ここが空のときの取得先の代替にだけ使う (``*`` を含むときは使わない)。
     url: str = ""
     #: 未知キーの退避先 (c_05 §0.5.2)。入れ子の dataclass も往復で落とさない。
     _extra: dict[str, Any] | None = None
@@ -467,6 +465,8 @@ class KnowledgeIngest:
                 # 注入の出所ヘッダ (c_16 §7.4) が読む。台帳を引かずに 1 行を
                 # 組めるよう、レコード側に名前を写しておく。
                 "source_name": source.name or source.id,
+                # 注入側が台帳を引かずに裏取り件数を出せるよう、取得元単位の数を写す (c_16 §3.1)
+                "independent_sources": 1,
             },
         )
         return self._store.put_record(record)
@@ -521,13 +521,15 @@ class KnowledgeIngest:
                 "captured_at": now,
             })
         fields: dict[str, Any] = {"provenance": provenance}
+        attrs: dict[str, Any] = {}
         if published_at and _is_newer(published_at, record.as_of):
             fields["as_of"] = published_at
-            fields["attrs"] = {"published_at": published_at}
+            attrs["published_at"] = published_at
+        count, reliability = self._independent_sources(provenance)
+        attrs["independent_sources"] = count
+        fields["attrs"] = attrs
         fields["confidence"] = derive_confidence(
-            "web",
-            corroboration_count(provenance),
-            source_reliability=self._reliability_of(item_id),
+            "web", count, source_reliability=reliability,
         )
         self._store.patch_record(fact_id, **fields)
         return True
@@ -549,7 +551,9 @@ class KnowledgeIngest:
           ``provenance`` だけ落とし、裏取り件数から確度を引き直す。
         - 同じ ``<subject>|<predicate>`` の新しい claim がある → その新 claim
           で **supersede** する (更新された言明として辿れるようにする)。
-        - どちらでもない → ``reason`` を付けて ``retract``。
+        - どちらでもない → ``reason`` を付けて ``retract``。取り下げで live に
+          戻る旧 claim も、根拠の取得単位が ``active`` でなければ同じ ``reason``
+          で取り下げる (連鎖を辿る)。
 
         Returns:
             ``{"retracted", "superseded", "detached"}`` の件数。
@@ -576,9 +580,47 @@ class KnowledgeIngest:
                 self._mark_superseded(fact.id, new_id)
                 out["superseded"] += 1
                 continue
-            if self._store.retract_fact(fact.id, reason):
-                out["retracted"] += 1
+            out["retracted"] += self._retract_with_stale_predecessors(fact.id, reason)
         return out
+
+    def _retract_with_stale_predecessors(self, fact_id: str, reason: str) -> int:
+        """``fact_id`` を取り下げ、それで live に戻る旧 claim のうち根拠の無いものも畳む。
+
+        ストアは取り下げた勝者に supersede されていた敗者を live へ戻す
+        (``_clear_dangling_supersession``)。敗者の取得単位がもう ``active`` で
+        なければ根拠の無い claim が注入され続けるので、同じ ``reason`` で取り下げ、
+        さらにその前の世代も辿る。根拠が ``active`` な敗者 (競合解決で負けたもの)
+        は戻すのが正しいので止めない。
+
+        Returns:
+            取り下げた件数。
+        """
+        retracted = 0
+        pending = [fact_id]
+        while pending:
+            current = pending.pop()
+            predecessors = self._store.supersedes_of(current)
+            if not self._store.retract_fact(current, reason):
+                continue
+            retracted += 1
+            pending.extend(
+                old_id for old_id in predecessors
+                if (old := self._store.get_fact(old_id)) is not None
+                and not old.superseded_by
+                and not self._has_active_item(old)
+            )
+        return retracted
+
+    def _has_active_item(self, fact: SemanticFact) -> bool:
+        """``item:`` 出所が無い、または 1 件でも ``active`` な取得単位を指すか。"""
+        items = [
+            self._store.items.get(p.source_id.removeprefix("item:"))
+            for p in fact.provenances
+            if p.source_id.startswith("item:")
+        ]
+        if not items:
+            return True
+        return any(item is not None and item.status == "active" for item in items)
 
     def _detach_items(self, fact_id: str, expired: set[str]) -> bool:
         """``expired`` の取得単位を ``provenance`` から外し、確度を引き直す。"""
@@ -592,16 +634,12 @@ class KnowledgeIngest:
         ]
         if not kept or len(kept) == len(original):
             return False
+        count, reliability = self._independent_sources(kept)
         self._store.patch_record(
             fact_id,
             provenance=kept,
-            confidence=derive_confidence(
-                "web",
-                corroboration_count(kept),
-                source_reliability=self._reliability_of(
-                    str(kept[0].get("source_id") or "").removeprefix("item:"),
-                ),
-            ),
+            confidence=derive_confidence("web", count, source_reliability=reliability),
+            attrs={"independent_sources": count},
         )
         return True
 
@@ -612,13 +650,34 @@ class KnowledgeIngest:
             return
         self._store.patch_record(old_id, superseded_by=new_id)
 
-    def _reliability_of(self, item_id: str) -> float:
-        """取得単位 → 取得元 → ``reliability``。辿れなければ下端。"""
-        item = self._store.items.get(item_id)
-        source = self._store.sources.get(item.source_id) if item else None
-        if source is None:
-            return RELIABILITY_MIN
-        return source.clamped_reliability()
+    def _independent_sources(
+        self, provenance: Iterable[dict[str, Any]],
+    ) -> tuple[int, float]:
+        """``provenance`` を取得元へ畳み、(独立した取得元の数, その最大 ``reliability``)。
+
+        同じ取得元の別 entry (RSS の複数記事など) は独立した裏取りではないので、
+        取得単位 (``item:ki_…``) を取得元 ID へ引いてから数える。確度の上限は
+        最後に足した取得元ではなく、根拠全体のうち最も信頼できる取得元で決める。
+        取得元まで辿れない出所は 1 件として数え、``reliability`` は下端に倒す。
+        """
+        reliability_by_source: dict[str, float] = {}
+        for entry in provenance:
+            marker = entry.get("source_id") or entry.get("session_id")
+            if not isinstance(marker, str) or not marker:
+                continue
+            key, reliability = marker, RELIABILITY_MIN
+            if marker.startswith("item:"):
+                item = self._store.items.get(marker.removeprefix("item:"))
+                source = self._store.sources.get(item.source_id) if item else None
+                if source is not None:
+                    key, reliability = f"source:{source.id}", source.clamped_reliability()
+            reliability_by_source[key] = max(
+                reliability_by_source.get(key, RELIABILITY_MIN), reliability,
+            )
+        return (
+            len(reliability_by_source),
+            max(reliability_by_source.values(), default=RELIABILITY_MIN),
+        )
 
 
 def _is_newer(candidate: str, current: str | None) -> bool:

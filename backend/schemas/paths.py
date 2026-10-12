@@ -1,18 +1,21 @@
 """モデル・ローカル状態のパス系スキーマ"""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from backend.config_normalize import reject_retired_keys
 
 
 class ModelPathsConfig(BaseModel):
     """モデルファイルパス
 
-    標準 2 モデル (base/embed) と任意のリランカー (rerank) を明示フィールドとして定義。
-    カスタムモデル種を追加できるよう ``extra="allow"`` を維持する。
+    標準 2 モデル (base/embed) と任意のクリエイト用 (create)・リランカー (rerank) を
+    明示フィールドとして定義する。読み手の無いキーは typo とみなして ``extra="forbid"``
+    で拒否する (G0 で撤去したモデル種は ``evoref config normalize`` が先に落とす)。
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
-    base_model: str = "models/gemma-4-12b-it-qat-q4_0.gguf"
+    base_model: str = Field(default="models/gemma-4-12b-it-qat-q4_0.gguf", min_length=1)
     embed_model: str = "models/Qwen3-Embedding-0.6B-Q8_0.gguf"
     create_model: str | None = Field(
         default=None,
@@ -22,6 +25,14 @@ class ModelPathsConfig(BaseModel):
         default=None,
         description="リランカー (rag.rerank) 用 GGUF パス。未指定なら rerank 用 llama-server は起動しない",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_model_kinds(cls, data: object) -> object:
+        """撤去したモデル種 (assist_model 等) は normalize の案内付きで拒否する (未知キーの一般の拒否より先)。"""
+        if isinstance(data, dict):
+            reject_retired_keys("model_paths", data)
+        return data
 
 
 class LocalPathsConfig(BaseModel):
@@ -40,5 +51,6 @@ class LocalPathsConfig(BaseModel):
     # (2026-09-08 監査 F-05)。明示パスを与えられた書込みはこの外へ出る。
     outputs_dir: str = Field(
         default="outputs/",
+        min_length=1,
         description="ディレクトリ指定の無い生成物の既定の書込み先 (相対ならデータ根基準)。",
     )

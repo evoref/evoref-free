@@ -41,7 +41,7 @@ import hashlib
 import json
 import re
 import zipfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -86,6 +86,20 @@ TEMPLATES_DIR = "templates"
 LANGUAGE_DIR = "language"
 #: ``provides`` に載る既知のセクション名 (この 3 つ + 将来のセクション)。
 SECTION_DIRS = (DOCS_DIR, TEMPLATES_DIR, LANGUAGE_DIR)
+#: 展開物のトップレベルに置けるファイル (``eval.json`` は Pro の作成が同梱する)。
+#: それ以外のトップレベルはディレクトリ (既知 / 未知のセクションと ``prebuilt/``) だけ。
+ALLOWED_TOP_LEVEL_FILES = frozenset({PACKAGE_FILE, "eval.json"})
+#: 版ディレクトリの派生物 (corpus/store.py・evidence/store.py・pseudo_queries.py が作る) と
+#: 同じ名前のディレクトリ。同梱を許すと未署名でも索引として読まれ、署名検証と
+#: prebuilt 不採用を素通りする。
+DERIVED_TOP_LEVEL_DIRS = frozenset({"snapshot", "embeddings", "events", "tail", "pseudo_queries"})
+
+#: ``rag.packages.max_package_bytes`` / ``max_unpacked_bytes`` の既定 (c_16 §4.3 の
+#: 入口検査)。設定を読まない経路 (CLI の署名・検証など) もこの上限で読む。
+DEFAULT_MAX_PACKAGE_BYTES = 268_435_456
+DEFAULT_MAX_UNPACKED_BYTES = 1_073_741_824
+#: 1 エントリの展開後の上限。
+DEFAULT_MAX_MEMBER_BYTES = 536_870_912
 
 #: ``kind`` の既知値 (c_16 §4.3)。``package`` = 配布物 (既定)、
 #: ``project_map`` = 機械生成 (c_16 §4.4)。
@@ -411,9 +425,10 @@ def _dir_content_digest(root: Path) -> str:
 def compute_content_digest(docs_dir: Path | str) -> str:
     """``docs/`` の内容ダイジェスト (:func:`_dir_content_digest`)。
 
-    チャンクの evidence id はこの値から導出するので (``chunking.py``)、
-    再インストールで id が変わらない。``docs/`` 以外を混ぜると意味が変わる
-    ため、対象は常に ``docs/`` だけ (c_16 §4.3)。
+    install 時の完全性の確認 (宣言値との突き合わせ) と、同じ (id, 版) の中身が
+    同じかの判定に使う。チャンクの evidence id には使わない (id は
+    ``chunking.chunk_evidence_id`` が本文の sha256 から導く)。``docs/`` 以外を
+    混ぜると意味が変わるため、対象は常に ``docs/`` だけ (c_16 §4.3)。
     """
     return _dir_content_digest(Path(docs_dir))
 
@@ -440,6 +455,22 @@ def discover_sections(root: Path | str) -> list[str]:
         if section.is_dir() and any(p.is_file() for p in section.rglob("*")):
             found.append(name)
     return sorted(found)
+
+
+def top_level_violations(entries: Iterable[tuple[str, bool]]) -> list[str]:
+    """``(名前, ディレクトリか)`` の列から、トップレベルに置けないものを返す (昇順)。
+
+    Windows は大文字小文字を区別しないので ``Events/`` も派生物として扱う。
+    """
+    bad: set[str] = set()
+    for name, is_dir in entries:
+        key = name.casefold()
+        if is_dir:
+            if key in DERIVED_TOP_LEVEL_DIRS:
+                bad.add(f"{name}/")
+        elif key not in ALLOWED_TOP_LEVEL_FILES:
+            bad.add(name)
+    return sorted(bad)
 
 
 def has_any_section_content(root: Path | str) -> bool:
@@ -615,8 +646,9 @@ def read_package(
     zip_path: Path | str,
     extract_to: Path | str | None = None,
     *,
-    max_package_bytes: int | None = None,
-    max_unpacked_bytes: int | None = None,
+    max_package_bytes: int | None = DEFAULT_MAX_PACKAGE_BYTES,
+    max_unpacked_bytes: int | None = DEFAULT_MAX_UNPACKED_BYTES,
+    max_member_bytes: int | None = DEFAULT_MAX_MEMBER_BYTES,
 ) -> PackageContents:
     """`.evocart` を読む (``extract_to`` 指定時は展開もする)。
 
@@ -626,11 +658,13 @@ def read_package(
         max_package_bytes: zip 本体のサイズ上限 (``rag.packages.max_package_bytes``)。
             ``None`` で無検査。
         max_unpacked_bytes: 展開後の合計サイズ上限 (zip bomb 対策)。``None`` で無検査。
+        max_member_bytes: 1 エントリの展開後のサイズ上限。``None`` で無検査。
 
     Raises:
         PackageFormatError: ``package.json`` が G1 の封筒でない (G0) / 新しい版。
         PackageError: zip でない / ``package.json`` が無い / id・版が不正 /
-            zip slip を検出した / サイズ上限を超えた。
+            zip slip を検出した / サイズ上限を超えた / トップレベルに置けない
+            もの (派生物と同じ名前・``package.json`` 以外のファイル) がある。
     """
     path = Path(zip_path)
     if not path.exists():
@@ -648,7 +682,9 @@ def read_package(
     destination = Path(extract_to) if extract_to is not None else None
 
     with zipfile.ZipFile(str(path), "r") as zf:
-        limits = ExtractLimits(max_total_bytes=max_unpacked_bytes)
+        limits = ExtractLimits(
+            max_total_bytes=max_unpacked_bytes, max_member_bytes=max_member_bytes,
+        )
         if max_unpacked_bytes is not None:
             # 自己申告の file_size で早めに断る (実際の展開量は下の budget でも数える)
             unpacked = sum(info.file_size for info in zf.infolist())
@@ -672,6 +708,11 @@ def read_package(
         meta_key = PurePosixPath(PACKAGE_FILE)
         if meta_key not in remap:
             raise PackageError(f"{PACKAGE_FILE} not found in package")
+        disallowed = top_level_violations((m.parts[0], len(m.parts) > 1) for m in remap)
+        if disallowed:
+            raise PackageError(
+                f"package has disallowed top-level entries: {', '.join(disallowed)}",
+            )
         meta = meta_from_json(zf.read(remap[meta_key]))
 
         doc_names = sorted(
@@ -870,6 +911,11 @@ def package_filename(meta: PackageMeta) -> str:
 
 
 __all__ = [
+    "ALLOWED_TOP_LEVEL_FILES",
+    "DEFAULT_MAX_MEMBER_BYTES",
+    "DEFAULT_MAX_PACKAGE_BYTES",
+    "DEFAULT_MAX_UNPACKED_BYTES",
+    "DERIVED_TOP_LEVEL_DIRS",
     "DOCS_DIR",
     "EDITION_PRO_FEATURE",
     "KNOWN_FEATURES",
@@ -907,6 +953,7 @@ __all__ = [
     "prebuilt_from_record",
     "read_package",
     "read_package_meta",
+    "top_level_violations",
     "validate_package_id",
     "section_manifest_payload",
     "validate_requires",

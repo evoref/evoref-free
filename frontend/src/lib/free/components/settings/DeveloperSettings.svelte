@@ -33,15 +33,13 @@
 		try {
 			await resetLocalData(true);
 		} catch (e) {
-			// ApiError (403/400/500 等) は本物のエラー。それ以外 (ネットワーク切断 =
-			// backend が応答前に停止) はヘルパーが進行中とみなし stopped へ倒す。
-			if (e instanceof ApiError) {
-				errorMessage = e.message;
-				phase = 'error';
-				return;
-			}
+			// ヘルパーは 202 を返してから停止を始める (--delay 2) ので、応答を受け取れなかった
+			// (通信失敗等) なら初期化は始まっていない。停止の案内へ倒さずエラーにする。
+			errorMessage = e instanceof ApiError ? e.message : $t('settings.error.network');
+			phase = 'error';
+			return;
 		}
-		// 202 受領 (またはネットワーク切断) = ヘルパー起動済み。全サービスは停止に向かう。
+		// 202 受領 = ヘルパー起動済み。全サービスは停止に向かう。
 		// 自動再起動はしないので、このタブを閉じる (best-effort)。スクリプトで開いて
 		// いない通常タブはブラウザ仕様で閉じられないため、その場合は stopped 案内が残る。
 		phase = 'stopped';
@@ -64,13 +62,13 @@
 					<div class="action-name">{$t('settings.develop.reset_title')}</div>
 					<div class="action-hint">{$t('settings.develop.reset_hint')}</div>
 				</div>
-				<button class="btn-danger" onclick={openConfirm} disabled={phase !== 'idle'}>
+				<button class="btn-danger" onclick={openConfirm} disabled={phase !== 'idle' && phase !== 'error'}>
 					{$t('settings.develop.reset_button')}
 				</button>
 			</div>
 
 			{#if phase === 'error' && errorMessage}
-				<div class="error-box">{errorMessage}</div>
+				<div class="error-box" role="alert">{errorMessage}</div>
 			{/if}
 		</section>
 	</div>

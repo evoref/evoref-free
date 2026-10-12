@@ -89,7 +89,6 @@
 		"knowledge_sources": "Knowledge Sources",
 		"audit_trail": "Audit Trail",
 		"themes": "Themes",
-		"knowledge": "Knowledge Base",
 		"settings": "Settings",
 		"dashboard": "Dashboard",
 		"fewshot": "Learned Examples",
@@ -501,6 +500,7 @@
 			"distribution": "Based on {n} vectors. match top1 p50={matchp50}, unrelated p95={bgp95}.",
 			"apply": "Apply",
 			"applied": "Thresholds applied.",
+			"applied_restart_required": "Thresholds saved. Restart the backend to apply them.",
 			"dismiss": "Dismiss",
 			"insufficient": "Not enough vectors to calibrate ({n}). Reindex first.",
 			"no_vectors": "No vectors found. Reindex first."
@@ -595,7 +595,8 @@
 		},
 		"tools": {
 			"fetch_url_enabled": "URL Fetch",
-			"fetch_url_timeout": "URL Timeout (sec)"
+			"fetch_url_timeout": "URL Timeout (sec)",
+			"fetch_url_reenable_note": "It cannot be re-enabled from the UI. To enable it, set tools.fetch_url_enabled to true in config.yaml."
 		},
 		"widget_proxy": {
 			"enabled": "Enabled",
@@ -627,6 +628,7 @@
 			"history": "History",
 			"rollback": "Rollback",
 			"rollback_confirm": "Roll back to version {version}?",
+			"rollback_discard_confirm": "Discard your unsaved edits and roll back to version {version}?",
 			"rolled_back": "Rolled back to version {version}",
 			"rollback_failed": "Rollback failed",
 			"no_history": "No history available",
@@ -655,7 +657,25 @@
 			"save": "Save",
 			"saved_restart": "Saved. Restart the server to apply.",
 			"create_shared_note": "The create model runs on the same server as the base model and uses the base model's launch options."
-		}
+		},
+		"leave_confirm": "You have unsaved changes. Discard them and leave this page?",
+		"applied_partial_restart_required": "Some settings were saved. Restart the backend to apply them",
+		"error": {
+			"readonly": "Cannot save: the data is read-only",
+			"forbidden": "This setting cannot be changed from the UI (edit config.yaml instead)",
+			"not_found": "This settings section cannot be saved (the backend edition may differ)",
+			"invalid": "Invalid value",
+			"server": "Failed to save ({code})",
+			"network": "Could not reach the backend"
+		},
+		"field": {
+			"on": "ON",
+			"off": "OFF",
+			"range_between": "Enter a value between {min} and {max}",
+			"range_min": "Enter a value of at least {min}",
+			"range_max": "Enter a value of at most {max}"
+		},
+		"server_changed_discarded": "These unsaved edits were discarded because the values were changed elsewhere: {keys}"
 	},
 	"file": {
 		"attach": "Attach File",
@@ -674,19 +694,10 @@
 		"installing": "Installing...",
 		"uninstall": "Uninstall",
 		"activate": "Activate",
-		"trusted": "Has code, trusted",
 		"no_themes": "No themes available. Use \"Install\" at the top right to add a .zip theme.",
 		"install_failed": "Failed to install theme",
 		"activate_failed": "Failed to activate theme",
 		"uninstall_failed": "Failed to uninstall theme",
-		"trust_title": "Theme Trust Confirmation",
-		"trust_theme_name": "Theme Name",
-		"trust_author": "Author",
-		"trust_version": "Version",
-		"trust_components": "Components",
-		"trust_cli_required": "This theme contains custom code. To enable it, run the following command in a terminal (trust cannot be granted from the UI).",
-		"trust_cli_restart": "Restart evoref afterwards to enable it. For now you can apply only the colors and layout without the code.",
-		"trust_apply_without_code": "Apply without code",
 		"active": "Active",
 		"preview_alt": "Preview of {name}",
 		"no_preview": "No preview",
@@ -694,8 +705,6 @@
 		"current": "Current theme",
 		"none": "No theme (standard)",
 		"installed_heading": "Installed themes ({count})",
-		"untrusted_code": "Has code, untrusted",
-		"trust_hint": "Untrusted themes apply colors and layout only. To enable their code, run evoref theme trust <theme ID> in a terminal and restart evoref.",
 		"uninstall_confirm_title": "Uninstall theme",
 		"uninstall_confirm_message": "Uninstall \"{name}\"? If it is the active theme, the standard look is restored."
 	},
@@ -807,10 +816,8 @@
 		"template_aliases_hint": "Comma-separated (optional)",
 		"template_lang": "Language",
 		"template_registering": "Registering...",
-		"template_register_success": "Registered template \"{doc_type}\"",
 		"template_register_failed": "Failed to register the template",
 		"progress": {
-			"title": "In progress",
 			"phase_extract": "Extracting documents",
 			"phase_chunk_embed": "Chunking and embedding",
 			"phase_index": "Building index",
@@ -821,9 +828,7 @@
 			"done": "Done",
 			"cancel": "Cancel",
 			"cancelling": "Cancelling…",
-			"cancelled": "Cancelled",
-			"install_title": "Installing cartridge",
-			"create_title": "Creating cartridge"
+			"install_title": "Installing cartridge"
 		},
 		"page_description": "A cartridge is a package of documents, templates and language packs used for answers. Documents in loaded cartridges are searched.",
 		"installed_heading": "Installed ({count})",
@@ -886,7 +891,6 @@
 		"learning_cycle_running": "Learning cycle already running",
 		"data_readonly": "The data is read-only, so this change was not saved. Memory, learning, history and settings are not saved.",
 		"learning_llm_unavailable": "LLM client not available",
-		"fewshot_delegated_to_semmem": "The few-shot pool is delegated to SemMem (evolve_writeback=semmem)",
 		"fewshot_not_found": "Few-shot example not found: {example_id}",
 		"optimize_invalid_level": "level must be 'level1'",
 		"optimize_invalid_mode": "mode must be 'create' or 'chat'",
@@ -897,6 +901,7 @@
 		"cartridge_manager_not_initialized": "Cartridge manager not initialized",
 		"cartridge_embedder_not_initialized": "Embedding backend not initialized",
 		"cartridge_not_found_id": "Cartridge not found: {cartridge_id}",
+		"cartridge_invalid_id": "Invalid package ID: {cartridge_id} (2-40 lowercase letters, digits, hyphens or underscores, starting with a letter or digit)",
 		"cartridge_busy": "Another cartridge operation (install, rebuild or delete) is running. Try again when it finishes.",
 		"export_unsupported_format": "Unsupported format: {ext}. Supported: {supported}",
 		"export_missing_content": "Either 'content' or 'data' must be provided",
@@ -931,21 +936,22 @@
 		"theme_zip_too_large": "ZIP file too large: {size} bytes (max {max_size})",
 		"theme_not_found": "Theme not found: {theme_id}",
 		"theme_preview_not_found": "Preview image not found",
-		"theme_cli_preview_not_found": "CLI preview image not found",
-		"theme_not_trusted": "Theme is not trusted",
-		"theme_component_not_found": "Component not found",
-		"theme_cli_module_not_found": "CLI module not found",
 		"theme_install_invalid": "Theme installation failed: invalid package",
 		"theme_already_exists": "Theme already exists",
 		"theme_css_not_found": "Theme CSS file not found",
 		"theme_activate_invalid": "Theme activation failed",
 		"theme_uninstall_invalid": "Cannot uninstall this theme",
+		"config_persist_failed": "The settings could not be saved to config.yaml",
 		"model_health_check_failed": "llama-server health check failed",
 		"prompt_manager_not_initialized": "Prompt manager not initialized",
 		"prompt_locale_unsupported": "Unsupported prompt locale: {locale}",
 		"prompt_locale_learning_running": "Cannot switch locale while learning is running",
 		"config_launch_args_protected": "These launch option flags cannot be set from the settings screen: {flags}. Edit config.yaml directly.",
-		"config_launch_args_invalid": "The launch options could not be parsed: {error}"
+		"config_launch_args_invalid": "The launch options could not be parsed: {error}",
+		"config_capability_key_protected": "These settings cannot be changed from the UI: {keys}. Edit config.yaml directly.",
+		"config_newer_version": "Not saved: config.yaml has config_version {version}, newer than this evoref. Update evoref or edit config.yaml by hand.",
+		"config_validation_failed": "The settings were not saved because some values are invalid: {errors}",
+		"mode_switch_failed": "The server could not be started with the model for mode {mode}, so the mode was set back to {previous}."
 	},
 	"sources": {
 		"title": "Sources",
@@ -1086,9 +1092,10 @@
 		"add": "Add",
 		"enable": "Enable",
 		"disable": "Disable",
-		"delete": "Remove",
+		"delete": "Block",
+		"unblock": "Unblock",
+		"unblocked_notice": "Unblocked \"{name}\". Enable it to resume fetching.",
 		"fetch_now": "Fetch Now",
-		"fetch_done": "Fetch complete ({added} new item(s))",
 		"fetch_requested": "Fetch requested (running in the background)",
 		"sources_empty": "No sources registered",
 		"recent_items": "Recently fetched items ({count})",
@@ -1099,11 +1106,11 @@
 		"sources_heading": "Sources ({count})",
 		"status_enabled": "Enabled",
 		"status_disabled": "Disabled",
-		"status_blocked": "Removed",
+		"status_blocked": "Blocked",
 		"last_fetched": "Last fetched {at}",
 		"never_fetched": "Not fetched yet",
-		"delete_confirm_title": "Delete source",
-		"delete_confirm_message": "Remove \"{name}\" from the ledger? Content fetched so far is kept."
+		"delete_confirm_title": "Block source",
+		"delete_confirm_message": "Block \"{name}\"? Information already fetched from it is dropped from use at the next cleanup. You can unblock it later."
 	},
 	"fewshot": {
 		"title": "Learned Examples",
@@ -1137,8 +1144,7 @@
 		"filter_label": "Filter by mode",
 		"usage_label": "Usage",
 		"query_label": "Question",
-		"mode_label": "Mode",
-		"writeback_note": "Storage: {writeback}"
+		"mode_label": "Mode"
 	},
 	"audit": {
 		"hint": "For every answer, the IDs of the material used, the cartridges, the model, the prompt version and the number of external calls are recorded in a hash-chained ledger. Texts are not recorded. Tampering is detectable, not prevented.",

@@ -69,13 +69,14 @@ export const backendEdition = writable<string | null>(null);
 export const proActive = derived(backendEdition, ($edition) => isPro && $edition !== 'free');
 
 /**
- * 現在 start/stop 操作中のサーバー名 (ModelServerControl のスピナー表示用)
+ * start/stop 操作中のサーバー (ModelServerControl のスピナー表示用)。サーバーごとに持つ
+ * (1 つの名前だけを持つと、base と embed を並行して操作したとき先に終わった側が他方の表示を消す)
  *
  * コンポーネントローカルの $state にすると、設定タブ切替やルート遷移で
  * ModelServerControl が再マウントされた瞬間にスピナーが消えてしまうため、
  * グローバルストアに保持して再マウントを跨いでも維持する。
  */
-export const busyServer = writable<ServerName | null>(null);
+export const busyServers = writable<Partial<Record<ServerName, boolean>>>({});
 
 /** ステータスを1回取得して store を更新 */
 export async function refreshServerStatus(): Promise<void> {

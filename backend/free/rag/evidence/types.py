@@ -585,6 +585,8 @@ class ClaimAttrs(_EmbedSideAttrs):
     region: list[str] | None = None
     #: 注入の出所ヘッダ (§7.4) の表示名
     source_name: str | None = None
+    #: 取得元単位の独立した裏取り件数 (§3.1)。注入の出所ヘッダが台帳を引かずに読む
+    independent_sources: int | None = None
 
 
 @persisted(omit_defaults=True)

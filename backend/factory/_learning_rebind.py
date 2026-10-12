@@ -148,7 +148,7 @@ def rebind_base_learning(
          SystemPromptManager / AuxPromptManager の prompt_dir を差替えて再ロード、
          ExperienceBuffer を新パーティションへ rebind、FeedbackCollector の
          base_model 名を更新、LearningScheduler 経由で learning_state /
-         PolicyParamEvolver / FewShotPool (再 bootstrap) / FeedbackPipe /
+         PolicyParamEvolver / FewShotPool (再 bootstrap) /
          GenerationParamEvolver を再バインド、PolicyAdjuster を再スコープ。
 
     Args:
