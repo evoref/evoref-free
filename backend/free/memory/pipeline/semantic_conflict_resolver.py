@@ -81,7 +81,13 @@ from backend.free.memory.notes.note_builder import (
 )
 from backend.free.memory.notes.subject_ns import is_session_summary_subject
 from backend.free.memory.protocols import SemanticFactStoreProtocol
-from backend.free.memory.semantic.fact import fact_carries_span, fact_value_update
+from backend.free.memory.corrections import rows_the_correction_names
+from backend.free.memory.semantic.fact import (
+    fact_carries_span,
+    fact_span_texts,
+    fact_value_update,
+    fact_value_update_topics,
+)
 from backend.free.memory.semantic.namespaces import namespace_of, policy_for
 from backend.free.memory.types import SemanticFact
 from backend.io.codec import CodecError, codec_for, persisted
@@ -935,6 +941,11 @@ def _correction_span_groups(facts: list[SemanticFact]) -> list[list[SemanticFact
             and f.created_at < correction.created_at
             and fact_carries_span(f, needle)
         ]
+        # 旧値の span を持っても、訂正が名指していない話題の行 (「車検も…4月18日」)
+        # は組ませない (書き込み側の畳みと同じ述語、不変則 #13)。
+        losers = rows_the_correction_names(
+            losers, fact_value_update_topics(correction), texts=fact_span_texts,
+        )
         if not losers:
             continue
         claimed.update(f.id for f in losers)

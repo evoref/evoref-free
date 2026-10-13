@@ -957,6 +957,7 @@
     "output_note": {
       "sign_differs": "(System note: the leading \"{lead}\" differs in sign from the result of the calculation in the body (-{magnitude}).)",
       "unread_file_entity": "(System note: the content of {files} has not been read in this conversation. {names} was not taken from the file.)",
+      "ungrounded_material_number": "(System note: not stated in the retrieved material; may involve calculation or guesswork: {numbers}.)",
       "table_aggregate": "(System note: the values of {spec} computed by code from all {rows} rows of {source} are {values}.)",
       "table_fallback": "the retrieved table"
     }

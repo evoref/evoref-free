@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,7 +39,13 @@ from backend.free.memory.notes.note_builder import (
     is_single_valued_subject,
     is_span_only_fold_subject,
 )
-from backend.free.memory.semantic.fact import fact_carries_span, fact_value_update
+from backend.free.memory.corrections import correction_topics, rows_the_correction_names
+from backend.free.memory.semantic.fact import (
+    fact_carries_span,
+    fact_span_texts,
+    fact_value_update,
+    fact_value_update_topics,
+)
 from backend.log_config import get_logger
 
 if TYPE_CHECKING:
@@ -57,6 +64,9 @@ def persist_facts(
     store: "SemanticFactStore",
     result: "ExtractionResult",
     label: str,
+    *,
+    corrections: list | None = None,
+    stats: dict | None = None,
 ) -> int:
     """``ExtractionResult`` のファクトを ``SemanticFactStore`` に書き込む。
 
@@ -67,6 +77,8 @@ def persist_facts(
         store: 書き込み先ストア。
         result: ``BaseExtractor.extract`` の戻り値。
         label: ログ用ラベル (``"chat"`` / ``"create"`` / ``"mdp_trace"`` 等)。
+        corrections: 同じバッチで閉じてよい検証済みの訂正 (:func:`verified_pending`)。
+        stats: 閉じた / 棄権した件数の置き場 (:func:`write_sleep_facts`)。
 
     Returns:
         実際に書き込まれたファクト数。
@@ -88,14 +100,21 @@ def persist_facts(
             continue
         seen_values.add(key)
         kept.append(fact)
-    written = len(write_sleep_facts(store, kept, label=label))
+    written = len(write_sleep_facts(
+        store, kept, label=label, corrections=corrections, stats=stats,
+    ))
     if written:
         logger.debug("Step 8 [%s]: persisted %d facts", label, written)
     return written
 
 
 def write_sleep_facts(
-    store: "SemanticFactStore", facts: list, *, label: str,
+    store: "SemanticFactStore",
+    facts: list,
+    *,
+    label: str,
+    corrections: list | None = None,
+    stats: dict | None = None,
 ) -> list:
     """sleep-time の SemMem 書込みの **共通入口** (不変則 #13)。
 
@@ -108,17 +127,22 @@ def write_sleep_facts(
        させない。キュレーターの ``public_notes`` と二重の防御)
     2. mem が所有しない型 (``FACT_OWNERSHIP``) は書かない (loop / learn の型は
        各 Fact View を通す)
-    3. 行が置き換える旧値の span (``value_update``) を ``attrs.value_update`` へ
+    3. 行が置き換える旧値の span (``value_update``) を ``attrs.value_update`` へ、
+       その訂正の話題語 (``value_update_topics``) を ``attrs.value_update_topics`` へ
        載せ、Step 6B と到着時の畳みが後から読めるようにする。検証済みの訂正は、
        その span を持つ古い live ファクトのスロットが 1 つに定まればそこを継ぐ
        (:func:`_inherit_corrected_slot`)
     4. 書いた後に #13 の畳みを掛ける — ``mem.*`` の属性スロットと
        ``mem.world.assertion.*`` だけ (セッション要約・``idx.*`` には掛けない)
+    5. ``corrections`` (:func:`verified_pending`) を渡されたら、このバッチで書いた
+       旧値の行を宛先にして訂正を閉じる (:func:`_close_corrections_in_batch`)。
+       旧値の行は上で書いたまま (値を失わない)。閉じた / 棄権した件数は ``stats`` の
+       ``corrections_closed_in_batch`` / ``corrections_abstained_in_batch`` へ足す
 
     ``sleep/*`` の ``.add_fact(`` 直呼びは ``test_sleep_fact_write_entry.py`` が禁止する。
 
     Returns:
-        書き込めたファクト (入力の順)。
+        書き込めたファクト (入力の順。訂正を閉じた新値の行は含めない)。
     """
     from backend.free.memory.ownership import can_write
 
@@ -143,7 +167,11 @@ def write_sleep_facts(
             continue
         span = getattr(fact, "value_update", None)
         if span:
-            fact._extra = {**(getattr(fact, "_extra", None) or {}), "value_update": str(span)}
+            extra = {**(getattr(fact, "_extra", None) or {}), "value_update": str(span)}
+            topics = getattr(fact, "value_update_topics", None)
+            if topics:
+                extra["value_update_topics"] = [str(t) for t in topics]
+            fact._extra = extra
             _inherit_corrected_slot(store, fact, label, inherited)
         try:
             store.add_fact(fact)
@@ -158,7 +186,244 @@ def write_sleep_facts(
         _supersede_corrected_slots(store, foldable, label)
         _retire_arrivals_behind_slot_edits(store, foldable, label)
         _retire_assertions_contradicted_by_change(store, foldable, label)
+    if corrections:
+        closed, abstained = _close_corrections_in_batch(
+            store, persisted, corrections, label,
+        )
+        if stats is not None:
+            for key, count in (
+                ("corrections_closed_in_batch", closed),
+                ("corrections_abstained_in_batch", abstained),
+            ):
+                stats[key] = int(stats.get(key, 0)) + count
     return persisted
+
+
+@dataclass(frozen=True)
+class PendingCorrection:
+    """同じバッチで閉じてよい検証済みの訂正 (:func:`verified_pending` が作る)。"""
+
+    note: "MemoryNote"
+    #: 訂正が言い直している前の発話のノート ID (``corrections.span_correction_target``:
+    #: 同じ会話で訂正より前に旧値の span を含む利用者のノートが **ちょうど 1 つ**)。
+    #: 定まらなければ ``None``。宛先の行はこのノートから出たものに限る — バッチ
+    #: (ノートごとの書込み) の境界で見える行が変わっても、宛先の決まり方は変わらない。
+    target_note_id: str | None
+    #: 判定に渡したノート列 (旧値の持ち主の判定 ``third_party_correction_slots`` を
+    #: Step 8 と同じ材料で呼ぶため)。
+    notes: tuple = ()
+
+
+def verified_pending(notes: list) -> list[PendingCorrection]:
+    """Step 8.0 で本人の訂正と検証されたが、まだファクトになっていない訂正 (純粋関数)。
+
+    旧値の行を作る書き手 (Step 8.3) が同じバッチで訂正を閉じるための入力
+    (:func:`_close_corrections_in_batch`)。Step 8 の値アンカーは旧値の行が live で
+    あることを前提にするが、その行を作るのは後に走る Step 8.3 なので、宛先の無い
+    訂正は次の Full まで閉じなかった (2026-10-12 audit_replay R27_cross_recall #4)。
+
+    条件: verdict が ``self`` (``core/correction_verdict`` の門を通った本人の値の訂正。
+    ``assistant`` / ``third_party`` / ``disputed`` / ``invalid_span`` / ``premise_change``
+    は含めない)、旧値の span が正規化して 2 文字以上、``extracted_fact_ids`` が空
+    (Step 8 がまだ書いていない)。言い直している前の発話は注入の随伴と同じ
+    ``corrections.span_correction_target`` で決める (不変則 #14a)。
+    """
+    from backend.free.core.correction_verdict import norm_span
+    from backend.free.memory.corrections import span_correction_target
+
+    out: list[PendingCorrection] = []
+    context = tuple(notes)
+    for note in notes:
+        wrong = str(getattr(note, "correction_wrong_claim", "") or "")
+        if (
+            getattr(note, "source", "user") != "user"
+            or getattr(note, "private", False)
+            or str(getattr(note, "correction_verdict", "") or "") != "self"
+            or len(norm_span(wrong)) < 2
+            or getattr(note, "extracted_fact_ids", None)
+        ):
+            continue
+        target = span_correction_target(note, notes)
+        out.append(PendingCorrection(
+            note=note,
+            target_note_id=str(target.id) if target is not None else None,
+            notes=context,
+        ))
+    return out
+
+
+def _fact_sessions(fact: object) -> set[str]:
+    """ファクトの会話 (session_ids と provenance、純粋関数)。"""
+    sessions = {str(s) for s in getattr(fact, "session_ids", None) or () if s}
+    for prov in getattr(fact, "provenances", None) or ():
+        if getattr(prov, "session_id", None):
+            sessions.add(str(prov.session_id))
+    return sessions
+
+
+def _close_corrections_in_batch(
+    store: "SemanticFactStore", persisted: list, corrections: list, label: str,
+) -> tuple[int, int]:
+    """このバッチで書いた旧値の行を宛先にして、検証済みの訂正を閉じる。
+
+    宛先の推論はここに持たない (不変則 #14a)。宛先と新値は Step 8 と同じ
+    ChatExtractor の値アンカーに、このバッチの行を含む live 値を渡して作らせ、
+    書込みと畳みも同じ入口 (:func:`write_sleep_facts`) を通す — 新値の行は
+    ``from_correction`` / ``value_update`` を持ち、``_supersede_corrected_slots`` が
+    旧値の行を畳んで訂正台帳の世代を作る。
+
+    閉じるのは次をすべて満たすときだけ。満たさなければ **棄権** して何もしない
+    (旧値の行は書いたまま、訂正は次の Full の Step 8 に任せる):
+
+    - 訂正が言い直している前の発話が 1 つに定まる
+      (``PendingCorrection.target_note_id``。2 つ以上 = どの言及を直したか決められない)
+    - このバッチで書いた、同じ会話の訂正より前の行のうち、旧値の span を本文に持つ
+      行が **ちょうど 1 行** で、その発話に由来し、本文に旧値が語として 1 回だけ
+      現れる (#13)。その行を訂正が名指している (共有の述語
+      ``corrections.rows_the_correction_names``: 話題語があれば行の本文がそれを持つ)
+    - 値アンカーが作った行がちょうど 1 行で、その行の旧値が訂正の旧値と同じ、
+      本文に検証済みの正しい値の span が現れ (新値を作れた)、宛先が上の 1 行と
+      同じスロット
+    - 畳みの範囲 (宛先スロットの live のうち旧値の span を持つ行) が上の 1 行だけ
+      (別会話の同じ値を巻き添えにしない、I1 / I6)
+
+    Returns:
+        ``(閉じた件数, 棄権した件数)``。宛先の候補がこのバッチに 1 行も無い訂正は
+        どちらにも数えない (このバッチとは無関係)。
+    """
+    from backend.free.core.correction_verdict import norm_span
+    from backend.free.memory.extractors import ChatExtractor, ExtractionContext
+    from backend.free.memory.extractors.chat import third_party_correction_slots
+
+    closed = abstained = 0
+    for pending in corrections:
+        note = pending.note
+        if getattr(note, "extracted_fact_ids", None):
+            continue  # 既に書かれた (同じ Full の先のバッチ / Step 8)
+        wrong = str(getattr(note, "correction_wrong_claim", "") or "")
+        needle = norm_span(wrong)
+        correct = norm_span(str(getattr(note, "correction_correct_value", "") or ""))
+        session = str(getattr(note, "session_id", "") or "")
+        at = float(getattr(note, "created_at", 0.0) or 0.0)
+        holders = [
+            fact for fact in persisted
+            if _is_foldable(fact)
+            and fact_carries_span(fact, needle)
+            and str(getattr(note, "id", "")) not in _note_ids(fact)
+            and session in _fact_sessions(fact)
+            and float(getattr(fact, "created_at", 0.0) or 0.0) < at
+        ]
+        if not holders:
+            continue
+        target = holders[0]
+        reason = ""
+        if any(pending.target_note_id not in _note_ids(f) for f in holders):
+            # 前の発話が 1 つに定まらない (None) か、別の発話の行も旧値を持つ
+            reason = "the old value is not from a single earlier utterance"
+        elif len(holders) != 1:
+            reason = f"{len(holders)} rows carry the old value"
+        elif getattr(target, "superseded_by", None):
+            reason = "the old-value row is already superseded"
+        elif not _names_value_once(norm_span(str(target.object or "")), needle):
+            reason = "the old value is not a single word in the row"
+        elif not rows_the_correction_names(
+            holders, correction_topics(note), texts=fact_span_texts, require_topic=True,
+        ):
+            # span_correction_target は話題を見ない。旧値の唯一の言及が別の話題
+            # (車検) だと、閉じれば誤った値が live になり訂正ノートに ID が付いて
+            # 後の Full でも直らない (反証レビュー MED-1)。同じバッチで閉じるのは
+            # 行が訂正の話題語を持つときだけ (1 行の規則には倒さない)。それ以外は
+            # 次の Full の共有の述語に任せる
+            reason = "the row does not name the topic of the correction"
+        elif (
+            str(target.type), str(target.subject).rsplit(".", 1)[-1],
+        ) in third_party_correction_slots(note, list(pending.notes)):
+            # 旧値の持ち主が本人以外 (Step 8 / 8.3 と同じ判定、2026-09-27 F10)
+            reason = "the old value belongs to another person"
+        new = None
+        before = list(getattr(note, "extracted_fact_ids", None) or [])
+        if not reason:
+            ctx = ExtractionContext(project_id=None, agent_trace_dir=None)
+            ctx.live_attribute_values = _live_and_batch_values(store, persisted)
+            ctx.defer_unverified_corrections = True
+            result = ChatExtractor().extract([note], ctx)
+            made = list(result.facts)
+            if len(made) != 1:
+                reason = f"the value anchor made {len(made)} rows"
+            else:
+                new = made[0]
+                if not getattr(new, "from_correction", False) or norm_span(
+                    fact_value_update(new),
+                ) != needle:
+                    reason = "the row does not replace the old value"
+                elif not correct or correct not in norm_span(str(new.object or "")):
+                    # 正しい値の span が無い / 行に現れない (訂正の発話そのものが
+                    # 本文になった) — 新値を作れていないので旧値の行を畳ませない
+                    reason = "the row does not state the corrected value"
+                elif (new.subject, new.predicate) != (target.subject, target.predicate):
+                    reason = f"the value anchor resolved {new.subject}"
+                else:
+                    scope = _fold_scope(store, new, needle)
+                    if scope != {target.id}:
+                        reason = f"the fold would reach {len(scope)} row(s)"
+        if not reason and not write_sleep_facts(store, [new], label=label):
+            reason = "the new row was not written"
+        if reason:
+            note.extracted_fact_ids = before
+            abstained += 1
+            logger.info(
+                "Step 8 [%s]: correction %s left open in this batch — %s",
+                label, getattr(note, "id", ""), reason,
+            )
+            continue
+        closed += 1
+        logger.info(
+            "Step 8 [%s]: correction %s closed in this batch — %s (%s) superseded by %s",
+            label, getattr(note, "id", ""), target.id, target.subject, new.id,
+        )
+    return closed, abstained
+
+
+def _named_by_correction(correction: object, rows: list) -> list:
+    """旧値の span を持つ行 ``rows`` のうち、``correction`` が畳んでよい行 (不変則 #13)。
+
+    述語は書き込み側の全経路が共有する ``corrections.rows_the_correction_names``
+    (話題語は ``correction`` の ``value_update_topics``。無い行は話題語なしとして
+    読む)。単値スロットは絞らない — スロットそのものが 1 つの話題で、同じ span を
+    持つ行はどれも同じ値の世代。``correction`` 自身が ``rows`` に居れば残す。
+    """
+    if is_single_valued_subject(str(getattr(correction, "subject", "") or "")):
+        return list(rows)
+    own = getattr(correction, "id", None)
+    named = {
+        id(row) for row in rows_the_correction_names(
+            [row for row in rows if getattr(row, "id", None) != own],
+            fact_value_update_topics(correction),
+            texts=fact_span_texts,
+        )
+    }
+    return [row for row in rows if getattr(row, "id", None) == own or id(row) in named]
+
+
+def _fold_scope(store: "SemanticFactStore", fact: object, needle: str) -> set[str]:
+    """``fact`` を書いたとき ``_supersede_corrected_slots`` が畳む live の行の ID。
+
+    書く前に見積もるための読み取り (本体の畳みの条件: 同じスロット・predicate、
+    旧値の span を持つ)。話題語の述語 (:func:`_named_by_correction`) は掛けない —
+    話題の違う行が span を持つだけでも閉じずに棄権する側の見積もり。``fact`` より新しい行は本体では逆向きに ``fact`` を畳むので、
+    それも数えて呼出側を棄権させる。読めなければ空集合 (呼出側は棄権する)。
+    """
+    try:
+        siblings = store.search_by_subject(fact.subject, include_superseded=False)
+    except Exception as exc:  # noqa: BLE001 - 読めなければ閉じない
+        logger.warning("Step 8: failed to list slot %s: %s", fact.subject, exc)
+        return set()
+    return {
+        other.id for other in siblings
+        if other.predicate == fact.predicate
+        and not other.superseded_by
+        and fact_carries_span(other, needle)
+    }
 
 
 def _is_slot_edit(fact: object) -> bool:
@@ -627,6 +892,7 @@ def _supersede_corrected_slots(
             siblings = [o for o in siblings if fact_carries_span(o, needle)]
             if getattr(fact, "value_update_latest_only", False):
                 siblings = _latest_mention(fact, siblings)
+            siblings = _named_by_correction(fact, siblings)
         elif _folds_as_multi_valued(fact.subject):
             # **並列多値スロットは、どの要素を置き換えるか特定できないなら
             # 畳まない。** 単値スロットの全畳みは「単値」の定義そのものだが、
@@ -782,6 +1048,13 @@ def _retire_stale_arrivals_into_corrected_slots(
                     # 最後の言及が既に畳まれていても数える — 本体の畳み
                     # (:func:`_supersede_corrected_slots`) の後に走るので。
                     continue
+                if needle:
+                    # 旧値の span を持つ到着でも、訂正が名指していない話題の行
+                    # (「車検も…4月18日」) は畳まない (本体の畳みと同じ述語)。
+                    if len(needle) >= 2 and not _arrival_named_by_correction(
+                        store, fact, other, needle,
+                    ):
+                        continue
                 if multi and not needle and (
                     fact.subject.startswith(_ASSERTION_SUBJECT_PREFIX)
                     or is_span_only_fold_subject(fact.subject)
@@ -807,6 +1080,37 @@ def _retire_stale_arrivals_into_corrected_slots(
             label, fact.id, winner.id,
         )
     return retired
+
+
+def _arrival_named_by_correction(
+    store: "SemanticFactStore", fact: object, correction: object, needle: str,
+) -> bool:
+    """後から届いた ``fact`` を、旧値の span を持つ訂正 ``correction`` が畳んでよいか。
+
+    共有の述語 (``corrections.rows_the_correction_names``) と同じ規則を、到着時の
+    材料で引く。話題語の照合には訂正が **既に畳んだ行** も含める — 畳まれた宛先が
+    話題語を持てば、後から届いた別の話題の行 (「車検も…4月18日」) は話題語に当たら
+    ないので畳まない。話題語に当たる行が無いときの「ちょうど 1 行」は **live の**
+    候補だけで数える (畳まれた宛先と言い回し・句点だけ違う同じ値の到着を 2 行と
+    数えると、F-14 が効かなくなる)。単値スロットは絞らない。
+    """
+    if is_single_valued_subject(str(getattr(fact, "subject", "") or "")):
+        return True
+    carriers = [
+        o for o in _span_carriers_including_retired(store, fact.subject, needle)
+        if o.id != correction.id and o.predicate == fact.predicate
+        and (not o.superseded_by or o.superseded_by == correction.id)
+    ]
+    named = rows_the_correction_names(
+        carriers, fact_value_update_topics(correction),
+        texts=fact_span_texts, require_topic=True,
+    )
+    if named:
+        return fact.id in {o.id for o in named}
+    live = [o for o in carriers if not o.superseded_by]
+    return fact.id in {
+        o.id for o in rows_the_correction_names(live, (), texts=fact_span_texts)
+    }
 
 
 def _shares_origin(a: object, b: object) -> bool:
@@ -849,12 +1153,30 @@ def collect_live_attribute_values(
     ``user`` スロットは除く — 属性が解決できなかったファクトの受け皿なので、
     そこを名指しても宛先を絞れない。
     """
-    values: dict[tuple[str, str], list[str]] = {}
     try:
         facts = store.all_facts(include_superseded=False)
     except Exception as exc:
         logger.warning("Step 8: failed to read live facts: %s", exc)
         return {}
+    return _attribute_values(facts)
+
+
+def _live_and_batch_values(
+    store: "SemanticFactStore", persisted: list,
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """live の値に、このバッチで書いた行の値を足す (``collect_live_attribute_values`` の形)。"""
+    try:
+        facts = list(store.all_facts(include_superseded=False))
+    except Exception as exc:  # noqa: BLE001 - 読めなければバッチの行だけ
+        logger.warning("Step 8: failed to read live facts: %s", exc)
+        facts = []
+    seen = {fact.id for fact in facts}
+    return _attribute_values(facts + [f for f in persisted if f.id not in seen])
+
+
+def _attribute_values(facts: list) -> dict[tuple[str, str], tuple[str, ...]]:
+    """ファクトの列から ``{(fact_type, 属性スロット): (値, ...)}`` を組む (純粋関数)。"""
+    values: dict[tuple[str, str], list[str]] = {}
     for fact in facts:
         parts = (fact.subject or "").split(".")
         if len(parts) != 3 or parts[0] != "mem":
@@ -1228,10 +1550,12 @@ async def extract_and_split_semantic_facts(
 
 
 __all__ = [
+    "PendingCorrection",
     "collect_live_attribute_values",
     "collect_unresolved_attribute_texts",
     "extract_and_split_semantic_facts",
     "extract_semantic_facts",
     "persist_facts",
+    "verified_pending",
     "write_sleep_facts",
 ]

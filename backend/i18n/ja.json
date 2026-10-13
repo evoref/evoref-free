@@ -957,6 +957,7 @@
     "output_note": {
       "sign_differs": "(注: 冒頭の「{lead}」は、本文の計算の結果 (-{magnitude}) と符号が異なります)",
       "unread_file_entity": "(注: {files} の中身はこの会話でまだ読めていません。{names} はファイルから確かめた名前ではありません)",
+      "ungrounded_material_number": "(注: {numbers} は取得した資料に記載が無く、計算や推測を含む場合があります)",
       "table_aggregate": "(注: {source} の全 {rows} 行からコードで集計した {spec} の値は {values} です)",
       "table_fallback": "取得した表"
     }

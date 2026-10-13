@@ -54,6 +54,7 @@ from backend.free.core.table_aggregate import result_block as table_aggregate_bl
 from backend.free.core.verifier_events import (
     current_tool_decision,
     decided_by_shortcut,
+    record_carried_material,
     record_grounding,
     record_table_aggregate,
     record_tool_decision,
@@ -229,24 +230,27 @@ _UNMEASURED_FACT_GUIDANCES: dict[str, str] = {
 #: 分類器の calculate が門で落ち、組み直しも回数の置き換えも通らず no_tool に
 #: なった回の注記 (``ToolJudgement.calculation_rejected``、docs/f_03 §3.1 / §3.5)。
 #: 注記が無いと暗算の値が検証済みの口調で出た (2026-09-28 実機確認 R10: 住宅ローンの
-#: 訂正の再計算で「毎月の返済額は約 8 万 7,300 円です。」、正 87,510 円)。§3.5 の
-#: 原則どおり「答えるな」ではなく「推測だと言え」にする。
+#: 訂正の再計算で「毎月の返済額は約 8 万 7,300 円です。」、正 87,510 円)。
+#: 「概算と明示して答えよ」は資料に無い数値を書く方へ誘導した (2026-10-12) ので、
+#: 検証できなかった計算の値は書かせない。
 _CALCULATION_REJECTED_GUIDANCES: dict[str, str] = {
     "ja": (
         "\n\n確定事実: このターンの計算は計算ツールで検証できなかった "
         "(組み立てた式が会話の条件と合わず、実行していない)。"
-        "数値を答えるなら「概算」「推測」であることを明示し、"
-        "使った式と前提 (元本・金利・期間などの条件) を併せて示すこと。"
+        "計算結果の数値は書かないこと (概算・推測の値も書かない)。"
+        "計算できなかったことと、計算に要る条件 (元本・金利・期間など) を述べ、"
+        "足りない値や確かめたい値があれば利用者に確認すること。"
         "計算した / 検証した / 正確な値だと述べない。"
     ),
     "en": (
         "\n\nConfirmed fact: the calculation for this turn could not be verified "
         "with the calculator tool (the expression built did not match the "
-        "conditions in the conversation, so it was not run). If you give a "
-        "number, state clearly that it is an estimate or a guess, and show the "
-        "formula and the assumptions you used (conditions such as principal, "
-        "interest rate, and term). Do not say that you calculated or verified it, "
-        "or that it is an exact value."
+        "conditions in the conversation, so it was not run). Do not write a "
+        "numeric result (not even an approximate or guessed value). Say that it "
+        "could not be calculated, state the conditions the calculation needs "
+        "(such as principal, interest rate, and term), and ask the user for any "
+        "value that is missing or needs confirming. Do not say that you "
+        "calculated or verified it, or that it is an exact value."
     ),
 }
 
@@ -515,6 +519,44 @@ def _neutralize_material(text: str) -> str:
         "＃＃＃ " + line[len(_RECENT_OBSERVATION_HEAD):]
         if line.startswith(_RECENT_OBSERVATION_HEAD) else line
         for line in text.split("\n")
+    )
+
+
+def carried_material_body(content: str) -> str:
+    """最後の user の本文から、持ち越した資料の本文 (無ければ空)。
+
+    区切り (``MATERIAL_TRAILING_DELIMITERS``) の後ろから資料の枠の閉じまでで、区切りと
+    枠の指示文は除く (集計の確定値は残す)。経験の記録 (``chat_recorder``) と出力の検査
+    (:func:`_record_carried_material`) が同じ切り出しを使う。
+    """
+    from backend.free.core.turn_text import MATERIAL_TRAILING_DELIMITERS
+
+    templates = (
+        *_RECENT_OBSERVATION_BLOCKS.values(),
+        *_RECENT_OBSERVATION_BLOCKS_WITH_AGGREGATE.values(),
+    )
+    for delimiter in MATERIAL_TRAILING_DELIMITERS.values():
+        start = (content or "").find(delimiter)
+        if start < 0:
+            continue
+        rest = content[start + len(delimiter):]
+        for template in templates:
+            head, tail = template.split("{items}", 1)
+            i = rest.find(head)
+            j = rest.find(tail, i + len(head)) if i >= 0 else -1
+            if j >= 0:
+                return (rest[:i] + "\n" + rest[i + len(head):j]).strip()
+    return ""
+
+
+def _record_carried_material(messages: list[dict], block: str) -> None:
+    """資料を持ち越したことを、出力の検査 (``CarriedMaterialNumberFilter``) のために積む。
+
+    照合の根拠は資料の本文と、資料を足した後のプロンプト全体 (会話・注記・ツールの結果)。
+    """
+    record_carried_material(
+        carried_material_body(block),
+        "\n".join(str(m.get("content") or "") for m in messages),
     )
 
 #: 窓内想起のガードが履歴検索を止めたターンの文言 (``_append_recall_in_window_note``)。
@@ -3332,6 +3374,7 @@ class DeliberativeAgent:
         if not text:
             return False
         append_to_last_user(messages, text, separator="")
+        _record_carried_material(messages, text)
         if lead_used and aggregate.spec.agg != "count":
             record_table_aggregate(aggregate)
         return True
@@ -3401,6 +3444,7 @@ class DeliberativeAgent:
         if not text:
             return False
         append_to_last_user(messages, text, separator="")
+        _record_carried_material(messages, text)
         return True
 
     @staticmethod
@@ -3524,8 +3568,8 @@ class DeliberativeAgent:
             messages, _localized(_CALCULATION_REJECTED_GUIDANCES), separator="",
         )
         logger.info(
-            "Calculation rejected without a passing expression; asked the model to "
-            "mark any number as an estimate and show the formula and assumptions",
+            "Calculation rejected without a passing expression; asked the model not "
+            "to write a numeric result and to state the conditions it needs",
         )
 
     @staticmethod

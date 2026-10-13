@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Iterable, Sequence
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
@@ -21,6 +22,7 @@ from functools import cache
 from backend.free.core.numerals import kanji_number_value
 from backend.free.core.relative_date import PERIOD_UNIT_ALTERNATION
 from backend.free.core.response_arithmetic import (
+    JaNumber,
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
     find_sign_contradiction,
@@ -1569,10 +1571,14 @@ def states_no_user_value(text: str) -> bool:
 #: 合計はいくらですか」)。数量 (数字 + 単位) の後ろに条件・前提の接続
 #: (で、/ と / なら / たら / 場合 / とき) が続く形。「1 キロメートルは何メートル
 #: ですか」(数量の直後が主題の「は」) は一般知識の問いで、前提ではない。
+#: 数の直後に付く量の単位 (前提の数量と、持ち越した資料に無い数の開示が共有する)。
+_QUANTITY_UNIT_ALTERNATION = (
+    r"円|個|台|人|本|枚|件|冊|部|kg|km|cm|mm|kb|mb|gb|g|m|l|トン|%|％|時間|分|秒|日|週間|"
+    r"か月|ヶ月|カ月|年|℃|°C|度|回|名|社|ページ|行|字|文字|通|便"
+)
 _QUANTITY_PREMISE_RE = re.compile(
     r"\d[\d,]*(?:\.\d+)?\s*"
-    r"(?:円|個|台|人|本|枚|件|冊|部|kg|km|cm|mm|kb|mb|gb|g|m|l|トン|%|％|時間|分|秒|日|週間|"
-    r"か月|ヶ月|カ月|年|℃|度|回|名|社|ページ|行|字|文字|通|便)"
+    rf"(?:{_QUANTITY_UNIT_ALTERNATION})"
     r"[^。！？!?\n]{0,24}?(?:で、|と、|と|なら|たら|れば|場合|とき|として|時に)",
 )
 
@@ -1905,6 +1911,151 @@ def ungrounded_answer_names(
     return names, kana
 
 
+#: 依頼の内容語 (問われた量の名詞: 「平均給与」「売上」) を取り出す連なり (漢字・カタカナ)。
+ANSWER_SLOT_RUN_RE = re.compile(rf"[{KANJI}{KANJI_MARKS}{KATAKANA_WORD}]{{2,}}")
+#: 数の直前でこの範囲 (文字) に問われた名詞があれば、その数は答えの位置にある。
+_ANSWER_SLOT_WINDOW = 16
+#: 数の直後に付いた量の単位 (英字の単位は語の途中で切らない)。
+_FOLLOWING_UNIT_RE = re.compile(
+    rf"\s*(?P<unit>{_QUANTITY_UNIT_ALTERNATION})(?![A-Za-z])", re.IGNORECASE,
+)
+#: 量でなく暦・時刻を表す単位 (「14日」「2027年」「45分」)。資料に無い日付を挙げて
+#: 「分かりません」と断る文の日付を、資料に無い数として数えない。
+_CALENDAR_UNIT_RE = re.compile(rf"(?:{PERIOD_UNIT_ALTERNATION}|時間|分|秒)")
+#: 同じ量の別の綴り (NFKC・casefold 後)。「℃」は NFKC で「°c」になる。
+_UNIT_SPELLINGS: tuple[frozenset[str], ...] = (frozenset({"°c", "度"}),)
+
+
+def _unit_spellings(unit: str) -> frozenset[str]:
+    """単位の綴りの組 (NFKC・casefold 後)。同じ量の別綴りが無ければ自分だけ。"""
+    import unicodedata
+
+    key = unicodedata.normalize("NFKC", unit).casefold()
+    return next((group for group in _UNIT_SPELLINGS if key in group), frozenset({key}))
+
+
+def _declining_sentence_spans(text: str) -> list[tuple[int, int]]:
+    """差し控えの述語 (:data:`_ABSTAIN_PREDICATE_RE`、「確認できません」) を含む文の範囲。"""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for sep in [*_ABSTAIN_SENTENCE_SPLIT_RE.finditer(text), None]:
+        end = sep.start() if sep is not None else len(text)
+        if _ABSTAIN_PREDICATE_RE.search(text[start:end]):
+            spans.append((start, end))
+        if sep is not None:
+            start = sep.end()
+    return spans
+
+
+def _ungrounded_numbers(
+    response: str, grounded: str, query: str = "", *, anchored: bool = True,
+) -> tuple[str, list[JaNumber]]:
+    """:func:`numbers_not_in` の数を位置つきで返す ``(パスを除いた応答, 数)`` (件数の上限なし)。"""
+    from backend.free.agent.tool_judge_args import without_drive_paths
+
+    slots = {run for run in ANSWER_SLOT_RUN_RE.findall(query or "")}
+    text = without_drive_paths(response or "", " ")
+    if anchored and not slots:
+        return text, []
+    known = {round(n.value, 6) for n in iter_ja_numbers(grounded or "")}
+    out: list[JaNumber] = []
+    for number in iter_ja_numbers(text):
+        if number.value < 10 or round(number.value, 6) in known:
+            continue
+        window = text[max(0, number.start - _ANSWER_SLOT_WINDOW):number.start]
+        if anchored and not any(slot in window for slot in slots):
+            continue
+        out.append(number)
+    return text, out
+
+
+def numbers_not_in(
+    response: str, grounded: str, query: str = "", *, anchored: bool = True,
+) -> list[str]:
+    """答えの位置にある数のうち、依頼・会話・ツールの結果 (``grounded``) に無い数の表記
+    (出現順、最大 3 件)。
+
+    数えるのは **問われた量の名詞の直後** (:data:`_ANSWER_SLOT_WINDOW` 文字以内) に
+    ある数だけ — 「営業部の平均給与は 520,000 円」の 520,000。見つからないと正しく答えた
+    応答の数 (「HTTP 404 相当」「ポート 8000 のサーバ」「12 個のフォルダを探した」) は
+    答えではないので数えない。パスの中の数字と 1 桁の数も数えない。判断できなければ
+    空 (呼出側はラベル無しのまま)。
+
+    ``anchored=False`` は問われた名詞の近さを見ずに全部の数を数える。省略した続きの問い
+    (「明後日は？」) は名詞を持たず、答えの数が名詞の近くに来ない — 呼出側が応答と資料の
+    関わりを別に確かめたとき (:func:`answer_draws_on_material`) だけ使う。
+    """
+    text, numbers = _ungrounded_numbers(response, grounded, query, anchored=anchored)
+    out: list[str] = []
+    for number in numbers:
+        literal = text[number.start:number.end].strip()
+        if literal and literal not in out:
+            out.append(literal)
+        if len(out) >= 3:
+            break
+    return out
+
+
+def answer_draws_on_material(response: str, material: str) -> bool:
+    """応答が持ち越した資料について答えたか — 応答の名詞の連なりが資料に現れるか (純粋関数)。
+
+    無関係な問いへの知識の答え (資料の語が 1 つも無い) の数を、資料に無い数として数えない。
+    """
+    if not material:
+        return False
+    return any(run in material for run in ANSWER_SLOT_RUN_RE.findall(response or ""))
+
+
+def ungrounded_material_numbers(
+    response: str, material: str, grounding: str,
+) -> list[str]:
+    """持ち越した資料について答えた応答の、資料にもプロンプト (``grounding``) にも無い
+    単位付きの数 (「19度」「70%」、出現順・最大 3 件、純粋関数)。
+
+    2026-10-11 実ログ (trace da2ad4f3bd35): 「明後日は？」にツールを撃たず、11日・12日の
+    概況しか無い天気の資料から「最高気温は19度、最低気温は15度…降水確率は70%」と答えた。
+    数の読みは :func:`numbers_not_in` (``anchored=False``) と同じ 1 本で、さらに次を全て
+    満たす数だけを返す (字句の鍵による出力検査、docs/c_17 §7 の対象外):
+
+    - 応答が資料について答えている (:func:`answer_draws_on_material`)
+    - 10 以上で、直後に量の単位 (:data:`_QUANTITY_UNIT_ALTERNATION`) が付く。暦・時刻の
+      単位 (:data:`_CALENDAR_UNIT_RE`) は除く
+    - その単位 (「℃」と「度」は同じ単位) が資料かプロンプトに現れる (同じ種類の量を
+      扱う答え。NFKC で比べる)
+    - calculate の結果 (``grounding`` の注入ブロック) を述べたものでない
+    - 差し控えた文 (「…かは確認できません」、:func:`_declining_sentence_spans`) の中でない
+
+    資料から計算・言い換えた数と、資料に無い数とは区別しない (注記の文面は計算も含む
+    言い回し)。``grounding`` は資料を足した後のプロンプトの本文 (会話・注記・ツールの結果)。
+    """
+    import unicodedata
+
+    if not answer_draws_on_material(response, material):
+        return []
+    body = strip_system_notes(response or "")
+    seen = unicodedata.normalize("NFKC", f"{grounding}\n{material}").casefold()
+    calculated = extract_calculate_result(grounding)
+    text, numbers = _ungrounded_numbers(body, f"{grounding}\n{material}", anchored=False)
+    declining = _declining_sentence_spans(text)
+    out: list[str] = []
+    for number in numbers:
+        unit = _FOLLOWING_UNIT_RE.match(text, number.end)
+        if unit is None or _CALENDAR_UNIT_RE.fullmatch(unit.group("unit")):
+            continue
+        if not any(s in seen for s in _unit_spellings(unit.group("unit"))):
+            continue
+        if any(start <= number.start < end for start, end in declining):
+            continue
+        if calculated is not None and _matches_calculate_result(number.value, calculated):
+            continue
+        literal = text[number.start:unit.end()].strip()
+        if literal and literal not in out:
+            out.append(literal)
+        if len(out) >= 3:
+            break
+    return out
+
+
 def _output_note(key: str, **kwargs: str) -> str:
     """末尾の開示注記を応答の言語 (``i18n.prompt_locale``) で組む。"""
     from backend.i18n_helper import msg_for_locale, prompt_locale
@@ -1923,6 +2074,20 @@ def unread_file_entity_note(files: "Sequence[str]", names: "Sequence[str]") -> s
     return _output_note(
         "agent.output_note.unread_file_entity",
         files=", ".join(files), names=", ".join(names),
+    )
+
+
+def ungrounded_material_number_note(numbers: "Sequence[str]") -> str:
+    """持ち越した資料に無い数を答えたときに末尾へ足す開示文 (無ければ空)。
+
+    「答えるな」ではなく「推測だと言え」(docs/f_03 §3.5) — 数を消さず、資料に記載が
+    無く計算や推測を含みうることだけを示す (資料からの計算・言い換えも同じ判定に
+    掛かるので、作話と断定しない)。文言は i18n (``agent.output_note.*``)。
+    """
+    if not numbers:
+        return ""
+    return _output_note(
+        "agent.output_note.ungrounded_material_number", numbers=", ".join(numbers),
     )
 
 
@@ -2379,14 +2544,20 @@ def ignores_calculate_result(response: str, result: float | None) -> str | None:
     numbers = _response_numbers(response)
     if not numbers:
         return None
-    magnitude = abs(result)
-    for value in numbers:
-        for scale in _RESULT_SCALES:
-            expected = magnitude * scale
-            tolerance = max(expected * 0.05, 0.5 if magnitude >= 1 else 0.005)
-            if abs(value - expected) <= tolerance:
-                return None
+    if any(_matches_calculate_result(value, result) for value in numbers):
+        return None
     return f"calculate result {result:g} does not appear in the answer"
+
+
+def _matches_calculate_result(value: float, result: float) -> bool:
+    """本文の数 ``value`` が calculate の結果を述べたものか (単位換算の倍率と丸めを許して 5%)。"""
+    magnitude = abs(result)
+    for scale in _RESULT_SCALES:
+        expected = magnitude * scale
+        tolerance = max(expected * 0.05, 0.5 if magnitude >= 1 else 0.005)
+        if abs(value - expected) <= tolerance:
+            return True
+    return False
 
 
 #: 率の分母になる期間 (「1 週間あたり」「3 日ごと」)。期間そのものの答え
@@ -2453,11 +2624,16 @@ def misrounded_result_values(text: str, result: float | None) -> list[str]:
     # 「2.」を丸め違いと読み、正しい応答を failed にした)
     body = normalize_numerals(mask_item_numbers(_CODE_FENCE_RE.sub("\n", text or "")))
     magnitude = abs(result)  # 本文の数は符号を読まない (ignores_calculate_result と同じ)
+    # 結果が整数なら整数の数は丸めの問題ではない (結果 3 に対する「2人分」の 2 を
+    # 誤りとしていた、2026-10-12)。整数結果の ±1 の誤答は検出しない。
+    integer_result = math.isfinite(magnitude) and abs(magnitude - round(magnitude)) <= 1e-9 * max(1.0, magnitude)
     for num in iter_ja_numbers(body):
         if num.has_unit or _PERIOD_DENOMINATOR_TAIL_RE.match(body, num.end):
             continue
         raw = body[num.start:num.end].strip()
         decimals = len(raw.split(".", 1)[1]) if "." in raw else 0
+        if integer_result and decimals == 0:
+            continue
         if abs(num.value - magnitude) > 10 ** -decimals:
             continue  # 最小桁 1 つぶんより離れた数は別の量 (基準値の 25 等)
         accepted = _accepted_roundings(

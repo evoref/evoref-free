@@ -1221,6 +1221,46 @@ class UnreadFileEntityFilter:
         return unread_file_entity_note(files, names)
 
 
+class CarriedMaterialNumberFilter:
+    """持ち越した資料にもプロンプトにも無い単位付きの数を答えたことを末尾で開示する。
+
+    2026-10-11 実ログ (trace da2ad4f3bd35): 「明後日は？」に、このターンの取得 0 件のまま
+    11日・12日の概況しか無い天気の資料を持ち越し、「最高気温は19度、最低気温は15度…
+    降水確率は70%」と答えた。経験のラベルは #1076 で外したが、利用者には作った数が
+    そのまま届く。資料を持ち越したターン (検証器の台帳 ``current_carried_material``) に
+    限り、``UnreadFileEntityFilter`` と同じく末尾の注記で「推測を含む」と示す (書き換え・
+    再生成はしない)。持ち越していないターンは素通し — 全ターンへの数の照合は一般知識の
+    答えの数を巻き込む。
+    """
+
+    def __init__(self) -> None:
+        self._seen: list[str] = []
+
+    def process(self, token: str) -> str:
+        if token:
+            self._seen.append(token)
+        return token
+
+    def flush(self) -> str:
+        from backend.free.core.text_quality import (
+            ungrounded_material_number_note,
+            ungrounded_material_numbers,
+        )
+        from backend.free.core.verifier_events import current_carried_material
+
+        response = "".join(self._seen)
+        self._seen.clear()
+        material, grounding = current_carried_material()
+        if not material or not response.strip():
+            return ""
+        numbers = ungrounded_material_numbers(response, material, grounding)
+        if not numbers:
+            return ""
+        record_verifier_hit("content.carried_material_number")
+        logger.info("Numbers not in the carried-over material: %s", numbers)
+        return ungrounded_material_number_note(numbers)
+
+
 class TableAggregateFilter:
     """コードで集計した表の値を応答が述べていなければ、正しい値を末尾の注記で示す。
 
@@ -1259,7 +1299,8 @@ class TableAggregateFilter:
 
 
 def disclosure_notes(text: str) -> str:
-    """本文の後ろへ足す開示注記 (未書込み / 符号 / 読めていないファイルの人名 / 表の集計) を返す。
+    """本文の後ろへ足す開示注記 (未書込み / 符号 / 読めていないファイルの人名 / 表の集計 /
+    持ち越した資料に無い数) を返す。
 
     ストリーミングではパイプラインの末尾のフィルタが同じ注記を足す。出力制約の検証で
     本文を溜めて修復した経路 (``chat_stream_deliberative._emit_verified_output``) は
@@ -1269,7 +1310,7 @@ def disclosure_notes(text: str) -> str:
     notes = ""
     for filt in (
         UnwrittenFileClaimFilter(), SignCorrectionFilter(), UnreadFileEntityFilter(),
-        TableAggregateFilter(),
+        TableAggregateFilter(), CarriedMaterialNumberFilter(),
     ):
         filt.process(text)
         notes += filt.flush()

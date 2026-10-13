@@ -24,7 +24,7 @@ logger = get_logger("core.response_verifiers")
 
 __all__ = [
     "contradicted_weekday", "declared_count_mismatch", "false_tool_unavailability",
-    "mask_item_numbers", "misstated_change_rate",
+    "mask_item_numbers", "misstated_change_rate", "stated_change_percents",
 ]
 
 #: 走査する本文の上限 (文字)。計算量を入力長に線形で抑え、巨大な応答でも止まらない。
@@ -157,6 +157,16 @@ def _states_change(sentence: str, num: JaNumber) -> bool:
     if _CHANGE_BEFORE_RE.search(before):
         return True
     return num.negative or before.rstrip(" \t　").endswith(tuple(_PLUS_SIGN_CHARS))
+
+
+def stated_change_percents(text: str) -> list[str]:
+    """変化として述べた百分率の数字の表記 (符号と桁区切りを除く) を本文の順に返す。"""
+    return [
+        sentence[n.start:n.end].replace(",", "")
+        for sentence in _SENTENCE_SPLIT_RE.split(_blank_code(text or ""))
+        for n in iter_ja_numbers(sentence)
+        if _is_percent(sentence, n) and _states_change(sentence, n)
+    ]
 
 
 def _change_rate_in_sentence(sentence: str) -> str | None:

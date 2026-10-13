@@ -225,6 +225,9 @@ class SleepTimeScheduler:
         #: 検証を見送った訂正候補が残っているか。残っている間は Full の待機を
         #: 静穏窓の少し後まで縮める (:meth:`_full_wait_seconds`)。
         self._verification_waiting: bool = False
+        #: 直近の Full で要約 (Step 8-9) がチャットに譲り、要約に出せる会話が残ったか。
+        #: 残っている間は Full の完走後に通常の待機を張り直す (:meth:`_rearm_for_paused_summary`)。
+        self._summary_waiting: bool = False
         #: 期限切れ / 前倒し要求で **実際に走り出した** Full の実行中フラグ。
         #: True の間は :meth:`on_user_input` が worker も待機タスクも止めない
         #: (:meth:`_schedule_full` の説明を参照)。
@@ -614,6 +617,24 @@ class SleepTimeScheduler:
         # (``on_response_sent`` と同じ ``_schedule_full``)。
         self._arm_full_soon()
 
+    def _rearm_for_paused_summary(self) -> None:
+        """要約がチャットに譲って残った Full の後、通常の Full の待機を 1 本張る。
+
+        前倒し / 期限切れの Full は応答の 30 秒後に起きるので要約の静穏窓の内側に入り、
+        ほぼ必ず譲る。張り直さないと次の応答まで誰もタイマーを張らず、離席中は要約・
+        light の畳み込み・Step 9 の昇格・``overdue`` の救済が止まる (f_02 §4.4)。
+        前倒しではない (``_full_requested`` を立てず待ちも縮めない) ので、入力で消え
+        応答のたびに張り直される。見送りの会話は数えないので、アイドルで最後まで
+        要約すれば 0 になって止まる。
+        """
+        left = getattr(self._worker, "summary_paused_left", 0)
+        # MagicMock の worker は属性が truthy な Mock になるので int だけを見る
+        self._summary_waiting = (
+            isinstance(left, int) and not isinstance(left, bool) and left > 0
+        )
+        if self._summary_waiting:
+            self._arm_full_soon()
+
     def _arm_full_soon(self) -> None:
         """いま走っている Full のタスクが終わった直後に待機タスクを張る。"""
         try:
@@ -622,10 +643,10 @@ class SleepTimeScheduler:
             pass
 
     def _arm_pending_full(self) -> None:
-        """前倒し要求 / 検証待ちの Full の待機タスクを張る (既に待機中なら何もしない)。"""
+        """前倒し要求 / 検証待ち / 要約待ちの Full の待機タスクを張る (既に待機中なら何もしない)。"""
         if self._worker is None:
             return
-        if not (self._full_requested or self._verification_waiting):
+        if not (self._full_requested or self._verification_waiting or self._summary_waiting):
             return
         if self._full_task is not None and not self._full_task.done():
             return
@@ -1239,6 +1260,7 @@ class SleepTimeScheduler:
                 full_result = await self._worker.run_full(llm_for_sleep)
             success = True
             self._rerequest_for_unverified_corrections(full_result)
+            self._rearm_for_paused_summary()
 
         except asyncio.CancelledError:
             cancelled = True

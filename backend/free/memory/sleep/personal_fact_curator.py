@@ -632,6 +632,8 @@ async def curate_personal_facts(
     now_provider: Callable[[], float] | None = None,
     should_pause: Callable[[], bool] | None = None,
     max_per_cycle: int = _MAX_PER_CYCLE,
+    corrections: list | None = None,
+    stats_out: dict | None = None,
 ) -> int:
     """自己開示発話を属性ごとの逐語 span に分けて SemMem へ書く。
 
@@ -647,10 +649,19 @@ async def curate_personal_facts(
             yield。残りのノートは ``personal_fact_curated_at`` が立たない
             ままなので次サイクルが拾う。
         max_per_cycle: 1 サイクルの上限 (sleep-time が実測 tps で伸縮する、c_16 §7.2.3)。
+        corrections: Step 8.0 の後に求めた、まだファクトになっていない検証済みの
+            訂正 (:func:`~backend.free.memory.sleep.extraction.verified_pending`)。
+            分割で書いた旧値の行を宛先にして、同じバッチで閉じる
+            (``write_sleep_facts`` の 5)。
+        stats_out: ``corrections_closed_in_batch`` / ``corrections_abstained_in_batch``
+            の件数の置き場 (入口で 0 を入れる)。
 
     Returns:
-        新規に書き込まれた fact 件数。
+        新規に書き込まれた fact 件数 (訂正を閉じた新値の行は ``stats_out`` 側で数える)。
     """
+    if stats_out is not None:
+        stats_out.setdefault("corrections_closed_in_batch", 0)
+        stats_out.setdefault("corrections_abstained_in_batch", 0)
     if aux_client is None:
         logger.debug("personal_fact_curator: aux_client is None, skipping")
         return 0
@@ -709,6 +720,12 @@ async def curate_personal_facts(
                 "left pending for the next cycle", remaining,
             )
             break
+        if any(note is c.note for c in corrections or ()) and note.extracted_fact_ids:
+            # この Full の先のバッチで訂正が閉じた (新値は値アンカーが書いた)。
+            # 訂正の発話を分割すると同じ新値の行が 2 つ目になり、閉じた行を
+            # 狭め直しで畳む (:func:`_persist_split`)。
+            note.personal_fact_curated_at = now_fn()
+            continue
         content = (note.content or "").strip()
         try:
             items = await _split_facts(aux_client, content, allowed)
@@ -746,6 +763,7 @@ async def curate_personal_facts(
         written += await _persist_split(
             store, note, accepted,
             embedder=embedder, profile_id=profile_id, now=now_fn(),
+            corrections=corrections, stats=stats_out,
         )
     return written
 
@@ -758,6 +776,8 @@ async def _persist_split(
     embedder: "EmbeddingBackend",
     profile_id: str,
     now: float,
+    corrections: list | None = None,
+    stats: dict | None = None,
 ) -> int:
     """検証済みの分割結果を Step 8 と同じ経路で書き込む。
 
@@ -870,6 +890,7 @@ async def _persist_split(
     refined.extend(_generic_shadows_of(existing, facts, refined))
     written = persist_facts(
         store, ExtractionResult(facts=facts), "personal_fact_split",
+        corrections=corrections, stats=stats,
     )
     for fact in facts:
         if fact.id not in note.extracted_fact_ids:

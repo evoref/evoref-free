@@ -169,6 +169,7 @@ from backend.free.agent.tool_judge_grounding import (
     _numeric_literals,
     _ungrounded_numbers,
     expression_sanity_issues,
+    has_dialogue_operand,
     percent_derived_values,
     percent_scale_slips,
     period_exponent_mismatches,
@@ -2278,6 +2279,24 @@ class ToolCallJudge:
                 "Classifier read_file(%r) dropped for a quantity question that names "
                 "no file; falling through to expression synthesis",
                 str((classified.tool_args or {}).get("file_path") or "")[:120],
+            )
+            classified = None
+        if (
+            classified is not None and classified.tool_needed
+            and classified.tool_name == "calculate"
+            and not has_dialogue_operand(
+                str((classified.tool_args or {}).get("expression") or ""),
+                query, call.dialogue_text,
+            )
+        ):
+            # 被演算子が 1 つもクエリ・会話に無い calculate は計算の依頼ではない
+            # (「今日は何曜日」に date_diff('today', 'monday')、「計算ミスを減らすには？」に
+            # ``1``、2026-10-12)。組み直すと別の問いの式を作るので、分類器の no_tool と
+            # 同じく扱う。現在日時は常に注記で渡っている (不変則 #15)。
+            logger.info(
+                "Classifier calculate(%r) dropped: no operand appears in the query "
+                "or the conversation",
+                str((classified.tool_args or {}).get("expression") or "")[:120],
             )
             classified = None
         if classified is not None:

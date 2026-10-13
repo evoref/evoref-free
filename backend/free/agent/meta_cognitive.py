@@ -649,6 +649,8 @@ class MetaCognitiveAgent(
         self._fetched_tool_outputs: list[str] = []
         # 素材の位置 → 積んだ取得のツール名 (主の取得が空振りしたタスクの付随の読込みを捨てる)
         self._material_tools: dict[int, str] = {}
+        # 素材の位置 → 積んだ取得の引数 (残す同じツールの取得を主と同じ出所に限る)
+        self._material_args: dict[int, dict] = {}
         # このターンでエラーを返した取得の URL の鍵 → 結果 (同じ URL を取りに行き直さない)
         self._turn_fetch_errors: dict[str, str] = {}
         # このターンで取得系ツールを撃ったか (成否を問わない)。前のタスクが撃って
@@ -1292,7 +1294,7 @@ class MetaCognitiveAgent(
                     task, result, tool_calls,
                     destination_known=self._task_destination_known(task),
                 )
-            self._settle_failed_task_materials(task, tool_calls, materials_before)
+            self._settle_failed_task_materials(task, tool_calls, materials_before, query)
 
             all_tool_calls.extend(tool_calls)
             context_parts.append(f"[{task.description}]: {result[:200]}")
@@ -2007,7 +2009,7 @@ class MetaCognitiveAgent(
                 task, result, tool_calls,
                 destination_known=self._task_destination_known(task),
             )
-            self._settle_failed_task_materials(task, tool_calls, materials_before)
+            self._settle_failed_task_materials(task, tool_calls, materials_before, query)
             all_tool_calls.extend(tool_calls)
             steps += 1
 
