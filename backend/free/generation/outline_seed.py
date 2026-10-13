@@ -23,9 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-#: 空白 (改行・タブ含む) の正規化用。逐語一致検査は空白の違いだけ許容する
-#: (f_08 §3.1.1)。
-_WS_RE = re.compile(r"\s+")
+from backend.free.core.text_norm import strip_ws
 
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
@@ -118,10 +116,6 @@ def parse_outline_markdown(text: str) -> ParsedOutline | None:
     return ParsedOutline(title=title, units=units)
 
 
-def _normalize_ws(text: str) -> str:
-    return _WS_RE.sub("", text.strip())
-
-
 def ensure_verbatim_sentence(text: str, sentence: str) -> tuple[str, bool]:
     """``sentence`` が ``text`` に逐語 (空白の正規化だけ許容) で含まれるか検査する。
 
@@ -131,7 +125,7 @@ def ensure_verbatim_sentence(text: str, sentence: str) -> tuple[str, bool]:
     needle = sentence.strip()
     if not needle:
         return text, False
-    if _normalize_ws(needle) in _normalize_ws(text):
+    if strip_ws(needle) in strip_ws(text):
         return text, False
     separator = "" if not text or text.endswith("\n") else "\n\n"
     return f"{text}{separator}{needle}", True

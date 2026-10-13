@@ -384,6 +384,13 @@ class ProfileSamplingByModeConfig(BaseModel):
     create: ProfileSamplingConfig | None = None
 
 
+#: 読み手が無く撤去したプロファイル reasoning のフィールド (docs/c_15 §2.7)。
+_RETIRED_REASONING_FIELDS = frozenset({
+    "reasoning_format", "client_handling", "marker_style",
+    "think_open", "think_close", "exclude_from_history",
+})
+
+
 class ProfileReasoningConfig(BaseModel):
     """``models/profiles/<arch>.yaml`` の ``reasoning`` セクション (docs/c_15)。
 
@@ -392,32 +399,38 @@ class ProfileReasoningConfig(BaseModel):
     - True (llama.cpp が reasoning を認識する Qwen3/DeepSeek 系): 起動フラグ
       (``-rea`` / ``--reasoning-format`` / ``--reasoning-budget``) でサーバ側制御。
     - False (lfm2moe 等 ``thinking=0``): クライアント側ハンドリング
-      (``_ReasoningFilter`` のマーカー駆動除去 / watchdog / 履歴除外)。
+      (``_ReasoningFilter`` の固定マーカー除去 / watchdog)。
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_fields(cls, data: object) -> object:
+        """撤去したフィールドを黙って捨てる (docs/c_15 §2.7、2026-10-13)。
+
+        プロファイル YAML は ``G1_RETIRED_KEYS`` の対象外で、検証に失敗すると
+        ``_normalize_profile`` が reasoning セクションごと落とす。利用者の
+        ``<data_root>/profiles/`` に残った古い宣言で mode / budget まで失わないよう、
+        ここで取り除く。
+        """
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if k not in _RETIRED_REASONING_FIELDS}
+        return data
 
     # 能力宣言
     mode: Literal["toggle", "always", "none"] = "none"
     enable_thinking: bool | None = None  # toggle 型の既定
 
     # サーバ側制御 (server_control=True; 起動フラグへ)
-    # 配線状況の SSOT は docs/c_15 §2.7。reasoning_format は未消費 (--reasoning-format は
-    # profile launch_flags 由来)、budget_default/budget_message のみ起動フラグへ反映。
+    # 配線状況の SSOT は docs/c_15 §2.7。budget_default/budget_message のみ起動フラグへ反映
+    # (--reasoning-format は profile launch_flags 由来)。
     server_control: bool = False
-    reasoning_format: Literal["auto", "deepseek", "deepseek-legacy", "none"] = "auto"
     budget_default: int = Field(default=-1, ge=-1)
     budget_message: str = ""
 
     # クライアント側ハンドリング (server_control=False)
-    # 現状 client_think_budget (watchdog) のみ消費。client_handling は strip 相当のみ・
-    # marker_style/think_open/think_close は _ReasoningFilter のハードコードで未消費・
-    # on_runaway は値保持のみ (watchdog は値に依らず一律 stream 中断)・exclude_from_history は
-    # strip 副作用で達成 (明示配線なし)。詳細は docs/c_15 §2.7。
-    client_handling: Literal["strip", "channel", "passthrough"] = "strip"
-    marker_style: Literal["think_tags", "harmony", "custom"] = "think_tags"
-    think_open: str = "<think>"
-    think_close: str = "</think>"
+    # 現状 client_think_budget (watchdog) のみ消費。on_runaway は値保持のみ (watchdog は値に
+    # 依らず一律 stream 中断)。マーカーは _ReasoningFilter のハードコード。詳細は docs/c_15 §2.7。
     client_think_budget: int = Field(default=512, ge=0)
     on_runaway: Literal["reask", "truncate", "fallback"] = "fallback"
-    exclude_from_history: bool = True

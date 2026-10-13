@@ -126,6 +126,3 @@ def tokenize_ja(
 
     return tokens
 
-
-# 旧名を後方互換用に残す（内部利用のみ、テスト/外部参照は tokenize_ja を推奨）。
-_tokenize_ja = tokenize_ja

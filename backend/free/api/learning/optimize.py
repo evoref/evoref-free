@@ -16,16 +16,12 @@ from backend.free.api.learning._optimize_collectors import (
 )
 
 # Pydantic スキーマは _optimize_schemas に集約
-# 外部 import 互換性のため re-export する。
 from backend.free.api.learning._optimize_schemas import (
-    AuxTaskStatus,
     Level1Status,
     OptimizeHistoryResponse,
     OptimizeStatusResponse,
     OptimizeTriggerRequest,
     OptimizeTriggerResponse,
-    PromptHistoryEntry,
-    PromptModeStatus,
 )
 from backend.log_config import get_logger
 
@@ -35,15 +31,11 @@ router = APIRouter(prefix="/api/optimize", tags=["optimize"])
 
 __all__ = [
     "router",
-    # 互換性のため re-export (テストや外部から import される)
-    "AuxTaskStatus",
     "Level1Status",
     "OptimizeHistoryResponse",
     "OptimizeStatusResponse",
     "OptimizeTriggerRequest",
     "OptimizeTriggerResponse",
-    "PromptHistoryEntry",
-    "PromptModeStatus",
 ]
 
 # Level 1 で集計対象とするモード / 補助タスクタスクのリスト

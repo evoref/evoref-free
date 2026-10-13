@@ -166,11 +166,3 @@ export async function rollbackGrowth(
 		mode
 	});
 }
-
-/** 回帰ケースを外す (retired) */
-export async function retireRegressionCase(caseId: string): Promise<RegressionRetireResponse> {
-	return request<RegressionRetireResponse>(
-		'POST',
-		`/learning/growth/regression/${encodeURIComponent(caseId)}/retire`
-	);
-}

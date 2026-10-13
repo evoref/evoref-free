@@ -42,6 +42,7 @@ from backend.free.agent.prompt_ledger import (
     save_ledger,
     shared_bullet_ids,
 )
+from backend.free.core.text_norm import collapse_ws
 from backend.i18n_helper import prompt_locale
 from backend.io.codec import persisted
 from backend.io.format_registry import FormatSpec, register_format
@@ -132,12 +133,10 @@ def ensure_static_directives(system_text: str) -> str:
         return system_text
     return f"{system_text}\n\n{directives}"
 
-_WS_RE = re.compile(r"\s+")
-
 
 def _normalized_equal(a: str, b: str) -> bool:
     """空白・大小文字を正規化したうえで 2 つの文字列が同一か判定"""
-    return _WS_RE.sub(" ", a).strip().lower() == _WS_RE.sub(" ", b).strip().lower()
+    return collapse_ws(a).lower() == collapse_ws(b).lower()
 
 
 @persisted()

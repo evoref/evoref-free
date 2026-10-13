@@ -65,12 +65,6 @@ class RuntimeConfig(BaseModel):
       タイムアウト秒数。既定 10 秒。
     - ``fit_params_binary``: ``llama-fit-params`` バイナリのパス
       または PATH 上のコマンド名。既定 ``"llama-fit-params"``。
-    - ``llama_endpoint_policy``: llama-server エンドポイント利用
-      ポリシー宣言。``"oai-only"`` (既定) で OpenAI 互換のみ採用、
-      ``"messages-allowed"`` は将来 ``/v1/messages`` 採用判断を行った
-      場合の予約値。挙動制御は行わず宣言的フラグ。実体の検証は
-      ``backend/free/tests/test_llama_endpoint_policy.py`` の静的検査で
-      担保する。詳細 ``docs/e_03_llama_server_endpoint_policy.md``。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -97,13 +91,6 @@ class RuntimeConfig(BaseModel):
     # llama-fit-params バイナリのパスまたは PATH 上のコマンド名。
     fit_params_binary: str = "llama-fit-params"
 
-    # llama-server エンドポイント利用ポリシー宣言
-    #: ⚠ 実行時にこの値を読むコードは無い (方針の宣言用フィールド)。実体の
-    #: 検証は ``backend/free/tests/test_llama_endpoint_policy.py`` の静的検査で
-    #: 担保しており、**その検査も config を参照しない**。したがって
-    #: ``"messages-allowed"`` にしても ``/v1/messages`` が使えるようにはならない。
-    llama_endpoint_policy: Literal["oai-only", "messages-allowed"] = "oai-only"
-
     # ``llama.gpu_layers`` / ``context_size`` が ``"auto"``
     # の場合に iGPU の空きから引く Vulkan host buffer 予約量 (MiB)。単体 GPU には使わない。
     # iGPU 環境では embed (CPU モード) でも llama.cpp が Vulkan
@@ -127,6 +114,14 @@ class RuntimeConfig(BaseModel):
     # プローブ失敗時は prior (プロファイル宣言) にフォールバックする。
     # 詳細 docs/c_15_model_capability_adaptation.md。
     capability_probe: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_keys(cls, data: object) -> object:
+        """撤去したキー (``llama_endpoint_policy``) を normalize の案内付きで拒否する (c_05 §7.6)。"""
+        if isinstance(data, dict):
+            reject_retired_keys("runtime", data)
+        return data
 
 
 class ThemeConfig(BaseModel):

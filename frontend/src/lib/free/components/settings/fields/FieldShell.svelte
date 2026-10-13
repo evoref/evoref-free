@@ -2,7 +2,7 @@
 	/**
 	 * 設定フィールドの共通シェル
 	 *
-	 * NumberField / TextField / SelectField / SliderField / TagListField / ToggleField で
+	 * NumberField / TextField / SelectField / SliderField / ToggleField で
 	 * 重複していた `<div class="field">` ラッパ + label + description + error 行を集約する。
 	 *
 	 * サブコンポーネント (実際のコントロール) は `children` snippet で渡す。

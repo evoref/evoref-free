@@ -44,6 +44,7 @@ from backend.free.memory.sleep._curator_common import (
     truncate_for_prompt,
 )
 from backend.free.core.session_mode import is_create_mode, normalize_session_mode
+from backend.free.core.text_norm import collapse_ws
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.sleep.extraction import write_sleep_facts
 from backend.free.memory.types import SemanticFact
@@ -59,7 +60,6 @@ logger = get_logger("memory.sleep.executable_command_curator")
 
 #: 接頭辞は _curator_common が SSOT (埋め込み側の定義と同じ場所に置く)。
 _SUBJECT_PREFIX = EXECUTABLE_COMMAND_SUBJECT_PREFIX
-_WS_RE = re.compile(r"\s+")
 
 #: 索引に記録してよい判定層 (``ToolJudgement.source``)。決定論層は毎ターン出し直し、
 #: 近道は自分の結果を正例にしない (不変則 #15)。分類器の決定だけが残す価値を持つ。
@@ -72,7 +72,7 @@ def _normalize_command(command: str) -> str:
     パスや引数の大小は意味を持ち得るが、subject キーの安定化を優先して
     lower + 連続空白の単一化のみ行う (過度な正規化は別コマンドの衝突を招く)。
     """
-    return _WS_RE.sub(" ", command).strip().lower()
+    return collapse_ws(command).lower()
 
 
 def _make_subject(mode: str, command_normalized: str) -> str:

@@ -3,11 +3,9 @@
 		"save": "Save",
 		"cancel": "Cancel",
 		"delete": "Delete",
-		"copy": "Copy",
 		"close": "Close",
 		"loading": "Loading...",
 		"error": "An error occurred",
-		"confirm": "Confirm",
 		"more_actions": "More actions"
 	},
 	"chat": {
@@ -27,7 +25,6 @@
 		"mode_restarting": "Switching models. Please wait until it finishes...",
 		"send": "Send",
 		"message_list": "Message list",
-		"clear_history": "Clear conversation history",
 		"agentic_steps": "Agentic Steps",
 		"agentic_steps_done": "Done ({elapsed})",
 		"long_form_progress": "Generating {current}/{total}: {label}",
@@ -38,14 +35,7 @@
 		"input_truncated": "⚠ Only the beginning of this message was sent due to the length limit ({sent} / {original} chars). The rest never reached the AI, so counts or totals over the whole text may be inaccurate.",
 		"output_truncated": "⚠ The output token limit was reached, so this response is cut off. Send \"continue\" to generate the rest.",
 		"input_truncated_toast": "Message too long — only the beginning was sent",
-		"step_complete": "✓ {detail}",
 		"rag_hits": "RAG search: {count} hit(s)",
-		"sufficiency_ok": "Sufficiency: OK",
-		"sufficiency_ng": "Sufficiency: Insufficient",
-		"apply_prompt": "Apply changes?",
-		"apply_yes": "Yes",
-		"apply_no": "No",
-		"apply_edit": "Edit",
 		"you": "You",
 		"thinking": "Thinking",
 		"step_marker_done": "✓",
@@ -280,8 +270,6 @@
 		"color_mode": "Color Mode",
 		"light": "Light",
 		"dark": "Dark",
-		"gpu_layers": "GPU Layers",
-		"context_size": "Context Size",
 		"loading": "Loading settings...",
 		"load_failed": "Failed to load settings",
 		"retry": "Retry",
@@ -451,8 +439,7 @@
 		},
 		"llama": {
 			"max_tokens": "Max response tokens",
-			"max_tokens_desc": "Upper limit of one reply (0 = up to the remaining context)",
-			"enable_thinking": "Thinking Mode"
+			"max_tokens_desc": "Upper limit of one reply (0 = up to the remaining context)"
 		},
 		"rag": {
 			"chunk_size": "Chunk Size",
@@ -461,7 +448,6 @@
 			"semantic_min_chunk": "Semantic Min Chunk",
 			"semantic_max_chunk": "Semantic Max Chunk",
 			"top_k": "Top K",
-			"embedding_dim": "Embedding Dimension",
 			"quantization": "Quantization",
 			"rescore_candidates": "Rescore Candidates",
 			"memmap_threshold": "memmap Threshold",
@@ -680,8 +666,6 @@
 	"file": {
 		"attach": "Attach File",
 		"upload_area": "Drag and drop or click to add files",
-		"drop_here": "Drop here",
-		"unsupported": "Unsupported format: {ext}",
 		"size_exceeded": "File size exceeds limit ({limit}MB): {name}",
 		"duplicate": "File already attached: {name}",
 		"attach_failed": "Could not attach: {filename}",
@@ -709,29 +693,14 @@
 		"uninstall_confirm_message": "Uninstall \"{name}\"? If it is the active theme, the standard look is restored."
 	},
 	"widget_proxy": {
-		"enabled": "Enabled",
-		"disabled": "Disabled",
-		"rate_limit": "Rate Limit"
-	},
-	"toast": {
-		"dismiss": "Dismiss"
+		"enabled": "Enabled"
 	},
 	"error": {
 		"connection": {
-			"sse_lost": "Connection to server lost. Attempting to reconnect...",
-			"ws_lost": "WebSocket connection lost. Attempting to reconnect...",
-			"api_timeout": "Request timed out. Please try again.",
 			"failed": "Failed to connect to server"
-		},
-		"upload": {
-			"size_exceeded": "File size exceeds the limit."
-		},
-		"stream": {
-			"interrupted": "Response stream was interrupted."
 		},
 		"status_failed": "Failed to get status",
 		"themes_failed": "Failed to get themes",
-		"cartridges_failed": "Failed to get cartridges",
 		"cartridge_install_failed": "Failed to install cartridge"
 	},
 	"cartridge": {
@@ -850,10 +819,8 @@
 		"duration": "{minutes} min",
 		"today": "Today",
 		"yesterday": "Yesterday",
-		"older": "Older",
 		"no_summary": "No summary",
 		"delete_confirm": "Delete this conversation?",
-		"deleted": "Deleted",
 		"mode_all": "All",
 		"load_more": "Load more",
 		"select_session": "Select a session to view conversation",
@@ -865,7 +832,6 @@
 		"no_turns": "No conversation turns",
 		"user_label": "You",
 		"assistant_label": "AI",
-		"first_message": "(first message)",
 		"copy_turn": "Copy",
 		"copied": "Copied",
 		"copy_failed": "Copy failed",
@@ -966,10 +932,6 @@
 	"cli": {
 		"mode_create_pro_only_warning": "Create mode is available only in the Pro edition. Falling back to chat mode."
 	},
-	"landing": {
-		"free_tagline": "Local personal knowledge assistant powered by Agentic RAG",
-		"pro_tagline": "Self-evolving local LLM assistant with Agentic RAG plus create mode"
-	},
 	"cartridgeTrust": {
 		"title": "Signatures and trust store",
 		"hint": "Only cartridges signed by your organization are installed with their bundled index (prebuilt), without re-embedding. Add and revoke keys with `evoref cartridge trust add` / `evoref cartridge revoke` while evoref is stopped.",
@@ -991,6 +953,7 @@
 			"digest_mismatch": "Content does not match the signature",
 			"bad_signature": "Invalid signature",
 			"malformed": "Malformed signature",
+			"legacy_scheme": "Legacy signature scheme (re-sign required)",
 			"verifier_error": "Could not verify"
 		}
 	},

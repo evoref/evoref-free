@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from backend.free.rag.topk import top_k_desc
 from backend.constants import FLOAT_EPS
 from backend.exceptions import VectorDimensionMismatchError
 from backend.io import atomic_write_text
@@ -130,6 +131,10 @@ def _kmeans_numpy(
         centroids = new_centroids
 
     return centroids, assignments
+
+
+IVF_MIN_ROWS = 20_000
+"""この行数未満では全探索 (recall 1.0)。IVF は数万行以上で初めて速さで勝つ (c_16 §6.1)。"""
 
 
 class VectorStore:
@@ -704,9 +709,9 @@ class VectorStore:
             if n_candidates >= n_vectors:
                 candidate_indices = np.arange(n_vectors)
             else:
-                candidate_indices = np.argpartition(dots, -n_candidates)[
-                    -n_candidates:
-                ]
+                candidate_indices = top_k_desc(
+                    dots, np.arange(n_vectors), n_candidates,
+                )
         else:
             # IVF 経路: 対象クラスタ内のみ dot を計算 (行スケール込み)
             sub_dots = _coarse_scores(
@@ -718,9 +723,7 @@ class VectorStore:
             if n_candidates >= len(restricted_indices):
                 candidate_indices = restricted_indices
             else:
-                local_top = np.argpartition(sub_dots, -n_candidates)[
-                    -n_candidates:
-                ]
+                local_top = top_k_desc(sub_dots, restricted_indices, n_candidates)
                 candidate_indices = restricted_indices[local_top]
 
         # ── 第2段階: float32 rescore ──
@@ -735,7 +738,7 @@ class VectorStore:
 
         # top_k 選択
         k = min(top_k, len(similarities))
-        local_top = np.argsort(similarities)[-k:][::-1]
+        local_top = top_k_desc(similarities, candidate_indices, k)
 
         results = []
         for local_idx in local_top:

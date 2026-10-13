@@ -44,6 +44,7 @@ from backend.free.core.correction_verdict import (
 from backend.free.core.numerals import kanji_number_value
 from backend.free.core.relative_date import annotate_relative_dates
 from backend.free.core.temporal_deixis import DAY_OFFSETS, WEEK_OFFSETS, alternation, kanji_terms
+from backend.free.core.text_norm import collapse_ws, ellipsize
 from backend.free.core.text_quality import detect_lang
 from backend.log_config import get_logger
 from backend.free.core.correction_target import contrast_pair
@@ -379,10 +380,7 @@ class BaseExtractor:
     @classmethod
     def truncate(cls, text: str, max_len: int) -> str:
         """テキストを ``max_len`` で切り詰める。改行 1 個に正規化"""
-        normalized = " ".join((text or "").split())
-        if len(normalized) <= max_len:
-            return normalized
-        return normalized[: max_len - 1] + "…"
+        return ellipsize(collapse_ws(text), max_len)
 
     def make_fact(
         self,

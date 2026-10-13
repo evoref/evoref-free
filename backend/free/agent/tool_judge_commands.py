@@ -661,15 +661,6 @@ def _day_count_command(query: str) -> str:
 #: だけ。日付演算を含まないコマンドの再生を止める。絶対日付 (「1987年3月14日は
 #: 何曜日でしたか？」) や相対日付 (「3年前の今日は何曜日でしたか？」) は過去形でも
 #: 計算が要るため、演算コマンドは従来どおり通す。
-#: 語彙は core.intent_vocab が SSOT (``tool_judge_history`` の既出対象の
-#: 尋ね直し判定と同じ文末形)。後方互換で旧名を残す。
-_PAST_RECALL_TAIL_RE = PAST_RECALL_TAIL_RE
-
-#: 「現在」を指す語。1 つでもあれば過去事実の想起とはみなさない。語彙と除外
-#: (「て**いま**せん」「興味」) は core.intent_vocab が SSOT (現在日時の注記の
-#: 発火条件と同じ語)。後方互換で旧名を残す。
-_PRESENT_ANCHOR_RE = PRESENT_ANCHOR_RE
-
 
 def _relative_anchor(query: str, offset_start: int) -> "_QueryDate | None":
     """相対オフセットの基点になる日付を返す (無ければ ``None`` = 今日基点)。
@@ -706,9 +697,9 @@ def _anchored_suffix(suffix: str, provenance: str) -> str:
 def _is_past_fact_recall(query: str) -> bool:
     """現在日時ではなく「以前述べられた日付」を訊いているか (純粋関数)。"""
     q = query or ""
-    if _PRESENT_ANCHOR_RE.search(q):
+    if PRESENT_ANCHOR_RE.search(q):
         return False
-    return bool(_PAST_RECALL_TAIL_RE.search(q))
+    return bool(PAST_RECALL_TAIL_RE.search(q))
 
 
 def _build_datetime_command(query: str) -> str:
@@ -1973,19 +1964,6 @@ def referent_anchor_candidates(
         )
         return user_dates + [d for d in asst_dates if d not in user_dates]
     return user_dates
-
-
-def referent_anchor_date(
-    query: str, conversation: list[dict] | None, today: datetime.date,
-) -> datetime.date | None:
-    """参照名詞の起点の日付。候補が無い / 2 つ以上なら ``None`` (棄権、純粋関数)。"""
-    dates = referent_anchor_candidates(query, conversation, today)
-    if len(dates) > 1:
-        logger.info(
-            "referent anchor abstained: %d candidate dates for %s",
-            len(dates), referent_anchor_nouns(query),
-        )
-    return dates[0] if len(dates) == 1 else None
 
 
 def referent_defined_in_query(query: str, today: datetime.date) -> datetime.date | None:

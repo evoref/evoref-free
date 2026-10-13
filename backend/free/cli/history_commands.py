@@ -15,6 +15,7 @@ from backend.free.cli.renderer import (
     render_info,
     render_table,
 )
+from backend.free.core.text_norm import ellipsize
 from backend.free.history.utils import format_datetime, format_duration
 from backend.i18n_helper import msg
 from backend.log_config import get_logger
@@ -93,7 +94,7 @@ def _history_list(
             msg("cli.history_col_date"): format_datetime(s.get("started_at", "")),
             msg("cli.history_col_turns"): str(s.get("turn_count", 0)),
             # 要約は sleep-time でしか付かないので、未要約は最初のユーザ発話で代替
-            msg("cli.history_col_summary"): _truncate(
+            msg("cli.history_col_summary"): ellipsize(
                 s.get("summary") or s.get("first_user_preview") or "-", 40,
             ),
         })
@@ -150,7 +151,7 @@ def _history_search(
             "ID": r["session_id"][:8],
             msg("cli.history_col_date"): format_datetime(r.get("started_at", "")),
             msg("cli.history_col_score"): f"{r.get('relevance_score', 0):.1f}",
-            msg("cli.history_col_summary"): _truncate(r.get("summary") or "-", 40),
+            msg("cli.history_col_summary"): ellipsize(r.get("summary") or "-", 40),
         })
 
     headers = [
@@ -206,7 +207,7 @@ def _history_show(backend_url: str, console, session_id: str) -> int:
             compressed = turn.get("compressed", False)
             prefix = "U" if role == "user" else "A"
             suffix = f" ({msg('cli.history_detail_compressed')})" if compressed else ""
-            render_info(console, f"  [{prefix}{i + 1}]{suffix} {_truncate(content, 100)}")
+            render_info(console, f"  [{prefix}{i + 1}]{suffix} {ellipsize(content, 100)}")
 
     return 0
 
@@ -355,12 +356,3 @@ def _history_prune(backend_url: str, console, before: str) -> int:
 
     render_info(console, msg("cli.history_prune_done", deleted=deleted, failed=failed))
     return 0
-
-
-# ── ユーティリティ ──
-
-def _truncate(text: str, max_len: int) -> str:
-    """文字列を指定長で切り詰め"""
-    if len(text) <= max_len:
-        return text
-    return text[:max_len - 1] + "…"

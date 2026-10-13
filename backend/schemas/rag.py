@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.config_normalize import reject_retired_keys
 from backend.llama_launch_args import derive_into
 
 
@@ -128,9 +129,15 @@ class ProjectMapConfig(BaseModel):
     # models / local / dist / build / htmlcov / coverage) への追加 glob。
     exclude_globs: list[str] = Field(default_factory=list)
     max_file_bytes: int = Field(default=1_000_000, ge=1)
-    neighborhood_depth: int = Field(default=2, ge=1, le=5)
-    neighborhood_budget_tokens: int = Field(default=800, ge=1)
     update: ProjectMapUpdateConfig = Field(default_factory=ProjectMapUpdateConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_retired_keys(cls, data: object) -> object:
+        """撤去したキー (``neighborhood_depth`` / ``neighborhood_budget_tokens``) を normalize の案内付きで拒否する (c_05 §7.6)。"""
+        if isinstance(data, dict):
+            reject_retired_keys("rag", {"project_map": data})
+        return data
 
 
 class SelfRagContentGateConfig(BaseModel):

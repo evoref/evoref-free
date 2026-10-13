@@ -35,8 +35,5 @@ sampling:
 reasoning:
   mode: always
   server_control: false      # llama.cpp 非認識 (thinking=0) → サーバ側 reasoning 制御不可 (Step0 実証)
-  client_handling: strip     # <think> を回答から除去 (隠す)
-  marker_style: think_tags
   client_think_budget: 4096  # watchdog 上限。LFM2.5 は難問で思考が 1000+ tok に達してから </think> を閉じるため、512 では回答到達前に stream 中断 (content 0) していた (実機実測)
   on_runaway: fallback
-  exclude_from_history: true # 思考を履歴/WM に残さない (多ターン汚染防止)

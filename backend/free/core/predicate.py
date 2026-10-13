@@ -41,6 +41,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 import numpy as np
 
 from backend.embed_priority import P2_LEARNING, with_embed_priority
+from backend.free.core.vectors import l2_normalize_rows
 from backend.liveness import ledger as liveness_ledger
 from backend.log_config import get_logger
 
@@ -277,12 +278,6 @@ def load_exemplars(path: Path) -> list[Exemplar]:
     return out
 
 
-def _l2_normalize(mat: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return (mat / norms).astype(np.float32)
-
-
 #: warmup の自己診断が要求する LOO 正解率 (判定分)。
 #:
 #: **事例は足すと精度が下がることがある** (2026-09-15 に 3 回踏んだ: 自己構成の
@@ -346,7 +341,7 @@ def calibrate_exemplar_gate(
         ``{"ok", "sim_floor", "positive_p05", "null_p95", "overlap",
         "n_positive", "n_negative"}``。
     """
-    mat = _l2_normalize(np.asarray(vectors, dtype=np.float32))
+    mat = l2_normalize_rows(np.asarray(vectors, dtype=np.float32))
     lab = np.asarray([str(x) for x in labels])
     pos_rows = np.flatnonzero(lab != NEGATIVE_LABEL)
     neg_rows = np.flatnonzero(lab == NEGATIVE_LABEL)
@@ -498,7 +493,7 @@ class ExemplarPredicate:
             vecs = await self._embedder.embed(
                 [e.text for e in self._exemplars], is_query=True, mode=self._mode,
             )
-            self._vectors = _l2_normalize(np.asarray(vecs, dtype=np.float32))
+            self._vectors = l2_normalize_rows(np.asarray(vecs, dtype=np.float32))
             self._labels = [e.label for e in self._exemplars]
             self._ids = [e.evidence_id for e in self._exemplars]
         except Exception as e:  # pragma: no cover - 縮退で吸収する
@@ -585,7 +580,7 @@ class ExemplarPredicate:
         必ず k 件選ばれるため、票が割れて棄権になるだけで、エラーにも
         ならない。
 
-        実例 (2026-09-15): ``fact_attribute_slot`` を k=7 / ratio=0.6 (4 票必要)
+        実例 (2026-09-15): ``fact_attribute_slot`` を k=7 / ratio=0.6 (5 票必要)
         にしたところ、18 スロット中 15 が事例 3 件以下で発火不能になり、実発話
         928 件に対して **1 度も発火しなかった**。LOO の正解率 0.944 は、ほぼ
         陰性クラス (28 件) だけを測っていた。
@@ -593,9 +588,7 @@ class ExemplarPredicate:
         直し方は 2 つで、どちらも実測で決める: ``k`` を下げるか、そのラベルの
         事例を増やす。
         """
-        import math
-
-        needed = math.ceil(self._k * self._fire_ratio)
+        needed = self._votes_needed()
         counts: dict[str, int] = {}
         for label in self._labels:
             counts[label] = counts.get(label, 0) + 1
@@ -613,14 +606,16 @@ class ExemplarPredicate:
             ", ".join(f"{label}={n}" for label, n in unreachable[:12]),
         )
 
+    def _votes_needed(self) -> int:
+        """発火に要る最少票数。実行時の ``votes / k >= fire_ratio`` と同じ比較で決める。"""
+        return next(v for v in range(1, self._k + 1) if v / self._k >= self._fire_ratio)
+
     def unreachable_labels(self) -> dict[str, int]:
         """``k × fire_ratio`` 票に届かないラベル (``{ラベル: 事例数}``)。
 
         ベンチとテストが同じ判定を使えるように公開する。
         """
-        import math
-
-        needed = math.ceil(self._k * self._fire_ratio)
+        needed = self._votes_needed()
         counts: dict[str, int] = {}
         for label in self._labels:
             counts[label] = counts.get(label, 0) + 1
@@ -723,6 +718,8 @@ class ExemplarPredicate:
         sims = mat @ mat.T
         np.fill_diagonal(sims, -2.0)
         k = min(self._k, mat.shape[0] - 1)
+        if k <= 0:
+            return {"ok": 0, "n": mat.shape[0]}
         correct = abstained = 0
         predicted_by_label: dict[str, int] = {}
         correct_by_label: dict[str, int] = {}

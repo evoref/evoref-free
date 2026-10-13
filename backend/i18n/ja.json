@@ -971,19 +971,9 @@
       "process_crashed": "推論サーバーが異常終了しました。再起動を試みています。",
       "request_rejected": "埋め込みサーバーがリクエストを拒否しました: {detail}。embedding.context_size の見直しが必要な場合があります。"
     },
-    "fs": {
-      "index_corrupted": "ベクトルインデックスが破損しています。復旧を試みます。",
-      "metadata_corrupted": "メタデータファイルが破損しています。復旧を試みます。",
-      "disk_full": "ディスク容量が不足しています。不要なファイルを削除してください。"
-    },
     "rag": {
-      "chunk_failed": "ファイルの分割に失敗しました: {filename}",
       "vector_dim_mismatch": "ベクトル次元が一致しません。埋め込みモデルが変更されました。evoref reindex を実行してください。",
       "stale_embedder": "埋め込みサーバーが旧モデル ({current}) のまま稼働しています。embed サーバーを再起動してから再実行してください (設定上の新モデル: {expected})。"
-    },
-    "cartridge": {
-      "invalid_zip": "不正なカートリッジファイルです: {filename}",
-      "duplicate_id": "同じIDのカートリッジが既に登録されています: {id}"
     },
     "long_form": {
       "generic": "長文生成中にエラーが発生しました。",
@@ -991,8 +981,6 @@
       "unit_failed": "長文生成のユニット生成に失敗しました。"
     },
     "cli": {
-      "backend_not_running": "バックエンドサーバーが起動していません。evoref serve を実行してください。",
-      "encoding_failed": "文字エンコードエラーが発生しました。UTF-8設定を確認してください。",
       "stream_interrupted": "応答の受信が中断されました。",
       "stream_timeout": "応答がタイムアウトしました。処理に時間がかかっている可能性があります。"
     },

@@ -19,10 +19,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-# FewShotExample / format_fewshot_section は EvorefLoop pillar
-# (agent) 所属の純粋 util に移動済。Learn 側はここから import する。
-# format_fewshot_section は他モジュール (tests / 一部呼出元) が本モジュール経由で
-# import するため re-export として保持する。
+# FewShotExample は EvorefLoop pillar (agent) 所属の純粋 util に移動済。
+# Learn 側はここから import する。
 from backend.embed_priority import P2_LEARNING, with_embed_priority
 from backend.free.core.date_math_cue import query_has_date_math_cue
 from backend.free.core.temporal_deixis import (
@@ -39,10 +37,7 @@ from backend.free.core.temporal_deixis import (
     ascii_words,
     kanji_terms,
 )
-from backend.free.agent.prompt_utils import (
-    FewShotExample,
-    format_fewshot_section,  # noqa: F401  (re-export for tests)
-)
+from backend.free.agent.prompt_utils import FewShotExample
 from backend.free.core.leak_reasons import LEAK_REASON_PREFIXES, leak_reason
 from backend.utils import estimate_tokens, parse_utc, utc_now, utc_now_dt
 from backend.free.core.intent_vocab import (

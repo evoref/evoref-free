@@ -57,6 +57,7 @@ Qwen3 系の instruction-aware な埋め込みは query 側と document 側で p
 
 from __future__ import annotations
 
+import dataclasses
 import asyncio
 import contextlib
 import hashlib
@@ -76,7 +77,7 @@ from backend.embed_priority import P1_FRESHNESS, embed_priority
 from backend.export.markdown_patterns import RE_LINK
 from backend.free.core.tuning.tuners.embed_params import HTTP_BATCH_MAX, http_batch_of
 from backend.free.rag.evidence.columns import active_mask as columns_active_mask
-from backend.free.rag.evidence.columns import build_columns
+from backend.free.rag.evidence.columns import EvidenceColumns, build_columns
 from backend.free.rag.evidence.events import EventPosition, EvidenceEventLog
 from backend.free.rag.evidence.lexical_index import (
     LEXICAL_INDEX_VERSION,
@@ -137,6 +138,7 @@ from backend.free.rag.evidence.vectors import (
     ids_digest,
 )
 from backend.free.rag.vector_store import (
+    IVF_MIN_ROWS,
     DEFAULT_MEMMAP_THRESHOLD,
     content_hash,
     dequantize_int8,
@@ -457,6 +459,7 @@ class EvidenceStore:
         self._snapshot: SnapshotReader | None = None
         #: 事象で作られた / 上書きされたレコード (snapshot より優先)。
         self._overlay: dict[str, Evidence] = {}
+        self._columns_view_cache: tuple[Any, Any, int, EvidenceColumns] | None = None
         #: 版の組み立て (``await``) の間に適用した事象。差し替え後のオーバーレイへ
         #: 戻す (組み立て中でなければ ``None``)。
         self._events_during_build: list[dict[str, Any]] | None = None
@@ -1232,6 +1235,42 @@ class EvidenceStore:
             mask[row] = is_active(record, now_epoch, include_private)
         return mask
 
+    #: overlay の値で上書きする列 (表の添字の ``namespace_id`` / ``tier`` / ``package_idx`` は重ねない)。
+    _OVERLAID_COLUMNS: tuple[str, ...] = (
+        "as_of_epoch", "observed_epoch", "valid_until_epoch", "half_life_days",
+        "confidence", "flags", "origin", "kind", "veracity", "claim_hash64",
+    )
+
+    def columns_view(self) -> EvidenceColumns | None:
+        """snapshot の列に、snapshot 後の変更 (overlay) の行を重ねたもの (c_16 §5.3)。
+
+        順位・畳み込みが読む列。snapshot の列だけだと、patch / retract / supersede の
+        解除で復活した行が古い flags / confidence / claim_hash64 のまま扱われる。
+        overlay の世代 (写しを差し替えるたびに別の dict) ごとに 1 回だけ作ってキャッシュする。
+        """
+        snapshot = self._snapshot
+        if snapshot is None:
+            return None
+        overlay = self._overlay
+        cache = self._columns_view_cache
+        if cache is not None and cache[0] is snapshot and cache[1] is overlay and cache[2] == len(overlay):
+            return cache[3]
+        columns = snapshot.columns
+        pairs = [
+            (row, record) for record_id, record in overlay.items()
+            if (row := snapshot.row_of(record_id)) is not None
+        ]
+        if pairs:
+            patch = build_columns([record for _, record in pairs])
+            rows = np.array([row for row, _ in pairs], dtype=np.int64)
+            copies = {name: getattr(columns, name).copy() for name in self._OVERLAID_COLUMNS}
+            for name, array in copies.items():
+                array[rows] = getattr(patch, name)
+            columns = dataclasses.replace(columns, **copies)
+        # overlay を保持して id の再利用 (別 dict が同じ id を得る) による取り違えを防ぐ
+        self._columns_view_cache = (snapshot, overlay, len(overlay), columns)
+        return columns
+
     @property
     def snapshot(self) -> SnapshotReader | None:
         """現在の active snapshot (未生成なら ``None``)。"""
@@ -1902,27 +1941,42 @@ class EvidenceStore:
 
     def vector_candidates(
         self, query_vec: np.ndarray, top_k: int = 20,
+        row_mask: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """ベクトル検索の候補を **snapshot の行番号** と cosine で返す。
 
         順位・ゲートは呼び出し側が素の cosine から計算する (c_16 §6.3 / §7.1)。
         snapshot に入っていない ``put`` 直後のレコードは対象外。
+
+        ``row_mask`` (有効行) を渡すと、無効行 (撤回・置換済みの世代) は候補に数えない。
+        置換前の世代は埋め込みがほぼ同じで上位を占めうるため、有効行が ``top_k`` に
+        満たなければ取得幅を広げて取り直す。
         """
         empty = (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32))
         store = self.vector_store()
         if store is None or self._snapshot is None:
             return empty
-        hits = store.search(query_vec, top_k=top_k)
-        if not hits:
-            return empty
         rows: list[int] = []
         scores: list[float] = []
-        for record_id, score, _text in hits:
-            row = self._snapshot.row_of(record_id)
-            if row is None:
-                continue
-            rows.append(row)
-            scores.append(float(score))
+        fetch_k = top_k
+        while True:
+            hits = store.search(query_vec, top_k=fetch_k)
+            rows, scores = [], []
+            for record_id, score, _text in hits:
+                row = self._snapshot.row_of(record_id)
+                if row is None or (row_mask is not None and not row_mask[row]):
+                    continue
+                rows.append(row)
+                scores.append(float(score))
+            if (
+                row_mask is None
+                or len(rows) >= top_k
+                or len(hits) < fetch_k
+                or fetch_k >= len(self._snapshot)
+            ):
+                break
+            fetch_k *= 4
+        rows, scores = rows[:top_k], scores[:top_k]
         if not rows:
             return empty
         return np.array(rows, dtype=np.int64), np.array(scores, dtype=np.float32)
@@ -2110,7 +2164,9 @@ class EvidenceStore:
         candidate_k = max(top_k * CANDIDATE_MULTIPLIER, MIN_CANDIDATES)
 
         mask = self.active_mask(now_epoch, include_private)
-        vector_rows, vector_cos = self.vector_candidates(query_vec, top_k=candidate_k)
+        vector_rows, vector_cos = self.vector_candidates(
+            query_vec, top_k=candidate_k, row_mask=mask,
+        )
         lexical_rows, _lexical_scores = self.lexical_candidates(
             query_text, candidate_k, shards=shards, row_mask=mask,
         )
@@ -2127,7 +2183,7 @@ class EvidenceStore:
         if rows.shape[0] == 0:
             return []
 
-        columns = RankColumns.from_columns(snapshot.columns)
+        columns = RankColumns.from_columns(self.columns_view() or snapshot.columns)
         prior = (
             self.default_store_prior if store_prior is None else store_prior
         )
@@ -2687,9 +2743,8 @@ def write_vector_store(
     }
     store.vectors_dir.mkdir(parents=True, exist_ok=True)
     if cluster:
-        # threshold=1: 件数に関わらず必ず構築する (c_16 §6.1)。numpy だけの
-        # K-means なので、増分埋め込みでも毎回作り直してよい。
-        store.build_cluster_index(threshold=1, n_probe_ratio=n_probe_ratio)
+        # 20,000 行未満は全探索のほうが recall が高く、構築もしない (c_16 §6.1)。
+        store.build_cluster_index(threshold=IVF_MIN_ROWS, n_probe_ratio=n_probe_ratio)
     store.save()
     return store
 

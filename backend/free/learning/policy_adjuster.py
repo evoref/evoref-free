@@ -533,12 +533,17 @@ class PolicyAdjuster:
         に維持される。
         """
         f = self.decay_factor
-        bucket.samples = int(bucket.samples * f)
-        bucket.failures = int(bucket.failures * f)
-        bucket.orphan_count = int(bucket.orphan_count * f)
-        bucket.duration_ms_sum *= f
-        bucket.duration_count = int(bucket.duration_count * f)
-        bucket.json_repair_count = int(bucket.json_repair_count * f)
+        old_samples, old_dur = bucket.samples, bucket.duration_count
+        bucket.samples = int(old_samples * f)
+        # 分子は新しい分母へ比例配分する (別々に切り捨てると率が丸めだけで動く)
+        for name in ("failures", "orphan_count", "json_repair_count"):
+            value = getattr(bucket, name)
+            setattr(bucket, name, round(value / old_samples * bucket.samples) if old_samples else 0)
+        bucket.duration_count = int(old_dur * f)
+        # 平均 (sum / count) を保つ
+        bucket.duration_ms_sum = (
+            bucket.duration_ms_sum * bucket.duration_count / old_dur if old_dur else 0.0
+        )
         # retry_max は max 値なので decay しない (履歴の最悪値を保持)
 
 

@@ -31,10 +31,10 @@ from typing import Any
 
 import numpy as np
 
+from backend.free.core.vectors import l2_normalize_rows
 from backend.free.rag.memory_threshold_calibration import (
     MIN_NOTES,
     MIN_QUERIES,
-    _l2_normalize,
     compute_calibration,
 )
 from backend.io.format_registry import FormatSpec, register_format
@@ -134,8 +134,8 @@ def compute_corpus_calibration(
             "ok": False, "reason": base.get("reason"),
             "n_chunks": base.get("n_notes", 0), "n_pq": base.get("n_queries", 0),
         }
-    pq = _l2_normalize(np.asarray(pq_vecs, dtype=np.float32))
-    canary = _l2_normalize(np.asarray(canary_vecs, dtype=np.float32))
+    pq = l2_normalize_rows(np.asarray(pq_vecs, dtype=np.float32))
+    canary = l2_normalize_rows(np.asarray(canary_vecs, dtype=np.float32))
 
     # 正側: 各疑似クエリを検索側に回し、自分自身を除いた top1。
     sims = pq @ pq.T

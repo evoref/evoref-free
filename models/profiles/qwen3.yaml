@@ -30,7 +30,6 @@ reasoning:
   mode: toggle
   enable_thinking: false
   server_control: true        # Qwen3 系は llama.cpp 認識 (thinking != 0) → サーバ側 reasoning 制御可
-  reasoning_format: auto      # 認識モデルは auto で <think> を reasoning_content に分離
   budget_default: -1
 # Qwen3-Embedding-0.6B (arch "qwen3") の埋め込みプロファイル。embed モデルを本 arch へ
 # 切替え (LFM2.5 からの戻し等) たとき ModelMigrator がここを config.yaml embedding.* へ

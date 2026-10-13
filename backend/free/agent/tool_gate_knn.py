@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 
 from backend.embed_priority import P2_LEARNING, with_embed_priority
+from backend.free.core.vectors import l2_normalize_rows
 from backend.log_config import get_logger
 
 logger = get_logger("agent.tool_gate_knn")
@@ -168,9 +169,7 @@ class ToolGateKNN:
                 texts, is_query=True, mode=EXEMPLAR_EMBED_MODE,
             )
             mat = np.asarray(vecs, dtype=np.float32)
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            self._vectors = (mat / norms).astype(np.float32)
+            self._vectors = l2_normalize_rows(mat)
             self._labels = [label for _, label in self._exemplars]
             logger.info(
                 "Tool gate kNN ready: %d exemplars (tool=%d, none=%d), k=%d",

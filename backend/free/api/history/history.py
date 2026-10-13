@@ -9,7 +9,6 @@ from backend.free.api.history._history_collectors import (
 )
 
 # Pydantic スキーマは _history_schemas に集約
-# 外部 import 互換性のため re-export する。
 from backend.free.api.history._history_schemas import (
     BatchDeleteRequest,
     BatchDeleteResponse,
@@ -19,7 +18,6 @@ from backend.free.api.history._history_schemas import (
     SearchResult,
     SessionDetailResponse,
     SessionListResponse,
-    SessionSummary,
     StatsResponse,
 )
 from backend.free.history.history_manager import get_history_manager
@@ -32,7 +30,6 @@ router = APIRouter(prefix="/api/history", tags=["history"])
 
 __all__ = [
     "router",
-    # 互換性のため re-export
     "BatchDeleteRequest",
     "BatchDeleteResponse",
     "CompactResponse",
@@ -41,7 +38,6 @@ __all__ = [
     "SearchResult",
     "SessionDetailResponse",
     "SessionListResponse",
-    "SessionSummary",
     "StatsResponse",
 ]
 

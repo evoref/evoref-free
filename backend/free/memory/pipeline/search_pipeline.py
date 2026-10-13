@@ -2500,13 +2500,6 @@ def store_rerank_positions(
     return positions[:max(0, limit)]
 
 
-def corpus_rerank_positions(
-    merged: Sequence[tuple[str, float, str]], limit: int,
-) -> list[int]:
-    """``merged`` の中で corpus 項目が占める位置 (現順位で上位 ``limit`` 件)。"""
-    return store_rerank_positions(merged, limit, "corpus")
-
-
 def apply_store_rerank(
     merged: Sequence[tuple[str, float, str]],
     scores: Sequence[float],
@@ -2533,15 +2526,6 @@ def apply_store_rerank(
     return out
 
 
-def apply_corpus_rerank(
-    merged: Sequence[tuple[str, float, str]],
-    scores: Sequence[float],
-    limit: int,
-) -> list[tuple[str, float, str]]:
-    """corpus の位置の集合を保ったまま、候補プール (上位 ``limit`` 件) を再順位で並べる。"""
-    return apply_store_rerank(merged, scores, limit, "corpus")
-
-
 def _eligible_pool_extras(
     query: str,
     extras: Sequence[StoreEntry],
@@ -2556,10 +2540,12 @@ def _eligible_pool_extras(
     """
     seen_ids = {cid for cid, _score, _text in merged}
     seen_claims = {_claim_key_of(text) for _cid, _score, text in merged if text}
-    passed = [e for e in extras if e[0] not in seen_ids and e[1] >= floor]
+    passed = sorted(
+        (e for e in extras if e[0] not in seen_ids and e[1] >= floor), key=lambda e: -e[2],
+    )
     eligible = set(eligible_rag_indices([e[3] for e in passed], query))
     out: list[tuple[str, float, str]] = []
-    for i, (cid, _cos, score, text) in enumerate(sorted(passed, key=lambda e: -e[2])):
+    for i, (cid, _cos, score, text) in enumerate(passed):
         claim = _claim_key_of(text) if text else ""
         if i not in eligible or (claim and claim in seen_claims):
             continue

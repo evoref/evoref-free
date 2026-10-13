@@ -186,7 +186,7 @@ def _apply_session_data(
 
     # 保存されていたファイルパスを再読込み
     if state.context_files:
-        from backend.free.cli.file_reader import FileReaderError, read_and_chunk
+        from backend.free.services.file_service import FileServiceError, read_and_chunk
         valid_files = []
         for file_path in state.context_files:
             p = Path(file_path)
@@ -197,7 +197,7 @@ def _apply_session_data(
                 result = read_and_chunk(p)
                 state.file_chunks[file_path] = result.chunks
                 valid_files.append(file_path)
-            except FileReaderError as e:
+            except FileServiceError as e:
                 logger.debug("/load: failed to re-read context file %s: %s", file_path, e)
         state.context_files = valid_files
 

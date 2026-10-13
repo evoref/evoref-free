@@ -365,9 +365,9 @@ def _should_skip_session(session: SessionData, auto_save: bool) -> str | None:
 def _complete_session_metadata(session: SessionData) -> None:
     """セッション終了情報を補完"""
     if not session.ended_at:
-        session.ended_at = _now_iso()
+        session.ended_at = utc_now()
     if not session.archived_at:
-        session.archived_at = _now_iso()
+        session.archived_at = utc_now()
     if not session.turn_count:
         session.turn_count = len(session.turns)
 
@@ -1502,7 +1502,7 @@ class HistoryManager:
         self._index_dirty = None
         if index is None:
             return
-        index.updated_at = _now_iso()
+        index.updated_at = utc_now()
         payload = {
             "built_from": _files_digest(self._files),
             "updated_at": index.updated_at,
@@ -1736,10 +1736,6 @@ def _in_window(started: datetime, lower: datetime | None, upper: datetime | None
     if started is _NO_TIME:
         return False
     return (lower is None or started >= lower) and (upper is None or started <= upper)
-
-
-def _now_iso() -> str:
-    return utc_now()
 
 
 # ── シングルトンファクトリ ──

@@ -42,6 +42,7 @@ from backend.free.rag.evidence import (
     new_evidence_id,
     read_snapshot,
 )
+from backend.free.rag.evidence.ranking import collapse_by_claim_key
 from backend.free.rag.evidence.types import KIND_IDS, TIER_IDS, UNKNOWN_I16
 from backend.free.rag.vector_store import dequantize_int8
 from backend.constants import SECONDS_PER_DAY
@@ -393,7 +394,9 @@ class EpisodicStore:
             if record.kind == "note" and (record.tier or "short") == tier
         ]
         if tail:
-            hits = sorted(hits + tail, key=lambda hit: hit.score, reverse=True)
+            merged = sorted(hits + tail, key=lambda hit: hit.score, reverse=True)
+            # snapshot の後に言い直された同じ主張は 1 件にする (c_16 §7.3)
+            hits = collapse_by_claim_key(merged, lambda hit: hit.record)
         return hits[:top_k]
 
     def _shards_for(self, tier: str, now: float) -> list[str] | None:

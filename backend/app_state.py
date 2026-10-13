@@ -117,12 +117,8 @@ class AppState:
     aux_client: AuxClient | None = None
 
     # ── メモリシステム ──
-    # legacy: session_id を持たない読み手 (統計 API / テストの seam) 向け。
-    # 本番では ``working_memory_registry`` が SSOT で、この属性は **最後に触った
-    # セッション** の WM を返すプロパティになる (クラス定義直後で差し替え)。
-    # 応答パスは必ず ``get_memory_system(session_id)`` を使うこと。
-    working_memory: WorkingMemory | None = None
     # セッション別 WM の台帳 (``memory.working_max_sessions`` で LRU 上限)。
+    # 応答パスは必ず ``get_memory_system(session_id)`` を使うこと。
     working_memory_registry: WorkingMemoryRegistry | None = None
     # エピソード記憶 (会話由来ノート)。WM→STM→LTM の 3 ストアを畳んだ
     # 1 本のストア (c_16 §4.1)。書き手は sleep-time だけ。
@@ -248,7 +244,7 @@ class AppState:
 
     # ── 4 pillar エントリポイント ──
     # wire_pillars() が依存順 (Gen → Mem → Loop → Learn) に構築して格納する。
-    # 既存フィールド (local_client / working_memory / learning_scheduler 等) は
+    # 既存フィールド (local_client / working_memory_registry / learning_scheduler 等) は
     # 移行期間中はそのまま共存し、新規コードは pillar 経由でアクセスすることが
     # 推奨される。``pro`` は Pro エディション起動時のみ非 None。
     gen: GenPillar | None = None
@@ -297,12 +293,10 @@ class AppState:
         持たない読み手専用で、並行セッション下では「誰の窓か」が定まらない。
         """
         registry = self.working_memory_registry
-        if registry is not None:
-            wm = registry.get(session_id) if session_id else registry.current()
-            return wm, self.episodic_memory
-        if self.working_memory is None:
+        if registry is None:
             return None
-        return self.working_memory, self.episodic_memory
+        wm = registry.get(session_id) if session_id else registry.current()
+        return wm, self.episodic_memory
 
     def get_semantic_store(self, scope: str = "global") -> "ScopedSemanticStore":
         """SemMem を scope に束縛したビューとして返す。
@@ -451,22 +445,3 @@ class AppState:
 def get_app_state(request: Request) -> AppState:
     """FastAPI 依存性注入: リクエストから AppState を取得する"""
     return request.app.state.app_state
-
-
-def _legacy_working_memory(self: AppState) -> "WorkingMemory | None":
-    registry = self.working_memory_registry
-    if registry is not None:
-        return registry.current()
-    return self.__dict__.get("_working_memory_legacy")
-
-
-def _set_legacy_working_memory(self: AppState, wm: "WorkingMemory | None") -> None:
-    self.__dict__["_working_memory_legacy"] = wm
-
-
-# dataclass の ``__init__`` は ``self.working_memory = ...`` を実行するので、
-# フィールド宣言の既定値 (None) を dataclass に取り込ませた後でプロパティに
-# 差し替える。コンストラクタ引数 ``working_memory=`` と代入はそのまま通り、
-# 読み出しは台帳があれば最後に触ったセッションの WM を返す (legacy 読み手用)。
-AppState.working_memory = property(_legacy_working_memory, _set_legacy_working_memory)  # type: ignore[assignment]
-

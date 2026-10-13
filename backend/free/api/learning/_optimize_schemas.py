@@ -3,9 +3,6 @@
 `backend.free.api.learning.optimize` から Pydantic スキーマを切り出した型モジュール。
 循環 import 防止のため、`_optimize_collectors` (helper) と `optimize.py`
 (handler) の双方から参照される型はここに集約する。
-
-`optimize.py` は本モジュールから schemas を import + re-export し、外部から
-`from backend.free.api.learning.optimize import PromptModeStatus` の互換性を維持する。
 """
 
 from __future__ import annotations

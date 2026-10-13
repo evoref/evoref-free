@@ -42,6 +42,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TypeVar
 
 import numpy as np
 
@@ -54,8 +55,9 @@ from backend.free.rag.evidence.columns import (
     FLAG_SUPERSEDED,
     EvidenceColumns,
 )
-from backend.free.rag.evidence.types import ORIGIN_IDS
+from backend.free.rag.evidence.types import ORIGIN_IDS, Evidence
 from backend.log_config import get_logger
+from backend.utils import parse_utc
 
 logger = get_logger("rag.evidence.ranking")
 
@@ -227,7 +229,8 @@ def score_rows(
         ``float32`` のスコア (``rows`` と同じ並び)。
     """
     idx = np.asarray(rows, dtype=np.int64)
-    cos = np.asarray(cosines, dtype=np.float64)
+    # cos <= 0 は「無関係」。負のまま掛けると新しい行・信頼度の高い行ほど順位が下がる (c_16 §7.2)
+    cos = np.maximum(np.asarray(cosines, dtype=np.float64), 0.0)
     if cos.shape[0] != idx.shape[0]:
         raise ValueError(f"cosines ({cos.shape[0]}) and rows ({idx.shape[0]}) length mismatch")
 
@@ -380,3 +383,29 @@ def merge_candidates(
     merged_cos = np.concatenate([v_cos, extra_cos])
     order = np.argsort(merged_rows, kind="stable")
     return merged_rows[order], merged_cos[order]
+
+
+_H = TypeVar("_H")
+
+
+def collapse_by_claim_key(hits: Sequence[_H], record_of: Callable[[_H], Evidence | None]) -> list[_H]:
+    """snapshot と tail を合流した後の畳み込み (§7.3)。並びは保ち、同じ ``claim_key`` は 1 件にする。
+
+    勝者は confidence 最大 → ``as_of`` 最新 → 先に来た方 (= スコアが高い方)。
+    ``claim_key`` の無いレコードは畳まない。
+    """
+    best: dict[str, tuple[float, float, int]] = {}
+    keys: list[str | None] = []
+    for i, hit in enumerate(hits):
+        record = record_of(hit)
+        key = record.claim_key if record is not None else None
+        keys.append(key or None)
+        if not key or record is None:
+            continue
+        moment = parse_utc(record.as_of or record.observed_at)
+        as_of = moment.timestamp() if moment is not None else 0.0
+        rank = (float(record.confidence), as_of)
+        current = best.get(key)
+        if current is None or rank > current[:2]:
+            best[key] = (*rank, i)
+    return [hit for i, hit in enumerate(hits) if keys[i] is None or best[keys[i]][2] == i]

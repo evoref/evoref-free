@@ -590,6 +590,24 @@ def _make_probe_embed_fn(embedder: Any) -> Any:
     return _embed
 
 
+def _register_current_project(resolver: Any, project_id: str) -> None:
+    """現在のプロジェクトを ``state.json`` へ登録する (Step 10 のアーカイブ候補の元)。
+
+    書けない (readonly 起動・I/O 失敗) ときも起動は止めない。
+    """
+    try:
+        from pathlib import Path as _Path
+
+        from backend.free.memory.local_state_store import register_current_project
+
+        register_current_project(
+            _Path(resolver.resolve_local("local_state_file")), project_id,
+            path=str(_Path.cwd()),
+        )
+    except Exception as exc:  # noqa: BLE001 — 登録は付随の記録 (readonly 含む)
+        logger.warning("current project registration skipped: %s", exc)
+
+
 def _init_cartridge_manager(state: AppState, cfg: dict[str, Any], resolver: Any) -> None:
     """6b. corpus パッケージストア初期化 (c_16 §4.3)
 
@@ -2066,12 +2084,7 @@ def _auto_migrate_base_model(
     prompt_manager = getattr(state, "prompt_manager", None)
     learning_scheduler = getattr(state, "learning_scheduler", None)
 
-    episodic = None
-    get_memory_system = getattr(state, "get_memory_system", None)
-    if callable(get_memory_system):
-        mem = get_memory_system()
-        if mem:
-            _, episodic = mem
+    episodic = getattr(state, "episodic_memory", None)
 
     logger.warning(
         "Auto-migrate on startup: %s -> %s. "
@@ -2377,6 +2390,8 @@ async def _build_mem_pillar(
             )
             project_id_for_policy = None
         state.current_project_id = project_id_for_policy
+        if project_id_for_policy:
+            _register_current_project(resolver, project_id_for_policy)
         apply_semmem_policy_overrides(state, cfg, project_id_for_policy)
 
     # Sleep-time 中核 (SleepTimeScheduler は Mem 所有、SleepTimeWorker の注入に必要)
@@ -2390,7 +2405,6 @@ async def _build_mem_pillar(
 
     from backend.pillars import MemPillar
     return MemPillar(
-        working_memory=None,
         working_memory_registry=wm,
         episodic_memory=episodic,
         cartridge_manager=state.cartridge_manager,
