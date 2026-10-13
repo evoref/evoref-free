@@ -14,12 +14,20 @@
 		data: DashboardLearningData;
 		/** Level 2 (成長) の状態。取れなければ提案の欄を出さない */
 		growth?: GrowthResponse | null;
+		/** 成長の状態の取得に失敗した (「提案が無い」と見分けて出す) */
+		growthFailed?: boolean;
 		/** 提案の比較の内訳を出す (Pro) */
 		showMeasure?: boolean;
 		onGrowthChange?: () => void;
 	}
 
-	let { data, growth = null, showMeasure = false, onGrowthChange }: LearningSummaryProps = $props();
+	let {
+		data,
+		growth = null,
+		growthFailed = false,
+		showMeasure = false,
+		onGrowthChange
+	}: LearningSummaryProps = $props();
 
 	/** 経験が貯まっても進まない理由のうち、待っても解けないもの (設定・起動の問題) */
 	const HARD_STOPS = ['learning_disabled', 'single_slot', 'no_llm_client', 'loop_not_started'];
@@ -94,10 +102,22 @@
 		<StatusRow label={$t('dashboard.learning_last')} value={formatRelativeTime(data.last_level1_run)} />
 		<p class="next" data-testid="learning-next">{nextText}</p>
 	</div>
-	{#if growth}
+	{#if growth || growthFailed}
 		<div class="proposals">
 			<StatusSection label={$t('dashboard.learning_proposals')}>
-				<GrowthProposals {growth} {showMeasure} onchange={onGrowthChange} />
+				{#if growth}
+					<GrowthProposals
+						{growth}
+						{showMeasure}
+						onchange={onGrowthChange}
+						lastResults={data.last_level1_results}
+					/>
+				{:else}
+					<p class="load-failed" role="alert">{$t('dashboard.growth_load_failed')}</p>
+					<button type="button" class="retry" onclick={() => onGrowthChange?.()}>
+						{$t('dashboard.growth_retry')}
+					</button>
+				{/if}
 			</StatusSection>
 		</div>
 	{/if}
@@ -113,6 +133,20 @@
 		margin: 6px 0 0;
 		font-size: 0.8125rem;
 		color: var(--text-secondary);
+	}
+	.load-failed {
+		margin: 0 0 6px;
+		font-size: 0.8125rem;
+		color: var(--color-error);
+	}
+	.retry {
+		font-size: 0.75rem;
+		padding: 2px 10px;
+		border-radius: 4px;
+		border: 1px solid var(--border);
+		background: var(--control-bg);
+		color: var(--text-primary);
+		cursor: pointer;
 	}
 	.proposals {
 		margin-top: 14px;

@@ -3,12 +3,10 @@
 from fastapi import APIRouter, Depends
 
 from backend.app_state import AppState, get_app_state
-from backend.edition import is_pro
+from backend.edition import get_pro_handler
 from backend.free.api._error_responses import api_error
 from backend.free.core.session_mode import canonicalize_session_mode
 from backend.free.api.learning._optimize_collectors import (
-    collect_aux_prompt_history,
-    collect_aux_task_statuses,
     collect_prompt_history,
     collect_prompt_mode_statuses,
     extract_scheduler_params,
@@ -55,12 +53,12 @@ async def optimize_status(state: AppState = Depends(get_app_state)):
 
     # Level 1: モード別 + 補助タスクタスク別プロンプト進化状態
     modes = collect_prompt_mode_statuses(state.prompt_manager, _LEVEL1_MODES)
-    if is_pro():
-        aux_tasks = collect_aux_task_statuses(
-            state.aux_prompt_manager, _AUX_TASKS,
-        )
-    else:
-        aux_tasks = []
+    # 補助タスクのプロンプト進化の状態は Pro の収集器 (handler) だけが持つ
+    aux_collectors = get_pro_handler("aux_prompt_collectors")
+    aux_tasks = (
+        aux_collectors.statuses(state.aux_prompt_manager, _AUX_TASKS)
+        if aux_collectors is not None else []
+    )
 
     # スケジューラ設定値 (未初期化時は既定値)
     params = extract_scheduler_params(scheduler)
@@ -142,9 +140,8 @@ async def optimize_history(state: AppState = Depends(get_app_state)):
 
     # プロンプト進化履歴 (システム + 補助タスク)
     prompt_history = collect_prompt_history(state.prompt_manager, _LEVEL1_MODES)
-    if is_pro():
-        prompt_history.update(
-            collect_aux_prompt_history(state.aux_prompt_manager, _AUX_TASKS),
-        )
+    aux_collectors = get_pro_handler("aux_prompt_collectors")
+    if aux_collectors is not None:
+        prompt_history.update(aux_collectors.history(state.aux_prompt_manager, _AUX_TASKS))
 
     return OptimizeHistoryResponse(prompt_history=prompt_history)

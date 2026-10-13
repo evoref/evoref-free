@@ -46,6 +46,9 @@ REASON_SHORTCUT_TOOL = "shortcut_tool"
 MODEL_ORIGIN_PREFIXES: tuple[str, ...] = LEAK_REASON_PREFIXES
 #: 除外理由: モデル由来の崩れだけが失敗の根拠 (採用ゲートの再生成は貪欲で再現せず引き分けになる)。
 REASON_MODEL_ORIGIN = "model_origin"
+#: 除外理由: プロンプトの編集では動かないと採用ゲートが続けて確かめた失敗クラス
+#: (全引き分けが ``learning.stalled_class_runs`` 回続いた、f_04 §4.5)。
+REASON_STALLED_CLASS = "stalled_class"
 
 
 def grounding_reason(exp: dict) -> str | None:
@@ -146,6 +149,7 @@ def case_eligible_ids(experiences: list[dict]) -> set[str]:
 __all__ = [
     "MODEL_ORIGIN_PREFIXES",
     "REASON_MODEL_ORIGIN",
+    "REASON_STALLED_CLASS",
     "is_model_origin",
     "REASON_CORPUS_GROUNDED",
     "REASON_LONG_FORM",

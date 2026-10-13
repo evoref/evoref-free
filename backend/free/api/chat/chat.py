@@ -98,7 +98,7 @@ from backend.free.api.chat._continuation import (
     resume_from_last_response,
     take_continuation,
 )
-from backend.edition import is_pro
+from backend.edition import get_pro_handler
 from backend.free.core.answer_conditions import (
     ExtractionOutcome as AnswerConditionsOutcome,
     PendingExtraction as AnswerConditionsPending,
@@ -1698,7 +1698,7 @@ def _plan_output_target(
             target = "file"
         elif detect_editor_route(req.message) == "chat":
             target = "chat"
-        elif is_pro():
+        elif get_pro_handler("editor_output_surface") is not None:
             target = "editor"
         else:
             # Free にはエディタが無い。editor_code を送ると表示先が無く生成物が消えるので、
@@ -2689,7 +2689,7 @@ def _staged_stage_base_enabled(mode: str, cfg: dict, state: AppState) -> bool:
     if getattr(state, "aux_client", None) is None:
         return False
     # v2 は Free でも使う (テスト工程は Pro だけ)。v1 は Pro だけ (f_10 §11.3)。
-    return is_pro() or staged_profile(cfg) == "v2"
+    return get_pro_handler("staged_v1_pipeline") is not None or staged_profile(cfg) == "v2"
 
 
 class _ProductionStageSelector:

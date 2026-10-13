@@ -13,7 +13,8 @@
 		type GrowthAssetKind,
 		type GrowthGate,
 		type GrowthProposalDetail,
-		type GrowthResponse
+		type GrowthResponse,
+		type Level1ResultEntry
 	} from '$lib/free/api';
 
 	interface GrowthProposalsProps {
@@ -22,9 +23,11 @@
 		showMeasure?: boolean;
 		/** 採用・却下・巻き戻しの後に呼ぶ (親が再取得する) */
 		onchange?: () => void;
+		/** 直近の Level 1 の結果 (モード別)。提案が無いときに「なぜ無いか」を 1 行で出す */
+		lastResults?: Record<string, Level1ResultEntry>;
 	}
 
-	let { growth, showMeasure = false, onchange }: GrowthProposalsProps = $props();
+	let { growth, showMeasure = false, onchange, lastResults = {} }: GrowthProposalsProps = $props();
 
 	const KNOWN_ERROR_REASONS = [
 		'stale_parent',
@@ -41,6 +44,68 @@
 	let detail = $state<GrowthProposalDetail | null>(null);
 
 	let suggestions = $derived(growth.adoptions.filter((a) => a.rollback_suggested));
+
+	const RESULT_MODES = ['chat', 'create'];
+	const KNOWN_LAST_REASONS = [
+		'no_pairwise_gain',
+		'unreachable_net_wins',
+		'no_selection_pressure',
+		'no_eval_cases',
+		'insufficient_cases',
+		'no_regression_samples',
+		'sample_regression',
+		'within_noise_floor',
+		'candidate_identical',
+		'proposal_withheld'
+	];
+	const KNOWN_EXCLUDED = [
+		'model_origin',
+		'stalled_class',
+		'depends_on_context',
+		'tool_context_missing',
+		'tool_context_truncated',
+		'shortcut_tool',
+		'corpus_grounded',
+		'long_form',
+		'unresolved_correction'
+	];
+
+	function excludedDetail(excluded: Record<string, number>): string {
+		return Object.entries(excluded)
+			.filter(([, count]) => count > 0)
+			.sort((a, b) => b[1] - a[1])
+			.map(([key, count]) =>
+				`${KNOWN_EXCLUDED.includes(key) ? $t(`dashboard.growth_last_excluded_${key}`) : key} ${count}`
+			)
+			.join(' / ');
+	}
+
+	/** 提案が無いときの理由 (モードごとに 1 行)。経験不足で始めなかったモードは出さない */
+	let lastRuns = $derived.by(() =>
+		RESULT_MODES.flatMap((mode) => {
+			const result = lastResults[mode];
+			if (!result?.reason || result.reason === 'insufficient_experiences') return [];
+			const excluded = result.excluded ?? {};
+			const excludedCount = Object.values(excluded).reduce((sum, n) => sum + n, 0);
+			const reason = KNOWN_LAST_REASONS.includes(result.reason)
+				? $t(`dashboard.growth_last_reason_${result.reason}`)
+				: result.reason;
+			return [
+				$t('dashboard.growth_last_run', {
+					mode,
+					measured: (result.wins ?? 0) + (result.losses ?? 0) + (result.ties ?? 0),
+					excluded:
+						excludedCount > 0
+							? $t('dashboard.growth_last_run_excluded', {
+									count: excludedCount,
+									detail: excludedDetail(excluded)
+								})
+							: '',
+					reason
+				})
+			];
+		})
+	);
 
 	function gateText(gate: GrowthGate | null): string {
 		if (!gate) return '-';
@@ -149,6 +214,9 @@
 
 	{#if growth.proposals.length === 0}
 		<p class="hint-text">{$t('dashboard.growth_no_proposals')}</p>
+		{#each lastRuns as line (line)}
+			<p class="hint-text" data-testid="growth-last-run">{line}</p>
+		{/each}
 	{:else}
 		<ul class="proposals">
 			{#each growth.proposals as proposal (proposal.proposal_id)}

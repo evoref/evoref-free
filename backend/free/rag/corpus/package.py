@@ -119,8 +119,11 @@ KNOWN_FEATURES: frozenset[str] = frozenset({
 #: ``language.verify/1`` を ``requires`` に持つパッケージだけが、宣言した
 #: verify コマンドを実行時に有効化できる (c_16 §4.5.4)。
 LANGUAGE_VERIFY_FEATURE = "language.verify/1"
-#: ``edition/pro`` だけは固定集合に置かず動的に評価する (``backend.edition.is_pro()``)。
+#: ``edition/pro`` だけは固定集合に置かず、Pro が登録した handler ``cartridge_feature_flags`` で動的に評価する。
 EDITION_PRO_FEATURE = "edition/pro"
+
+#: Pro が提供するフラグの集合 (``frozenset[str]``) を登録する handler 名。
+CARTRIDGE_FEATURE_FLAGS_HANDLER = "cartridge_feature_flags"
 
 #: パッケージ id。ディレクトリ名・シャード名・検索結果の接頭辞に素で入るので
 #: 小文字英数 + ``_`` / ``-`` だけに絞る (2〜40 文字)。長さは Windows の MAX_PATH
@@ -512,17 +515,18 @@ def compute_section_digests(root: Path | str) -> dict[str, str]:
 def validate_requires(requires: Sequence[str]) -> None:
     """``requires`` の機能フラグを検査する (c_16 §4.3)。
 
-    ``edition/pro`` だけは動的に評価する (:func:`backend.edition.is_pro`)。
-    それ以外は :data:`KNOWN_FEATURES` に無ければ拒否する — 段階 A では
-    空集合なので、``edition/pro`` 以外の全フラグが未知として拒否される
+    Pro が handler ``cartridge_feature_flags`` (``frozenset``) で登録したフラグ
+    (``edition/pro``) は動的に評価する。それ以外は :data:`KNOWN_FEATURES` に無ければ
+    拒否する — 段階 A では空集合なので、Pro が足したもの以外の全フラグが未知として拒否される
     (後続段階が自分のフラグをここに足す)。
     """
-    from backend.edition import is_pro
+    from backend.edition import get_pro_handler
 
+    provided = get_pro_handler(CARTRIDGE_FEATURE_FLAGS_HANDLER) or frozenset()
     unknown: list[str] = []
     for flag in requires:
         if flag == EDITION_PRO_FEATURE:
-            if not is_pro():
+            if EDITION_PRO_FEATURE not in provided:
                 raise PackageError(
                     f"package requires {EDITION_PRO_FEATURE!r} but this is not "
                     "the Pro edition",
@@ -917,6 +921,7 @@ __all__ = [
     "DEFAULT_MAX_UNPACKED_BYTES",
     "DERIVED_TOP_LEVEL_DIRS",
     "DOCS_DIR",
+    "CARTRIDGE_FEATURE_FLAGS_HANDLER",
     "EDITION_PRO_FEATURE",
     "KNOWN_FEATURES",
     "LANGUAGE_DIR",

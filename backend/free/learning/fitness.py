@@ -120,6 +120,21 @@ def outcome_channel(signals: Mapping) -> str | None:
     return OUTCOME_CHANNEL_OTHER
 
 
+def outcome_reason_class(reason: object) -> str | None:
+    """失敗理由の **クラス** (``OUTCOME_REASON_CHANNELS`` の一致した接頭辞) を返す。
+
+    どの接頭辞にも当たらない理由・空・別の欠陥キーが数える理由は ``None`` (クラスを
+    持たない失敗は、停滞の記録 (f_04 §4.5) の対象にしない)。
+    """
+    text = str(reason or "")
+    if not text or text.startswith(OUTCOME_REASONS_COUNTED_ELSEWHERE):
+        return None
+    for prefix, _channel in OUTCOME_REASON_CHANNELS:
+        if text.startswith(prefix):
+            return prefix
+    return None
+
+
 def _channel_predicate(channel: str) -> Callable[[Mapping], bool]:
     """``channel`` に属する失敗かを判定する述語を返す。"""
     return lambda s: outcome_channel(s) == channel

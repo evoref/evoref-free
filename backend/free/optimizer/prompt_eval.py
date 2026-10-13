@@ -25,8 +25,10 @@ from backend.free.learning.corrected_pairs import (
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from backend.free.learning.fitness import outcome_reason_class
 from backend.free.learning.case_filters import (
     REASON_MODEL_ORIGIN,
+    REASON_STALLED_CLASS,
     has_failure_evidence,
     is_model_origin,
     regeneration_mismatch_reason,
@@ -94,6 +96,9 @@ class PromptEvalCase:
     #: ``case_id`` に畳んだターンは和集合 (古い順) — 再生成に使った厳密な
     #: ターンではなく根拠となった候補群。
     experience_ids: tuple[str, ...] = ()
+    #: 失敗ターンの理由クラス (``fitness.outcome_reason_class``)。``failed`` 種別のケース
+    #: だけが持つ。採用ゲートが全引き分けだったクラスを数える (f_04 §4.5)。
+    reason_class: str = ""
 
 
 def _merged_ids(
@@ -216,6 +221,7 @@ def select_prompt_eval_cases(
 
 def select_prompt_eval_case_sets(
     experiences: list[dict], mode: str, limit: int, *, sample_cases: int = 0,
+    exclude_reason_classes: frozenset[str] = frozenset(),
 ) -> EvalCaseSelection:
     """経験から採用ゲートの評価ケースを選び、失敗・標本・除外件数に分けて返す。
 
@@ -352,9 +358,15 @@ def select_prompt_eval_case_sets(
                     experience_ids=ids, **replay,
                 )
             elif signals.get("turn_outcome") == "failed":
+                reason_class = outcome_reason_class(signals.get("turn_outcome_reason")) or ""
+                # プロンプトの編集では動かないと続けて確かめた失敗クラスは圧に数えない
+                # (f_04 §4.5)。ここで外すので、枠 (``limit``) を使い切らない。
+                if reason_class and reason_class in exclude_reason_classes:
+                    mismatched[REASON_STALLED_CLASS] = mismatched.get(REASON_STALLED_CLASS, 0) + 1
+                    continue
                 picked[_case_id(query)] = PromptEvalCase(
                     case_id=_case_id(query), query=query, kind=CASE_KIND_FAILED, mode=mode,
-                    experience_ids=ids, **replay,
+                    experience_ids=ids, reason_class=reason_class, **replay,
                 )
             elif signals.get("rephrased_query"):
                 picked[_case_id(query)] = PromptEvalCase(

@@ -38,13 +38,21 @@
 	let ragStats: DashboardRagStats = $state({ ...DEFAULT_RAG_STATS });
 	let fetchError = $state(false);
 	let growth: GrowthResponse | null = $state(null);
+	let growthFailed = $state(false);
 	let loaded = $state(false);
 
 	let gridCols = $derived($layout.dashboard.grid_columns);
 
 	async function refreshGrowth() {
-		// Level 2 (成長) の欄。取れなければ欄を出さない (学習状態の表示は止めない)
-		growth = await getGrowth().catch(() => null);
+		// Level 2 (成長) の欄。取れなくても学習状態の表示は止めない。失敗は「提案なし」と
+		// 見分けて出す (growthFailed)。
+		try {
+			growth = await getGrowth();
+			growthFailed = false;
+		} catch {
+			growth = null;
+			growthFailed = true;
+		}
 	}
 
 	async function refreshDashboardData() {
@@ -84,6 +92,7 @@
 			<LearningSummary
 				data={learningData}
 				{growth}
+				{growthFailed}
 				showMeasure={$proActive}
 				onGrowthChange={refreshDashboardData}
 			/>

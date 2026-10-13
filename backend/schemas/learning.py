@@ -146,6 +146,11 @@ class LearningConfig(BaseModel):
     #: 予定が毎回 3 世代で終わっていた (2026-09-14 実測)。選択圧は採用ゲート
     #: 側にあるので、変異生成は少数で足りる。
     level1_generations: int = Field(default=5, ge=1)
+    #: 採用ゲートが全引き分けを続けた失敗クラスを圧に数えなくなる連続回数と、再試行する日数
+    #: (f_04 §4.5)。プロンプトの規則では動かない失敗 (文字数を数える力など) に毎回数分を
+    #: かけない。
+    stalled_class_runs: int = Field(default=2, ge=1)
+    stalled_class_retry_days: int = Field(default=7, ge=1)
     level1_population_size: int = Field(default=5, ge=1)
     # アイドル判定タイマー
     full_idle_minutes: int = Field(default=10, ge=1)        # Trigger B: Full sleep-time
