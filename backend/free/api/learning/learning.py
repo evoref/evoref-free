@@ -19,16 +19,9 @@ from backend.free.api.learning._learning_collectors import (
 )
 
 # Pydantic スキーマは _learning_schemas に集約
-# 外部 import 互換性のため re-export する。
 from backend.free.api.learning._growth_schemas import GrowthSummaryModel
 from backend.free.api.learning._learning_schemas import (
-    ActiveSessionInfo,
-    ExperienceByModeModel,
-    FitnessPoint,
     LearningStatusResponse,
-    Level1ResultEntry,
-    PolicyEvolverDomainStatus,
-    PriorityRequestEntry,
     SchedulerStatusModel,
     TriggerRequest,
     TriggerResponse,
@@ -44,14 +37,7 @@ router = APIRouter(prefix="/api/learning", tags=["learning"])
 
 __all__ = [
     "router",
-    # 互換性のため re-export (テストや外部から import される)
-    "ActiveSessionInfo",
-    "ExperienceByModeModel",
-    "FitnessPoint",
     "LearningStatusResponse",
-    "Level1ResultEntry",
-    "PolicyEvolverDomainStatus",
-    "PriorityRequestEntry",
     "SchedulerStatusModel",
     "TriggerRequest",
     "TriggerResponse",

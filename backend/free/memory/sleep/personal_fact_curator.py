@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from backend.free.core.script_ranges import KANJI, KATAKANA_WORD
+from backend.free.core.text_norm import strip_ws
 from backend.free.llm.json_schemas import PersonalFactSplit
 from backend.free.memory.note_facts import fact_from_note
 from backend.free.memory.notes.note_builder import (
@@ -172,11 +173,6 @@ def resolve_slot(
     return None
 
 
-def _normalize_ws(text: str) -> str:
-    """空白を全て落とした比較用の形 (純粋関数)。"""
-    return "".join((text or "").split())
-
-
 #: 述語だけの値 (「走ります」「起きて」)。属性スロットの値は名詞句で、助詞も
 #: 読点も持たない短い動詞形は「何をするか」であって「何が値か」ではない
 #: (2026-09-11 (k): 分割が「走ります」を hobby に置いた)。
@@ -257,10 +253,10 @@ def is_verbatim_span(value: str, content: str) -> bool:
     ここで落ちる。空白を無視するのは、モデルが読点前後の空白を落とす /
     足すことがあるだけで、それは値の同一性を壊さないため。
     """
-    v = _normalize_ws(value)
+    v = strip_ws(value)
     if len(v) < _MIN_VALUE_CHARS:
         return False
-    return v in _normalize_ws(content)
+    return v in strip_ws(content)
 
 
 def _is_tight_value(value: str, content: str) -> bool:
@@ -280,7 +276,7 @@ def _is_tight_value(value: str, content: str) -> bool:
     # しない。複数節の発話では従来どおり落とす。
     if _clause_count(content) <= 1:
         return True
-    return _normalize_ws(body) != _normalize_ws(content)
+    return strip_ws(body) != strip_ws(content)
 
 
 def _clause_count(text: str) -> int:
@@ -605,7 +601,7 @@ def accept_items(
             )
             value = widened
         single = is_single_valued_subject(make_mem_subject(kind, slug))
-        key = (kind, slug, "" if single else _normalize_ws(value))
+        key = (kind, slug, "" if single else strip_ws(value))
         if key in seen:
             continue
         seen.add(key)
@@ -617,7 +613,7 @@ def accept_items(
 
 def _is_refinement(value: str, existing_object: str) -> bool:
     """``value`` が既存 object の **より狭い span** か (純粋関数)。"""
-    v, o = _normalize_ws(value), _normalize_ws(existing_object)
+    v, o = strip_ws(value), strip_ws(existing_object)
     return bool(v) and v in o and len(v) < len(o)
 
 
@@ -815,7 +811,7 @@ async def _persist_split(
         if (
             prior is not None
             and not split_confirmed
-            and _normalize_ws(value) in _normalize_ws(prior.object or "")
+            and strip_ws(value) in strip_ws(prior.object or "")
         ):
             # F-10 の保護は「regex の object が既にその値を含む」ときだけ。
             # 含まないなら regex は **値を持たない文** (「今日は新しい趣味の話を
@@ -827,7 +823,7 @@ async def _persist_split(
                 "object for %s", subject,
             )
             continue
-        if prior is not None and _normalize_ws(prior.object or "") == _normalize_ws(
+        if prior is not None and strip_ws(prior.object or "") == strip_ws(
             value,
         ):
             continue  # regex が既に同じ span を書いている
@@ -861,7 +857,7 @@ async def _persist_split(
         # 含まない前置き文だった場合でも、逐語 span の方が現在値になる。
         if prior is not None and (
             _is_refinement(value, prior.object or "")
-            or _normalize_ws(value) not in _normalize_ws(prior.object or "")
+            or strip_ws(value) not in strip_ws(prior.object or "")
         ):
             refined.append((prior, fact))
 
@@ -874,12 +870,12 @@ async def _persist_split(
     # live のまま残って分割後の値と二重に注入される。分割が確定したノートでは、
     # 狭めた object と同じ文を持つ同一ノート由来のファクトも一緒に畳む。
     if split_confirmed and refined:
-        coarse_texts = {_normalize_ws(old.object or "") for old, _ in refined}
+        coarse_texts = {strip_ws(old.object or "") for old, _ in refined}
         refined_olds = {id(old) for old, _ in refined}
         for existing_fact in existing.values():
             if id(existing_fact) in refined_olds:
                 continue
-            if _normalize_ws(existing_fact.object or "") not in coarse_texts:
+            if strip_ws(existing_fact.object or "") not in coarse_texts:
                 continue
             slug = (existing_fact.subject or "").rsplit(".", 1)[-1]
             target = next(
@@ -936,11 +932,11 @@ def _generic_shadows_of(
     for subject, old in existing.items():
         if id(old) in already or not is_generic_slot(subject):
             continue
-        coarse = _normalize_ws(old.object or "")
+        coarse = strip_ws(old.object or "")
         if not coarse:
             continue
         winner = next(
-            (f for f in facts if _normalize_ws(f.object or "") in coarse),
+            (f for f in facts if strip_ws(f.object or "") in coarse),
             None,
         )
         if winner is not None:

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from backend.free.core.vectors import l2_normalize_rows
 from backend.free.rag.vector_store import dequantize_int8
 from backend.log_config import get_logger
 
@@ -58,9 +59,7 @@ def calibrate_thresholds(
         return {"ok": False, "reason": "insufficient_vectors", "n_vectors": n}
 
     # コサイン用に L2 正規化 (量子化で厳密な単位長から僅かにずれるため再正規化)。
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    unit = (vectors / norms).astype(np.float32)
+    unit = l2_normalize_rows(vectors)
 
     rng = np.random.default_rng(seed)
 

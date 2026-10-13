@@ -315,20 +315,6 @@ def set_current_project(
         state.mode = mode
 
 
-def add_alias(state: LocalState, alias_key: str, project_id: str) -> None:
-    """alias を登録 / 上書きする。存在しない project_id を指す alias は禁止"""
-    if not alias_key:
-        raise ValueError("alias_key must be non-empty")
-    if project_id not in state.projects:
-        raise KeyError(f"unknown project_id: {project_id}")
-    state.project_aliases[alias_key] = project_id
-
-
-def remove_alias(state: LocalState, alias_key: str) -> bool:
-    """alias を削除する。削除した場合 True"""
-    return state.project_aliases.pop(alias_key, None) is not None
-
-
 def archive_project(
     state: LocalState,
     project_id: str,
@@ -357,6 +343,24 @@ def archive_project(
         )
 
     meta.archived = True
+
+
+def register_current_project(
+    state_path: Path,
+    project_id: str,
+    *,
+    path: str | None = None,
+    now: float | None = None,
+) -> None:
+    """現在のプロジェクトを ``state.json`` へ登録する (起動時に 1 回、Step 10 の候補の元)。
+
+    ``touch_project`` で ``last_accessed_at`` を更新し、``current_project_id`` を記録する。
+    読めない・新しい版で readonly のファイルは書き換えない (``LocalStateStore.save`` が拒否する)。
+    """
+    state = LocalStateStore.load(state_path)
+    touch_project(state, project_id, path=path, now=now)
+    set_current_project(state, project_id)
+    LocalStateStore.save(state_path, state)
 
 
 def propose_archives(

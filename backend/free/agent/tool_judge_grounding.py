@@ -26,9 +26,6 @@ from backend.free.core.response_arithmetic import JaNumber, iter_ja_numbers
 #: が決定論的に処理するため、ここは「数値は複数あるが式は書かれていない」ものだけを
 #: 対象にする。aux 往復 (realtime) を増やさないよう条件は厳しめにする。
 #: 実体は ``core.intent_vocab`` が SSOT (``agent.router`` も同じ判定を使う)。
-#: 既存の呼出元とテストのために旧名を残す。
-_NUMBER_LITERAL_RE = NUMBER_LITERAL_RE
-
 
 #: 単位系の定義そのものに由来する定数。ユーザーが書いた数値ではないが、
 #: 「モデルが知識から思い出した換算率」でもない (分/時、時/日、SI 接頭辞、
@@ -270,7 +267,7 @@ def _operand_string_numbers(func: str, value: str) -> list[str]:
         parts = date_parts(value)
         if parts is not None:
             return [str(p) for p in parts]
-    numbers = [_plain_number(n) for n in _NUMBER_LITERAL_RE.findall(value)]
+    numbers = [_plain_number(n) for n in NUMBER_LITERAL_RE.findall(value)]
     if func in DURATION_OPS:
         numbers = [n for n in numbers if float(n) != 0]
     return numbers
@@ -287,7 +284,7 @@ def _expression_number_literals(expression: str) -> list[str]:
     try:
         tree = ast.parse(expression, mode="eval")
     except SyntaxError:
-        return _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", expression))
+        return NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", expression))
     ops = DATE_OPS | DURATION_OPS | TEXT_COUNT_OPS
     encoded = expression.encode("utf-8")
     line_starts = [0]
@@ -316,7 +313,7 @@ def _expression_number_literals(expression: str) -> list[str]:
     for start, end in sorted(spans, reverse=True):
         encoded = encoded[:start] + b'""' + encoded[end:]
     rest = encoded.decode("utf-8")
-    return _NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", rest)) + from_strings
+    return NUMBER_LITERAL_RE.findall(_POWER_EXPONENT_RE.sub("", rest)) + from_strings
 
 
 def conversation_operands(
@@ -503,7 +500,7 @@ def _known_numbers(text: str, *, include_percent: bool = True) -> set[str]:
       (換算定数の相手の判定、docs/f_03 §3.4.1)
     - 時間表現 / 万進表記 / 漢数字の量 / SI 接頭辞付きの長さ・質量
     """
-    known = set(_NUMBER_LITERAL_RE.findall(text))
+    known = set(NUMBER_LITERAL_RE.findall(text))
     for grouped in _GROUPED_NUMBER_RE.findall(text):
         known.add(grouped.replace(",", ""))
     if include_percent:
@@ -1270,7 +1267,7 @@ def percent_scale_slips(
     derived = percent_derived_values(text)
     if not derived:
         return ()
-    expression_numbers = set(_NUMBER_LITERAL_RE.findall(expression or ""))
+    expression_numbers = set(NUMBER_LITERAL_RE.findall(expression or ""))
     slips: list[str] = []
     for literal in unexplained:
         try:
@@ -1334,7 +1331,7 @@ def query_percents_unused(expression: str, query: str) -> bool:
     candidates = _percent_usage_values(query)
     if not candidates:
         return False
-    for literal in _NUMBER_LITERAL_RE.findall(expression or ""):
+    for literal in NUMBER_LITERAL_RE.findall(expression or ""):
         try:
             value = float(literal)
         except ValueError:

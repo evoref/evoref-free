@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.free.agent.prompt_utils import PROTECTED_CLOSE, PROTECTED_OPEN
+from backend.free.core.text_norm import collapse_ws
 from backend.free.core.verifier_events import VERIFIER_IDS
 from backend.io.codec import codec_for, decode_skipping, persisted
 from backend.io.format_registry import FormatSpec, register_format
@@ -52,7 +53,6 @@ _OVERRIDE_NOTES: dict[str, str] = {
     "en": "(When this conflicts with another item, this item takes precedence)",
 }
 
-_WS_RE = re.compile(r"\s+")
 
 
 @persisted()
@@ -135,7 +135,7 @@ LEDGER_FORMAT = register_format(FormatSpec(
 
 def normalize_text(text: str) -> str:
     """id の引き継ぎ判定に使う正規化 (空白の揺れを無視)。"""
-    return _WS_RE.sub(" ", text or "").strip()
+    return collapse_ws(text)
 
 
 def _slug(text: str) -> str:
@@ -409,30 +409,6 @@ def rule_ids_for_verifiers(ledger: Ledger, verifier_ids: set[str]) -> set[str]:
         r.id for r in ledger.rules
         if r.kind == "bullet" and r.verifier and r.verifier in verifier_ids
     }
-
-
-def sync_protected(ledger: Ledger, default: Ledger) -> Ledger:
-    """protected 規則を現行コード (``default``) の集合へ強制同期する。
-
-    旧 ``_resync_protected`` の規則単位版。非 protected 規則は触らない。
-    default 側の protected 規則の計数は台帳側の同 id から引き継ぐ。
-    """
-    counts = {r.id: r for r in ledger.rules if r.protected}
-    synced: list[Rule] = []
-    for r in default.rules:
-        if not r.protected:
-            continue
-        prior = counts.get(r.id)
-        rule = replace(r, overrides=list(r.overrides))
-        if prior is not None:
-            rule.helpful, rule.harmful, rule.last_fired = prior.helpful, prior.harmful, prior.last_fired
-            rule.verifier = rule.verifier or prior.verifier
-            rule._extra = prior._extra
-        synced.append(rule)
-    others = [r for r in ledger.rules if not r.protected]
-    # 元の位置関係 (title / intro → 非 protected → protected) は render 側が
-    # 決めるので、ここでは単に連結する。
-    return Ledger(mode=ledger.mode, locale=ledger.locale, rules=others + synced, _extra=ledger._extra)
 
 
 def record_rule_outcome(ledger: Ledger, violated_ids: set[str], *, fired_at: str) -> None:

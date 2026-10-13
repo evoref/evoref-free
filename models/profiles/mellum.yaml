@@ -27,13 +27,10 @@ sampling:
 # '<think>\n\n</think>' を前置する (toggle)。既定は Thinking モデルなので ON。
 # generation prompt は '<think>' を開かず本体が出力するため、llama.cpp 側の reasoning 認識
 # (thinking != 0) は未確認 → server_control: false とし、思考はクライアント側
-# (_ReasoningFilter) で除去する。実機で認識が確認できたら true + reasoning_format: auto に変える。
+# (_ReasoningFilter) で除去する。実機で認識が確認できたら true に変える。
 reasoning:
   mode: toggle
   enable_thinking: true
   server_control: false
-  client_handling: strip
-  marker_style: think_tags
   client_think_budget: 4096
   on_runaway: fallback
-  exclude_from_history: true

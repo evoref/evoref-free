@@ -71,28 +71,6 @@ _VALUE_OPTIONS = {
     "--frontend-port", "--develop", "--edition",
 }
 
-#: 旧サブコマンド名 → 現行名。``code`` はクリエイトモードへの改名に追随して
-#: ``create`` になった。既存のスクリプトや手癖を壊さないよう受理し続け、
-#: 読み替えたことを 1 行だけ警告する。
-_LEGACY_SUBCOMMANDS = {"code": "create"}
-
-
-def _canonicalize_subcommands(argv: list[str]) -> list[str]:
-    """旧サブコマンド名 (``code``) を現行名 (``create``) へ読み替える。"""
-    out: list[str] = []
-    for arg in argv:
-        renamed = _LEGACY_SUBCOMMANDS.get(arg)
-        if renamed is None:
-            out.append(arg)
-            continue
-        logger.warning(
-            "Subcommand %r was renamed to %r; accepting the old name for now",
-            arg, renamed,
-        )
-        out.append(renamed)
-    return out
-
-
 # ────────────────────────────────────────────
 # gui サブコマンド
 # ────────────────────────────────────────────
@@ -844,7 +822,7 @@ def _load_context_files(state: SessionState, console) -> None:
     """`--file` 指定ファイルを読み込み state.file_chunks に格納する。"""
     if not state.context_files:
         return
-    from backend.free.cli.file_reader import FileReaderError, read_and_chunk
+    from backend.free.services.file_service import FileServiceError, read_and_chunk
     loaded_files: list[str] = []
     for file_path in list(state.context_files):
         p = Path(file_path)
@@ -856,7 +834,7 @@ def _load_context_files(state: SessionState, console) -> None:
             result = read_and_chunk(p)
             state.file_chunks[file_path] = result.chunks
             loaded_files.append(p.name)
-        except FileReaderError as e:
+        except FileServiceError as e:
             render_error(console, f"{p.name}: {e}")
             state.context_files.remove(file_path)
     if loaded_files:
@@ -983,7 +961,7 @@ def main() -> None:
         sys.exit(1)
 
     # サブコマンドを位置に依存せず検出（--develop serve 等に対応）
-    argv = _canonicalize_subcommands(sys.argv[1:])
+    argv = sys.argv[1:]
 
     # サブコマンドルーティング
     # 複数一致しても先頭の語を採る (set の反復順に依存させない)

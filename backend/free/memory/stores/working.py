@@ -402,7 +402,7 @@ class WorkingMemoryRegistry:
         return self._sessions.get(session_id)
 
     def current(self) -> WorkingMemory:
-        """最後に触ったセッションの WM (legacy: session_id を持たない読み手向け)。
+        """最後に触ったセッションの WM (統計 API のようにセッションを持たない読み手向け)。
 
         並行セッション下では「誰の窓か」が定まらないので、応答パスでは必ず
         :meth:`get` を session_id 付きで使うこと。1 件も無ければ台帳外の空の

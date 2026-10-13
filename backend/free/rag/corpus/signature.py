@@ -33,6 +33,7 @@ SignatureStatus = Literal[
     "digest_mismatch",
     "bad_signature",
     "malformed",
+    "legacy_scheme",
     "verifier_error",
 ]
 

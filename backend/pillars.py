@@ -41,10 +41,7 @@ if TYPE_CHECKING:
     from backend.free.loop.log_ingestor import LogIngestor
     from backend.free.memory.scheduler import SleepTimeScheduler
     from backend.free.memory.episodic.store import EpisodicStore
-    from backend.free.memory.stores.working import (
-        WorkingMemory,
-        WorkingMemoryRegistry,
-    )
+    from backend.free.memory.stores.working import WorkingMemoryRegistry
     from backend.free.rag.cartridge_manager import CartridgeManager
     from backend.free.core.tuning.gate import AutoTuneStatus
     from backend.free.rag.embed_placement import EmbedPlacementStatus
@@ -93,12 +90,10 @@ class MemPillar:
     ``SemanticFactStore`` は ``AppState._semantic_stores`` に scope ごと
     lazy 生成される (他 pillar は Fact View 経由でのみアクセス)。
 
-    ``working_memory`` は legacy (単一 WM 時代の名残)。WM はセッション別に
-    ``working_memory_registry`` が持つので、応答パスは
+    WM はセッション別に ``working_memory_registry`` が持つので、応答パスは
     ``AppState.get_memory_system(session_id)`` 経由で引く。
     """
 
-    working_memory: "WorkingMemory | None"
     episodic_memory: "EpisodicStore"
     cartridge_manager: "CartridgeManager | None"
     sleep_scheduler: "SleepTimeScheduler"

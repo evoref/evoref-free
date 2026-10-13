@@ -59,17 +59,6 @@ runtime:
   fit_params_timeout_sec: 10.0          # 1 モデルあたりの subprocess タイムアウト秒数
   fit_params_binary: "llama-fit-params" # PATH 上のコマンド名または絶対パス
 
-  # llama-server エンドポイント利用ポリシー宣言
-  # "oai-only" (既定) で OpenAI 互換 (/v1/chat/completions / /v1/embeddings /
-  # /tokenize / /health / /props) のみ採用、
-  # "messages-allowed" は将来 /v1/messages 採用判断を行った場合の予約値。
-  # ⚠ 実行時にこの値を読むコードは無い。実体の検証は
-  #   backend/free/tests/test_llama_endpoint_policy.py の静的検査で担保しており、
-  #   その検査も config を参照しない。つまり "messages-allowed" にしても
-  #   /v1/messages が使えるようにはならない (方針の宣言用フィールド)。
-  #   詳細 docs/e_03_llama_server_endpoint_policy.md。
-  llama_endpoint_policy: "oai-only"
-
   # モデル接続/切替時に実挙動プローブを実行し、宣言と実機の食い違いを観測して
   # 処理を自動適応するか。true (既定) でバックグラウンド実行 (起動遅延なし)。
   # プローブ失敗時は prior (プロファイル宣言) にフォールバック。
@@ -462,8 +451,6 @@ rag:
     exclude_globs: []                    # 既定の除外ディレクトリ (.git/node_modules/... 等) への追加 glob。
                                          # 例: 配布物のミラーを持つ開発リポジトリなら ["release/**"]
     max_file_bytes: 1000000              # これを超えるファイルは走査対象外
-    neighborhood_depth: 2                # project_map ツール neighborhood の既定探索深さ
-    neighborhood_budget_tokens: 800      # neighborhood 描画のトークン予算
     update:
       architecture_threshold: 10         # 構造変更ファイル数がこれを超えると architecture 分類
       full_threshold: 30                 # 構造変更ファイル数がこれを超えると full 分類

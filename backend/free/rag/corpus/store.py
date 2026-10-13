@@ -2255,7 +2255,7 @@ class CorpusStore:
             cosines = package.store.cosines_for_rows(query_vec, row_array)
             scores = score_rows(
                 np.nan_to_num(cosines, nan=0.0), row_array,
-                RankColumns.from_columns(snapshot.columns),
+                RankColumns.from_columns(package.store.columns_view() or snapshot.columns),
                 now_epoch, self.store_prior_for(package_id),
             )
             for (target_id, pq_cos, hinted), row, cosine, score in zip(
@@ -2331,7 +2331,7 @@ class CorpusStore:
             cosines = store.cosines_for_rows(query_vec, row_array)
             scores = score_rows(
                 np.nan_to_num(cosines, nan=0.0), row_array,
-                RankColumns.from_columns(snapshot.columns),
+                RankColumns.from_columns(package.store.columns_view() or snapshot.columns),
                 now_epoch, self.store_prior_for(package_id),
             )
             for row, cosine, score in zip(picked, cosines, scores, strict=True):

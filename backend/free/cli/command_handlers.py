@@ -125,10 +125,10 @@ def _cmd_file(args: str, state: SessionState, console) -> CommandResult:
         return CommandResult()
 
     # ファイル読込み・チャンク分割
-    from backend.free.cli.file_reader import FileReaderError, read_and_chunk
+    from backend.free.services.file_service import FileServiceError, read_and_chunk
     try:
         result = read_and_chunk(path)
-    except FileReaderError as e:
+    except FileServiceError as e:
         error_key = str(e)
         if error_key.startswith("legacy_format:"):
             render_error(console, msg("cli.file_legacy_unsupported", path=path.name))

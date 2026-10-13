@@ -3,9 +3,6 @@
 `backend.free.api.learning.learning` から Pydantic スキーマを切り出した型モジュール。
 循環 import 防止のため、`_learning_collectors` (helper) と `learning.py`
 (handler) の双方から参照される型はここに集約する。
-
-`learning.py` は本モジュールから schemas を import + re-export し、外部からの
-`from backend.free.api.learning.learning import SchedulerStatusModel` の互換性を維持する。
 """
 
 from __future__ import annotations

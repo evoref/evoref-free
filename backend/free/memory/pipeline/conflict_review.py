@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
+from backend.free.core.text_norm import ellipsize
 from backend.free.core.text_quality import states_no_user_value
 from backend.free.memory.pipeline.injector import (
     is_internal_index_subject,
@@ -517,10 +518,6 @@ def _short_date(ts: float) -> str:
         return ""
 
 
-def _truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
 def _render_group_line(
     index: int, group: PendingConflictGroup, *, max_object_chars: int,
 ) -> str:
@@ -535,7 +532,7 @@ def _render_group_line(
     labels = _conflict_labels()
     parts = [
         (labels["new"] if i == last else labels["old"]).format(
-            value=_truncate(f.object, max_object_chars),
+            value=ellipsize(f.object, max_object_chars),
             date=_short_date(f.created_at),
         )
         for i, f in enumerate(facts)

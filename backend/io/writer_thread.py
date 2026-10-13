@@ -243,7 +243,7 @@ class ChatWriter:
 
     def _submit(self, op: _Op) -> None:
         with self._mode_lock:
-            if self._thread is not None:
+            if self._thread is not None and self._thread.is_alive():
                 self._queue.put(op)
                 return
             try:
@@ -262,6 +262,14 @@ class ChatWriter:
                 self._idle()
                 continue
             if op.kind == _STOP:
+                # stop() が時間切れで戻った後に積まれた操作も落とさない
+                while True:
+                    try:
+                        rest = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if rest.kind != _STOP:
+                        self._execute(rest)
                 self._finish()
                 if op.event is not None:
                     op.event.set()

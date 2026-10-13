@@ -156,10 +156,6 @@ def _history_messages(case: RegressionCase) -> list[dict[str, str]]:
 # ── 役割と flaky ──
 
 
-def _streak_of(status: RegressionCaseStatus, result: str) -> int:
-    return status.pass_streak if result == RESULT_PASS else status.fail_streak
-
-
 def record_result(
     previous: RegressionCaseStatus | None,
     *,

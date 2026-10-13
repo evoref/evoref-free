@@ -20,6 +20,7 @@ from backend.free.agent.meta_cognitive_utils import (
     tool_result_lacks_information,
     tool_result_succeeded,
 )
+from backend.free.agent.meta_cognitive_task_exec import truncate_tool_result
 from backend.free.agent.tool_call_judge import (
     ToolCallJudge,
     ToolJudgement,
@@ -122,7 +123,6 @@ from backend.free.api.chat.chat_constants import (
     CONTENT_MAX_TOKENS_MIN, CONTENT_SYSTEM_RESERVE,
     TOOL_EXECUTION_TIMEOUT_SEC, TOOL_GROUNDED_TEMPERATURE,
     TOOL_RESULT_MAX_CHARS,
-    TOOL_RESULT_HEAD_RATIO, TOOL_RESULT_OMISSION_CHARS,
 )
 from backend.free.api.chat.chat_types import GenerationParams, StepCallback
 from backend.log_config import get_logger
@@ -2366,7 +2366,7 @@ class DeliberativeAgent:
                 if expression and query else None
             ),
         )
-        truncated = _truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS)
+        truncated = truncate_tool_result(tool_result_text, TOOL_RESULT_MAX_CHARS)
         if tool_name == "calculate":
             expression = str(args.get("expression") or "").strip()
             if expression:
@@ -4969,18 +4969,4 @@ def _stale_previous_answer_note(messages: list[dict], tool_result_text: str) -> 
     decimals = len(stale[0].split(".", 1)[1]) if "." in stale[0] else 0
     return _localized(_STALE_PREVIOUS_ANSWER_NOTES).format(
         stale=", ".join(stale), rounded=f"{result:.{decimals}f}",
-    )
-
-
-def _truncate_tool_result(text: str, max_chars: int) -> str:
-    """ツール結果が max_chars を超える場合、先頭と末尾を残して切り詰める"""
-    if len(text) <= max_chars:
-        return text
-    head_size = int(max_chars * TOOL_RESULT_HEAD_RATIO)
-    tail_size = max_chars - head_size - TOOL_RESULT_OMISSION_CHARS
-    omitted = len(text) - head_size - tail_size
-    return (
-        text[:head_size]
-        + f"\n\n... ({omitted} chars omitted) ...\n\n"
-        + text[-tail_size:]
     )

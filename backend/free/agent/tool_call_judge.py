@@ -29,6 +29,7 @@ from backend.free.agent.router import (
     is_environment_fact_query,
 )
 from backend.free.core.intent_vocab import (
+    RUNTIME_INFO_QUERY_RE,
     refers_to_ongoing_session,
     refers_to_previous_output,
     asks_to_restate_prior_report,
@@ -127,7 +128,6 @@ from backend.free.agent.tool_judge_signals import (
     _DELETE_INTENT_RE,
     _EXPLICIT_EXEC_VERB_RE,
     _HARDWARE_MEMORY_QUERY_RE,
-    _RUNTIME_INFO_QUERY_RE,
     _IMMEDIATE_CHILDREN_RE,
     _INFER_TOOL_EXEC_QUERY_RE_ALL,
     _KNOWLEDGE_PATTERNS_ALL,
@@ -158,7 +158,6 @@ from backend.free.agent.tool_judge_grounding import (
     _FULLWIDTH_DIGITS,
     _GROUPED_NUMBER_RE,
     _INTERVAL_M_RE,
-    _NUMBER_LITERAL_RE,
     _NUMERIC_LITERAL_RE,
     _PERCENT_LITERAL_RE,
     _UNIT_SYSTEM_CONSTANTS,
@@ -264,7 +263,6 @@ from backend.free.agent.tool_judge_history import (
     _ORDER_QUERY_STOPWORD_RUNS_EN,
     _ORDER_QUERY_STOPWORDS_BY_LEN,
     _ORDERED_HISTORY_QUERY_RE,
-    _RETROSPECTIVE_QUESTION_RE,
     _has_history_recall_keywords,
     _reduce_ordered_history_query,
     _strip_stopword_affixes,
@@ -1864,7 +1862,7 @@ class ToolCallJudge:
         # 自己申告の平叙文 (「llama-server は 8080 で動かしています。」) は
         # 実行要求ではないので落とす (_infer_executable_command と同じ扱い)。
         if (
-            _RUNTIME_INFO_QUERY_RE.search(query)
+            RUNTIME_INFO_QUERY_RE.search(query)
             and not is_plain_statement(query)
             and tools_registry.is_available("evoref_runtime_info", mode)
         ):

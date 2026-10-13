@@ -3,11 +3,9 @@
 		"save": "保存",
 		"cancel": "キャンセル",
 		"delete": "削除",
-		"copy": "コピー",
 		"close": "閉じる",
 		"loading": "読込み中...",
 		"error": "エラーが発生しました",
-		"confirm": "確認",
 		"more_actions": "その他の操作"
 	},
 	"chat": {
@@ -27,7 +25,6 @@
 		"mode_restarting": "モデル切替中です。完了までお待ちください...",
 		"send": "送信",
 		"message_list": "メッセージ一覧",
-		"clear_history": "チャット履歴をリセット",
 		"agentic_steps": "Agenticステップ",
 		"agentic_steps_done": "完了 ({elapsed})",
 		"long_form_progress": "生成中 {current}/{total}: {label}",
@@ -38,14 +35,7 @@
 		"input_truncated": "⚠ この発言は長さ制限のため先頭のみが送信されました ({sent} / {original} 文字)。後半は AI に渡っていないため、全体を対象とする件数・集計の回答は正確でない可能性があります。",
 		"output_truncated": "⚠ 出力トークンの上限に達したため、この応答は途中で終わっています。「続けて」と送ると続きを生成します。",
 		"input_truncated_toast": "メッセージが長すぎるため、先頭のみが送信されました",
-		"step_complete": "✓ {detail}",
 		"rag_hits": "RAG検索: {count}件ヒット",
-		"sufficiency_ok": "十分性判定: OK",
-		"sufficiency_ng": "十分性判定: 不足",
-		"apply_prompt": "適用しますか？",
-		"apply_yes": "はい",
-		"apply_no": "いいえ",
-		"apply_edit": "編集",
 		"you": "あなた",
 		"thinking": "思考中",
 		"step_marker_done": "✓",
@@ -280,8 +270,6 @@
 		"color_mode": "カラーモード",
 		"light": "ライト",
 		"dark": "ダーク",
-		"gpu_layers": "GPUレイヤー数",
-		"context_size": "コンテキストサイズ",
 		"loading": "設定を読込み中...",
 		"load_failed": "設定の読込みに失敗しました",
 		"retry": "再試行",
@@ -451,8 +439,7 @@
 		},
 		"llama": {
 			"max_tokens": "応答の最大トークン数",
-			"max_tokens_desc": "1 回の応答の上限 (0 = 文脈の残りまで)",
-			"enable_thinking": "思考モード"
+			"max_tokens_desc": "1 回の応答の上限 (0 = 文脈の残りまで)"
 		},
 		"rag": {
 			"chunk_size": "チャンクサイズ",
@@ -461,7 +448,6 @@
 			"semantic_min_chunk": "セマンティック最小チャンク",
 			"semantic_max_chunk": "セマンティック最大チャンク",
 			"top_k": "Top K",
-			"embedding_dim": "埋め込み次元数",
 			"quantization": "量子化",
 			"rescore_candidates": "リスコア候補数",
 			"memmap_threshold": "memmap 閾値",
@@ -680,8 +666,6 @@
 	"file": {
 		"attach": "ファイル追加",
 		"upload_area": "ファイルをドラッグ＆ドロップまたはクリックして追加",
-		"drop_here": "ここにドロップ",
-		"unsupported": "非対応の形式です: {ext}",
 		"size_exceeded": "ファイルサイズが上限（{limit}MB）を超えています: {name}",
 		"duplicate": "同名のファイルが既に添付されています: {name}",
 		"attach_failed": "添付できませんでした: {filename}",
@@ -709,29 +693,14 @@
 		"uninstall_confirm_message": "「{name}」をアンインストールします。適用中のテーマなら標準の表示に戻ります。"
 	},
 	"widget_proxy": {
-		"enabled": "有効",
-		"disabled": "無効",
-		"rate_limit": "レート制限"
-	},
-	"toast": {
-		"dismiss": "閉じる"
+		"enabled": "有効"
 	},
 	"error": {
 		"connection": {
-			"sse_lost": "サーバーとの接続が切断されました。再接続を試みています...",
-			"ws_lost": "WebSocket接続が切断されました。再接続を試みています...",
-			"api_timeout": "リクエストがタイムアウトしました。再試行してください。",
 			"failed": "サーバーへの接続に失敗しました"
-		},
-		"upload": {
-			"size_exceeded": "ファイルサイズが上限を超えています。"
-		},
-		"stream": {
-			"interrupted": "応答の受信が中断されました。"
 		},
 		"status_failed": "ステータスの取得に失敗しました",
 		"themes_failed": "テーマ一覧の取得に失敗しました",
-		"cartridges_failed": "カートリッジ一覧の取得に失敗しました",
 		"cartridge_install_failed": "カートリッジのインストールに失敗しました"
 	},
 	"cartridge": {
@@ -850,10 +819,8 @@
 		"duration": "{minutes}分",
 		"today": "今日",
 		"yesterday": "昨日",
-		"older": "それ以前",
 		"no_summary": "要約なし",
 		"delete_confirm": "このチャット履歴を削除しますか？",
-		"deleted": "削除しました",
 		"mode_all": "すべて",
 		"load_more": "もっと見る",
 		"select_session": "セッションを選択すると会話内容が表示されます",
@@ -865,7 +832,6 @@
 		"no_turns": "会話ターンがありません",
 		"user_label": "あなた",
 		"assistant_label": "AI",
-		"first_message": "（先頭メッセージ）",
 		"copy_turn": "コピー",
 		"copied": "コピーしました",
 		"copy_failed": "コピーに失敗しました",
@@ -966,10 +932,6 @@
 	"cli": {
 		"mode_create_pro_only_warning": "クリエイトモードは Pro エディション専用です。チャットモードで起動します。"
 	},
-	"landing": {
-		"free_tagline": "Agentic RAG で動くローカル個人ナレッジアシスタント",
-		"pro_tagline": "Agentic RAG + クリエイトモードを備えた進化型ローカル LLM アシスタント"
-	},
 	"cartridgeTrust": {
 		"title": "署名と信頼ストア",
 		"hint": "組織が署名したカートリッジだけ、同梱の索引 (prebuilt) をそのまま使って再埋め込みなしで導入します。鍵の追加と失効は evoref を停止して `evoref cartridge trust add` / `evoref cartridge revoke` で行います。",
@@ -991,6 +953,7 @@
 			"digest_mismatch": "内容が署名と不一致",
 			"bad_signature": "署名が不正",
 			"malformed": "署名の形式が不正",
+			"legacy_scheme": "旧方式の署名 (署名し直しが必要)",
 			"verifier_error": "検証できませんでした"
 		}
 	},

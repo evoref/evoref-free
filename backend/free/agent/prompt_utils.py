@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from backend.free.core.text_norm import collapse_ws
 from backend.io.codec import persisted
 from backend.io.id_registry import new_id
 
@@ -213,12 +214,10 @@ def strip_orphan_protected_markers(text: str) -> str:
 # 段落・文の正規化と重複検出
 # ─────────────────────────────────────────────────────────────────────
 
-_WS_RE = re.compile(r"\s+")
-
 
 def _normalize_for_dedup(text: str) -> str:
     """重複判定用に空白・大小文字を正規化する"""
-    return _WS_RE.sub(" ", text).strip().lower()
+    return collapse_ws(text).lower()
 
 
 def dedupe_paragraphs(text: str) -> str:

@@ -28,7 +28,7 @@ sampling:
 # (同系でも MoE の LFM2.5-8B-A1B は thinking=0 で分離不可だった)。
 # budget_default: -1 なので起動時に --reasoning-budget は付与されない。
 #
-# client_handling 以下はサーバ分離が効かない環境向けのフォールバック。
+# client_think_budget 以下はサーバ分離が効かない環境向けのフォールバック。
 # client_think_budget: 4096 — 8B-A1B は難問で思考が 1000+ トークンに達してから
 # </think> を閉じ、512 では回答到達前にストリームが中断した実測がある。
 #
@@ -40,8 +40,5 @@ sampling:
 reasoning:
   mode: always
   server_control: true
-  client_handling: strip
-  marker_style: think_tags
   client_think_budget: 4096
   on_runaway: fallback
-  exclude_from_history: true

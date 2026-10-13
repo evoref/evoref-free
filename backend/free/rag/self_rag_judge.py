@@ -458,8 +458,7 @@ class RetrievalNecessityJudge:
     """検索必要性のルール判定
 
     `_judge_rule` がルールで `"retrieve"` / `"fetch"` / `"skip"` /
-    `"uncertain"` を返す。外向きの後方互換 API `judge` は `uncertain` を
-    安全側の `"retrieve"` に正規化する。
+    `"uncertain"` を返す。公開 API ``judge_rule_only`` が 3 値のまま返す。
     """
 
     def _judge_rule(
@@ -639,36 +638,10 @@ class RetrievalNecessityJudge:
         logger.debug("Necessity: uncertain (default, query=%r)", query_stripped[:_LOG_QUERY_PREVIEW_CHARS])
         return "uncertain"
 
-    def judge(
-        self, query: str, context_count: int = 0, *, window_complete: bool = True,
-    ) -> str:
-        """ルール判定の後方互換ラッパ (2 値返却).
-
-        `_judge_rule` の 3 値 + uncertain を旧 API の 2 値
-        (``"retrieve"`` / ``"skip"``) に正規化する:
-
-        - ``"fetch"`` → ``"skip"`` (RAG 不要の意味では同義)
-        - ``"uncertain"`` → ``"retrieve"`` (安全側、検索する)
-
-        3 値のまま扱いたい呼出側は ``judge_rule_only`` を使うこと。
-        """
-        rule = self._judge_rule(
-            query, context_count, window_complete=window_complete,
-        )
-        if rule == "uncertain":
-            return "retrieve"
-        if rule == "fetch":
-            return "skip"
-        return rule
-
     def judge_rule_only(
         self, query: str, context_count: int = 0, *, window_complete: bool = True,
     ) -> str:
-        """ルール判定の 3 値 (``uncertain`` 含む) をそのまま返す。
-
-        ``judge()`` が ``uncertain`` を ``retrieve`` へ丸める前の生の判定を
-        見たい呼出元 (テスト / 診断) 向けの公開 API。
-        """
+        """ルール判定の 3 値 (``uncertain`` 含む) をそのまま返す。"""
         return self._judge_rule(
             query, context_count, window_complete=window_complete,
         )

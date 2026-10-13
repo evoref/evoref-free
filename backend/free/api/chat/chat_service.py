@@ -125,7 +125,7 @@ async def prepare_memory_context(
     Returns:
         (history, session_id) のタプル
     """
-    if not state.get_memory_system():
+    if state.working_memory_registry is None:
         logger.debug("Memory not initialized, using single-turn context")
         session_id = req.session_id or "default"
         accumulate_user_turn(session_id, req.message)

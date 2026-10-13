@@ -146,18 +146,6 @@ export async function requestFormData<T>(
 	return res.json() as Promise<T>;
 }
 
-/** multipart/form-data でレスポンスボディを読まないバリエーション */
-export async function requestFormDataVoid(
-	path: string,
-	formData: FormData
-): Promise<void> {
-	const res = await fetch(`${BASE_URL}${path}`, {
-		method: 'POST',
-		body: formData
-	});
-	await throwIfNotOk(res);
-}
-
 /**
  * ストリーミング操作 (install / create 等) のキャンセル要求共通ヘルパー。
  *

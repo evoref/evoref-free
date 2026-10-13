@@ -43,7 +43,11 @@ from backend.free.rag.evidence.tokenize import (
 from backend.io import AtomicWriter, atomic_write_text
 from backend.log_config import get_logger
 
+from backend.free.rag.topk import top_k_desc
+
 logger = get_logger("rag.evidence.lexical_index")
+
+_PRUNE_MIN_DOCS = 50
 
 
 #: 索引ファイルの形式版。配列の意味を変える場合に上げる。
@@ -392,7 +396,7 @@ class LexicalIndexBuilder:
     def build(self, texts: Sequence[str]) -> LexicalIndex:
         """``texts`` を行位置 (0..N-1) で索引する。
 
-        剪定は **相対**: ``df > max(1, max_df_ratio × N)`` の語を落とす。
+        剪定は **相対**: ``df > max_df_ratio × N`` の語を落とす (N < 50 では剪定しない)。
         文書が極端に少ないときに全語が消えないよう下限 1 を置く。
         """
         n_docs = len(texts)
@@ -448,7 +452,8 @@ class LexicalIndexBuilder:
         df = np.bincount(terms, minlength=n_terms_raw).astype(np.float64)
 
         # 相対剪定 + df == 0 の除去 (後者は語彙構築の性質上起きないが規約どおり明示)
-        max_df = max(1.0, params.max_df_ratio * n_docs)
+        # 小さい shard (N < 50) では比率が 1 文書へ潰れて語がほぼ全滅するので剪定しない
+        max_df = params.max_df_ratio * n_docs if n_docs >= _PRUNE_MIN_DOCS else float(n_docs)
         keep_term = (df > 0) & (df <= max_df)
         n_kept = int(keep_term.sum())
         if n_kept == 0:
@@ -742,9 +747,5 @@ def _top_k_desc(
     """スコア降順 (同点は行番号昇順) で上位 ``top_k`` を返す。"""
     if top_k <= 0 or rows.shape[0] == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
-    if rows.shape[0] > top_k:
-        part = np.argpartition(-scores, top_k - 1)[:top_k]
-        rows = rows[part]
-        scores = scores[part]
-    order = np.lexsort((rows, -scores))
+    order = top_k_desc(scores, rows, top_k)
     return rows[order].astype(np.int64, copy=False), scores[order].astype(np.float32, copy=False)

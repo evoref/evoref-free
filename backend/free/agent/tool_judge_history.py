@@ -572,9 +572,6 @@ _ANAPHORIC_REFERENCE_RE = re.compile(
     r"(?:その|あの|例の|先ほどの|さきほどの|さっきの|前述の|上記の|くだんの)"
     r"\s*[^\s、。，．]{1,12}",
 )
-#: 過去に述べられた内容を尋ね直す文末形。語彙は core.intent_vocab が SSOT
-#: (``tool_judge_commands`` の now-only 抑止と同じ形)。後方互換で旧名を残す。
-_RETROSPECTIVE_QUESTION_RE = PAST_RECALL_TAIL_RE
 
 
 def asks_about_prior_conversation_entity(query: str) -> bool:
@@ -596,5 +593,5 @@ def asks_about_prior_conversation_entity(query: str) -> bool:
         return False
     return bool(
         _ANAPHORIC_REFERENCE_RE.search(query)
-        and _RETROSPECTIVE_QUESTION_RE.search(query)
+        and PAST_RECALL_TAIL_RE.search(query)
     )

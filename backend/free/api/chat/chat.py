@@ -1598,16 +1598,6 @@ def _resolve_template_resolution(
     )
 
 
-def _resolve_selected_template(
-    req: ChatRequest, state: AppState,
-) -> SelectedTemplate | None:
-    """``_resolve_template_resolution`` の選択結果だけを返す薄いラッパ。
-
-    hint 用の verdict / candidates が要らない呼出側 (既存テスト含む) 向け。
-    """
-    return _resolve_template_resolution(req, state).selected
-
-
 def _template_hint_entries(
     text: str, candidates: "Sequence[TemplateCandidate]",
 ) -> list[dict]:

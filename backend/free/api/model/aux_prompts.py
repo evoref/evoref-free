@@ -82,21 +82,6 @@ async def update_aux_prompt(task: str, body: PromptUpdateRequest, state: AppStat
     return {"status": "updated", "version": mgr.get_meta(task).version}
 
 
-@router.post("/{task}/reload")
-async def reload_aux_prompt(task: str, state: AppState = Depends(get_app_state)):
-    """ディスクから再読込み"""
-    logger.debug("POST /api/aux-prompts/%s/reload", task)
-    mgr = state.aux_prompt_manager
-    if mgr is None:
-        raise HTTPException(503, "Aux prompt manager not initialized")
-
-    if task not in mgr.TASKS:
-        raise HTTPException(404, f"Unknown task: {task}")
-
-    mgr._load_all()
-    return {"status": "reloaded"}
-
-
 @router.get("/{task}/history")
 async def get_aux_prompt_history(task: str, state: AppState = Depends(get_app_state)):
     """タスク別履歴一覧"""

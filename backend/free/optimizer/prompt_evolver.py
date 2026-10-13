@@ -24,6 +24,7 @@ from backend.free.agent.prompt_utils import (
     text_contains_sentence,
     validate_protected_sections,
 )
+from backend.free.core.text_norm import collapse_ws
 from backend.free.llm.json_extract import extract_json_object
 from backend.io import JSONLAppendStore
 from backend.io.codec import codec_for, persisted
@@ -243,14 +244,13 @@ _EDIT_RESPONSE_FORMAT = {
 
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
 _HEADING_RE = re.compile(r"^\s*#{1,6}\s+")
-_INLINE_WS_RE = re.compile(r"\s+")
 
 
 def _normalize_anchor(line: str) -> str:
     """アンカー照合用に箇条書き記号・見出し記号・空白・大小文字を落とす"""
     text = _BULLET_RE.sub("", line.strip())
     text = _HEADING_RE.sub("", text)
-    return _INLINE_WS_RE.sub(" ", text).strip().lower()
+    return collapse_ws(text).lower()
 
 
 def _editable_view(text: str) -> tuple[str, list[tuple[int, str]]]:

@@ -101,12 +101,9 @@ def messages_carry_evidence(messages: list[dict] | None) -> bool:
         return any(marker in text for marker in EVIDENCE_BLOCK_MARKERS)
     return False
 
+
 # 動的コンテキストブロックと生クエリの境界に挟む区切り。文言と locale 版の
 # SSOT は ``core.turn_text`` (送信時ガードが同じ境界で切り詰めるため)。
-# ``_DYNAMIC_CONTEXT_DELIMITER`` は ja 既定の別名 (後方互換 / テスト用)。
-_DYNAMIC_CONTEXT_DELIMITER = DYNAMIC_CONTEXT_DELIMITER
-
-
 def _dynamic_context_delimiter() -> str:
     """prompt_locale に応じた前置用の区切り (未知 locale は ja)。"""
     return DYNAMIC_CONTEXT_DELIMITERS.get(prompt_locale(), DYNAMIC_CONTEXT_DELIMITER)

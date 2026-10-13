@@ -36,8 +36,10 @@ from typing import Any
 
 import numpy as np
 
+from backend.free.core.vectors import l2_normalize_rows
 from backend.io.format_registry import FormatSpec, register_format
 from backend.io.versioned import VersionedPayloadFile
+from backend.free.rag.threshold_calibration import _clamp01
 from backend.log_config import get_logger
 
 logger = get_logger("rag.memory_threshold_calibration")
@@ -167,17 +169,6 @@ def embedder_fingerprint(model_id: str, dim: int) -> str:
     return f"{model_id}::{int(dim)}"
 
 
-def _clamp01(x: float) -> float:
-    return round(float(max(0.0, min(1.0, x))), 3)
-
-
-def _l2_normalize(mat: np.ndarray) -> np.ndarray:
-    """行ごとに L2 正規化する (ゼロベクトルはそのまま)。"""
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return (mat / norms).astype(np.float32)
-
-
 def pinned_relevance_from_distribution(distribution: Any) -> float | None:
     """pin の関連度下限 = 背景分布の p50 と p95 の中点。
 
@@ -225,8 +216,8 @@ def compute_calibration(
 
     # dot 積をコサインとして扱うため、両側を L2 正規化しておく
     # (量子化・キャッシュ経路によっては厳密な単位長でないことがある)。
-    note_vecs = _l2_normalize(np.asarray(note_vecs, dtype=np.float32))
-    query_vecs = _l2_normalize(np.asarray(query_vecs, dtype=np.float32))
+    note_vecs = l2_normalize_rows(np.asarray(note_vecs, dtype=np.float32))
+    query_vecs = l2_normalize_rows(np.asarray(query_vecs, dtype=np.float32))
 
     rng = np.random.default_rng(seed)
 

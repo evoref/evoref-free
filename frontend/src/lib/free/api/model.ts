@@ -1,8 +1,8 @@
 /**
  * Model migration API client
  *
- * - base モデル切替 (migrate / rollback / reload / process restart)
- * - embedding のコンポーネント切替・ロールバック
+ * - base モデル切替 (migrate)
+ * - embedding のコンポーネント切替
  */
 
 import { request } from './_client';
@@ -33,51 +33,11 @@ export interface BaseMigrateResponse {
 	recommendations: string[];
 }
 
-export interface BaseRollbackResponse {
-	rolled_back_to: string;
-}
-
-export interface ReloadResponse {
-	reloaded: boolean;
-	model_id: string;
-	chat_template: string;
-	has_system_role: boolean;
-}
-
-export interface ProcessRestartResponse {
-	component: string;
-	restarted: boolean;
-	host?: string;
-	port?: number;
-	pid?: number;
-}
-
 /** ベースモデルの migrate を実行する (dry_run=true でプレビュー) */
 export async function migrateBaseModel(
 	body: BaseMigrateRequest
 ): Promise<BaseMigrateResponse> {
 	return request<BaseMigrateResponse>('POST', '/model/migrate', body);
-}
-
-/** ベースモデルの migrate をロールバックする */
-export async function rollbackBaseModel(
-	target_model?: string
-): Promise<BaseRollbackResponse> {
-	return request<BaseRollbackResponse>(
-		'POST',
-		'/model/rollback',
-		target_model ? { target_model } : {}
-	);
-}
-
-/** migrate 後に llama-server へ再接続し model_state を同期する */
-export async function reloadModel(): Promise<ReloadResponse> {
-	return request<ReloadResponse>('POST', '/model/reload', {});
-}
-
-/** base llama-server プロセスを再起動する (LlamaProcessManager 管理下のみ) */
-export async function restartBaseProcess(): Promise<ProcessRestartResponse> {
-	return request<ProcessRestartResponse>('POST', '/model/process/base/restart', {});
 }
 
 export type ModelComponent = 'embedding';
@@ -97,11 +57,6 @@ export interface ComponentMigrateResponse {
 	recommendations: string[];
 }
 
-export interface ComponentRollbackResponse {
-	component: ModelComponent;
-	rolled_back_to: string;
-}
-
 export async function migrateComponent(
 	component: ModelComponent,
 	body: ComponentMigrateRequest
@@ -110,17 +65,6 @@ export async function migrateComponent(
 		'POST',
 		`/model/${component}/migrate`,
 		body
-	);
-}
-
-export async function rollbackComponent(
-	component: ModelComponent,
-	target_model?: string
-): Promise<ComponentRollbackResponse> {
-	return request<ComponentRollbackResponse>(
-		'POST',
-		`/model/${component}/rollback`,
-		target_model ? { target_model } : {}
 	);
 }
 

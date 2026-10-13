@@ -73,7 +73,7 @@ from backend.free.rag.evidence import (
     list_versions,
     read_snapshot,
 )
-from backend.free.rag.evidence.ranking import RankColumns, score_rows
+from backend.free.rag.evidence.ranking import RankColumns, collapse_by_claim_key, score_rows
 from backend.free.rag.vector_store import dequantize_int8
 from backend.constants import SECONDS_PER_DAY
 from backend.log_config import get_logger
@@ -1012,7 +1012,7 @@ class SemanticStore:
             cosines = self.evidence.cosines_for_rows(query, rows)
             finite = np.isfinite(cosines)
             if np.any(finite):
-                columns = RankColumns.from_columns(snapshot.columns)
+                columns = RankColumns.from_columns(self.evidence.columns_view() or snapshot.columns)
                 target = rows[finite]
                 scores = score_rows(
                     np.nan_to_num(cosines[finite]), target, columns, now_epoch,
@@ -1180,7 +1180,9 @@ class SemanticStore:
                 continue
             tail.append(SemanticHit(fact, cosine, score))
         if tail:
-            hits = sorted(hits + tail, key=lambda hit: hit.score, reverse=True)[:top_k]
+            merged = sorted(hits + tail, key=lambda hit: hit.score, reverse=True)
+            # snapshot の後に言い直された同じ主張は 1 件にする (c_16 §7.3)
+            hits = collapse_by_claim_key(merged, lambda hit: self.evidence.get(hit.fact.id))[:top_k]
         return hits
 
     # ── 保持方針 (c_16 §5.4) ────────────────────────────────────────

@@ -45,7 +45,6 @@ reasoning:
   mode: toggle
   enable_thinking: false
   server_control: true
-  reasoning_format: auto
   budget_default: -1
 # 切替時の出力品質プローブ (backend/free/llm/quality_probe.py) の閾値は既定のまま
 # 宣言しない。実測済みの弱点 (12B の日本語語間空白等) は arch 全体の性質ではなく

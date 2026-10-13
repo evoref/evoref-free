@@ -93,10 +93,7 @@ def _get_migrator(state: AppState):
     learning_scheduler = state.learning_scheduler
 
     # エピソード記憶 (移行時に context_description の再生成印を立てる)
-    episodic = None
-    mem = state.get_memory_system()
-    if mem:
-        _, episodic = mem
+    episodic = state.episodic_memory
 
     return ModelMigrator(
         config=cfg,

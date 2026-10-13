@@ -138,7 +138,7 @@ async def execute_tool_with_timeout(
 def truncate_tool_result(text: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -> str:
     """ツール結果が max_chars を超える場合、先頭と末尾を残して切り詰める。
 
-    deliberative の ``_truncate_tool_result`` と同じ体裁。meta のツールループは
+    meta のツールループは
     最新 step の出力を全文で LLM に渡す (StepCompactor は最新反復を圧縮しない)
     ため、巨大な結果がそのままコンテキストを食い潰さないようここで上限を掛ける。
     """

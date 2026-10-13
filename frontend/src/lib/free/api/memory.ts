@@ -47,24 +47,6 @@ export interface MemoryDetailedStats {
 	current_mode: string;
 }
 
-export interface NoteInfo {
-	id: string;
-	content: string;
-	keywords: string[];
-	tags: string[];
-	created_at: number;
-	accessed_at: number;
-	session_id: string;
-	context_description: string;
-	evolution_pending: boolean;
-	has_embedding: boolean;
-}
-
-export interface MemoryNotesResponse {
-	total: number;
-	notes: NoteInfo[];
-}
-
 export interface PinnedFactInfo {
 	id: string;
 	subject: string;
@@ -95,16 +77,6 @@ export interface UnpinFactRequest {
 	fact_id: string;
 	scope?: string;
 	force?: boolean;
-}
-
-/** 記憶システム全体の統計 */
-export async function getMemoryStats(): Promise<MemoryDetailedStats> {
-	return request<MemoryDetailedStats>('GET', '/memory/stats');
-}
-
-/** 短期記憶のノート一覧 */
-export async function getMemoryNotes(limit = 20, offset = 0): Promise<MemoryNotesResponse> {
-	return request<MemoryNotesResponse>('GET', `/memory/notes?limit=${limit}&offset=${offset}`);
 }
 
 /** ピン留めされたファクトの一覧 */

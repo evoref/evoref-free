@@ -193,6 +193,11 @@ G1_RETIRED_KEYS: tuple[tuple[str, ...], ...] = (
     # 版は上げない。手本と進化した policy 値を SemMem へ書き戻す経路を撤去した
     # (既定の yaml だけが残る、f_04 §3.2、2026-10-12)
     ("learning", "policy", "evolve_writeback"),
+    # 版は上げない。実行時に読む箇所が無かった宣言だけのキー (c_05 §7.6、2026-10-13)。
+    # neighborhood の深さと予算は project_map ツールの呼出し側が決める
+    ("runtime", "llama_endpoint_policy"),
+    ("rag", "project_map", "neighborhood_depth"),
+    ("rag", "project_map", "neighborhood_budget_tokens"),
 )
 
 

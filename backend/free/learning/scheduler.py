@@ -127,10 +127,6 @@ def _schema_default(key: str) -> Any:
     return LearningConfig.model_fields[key].default
 
 
-#: 後方互換の別名 (実体は ``level0_instant.used_corpus_evidence``)。
-_used_corpus_evidence = used_corpus_evidence
-
-
 def _fmt_measured(value: float | None) -> str:
     """採用ゲートの実測値をログ用に整形する (None は "-")。"""
     return "-" if value is None else f"{value:.3f}"
@@ -2723,7 +2719,7 @@ class LearningScheduler:
         # RAG 利用率 — **corpus 由来の材料を実際に注入したターンの割合** で数える
         # (c_16 §5.5)。``signals.rag_used`` は「検索が何か返したか」で、注入まで
         # 届いたかを表していなかった。
-        rag_used = sum(1 for e in safe_exp if _used_corpus_evidence(e))
+        rag_used = sum(1 for e in safe_exp if used_corpus_evidence(e))
         rag_usage_rate = rag_used / total if total > 0 else 0.0
         # 「注入ゼロ」の理由 (f_01 §6.6): 疑似クエリのゲートで corpus を引かなかった
         # turn の比率と、注入のうち疑似クエリ索引経由が 1 件以上あった turn の比率。

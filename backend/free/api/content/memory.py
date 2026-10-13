@@ -222,11 +222,7 @@ async def get_memory_notes(
         "GET /api/memory/notes: limit=%d, offset=%d, sort=%s, tag=%s",
         limit, offset, sort, tag,
     )
-    mem_sys = state.get_memory_system()
-    if mem_sys is None:
-        return MemoryNotesResponse(total=0, notes=[])
-
-    _, episodic = mem_sys
+    episodic = state.episodic_memory
     if episodic is None:
         return MemoryNotesResponse(total=0, notes=[])
     notes = list(episodic.short_notes())
