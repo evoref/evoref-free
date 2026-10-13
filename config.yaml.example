@@ -938,6 +938,8 @@ learning:
   # base モデルの自己学習データは <data_root>/store/learning/<model_key>/ に分離される（モデル切替で差し替え、未知モデルはゼロから学習）。
   level1_min_experiences: 8       # Level 1 トリガーに必要な最小経験数 (前回実行以降の新規件数にも同じ値)
   level1_generations: 5           # Level 1 の世代数 (停滞 3 世代で打ち切り。選択圧は採用ゲート側)
+  stalled_class_runs: 2           # 採用ゲートが全引き分けをこの回数続けた失敗クラスは圧に数えない (文字数指定など)
+  stalled_class_retry_days: 7     # 停滞したクラスを測り直す日数 (プロンプトが採用されても測り直す)
   level1_population_size: 5       # Level 1 の集団サイズ
   # アイドル判定タイマー
   full_idle_minutes: 10           # Trigger B: sleep-time Full の起動アイドル時間（分）

@@ -174,6 +174,8 @@ PROMPT_ROLLBACK_EPSILON = 0.02
 #: 窓・悪化幅はプロンプトと同じ (:data:`PROMPT_ROLLBACK_WINDOWS` /
 #: :data:`PROMPT_ROLLBACK_EPSILON`)。
 GENERATION_ADOPTIONS_KEY = "generation_adoptions"
+#: ``learning_state._extra`` の中の停滞した失敗クラスの記録 (f_04 §4.5)。
+STALLED_CLASSES_KEY = "stalled_failure_classes"
 
 
 def _aggregate_mutation_health(results: dict) -> tuple[int, int]:
@@ -1365,6 +1367,83 @@ class LearningScheduler:
         prompt_cfg = self._config.get("prompt") or {}
         return max(1, int(prompt_cfg.get("adoption_min_net_wins", 2)))
 
+    # ── 停滞した失敗クラス (f_04 §4.5) ──
+
+    def _stalled_class_settings(self) -> tuple[int, int]:
+        """``(stalled_class_runs, stalled_class_retry_days)``。"""
+        cfg = self._config.get("learning") or {}
+        return (
+            max(1, int(cfg.get("stalled_class_runs", 2))),
+            max(1, int(cfg.get("stalled_class_retry_days", 7))),
+        )
+
+    def _stalled_classes(self, mode: str) -> frozenset[str]:
+        """採用ゲートが全引き分けを ``stalled_class_runs`` 回続けた失敗クラス。
+
+        最後に測ってから ``stalled_class_retry_days`` が過ぎた記録は数えない (再試行)。
+        記録が読めない形なら空 (従来の動作 — fail-open)。
+        """
+        records = ((self._state_extra or {}).get(STALLED_CLASSES_KEY) or {}).get(mode)
+        if not isinstance(records, dict):
+            return frozenset()
+        runs, retry_days = self._stalled_class_settings()
+        now = time.time()
+        stalled: set[str] = set()
+        for reason_class, record in records.items():
+            if not isinstance(record, dict):
+                continue
+            last_run_at = record.get("last_run_at")
+            if not isinstance(last_run_at, str):
+                continue
+            measured = parse_utc(last_run_at)
+            try:
+                streak = int(record.get("streak", 0))
+            except (TypeError, ValueError):
+                continue
+            if measured is None:
+                continue
+            if streak >= runs and now - measured.timestamp() < retry_days * 86400:
+                stalled.add(str(reason_class))
+        return frozenset(stalled)
+
+    def _record_stalled_classes(self, mode: str, failures: list, verdict: dict) -> None:
+        """一対比較の採用ゲートの結果を、載った失敗クラスごとに記録する。
+
+        全引き分け (``wins == 0 and losses == 0``) なら連続回数を 1 増やし、勝ちか負けが
+        あれば載ったクラスの記録を消す。クラスを持たない失敗は数えない。
+        """
+        classes = {c.reason_class for c in failures if getattr(c, "reason_class", "")}
+        if not classes:
+            return
+        all_tie = verdict.get("wins") == 0 and verdict.get("losses") == 0
+        extra = dict(self._state_extra or {})
+        by_mode = {m: dict(r) for m, r in (extra.get(STALLED_CLASSES_KEY) or {}).items()
+                   if isinstance(r, dict)}
+        records = by_mode.setdefault(mode, {})
+        now = utc_now()
+        for reason_class in classes:
+            previous = records.get(reason_class)
+            streak = previous.get("streak", 0) if isinstance(previous, dict) else 0
+            if all_tie:
+                records[reason_class] = {
+                    "streak": (streak if isinstance(streak, int) else 0) + 1,
+                    "last_run_at": now,
+                }
+            else:
+                records.pop(reason_class, None)
+        extra[STALLED_CLASSES_KEY] = {m: r for m, r in by_mode.items() if r}
+        self._state_extra = extra
+        self._save_state()
+
+    def _clear_stalled_classes(self, mode: str) -> None:
+        """そのモードの停滞の記録を消す (プロンプトが採用された = 測り直す)。"""
+        extra = dict(self._state_extra or {})
+        by_mode = dict(extra.get(STALLED_CLASSES_KEY) or {})
+        if by_mode.pop(mode, None) is None:
+            return
+        extra[STALLED_CLASSES_KEY] = by_mode
+        self._state_extra = extra
+
     # ── Level 2 (成長): 回帰台帳と再生 (f_04 §6.4 / §6.5) ──
 
     def _growth_settings(self) -> Any:
@@ -1424,6 +1503,7 @@ class LearningScheduler:
 
         selection = select_prompt_eval_case_sets(
             experiences, mode, limit, sample_cases=self._sample_cases(),
+            exclude_reason_classes=self._stalled_classes(mode),
         )
         if not self._pairwise_gate_available():
             return selection
@@ -1688,6 +1768,7 @@ class LearningScheduler:
             return
         wins, losses, ties = tally(outcomes)
         verdict.update({"wins": wins, "losses": losses, "ties": ties})
+        self._record_stalled_classes(mode, failures, verdict)
         sample_outcomes: dict[str, int] = {}
         verdict["reason"] = pairwise_verdict(wins - losses, noise, min_net)
         if verdict["reason"] == PAIRWISE_NET_WINS:
@@ -2000,6 +2081,8 @@ class LearningScheduler:
             "window_since": now,
             "windows": [],
         }
+        # プロンプトが変わったので、停滞していた失敗クラスも測り直す (f_04 §4.5)
+        self._clear_stalled_classes(mode)
 
     def _append_adoption_ledger(self, **row: Any) -> Any:
         """採用台帳 (``learning.prompt_adoption``) へ 1 行追記し、その行を返す (書けなければ ``None``)。

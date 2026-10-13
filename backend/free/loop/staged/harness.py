@@ -91,8 +91,7 @@ class StagedCodeHarness:
         # api 層 (composition) の共有実体への参照。loop pillar → api の top-level
         # import は方向が逆になるため lazy import で避ける
         # (backend/free/loop/staged/README 相当の既存パターンと同じ判断)。
-        from backend.edition import is_pro
-        from backend.free.api.chat.chat_stream_staged import run_staged_pipeline
+        from backend.edition import get_pro_handler
 
         if staged_profile(self._cfg) == "v2" and self._client is not None:
             # staged v2 (f_10 §11): 骨組み → 同時生成 → smoke → (Pro) 契約テスト → as-built 文書
@@ -114,7 +113,7 @@ class StagedCodeHarness:
                 is_cancelled=is_cancelled,
                 resume_of=req.resume_of or None,
                 # テスト工程は Pro だけ (Free は smoke と as-built 文書まで)
-                tests_enabled=is_pro() and bool(staged_cfg.get("test_stage_enabled", True)),
+                tests_enabled=get_pro_handler("staged_test_stage") is not None and bool(staged_cfg.get("test_stage_enabled", True)),
             ), on_event)
             if (
                 result_payload is not None
@@ -122,13 +121,17 @@ class StagedCodeHarness:
             ):
                 # 第 1 段の対象外の言語・系統は変更前の経路へ (f_10 §12.1):
                 # Pro は同じターンで v1、Free は呼出し側 (制作ステージ選択) が longform へ回す
-                if not is_pro():
+                if get_pro_handler("staged_v1_pipeline") is None:
                     return ProductionResult(
                         exit_kind="error", notes=dict(result_payload.get("notes") or {}),
                     )
                 result_payload = None
             else:
                 return self._to_result(result_payload)
+        run_staged_pipeline = get_pro_handler("staged_v1_pipeline")
+        if run_staged_pipeline is None:
+            # v1 は Pro だけ (f_10 §11.3)。Free は v2 の client が無いときもここへ来る
+            return ProductionResult(exit_kind="error", notes={"reason": "staged_v1_unavailable"})
         result_payload = await self._drain(run_staged_pipeline(
             query=req.instruction,
             session_id=req.session_id,

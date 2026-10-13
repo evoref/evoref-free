@@ -24,6 +24,7 @@ from backend.free.agent.prompt_utils import (
     text_contains_sentence,
     validate_protected_sections,
 )
+from backend.free.core.leak_reasons import is_model_origin_reason
 from backend.free.core.text_norm import collapse_ws
 from backend.free.llm.json_extract import extract_json_object
 from backend.io import JSONLAppendStore
@@ -913,6 +914,15 @@ class PromptEvolver:
             elif signals.get("rephrased_query"):
                 hints.append(
                     f"User rephrased: query=\"{exp.get('query', '')[:80]}\""
+                )
+            elif (
+                signals.get("turn_outcome") == "failed"
+                and signals.get("turn_outcome_reason")
+                and not is_model_origin_reason(signals["turn_outcome_reason"])
+            ):
+                hints.append(
+                    f"Failed turn: query=\"{exp.get('query', '')[:80]}\" "
+                    f"reason=\"{str(signals['turn_outcome_reason'])[:100]}\""
                 )
 
         return hints

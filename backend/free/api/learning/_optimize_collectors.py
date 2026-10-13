@@ -21,14 +21,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from backend.free.api.learning._optimize_schemas import (
-    AuxTaskStatus,
     PromptHistoryEntry,
     PromptModeStatus,
 )
 from backend.utils import epoch_to_utc
 
 if TYPE_CHECKING:
-    from backend.free.agent.aux_prompt_manager import AuxPromptManager
     from backend.free.agent.prompt_manager import SystemPromptManager
 
 
@@ -68,34 +66,6 @@ def collect_prompt_mode_statuses(
             source=meta.source,
             updated_at=meta.updated_at,
             model_calibrated_for=meta.model_calibrated_for,
-        ))
-    return result
-
-
-def collect_aux_task_statuses(
-    aux_prompt_mgr: AuxPromptManager | None,
-    tasks: list[str],
-) -> list[AuxTaskStatus]:
-    """指定タスクリストから `AuxTaskStatus` のリストを構築する。
-
-    `aux_prompt_mgr` が `None` の場合は空リストを返す。`get_meta` が
-    `ValueError` を投げたタスクはスキップする。Pro/Free ガードは呼び出し側の
-    責務 (この関数自体は edition-agnostic)。
-    """
-    if aux_prompt_mgr is None:
-        return []
-    result: list[AuxTaskStatus] = []
-    for task in tasks:
-        try:
-            meta = aux_prompt_mgr.get_meta(task)
-        except ValueError:
-            continue
-        result.append(AuxTaskStatus(
-            task=meta.task,
-            version=meta.version,
-            source=meta.source,
-            updated_at=meta.updated_at,
-            fitness_score=meta.fitness_score,
         ))
     return result
 
@@ -155,31 +125,6 @@ def collect_prompt_history(
             continue
         result[mode] = [
             PromptHistoryEntry(mode=mode, version=e["version"], file=e["file"])
-            for e in entries
-        ]
-    return result
-
-
-def collect_aux_prompt_history(
-    aux_prompt_mgr: AuxPromptManager | None,
-    tasks: list[str],
-) -> dict[str, list[PromptHistoryEntry]]:
-    """補助タスクのプロンプト別履歴を `{f"aux_{task}": [entries...]}` で返す。
-
-    `aux_prompt_mgr` が `None` の場合は空 dict。`ValueError` はスキップ。
-    Pro/Free ガードは呼び出し側の責務。
-    """
-    if aux_prompt_mgr is None:
-        return {}
-    result: dict[str, list[PromptHistoryEntry]] = {}
-    for task in tasks:
-        try:
-            entries = aux_prompt_mgr.get_history(task)
-        except ValueError:
-            continue
-        key = f"aux_{task}"
-        result[key] = [
-            PromptHistoryEntry(mode=key, version=e["version"], file=e["file"])
             for e in entries
         ]
     return result

@@ -23,7 +23,6 @@ import json
 import posixpath
 import re
 import time
-from dataclasses import replace
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, AsyncIterator, Callable
 
@@ -35,7 +34,6 @@ from backend.free.api.chat.staged_v2_state import (
     VerifiedState,
     compare,
     compile_error_count,
-    lost_checks,
 )
 from backend.free.api.chat.chat_stream_staged import (
     _REFERENCE_DOC_MAX_CHARS,
@@ -58,7 +56,6 @@ from backend.free.core.check_outcome import (
 )
 from backend.free.core.intent_vocab import is_absolute_path_text
 from backend.free.generation.contract_tests import (
-    file_based_data_locations,
     rebase_absolute_paths_in_expression,
     path_constants_by_module,
     rebase_absolute_paths_in_source,
@@ -106,8 +103,6 @@ def _module_max_tokens(path: str) -> int:
     """ファイル種別ごとの初回 max_tokens。"""
     suffix = "." + path.lower().rsplit(".", 1)[-1] if "." in path else ""
     return _MODULE_MAX_TOKENS_BY_SUFFIX.get(suffix, _MODULE_MAX_TOKENS)
-#: LLM の参考テスト (Pro) の最大トークン。
-_ADVISORY_TEST_MAX_TOKENS = 1024
 #: 骨組み (JSON) の最大トークン。
 _SKELETON_MAX_TOKENS = 1536
 #: 作り直しの上限 (1 回目が上限で切れたとき用、f_10 §12.2)。
@@ -124,7 +119,6 @@ _CODE_EXCERPT_CHARS = 6000  # 既に書いた依存ファイル / コードの�
 _PREVIOUS_CODE_CHARS = 12000  # 作り直し時に渡す直前のコード
 _REPAIR_ERRORS_CHARS = 3000  # 作り直し時に渡すエラー本文
 _TEST_OUTPUT_TAIL_CHARS = 3000  # テスト出力 (pytest / stderr) の末尾
-_GATE_OUTPUT_TAIL_CHARS = 2000  # ゲート結果に残す出力の末尾
 
 _SKELETON_PROMPT = """\
 You design a small software deliverable before any code is written. Return ONLY JSON.
@@ -204,43 +198,9 @@ Previous version:
 ```
 """
 
-_ADVISORY_TEST_TASK = """\
-Write a pytest file `{path}` with at most 5 focused test functions for the public API above.
-
-Rules:
-- Import modules by bare name (e.g. `import {example_module}`).
-- Test behaviour only: return values, raised exception TYPES (`pytest.raises(ValueError)` without
-  `match=`), and files written. For stdout use the `capsys` fixture and check a short substring at most.
-- Never reassign sys.stdout, never compare `__annotations__`, never assert exact user-facing
-  message texts.
-- """ + _ABSOLUTE_PATH_BAN + """
-  into the tests, not even in fixtures or module-level constants: a test file that does is discarded.
-  Where the code reads or writes data files, keep every file under pytest's `tmp_path`. When the
-  code locates a data file from `__file__` (a module-level constant such as `DATA_FILE`), replace
-  that constant in every such test with `monkeypatch.setattr(<module>, "<CONSTANT>", <new path>)`
-  where <new path> has the constant's type (`str(tmp_path / "<file name>")` for a string,
-  `tmp_path / "<file name>"` for a `pathlib.Path`): changing the working directory does not move
-  such a file. Use `monkeypatch.chdir(tmp_path)` only when the code opens its data files relative
-  to the working directory.
-- Output only the file content.
-{data_constants}"""
-
-#: 前の段の本文から拾った置き場の定数 (``_ADVISORY_TEST_TASK`` の末尾、task 部分なので KV 接頭辞は変わらない)。
-_ADVISORY_DATA_CONSTANTS = """\
-- The code keeps its data files at these module-level constants; in every test that reads or
-  writes data, replace each of them first:
-{lines}
-"""
 
 
-def _advisory_data_constants(written: dict[str, str]) -> str:
-    """書き上がった本文の置き場の定数を、参考テストの差し替えの指示にする (無ければ空、f_10 §11.1-4)。"""
-    lines = [
-        f'  `monkeypatch.setattr({loc.module}, "{loc.constant}", {loc.replacement})`'
-        # 既定引数に焼き込まれた定数は差し替えが届かないので挙げない (R17)
-        for loc in file_based_data_locations(written) if loc.constant and not loc.baked
-    ]
-    return _ADVISORY_DATA_CONSTANTS.format(lines="\n".join(lines)) if lines else ""
+
 
 
 def _unbake(cmap: dict[str, str], paths: list[str], record: list[str]) -> dict[str, str]:
@@ -1112,6 +1072,11 @@ def break_undeclared_cycles(
 
 
 
+def _usage_not_run(check: CheckOutcome) -> bool:
+    """使い方の実行が時間切れ・実行の場の制約で走らなかった (もう 1 回実行しても同じ結果になる)。"""
+    return check.is_unchecked and check.reason is UncheckedReason.NOT_RUN
+
+
 def _read_text(path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -1127,48 +1092,14 @@ def _test_files_named_in(query: str) -> list[str]:
     """依頼文が名指したテストファイルの名前 (出た順、重複なし)。"""
     return list(dict.fromkeys(m.group(1) for m in _NAMED_TEST_FILE_RE.finditer(query or "")))
 
-_EXAMPLE_TEST_RE = re.compile(r"test_example_(\d+)\b")
 
 
-def _contract_revert_line(
-    decided_by: str | None, paths: list[str], *, before: int, after: int,
-    contract_unchecked: bool, usage_unchecked: bool,
-) -> str:
-    """契約テストの作り直しを戻した理由の 1 行 (悪化を決めた項目から選ぶ、f_10 §11.1-4)。"""
-    from backend.i18n_helper import msg
-
-    names = ", ".join(paths)
-    if decided_by == "contract":
-        if contract_unchecked:
-            return msg("create.contract_repair_unchecked", paths=names)
-        return msg("create.contract_repair_worse", before=before, after=after, paths=names)
-    if decided_by == "usage":
-        key = "create.contract_repair_usage_unchecked" if usage_unchecked else "create.contract_repair_broke_usage"
-        return msg(key, paths=names)
-    if decided_by == "smoke":
-        return msg("create.contract_repair_unchecked", paths=names)
-    return msg("create.contract_repair_reverted", paths=names)
 
 
-def _failed_example_cases(cases: list, failures: list[str]) -> list:
-    """契約テストの失敗の行 (``test_example_2 — AssertionError: …``) に対応する入出力例。"""
-    numbers = {int(m.group(1)) for line in failures for m in [_EXAMPLE_TEST_RE.match(line)] if m}
-    return [case for i, case in enumerate(cases, start=1) if i in numbers]
 
 
-def _contract_evidence(failed_cases: list, stdout_tail: str) -> str:
-    """契約テスト後の作り直しに渡す証拠: 落ちた例の式と期待値 + pytest の出力の末尾。"""
-    lines = [f"- `{case.module}.{case.call}` must return `{case.expected}`" for case in failed_cases]
-    head = "These input/output examples from the contract failed:\n" + "\n".join(lines) + "\n\n" if lines else ""
-    return head + "pytest output:\n" + stdout_tail[-_TEST_OUTPUT_TAIL_CHARS:]
 
 
-def _unchecked_reason(gate) -> UncheckedReason:
-    """skipped のゲートの理由 (``GateResult.skip_kind``)。知らない値は「実行できなかった」。"""
-    try:
-        return UncheckedReason(gate.skip_kind or "")
-    except ValueError:
-        return UncheckedReason.NOT_RUN
 
 
 def _declared_signatures(modules: list[dict]) -> dict[str, str]:
@@ -1208,25 +1139,8 @@ async def run_staged_v2_pipeline(
     """staged v2 を駆動し、旧経路と同じ形の構造化イベントを yield する。"""
     from backend.config import get_path_resolver
     from backend.free.generation.as_built import render_flowchart, render_spec, subcommand_usages
-    from backend.free.generation.contract_tests import (
-        build_example_tests,
-        examples_skip_reason,
-        file_dependent_example_count,
-        lint_generated_tests,
-        malformed_example_count,
-        usable_examples,
-    )
     from backend.free.generation.direct_codegen import generate_single_file
     from backend.free.loop.staged import RunEventLog, RunRecordStore, WorkspaceManager
-    from backend.free.loop.staged.test_runner import (
-        StagedTestRunner,
-        failed_count,
-        failure_lines,
-        progress_marks,
-        skip_messages,
-        skipped_count,
-    )
-    from backend.free.loop.staged.workspace import StageTestResult
     from backend.i18n_helper import get_locale, msg
     from backend.io.id_registry import new_id
 
@@ -1422,28 +1336,19 @@ async def run_staged_v2_pipeline(
     sibling_sheet_modules = 0
     advisory_path = ""
     py_modules = [m for m in modules if m["path"].endswith(".py")]
-    advisory = tests_enabled and bool(py_modules)
+    from backend.edition import get_pro_handler
+    from backend.free.loop.staged.test_stage import STAGED_TEST_STAGE_HANDLER, StagedTestStageContext
+
+    # テスト工程は Pro の handler (登録が無ければ Free の構成 = 工程なし、f_10 §11.3)
+    test_stage = get_pro_handler(STAGED_TEST_STAGE_HANDLER) if tests_enabled else None
+    advisory = test_stage is not None and bool(py_modules)
     if advisory:
         advisory_path = f"test_{PurePosixPath(py_modules[0]['path']).stem}_generated.py"
         shared = (f"{brief}\n\n" if brief else "") + render_skeleton_context(skeleton, query)
-
-        def _advisory_job(written: dict[str, str]):
-            # 前の段の本文から拾ったデータの置き場の定数を渡す (1 段なら無し、f_10 §11.1-4 R12)
-            instruction = f"{shared}{SHARED_CONTEXT_BOUNDARY}" + _ADVISORY_TEST_TASK.format(
-                path=advisory_path, example_module=PurePosixPath(py_modules[0]["path"]).stem,
-                data_constants=_advisory_data_constants(written),
-            )
-
-            async def _job(slot: int) -> str:
-                if _remaining() < _CALL_FLOOR_SEC or _is_cancelled():
-                    return ""
-                out = await generate_single_file(
-                    client, instruction, advisory_path,
-                    max_tokens=_ADVISORY_TEST_MAX_TOKENS,
-                    request_timeout=max(_CALL_FLOOR_SEC, _remaining()), id_slot=slot, stats=gen_stats,
-                )
-                return out.get(advisory_path, "")
-            return _job
+        _advisory_job = test_stage.advisory_job(
+            client=client, shared=shared, py_modules=py_modules, advisory_path=advisory_path,
+            gen_stats=gen_stats, remaining=_remaining, is_cancelled=_is_cancelled,
+        )
     advisory_src = ""
     advisory_done = not advisory
     # 既定引数に焼き込んだ置き場を書き換えた ``<ファイル>: <関数>(<引数>)`` (notes / finalize に残す、R17)
@@ -1463,7 +1368,7 @@ async def run_staged_v2_pipeline(
         # 参考テストの置き場所 (f_10 §11.1-2): 段が 1 つなら本文と同時、最後の段より前の本文に置き場の定数が
         # あれば最後の段と同時、無ければ全段の後 (置き場が最後の段にあっても名前を渡す、独立レビュー P3-1)
         together = not advisory_done and i == len(waves) - 1 and (
-            len(waves) == 1 or bool(_advisory_data_constants(code_map))
+            len(waves) == 1 or bool(test_stage.data_constants(code_map))
         )
         if together:
             jobs.append(_advisory_job(dict(code_map)))
@@ -1857,10 +1762,6 @@ async def run_staged_v2_pipeline(
         )
         return outcome, blamed, (run.stderr or "")[-_TEST_OUTPUT_TAIL_CHARS:]
 
-    def _usage_not_run(check: CheckOutcome) -> bool:
-        # 時間切れ・実行の場の制約 — もう 1 回実行しても同じ結果になる
-        return check.is_unchecked and check.reason is UncheckedReason.NOT_RUN
-
     usage_check: CheckOutcome | None = None
     usage_checked_code: dict[str, str] = {}
     if command is not None and code_map and not smoke_errors:
@@ -1926,7 +1827,6 @@ async def run_staged_v2_pipeline(
         phase_sec["usage"] = round(time.monotonic() - t0, 1)
 
     # ── 4. (Pro) 契約テスト ──────────────────────────────────────
-    advisory_note = ""
     # 契約テストの作り直しの「同じ本文」(smoke の作り直しと同じ判定、f_10 §11.1-3)
     contract_history = RepairHistory()
     # SPEC.md に載せる入出力例。契約テストで例ごとに判定できたときは合格した例だけ (除外・不合格の例を落とす)。
@@ -1949,284 +1849,33 @@ async def run_staged_v2_pipeline(
 
     def _is_named(name: str) -> bool:
         return name in named_tests
-    if tests_enabled and code_map and not smoke_errors:
-        t0 = time.monotonic()
-        runner = StagedTestRunner(
-            workspace=ws, test_timeout_sec=float(staged_cfg.get("test_timeout_sec", 120.0)),
-            debug_logger=state.debug_logger,
+    if test_stage is not None and code_map and not smoke_errors:
+        ctx = StagedTestStageContext(
+            query=query, brief=brief, locale=locale, skeleton=skeleton, modules=modules, staged_cfg=staged_cfg,
+            state=state, ws=ws, event_log=event_log, slots=slots, missing=missing, smoke_errors=smoke_errors,
+            smoke_unchecked=smoke_unchecked, static_check=static_check, revert_if_worse=revert_if_worse,
+            contract_history=contract_history, requested_tests=requested_tests, is_named=_is_named,
+            advisory_path=advisory_path, advisory_src=advisory_src, check=_check, module_job=_module_job,
+            remaining=_remaining, run_usage_check=_run_usage_check, verified=_verified,
+            checks=checks, verification=verification, notices=notices, extra_files=extra_files,
+            phase_sec=phase_sec, code_map=code_map, delivered_state=delivered_state,
+            usage_check=usage_check, usage_checked_code=usage_checked_code, tasks_failed=tasks_failed,
+            repair_reverts=repair_reverts, repair_rounds_run=repair_rounds_run,
+            spec_examples=spec_examples, advisory_dropped=advisory_dropped,
         )
-        attempts: dict[str, int] = {}
-
-        def _record_gate(task_id: str, gate, *, kind: str) -> None:
-            # 実行ごとに tests/_runs と manifest へ (以前は debug JSONL にしか残らなかった、f_10 §11.1-4)
-            attempts[task_id] = attempts.get(task_id, 0) + 1
-            try:
-                ws.record_test_result(StageTestResult(
-                    task_id=task_id, passed=gate.ok, failed_count=failed_count(gate),
-                    attempt=attempts[task_id],
-                    summary=gate.error or gate.skip_reason or ("passed" if gate.ok else ""),
-                    output_tail=(gate.stdout_tail or gate.stderr_tail or "")[-_GATE_OUTPUT_TAIL_CHARS:],
-                    ran_at=time.time(), kind="unchecked" if gate.skipped else kind,
-                ))
-            except Exception as exc:  # noqa: BLE001 - 記録の失敗で制作は止めない
-                logger.warning("staged v2: test result record failed (%s): %s", task_id, exc)
-            _emit_check(event_log, "test_gate", {
-                "type": "task_result", "task_id": task_id, "attempt": attempts[task_id],
-                "status": "done" if gate.ok else "skipped" if gate.skipped else "failed",
-                "detail": gate.error or gate.skip_reason or "",
-                "failures": failure_lines(gate),
-            })
-
-        cases = usable_examples(skeleton, list(code_map))
-        example_src = build_example_tests(cases)
-        if example_src:
-            ws.write_file("test_examples.py", example_src, kind="test", stage="test", task_id="test_examples")
-            gate = await asyncio.to_thread(runner.run, test_logical_path="test_examples.py")
-            _record_gate("test_examples", gate, kind="pytest")
-            if not gate.ok and not gate.skipped and _remaining() >= _CALL_FLOOR_SEC:
-                gate_before = gate
-                code_before = dict(code_map)
-                # 例 (契約) に反するのはコード側 — 失敗の証拠を渡して対象モジュールを 1 回だけ作り直す。
-                # 証拠には落ちた例の式と期待値を添え、作り直すのは落ちた例のモジュールだけ (2026-10-02 ライブ
-                # 監査 K01: pytest の末尾だけを渡した作り直しが 83 秒かけて同じ本文を返した)
-                failed_cases = _failed_example_cases(cases, failure_lines(gate, limit=len(cases)))
-                failing = [
-                    m for m in modules
-                    if any(c.module == PurePosixPath(m["path"]).stem for c in failed_cases or cases)
-                ]
-                evidence = _contract_evidence(failed_cases, gate.stdout_tail or "")
-                repair_jobs = [
-                    _module_job(m, _module_instruction(skeleton, m, request=query, brief=brief, locale=locale)
-                                + "\n\n" + _REPAIR_TASK.format(
-                                    path=m["path"], fence=languages.fence_language(m["path"]),
-                                    errors=evidence, previous=code_map.get(m["path"], "")[:_PREVIOUS_CODE_CHARS]))
-                    for m in failing if m["path"] in code_map
-                ]
-                repaired = await _run_jobs(repair_jobs, slots)
-                repair_rounds_run += 1 if repair_jobs else 0
-                candidates = {
-                    m["path"]: content
-                    for m, content in zip([m for m in failing if m["path"] in code_map], repaired)
-                    if content
-                }
-                # 同じ本文が返った作り直しは検査し直しても結果が変わらない — smoke と契約の再実行を飛ばす
-                # (判定は smoke の作り直しの停滞と同じ RepairHistory、f_10 §11.1-3)
-                unchanged = [
-                    p for p, c in candidates.items()
-                    if contract_history.body_verdict(p, c, previous=code_map.get(p, ""))
-                ]
-                for path in unchanged:
-                    logger.info("staged v2: the contract repair of %s returned the same code; not re-checking", path)
-                    contract_history.drop(path, "same")
-                    candidates.pop(path)
-                repair_changed = bool(candidates)
-                # 作り直した版は smoke を通してから採る (f_10 §11.1-4)。いまの code_map は smoke
-                # 合格済みなので、落ちたモジュールは修正前の版に戻す (K05 run2: 構文エラー版が
-                # smoke 合格の元コードに取って代わった)
-                # smoke が未検査 (外へ書こうとした) になった版も採らない — いまの code_map の smoke は
-                # 未検査ではなかったので、採ると「検査済みの不合格」が「未検査」に化ける (独立レビュー)
-                static_was_checked = not static_check.is_unchecked
-                trial_state = delivered_state
-                while candidates:
-                    wired_trial, trial_errors, _ = await _check({**code_map, **candidates})
-                    trial_state = _verified(wired_trial, missing, delivered_state.round)
-                    # 時間切れで走らなかった smoke も「検査できなかった」— 合格に数えない (f_10 §11.1-4)
-                    lost_smoke = (
-                        "smoke" in lost_checks(trial_state, delivered_state) if revert_if_worse
-                        else static_was_checked and bool(smoke_unchecked)
-                    )
-                    if lost_smoke and not trial_errors:
-                        trial_errors = [f"{p}: import smoke could not be checked" for p in candidates]
-                    if not trial_errors:
-                        break
-                    blamed = [p for p in candidates if _errors_for(p, trial_errors)] or list(candidates)
-                    for path in blamed:
-                        logger.warning(
-                            "staged v2: the contract repair of %s failed the smoke check (%s); "
-                            "keeping the previous version", path, "; ".join(trial_errors[:2]),
-                        )
-                        candidates.pop(path)
-                    verification.append(msg("create.contract_repair_reverted", paths=", ".join(blamed)))
-                adopted = False
-                if candidates:
-                    # smoke に通った組 (配線後) をそのまま採る
-                    for path, content in wired_trial.items():
-                        if code_map.get(path) != content:
-                            code_map[path] = content
-                            adopted = True
-                            ws.write_file(path, content, kind="src", stage="code", task_id=_task_id(path))
-                # 契約テストのファイルはこの工程しか書かず、テストの実行は tests/ へ書けない (隔離が止める) ので、
-                # 実際には契約は変わらない。変わった回 (将来、契約を作り直す経路を足したとき) に件数を比べない
-                # ための防御 (test_fix_is_kept_when_the_contract_itself_changed が固定する)
-                contract_now = _read_text(ws.path("tests/test_examples.py"))
-                if repair_changed:
-                    gate = await asyncio.to_thread(runner.run, test_logical_path="test_examples.py")
-                    _record_gate("test_examples", gate, kind="pytest")
-                # 契約そのものを作り直した回は件数を比べられない
-                comparable = adopted and contract_now == example_src
-                # 修正前は不合格 (検査できた) — 修正版が未検査なら「不合格」が「未検査」に化ける
-                unchecked_after = comparable and gate.skipped
-                count_worse = comparable and not gate.skipped and failed_count(gate) > failed_count(gate_before)
-                worse = count_worse or unchecked_after
-                decided_by: str | None = "contract" if worse else None
-                usage_trial = usage_check
-                if revert_if_worse and adopted:
-                    # smoke と同じ方針で比べる (f_10 §11.1-4)。使い方は作り直した版でその場で実行する —
-                    # 契約の失敗が減っても使い方が合格 → 不合格になったら戻す
-                    if usage_check is not None and not _usage_not_run(usage_check):
-                        usage_trial, _, _ = await _run_usage_check(code_map)
-                        if _usage_not_run(usage_trial):
-                            # 時間切れは負荷による一過性のことがある — 1 回だけ実行し直してから決める
-                            usage_trial, _, _ = await _run_usage_check(code_map)
-                    state_before = replace(
-                        delivered_state, code_map=code_before, usage=usage_check,
-                        contract_failed=failed_count(gate_before), contract_key=example_src,
-                    )
-                    state_after = replace(
-                        trial_state, code_map=dict(code_map), usage=usage_trial,
-                        contract_failed=None if gate.skipped else failed_count(gate), contract_key=contract_now,
-                    )
-                    sign, decided_by = compare(state_after, state_before)
-                    # 未検査の契約は、使い方が良くなっても検査済みの不合格の上に採らない
-                    if unchecked_after:
-                        decided_by = "contract"
-                    worse = sign > 0 or unchecked_after
-                    if not worse and usage_check is not None:
-                        usage_check, usage_checked_code = usage_trial, dict(code_map)
-                        delivered_state = state_after
-                if worse:
-                    # 作り直しで悪化した — 修正前の版に丸ごと戻す (K01: 2 → 4 failed のまま配信された)。
-                    # 配線で増えたファイルも消す (残すと版が混ざる)
-                    changed = [p for p in code_before if code_map.get(p) != code_before[p]]
-                    added = [p for p in code_map if p not in code_before]
-                    reverted = changed + added
-                    logger.warning(
-                        "staged v2: the contract repair made things worse (%s; %d failed -> %s); "
-                        "keeping the previous version of %s",
-                        decided_by, failed_count(gate_before),
-                        "not checked" if gate.skipped else f"{failed_count(gate)} failed", reverted,
-                    )
-                    code_map = dict(code_before)
-                    for path in changed:
-                        ws.write_file(path, code_before[path], kind="src", stage="code", task_id=_task_id(path))
-                    for path in added:
-                        ws.remove_file(path, kind="src")
-                    repair_reverts += 1
-                    verification.append(_contract_revert_line(
-                        decided_by, reverted, before=failed_count(gate_before), after=failed_count(gate),
-                        contract_unchecked=gate.skipped,
-                        usage_unchecked=usage_trial is None or usage_trial.is_unchecked,
-                    ))
-                    gate = gate_before
-                    # 最新の記録を戻した版の結果にする (悪化版のまま残さない)
-                    _record_gate("test_examples", gate, kind="pytest")
-            # skip した例 (ファイル・前の例の結果・乱数に依存) は契約から外したもの — 件数に数えない。
-            # 全件 skip の実行は rc 0 で ok になるが「合格」ではない (2026-10-02 ライブ監査 K01)
-            checked = len(cases) - skipped_count(gate)
-            marks = progress_marks(gate)
-            if len(marks) == len(cases):
-                spec_examples = [
-                    {"module": c.module, "call": c.call, "expected": c.expected}
-                    for c, mark in zip(cases, marks) if mark == "."
-                ]
-            if gate.skipped:
-                contract_check = CheckOutcome.unchecked(
-                    CheckKind.CONTRACT, _unchecked_reason(gate), detail=gate.skip_detail or "", count=len(cases),
-                )
-            elif gate.ok and checked <= 0:
-                # 理由は skip の理由から (乱数・時刻だけで外した回を「ファイルに依存」と書かない)
-                contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, examples_skip_reason(skip_messages(gate)))
-            elif gate.ok:
-                contract_check = CheckOutcome.passed(CheckKind.CONTRACT, count=checked)
-            else:
-                tasks_failed += 1
-                contract_check = CheckOutcome.failed(
-                    CheckKind.CONTRACT, count=checked, errors=failed_count(gate), failures=failure_lines(gate),
-                )
-        elif malformed_example_count(skeleton, list(code_map)):
-            # 例はあるのに形が崩れていて組めない — 「例なし」と黙らない (2026-09-27 ライブ監査 M7)
-            contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, UncheckedReason.INVALID_EXAMPLES)
-        elif file_dependent_example_count(skeleton, list(code_map)):
-            # 例はファイルを名指すので組まなかった — 「例なし」とは書かない (2026-10-02 ライブ監査 K03 / K05)
-            contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, UncheckedReason.STATEFUL_EXAMPLES)
-        else:
-            contract_check = CheckOutcome.unchecked(CheckKind.CONTRACT, UncheckedReason.NO_EXAMPLES)
-        checks.append(contract_check)
-        verification.append(contract_check.render())
-        if contract_check.failures:
-            verification.append(contract_check.render_failures())
-        if advisory_src:
-            linted, dropped = lint_generated_tests(
-                advisory_src, allowed_text=query + json.dumps(skeleton, ensure_ascii=False),
-                # 本文が __file__ 基準の置き場を持つのに chdir だけで隔離するテストも落とす (R12)
-                data_locations=file_based_data_locations(code_map),
-            )
-            if dropped:
-                # 件数だけでは実物で確かめられない — 理由をログへ、lint 前の本文を tests/_dropped/ へ (R8)
-                advisory_dropped = list(dropped)
-                try:
-                    kept_at = ws.record_dropped_test(advisory_path, advisory_src)
-                except Exception as exc:  # noqa: BLE001 - 記録の失敗で制作は止めない
-                    logger.warning("staged v2: could not keep the dropped advisory test: %s", exc)
-                    kept_at = "(not kept)"
-                logger.info(
-                    "staged v2: lint dropped %d brittle check(s) from the advisory test %s "
-                    "(raw output kept at %s): %s",
-                    len(dropped), advisory_path, kept_at, "; ".join(dropped),
-                )
-            if linted:
-                ws.write_file(advisory_path, linted, kind="test", stage="test", task_id="test_advisory")
-                agate = await asyncio.to_thread(runner.run, test_logical_path=advisory_path)
-                _record_gate("test_advisory", agate, kind="advisory")
-                if agate.skipped:
-                    advisory_check = CheckOutcome.unchecked(
-                        CheckKind.ADVISORY, _unchecked_reason(agate), detail=agate.skip_detail or "",
-                    )
-                elif agate.ok:
-                    advisory_check = CheckOutcome.passed(CheckKind.ADVISORY)
-                else:
-                    advisory_check = CheckOutcome.failed(
-                        CheckKind.ADVISORY, errors=failed_count(agate), failures=failure_lines(agate),
-                    )
-                if requested_tests:
-                    # 依頼されたテストは参考テストを依頼の名前で配信する (f_10 §11.1-1 / §11.3)
-                    extra_files[requested_tests[0]] = linted
-                    if advisory_check.is_failure:
-                        notices.append(msg(
-                            "create.requested_tests_failing" if _is_named(requested_tests[0])
-                            else "create.tests_failing",
-                            name=requested_tests[0],
-                        ))
-                elif advisory_check.is_failure:
-                    # 配信しない参考テストの不合格も本文に 1 行 (SPEC にしか無かった、2026-09-27 ライブ監査 M7)
-                    notices.append(
-                        msg("create.reference_tests_failing", count=advisory_check.errors)
-                        if advisory_check.errors else msg("create.reference_tests_failing_some")
-                    )
-            elif dropped:
-                # 生成したが lint が全件落とした — 「参考テストなし」と書かない (独立レビュー P3-6)
-                advisory_check = CheckOutcome.unchecked(
-                    CheckKind.ADVISORY, UncheckedReason.LINT_DROPPED, detail=str(len(dropped)),
-                )
-            else:
-                advisory_check = CheckOutcome.unchecked(CheckKind.ADVISORY, UncheckedReason.NO_TESTS)
-            checks.append(advisory_check)
-            advisory_note = advisory_check.render()
-            if advisory_check.is_failure:
-                advisory_note += msg("create.check.advisory_warning_only")
-            if dropped and linted:
-                advisory_note += msg("create.check.advisory_dropped", count=len(dropped))
-            verification.append(advisory_note)
-            if advisory_check.failures:
-                verification.append(advisory_check.render_failures())
-        phase_sec["tests"] = round(time.monotonic() - t0, 1)
+        await test_stage.run(ctx)
+        code_map, delivered_state = ctx.code_map, ctx.delivered_state
+        usage_check, usage_checked_code = ctx.usage_check, ctx.usage_checked_code
+        tasks_failed, repair_reverts = ctx.tasks_failed, ctx.repair_reverts
+        repair_rounds_run, spec_examples = ctx.repair_rounds_run, ctx.spec_examples
+        advisory_dropped = ctx.advisory_dropped
     # 自分の前の検査 (import / 静的検査) が不合格で飛ばした検査は、何も出さずに消えるのでなく未検査 (前提の不合格) として
     # 伝える。契約テストの行は、その工程がある構成 (Pro) だけ — Free に足すと ``unchecked_labels`` が毎回ラベル無しにする。
     # 使い方の実行は ``usage_check`` に入れない (作り直しの比較 ``staged_v2_state`` は未実行と未検査を同じ点に数える)
     if smoke_errors and code_map:
         skip_detail = msg("create.check.label.static")
         skipped: list[CheckOutcome] = []
-        if tests_enabled:
+        if test_stage is not None:
             skipped.append(CheckOutcome.unchecked(
                 CheckKind.CONTRACT, UncheckedReason.PREREQUISITE_FAILED, detail=skip_detail,
             ))
@@ -2298,7 +1947,7 @@ async def run_staged_v2_pipeline(
             notices.append(line)
     named_only = [name for name in requested_tests if _is_named(name)]
     planned_only = [name for name in requested_tests if not _is_named(name)]
-    if requested_tests and not tests_enabled:
+    if requested_tests and test_stage is None:
         # テスト工程の無い構成 (Free) — 作っていないことを本文で伝える
         if named_only:
             notices.append(msg("create.requested_tests_not_available", names=", ".join(named_only)))
