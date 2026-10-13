@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from backend.free.constants import READ_FILE_META_PREFIX
+from backend.free.core.response_verifiers import stated_change_percents
 from backend.free.core.script_ranges import KANJI, KANJI_EXT_A, KANJI_MARKS, KATAKANA_WORD
 
 __all__ = [
@@ -662,10 +663,13 @@ def _base_numbers(segment: str, result: AggregateResult) -> list[Decimal]:
 
 
 def contradicted_derived(response: str, result: AggregateResult) -> list[DerivedValue]:
-    """応答がグループに帰して述べた百分率が、どの派生値とも合わないもの (純粋関数)。
+    """応答がグループの範囲 (無ければ応答全体の増減率) で述べた百分率が、どの派生値とも合わないもの。
 
-    照合するのは百分率の派生値 (``pct_change`` / ``share_of_total``) だけ。グループの範囲は
-    :func:`contradicted_values` と同じ (グループの値の位置から次のグループの値の手前まで)。
+    純粋関数。照合するのは百分率の派生値 (``pct_change`` / ``share_of_total``) だけ。
+    グループの範囲は :func:`contradicted_values` と同じ (グループの値の位置から次の
+    グループの値の手前まで)。グループの値が応答に 1 つも無ければ応答全体を全派生値の
+    範囲とし、変化として述べた率 (``response_verifiers.stated_change_percents``: 向きの語・
+    比べた率のラベル・符号) だけを見る — 「構成比 20%」「消費税 10%」は帯に入っても数えない。
     範囲の「%」の数のうち絶対値が派生値の絶対値の ``_CONTRADICTION_BAND`` に入るものを
     候補とし、候補がありどれも **いずれかの** 派生値と合わなければ食い違い
     (:func:`_matches_rate`: 小数は ±``_PERCENT_TOLERANCE``、整数は四捨五入した値)。
@@ -690,6 +694,11 @@ def contradicted_derived(response: str, result: AggregateResult) -> list[Derived
         scoped.setdefault(key, []).extend(
             Decimal(m.group("num")) for m in _PERCENT_RE.finditer(text[end:stop])
         )
+    if not spans:
+        # グループの値が 1 つも現れない (「9月」と書き換えた) ときは応答全体を範囲にし、
+        # 変化として述べた率だけを見る (構成比・税率は帯に入っても別の量)
+        whole = [Decimal(n) for n in stated_change_percents(text)]
+        scoped = {item.key: whole for item in result.derived}
     contradicted: list[DerivedValue] = []
     for item in result.derived:
         if item.value is None:

@@ -251,6 +251,7 @@ async def summarize_unsummarized_sessions(
     should_pause: Callable[[], bool] | None = None,
     skip_modes: frozenset[str] = frozenset(),
     first_session_id: str | None = None,
+    on_paused: Callable[[int], None] | None = None,
 ) -> int:
     """未要約セッションに LLM 要約 + 埋め込みベクトルを生成する。
 
@@ -286,6 +287,9 @@ async def summarize_unsummarized_sessions(
             (:func:`chat_summary_skip_modes`)。見送ったセッションは次サイクルが拾う。
         first_session_id: 先に要約する会話 (待ちすぎた最古の会話、
             :func:`oldest_pending_summary`)。打ち切らせない 1 回をこの会話に充てる。
+        on_paused: チャットに譲って打ち切ったとき、まだ要約に出せる会話の件数
+            (見送りの会話を除く、:func:`_held_back`) を受け取る。次の Full を
+            張るかの判断に使う (f_02 §4.4)。
 
     Returns:
         実際に要約を生成できたセッション数。
@@ -307,7 +311,17 @@ async def summarize_unsummarized_sessions(
     if first_session_id is not None:
         entries.sort(key=lambda e: getattr(e, "session_id", None) != first_session_id)
 
-    for entry in entries:
+    def _report_left(start: int) -> None:
+        # ``pending_total - attempted`` は見送りの会話も含むので使わない (見送りだけが
+        # 残ると次の Full を張り続ける)。
+        if on_paused is None:
+            return
+        on_paused(sum(
+            1 for e in entries[start:]
+            if needs_summary(e) and not _held_back(e, skip_modes)
+        ))
+
+    for pos, entry in enumerate(entries):
         if is_cancelled is not None and is_cancelled():
             break
         # 協調 yield: チャット生成が走っている間はセッション境界で手を止める
@@ -319,6 +333,7 @@ async def summarize_unsummarized_sessions(
                     "Step 8-9 summarization paused for the user turn: "
                     "%d session(s) left pending for the next cycle", remaining,
                 )
+            _report_left(pos)
             break
         if batch_size > 0 and summarized >= batch_size:
             break
@@ -389,6 +404,7 @@ async def summarize_unsummarized_sessions(
                     "%d session(s) left pending for the next window",
                     pending_total - attempted + 1,
                 )
+                _report_left(pos)
                 break
             logger.warning(
                 "Failed to summarize session %s: %s", entry.session_id, exc,

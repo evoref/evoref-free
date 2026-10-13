@@ -52,11 +52,16 @@ from backend.free.core.text_quality import (
     value_was_adopted,
 )
 from backend.free.llm.json_schemas import AssertionNaming
-from backend.free.memory.corrections import correction_target, has_correction_shape
+from backend.free.memory.corrections import (
+    correction_target,
+    correction_topics,
+    has_correction_shape,
+)
 from backend.free.core.correction_verdict import strip_copula
 from backend.free.memory.extractors.base import (
     OWN_VALUE_UPDATE_VERDICTS,
     note_is_verified_correction,
+    note_may_update_own_value,
     note_verification_rejected,
     value_update_spans,
 )
@@ -306,9 +311,19 @@ def _replaces_a_value(note: "MemoryNote") -> bool:
 
 
 def _is_verified_self_restatement(note: "MemoryNote", content: str) -> bool:
-    """検証済み ``self`` の訂正で、「X ではなく Y」の旧値 span が取れるノートか。"""
+    """検証済みの本人の値の言い直し (``self`` / 本人の値更新) で、「X ではなく Y」の
+    旧値 span が取れるノートか。
+
+    検証は同じ「2泊3日ではなく1泊2日に変更になりました」を ``self`` にも
+    ``premise_change`` にも答える。``self`` しか通さないと、task タグの値更新が
+    命名に届かず旧値が live に残った (audit_replay R26_cross_recall)。伝聞・仮定は
+    :func:`note_may_update_own_value` が落とす (不変則 #12)。
+    """
+    verdict = str(getattr(note, "correction_verdict", "") or "")
     return (
-        str(getattr(note, "correction_verdict", "") or "") == "self"
+        getattr(note, "correction_verified_at", None) is not None
+        and (verdict == "self" or verdict in OWN_VALUE_UPDATE_VERDICTS)
+        and note_may_update_own_value(note)
         and value_update_spans(content) is not None
     )
 
@@ -346,6 +361,89 @@ def _old_value_target(
         if topic & set(getattr(other, "keywords", None) or ()):
             found.append(other)
     return found[0] if len(found) == 1 else None
+
+
+def _old_value_live_slug(
+    store: "SemanticFactStore", note: "MemoryNote", span: str,
+) -> str | None:
+    """旧値の span を持つ live の assertion が **ちょうど 1 件** なら、その slug。
+
+    話題語を落とした本人の値の言い直し (「すみません、2泊3日ではなく1泊2日に変更に
+    なりました。」の keywords は「変更」「行程」) は、:func:`_old_value_target` の
+    話題語の重なりで宛先を継げず別 slug に並び、旧値が live のまま残る
+    (audit_replay R26_cross_recall)。宛先は語の重なりでなく旧値で決める — 照合は
+    畳み (``fact_carries_span``) と同じ本文 (object / 原文)、本文に旧値が
+    **ちょうど 1 回、語として** 現れる行が、訂正より古い **同じセッションの** live に
+    1 件だけのとき (Step 8 の ``_inherit_corrected_slot`` と同じ方式、不変則 #13)。
+    0 件・2 件以上なら継がない (多値の兄弟を巻き添えにしない)。その行の旧値が他者の
+    値 (「妻は来週大阪へ2泊3日の出張です。」) なら継がない — セッションを問わず全件から
+    選ぶと、本人の元発話が命名されていないとき妻の予定を継いで畳んだ (PR #1078 反証
+    レビュー)。``assistant`` の訂正の旧値は
+    アシスタントの言い誤りなので対象外、伝聞・仮定は
+    :func:`note_may_update_own_value` が落とす (#12)。
+    """
+    from backend.free.core.correction_verdict import norm_span
+    from backend.free.memory.semantic.fact import fact_carries_span
+    from backend.free.memory.sleep.extraction import _names_value_once
+
+    verdict = str(getattr(note, "correction_verdict", "") or "")
+    if not (verdict == "self" or verdict in OWN_VALUE_UPDATE_VERDICTS):
+        return None
+    if not note_may_update_own_value(note):
+        return None
+    needle = norm_span(span)
+    if len(needle) < 2:
+        return None
+    search = getattr(store, "search_by_pillar_prefix", None)
+    if search is None:
+        return None
+    try:
+        live = search(f"mem.world.{_SUBJECT_PREFIX}.", include_superseded=False)
+    except Exception:  # ストアの状態に依存しない (取れなければ継がない)
+        return None
+    session = getattr(note, "session_id", None)
+    if not session:
+        return None
+    at = float(getattr(note, "created_at", 0.0) or 0.0)
+    holders = [
+        f for f in live
+        if not getattr(f, "superseded_by", None)
+        and session in (getattr(f, "session_ids", None) or ())
+        and float(getattr(f, "created_at", 0.0) or 0.0) <= at
+        and fact_carries_span(f, needle)
+    ]
+    if len(holders) != 1:
+        return None
+    (holder,) = holders
+    raw = (getattr(holder, "_extra", None) or {}).get("raw_utterance") or ""
+    texts = (getattr(holder, "object", "") or "", raw)
+    if not any(_names_value_once(norm_span(str(t)), needle) for t in texts if t):
+        return None
+    if _old_value_belongs_to_another_person(raw or texts[0], span):
+        return None
+    return str(holder.subject).rsplit(".", 1)[-1]
+
+
+def _old_value_belongs_to_another_person(text: str, old: str) -> bool:
+    """旧値を含む文の **すべて** が他者の値の文か (純粋関数)。
+
+    「妻は来週大阪へ2泊3日の出張です。」の 2泊3日 は本人の旅行の旧値ではない
+    (PR #1078 反証レビュー)。判定は Step 8 の ``third_party_correction_slots`` と同じ
+    人名詞の SSOT (``value_modifies_another_person`` / ``attribute_belongs_to_another_person``)
+    で、旧値を含む文が 1 つでも本人の文なら他者とみなさない。
+    """
+    from backend.free.core.text_quality import (
+        attribute_belongs_to_another_person,
+        value_modifies_another_person,
+    )
+    from backend.free.memory.extractors.chat import _SENTENCE_SPLIT_RE
+
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text or "") if old in s]
+    return bool(sentences) and all(
+        value_modifies_another_person(s, old, ())
+        or attribute_belongs_to_another_person(s, (old,))
+        for s in sentences
+    )
 
 
 def _old_value_span(note: "MemoryNote", content: str) -> str:
@@ -633,6 +731,11 @@ async def curate_assertion_facts(
                 note, all_notes, _old_value_span(note, content),
             ) or correction_target(note, all_notes)
             inherited = getattr(target, "assertion_slug", None) if target else None
+            if not inherited:
+                # 話題語が重ならない言い直しは、旧値を持つ live の行で継ぐ。
+                inherited = _old_value_live_slug(
+                    store, note, _old_value_span(note, content),
+                )
             if inherited:
                 logger.info(
                     "assertion_curator: correction %s inherits slug %s from %s",
@@ -701,6 +804,7 @@ async def curate_assertion_facts(
             # span の無い訂正は兄弟を畳まない (共通入口 write_sleep_facts が畳む)。
             if has_correction_shape(note) and _replaces_a_value(note):
                 fact.value_update = _old_value_span(note, content)  # type: ignore[attr-defined]
+                fact.value_update_topics = correction_topics(note)  # type: ignore[attr-defined]
             if not write_sleep_facts(store, [fact], label="assertion"):
                 continue
             written += 1

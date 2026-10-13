@@ -218,6 +218,11 @@ class SleepTimeWorker:
         self._aux_prompt_manager = aux_prompt_manager
         self._fewshot_pool = None
         self._cancelled = False
+        #: 直近の Full で要約 (Step 8-9) がチャットに譲って打ち切ったとき、まだ要約に
+        #: 出せる会話の件数 (見送りの会話を除く)。scheduler が次の Full を張るかを
+        #: これで決める (f_02 §4.4)。結果辞書の段キーにしない — 死活監視が「効果」
+        #: として読んでしまう (c_07 §7.1)。
+        self.summary_paused_left = 0
         #: このサイクルの件数の倍率 (実測 tps から、Full の開始時に引き直す。c_16 §7.2.3)。
         #: 未測定の間は 1.0 で件数は既定のまま。
         self._background_scale = 1.0
@@ -904,6 +909,7 @@ class SleepTimeWorker:
         async with self._cycle_lock:
             self._cancelled = False
             self._bounded_preempted = 0
+            self.summary_paused_left = 0
             result = await self._run_full_locked(llm_client)
         if isinstance(result, dict):
             # Step 8.0 / 8.3 の補助タスクがチャットに打ち切られた数 (c_07 §7.1)。
@@ -1035,6 +1041,11 @@ class SleepTimeWorker:
         step_durations["step8_0_correction_verify"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
             return result
+        # 検証済みでまだファクトになっていない訂正。旧値の行を作った書き手
+        # (Step 8.3) が同じバッチで閉じる (``extraction.write_sleep_facts`` の 5)。
+        from backend.free.memory.sleep.extraction import verified_pending
+
+        pending_corrections = verified_pending(self._curatable_notes())
 
         # Step 8: SemanticFact Extractor
         # (2026-09-21) _step8_9_summarize_sessions は Full 冒頭 (Step 5.85 の
@@ -1053,8 +1064,15 @@ class SleepTimeWorker:
         # 語形 1 つの欠落で 0 件になる事故 (2026-08-31 / 09-04 / 09-08 F-01) の
         # 受け皿。値は発話の部分文字列であることをコード側で検証する。
         ts = time.monotonic()
+        closure: dict[str, int] = {}
         result["personal_facts_split"] = await self._step8_3_split_personal_facts(
-            llm_client,
+            llm_client, corrections=pending_corrections, stats_out=closure,
+        )
+        result["corrections_closed_in_batch"] = int(
+            closure.get("corrections_closed_in_batch", 0),
+        )
+        result["corrections_abstained_in_batch"] = int(
+            closure.get("corrections_abstained_in_batch", 0),
         )
         step_durations["step8_3_personal_fact_split"] = round(time.monotonic() - ts, 3)
         if self._check_cancelled():
@@ -1577,6 +1595,7 @@ class SleepTimeWorker:
                 should_pause=lambda: not preemption_suspended() and self._chat_recent(quiet),
                 skip_modes=skip_modes,
                 first_session_id=oldest_id if overdue else None,
+                on_paused=lambda left: setattr(self, "summary_paused_left", left),
             )
 
     def _summary_overdue_seconds(self) -> float:
@@ -1899,11 +1918,19 @@ class SleepTimeWorker:
 
     # ── Step 8.3 (personal fact split) ─────────────────
 
-    async def _step8_3_split_personal_facts(self, llm_client=None) -> int:
+    async def _step8_3_split_personal_facts(
+        self,
+        llm_client=None,
+        *,
+        corrections: list | None = None,
+        stats_out: dict | None = None,
+    ) -> int:
         """Step 8.3: regex が取りこぼした自己開示発話を属性ごとに分けて書く。
 
         実ロジックは :mod:`backend.free.memory.sleep.personal_fact_curator`
         に分離されている。本メソッドは state を詰め替える薄いラッパ。
+        ``corrections`` / ``stats_out`` は同じバッチで閉じる訂正とその件数
+        (``extraction.write_sleep_facts`` の 5)。
         """
         from backend.free.memory.sleep.personal_fact_curator import (
             _MAX_PER_CYCLE,
@@ -1920,6 +1947,8 @@ class SleepTimeWorker:
                 profile_id=self._profile_id,
                 should_pause=self._bounded_step_pause(),
                 max_per_cycle=self._cycle_count(_MAX_PER_CYCLE),
+                corrections=corrections,
+                stats_out=stats_out,
             )
 
     async def _step8_35_apply_slot_edits(self, llm_client=None) -> dict[str, int]:

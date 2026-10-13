@@ -339,6 +339,35 @@ def conversation_operands(
     return tuple(seen)
 
 
+def has_dialogue_operand(expression: str, query: str, dialogue: str = "") -> bool:
+    """式の被演算子のうち 1 つ以上がクエリか会話に書かれているか (純粋関数)。
+
+    数値リテラル (日付・時間長の文字列は値で、:func:`_expression_number_literals`) が
+    クエリか会話に書かれているか、数える関数の文字列が会話の原文のひとまとまりとして
+    現れれば真。単位系の定数 (``1`` / ``60`` 等) は書かれたものとして数えない —
+    「計算ミスを減らすには？」に ``1``、「今日は何曜日」に ``date_diff('today', 'monday')``
+    が組まれ、計算の問いでないターンに calculate が撃たれていた (2026-10-12)。
+    """
+    known = _known_numbers(query or "") | _known_numbers(dialogue or "")
+    known |= _plain_numbers(known)
+    text = f"{query or ''}\n{dialogue or ''}"
+    known |= _named_constant_prefixes(text)
+    if any(n in known for n in _expression_number_literals(expression)):
+        return True
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in TEXT_COUNT_OPS and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and _count_text_grounded(node.args[0].value, text)
+        for node in ast.walk(tree)
+    )
+
+
 #: 桁区切り入りの数字 (``2,660`` / ``1,234,567``)。アシスタント自身が金額を
 #: この書式で提示するため、次のターンでその数値を使う式が「対話に無い数値」と
 #: 誤判定されていた (実インシデント 2026-08-03 ライブ監査: 直前の回答

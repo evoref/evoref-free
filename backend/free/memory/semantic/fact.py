@@ -132,6 +132,10 @@ FACT_CURATOR_ATTR_FIELDS: frozenset[str] = frozenset({
     "source_note_id", "raw_utterance",
     # 行が置き換える旧値の span (不変則 #13)。Step 6B と到着時の畳みが後から読む。
     "value_update",
+    # その訂正の話題語 (``corrections.correction_topics``)。旧値の span を持つ行の
+    # うち畳んでよい行を決める (``corrections.rows_the_correction_names``)。任意キー
+    # で、無い行 (2026-10-13 より前に書かれた行) は「話題語なし」として読む。
+    "value_update_topics",
 })
 
 
@@ -145,6 +149,20 @@ def fact_value_update(fact: object) -> str:
     if not span:
         span = (getattr(fact, "_extra", None) or {}).get("value_update")
     return str(span or "")
+
+
+def fact_value_update_topics(fact: object) -> tuple[str, ...]:
+    """ファクトが置き換える旧値の訂正の話題語 (無ければ空タプル、純粋関数)。
+
+    :func:`fact_value_update` と同じく、作業値 (``fact.value_update_topics``) か
+    永続形 (``attrs.value_update_topics`` → ``SemanticFact._extra``) から読む。
+    """
+    topics = getattr(fact, "value_update_topics", None)
+    if not topics:
+        topics = (getattr(fact, "_extra", None) or {}).get("value_update_topics")
+    if isinstance(topics, str) or not topics:
+        return ()
+    return tuple(str(t) for t in topics if t)
 
 
 def fact_carries_span(fact: object, needle: str) -> bool:
@@ -161,13 +179,19 @@ def fact_carries_span(fact: object, needle: str) -> bool:
 
     if not needle:
         return False
+    return any(needle in norm_span(text) for text in fact_span_texts(fact))
+
+
+def fact_span_texts(fact: object) -> tuple[str, ...]:
+    """旧値の span・訂正の話題語を照らすファクトの本文 (純粋関数)。
+
+    object と、assertion (``mem.world.assertion.*``) に限りキュレーターが残した原文
+    (``raw_utterance``)。範囲の理由は :func:`fact_carries_span`。
+    """
     raw = ""
     if str(getattr(fact, "subject", "") or "").startswith("mem.world.assertion."):
         raw = (getattr(fact, "_extra", None) or {}).get("raw_utterance") or ""
-    return any(
-        needle in norm_span(str(text))
-        for text in (getattr(fact, "object", "") or "", raw) if text
-    )
+    return tuple(str(t) for t in (getattr(fact, "object", "") or "", raw) if t)
 
 #: ``SemanticFact`` のフィールド → ``Evidence`` の書き先 (c_05 §1.4 の対応表)。
 #:
@@ -651,7 +675,9 @@ __all__ = [
     "fact_namespace",
     "fact_patch",
     "fact_carries_span",
+    "fact_span_texts",
     "fact_to_evidence",
     "fact_value_update",
+    "fact_value_update_topics",
     "is_ignored_fact_record",
 ]

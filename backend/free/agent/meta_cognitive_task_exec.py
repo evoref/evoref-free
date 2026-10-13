@@ -470,6 +470,8 @@ class _TaskExecutionMixin:
         self._primary_retrieval_missed = False
         # ループを同じ結果の繰り返しで打ち切ったか (付随の素材を捨てるかを決める、run23 Z1r)
         self._stopped_by_repeat = False
+        # ループを手順の上限で打ち切ったか (同上、audit_replay R10)
+        self._stopped_by_step_limit = False
 
         if tools_registry is not None:
             judgement = await self._judge_tool_for_task(
@@ -780,14 +782,41 @@ class _TaskExecutionMixin:
         sources = getattr(self, "_material_tools", None)
         if sources is None:
             sources = self._material_tools = {}
+        material_args = getattr(self, "_material_args", None)
+        if material_args is None:
+            material_args = self._material_args = {}
+        material_args[len(self._fetched_tool_outputs)] = dict(tool_args)
         sources[len(self._fetched_tool_outputs)] = tool_name
         self._fetched_tool_outputs.append(result_text)
         key = fetch_cache_key(tool_name, tool_args)
         if key:
             self._turn_fetches[key] = result_text
 
+    @staticmethod
+    def _same_source_as_primary(primary_args: dict, args: dict, query: str) -> bool:
+        """ループの取得が主の取得と同じ出所を対象にしたか (引数の構造だけで決める、語彙は見ない)。
+
+        場所 (``directory``) は主の場所かその配下 (兄弟・親のフォルダは別の出所)。主が場所を
+        持たなければ、場所を持たない呼出しだけ。パターン (``pattern``) は依頼文に語として出るもの
+        (依頼に無い FIXME / 思いつきの語で当たった行を依頼の該当として書かない、反証 HIGH)。
+        """
+        primary_dir, directory = primary_args.get("directory"), args.get("directory")
+        if primary_dir:
+            if not directory or relative_to_roots(str(directory), [Path(primary_dir)]) is None:
+                return False
+        elif directory:
+            return False
+        if "pattern" in args:
+            pattern = str(args.get("pattern") or "").strip()
+            if not pattern or not re.search(
+                rf"(?<!\w){re.escape(pattern)}(?!\w)", query, re.IGNORECASE,
+            ):
+                return False
+        return True
+
     def _settle_failed_task_materials(
         self, task: TaskItem, tool_calls: list[dict], before: tuple[int, int],
+        query: str = "",
     ) -> None:
         """主の取得が素材を返さなかったタスクの、その間に積んだ付随の素材と取得済み URL を捨てる。
 
@@ -799,28 +828,44 @@ class _TaskExecutionMixin:
           なら、done でも、ループが主と別のツールで積んだ素材 (一覧の後の無関係な readme.txt) を
           捨てる。主と同じツールの取得 (TODO が無ければ FIXME の検索) は残す (run23 Z1r)。モデルが
           自分の答えで終えたタスク (正しいファイルを読んで答えた) の読込みは残す (反証 MED-1)。
+        - 同じく主の取得が情報を返さなかったタスクが手順の上限で失敗したときも、主と同じツールの
+          取得だけ残す (計画が書き換えたパターンの検索が 0 件で、ループの TODO の検索は当たった、
+          audit_replay R10)。無関係な読込み (run21 Z1 の util.py) は捨てる。
+        - 残す同じツールの取得も、主と同じ出所 (同じ場所かその配下・依頼文の語のパターン) に
+          限る (``_same_source_as_primary``)。兄弟のフォルダや別のパターンの該当は捨てる (反証 HIGH)。
         """
         outputs_len, fetches_len = before
         primary = next((tc for tc in tool_calls if tc.get("fast_path")), None)
-        if task.status == "failed" and not (primary and primary.get("success")):
-            keep_tool = None
-        elif (
-            primary and not primary.get("success") and not primary.get("error")
-            and getattr(self, "_stopped_by_repeat", False)
+        primary_missed = bool(primary) and not primary.get("success") and not primary.get("error")
+        if (
+            task.status == "failed" and primary_missed
+            and getattr(self, "_stopped_by_step_limit", False)
         ):
+            keep_tool = primary.get("tool")
+        elif task.status == "failed" and not (primary and primary.get("success")):
+            keep_tool = None
+        elif primary_missed and getattr(self, "_stopped_by_repeat", False):
             keep_tool = primary.get("tool")
         else:
             return
         sources = getattr(self, "_material_tools", None) or {}
+        material_args = getattr(self, "_material_args", None)
+        if material_args is None:
+            material_args = self._material_args = {}
+        primary_args = (primary or {}).get("args") or {}
         kept = [
-            (sources.get(i), text)
+            (sources.get(i), material_args.get(i, {}), text)
             for i, text in enumerate(self._fetched_tool_outputs[outputs_len:], outputs_len)
             if keep_tool is not None and sources.get(i) == keep_tool
+            and self._same_source_as_primary(primary_args, material_args.get(i, {}), query)
         ]
         del self._fetched_tool_outputs[outputs_len:]
         for i in [i for i in sources if i >= outputs_len]:
             del sources[i]
-        for tool_name, text in kept:
+        for i in [i for i in material_args if i >= outputs_len]:
+            del material_args[i]
+        for tool_name, args, text in kept:
+            material_args[len(self._fetched_tool_outputs)] = args
             sources[len(self._fetched_tool_outputs)] = tool_name
             self._fetched_tool_outputs.append(text)
         # 取得済み URL は fetch_url の取得だけが積む (情報ゼロの主の取得は検索なので別のツール)
@@ -1521,6 +1566,7 @@ class _TaskExecutionMixin:
             )
 
         # 生のツールの出力ではなく、打ち切った理由を利用者へ伝える (f_03 §4.2.1)
+        self._stopped_by_step_limit = True
         task.failure_note = task.failure_note or msg("agent.step_limit_reached")
         return "Step limit reached during task execution.", tool_calls
 

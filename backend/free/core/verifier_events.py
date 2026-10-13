@@ -34,6 +34,8 @@ __all__ = [
     "decided_by_shortcut",
     "record_table_aggregate",
     "current_table_aggregate",
+    "record_carried_material",
+    "current_carried_material",
 ]
 
 #: ツール判定を確定させた層のうち **近道** (学習・記憶から引いた結論) の ``source``。
@@ -77,6 +79,7 @@ VERIFIER_IDS: frozenset[str] = frozenset({
     "content.declared_count",   # 「以下の N つ」と宣言した直後の一覧が N 項目でない
     "content.tool_unavailable",  # 常に登録されているツールを「使えない」と述べて断った
     "content.weekday",          # 西暦つきの月日に添えた曜日が暦と食い違う
+    "content.carried_material_number",  # 持ち越した資料にも会話にも無い単位付きの数を述べた
 })
 
 
@@ -119,6 +122,11 @@ class _Scope:
     #: 取得した表をコードで集計して渡した結果 (``core.table_aggregate.AggregateResult``)。
     #: ``None`` = 渡していない。出力の検査 (``TableAggregateFilter``) が応答と照合する。
     table_aggregate: object | None = None
+    #: 前のターンの資料を持ち越したときの資料の本文と、そのときプロンプトに載っていた
+    #: 本文 (``deliberative._carry_recent_observations``)。空 = 持ち越していない。
+    #: 出力の検査 (``CarriedMaterialNumberFilter``) が応答の数と照合する。
+    carried_material: str = ""
+    carried_grounding: str = ""
 
 
 _scope: ContextVar[_Scope | None] = ContextVar("verifier_scope", default=None)
@@ -264,6 +272,23 @@ def current_table_aggregate() -> object | None:
     """このターンにプロンプトへ渡した表の集計結果 (渡していなければ ``None``)。"""
     scope = _scope.get()
     return scope.table_aggregate if scope else None
+
+
+def record_carried_material(material: str, grounding: str) -> None:
+    """前のターンの資料を持ち越したことを積む (資料の本文とプロンプトの本文)。スコープ外は no-op。"""
+    scope = _scope.get()
+    if scope is None or not material:
+        return
+    scope.carried_material = str(material)
+    scope.carried_grounding = str(grounding or "")
+
+
+def current_carried_material() -> tuple[str, str]:
+    """``(資料の本文, プロンプトの本文)``。持ち越していなければ ``("", "")``。"""
+    scope = _scope.get()
+    if scope is None:
+        return "", ""
+    return scope.carried_material, scope.carried_grounding
 
 
 def current_turn_outcome() -> tuple[str | None, str | None]:

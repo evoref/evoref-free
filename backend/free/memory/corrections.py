@@ -44,6 +44,7 @@ AWS が注入され続けた。復唱を除いても「直前」だけでは足�
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any
 
 #: 訂正ノートと被訂正ノートを結ぶ最小 keyword 重なり数。
@@ -226,6 +227,86 @@ def _structural_old_values(correction: Any) -> list[tuple[str, tuple[str, ...]]]
             if norm_span(old):
                 out.append((old, before))
     return out
+
+
+def correction_topics(correction: Any) -> tuple[str, ...]:
+    """訂正の発話の話題語 — 平叙文の「X ではなく Y」の旧値 X より前に現れる内容語 (純粋関数)。
+
+    話題語の抽出は ``injector.correction_form_topics`` の 1 実装 (不変則 #14a)、旧値の
+    分解は :func:`~backend.free.core.correction_target.contrast_pairs` (引用の内側は
+    落とす)。前の文の語も含む (「会議の場所も変わりました。本社ではなく名古屋支社です。」
+    の「会議」)。X より後ろの語 (「変更になりました」の「変更」、後続の依頼文の「計算」)
+    は何の値かを名指さないので含めない。対比の平叙文が無ければ空。
+    """
+    from backend.free.core.correction_target import contrast_pairs, split_sentences
+    from backend.free.core.correction_verdict import mask_quoted_speech, strip_copula
+    from backend.free.core.intent_vocab import is_plain_statement
+    from backend.free.memory.pipeline.injector import correction_form_topics
+
+    text = mask_quoted_speech(str(getattr(correction, "content", "") or ""))
+    form = correction_form_topics(text)
+    if form is None:
+        return ()
+    starts: list[int] = []
+    offset = 0
+    for sentence in split_sentences(text):
+        at = text.find(sentence, offset)
+        offset = at + len(sentence) if at >= 0 else offset
+        if at < 0 or not is_plain_statement(sentence):
+            continue
+        for old, _new in contrast_pairs(sentence):
+            pos = sentence.find(strip_copula(old))
+            if pos >= 0:
+                starts.append(at + pos)
+    if not starts:
+        return ()
+    end = max(starts)
+    return tuple(t for t in form[1] if 0 <= text.find(t) < end)
+
+
+def rows_the_correction_names[T](
+    rows: Sequence[T],
+    topics: Sequence[str],
+    *,
+    texts: Callable[[T], Sequence[str]],
+    require_topic: bool = False,
+) -> list[T]:
+    """旧値の span を持つ行 ``rows`` のうち、訂正が畳んでよい / 言い直しの元にしてよい行。
+
+    旧値 span で畳む書き込み側の全経路 (値アンカー・言い直しの元の本文・本人の値
+    更新の畳み・到着時の畳み F-14・Step 6B・同じバッチで閉じる処理) が共有する述語
+    (不変則 #13、2026-10-13)。同じ日付・数値は別の話題の行 (「車検も2027年4月18日
+    です」) にも現れるので、旧値の span だけでは宛先にならない。
+
+    - 訂正の話題語 (:func:`correction_topics`) を本文に持つ行が 1 行以上あれば、その行だけ
+      (話題語は候補を **絞る** 用途に限る)
+    - 話題語に当たる行が無い (話題語が無い・行が別の語で述べている「受験日」/「試験日」)
+      なら、``rows`` が (本文の違いで数えて) **ちょうど 1 行** のときその行
+    - どちらも満たさなければ空 — 畳まず並列に足す (不変則 #15: 迷ったら畳まない)
+
+    限界: 旧値を持つ行が別の話題の 1 行だけ (「車検は…4月18日」に「試験日は…」の訂正)
+    だと、話題語に当たる行が無いので 1 行の規則で畳む — 「受験日」と「試験日」の言い換えと
+    字句では区別できない (語形は足さない)。``require_topic=True`` (同じバッチで閉じる処理、
+    次の Full を待てば済む早い確定) は 1 行の規則に倒さず、話題語に当たる行だけを返す。
+
+    ``rows`` は呼出側が旧値の span で絞った候補 (同じスロット)、``texts`` は行の
+    本文 (ファクトなら ``semantic.fact.fact_span_texts``)。語形は足さない (#12 / #14)。
+    """
+    from backend.free.core.correction_verdict import norm_span
+
+    def _bodies(row: T) -> tuple[str, ...]:
+        return tuple(norm_span(text) for text in texts(row) if text)
+
+    needles = [n for n in (norm_span(t) for t in topics) if n]
+    named = [
+        row for row in rows
+        if any(n in body for body in _bodies(row) for n in needles)
+    ]
+    if named or require_topic:
+        return named
+    if len({_bodies(row) for row in rows}) == 1:
+        return list(rows)
+    return []
 
 
 def structural_correction_target(correction: Any, notes: list) -> Any | None:

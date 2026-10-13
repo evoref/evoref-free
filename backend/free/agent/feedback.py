@@ -45,7 +45,6 @@ from backend.free.core.response_arithmetic import (
     find_arithmetic_contradictions,
     find_conclusion_contradiction,
     find_sign_contradiction,
-    iter_ja_numbers,
 )
 from backend.free.core.response_verifiers import (
     contradicted_weekday,
@@ -59,7 +58,6 @@ from backend.free.core.relative_date import (
     date_result_use,
 )
 from backend.free.core.leak_reasons import LEAK_REASON_PREFIXES, leak_reason_for
-from backend.free.core.script_ranges import KANJI, KANJI_MARKS, KATAKANA_WORD
 from backend.free.core.response_dates import extract_tool_anchor
 from backend.free.core.verifier_events import (
     current_calculate_history_operands,
@@ -74,6 +72,7 @@ from backend.free.core.verifier_events import (
 from backend.free.agent.issue_ledger import record_current_issue
 from backend.free.core.text_quality import (
     abstains_on_reference_material,
+    answer_draws_on_material,
     calculate_result_contradiction,
     cites_reference_material,
     claims_completed_state_change,
@@ -81,6 +80,7 @@ from backend.free.core.text_quality import (
     fabricated_household_count,
     has_broken_ja_spacing,
     is_cut_off_answer,
+    numbers_not_in as _numbers_not_in,
     ungrounded_answer_names,
     retracts_own_conclusion,
     value_was_adopted,
@@ -1047,42 +1047,19 @@ def _publish_turn_outcome(outcome: str, reason: str | None) -> None:
             return
 
 
-#: 依頼の内容語 (問われた量の名詞: 「平均給与」「売上」) を取り出す連なり (漢字・カタカナ)。
-_ANSWER_SLOT_RUN_RE = re.compile(rf"[{KANJI}{KANJI_MARKS}{KATAKANA_WORD}]{{2,}}")
-#: 数の直前でこの範囲 (文字) に問われた名詞があれば、その数は答えの位置にある。
-_ANSWER_SLOT_WINDOW = 16
+def _numbers_beyond_carried_material(
+    response: str, carried_material: str, grounded: str,
+) -> list[str]:
+    """持ち越した資料について答えた応答の、資料にも依頼・会話 (``grounded``) にも無い数。
 
-
-def _numbers_not_in(response: str, grounded: str, query: str = "") -> list[str]:
-    """答えの位置にある数のうち、依頼・会話・ツールの結果 (``grounded``) に無い数の表記
-    (出現順、最大 3 件)。
-
-    数えるのは **問われた量の名詞の直後** (:data:`_ANSWER_SLOT_WINDOW` 文字以内) に
-    ある数だけ — 「営業部の平均給与は 520,000 円」の 520,000。見つからないと正しく答えた
-    応答の数 (「HTTP 404 相当」「ポート 8000 のサーバ」「12 個のフォルダを探した」) は
-    答えではないので数えない。パスの中の数字と 1 桁の数も数えない。判断できなければ
-    空 (呼出側はラベル無しのまま)。
+    資料について答えたかは、応答の名詞の連なりが資料に現れるかで見る (無関係な問いへの
+    知識の答えの数を数えない)。2026-10-11 実ログ: 「明後日は？」に、11日・12日の概況しか
+    無い天気の資料から「最高気温は19度…降水確率は70%」と答えて成功の経験になった。
+    数の読みは利用者への開示 (``text_quality.ungrounded_material_numbers``) と同じ 1 本。
     """
-    from backend.free.agent.tool_judge_args import without_drive_paths
-
-    slots = {run for run in _ANSWER_SLOT_RUN_RE.findall(query or "")}
-    if not slots:
+    if not answer_draws_on_material(response, carried_material):
         return []
-    known = {round(n.value, 6) for n in iter_ja_numbers(grounded or "")}
-    text = without_drive_paths(response or "", " ")
-    out: list[str] = []
-    for number in iter_ja_numbers(text):
-        if number.value < 10 or round(number.value, 6) in known:
-            continue
-        window = text[max(0, number.start - _ANSWER_SLOT_WINDOW):number.start]
-        if not any(slot in window for slot in slots):
-            continue
-        literal = text[number.start:number.end].strip()
-        if literal and literal not in out:
-            out.append(literal)
-        if len(out) >= 3:
-            break
-    return out
+    return _numbers_not_in(response, f"{grounded}\n{carried_material}", anchored=False)
 
 
 class FeedbackCollector:
@@ -1237,6 +1214,7 @@ class FeedbackCollector:
         tool_result_text: str = "",
         tool_context: str = "",
         stated_context: str = "",
+        carried_material: str = "",
         truncated: bool = False,
         generation_failed: bool = False,
         session_id: str = "",
@@ -1269,6 +1247,10 @@ class FeedbackCollector:
         呼出側が渡し、``gen_config._extra["tool_context"]`` に
         :data:`TOOL_CONTEXT_CAP` 字まで入れる (超えたら先頭だけ残し
         ``tool_context_truncated`` を立てる。形式の版は変えない)。
+
+        ``carried_material`` は deliberative が前のターンから持ち越した資料の本文
+        (``[この会話で取得した資料]`` の中身)。ツールを撃たなかったターンの応答の数を
+        これと突き合わせる。
 
         ``unchecked_checks`` は create の制作ステージで未検査に終わった主要な検査
         (``"contract:no_examples"`` の形、``core.check_outcome.unchecked_labels``)。
@@ -1324,6 +1306,7 @@ class FeedbackCollector:
             tool_uses=tool_uses,
             unread_files=unread_files,
             unread_grounding=unread_grounding,
+            carried_material=carried_material,
         )
         if generation_failed:
             # 本文が届かなかった / error フレームで終わったターン。
@@ -1686,6 +1669,7 @@ class FeedbackCollector:
         tool_uses: list[dict] | None = None,
         unread_files: list[str] | None = None,
         unread_grounding: str = "",
+        carried_material: str = "",
     ) -> tuple[str, str | None]:
         """ターン成否 ("success" | "partial" | "failed" | "unlabeled") と理由を決定論導出する。
 
@@ -1916,6 +1900,16 @@ class FeedbackCollector:
         if extra is not None:
             logger.info("Turn marked failed (%s)", extra)
             return "failed", extra
+        # ツールを撃たず前のターンの資料だけで答えたのに、資料にも会話にも無い数を述べた。
+        # 作話か、資料からの計算・言い換えかは区別できないのでラベル無し (成功の手本にしない)。
+        if not tool_uses:
+            beyond = _numbers_beyond_carried_material(
+                text, carried_material, f"{query}\n{stated_context}\n{tool_result_text}",
+            )
+            if beyond:
+                unlabeled = "numbers not in carried-over material: " + ", ".join(beyond)
+                logger.info("Turn left unlabeled (%s)", unlabeled)
+                return "unlabeled", unlabeled
         return "success", None
 
     @staticmethod

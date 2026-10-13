@@ -847,6 +847,19 @@ def _tool_result_text_in_prompt(messages: list[ChatMessage]) -> str:
     return content[idx:] if idx >= 0 else ""
 
 
+def _carried_material_in_prompt(messages: list[ChatMessage]) -> str:
+    """最後の user メッセージへ deliberative が持ち越した資料の本文 (無ければ空)。
+
+    区切り (``MATERIAL_TRAILING_DELIMITERS``) の後ろから資料の枠の閉じまでで、区切りと
+    枠の指示文は除く (集計の確定値は残す)。送信版から読む。
+    """
+    from backend.free.agent.deliberative import carried_material_body
+
+    if not messages:
+        return ""
+    return carried_material_body(str(messages[-1].get("content") or ""))
+
+
 def _calculate_result_in_prompt(messages: list[ChatMessage]) -> float | None:
     """最後の user メッセージへ注入済みの calculate 結果 (無ければ ``None``)。
 
@@ -1461,6 +1474,7 @@ def _record_turn(
                 action_blocked=blocked,
                 measured_values=measured,
                 stated_context=_stated_context(messages, tool_result_text),
+                carried_material=_carried_material_in_prompt(sent),
                 calculate_result=_calculate_result_in_prompt(sent),
                 tool_result_text=tool_result_text,
                 # 採用ゲートがツール根拠のターンを同じ入力で再生する (f_04 §4.5)。

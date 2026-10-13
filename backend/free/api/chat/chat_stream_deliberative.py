@@ -34,6 +34,7 @@ from backend.free.api.chat.chat_types import (
 )
 from backend.free.agent.deliberative import DeliberativeAgent
 from backend.free.core.stream_filter import (
+    CarriedMaterialNumberFilter,
     HeadBufferFilter,
     InternalFrameMentionFilter,
     ContinuationRepeatFilter,
@@ -187,6 +188,8 @@ def _build_output_pipeline(
         filters.append(UnreadFileEntityFilter())
         # コードで集計した表の値を述べていなければ正しい値を示す 1 行を足す。
         filters.append(TableAggregateFilter())
+        # 持ち越した資料にもプロンプトにも無い単位付きの数を答えたら推測だと示す。
+        filters.append(CarriedMaterialNumberFilter())
     if continuation_tail:
         # 継続生成の冒頭にある直前応答の再掲を落とす。プロンプトの
         # 「繰り返さない」指示は実測で効かない (2026-08-27 T10-3)。

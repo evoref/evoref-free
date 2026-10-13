@@ -67,7 +67,11 @@ from backend.free.memory.notes.note_builder import (
     resolve_fact_attributes_path,
 )
 from backend.free.memory.attribute_key import GENERIC_ATTRIBUTE as _GENERIC_ATTRIBUTE
-from backend.free.memory.corrections import has_correction_shape
+from backend.free.memory.corrections import (
+    correction_topics,
+    has_correction_shape,
+    rows_the_correction_names,
+)
 from backend.free.memory.episodic.note import MemoryNote
 from backend.free.memory.notes.subject_ns import make_mem_subject
 from backend.free.memory.types import FactType, SemanticFact
@@ -1474,6 +1478,35 @@ def value_names_span(value: str, span: str) -> bool:
     return bool(needle) and _contains_anchor(norm_span(value or ""), needle)
 
 
+def values_open_to_correction(
+    note: MemoryNote, values: Iterable[str], span: str, subject: str,
+) -> tuple[str, ...]:
+    """``values`` から、旧値 ``span`` を持つが訂正 ``note`` が名指していない値を除く (純粋関数)。
+
+    旧値 span で宛先・言い直しの元を決める経路 (値アンカーの照合・J-03 の旧値の当て・
+    言い直しの元の本文) の門。述語は書き込み側の畳みと共有する
+    ``corrections.rows_the_correction_names`` (不変則 #13 / #14a): 訂正に話題語が
+    あれば本文がそれを持つ値だけ、無ければ span を持つ値がちょうど 1 つのときだけ
+    残す。span が 1 文字の旧値は絞らない (最後の言及だけを畳む別の門が受け持つ、
+    ``sleep.extraction._latest_mention``)。``subject`` (値のスロット) が単値なら絞らない
+    — スロットそのものが 1 つの話題で、旧値を持つ値はどれも同じ値の世代
+    (書き込み側の ``sleep.extraction._named_by_correction`` と同じ)。
+    """
+    from backend.free.memory.notes.note_builder import is_single_valued_subject
+
+    values = tuple(values)
+    needle = norm_span(span)
+    if len(needle) < 2 or is_single_valued_subject(subject):
+        return values
+    carriers = [v for v in values if needle in norm_span(v or "")]
+    if not carriers:
+        return values
+    named = set(rows_the_correction_names(
+        carriers, correction_topics(note), texts=lambda v: (v,),
+    ))
+    return tuple(v for v in values if v in named or needle not in norm_span(v or ""))
+
+
 def _anchor_hit_length(anchors: tuple[str, ...], haystack: str) -> tuple[int, str]:
     """``haystack`` に現れる最長のアンカーを ``(長さ, アンカー)`` で返す。"""
     best = (0, "")
@@ -1525,6 +1558,8 @@ def _old_value_forms(note: MemoryNote, old: str) -> tuple[str, ...]:
 def resolve_value_anchored_matches(
     notes: Iterable[MemoryNote],
     live_values: dict[tuple[str, str], tuple[str, ...]],
+    *,
+    topic_gate: bool = False,
 ) -> dict[tuple[str, str], tuple[str, str]]:
     """:func:`resolve_value_anchored_attributes` の本体 (アンカー付きで返す)。
 
@@ -1545,6 +1580,12 @@ def resolve_value_anchored_matches(
     検証済みで **却下された** ノート (``same_value`` / ``premise_change`` /
     ``none`` …) はどちらの経路にも入らない — 訂正ではないと判定済みだからで、
     そこを通すと検証そのものが無意味になる。
+
+    ``topic_gate=True`` は **宛先を決める** ときの照合で、旧値の span を持つが訂正が
+    名指していない話題の live 値 (別の会話・別の予定の「車検も…4月18日」) を照合から
+    除く (不変則 #13、書き込み側の畳みと同じ述語 :func:`values_open_to_correction`)。
+    既定 (False) の照合は「旧値を別のスロットが持つ」証拠 (J-03 の ``_foreign_anchor``)
+    に使うので絞らない — 絞ると書かない理由が消える (#15)。
     """
     if not live_values:
         return {}
@@ -1566,6 +1607,21 @@ def resolve_value_anchored_matches(
         verified = note_is_verified_correction(note)
         if not verified and not has_correction_shape(note):
             continue
+        old_spans = [
+            str(getattr(note, "correction_wrong_claim", "") or "").strip()
+        ] if verified and topic_gate else []
+        update0 = value_update_spans(content) if topic_gate else None
+        if update0 is not None:
+            old_spans.extend(_old_value_forms(note, update0[0]))
+        note_live = live_values
+        for old in old_spans:
+            note_live = {
+                slot: values_open_to_correction(
+                    note, values, old, make_mem_subject(_KIND_BY_TAG.get(slot[0], slot[0]), slot[1]),
+                )
+                for slot, values in note_live.items()
+            }
+        note_index = index if note_live == live_values else _slot_anchor_index(note_live)
         spans = [
             span for span in (
                 str(getattr(note, "correction_wrong_claim", "") or "").strip(),
@@ -1585,7 +1641,7 @@ def resolve_value_anchored_matches(
             # 無関係なスロットへ訂正値が書かれた (2026-09-10 ライブ監査 (f)
             # F-13)。宛先は誤りの側で決まり、正しい値は最後の手段。
             for span in spans:
-                for (tag, attr), (values, anchors) in index.items():
+                for (tag, attr), (values, anchors) in note_index.items():
                     length, anchor = _span_hit_length(values, anchors, span)
                     if not length:
                         continue
@@ -1604,7 +1660,7 @@ def resolve_value_anchored_matches(
             # 本人の値の更新と読めるときだけ (:func:`_old_value_forms`)。
             for old in _old_value_forms(note, update[0]) if update is not None else ():
                 needle = norm_span(old)
-                for (tag, attr), (values, _anchors) in index.items():
+                for (tag, attr), (values, _anchors) in note_index.items():
                     for value in values:
                         if value_names_span(value, old):
                             if _better_hit(best.get(tag), len(needle), attr):
@@ -1613,7 +1669,7 @@ def resolve_value_anchored_matches(
                             break
                 if explicit:
                     break
-            for (tag, attr), (values, anchors) in index.items():
+            for (tag, attr), (values, anchors) in note_index.items():
                 # 明示された旧値 (「本社ではなく」) が当たった tag は、一般の
                 # アンカー (live 値の全文 = 値なしの旧行「会議の場所も変わり
                 # ました」等、長い一致) に上書きさせない。
@@ -1877,6 +1933,8 @@ def resolve_batch_anchored_matches(
     notes: list[MemoryNote],
     live_values: dict[tuple[str, str], tuple[str, ...]],
     builder: "ChatNoteBuilder",
+    *,
+    topic_gate: bool = False,
 ) -> dict[tuple[str, str], tuple[str, str]]:
     """検証が済んだ訂正の宛先を、**同じセッションの先行する未抽出の言明** でも決める (純粋関数)。
 
@@ -1891,7 +1949,7 @@ def resolve_batch_anchored_matches(
     **同じセッションでそれより前** の言明だけ — 検証の無い候補の推測の照合
     (アンカー索引の全文照合) を別セッションの言明へ広げない。戻り値の形は
     :func:`resolve_value_anchored_matches` と同じ (呼出側はストアの live 値で決まった
-    宛先を優先する)。
+    宛先を優先する)。``topic_gate`` は :func:`resolve_value_anchored_matches` と同じ。
     """
     resolved: dict[tuple[str, str], tuple[str, str]] = {}
     for note in notes:
@@ -1911,7 +1969,7 @@ def resolve_batch_anchored_matches(
         merged = dict(live_values or {})
         for key, values in earlier.items():
             merged[key] = (*merged.get(key, ()), *values)
-        resolved.update(resolve_value_anchored_matches([note], merged))
+        resolved.update(resolve_value_anchored_matches([note], merged, topic_gate=topic_gate))
     return resolved
 
 
@@ -1947,18 +2005,26 @@ class ChatExtractor(BaseExtractor):
         # 「さっき名古屋と言いましたが、正しくは横浜です。」は location の
         # トリガ語を 1 つも含まず、候補タグ 0 件で入口に到達しなかった
         # (resolve_value_anchored_attributes の説明を参照)。
-        value_anchored_matches = resolve_value_anchored_matches(
-            note_list, ctx.live_attribute_values,
-        )
-        # ストアの live 値で決まらなかった検証済みの訂正は、同じセッションの先行する
-        # 未抽出の言明でも宛先を探す (:func:`resolve_batch_anchored_matches`)。
-        for key, hit in resolve_batch_anchored_matches(
-            note_list, ctx.live_attribute_values, self._builder,
-        ).items():
-            if not any(k[0] == key[0] for k in value_anchored_matches):
-                value_anchored_matches[key] = hit
+        def _anchored(topic_gate: bool) -> dict[tuple[str, str], tuple[str, str]]:
+            matches = resolve_value_anchored_matches(
+                note_list, ctx.live_attribute_values, topic_gate=topic_gate,
+            )
+            # ストアの live 値で決まらなかった検証済みの訂正は、同じセッションの先行する
+            # 未抽出の言明でも宛先を探す (:func:`resolve_batch_anchored_matches`)。
+            for key, hit in resolve_batch_anchored_matches(
+                note_list, ctx.live_attribute_values, self._builder,
+                topic_gate=topic_gate,
+            ).items():
+                if not any(k[0] == key[0] for k in matches):
+                    matches[key] = hit
+            return matches
+
+        # 宛先は訂正が名指している話題の live 値だけで決める (別の予定の「車検も…
+        # 4月18日」をスロットの根拠にしない、不変則 #13)。旧値を別のスロットが持つ
+        # 証拠 (J-03 の ``_foreign_anchor``) と根拠本文の絞り込みは絞らない照合で見る。
+        value_anchored_matches = _anchored(topic_gate=False)
         value_anchored = {
-            key: attr for key, (attr, _anchor) in value_anchored_matches.items()
+            key: attr for key, (attr, _anchor) in _anchored(topic_gate=True).items()
         }
         for note in note_list:
             if not self.is_eligible(note, self.mode):
@@ -2219,7 +2285,12 @@ class ChatExtractor(BaseExtractor):
                             _anchor_hit = next(
                                 (
                                     update[0]
-                                    for value in ctx.live_attribute_values.get((tag, _dest)) or ()
+                                    for value in values_open_to_correction(
+                                        note,
+                                        ctx.live_attribute_values.get((tag, _dest)) or (),
+                                        update[0] if update is not None else "",
+                                        make_mem_subject(kind, _dest),
+                                    )
                                     if update is not None and value_names_span(value, update[0])
                                 ),
                                 "",
@@ -2234,10 +2305,18 @@ class ChatExtractor(BaseExtractor):
                             # 前置きを外した形 (「やっぱり妻」の「妻」) は区間のままで
                             # 当たらないときだけ使う (値アンカーの経路と同じ扱い)。
                             for _old in _old_value_forms(note, update[0]):
+                                _open = values_open_to_correction(
+                                    note,
+                                    [f.object or "" for _n, f in candidates
+                                     if f.subject == _subject_u],
+                                    _old,
+                                    _subject_u,
+                                )
                                 _anchor_hit = next(
                                     (
                                         _old for _n, f in reversed(candidates)
                                         if f.subject == _subject_u
+                                        and (f.object or "") in _open
                                         and value_names_span(f.object or "", _old)
                                     ),
                                     "",
@@ -2316,10 +2395,13 @@ class ChatExtractor(BaseExtractor):
                         # ストアにはまだ無い)。新しい方 (バッチ) を先に見る。
                         _attr = matches[0][0] or "user"
                         _subject = make_mem_subject(kind, _attr)
-                        _sources = tuple(
+                        # 元にする本文は訂正が名指している行だけ (旧値を持つ最初の値を
+                        # 採ると、別の話題「車検も…4月18日」が新しい行の本文になる、#13)
+                        _sources = values_open_to_correction(note, tuple(
                             f.object for _n, f in reversed(candidates)
                             if f.subject == _subject
-                        ) + tuple(ctx.live_attribute_values.get((tag, _attr)) or ())
+                        ) + tuple(ctx.live_attribute_values.get((tag, _attr)) or ()),
+                            wrong_claim, _subject)
                         correct_value = restate_with_correction(
                             _sources, wrong_claim, correct_value,
                         ) or correct_value
@@ -2327,10 +2409,11 @@ class ChatExtractor(BaseExtractor):
                         # 「X ではなく Y」の値更新は旧値の言明の X を Y に置換する
                         _attr = matches[0][0] or "user"
                         _subject = make_mem_subject(kind, _attr)
-                        _sources = tuple(
+                        _sources = values_open_to_correction(note, tuple(
                             f.object for _n, f in reversed(candidates)
                             if f.subject == _subject
-                        ) + tuple(ctx.live_attribute_values.get((tag, _attr)) or ())
+                        ) + tuple(ctx.live_attribute_values.get((tag, _attr)) or ()),
+                            wrong_claim, _subject)
                         correct_value = restate_with_correction(
                             _sources, wrong_claim, correct_value,
                         ) or correct_value
@@ -2472,6 +2555,10 @@ class ChatExtractor(BaseExtractor):
                     # 無い」状態になっていた (2026-09-14 監査 F-02 の追補)。
                     if wrong_claim:
                         fact.value_update = wrong_claim  # type: ignore[attr-defined]
+                        # 訂正の話題語。後の畳み (本人の値更新・F-14・Step 6B) が訂正の
+                        # ノートを読み直さずに「どの行の旧値か」を絞る材料で、
+                        # ``attrs.value_update_topics`` へ永続化する (#13)。
+                        fact.value_update_topics = correction_topics(note)  # type: ignore[attr-defined]
                         if len(norm_span(wrong_claim)) == 1:
                             # 1 文字の旧値 (「妻」— 前置きを外した形や検証器の span) は、
                             # 誰の・どの行の値かを旧値だけでは決められない。畳むのは
