@@ -1801,8 +1801,28 @@ def fabricated_household_count(
             continue
         if not _household_word_governs(body, m.start(), m.end()):
             continue
+        if _count_is_subgroup_or_hypothetical(body, m.start(), m.end()):
+            continue
         return f"{m.group(0)} is not a count the user stated"
     return None
+
+
+#: 人数の直前にあって、数えているのが **世帯の一部** (子供 / 大人 …) だと示す語。
+#: 「お子様 2 名を含む 4 人家族」の 2 名は世帯の人数の数え直しではない。
+_SUBGROUP_BEFORE_RE = re.compile(r"(?:子|娘|息子|大人|兄弟|姉妹|孫|親)(?:様|さん|たち|達)?\s*$")
+
+#: 人数と同じ節の後ろで条件・仮定を表す語。「一人暮らしの場合は」は例示であって
+#: ユーザーの世帯を述べ返していない。
+_HYPOTHETICAL_AFTER_RE = re.compile(r"場合|なら|であれば|ときは|時は|だと|とすると|たら")
+
+
+def _count_is_subgroup_or_hypothetical(body: str, start: int, end: int) -> bool:
+    """人数が世帯の一部の数え上げ、または仮定の例示なら True (純粋関数)。"""
+    if _SUBGROUP_BEFORE_RE.search(body[max(0, start - 6):start]):
+        return True
+    after = body[end:end + _HOUSEHOLD_WINDOW_CHARS]
+    brk = _HOUSEHOLD_CLAUSE_END_RE.search(after)
+    return bool(_HYPOTHETICAL_AFTER_RE.search(after[:brk.start()] if brk else after))
 
 
 #: 人数と後ろの世帯語を別の節に分ける区切り (読点・句点・改行)。

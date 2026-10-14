@@ -491,35 +491,11 @@ def clear_spinner_line() -> None:
 
 
 def render_help(console: Console) -> None:
-    """ヘルプをインラインリストで表示"""
+    """ヘルプをインラインリストで表示 (行はスラッシュコマンドの表から作る)"""
+    from backend.free.cli.command_parser import help_entries
     from backend.i18n_helper import msg
 
-    commands = [
-        ("/help", msg("cli.help_help")),
-        ("/status", msg("cli.help_status")),
-        ("/file <path>", msg("cli.help_file")),
-        ("/file", msg("cli.help_file_list")),
-        ("/export <path> [--all|--last N]", msg("cli.help_export")),
-        ("/history [action]", msg("cli.help_history")),
-        ("/cartridge [action]", msg("cli.help_cartridge")),
-        ("/theme [action]", msg("cli.help_theme")),
-        ("/migrate-model [options]", msg("cli.help_migrate_model")),
-        ("/web <url>", msg("cli.help_web")),
-        ("/learn [status|level1|full]", msg("cli.help_learn")),
-        ("/reindex [--dry-run] [--cartridge <id>]", msg("cli.help_reindex")),
-        ("/page", msg("cli.help_page")),
-        ("/clear", msg("cli.help_clear")),
-        ("/save [name]", msg("cli.help_save")),
-        ("/load [name]", msg("cli.help_load")),
-        ("/load --history <id>", msg("cli.help_load_history")),
-        ("/load --history --latest", msg("cli.help_load_latest")),
-        ("/pin <text>", msg("cli.help_pin")),
-        ("/unpin <id> [--force]", msg("cli.help_unpin")),
-        ("/pinned", msg("cli.help_pinned")),
-        ("/memory [stats|notes [N]]", msg("cli.help_memory")),
-        ("/rag", msg("cli.help_rag")),
-        ("/exit", msg("cli.help_exit")),
-    ]
+    commands = help_entries()
 
     from rich.markup import escape
 

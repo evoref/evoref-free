@@ -41,10 +41,11 @@ from backend.free.api.chat.chat_stream_staged import (
     _STAGED_PROJECT_ID,
     _STAGED_TOTAL_TIMEOUT_DEFAULT_SEC,
     _TURN_TIMEOUT_DEFAULT_SEC,
+    RunTerminal,
     _emit_check,
-    _finish_run_safely,
     _staged_import_smoke,
     _staged_postprocess,
+    terminates_run,
 )
 from backend.free.core.file_names import allows_empty_content
 from backend.free.core.check_outcome import (
@@ -1122,6 +1123,7 @@ def _declared_signatures(modules: list[dict]) -> dict[str, str]:
     return out
 
 
+@terminates_run
 async def run_staged_v2_pipeline(
     *,
     query: str,
@@ -1135,8 +1137,12 @@ async def run_staged_v2_pipeline(
     is_cancelled: Callable[[], bool] | None = None,
     resume_of: str | None = None,
     tests_enabled: bool = False,
+    run_terminal: RunTerminal,
 ) -> AsyncIterator[dict]:
-    """staged v2 を駆動し、旧経路と同じ形の構造化イベントを yield する。"""
+    """staged v2 を駆動し、旧経路と同じ形の構造化イベントを yield する。
+
+    ``run_terminal`` は :func:`terminates_run` が渡す (呼出側は渡さない)。
+    """
     from backend.config import get_path_resolver
     from backend.free.generation.as_built import render_flowchart, render_spec, subcommand_usages
     from backend.free.generation.direct_codegen import generate_single_file
@@ -1290,6 +1296,7 @@ async def run_staged_v2_pipeline(
     except Exception as exc:  # noqa: BLE001 - 記録の失敗で制作は止めない
         logger.warning("staged v2 run record start failed: %s", exc)
         run_store, event_log = None, None
+    run_terminal.bind(run_store, event_log)
     yield {"kind": "run_started", "payload": {"run_id": run_id, "session_id": session_id}}
     try:
         ws.write_plan({m["path"]: list(m.get("imports_from") or []) for m in skeleton["modules"]})
@@ -2022,7 +2029,7 @@ async def run_staged_v2_pipeline(
         "advisory_dropped": advisory_dropped,
         "unbaked_defaults": unbaked_defaults,
     })
-    _finish_run_safely(run_store, event_log, exit_kind, tasks_failed=tasks_failed)
+    run_terminal.finish(exit_kind, tasks_failed=tasks_failed)
     # 照合は配信する版のもの (最後の _check の版と違えば照合し直す — 戻した版・同点で残した先の版)
     conformance_observed: list[str] = []
     if conformance_on:

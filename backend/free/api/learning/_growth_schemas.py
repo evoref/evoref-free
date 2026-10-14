@@ -139,9 +139,51 @@ class GrowthRollbackRequest(BaseModel):
 
 
 class RegressionRetireResponse(BaseModel):
+    """回帰ケースの除外 (retire) / 除外の取り消し (unretire) の結果。"""
+
     case_id: str
+    #: 操作の後の台帳の状態 (unretire は外す前の状態へ戻る: ``active`` / ``quarantined``)。
     status: str
     changed: bool = False
+    #: 操作の前の台帳の状態。
+    previous_status: str = ""
+
+
+class RegressionStatusChangeRequest(BaseModel):
+    """retire / unretire の本文 (省略可)。操作者と理由はケースの行に残る。"""
+
+    by: Literal["cli", "gui", "api"] = "api"
+    reason: str = Field(default="", max_length=500)
+
+
+class RegressionCaseItem(BaseModel):
+    """回帰ケースの一覧の 1 行 (問いの本文・期待値・ツール結果は返さない)。"""
+
+    case_id: str
+    mode: str
+    source: str
+    #: 台帳の状態 (``active`` / ``quarantined`` / ``retired``)。
+    status: str
+    #: ``active`` のケースの役割 (``guard`` / ``pressure`` / ``flaky`` / ``unknown``)。それ以外は空。
+    role: str = ""
+    #: 同梱の種ケース (台帳に無いので retire できない)。
+    seed: bool = False
+    #: 問いの先頭 80 字 (空白を畳む)。
+    query_preview: str = ""
+    query_chars: int = 0
+    written_at: str = ""
+    last_result: str | None = None
+    last_run_at: str | None = None
+
+
+class RegressionCaseListResponse(BaseModel):
+    """``GET /api/learning/growth/regression``。"""
+
+    cases: list[RegressionCaseItem] = Field(default_factory=list)
+    #: 絞り込んだ後の件数 (ページングの前)。
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
 
 
 class GrowthSummaryModel(BaseModel):

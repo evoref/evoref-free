@@ -36,6 +36,7 @@ __all__ = [
     "list_history_entries",
     "archive_to_history",
     "read_history_version",
+    "read_history_entry",
     "history_file_path",
     "body_file_path",
     "read_body",
@@ -151,6 +152,24 @@ def read_history_version(
     if not src.exists():
         raise FileNotFoundError(f"Version not found: {src}")
     return src.read_text(encoding="utf-8")
+
+
+def read_history_entry(prompt_dir: Path, key_prefix: str, version: int) -> dict[str, Any]:
+    """指定バージョンの履歴を ``{"version", "file", "content"}`` で返す (読むだけ)。
+
+    ``rollback`` が読むのと同じファイル (:func:`history_file_path`) を読むので、ここで
+    見た本文がそのまま巻き戻し先になる。実体が履歴ディレクトリの直下に無いもの
+    (区切りを含む key_prefix・外を指すリンク) は無いものとして扱う。
+
+    Raises:
+        FileNotFoundError: 該当バージョンのファイルが無い / 履歴ディレクトリの外を指す場合
+    """
+    src = history_file_path(prompt_dir, key_prefix, version)
+    history_dir = (prompt_dir / "history").resolve()
+    resolved = src.resolve()
+    if resolved.parent != history_dir or not resolved.is_file():
+        raise FileNotFoundError(f"Version not found: {key_prefix} v{version}")
+    return {"version": version, "file": src.name, "content": resolved.read_text(encoding="utf-8")}
 
 
 # ──────────────────────────────────────────────────────────────────────────

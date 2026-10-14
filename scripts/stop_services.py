@@ -18,6 +18,11 @@ backend / frontend を止めようとしていた。ウィンドウタイトル�
 は ``evoref reset --stop-services`` も同じ目的で使っている純粋ヘルパーで、アプリ context
 に依存しない。
 
+最初に backend へ正常停止 (``POST /api/system/shutdown``) を頼み、ポートが空くまで最大
+20 秒待つ (c_09 §2.1 の段 1)。呼べない (接続不能・404 = 旧 backend) ときは待たない。
+残ったものは従来の強制経路 (ウィンドウタイトル + イメージ名を確かめたポートの占有者の kill)
+で止める。``--llama-only`` では backend に触らない。
+
 ログは英語固定 (リポジトリ規約)。standalone のため print で stdout へ出す。
 """
 
@@ -33,9 +38,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.free.cli.pid_manager import (  # noqa: E402
+    GRACEFUL_STOP_WAIT_SEC,
     IMAGE_LLAMA,
+    backend_port_of,
     expected_images_by_port,
     find_port_occupants,
+    graceful_stop_backend,
     kill_port_occupants,
 )
 
@@ -83,12 +91,20 @@ def stop(
     include_frontend: bool,
     wait_timeout: float,
     llama_only: bool = False,
+    graceful_timeout: float = GRACEFUL_STOP_WAIT_SEC,
 ) -> int:
     expected = _load_expected(project_root, include_frontend=include_frontend)
     if llama_only:
         expected = {p: imgs for p, imgs in expected.items() if imgs == IMAGE_LLAMA}
     ports = list(expected)
     print(f"[stop] target ports: {ports}")
+
+    # 段 1: backend に正常停止を頼み、ポートが空くまで待つ (c_09 §2.1)。呼べない (接続不能・
+    # 404 = 旧 backend) ときは待たずに、空かなければ待った後に、下の強制経路へ落ちる。
+    backend_port = None if llama_only else backend_port_of(expected)
+    if backend_port is not None:
+        outcome = graceful_stop_backend(backend_port, wait_timeout=graceful_timeout)
+        print(f"[stop] graceful shutdown of backend :{backend_port}: {outcome}")
 
     _taskkill_titles((_LLAMA_WINDOW_TITLE,) if llama_only else _WINDOW_TITLES)
 

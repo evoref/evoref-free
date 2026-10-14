@@ -7,6 +7,7 @@ import locale
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -111,6 +112,15 @@ def _image_matches(name: str, prefixes: Sequence[str]) -> bool:
     if stem.endswith(".exe"):
         stem = stem[:-4]
     return bool(stem) and any(stem.startswith(p) for p in prefixes)
+
+
+def occupant_image_matches(occ: PortOccupant, prefixes: Sequence[str]) -> bool:
+    """占有者のイメージ名が接頭辞のどれかに一致するか (名前が無ければ PID から引く。:func:`kill_port_occupants` と同じ判定)"""
+    name = occ.process_name
+    if not name:
+        identity = get_process_identity(occ.pid)
+        name = identity.name if identity is not None else ""
+    return _image_matches(name, prefixes)
 
 
 # ────────────────────────────────────────────
@@ -548,3 +558,82 @@ def expected_images_by_port(
     if include_frontend:
         expected[FRONTEND_PORT] = IMAGE_FRONTEND
     return expected
+
+
+# ────────────────────────────────────────────
+# 正常停止 (c_09 §2.1 の段 1)
+# ────────────────────────────────────────────
+
+SHUTDOWN_API_PATH = "/api/system/shutdown"
+#: 正常停止 API の応答を待つ時間 (秒)。backend は受理を即返す (202)。
+SHUTDOWN_REQUEST_TIMEOUT_SEC = 3.0
+#: 受理された後、backend のポートが空くまで待つ上限 (秒)。過ぎたら強制経路へ落ちる。
+GRACEFUL_STOP_WAIT_SEC = 20.0
+
+
+def backend_port_of(expected: Mapping[int, Sequence[str]]) -> int | None:
+    """:func:`expected_images_by_port` の結果から backend のポートを返す。"""
+    return next((port for port, images in expected.items() if tuple(images) == IMAGE_BACKEND), None)
+
+
+def request_backend_shutdown(port: int, *, timeout: float = SHUTDOWN_REQUEST_TIMEOUT_SEC) -> bool:
+    """``POST /api/system/shutdown`` を呼ぶ。202 で受理されたら ``True``。
+
+    接続できない・404 (このルートを持たない旧 backend)・その他の応答は ``False`` (待たずに
+    強制経路へ落ちる)。ヘッダは CLI と同じ (``X-Evoref-Client``、あればトークン、c_06 §1.5)。
+    """
+    import httpx
+
+    from backend.free.cli.backend_headers import CLIENT_HEADER, backend_headers
+
+    try:
+        headers = backend_headers()
+    except Exception as e:  # noqa: BLE001 — トークンの置き場が引けなくても loopback では頼める
+        logger.info("Could not resolve the API token (%s); asking without it", e)
+        headers = {CLIENT_HEADER: "cli"}
+    try:
+        response = httpx.post(f"http://127.0.0.1:{port}{SHUTDOWN_API_PATH}", headers=headers, timeout=timeout)
+    except httpx.HTTPError as e:
+        logger.info("Graceful shutdown request to port %d failed: %s", port, e)
+        return False
+    if response.status_code != 202:
+        logger.info("Graceful shutdown request to port %d was not accepted (HTTP %d)", port, response.status_code)
+        return False
+    return True
+
+
+def graceful_stop_backend(
+    port: int,
+    *,
+    wait_timeout: float = GRACEFUL_STOP_WAIT_SEC,
+    poll_sec: float = 0.5,
+) -> str:
+    """段 1: backend に正常停止を頼み、ポートが空くまで待つ (c_09 §2.1)。
+
+    頼むのはポートの占有者が backend のイメージ (:data:`IMAGE_BACKEND`) のときだけ。
+
+    Returns:
+        ``not_running`` (誰も待ち受けていない) / ``foreign`` (占有者が backend のイメージでない。
+        頼まない) / ``unavailable`` (API を呼べない・受理されない。待たない) / ``stopped``
+        (受理されてポートが空いた) / ``timeout`` (受理されたが ``wait_timeout`` 内に空かない)
+    """
+    own_pid = os.getpid()
+    occupants = [o for o in find_port_occupants([port]) if o.port == port and o.pid != own_pid]
+    if not occupants:
+        return "not_running"
+    occupant = occupants[0]
+    name = occupant.process_name
+    if not name:
+        identity = get_process_identity(occupant.pid)
+        name = identity.name if identity is not None else ""
+    if not _image_matches(name, IMAGE_BACKEND):
+        return "foreign"
+    if not request_backend_shutdown(port):
+        return "unavailable"
+    deadline = time.monotonic() + wait_timeout
+    while True:
+        if not [o for o in find_port_occupants([port]) if o.port == port]:
+            return "stopped"
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(poll_sec)

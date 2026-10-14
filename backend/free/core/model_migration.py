@@ -1039,7 +1039,7 @@ class ModelMigrator:
         return [
             "llama-server を新モデルで再起動してください",
             "通常通り使用を開始してください（経験が自動蓄積されます）",
-            "プロンプトの再最適化: evoref optimize --level1 で手動実行可能",
+            "プロンプトの再最適化: evoref chat の対話中に /learn level1 で手動実行可能",
         ]
 
     def _resolve_path(self, raw: str) -> Path:

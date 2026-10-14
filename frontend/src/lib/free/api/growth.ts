@@ -118,11 +118,41 @@ export interface GrowthActionResponse {
 	adoption_id: string | null;
 }
 
-/** 回帰ケースの除外の結果 */
+/** 回帰ケースの除外 (retire) / 除外の取り消し (unretire) の結果 */
 export interface RegressionRetireResponse {
 	case_id: string;
+	/** 操作の後の台帳の状態 */
 	status: string;
 	changed: boolean;
+	/** 操作の前の台帳の状態 */
+	previous_status: string;
+}
+
+/** 回帰ケースの一覧の 1 行 (問いは先頭の要約だけ。本文・期待値は返らない) */
+export interface RegressionCaseItem {
+	case_id: string;
+	mode: string;
+	source: string;
+	/** 台帳の状態 (active / quarantined / retired) */
+	status: string;
+	/** active のケースの役割 (guard / pressure / flaky / unknown)。それ以外は空 */
+	role: string;
+	/** 同梱の種ケース (retire できない) */
+	seed: boolean;
+	query_preview: string;
+	query_chars: number;
+	written_at: string;
+	last_result: string | null;
+	last_run_at: string | null;
+}
+
+/** GET /api/learning/growth/regression */
+export interface RegressionCaseListResponse {
+	cases: RegressionCaseItem[];
+	/** 絞り込んだ後の件数 (ページングの前) */
+	total: number;
+	limit: number;
+	offset: number;
 }
 
 export type GrowthAssetKind = 'prompt' | 'generation_params';

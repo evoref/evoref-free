@@ -1,4 +1,4 @@
-"""Level 2 (成長) の API — 提案の採用 / 却下・巻き戻し・回帰ケースの除外 (docs/f_04 §6.8)。
+"""Level 2 (成長) の API — 提案の採用 / 却下・巻き戻し・回帰ケースの一覧と除外 / 除外の取り消し (docs/f_04 §6.8)。
 
 すべて Free (学習の資産を見る・直す・巻き戻す・採用理由を知るのはデータ主権、e_01 §0)。
 書き込みは束ねた active パーティションの学習ストアへ、イベントループの上で同期に行う
@@ -11,7 +11,7 @@ import asyncio
 import functools
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Body, Depends, Query
 
 from backend.app_state import AppState, get_app_state
 from backend.free.api._error_responses import api_error
@@ -20,7 +20,9 @@ from backend.free.api.learning._growth_schemas import (
     GrowthProposalDetail,
     GrowthResponse,
     GrowthRollbackRequest,
+    RegressionCaseListResponse,
     RegressionRetireResponse,
+    RegressionStatusChangeRequest,
 )
 from backend.log_config import get_logger
 from backend.trace_context import run_in_executor_with_context
@@ -33,6 +35,9 @@ router = APIRouter(prefix="/api/learning/growth", tags=["learning"])
 _REASON_KEYS: dict[str, str] = {
     "proposal_not_found": "api.growth_proposal_not_found",
     "case_not_found": "api.growth_case_not_found",
+    "case_not_retired": "api.growth_case_not_retired",
+    "unknown_regression_status": "api.growth_unknown_regression_status",
+    "unknown_mode": "api.growth_unknown_mode",
     "unknown_asset_kind": "api.growth_unknown_asset_kind",
     "unsupported_asset_kind": "api.growth_unknown_asset_kind",
     "stale_parent": "api.growth_stale_parent",
@@ -152,14 +157,54 @@ async def rollback_asset(
     )
 
 
+@router.get("/regression", response_model=RegressionCaseListResponse)
+async def list_regression_cases(
+    status: str | None = Query(default=None),
+    mode: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    state: AppState = Depends(get_app_state),
+) -> RegressionCaseListResponse:
+    """回帰台帳のケースの一覧 (読むだけ。問いは先頭の要約だけを返す)。"""
+    service = _service(state)
+    try:
+        out = await _in_executor(
+            functools.partial(service.regression_cases, status=status, mode=mode, limit=limit, offset=offset),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _raise(exc)
+        raise
+    return RegressionCaseListResponse(**out)
+
+
 @router.post("/regression/{case_id}/retire", response_model=RegressionRetireResponse)
 async def retire_regression_case(
-    case_id: str, state: AppState = Depends(get_app_state),
+    case_id: str,
+    req: RegressionStatusChangeRequest | None = Body(default=None),
+    state: AppState = Depends(get_app_state),
 ) -> RegressionRetireResponse:
     """回帰ケースを ``retired`` にする (誤った訂正から収穫したケースを外す)。"""
     service = _service(state)
+    body = req or RegressionStatusChangeRequest()
     try:
-        out = service.retire_case(case_id)
+        out = service.retire_case(case_id, by=body.by, reason=body.reason)
+    except Exception as exc:  # noqa: BLE001
+        _raise(exc)
+        raise
+    return RegressionRetireResponse(**out)
+
+
+@router.post("/regression/{case_id}/unretire", response_model=RegressionRetireResponse)
+async def unretire_regression_case(
+    case_id: str,
+    req: RegressionStatusChangeRequest | None = Body(default=None),
+    state: AppState = Depends(get_app_state),
+) -> RegressionRetireResponse:
+    """retire を取り消し、外す前の状態へ戻す。``retired`` でなければ 409 (``case_not_retired``)。"""
+    service = _service(state)
+    body = req or RegressionStatusChangeRequest()
+    try:
+        out = service.unretire_case(case_id, by=body.by, reason=body.reason)
     except Exception as exc:  # noqa: BLE001
         _raise(exc)
         raise

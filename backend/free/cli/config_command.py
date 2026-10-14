@@ -39,7 +39,8 @@ from backend.config_normalize import (
 )
 from backend.data_root import DataRootError, resolve_data_root, store_root
 from backend.free.cli.backend_headers import backend_headers
-from backend.free.cli.config_loader import _find_project_root, _load_yaml_section, _setup_encoding
+from backend.free.cli.cli_common import resolve_backend_url
+from backend.free.cli.config_loader import _find_project_root, _setup_encoding
 from backend.free.cli.renderer import create_console, render_error, render_info
 from backend.i18n_helper import init_i18n, msg
 from backend.io.writer_lock import WriterLockHeld, acquire_config_write_lock, acquire_writer_lock
@@ -47,7 +48,6 @@ from backend.log_config import get_logger
 
 logger = get_logger("cli.config")
 
-_DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 30.0
 _MISSING = object()
 
@@ -358,19 +358,8 @@ def _local_config(root: Path) -> dict:
     return read_config_file(root / "config.yaml", root)
 
 
-def _default_backend_url(root: Path) -> str:
-    """``config.yaml`` の ``server.port`` を見た既定の backend URL (読めなければ 8000)。"""
-    try:
-        port = _load_yaml_section(root, "server").get("port")
-    except (AttributeError, yaml.YAMLError):
-        return _DEFAULT_BACKEND
-    if isinstance(port, int) and not isinstance(port, bool):
-        return f"http://localhost:{port}"
-    return _DEFAULT_BACKEND
-
-
 def _run_value_action(args: argparse.Namespace, root: Path, console: Console) -> int:
-    base = (args.backend_url or _default_backend_url(root)).rstrip("/")
+    base = resolve_backend_url(args.backend_url, root)
     try:
         with httpx.Client(headers=backend_headers(), timeout=_TIMEOUT) as client:
             if args.action == "set":

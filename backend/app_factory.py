@@ -54,6 +54,10 @@ def create_app() -> FastAPI:
         version="0.0.0",
         lifespan=lifespan,
     )
+    # 停止を受理した後の書き込みを 503 で断る (c_06 §2.7)。CORS より内側に置く
+    from backend.free.api.system.shutdown import register_shutdown_gate
+
+    register_shutdown_gate(app)
     _register_cors(app)
     # CORS より外側で Host / Origin / クライアントヘッダを検査する (c_06 §1.5)
     register_access_guard(app)

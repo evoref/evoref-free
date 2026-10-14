@@ -49,6 +49,7 @@ from backend.data_root import (
     resolve_data_root,
     store_root,
 )
+from backend.free.cli.pid_manager import graceful_stop_backend
 from backend.io import ledger_files
 from backend.io.generation_seal import GITKEEP_FILENAME, SEAL_FILENAME
 from backend.io.writer_lock import LOCK_FILENAME, WriterLockHeld, acquire_writer_lock
@@ -379,13 +380,17 @@ def _taskkill_window_titles() -> None:
 def stop_services(project_root: Path, *, wait_timeout: float = 30.0) -> bool:
     """全サービス (backend + llama-server + frontend) を止め、ポートの解放を待つ。
 
-    ポートの占有者はイメージ名が役割どおりのときだけ kill する。evoref のものでない
-    占有者は残して ``False`` を返す (待たない)。
+    最初に backend へ正常停止を頼んでポートが空くのを待ち (``scripts/stop_services.py`` と同じ
+    段 1、c_09 §2.1)、残ったものを止める。ポートの占有者はイメージ名が役割どおりのときだけ
+    kill する。evoref のものでない占有者は残して ``False`` を返す (待たない)。
     """
-    from backend.free.cli.pid_manager import find_port_occupants, kill_port_occupants
+    from backend.free.cli.pid_manager import backend_port_of, find_port_occupants, kill_port_occupants
 
     expected = _expected_images(project_root)
     ports = list(expected)
+    backend_port = backend_port_of(expected)
+    if backend_port is not None:
+        print(f"[reset] graceful shutdown of backend :{backend_port}: {graceful_stop_backend(backend_port)}")
     _taskkill_window_titles()
     own_pid = os.getpid()
     occupants = [o for o in find_port_occupants(ports) if o.pid != own_pid]

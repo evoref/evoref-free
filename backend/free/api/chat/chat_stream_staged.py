@@ -11,6 +11,8 @@ staged クリエイト (仕様書 → コード → テスト) の「合成 → 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 
 from typing import (
     TYPE_CHECKING,
@@ -21,6 +23,8 @@ from backend.free.api.chat.chat_stream_common import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
+
     from backend.free.loop.staged.run_record import RunEventLog, RunRecordStore
 
 
@@ -71,6 +75,60 @@ def _finish_run_safely(
         )
     except Exception as exc:  # noqa: BLE001 - 後始末の失敗で応答を壊さない
         logger.warning("staged run record finish(%s) failed: %s", exit_kind, exc)
+
+
+class RunTerminal:
+    """run.json の終端を 1 回だけ書く (最初の終端が勝つ、f_10 §7)。
+
+    パイプラインは ``run_store.start`` の後で :meth:`bind` し、正常な結末は
+    :meth:`finish` で書く。:func:`terminates_run` が取り消し・想定外の例外の
+    出口で同じ :meth:`finish` を呼ぶので、終端済みなら何もしない。
+    """
+
+    def __init__(self) -> None:
+        self.run_store: "RunRecordStore | None" = None
+        self.event_log: "RunEventLog | None" = None
+        self.finished = False
+
+    def bind(self, run_store: "RunRecordStore | None", event_log: "RunEventLog | None") -> None:
+        """開始を書いた run の記録先を覚える (開始に失敗したら ``None`` のまま)。"""
+        self.run_store = run_store
+        self.event_log = event_log
+
+    def finish(self, exit_kind: str, *, tasks_failed: int = 0) -> None:
+        """終端を同期で書く (await しない — 取り消しの最中でも書き切る)。2 回目以降は何もしない。"""
+        if self.finished or self.run_store is None:
+            return
+        self.finished = True
+        _finish_run_safely(self.run_store, self.event_log, exit_kind, tasks_failed=tasks_failed)
+
+
+def terminates_run(body: "Callable[..., AsyncIterator[dict]]") -> "Callable[..., AsyncIterator[dict]]":
+    """staged パイプライン (async generator) をどう抜けても run.json を終端する。
+
+    ``body`` は ``run_terminal`` キーワードで :class:`RunTerminal` を受け取る。
+    強制取り消し (``agent_task.cancel()`` = ``/api/chat/cancel`` / 正常停止) は
+    await の途中に ``CancelledError`` を投げ、段の境界でしか見ない協調フラグの
+    終端に届かない — ``running`` のまま残っていた (2026-10-14 実機)。
+    ``CancelledError`` / ``GeneratorExit`` は ``cancelled``、それ以外の例外は
+    ``error`` で終端してから送出し直す。
+    """
+
+    @functools.wraps(body)
+    async def _guarded(*args, **kwargs) -> "AsyncIterator[dict]":
+        terminal = RunTerminal()
+        async with contextlib.aclosing(body(*args, run_terminal=terminal, **kwargs)) as events:
+            try:
+                async for event in events:
+                    yield event
+            except (asyncio.CancelledError, GeneratorExit):
+                terminal.finish("cancelled")
+                raise
+            except BaseException:
+                terminal.finish("error")
+                raise
+
+    return _guarded
 
 
 # ---------------------------------------------------------------------------

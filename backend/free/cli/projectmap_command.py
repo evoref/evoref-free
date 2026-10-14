@@ -15,6 +15,7 @@ import httpx
 from rich.console import Console
 
 from backend.free.cli.backend_headers import backend_headers
+from backend.free.cli.cli_common import add_common_args, resolve_backend_url
 from backend.free.cli.config_loader import _find_project_root, _setup_encoding
 from backend.free.cli.renderer import (
     create_console,
@@ -27,7 +28,6 @@ from backend.log_config import get_logger, setup_cli_logging
 
 logger = get_logger("cli.projectmap")
 
-_DEFAULT_BACKEND = "http://localhost:8000"
 #: 走査 + tree-sitter 抽出は数分掛かりうる (reindex と同様に同期で待つ)。
 _TIMEOUT = 900.0
 
@@ -56,10 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "action", nargs="?", default="status", choices=["status", "update"],
         help="status (default): show current versions. update: trigger a manual update",
     )
-    parser.add_argument(
-        "--backend-url", default=_DEFAULT_BACKEND,
-        help="Backend URL (default: http://localhost:8000)",
-    )
+    add_common_args(parser, json=False)
     parser.add_argument(
         "--json", action="store_true",
         help="Print the raw JSON response instead of a table",
@@ -84,7 +81,7 @@ def run_projectmap(argv: list[str]) -> int:
 
 async def _run_projectmap_async(args: argparse.Namespace) -> int:
     console = create_console()
-    backend_url = args.backend_url.rstrip("/")
+    backend_url = resolve_backend_url(args.backend_url)
 
     async with httpx.AsyncClient(headers=backend_headers(), timeout=_TIMEOUT) as client:
         if args.action == "update":

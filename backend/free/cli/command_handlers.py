@@ -10,8 +10,11 @@ import httpx
 
 from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.command_parser import (
+    PRO_SLASH_ACTIONS,
     CommandResult,
     SessionState,
+    get_slash_action,
+    resolve_slash_handler,
 )
 from backend.free.cli.renderer import (
     render_error,
@@ -627,7 +630,7 @@ async def _cmd_cartridge(args: str, state: SessionState, console) -> CommandResu
         /cartridge unload <id>        — メモリからアンロード
         /cartridge uninstall <id>     — 完全削除
         /cartridge rebuild <id>       — ベクトルインデックス再構築
-        /cartridge create <dir> ...   — カートリッジ作成 (Pro)
+        /cartridge create <dir> ...   — カートリッジ作成 (Pro が差し込む。Free は「Pro 専用」の案内)
     """
     from backend.free.cli.cartridge_commands import (
         _cartridge_install,
@@ -690,59 +693,16 @@ async def _cmd_cartridge(args: str, state: SessionState, console) -> CommandResu
         _cartridge_rebuild(backend_url, console, rest[0])
         return CommandResult()
 
-    if action == "create":
-        return _cartridge_create_interactive(rest, state, console)
+    if action in PRO_SLASH_ACTIONS.get("/cartridge", frozenset()):
+        # Pro が差し込むサブアクション (create)。登録が無ければ「Pro 専用」の案内
+        extension = get_slash_action("/cartridge", action)
+        if extension is None:
+            render_error(console, msg("cli.cartridge_create_pro_only"))
+            return CommandResult()
+        result = resolve_slash_handler(extension)(" ".join(rest), state, console)
+        return await result if extension.is_async else result
 
     render_error(console, msg("cli.cartridge_unknown_action", action=action))
-    return CommandResult()
-
-
-def _cartridge_create_interactive(
-    rest: list[str], state: SessionState, console,
-) -> CommandResult:
-    """/cartridge create のインタラクティブ引数パース"""
-    import argparse as _argparse
-
-    from backend.free.cli.cartridge_commands import _cartridge_create
-
-    parser = _argparse.ArgumentParser(
-        prog="/cartridge create", exit_on_error=False,
-    )
-    parser.add_argument("source_dir")
-    parser.add_argument("--id", required=True)
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--version", default="1.0.0")
-    parser.add_argument("--author", default="")
-    parser.add_argument("--description", default="")
-    parser.add_argument("--tags", default="")
-    parser.add_argument("--language", default="ja")
-    parser.add_argument("--no-eval", action="store_true")
-    parser.add_argument("--eval-count", type=int, default=10)
-    parser.add_argument("--output", "-o", default=None)
-
-    try:
-        create_args = parser.parse_args(rest)
-    except (SystemExit, _argparse.ArgumentError):
-        render_error(
-            console,
-            "Usage: /cartridge create <source_dir> --id <id> --name <name> [--version V] [--author A] [--tags T]",
-        )
-        return CommandResult()
-
-    _cartridge_create(
-        state.backend_url, console,
-        source_dir=create_args.source_dir,
-        cart_id=create_args.id,
-        name=create_args.name,
-        version=create_args.version,
-        author=create_args.author,
-        description=create_args.description,
-        tags=create_args.tags,
-        language=create_args.language,
-        generate_eval=not create_args.no_eval,
-        eval_count=create_args.eval_count,
-        output=create_args.output,
-    )
     return CommandResult()
 
 

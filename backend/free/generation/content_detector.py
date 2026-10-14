@@ -160,7 +160,9 @@ def _extension_only_on_bare_names(hits: list[str], text: str) -> bool:
 
 
 #: 文書として書く宛先の拡張子。コードの拡張子を同時に名指していなければ、成果物は文書。
-_DOCUMENT_DESTINATION_EXTS = frozenset({".md", ".markdown", ".txt", ".rst"})
+_DOCUMENT_DESTINATION_EXTS = frozenset(
+    {".md", ".markdown", ".txt", ".rst", ".docx", ".pptx", ".odt", ".odp"},
+)
 
 
 #: 作る対象のプログラムを直接目的語に取る形 (「CLI ツールを作って」)。「ツールの README を作って」の

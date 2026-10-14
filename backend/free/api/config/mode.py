@@ -7,8 +7,6 @@ import asyncio
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from pathlib import Path
-
 from backend.app_state import AppState, get_app_state
 from backend.config import (
     get_config,
@@ -17,7 +15,6 @@ from backend.config import (
     get_project_root,
 )
 from backend.free.api._error_responses import api_error
-from backend.free.llm._base_client import health_wait_for_cfg
 from backend.log_config import get_logger
 
 logger = get_logger("api.mode")
@@ -84,8 +81,15 @@ async def _switch_mode_locked(new_mode: str, state: AppState) -> ModeSwitchRespo
     message = f"switched from {old_mode} to {new_mode}"
 
     if model_changed:
+        from backend.free.core.llama_process_manager import ProcessPortBusyError
+
+        refused = False
         try:
             restart_initiated = await _restart_base_server(state, new_params["model"])
+        except ProcessPortBusyError as e:
+            # 何も止めていない (ポートが別アプリ)。旧サーバは動いたまま
+            logger.error("Base server restart refused during mode switch: %s", e)
+            refused = True
         except Exception as e:
             logger.error("Base server restart raised during mode switch: %s", e)
             restart_initiated = False
@@ -93,8 +97,9 @@ async def _switch_mode_locked(new_mode: str, state: AppState) -> ModeSwitchRespo
             state.current_mode = old_mode
             get_path_resolver().set_active_mode(old_mode)
             # 旧サーバは新モデルの起動前に止めている。旧モデルで 1 回だけ起動し直す
-            # (失敗しても再試行・再ロールバックはしない。停止中は server_running=false で返す)
-            server_running = await _restore_previous_server(state, old_params["model"])
+            # (失敗しても再試行・再ロールバックはしない。停止中は server_running=false で返す)。
+            # 拒否された回は止めていないので起こし直さない
+            server_running = refused or await _restore_previous_server(state, old_params["model"])
             logger.error(
                 "Mode switch %s -> %s failed (base server restart failed); rolled back to %s "
                 "(previous model server running=%s)",
@@ -133,82 +138,35 @@ async def _restore_previous_server(state: AppState, model_path: str) -> bool:
 
 
 async def _restart_base_server(state: AppState, model_path: str) -> bool:
-    """ベースサーバーを新モデルで再起動する
+    """ベースサーバーを新モデルで起動し直す (所有者の ``LlamaProcessManager`` 経由、c_06 §2.6)
+
+    動いている base (このバックエンドが起こしたもの、または外部起動の llama-server) を止め、
+    ポートが空いてから ``model_override`` で起こす。health 待ちは ``process_manager.health_timeout``
+    (整数は明示値、auto は GGUF サイズ連動)。起動前にポートを空けて確かめるので、旧サーバの
+    200 を新モデルと取り違えない。
 
     Returns:
         再起動が成功したかどうか
+    Raises:
+        ProcessPortBusyError: 何も止めずに拒否した (ポートが別アプリ)。
+            旧サーバはそのまま動いている
     """
-    from backend.free.api.system.server_control import (
-        stop_server_process,
-        wait_port_released,
-        _spawn_server_with_override,
-        _try_reconnect,
-    )
-    from scripts.launch_llama import wait_for_health
+    from backend.free.api.model.process_service import start_component
+    from backend.free.core.llama_process_manager import ProcessManagerError, ProcessPortBusyError
 
+    if state.llama_manager is None:
+        logger.error("LlamaProcessManager not initialized; cannot restart the base server")
+        return False
     cfg = get_config()
-
-    # 1. 既存プロセスを確実に停止。``_stop_server`` は本バックエンドが spawn して
-    #    ``_managed`` に登録したプロセスしか kill しないが、base は通常 CLI /
-    #    launch_llama / evoref-ctl 経由の外部プロセスとして起動され ``_managed`` に
-    #    入らない。素の ``_stop_server`` だと no-op になり旧サーバが :8080 に残留し、
-    #    後続の health/reconnect が旧モデルを掴む (モデル切替が効かない根因)。
-    #    ``stop_server_process`` は _managed → LlamaProcessManager → 外部ポート占有
-    #    kill の 3 経路を踏むため外部 base も確実に停止する (内部で netstat/taskkill
-    #    がブロッキングなので別スレッドへ退避)。
-    await asyncio.to_thread(stop_server_process, "base", cfg, state)
-
-    # AppState のクライアント参照をクリア
-    if state.local_client:
-        await state.local_client.aclose()
-    state.local_client = None
-    if state.llm_client:
-        state.llm_client.local = None
-
-    # 2. 旧サーバが port を解放するまで待ってから再 spawn (graceful shutdown 残響で
-    #    旧サーバの 200 を拾う窓を潰す)。
-    await asyncio.to_thread(wait_port_released, "base", cfg, 10.0)
-
-    # 3. model_override 付きで新プロセス起動。base は止めたので環境調整の予約の再計算・
-    #    その場の見積りを許す (ブロッキングなので executor で、c_16 §7.2.3)
-    from functools import partial
-
-    from backend.trace_context import run_in_executor_with_context
-
-    managed = await run_in_executor_with_context(
-        asyncio.get_running_loop(), None, partial(
-            _spawn_server_with_override, "base", cfg, model_override=model_path,
-            allow_decide=True,
-        ),
-    )
-    if managed is None:
-        logger.error("Failed to spawn base server with model override")
+    try:
+        await start_component(state, "base", cfg, force=True, model_override=model_path)
+    except ProcessPortBusyError:
+        raise
+    except ProcessManagerError as e:
+        logger.error("Base server restart failed after model switch (model=%s): %s", model_path, e)
         return False
 
-    # 4. ヘルスチェック。``/health`` 200 だけでなく ``/props`` の load 済みモデルが
-    #    要求モデルと一致するまで待つ (旧サーバの 200 やロード途中を成功と誤判定
-    #    しない)。大きい create GGUF は load に時間がかかるためタイムアウトは
-    #    process_manager.health_timeout (整数は明示値、auto / 無しは GGUF サイズ連動で下限 120s) を採用。
-    expected_model_id = Path(model_path).name
-    health_timeout = health_wait_for_cfg(
-        cfg, model_path, project_root=get_project_root(), label="base",
-    )
-    healthy = await asyncio.to_thread(
-        wait_for_health, managed.host, managed.port, health_timeout, expected_model_id,
-    )
-
-    if not healthy:
-        logger.error(
-            "Base server health check failed/timed out after model switch "
-            "(expected model=%s)", expected_model_id,
-        )
-        await asyncio.to_thread(stop_server_process, "base", cfg, state)
-        return False
-
-    # 5. クライアント再接続
-    await _try_reconnect("base", state, cfg)
-
-    # 6. 実際に載ったモデルをこのモードのモデルと照合する (c_05 §0.5.7)
+    # 実際に載ったモデルをこのモードのモデルと照合する (c_05 §0.5.7)
     from backend.factory._served_model import check_served_model
 
     check_served_model(state, model_path, get_project_root())

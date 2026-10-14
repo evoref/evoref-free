@@ -17,6 +17,7 @@ from backend.free.agent._prompt_store_helpers import (
     body_exists,
     list_history_entries,
     read_body,
+    read_history_entry,
     read_history_version,
     read_meta,
     write_body,
@@ -1041,6 +1042,17 @@ class SystemPromptManager:
         if mode not in self.MODES:
             raise ValueError(f"Unknown mode: {mode}")
         return list_history_entries(self.prompt_dir, mode)
+
+    def get_history_version(self, mode: str, version: int) -> dict[str, Any]:
+        """履歴の版 ``version`` の本文 (``{"version", "file", "content"}``)。読むだけ。
+
+        Raises:
+            ValueError: 不明なモード
+            FileNotFoundError: その版の履歴ファイルが無い
+        """
+        if mode not in self.MODES:
+            raise ValueError(f"Unknown mode: {mode}")
+        return read_history_entry(self.prompt_dir, mode, version)
 
     def rollback(self, mode: str, version: int) -> None:
         """特定バージョンにロールバック"""
