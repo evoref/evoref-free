@@ -65,7 +65,7 @@ def prose_language_name(*, english: bool = False) -> str:
     return names[1] if english else names[0]
 
 
-def msg(key: str, **kwargs) -> str:
+def msg(key: str, /, **kwargs) -> str:
     """
     メッセージ取得。ドット区切りのキーでネストをたどる。
     例: msg("cli.welcome", version="0.1.0", mode="create")
@@ -73,7 +73,7 @@ def msg(key: str, **kwargs) -> str:
     return msg_for_locale(_locale, key, **kwargs)
 
 
-def msg_for_locale(locale: str, key: str, **kwargs) -> str:
+def msg_for_locale(locale: str, key: str, /, **kwargs) -> str:
     """``locale`` を明示してメッセージを取得する (``msg`` は UI の ``_locale`` 固定)。
 
     LLM プロンプトへ埋め込む文 (``agent.event_reminder``) は UI 言語ではなく

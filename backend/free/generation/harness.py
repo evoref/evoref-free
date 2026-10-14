@@ -211,133 +211,148 @@ class LongFormHarness:
             except Exception as exc:  # noqa: BLE001 - run 記録の失敗で生成は止めない
                 logger.warning("longform run recorder start failed: %s", exc)
                 recorder = None
-        if recorder is not None:
-            # SSE フレーム化 (meta の create_run) 用。events.jsonl への追記は
-            # run.json の start() 自体が事実を持つため二重に積まない
-            # (staged の run_started フレームと同じ扱い、f_10 §7)。
-            await on_event(ProductionEvent(
-                kind="run_started",
-                payload={"run_id": run_id, "session_id": req.session_id or self._session_id},
-            ))
+        # 終端は 1 回だけ (最初の結末が勝つ)。取り消し・想定外の例外で抜けても
+        # run.json を running のまま残さない (f_10 §7、2026-10-14 実機)
+        finished = False
 
-        buffer_parts: list[str] = []
-
-        def _on_step(data: dict) -> None:
-            # orchestrator._call_step は sync 呼出し。同一コルーチン内の
-            # put_nowait は競合しない (次に drain するまでキューに積むだけ)。
-            # 永続化は配信より先に行う (events.jsonl → SSE、f_10 §7)。
-            if recorder is not None:
-                try:
-                    recorder.append_event(str(data.get("type") or "step"), data)
-                except Exception as exc:  # noqa: BLE001 - 記録の失敗で生成は止めない
-                    logger.warning("longform run event append failed: %s", exc)
-            queue.put_nowait(data)
-
-        def _write_progress() -> None:
-            if recorder is None:
+        def _finish(exit_kind: str, *, template: str = "", tasks_failed: int = 0) -> None:
+            nonlocal finished
+            if recorder is None or finished:
                 return
-            try:
-                recorder.write_src(
-                    _deliverable_path(orchestrator, req), "".join(buffer_parts),
-                )
-            except Exception as exc:  # noqa: BLE001 - 途中経過の書込み失敗で生成は止めない
-                logger.warning("longform progress write_src failed: %s", exc)
+            finished = True
+            _finish_recorder(recorder, exit_kind, template=template, tasks_failed=tasks_failed)
 
-        async def _drain() -> None:
-            while not queue.empty():
-                data = queue.get_nowait()
-                kind = str(data.get("type") or "")
-                if recorder is not None and kind == "long_form_document_gate":
-                    gate = getattr(orchestrator, "last_document_gate", None)
-                    if gate is not None:
-                        try:
-                            recorder.append_event("outline_drift", gate)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.warning("longform outline_drift append failed: %s", exc)
-                if kind == "long_form_unit_done":
-                    _write_progress()
-                await on_event(ProductionEvent(kind="step", payload=data))
-
-        exit_kind = "done"
         try:
-            async for token in orchestrator.generate(
-                instruction=req.instruction,
-                session_id=req.session_id or self._session_id,
-                mode="create",
-                on_step=_on_step,
-                existing_content=existing_content,
-                prefetched_rag=self._prefetched_rag,
-                file_context_block=self._file_context_block,
-                brief=req.brief,
-            ):
-                buffer_parts.append(token)
-                await _drain()
-                if is_cancelled():
-                    logger.info("longform harness: cancel requested; stopping generate()")
-                    exit_kind = "cancelled"
-                    break
-        except Exception as exc:
-            logger.warning("longform harness generation failed: %s", exc)
-            await _drain()
             if recorder is not None:
-                _finish_recorder(recorder, "error")
-            notes = _base_notes(recorder, run_id)
-            notes["error"] = str(exc)
-            return ProductionResult(exit_kind="error", notes=notes)
-        await _drain()
-        # 総時間で打ち切ったなら「予算で止まり未完了が残った」= timeout (f_10 §7)。
-        # 以前は done と記録し、meta の報告も「完了」だった (2026-09-26)。
-        final_metrics = getattr(orchestrator, "last_metrics", None)
-        if (
-            exit_kind == "done" and isinstance(final_metrics, dict)
-            and final_metrics.get("timed_out") is True
-        ):
-            exit_kind = "timeout"
+                # SSE フレーム化 (meta の create_run) 用。events.jsonl への追記は
+                # run.json の start() 自体が事実を持つため二重に積まない
+                # (staged の run_started フレームと同じ扱い、f_10 §7)。
+                await on_event(ProductionEvent(
+                    kind="run_started",
+                    payload={"run_id": run_id, "session_id": req.session_id or self._session_id},
+                ))
 
-        content_type = getattr(orchestrator, "last_content_type", None)
-        artifacts: list[EditorArtifact] = []
-        #: リペア後も残った CODE の検証エラー (構文 / 整合 / import スモーク)。
-        #: 配信はするが未完了として数える (f_08 §2.3、2026-09-26)。
-        unresolved: list[str] = []
-        if content_type == "code":
-            files = orchestrator.last_code_files or (
-                {"output.py": orchestrator.last_code_output}
-                if orchestrator.last_code_output else {}
-            )
-            artifacts = [
-                _artifact_from_file(path, code)
-                for path, code in files.items()
-                if code and code.strip()
-            ]
-            # 「壊れたコードを成功として渡さない」: リペア後も残った検証エラーが
-            # あれば best-effort で成果物を返しつつ未解決エラーを可視化する。
-            if artifacts and orchestrator.last_validation_errors:
-                unresolved = list(orchestrator.last_validation_errors)
-                artifacts.append(_validation_issues_artifact(unresolved))
-            if recorder is not None:
-                _write_final_files(recorder, files)
-        else:
-            from backend.free.agent.meta_cognitive_tasks import EditorArtifact
-            text = orchestrator.last_text_output
-            if text and text.strip():
-                artifacts = [EditorArtifact(content=text, language="text", filename=None)]
+            buffer_parts: list[str] = []
+
+            def _on_step(data: dict) -> None:
+                # orchestrator._call_step は sync 呼出し。同一コルーチン内の
+                # put_nowait は競合しない (次に drain するまでキューに積むだけ)。
+                # 永続化は配信より先に行う (events.jsonl → SSE、f_10 §7)。
                 if recorder is not None:
-                    _write_final_files(
-                        recorder, {_deliverable_path(orchestrator, req): text},
+                    try:
+                        recorder.append_event(str(data.get("type") or "step"), data)
+                    except Exception as exc:  # noqa: BLE001 - 記録の失敗で生成は止めない
+                        logger.warning("longform run event append failed: %s", exc)
+                queue.put_nowait(data)
+
+            def _write_progress() -> None:
+                if recorder is None:
+                    return
+                try:
+                    recorder.write_src(
+                        _deliverable_path(orchestrator, req), "".join(buffer_parts),
                     )
+                except Exception as exc:  # noqa: BLE001 - 途中経過の書込み失敗で生成は止めない
+                    logger.warning("longform progress write_src failed: %s", exc)
 
-        if recorder is not None:
-            template = str(getattr(orchestrator, "last_metrics", {}).get("template") or "")
-            _finish_recorder(
-                recorder, exit_kind, template=template, tasks_failed=1 if unresolved else 0,
+            async def _drain() -> None:
+                while not queue.empty():
+                    data = queue.get_nowait()
+                    kind = str(data.get("type") or "")
+                    if recorder is not None and kind == "long_form_document_gate":
+                        gate = getattr(orchestrator, "last_document_gate", None)
+                        if gate is not None:
+                            try:
+                                recorder.append_event("outline_drift", gate)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("longform outline_drift append failed: %s", exc)
+                    if kind == "long_form_unit_done":
+                        _write_progress()
+                    await on_event(ProductionEvent(kind="step", payload=data))
+
+            exit_kind = "done"
+            try:
+                async for token in orchestrator.generate(
+                    instruction=req.instruction,
+                    session_id=req.session_id or self._session_id,
+                    mode="create",
+                    on_step=_on_step,
+                    existing_content=existing_content,
+                    prefetched_rag=self._prefetched_rag,
+                    file_context_block=self._file_context_block,
+                    brief=req.brief,
+                ):
+                    buffer_parts.append(token)
+                    await _drain()
+                    if is_cancelled():
+                        logger.info("longform harness: cancel requested; stopping generate()")
+                        exit_kind = "cancelled"
+                        break
+            except Exception as exc:
+                logger.warning("longform harness generation failed: %s", exc)
+                await _drain()
+                _finish("error")
+                notes = _base_notes(recorder, run_id)
+                notes["error"] = str(exc)
+                return ProductionResult(exit_kind="error", notes=notes)
+            await _drain()
+            # 総時間で打ち切ったなら「予算で止まり未完了が残った」= timeout (f_10 §7)。
+            # 以前は done と記録し、meta の報告も「完了」だった (2026-09-26)。
+            final_metrics = getattr(orchestrator, "last_metrics", None)
+            if (
+                exit_kind == "done" and isinstance(final_metrics, dict)
+                and final_metrics.get("timed_out") is True
+            ):
+                exit_kind = "timeout"
+
+            content_type = getattr(orchestrator, "last_content_type", None)
+            artifacts: list[EditorArtifact] = []
+            #: リペア後も残った CODE の検証エラー (構文 / 整合 / import スモーク)。
+            #: 配信はするが未完了として数える (f_08 §2.3、2026-09-26)。
+            unresolved: list[str] = []
+            if content_type == "code":
+                files = orchestrator.last_code_files or (
+                    {"output.py": orchestrator.last_code_output}
+                    if orchestrator.last_code_output else {}
+                )
+                artifacts = [
+                    _artifact_from_file(path, code)
+                    for path, code in files.items()
+                    if code and code.strip()
+                ]
+                # 「壊れたコードを成功として渡さない」: リペア後も残った検証エラーが
+                # あれば best-effort で成果物を返しつつ未解決エラーを可視化する。
+                if artifacts and orchestrator.last_validation_errors:
+                    unresolved = list(orchestrator.last_validation_errors)
+                    artifacts.append(_validation_issues_artifact(unresolved))
+                if recorder is not None:
+                    _write_final_files(recorder, files)
+            else:
+                from backend.free.agent.meta_cognitive_tasks import EditorArtifact
+                text = orchestrator.last_text_output
+                if text and text.strip():
+                    artifacts = [EditorArtifact(content=text, language="text", filename=None)]
+                    if recorder is not None:
+                        _write_final_files(
+                            recorder, {_deliverable_path(orchestrator, req): text},
+                        )
+
+            if recorder is not None:
+                template = str(getattr(orchestrator, "last_metrics", {}).get("template") or "")
+                _finish(exit_kind, template=template, tasks_failed=1 if unresolved else 0)
+
+            notes = _base_notes(recorder, run_id)
+            if unresolved:
+                notes["validation_errors"] = len(unresolved)
+            return ProductionResult(
+                artifacts=artifacts,
+                exit_kind=exit_kind,
+                metrics=dict(getattr(orchestrator, "last_metrics", {}) or {}),
+                notes=notes,
             )
-
-        notes = _base_notes(recorder, run_id)
-        if unresolved:
-            notes["validation_errors"] = len(unresolved)
-        return ProductionResult(
-            artifacts=artifacts,
-            exit_kind=exit_kind,
-            metrics=dict(getattr(orchestrator, "last_metrics", {}) or {}),
-            notes=notes,
-        )
+        except (asyncio.CancelledError, GeneratorExit):
+            _finish("cancelled")
+            raise
+        except BaseException:
+            _finish("error")
+            raise

@@ -357,7 +357,7 @@ _DAY_SCOPE_RECALL_RE = re.compile(
     r"(?P<day>" + alternation(kanji_terms(DAY_OFFSETS, where=lambda off: off <= 0))
     + r")(?:は|に|も|の)?(?P<gap>[^。！？!?\n]{0,16}?)"
     rf"(?:(?:{_SPEECH_VERB_STEMS})(?:を?[しっいん]|ね|え)?"
-    r"(?:た|ました|まし|てくれ|てもらっ|ていただ)|話題|会話|やり取り)",
+    r"(?:た(?![いく])|ました|まし|てくれ|てもらっ|ていただ)|話題|会話|やり取り)",
 )
 
 #: 発話動詞 (会話の名詞) に **直に** 掛かる相手 — 共格「と」・与格「に」(「友達と話した」
@@ -442,7 +442,7 @@ _DATED_CONVERSATION_TAIL_RE = re.compile(
     r"(?:(?:チャット)?履歴"
     r"|[^。！？!?\nとで]{0,8}?(?:会話|やり取り|チャット)(?:履歴)?"
     rf"(?![{KATAKANA_BLOCK}{KANJI}])"
-    rf"|(?:何を?|どんな)?(?:{_SPEECH_VERB_STEMS})(?:を?[しっいん]|ね|え)?(?:た|ました))",
+    rf"|(?:何を?|どんな)?(?:{_SPEECH_VERB_STEMS})(?:を?[しっいん]|ね|え)?(?:た(?![いく])|ました))",
 )
 
 _YMD = tuple[int | None, int, int]

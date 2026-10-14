@@ -495,6 +495,68 @@ class PinnedFactsResponse(BaseModel):
     facts: list[PinnedFactInfo]
 
 
+# ===== 意味記憶のファクトの一覧 (evoref forget --id の ID を探す、f_02 §9) =====
+
+class MemoryFactInfo(BaseModel):
+    """ファクト 1 件の表示用 DTO。private は ``value`` を返さない。"""
+
+    id: str
+    subject: str
+    predicate: str
+    #: 本文 (正規化済みの命題、無ければ発話原文)。秘密らしき文字列は伏せる。private は ``None``
+    value: str | None
+    type: str
+    scope: str
+    #: ``live`` / ``disputed`` (live のまま競合中) / ``superseded`` (取り下げ済みは載らない)
+    status: str
+    veracity: str
+    origin: str
+    confidence: float
+    pinned: bool
+    private: bool
+    #: ``value`` の中の秘密らしき文字列を伏せたか
+    redacted: bool
+    #: 多値スロット (``multi_valued`` / ``span_only_fold``)。forget は ID 単体だけを取り下げる
+    multi_valued: bool
+    superseded_by: str | None
+    #: 発話時刻 (ISO 8601 UTC)
+    created_at: str | None
+    #: 最後に使われた時刻 (ISO 8601 UTC)
+    accessed_at: str | None
+    note_ids: list[str]
+    session_ids: list[str]
+    extractors: list[str]
+
+
+class MemoryFactsResponse(BaseModel):
+    scope: str
+    status: str
+    total: int
+    limit: int
+    offset: int
+    facts: list[MemoryFactInfo]
+
+
+class MemoryFactNoteInfo(BaseModel):
+    """根拠ノート (provenance の ``note_id``) の要約。"""
+
+    id: str
+    #: ``active`` / ``retracted`` / ``missing``
+    state: str
+    private: bool
+    #: 先頭の要約 (秘密らしき文字列は伏せる)。private / 無いノートは ``None``
+    preview: str | None
+
+
+class MemoryFactDetailResponse(BaseModel):
+    fact: MemoryFactInfo
+    #: 同じ subject・同じ scope の live の別ファクト (多値スロットの別の値)
+    siblings: list[MemoryFactInfo]
+    #: このファクトが置き換えた旧値 (forget すると live に戻る)
+    revived_on_forget: list[MemoryFactInfo]
+    notes: list[MemoryFactNoteInfo]
+
+
 # ===== Model =====
 
 class ModelDetailResponse(BaseModel):

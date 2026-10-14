@@ -60,8 +60,15 @@ CONFLICT_STALE_PARENT = "stale_parent"
 CONFLICT_LEARNING_RUNNING = "learning_running"
 CONFLICT_IDENTICAL = "identical_after_normalization"
 CONFLICT_NO_TARGET = "no_rollback_target"
+CONFLICT_CASE_NOT_RETIRED = "case_not_retired"
 #: ``recent`` に載せる台帳の末尾の行数。
 RECENT_ROWS = 20
+#: 回帰ケースの一覧に載せる問いの要約の字数 (本文は返さない)。
+QUERY_PREVIEW_CHARS = 80
+#: 回帰ケースの一覧の ``status`` の絞り込み (台帳の状態 + ``active`` の役割)。
+REGRESSION_LIST_STATUSES: tuple[str, ...] = (
+    "active", "guard", "pressure", "flaky", "quarantined", "retired",
+)
 
 
 class GrowthError(Exception):
@@ -69,10 +76,12 @@ class GrowthError(Exception):
 
     status = 400
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    def __init__(self, reason: str, detail: str = "", context: dict[str, Any] | None = None) -> None:
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail or reason
+        #: i18n の文言を埋める値 (API の ``context`` に載る)。
+        self.context = dict(context or {})
 
 
 class GrowthNotFound(GrowthError):
@@ -547,9 +556,8 @@ class GrowthService:
             "row_id": row.row_id if row else None, "adoption_id": adoption_id,
         }
 
-    def retire_case(self, case_id: str) -> dict[str, Any]:
-        """回帰ケースを ``retired`` にする (誤った訂正から収穫したケースを利用者が外す)。"""
-        from backend.free.learning.growth.regression import STATUS_RETIRED
+    def _ledger_case(self, case_id: str) -> tuple[Any, Any]:
+        """書き込みの前検査 (readonly は 423、台帳に無ければ 404)。``(台帳, ケース)``。"""
         from backend.io.readonly import is_readonly, readonly_reason
 
         if is_readonly():
@@ -558,9 +566,74 @@ class GrowthService:
         current = next((c for c in ledger.load() if c.case_id == case_id), None)
         if current is None:
             raise GrowthNotFound("case_not_found", f"no regression case {case_id} in the ledger")
-        changed = ledger.retire(case_id)
-        logger.info("Growth: regression case %s retired by the user (changed=%s)", case_id, changed)
-        return {"case_id": case_id, "status": STATUS_RETIRED, "changed": bool(changed)}
+        return ledger, current
+
+    def retire_case(self, case_id: str, *, by: str = "api", reason: str = "") -> dict[str, Any]:
+        """回帰ケースを ``retired`` にする (誤った訂正から収穫したケースを利用者が外す)。
+
+        外す前の状態・操作者・理由はケースの行の ``_extra["status_change"]`` に残す
+        (:meth:`unretire_case` が外す前の状態へ戻すのに使う)。
+        """
+        from backend.free.learning.growth.regression import STATUS_RETIRED
+
+        ledger, current = self._ledger_case(case_id)
+        changed = ledger.retire(case_id, by=by, reason=reason)
+        logger.info(
+            "Growth: regression case %s retired by the user via %s (from=%s, changed=%s)",
+            case_id, by, current.status, changed,
+        )
+        return {
+            "case_id": case_id, "status": STATUS_RETIRED, "changed": bool(changed),
+            "previous_status": str(current.status),
+        }
+
+    def unretire_case(self, case_id: str, *, by: str = "api", reason: str = "") -> dict[str, Any]:
+        """``retired`` を取り消して外す前の状態へ戻す。``retired`` でなければ 409。"""
+        from backend.free.learning.growth.regression import STATUS_RETIRED
+
+        ledger, current = self._ledger_case(case_id)
+        if current.status != STATUS_RETIRED:
+            raise GrowthConflict(
+                CONFLICT_CASE_NOT_RETIRED, f"regression case {case_id} is {current.status}, not retired",
+            )
+        restored = ledger.unretire(case_id, by=by, reason=reason)
+        if restored is None:  # 読んだ後に別の書き手が状態を変えた
+            raise GrowthConflict(CONFLICT_CASE_NOT_RETIRED, f"regression case {case_id} is no longer retired")
+        logger.info("Growth: regression case %s unretired by the user via %s (to=%s)", case_id, by, restored)
+        return {
+            "case_id": case_id, "status": str(restored), "changed": True,
+            "previous_status": STATUS_RETIRED,
+        }
+
+    def regression_cases(
+        self, *, status: str | None = None, mode: str | None = None, limit: int = 50, offset: int = 0,
+    ) -> dict[str, Any]:
+        """回帰台帳のケースの一覧 (読むだけ。``written_at`` の新しい順、種ケースは最後)。
+
+        問いの本文は返さず、先頭 :data:`QUERY_PREVIEW_CHARS` 字の要約と字数だけを返す。
+        期待値・誤値・ツール結果・直前の会話・ヒントも返さない (台帳の本文は forget の
+        対象で、一覧に載せる必要が無い)。``status`` は台帳の状態 (``active`` /
+        ``quarantined`` / ``retired``) か、``active`` のうちの役割 (``guard`` / ``pressure``
+        / ``flaky``。``count_roles`` と同じ数え方で、flaky が先)。
+        """
+        if status is not None and status not in REGRESSION_LIST_STATUSES:
+            raise GrowthError(
+                "unknown_regression_status", f"unknown status: {status}",
+                {"status": status, "allowed": ", ".join(REGRESSION_LIST_STATUSES)},
+            )
+        if mode is not None and mode not in self.s.MODES:
+            raise GrowthError("unknown_mode", f"unknown mode: {mode}", {"mode": mode})
+        cases, case_status = self._cases_and_status()
+        items = [_case_item(c, case_status) for c in cases]
+        if mode is not None:
+            items = [i for i in items if i["mode"] == mode]
+        if status is not None:
+            key = "status" if status in ("active", "quarantined", "retired") else "role"
+            items = [i for i in items if i[key] == status]
+        items.sort(key=lambda i: (not i["seed"], _time_key(i["written_at"])), reverse=True)
+        return {
+            "cases": items[offset:offset + limit], "total": len(items), "limit": limit, "offset": offset,
+        }
 
     # ── 監視 (phase8 の後) ──
 
@@ -742,6 +815,31 @@ def _policy_denial(asset_kind: str, mode: str) -> Any:
     return policy_denial(asset_kind, mode=mode)
 
 
+def _case_item(case: Any, status: Any) -> dict[str, Any]:
+    """一覧の 1 行 (問いは要約だけ。役割は ``active`` のケースだけ、flaky が先)。"""
+    from backend.free.learning.growth.regression import SOURCE_SEED, STATUS_ACTIVE
+    from backend.free.learning.growth.replay import ROLE_UNKNOWN
+
+    entry = status.cases.get(case.case_id)
+    role = ""
+    if case.status == STATUS_ACTIVE:
+        role = ROLE_UNKNOWN if entry is None else ("flaky" if entry.flaky else str(entry.role))
+    query = " ".join(str(case.query or "").split())
+    return {
+        "case_id": case.case_id,
+        "mode": case.mode,
+        "source": case.source,
+        "status": str(case.status),
+        "role": role,
+        "seed": case.source == SOURCE_SEED,
+        "query_preview": query[:QUERY_PREVIEW_CHARS],
+        "query_chars": len(case.query or ""),
+        "written_at": case.written_at or "",
+        "last_result": entry.last_result if entry is not None else None,
+        "last_run_at": entry.last_run_at if entry is not None else None,
+    }
+
+
 def _experience_ids(refs: Iterable[Any]) -> list[str]:
     seen: list[str] = []
     for ref in refs:
@@ -759,6 +857,7 @@ def _time_key(value: str) -> float:
 
 
 __all__ = [
+    "CONFLICT_CASE_NOT_RETIRED",
     "CONFLICT_IDENTICAL",
     "CONFLICT_LEARNING_RUNNING",
     "CONFLICT_NO_TARGET",

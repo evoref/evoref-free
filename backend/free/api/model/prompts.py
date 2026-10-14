@@ -2,11 +2,13 @@
 
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Path, Response
 from pydantic import BaseModel
 
 from backend.app_state import AppState, get_app_state
+from backend.free.api._pagination import LimitParam, OffsetParam, paginate
 from backend.free.api.model._prompt_helpers import (
+    HISTORY_VERSION_MAX,
     learning_running_error,
     manager_for_mode,
     prompt_detail_dict,
@@ -14,6 +16,7 @@ from backend.free.api.model._prompt_helpers import (
     prompt_file_not_found_error,
     prompt_partition_dict,
     prompt_summary_dict,
+    prompt_version_not_found_error,
     require_prompt_manager,
     unknown_mode_error,
     unsupported_locale_error,
@@ -195,15 +198,42 @@ async def reload_prompt(mode: str, state: AppState = Depends(get_app_state)):
 
 
 @router.get("/{mode}/history")
-async def get_history(mode: str, state: AppState = Depends(get_app_state)):
-    """履歴一覧"""
+async def get_history(
+    mode: str,
+    response: Response,
+    limit: LimitParam = None,
+    offset: OffsetParam = 0,
+    state: AppState = Depends(get_app_state),
+):
+    """履歴一覧 (``limit`` / ``offset`` は任意、絞る前の件数は ``X-Total-Count``)"""
     logger.debug("GET /api/prompts/%s/history", mode)
     mgr = manager_for_mode(require_prompt_manager(state), mode)
 
     try:
-        return mgr.get_history(mode)
+        history = mgr.get_history(mode)
     except ValueError:
         raise unknown_mode_error(mode)
+    return paginate(history, limit, offset, response)
+
+
+@router.get("/{mode}/history/{version}")
+async def get_history_version(
+    mode: str,
+    version: int = Path(ge=1, le=HISTORY_VERSION_MAX),
+    state: AppState = Depends(get_app_state),
+):
+    """履歴の版の本文 (巻き戻す前に旧版を読む。読むだけ)"""
+    logger.debug("GET /api/prompts/%s/history/%d", mode, version)
+    mgr = manager_for_mode(require_prompt_manager(state), mode)
+
+    try:
+        entry = mgr.get_history_version(mode, version)
+    except ValueError:
+        raise unknown_mode_error(mode)
+    except FileNotFoundError:
+        raise prompt_version_not_found_error(mode, version)
+
+    return {"mode": mode, **entry}
 
 
 @router.post("/{mode}/rollback")

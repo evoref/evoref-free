@@ -1,6 +1,9 @@
 """evoref growth サブコマンド — Level 2 (成長) の提案・採用・巻き戻し (docs/f_04 §6.8)。
 
 ``list`` / ``show ID`` / ``adopt ID`` / ``reject ID`` / ``rollback --kind prompt --mode chat``。
+回帰台帳のケースは ``regression list [--status S] [--mode M] [--limit N] [--offset N]`` /
+``regression retire ID [--reason TEXT] [--yes]`` / ``regression unretire ID [--yes]``
+(retire / unretire は確認を取る。対話端末でなければ ``--yes`` が要る)。
 
 backend が動いていれば ``/api/learning/growth`` 系を使う (Level 1 の実行中の 409 などの判定は
 backend 側)。動いていなければ束ねるパーティション (``model_paths.base_model`` の model_key) の
@@ -16,51 +19,56 @@ import argparse
 import contextlib
 import difflib
 import json
+import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from rich.console import Console
+from rich.markup import escape
 
-from backend.data_root import DataRootError, resolve_data_root, store_root
-from backend.free.cli.backend_headers import backend_headers
+from backend.data_root import DataRootError, resolve_data_root
+from backend.free.cli.cli_common import (
+    EXIT_FAIL,
+    EXIT_INTERRUPTED,
+    EXIT_UNAVAILABLE,
+    BackendError,
+    add_common_args,
+    diag_console,
+    emit,
+    request,
+    resolve_backend_url,
+    run_dual,
+    writer_locked,
+)
 from backend.free.cli.config_loader import _find_project_root, _setup_encoding
 from backend.free.cli.renderer import create_console, render_diff, render_error, render_info, render_table
 from backend.i18n_helper import init_i18n, msg
-from backend.io.writer_lock import WriterLockHeld, acquire_writer_lock
+from backend.io.id_registry import is_valid_id
+from backend.io.readonly import DataReadonlyError
+from backend.io.writer_lock import WriterLockHeld
 from backend.log_config import get_logger
 
 logger = get_logger("cli.growth")
 
-_DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 60.0
 _ACTIONS = ("list", "show", "adopt", "reject", "rollback")
-
-
-class _BackendError(Exception):
-    """backend が非 200 を返した (表示用の理由を持つ)。"""
-
-    def __init__(self, status: int, detail: str) -> None:
-        super().__init__(detail)
-        self.status = status
-        self.detail = detail
+_WRITE_ACTIONS = ("adopt", "reject", "rollback")
+#: ``regression`` は :func:`_run_regression` が受ける (ここでは --help に出すだけ)。
+_REGRESSION = "regression"
+_REGRESSION_WRITE_ACTIONS = ("retire", "unretire")
+_CASE_PREFIX = "rgc_"
+_LIST_LIMIT_MAX = 200
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evoref growth", description=msg("cli.help_growth"))
-    parser.add_argument("action", choices=_ACTIONS)
+    parser.add_argument("action", choices=(*_ACTIONS, _REGRESSION))
     parser.add_argument("proposal_id", nargs="?", default=None, help="show / adopt / reject: gpp_<hex16>")
     parser.add_argument("--kind", choices=["prompt", "generation_params"], default=None)
     parser.add_argument("--mode", default=None, help="rollback: chat / create")
-    parser.add_argument("--json", action="store_true", help="Print the response as JSON")
-    parser.add_argument(
-        "--data-root", default=None, metavar="PATH",
-        help="Data root used while the backend is stopped (default: EVOREF_DATA_ROOT or <install_root>/userdata)",
-    )
-    parser.add_argument(
-        "--backend-url", default=_DEFAULT_BACKEND,
-        help="Backend URL (default: http://localhost:8000)",
-    )
+    add_common_args(parser, data_root=True)
     return parser
 
 
@@ -69,70 +77,49 @@ def run_growth(argv: list[str]) -> int:
     if not _setup_encoding():
         return 1
     init_i18n()
-    args = _build_parser().parse_args(argv)
+    if argv and argv[0] == "regression":
+        return _run_regression(argv[1:])
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.action == _REGRESSION:
+        parser.error("put regression first: evoref growth regression list|retire|unretire ...")
     console = create_console()
+    diag = diag_console(args.json, console)
     if args.action in ("show", "adopt", "reject") and not args.proposal_id:
-        render_error(console, msg("cli.growth_id_required", action=args.action))
-        return 1
+        render_error(diag, msg("cli.growth_id_required", action=args.action))
+        return EXIT_FAIL
     if args.action == "rollback" and not (args.kind and args.mode):
-        render_error(console, msg("cli.growth_rollback_usage"))
-        return 1
+        render_error(diag, msg("cli.growth_rollback_usage"))
+        return EXIT_FAIL
     try:
-        with httpx.Client(headers=backend_headers(), timeout=_TIMEOUT) as client:
-            out = _remote(client, args)
-        if out is None:
-            out = _offline(args, console)
-            if out is None:
-                return 1
-    except _BackendError as e:
-        render_error(console, msg("cli.growth_failed", detail=e.detail))
-        return 1
+        out = run_dual(
+            lambda client: _remote(client, args), lambda: _offline(args, diag), timeout=_TIMEOUT,
+        )
+    except BackendError as e:
+        render_error(diag, msg("cli.growth_failed", detail=e.detail))
+        return EXIT_FAIL
     except (httpx.HTTPError, OSError, ValueError) as e:
         logger.error("growth %s failed: %s", args.action, e)
-        render_error(console, msg("cli.growth_failed", detail=str(e)))
-        return 1
-    if args.json:
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
-    _render(console, args.action, out)
-    return 0
+        render_error(diag, msg("cli.growth_failed", detail=str(e)))
+        return EXIT_FAIL
+    if out is None:
+        return EXIT_FAIL
+    return emit(out, as_json=args.json, render=lambda: _render(console, args.action, out))
 
 
 # ── backend 稼働中 ──
 
 
-def _request(client: httpx.Client, method: str, url: str, **kwargs: Any) -> dict | None:
-    """backend を呼ぶ。届かなければ ``None`` (= 停止中)、非 200 は :class:`_BackendError`。"""
-    try:
-        resp = client.request(method, url, **kwargs)
-    except httpx.ConnectError:
-        return None
-    if resp.status_code != 200:
-        detail = f"HTTP {resp.status_code}"
-        try:
-            body = resp.json().get("detail")
-            if isinstance(body, dict):
-                reason = body.get("context", {}).get("reason")
-                key = body.get("i18n_key") or ""
-                text = msg(key) if key else str(body.get("message") or "")
-                detail = f"{text} ({reason})" if reason else (text or detail)
-            elif isinstance(body, str):
-                detail = body
-        except ValueError:
-            pass
-        raise _BackendError(resp.status_code, detail)
-    return resp.json()
-
-
 def _remote(client: httpx.Client, args: argparse.Namespace) -> dict | None:
-    base = f"{args.backend_url.rstrip('/')}/api/learning/growth"
+    """backend を呼ぶ。届かなければ ``None`` (= 停止中)、2xx 以外は :class:`BackendError`。"""
+    base = f"{resolve_backend_url(args.backend_url)}/api/learning/growth"
     if args.action == "list":
-        return _request(client, "GET", base)
+        return request(client, "GET", base)
     if args.action == "show":
-        return _request(client, "GET", f"{base}/proposals/{args.proposal_id}")
+        return request(client, "GET", f"{base}/proposals/{args.proposal_id}")
     if args.action in ("adopt", "reject"):
-        return _request(client, "POST", f"{base}/proposals/{args.proposal_id}/{args.action}")
-    return _request(client, "POST", f"{base}/rollback", json={"asset_kind": args.kind, "mode": args.mode})
+        return request(client, "POST", f"{base}/proposals/{args.proposal_id}/{args.action}")
+    return request(client, "POST", f"{base}/rollback", json={"asset_kind": args.kind, "mode": args.mode})
 
 
 # ── backend 停止中 ──
@@ -185,15 +172,9 @@ def _offline(args: argparse.Namespace, console: Console) -> dict | None:
         return None
     if not args.json:
         render_info(console, msg("cli.growth_source_file", path=str(data_root)))
-    lock = None
-    if args.action in ("adopt", "reject", "rollback"):
-        try:
-            lock = acquire_writer_lock(store_root(data_root))
-        except WriterLockHeld as e:
-            render_error(console, msg("cli.growth_locked", detail=str(e)))
-            return None
+    lock = writer_locked(data_root) if args.action in _WRITE_ACTIONS else contextlib.nullcontext()
     try:
-        with _offline_policy(data_root):
+        with lock, _offline_policy(data_root):
             service = _offline_scheduler(root, data_root).growth
             if args.action == "list":
                 return service.overview()
@@ -205,12 +186,178 @@ def _offline(args: argparse.Namespace, console: Console) -> dict | None:
                 return service.reject(args.proposal_id)
             out = service.rollback(args.kind, args.mode)
             return {k: out[k] for k in ("asset_kind", "mode", "version", "row_id", "adoption_id")}
+    except WriterLockHeld as e:
+        render_error(console, msg("cli.growth_locked", detail=str(e)))
+        return None
     except GrowthError as e:
         render_error(console, msg("cli.growth_failed", detail=f"{e.detail} ({e.reason})"))
         return None
-    finally:
-        if lock is not None:
-            lock.release()
+
+
+# ── regression (回帰台帳のケース) ──
+
+
+class _OfflineFailed(Exception):
+    """停止中の経路の失敗 (表示済み。``code`` は終了コード)。"""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _build_regression_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    add_common_args(common, data_root=True)
+    parser = argparse.ArgumentParser(prog="evoref growth regression", description=msg("cli.growth_regression_help"))
+    sub = parser.add_subparsers(dest="action", required=True)
+    lst = sub.add_parser("list", parents=[common], help=msg("cli.growth_regression_help_list"))
+    lst.add_argument(
+        "--status", default=None, choices=["active", "guard", "pressure", "flaky", "quarantined", "retired"],
+    )
+    lst.add_argument("--mode", default=None, help="chat / create")
+    lst.add_argument("--limit", type=int, default=50, metavar="N", help=f"1-{_LIST_LIMIT_MAX} (default: 50)")
+    lst.add_argument("--offset", type=int, default=0, metavar="N", help="Skip the first N cases (default: 0)")
+    retire = sub.add_parser("retire", parents=[common], help=msg("cli.growth_regression_help_retire"))
+    retire.add_argument("case_id", help="rgc_<hex16> (see regression list)")
+    retire.add_argument("--reason", default="", metavar="TEXT", help="Why the case is retired (kept with the case)")
+    unretire = sub.add_parser("unretire", parents=[common], help=msg("cli.growth_regression_help_unretire"))
+    unretire.add_argument("case_id", help="rgc_<hex16> (see regression list --status retired)")
+    for p in (retire, unretire):
+        p.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
+    return parser
+
+
+def _run_regression(argv: list[str]) -> int:
+    """``evoref growth regression list|retire|unretire``。
+
+    dual: 稼働中は API、停止中は回帰台帳を直接読む / 単一書き手ロックの下で書く
+    (retire / unretire は adopt / reject と同じ作法)。
+    """
+    args = _build_regression_parser().parse_args(argv)
+    console = create_console()
+    diag = diag_console(args.json, console)
+    if args.action == "list" and not (1 <= args.limit <= _LIST_LIMIT_MAX and args.offset >= 0):
+        render_error(diag, msg("cli.growth_regression_bad_limit"))
+        return EXIT_UNAVAILABLE
+    if args.action != "list":
+        if not is_valid_id(args.case_id, _CASE_PREFIX):
+            render_error(diag, msg("cli.growth_regression_bad_case_id", case_id=args.case_id))
+            return EXIT_UNAVAILABLE
+        if not args.yes and not _regression_confirmed(diag, args):
+            return EXIT_FAIL
+    try:
+        out = run_dual(
+            lambda client: _regression_remote(client, args),
+            lambda: _regression_offline(args, diag),
+            timeout=_TIMEOUT,
+        )
+    except _OfflineFailed as e:
+        return e.code
+    except BackendError as e:
+        render_error(diag, msg("cli.growth_failed", detail=e.detail))
+        return EXIT_UNAVAILABLE if e.status in (423, 503) else EXIT_FAIL
+    except (httpx.HTTPError, OSError, ValueError) as e:
+        logger.error("growth regression %s failed: %s", args.action, e)
+        render_error(diag, msg("cli.growth_failed", detail=str(e)))
+        return EXIT_FAIL
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+    return emit(out, as_json=args.json, render=lambda: _render_regression(console, args.action, out))
+
+
+def _regression_confirmed(console: Console, args: argparse.Namespace) -> bool:
+    """retire / unretire の確認。対話端末でなければ確認できないので拒否する。"""
+    if sys.stdin is None or not sys.stdin.isatty():
+        render_error(console, msg("cli.growth_regression_needs_yes"))
+        return False
+    answer = console.input(
+        msg(f"cli.growth_regression_confirm_{args.action}", id=args.case_id) + " [y/N] ", markup=False,
+    )
+    if answer.strip().lower() in ("y", "yes"):
+        return True
+    render_info(console, msg("cli.growth_regression_aborted"))
+    return False
+
+
+def _regression_remote(client: httpx.Client, args: argparse.Namespace) -> dict | None:
+    """backend を呼ぶ。届かなければ ``None`` (= 停止中)、2xx 以外は :class:`BackendError`。"""
+    base = f"{resolve_backend_url(args.backend_url)}/api/learning/growth/regression"
+    if args.action == "list":
+        params: dict[str, Any] = {"limit": args.limit, "offset": args.offset}
+        if args.status:
+            params["status"] = args.status
+        if args.mode:
+            params["mode"] = args.mode
+        return request(client, "GET", base, params=params)
+    body = {"by": "cli", "reason": getattr(args, "reason", "") or ""}
+    return request(client, "POST", f"{base}/{quote(args.case_id, safe='')}/{args.action}", json=body)
+
+
+def _regression_offline(args: argparse.Namespace, console: Console) -> dict:
+    """停止中: 回帰台帳を直接読む。retire / unretire は単一書き手ロックの下で書く。"""
+    from backend.free.learning.growth.service import GrowthError, GrowthReadonly
+
+    root = _find_project_root()
+    try:
+        data_root = resolve_data_root(args.data_root, root=root)
+    except DataRootError as e:
+        render_error(console, msg("cli.data_root_invalid", detail=str(e)))
+        raise _OfflineFailed(EXIT_UNAVAILABLE) from e
+    if not args.json:
+        render_info(console, msg("cli.growth_source_file", path=str(data_root)))
+    write = args.action in _REGRESSION_WRITE_ACTIONS
+    lock = writer_locked(data_root) if write else contextlib.nullcontext()
+    try:
+        with lock, _offline_policy(data_root):
+            service = _offline_scheduler(root, data_root).growth
+            if args.action == "list":
+                return service.regression_cases(
+                    status=args.status, mode=args.mode, limit=args.limit, offset=args.offset,
+                )
+            if args.action == "retire":
+                return service.retire_case(args.case_id, by="cli", reason=args.reason)
+            return service.unretire_case(args.case_id, by="cli")
+    except WriterLockHeld as e:
+        render_error(console, msg("cli.growth_locked", detail=str(e)))
+        raise _OfflineFailed(EXIT_UNAVAILABLE) from e
+    except DataReadonlyError as e:  # 台帳に新しい版の行がある (c_05 §0.4.5)
+        render_error(console, msg("cli.growth_failed", detail=str(e)))
+        raise _OfflineFailed(EXIT_UNAVAILABLE) from e
+    except GrowthError as e:
+        render_error(console, msg("cli.growth_failed", detail=f"{e.detail} ({e.reason})"))
+        raise _OfflineFailed(EXIT_UNAVAILABLE if isinstance(e, GrowthReadonly) else EXIT_FAIL) from e
+
+
+def _render_regression(console: Console, action: str, out: dict) -> None:
+    if action == "retire":
+        if out.get("changed"):
+            render_info(console, msg(
+                "cli.growth_regression_retired", id=out.get("case_id"), previous=out.get("previous_status") or "-",
+            ))
+        else:
+            render_info(console, msg("cli.growth_regression_unchanged", id=out.get("case_id")))
+        return
+    if action == "unretire":
+        render_info(console, msg("cli.growth_regression_unretired", id=out.get("case_id"), status=out.get("status")))
+        return
+    cases = out.get("cases") or []
+    if not cases:
+        render_info(console, msg("cli.growth_regression_empty"))
+        return
+    cols = ("id", "status", "role", "source", "mode", "written", "query")
+    h = [msg(f"cli.growth_regression_col_{c}") for c in cols]
+    render_table(console, [
+        {
+            h[0]: c.get("case_id"), h[1]: c.get("status"), h[2]: c.get("role") or "-",
+            h[3]: c.get("source"), h[4]: c.get("mode"), h[5]: c.get("written_at") or "-",
+            h[6]: escape(str(c.get("query_preview") or "")),
+        }
+        for c in cases
+    ], h)
+    render_info(console, msg(
+        "cli.growth_regression_page", shown=len(cases), total=out.get("total", len(cases)),
+        offset=out.get("offset", 0),
+    ))
 
 
 # ── 表示 ──

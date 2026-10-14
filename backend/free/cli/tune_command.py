@@ -32,7 +32,6 @@ EXIT_OK = 0
 EXIT_PROPOSAL = 1
 EXIT_CANNOT_RUN = 2
 
-_DEFAULT_BACKEND = "http://localhost:8000"
 #: API の進捗を読む間隔と、待つ上限 (秒)。
 _POLL_SEC = 1.0
 _POLL_MAX_SEC = 3600.0
@@ -44,6 +43,7 @@ _ASK_ATTEMPTS = 3
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from backend.free.cli.cli_common import add_common_args
     from backend.i18n_helper import msg
 
     parser = argparse.ArgumentParser(prog="evoref tune", description=msg("cli.help_tune"))
@@ -63,7 +63,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--data-root", default=None, metavar="PATH",
         help="Data root (default: EVOREF_DATA_ROOT or <install_root>/userdata)",
     )
-    parser.add_argument("--backend-url", default=_DEFAULT_BACKEND, help="Backend URL (default: http://localhost:8000)")
+    add_common_args(parser, json=False)
     return parser
 
 
@@ -265,10 +265,11 @@ def _run_via_api(
     """稼働中の backend に実行を頼み、done / failed まで進捗を 1 行ずつ出して待つ。"""
     import httpx
 
+    from backend.free.cli.cli_common import resolve_backend_url
     from backend.free.cli.renderer import render_error, render_info
     from backend.i18n_helper import msg
 
-    url = args.backend_url.rstrip("/")
+    url = resolve_backend_url(args.backend_url)
     render_info(console, msg("cli.tune_via_api", url=url))
     try:
         with _client() as client:
@@ -419,12 +420,13 @@ def _emit_json(payload: dict[str, Any]) -> None:
 def _cmd_status(
     args: argparse.Namespace, cfg: dict[str, Any], project_root: Path, data_root: Path, console: Console,
 ) -> int:
+    from backend.free.cli.cli_common import resolve_backend_url
     from backend.free.cli.renderer import render_error
 
     if _writer_running(data_root):
         try:
             with _client() as client:
-                view = _api_get(client, args.backend_url.rstrip("/"))
+                view = _api_get(client, resolve_backend_url(args.backend_url, project_root))
         except _ApiFailure as e:
             render_error(console, str(e))
             return e.code

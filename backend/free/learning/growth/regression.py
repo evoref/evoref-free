@@ -5,7 +5,7 @@ Level 2 (成長、docs/f_04 §6) の部品。実際に起きた失敗 (検証済
 後継。
 
 - 台帳はモデル非依存 (``store/learning/shared/growth/regression_cases.jsonl``)。1 行 1 ケースで、
-  状態の変更 (quarantine / retire) は同じ ``case_id`` の行を追記する (後勝ち)。削除は tombstone
+  状態の変更 (quarantine / retire / unretire) は同じ ``case_id`` の行を追記する (後勝ち)。削除は tombstone
   の直後に compaction して本文を物理的に消す (forget / 件数上限)。
 - 書き手は sleep-time Step 13.6 (収穫) と、後続の Level 1 の段・API (状態の変更) だけ。
   チャット応答パスでは書かない (書き手スレッドの対象外。採用台帳と同じ通常の追記)。
@@ -68,6 +68,8 @@ STATUS_RETIRED: CaseStatus = "retired"
 #: 件数上限を超えたときに消す順 (それぞれ古い行から)。
 EVICTION_ORDER: tuple[CaseStatus, ...] = (STATUS_RETIRED, STATUS_QUARANTINED, STATUS_ACTIVE)
 _KNOWN_STATUSES = frozenset(EVICTION_ORDER)
+#: 利用者の状態変更 (retire / unretire) の記録を置く ``_extra`` のキー (f_04 §6.8)。
+STATUS_CHANGE_KEY = "status_change"
 
 #: ``consistency`` のケースに持たせる直前の会話の上限 (ターン数・文字数)。
 PRIOR_TURNS_MAX = 4
@@ -451,21 +453,51 @@ class RegressionLedger:
             self.enforce_limit()
         return added, duplicates
 
-    def set_status(self, case_id: str, status: CaseStatus) -> bool:
-        """ケースの状態を変える (同じ ``case_id`` の行を追記、後勝ち)。変えたら ``True``。"""
+    def set_status(
+        self, case_id: str, status: CaseStatus, *, change: dict[str, Any] | None = None,
+    ) -> bool:
+        """ケースの状態を変える (同じ ``case_id`` の行を追記、後勝ち)。変えたら ``True``。
+
+        ``change`` は利用者の操作の記録 (``{op, by, reason, from}``) で、行の
+        ``_extra["status_change"]`` に置く (宣言フィールドにすると形式の版が動く)。
+        渡さなければ前の行の記録は引き継がない。
+        """
         current = next((c for c in self.load() if c.case_id == case_id), None)
         if current is None or current.status == status:
             return False
-        self._store.append(replace(current, status=status, written_at=utc_now()))
+        extra = {k: v for k, v in (current._extra or {}).items() if k != STATUS_CHANGE_KEY}
+        if change:
+            extra[STATUS_CHANGE_KEY] = {**change, "at": utc_now()}
+        self._store.append(replace(current, status=status, written_at=utc_now(), _extra=extra or None))
         return True
 
     def quarantine(self, case_id: str) -> bool:
         """guard / pressure に使わない状態にする (モデル由来の失敗など)。"""
         return self.set_status(case_id, STATUS_QUARANTINED)
 
-    def retire(self, case_id: str) -> bool:
-        """利用者が外したケース (件数上限で最初に消える)。"""
-        return self.set_status(case_id, STATUS_RETIRED)
+    def retire(self, case_id: str, *, by: str = "", reason: str = "") -> bool:
+        """利用者が外したケース (件数上限で最初に消える)。外す前の状態を記録に残す。"""
+        current = next((c for c in self.load() if c.case_id == case_id), None)
+        if current is None:
+            return False
+        return self.set_status(case_id, STATUS_RETIRED, change={
+            "op": "retire", "by": by, "reason": reason, "from": current.status,
+        })
+
+    def unretire(self, case_id: str, *, by: str = "", reason: str = "") -> CaseStatus | None:
+        """``retired`` を外す前の状態へ戻す (記録が無ければ ``active``)。戻した状態を返す。
+
+        ``retired`` でない・台帳に無いケースは ``None`` (何も書かない)。``quarantined`` から
+        外したケースは ``quarantined`` へ戻す (退役の取り消しで隔離を解かない)。
+        """
+        current = next((c for c in self.load() if c.case_id == case_id), None)
+        if current is None or current.status != STATUS_RETIRED:
+            return None
+        target = retired_from(current)
+        self.set_status(case_id, target, change={
+            "op": "unretire", "by": by, "reason": reason, "from": STATUS_RETIRED,
+        })
+        return target
 
     def _delete(self, case_ids: list[str], reason: str) -> int:
         if not case_ids:
@@ -515,6 +547,16 @@ class RegressionLedger:
         return self._delete(victims, "forget")
 
 
+def retired_from(case: RegressionCase) -> CaseStatus:
+    """``retired`` のケースを外す前の状態 (``status_change`` の記録。無ければ ``active``)。"""
+    change = (case._extra or {}).get(STATUS_CHANGE_KEY)
+    if isinstance(change, dict) and change.get("op") == "retire":
+        previous = change.get("from")
+        if previous in _KNOWN_STATUSES and previous != STATUS_RETIRED:
+            return previous  # type: ignore[return-value]
+    return STATUS_ACTIVE
+
+
 def _written_order(case: RegressionCase) -> float:
     """``written_at`` の古い順 (読めない時刻は最も古い扱い)。"""
     at = parse_utc(case.written_at)
@@ -539,6 +581,7 @@ __all__ = [
     "SOURCE_VERIFIED_CORRECTION",
     "SOURCE_VERIFIER_FAILURE",
     "STATUS_ACTIVE",
+    "STATUS_CHANGE_KEY",
     "STATUS_QUARANTINED",
     "STATUS_RETIRED",
     "PriorTurn",
@@ -553,5 +596,6 @@ __all__ = [
     "make_case",
     "normalize_text",
     "replay_exclusion",
+    "retired_from",
     "save_status",
 ]

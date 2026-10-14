@@ -22,6 +22,9 @@ def _setup_encoding() -> bool:
             sys.stdout.reconfigure(encoding="utf-8")
         if sys.stdin.encoding and sys.stdin.encoding.lower() != "utf-8":
             sys.stdin.reconfigure(encoding="utf-8")
+        # --json のとき診断は stderr に出す (cli_common)。cp932 のままだと日本語が化ける
+        if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+            sys.stderr.reconfigure(encoding="utf-8")
         return True
     except (UnicodeEncodeError, UnicodeDecodeError, OSError) as e:
         logger.error("E6002 UTF-8 encoding error: %s", e)

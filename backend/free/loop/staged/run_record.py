@@ -10,7 +10,8 @@
 書き手は ``chat_stream_staged.run_staged_pipeline`` (staged) と
 ``generation.harness.LongFormHarness`` (longform、f_08 §2.3) の開始 / 終端だけ。
 読み手は ``/api/create/runs*`` (再接続の口、backend のみ) と sleep-time の
-GC (Step 5.89)。
+GC (Step 5.89)。run ごと消すのは GC と利用者の削除 (``DELETE /api/create/runs/{run_id}``、
+:func:`delete_run`) だけ。
 
 ディレクトリ配置は :mod:`backend.free.loop.staged.workspace` と同じ
 ``create_workspace_dir/{run_id}/`` (run_id == workspace_id)。
@@ -571,6 +572,40 @@ def gc_old_runs(
     return removed
 
 
+#: :func:`delete_run` の結果。
+DeleteOutcome = Literal["deleted", "not_found", "working", "in_use"]
+
+
+def delete_run(
+    create_dir: Path | str, run_id: str, *, stale_after_sec: float = STALE_RUNNING_AFTER_SEC,
+) -> DeleteOutcome:
+    """利用者の指定で 1 run の作業場 (``run.json`` / ``events.jsonl`` / 生成物) を消す。
+
+    GC (:func:`gc_old_runs`) と同じ作法: 走行中 (導出状態 ``working``) は消さず、``.trash-`` へ
+    改名してから中身を消す (掴まれていれば改名ごと失敗して ``in_use``、何も消えない)。
+    run の外にあるもの — 利用者の出力先へ配信したファイルと、上書きの前の退避
+    (``<data_root>/bk/overwrite/``、f_10 §7) — には触らない。readonly の判定は呼出側。
+    """
+    loaded = load_run(create_dir, run_id, stale_after_sec=stale_after_sec)
+    if loaded is None:
+        return "not_found"
+    if loaded[1] == "working":
+        return "working"
+    root = Path(create_dir)
+    path = root / run_id
+    trash = root / f"{TRASH_PREFIX}{run_id}"
+    if trash.exists():  # 前回の掃き残し (改名の先が在ると Windows では改名が失敗する)
+        shutil.rmtree(str(trash), ignore_errors=True)
+    try:
+        path.rename(trash)
+    except OSError as e:
+        logger.warning("run delete refused (in use?): %s: %s", run_id, e)
+        return "in_use"
+    shutil.rmtree(str(trash), ignore_errors=True)
+    logger.info("Deleted staged create run %s on request", run_id)
+    return "deleted"
+
+
 __all__ = [
     "EVENTS_FILE",
     "RUN_FILE",
@@ -579,6 +614,7 @@ __all__ = [
     "RunRecord",
     "RunRecordStore",
     "RunStatus",
+    "delete_run",
     "derive_run_status",
     "gc_old_runs",
     "is_valid_run_id",

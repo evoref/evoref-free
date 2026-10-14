@@ -39,7 +39,6 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.history.sessions import router as sessions_router
     from backend.free.api.config.themes import router as themes_router
     from backend.free.api.learning.learning import router as learning_router
-    from backend.free.api.learning.optimize import router as optimize_router
     from backend.free.api.learning.fewshot import router as fewshot_router
     from backend.free.api.learning.growth import router as growth_router
     from backend.free.api.system.export_file import router as export_file_router
@@ -48,6 +47,7 @@ def setup_free(app: FastAPI) -> None:
     from backend.free.api.config.mode import router as mode_router
     from backend.free.api.system.system import router as system_router
     from backend.free.api.system.auto_tune import router as auto_tune_router
+    from backend.free.api.system.shutdown import router as shutdown_router
 
     app.include_router(status_router)
     app.include_router(chat_router)
@@ -66,7 +66,6 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(sessions_router)
     app.include_router(themes_router)
     app.include_router(learning_router)
-    app.include_router(optimize_router)
     app.include_router(fewshot_router)
     app.include_router(growth_router)
     app.include_router(export_file_router)
@@ -75,6 +74,7 @@ def setup_free(app: FastAPI) -> None:
     app.include_router(mode_router)
     app.include_router(system_router)
     app.include_router(auto_tune_router)
+    app.include_router(shutdown_router)
 
     # テキスト抽出 Extractor の登録（Free 11種）
     import backend.free.extraction

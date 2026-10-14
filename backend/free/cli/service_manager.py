@@ -266,23 +266,116 @@ def _validate_edition_arg(args: argparse.Namespace, console) -> int | None:
     return validate_edition_arg(args, console)
 
 
+#: serve の後始末で backend の正常停止 (停止の段 + lifespan の ``shutdown_all``) の終わりを待つ上限 (秒)。
+#: 停止の段は 20 秒で打ち切られ、``shutdown_all`` は llama-server 1 本につき最大 10 秒待つ。
+SERVE_BACKEND_STOP_WAIT_SEC = 60.0
+#: backend に llama-server の管理状態を尋ねる時間 (秒)
+_PROCESS_STATUS_TIMEOUT_SEC = 5.0
+
+
+@dataclass
+class ServeBackend:
+    """serve が起こした backend (後始末で最初に正常停止を頼む相手)。起動前は ``proc`` が ``None``。"""
+    proc: subprocess.Popen | None = None
+    port: int = 0
+
+
+def _llama_ports(config: dict) -> list[int]:
+    """config のポートのうち llama-server が待ち受けるもの (base / embed / rerank)。"""
+    return [port for port, images in expected_images_by_port(config).items() if tuple(images) == IMAGE_LLAMA]
+
+
+def _backend_llama_pids(port: int) -> set[int]:
+    """backend の LlamaProcessManager が起こして管理している llama-server の PID (尋ねられなければ空)。
+
+    backend が起こし直した llama-server は serve の子ではないので、serve はこれでしか持ち主を知れない。
+    """
+    try:
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/api/model/process/status",
+            headers=backend_headers(), timeout=_PROCESS_STATUS_TIMEOUT_SEC,
+        )
+        data = response.json() if response.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError, OSError) as e:
+        logger.info("Could not ask the backend for its llama-server processes: %s", e)
+        return set()
+    components = data.get("components") or {}
+    return {
+        int(c["pid"]) for c in components.values()
+        if isinstance(c, dict) and c.get("managed") and c.get("pid")
+    }
+
+
+def _stop_backend_gracefully(backend: ServeBackend) -> set[int]:
+    """backend に正常停止を頼み、プロセスの終了まで待つ。backend が管理していた llama-server の PID を返す。
+
+    ポートが空くのを待つ (``graceful_stop_backend``) のでは足りない — uvicorn は待ち受けを閉じてから
+    lifespan の shutdown (``LlamaProcessManager.shutdown_all``) を走らせるので、ポートが空いた時点では
+    backend が起こした llama-server がまだ動いている。serve は backend の Popen を持つので終了を待てる。
+    頼めない・受理されないときは待たない (呼び手が従来どおりプロセスツリーごと止める)。
+    """
+    from backend.free.cli.pid_manager import request_backend_shutdown
+
+    proc = backend.proc
+    if proc is None or proc.poll() is not None:
+        return set()
+    llama_pids = _backend_llama_pids(backend.port)
+    if not request_backend_shutdown(backend.port):
+        return llama_pids
+    try:
+        proc.wait(timeout=SERVE_BACKEND_STOP_WAIT_SEC)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Backend did not exit within %.0fs after the graceful shutdown request; killing it",
+            SERVE_BACKEND_STOP_WAIT_SEC,
+        )
+    return llama_pids
+
+
+def _sweep_own_llama_ports(ports: list[int], own_pids: set[int]) -> None:
+    """llama のポートに残った占有者のうち、この serve か その backend が起こしたものだけを止める。
+
+    持ち主の分からない占有者 (他の起動経路・別アプリ) は止めない。止めるときもイメージ名が
+    llama-server であることを確かめる (PID の再利用で別のプロセスを止めない)。
+    """
+    for occ in find_port_occupants(ports):
+        if occ.pid not in own_pids:
+            logger.info("Leaving %s running: not started by this serve or its backend", occ.summary)
+            continue
+        kill_port_occupants([occ], expected={occ.port: IMAGE_LLAMA})
+
+
 def _make_serve_cleanup(
     console,
     procs: list[subprocess.Popen],
     stderr_files: list,
     project_root: Path,
+    backend: ServeBackend | None = None,
+    llama_ports: list[int] | None = None,
 ):
-    """serve 用 cleanup クロージャを生成（signal ハンドラから呼ばれる）。"""
+    """serve 用 cleanup クロージャを生成（signal ハンドラから呼ばれる）。
+
+    順序: (1) backend に正常停止を頼んで終了を待つ — backend が起こし直した llama-server
+    (serve の子ではない) は lifespan の ``shutdown_all`` が止める (2) serve の Popen (llama と、
+    まだ生きていれば backend) をプロセスツリーごと止める (3) llama のポートに残った占有者のうち
+    serve か backend が起こしたものだけを止める。
+    """
+    backend = backend if backend is not None else ServeBackend()
 
     def cleanup(signum=None, frame=None):  # noqa: ARG001
         render_info(console, msg("cli.svc_shutting_down"))
+        backend_llama_pids = _stop_backend_gracefully(backend)
+        own_pids = {p.pid for p in procs} | backend_llama_pids
         for p in procs:
-            _kill_process_tree(p.pid)
+            if p.poll() is None:
+                _kill_process_tree(p.pid)
         for p in procs:
             try:
                 p.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 p.kill()
+        if llama_ports:
+            _sweep_own_llama_ports(llama_ports, own_pids)
         for f in stderr_files:
             try:
                 f.close()
@@ -440,8 +533,9 @@ def _spawn_backend(
     args: argparse.Namespace,
     procs: list[subprocess.Popen],
     console,
+    backend: ServeBackend,
 ) -> int | None:
-    """FastAPI バックエンドを起動。成功時はバインドポート、失敗時 ``None``。"""
+    """FastAPI バックエンドを起動して ``backend`` に記録する。成功時はバインドポート、失敗時 ``None``。"""
     backend_port = config.get("server", {}).get("port", args.port)
     render_info(console, msg("cli.svc_starting_backend", port=backend_port))
     backend_env = _build_backend_env(args)
@@ -456,6 +550,8 @@ def _spawn_backend(
     except FileNotFoundError as e:
         render_error(console, msg("cli.svc_backend_start_failed", reason=e))
         return None
+    backend.proc = backend_proc
+    backend.port = backend_port
     return backend_port
 
 
@@ -482,34 +578,48 @@ def _monitor_serve_processes(
     console,
     cleanup,
     optional_procs: list[subprocess.Popen] | None = None,
+    backend_proc: subprocess.Popen | None = None,
 ) -> int:
-    """全プロセスを監視。子プロセス異常終了 → 1、Ctrl+C → 0。
+    """全プロセスを監視。致命的な終了 → 1、Ctrl+C → 0。
 
-    ``optional_procs`` (rerank) の終了は 1 回だけ知らせて監視から外す (serve は続ける)。
+    致命的なのは backend の終了だけ。base / embed の llama-server の終了は、backend が生きていれば
+    1 回だけ知らせて監視から外す — llama の止め・起こし直し (GUI の再起動・モード切替・
+    ``evoref servers restart``) は backend の LlamaProcessManager が担い、起こし直したものは
+    backend の子になる (c_06 §2.7)。backend も死んでいれば (``backend_proc`` が無い場合も) 従来どおり
+    致命的。``optional_procs`` (rerank) の終了は 1 回だけ知らせて監視から外す (serve は続ける)。
     """
     optional = list(optional_procs or [])
     try:
         while True:
             for p in list(procs):
                 ret = p.poll()
-                if ret is not None and p in optional:
+                if ret is None:
+                    continue
+                if p in optional:
                     render_error(console, msg("cli.svc_rerank_exited", code=ret))
                     optional.remove(p)
                     procs.remove(p)
                     continue
-                if ret is not None:
-                    render_error(
-                        console,
-                        msg("cli.process_exited", pid=p.pid, code=ret),
+                if backend_proc is not None and p is not backend_proc and backend_proc.poll() is None:
+                    logger.warning(
+                        "llama-server pid=%d exited (code=%s) while the backend is alive; "
+                        "leaving its restart to the backend", p.pid, ret,
                     )
-                    _show_stderr_tail(console, project_root, "llama-base")
-                    _show_stderr_tail(console, project_root, "backend")
-                    render_info(
-                        console,
-                        msg("cli.hint_check_stderr", path=str(resolve_data_path("logs_dir", project_root))),
-                    )
-                    cleanup()
-                    return 1
+                    render_info(console, msg("cli.svc_llama_handed_over", pid=p.pid, code=ret))
+                    procs.remove(p)
+                    continue
+                render_error(
+                    console,
+                    msg("cli.process_exited", pid=p.pid, code=ret),
+                )
+                _show_stderr_tail(console, project_root, "llama-base")
+                _show_stderr_tail(console, project_root, "backend")
+                render_info(
+                    console,
+                    msg("cli.hint_check_stderr", path=str(resolve_data_path("logs_dir", project_root))),
+                )
+                cleanup()
+                return 1
             time.sleep(1)
     except KeyboardInterrupt:
         cleanup()
@@ -568,7 +678,10 @@ def _run_serve(args: argparse.Namespace) -> int:
 
     procs: list[subprocess.Popen] = []
     stderr_files: list = []
-    cleanup = _make_serve_cleanup(console, procs, stderr_files, project_root)
+    backend = ServeBackend()
+    cleanup = _make_serve_cleanup(
+        console, procs, stderr_files, project_root, backend=backend, llama_ports=_llama_ports(config),
+    )
     signal.signal(signal.SIGINT, lambda s, f: cleanup(s, f) or sys.exit(0))
     signal.signal(signal.SIGTERM, lambda s, f: cleanup(s, f) or sys.exit(0))
 
@@ -586,7 +699,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     if rerank is not None:
         all_servers["rerank"] = rerank
 
-    backend_port = _spawn_backend(project_root, config, args, procs, console)
+    backend_port = _spawn_backend(project_root, config, args, procs, console, backend)
     if backend_port is None:
         cleanup()
         return 1
@@ -594,6 +707,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     _print_serve_running_banner(console, backend_port, args.no_llama, all_servers)
     return _monitor_serve_processes(
         procs, project_root, console, cleanup, optional_procs=optional_procs,
+        backend_proc=backend.proc,
     )
 
 

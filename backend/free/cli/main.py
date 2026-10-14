@@ -13,9 +13,10 @@ from pathlib import Path
 
 import httpx
 
+from backend.free.cli import registry
 from backend.free.cli.backend_headers import backend_headers
 from backend.free.cli.chat_loop import chat_stream, _main_loop
-from backend.free.cli.command_parser import SessionState
+from backend.free.cli.command_parser import SessionState, parse_command
 from backend.free.cli.develop_mode_setup import add_data_root_flag, setup_develop_mode
 from backend.free.cli.edition_validator import validate_edition_arg
 from backend.free.cli.config_loader import (
@@ -56,14 +57,6 @@ from backend.i18n_helper import init_i18n, msg
 from backend.log_config import get_logger, setup_cli_logging
 
 logger = get_logger("cli.main")
-
-# サブコマンドとして認識する名前
-# - "create": 対話モード (Pro はクリエイト、Free は警告 + chat フォールバック)
-_SUBCOMMANDS = {
-    "serve", "chat", "create", "gui", "export", "import", "reindex", "projectmap", "theme",
-    "config", "reset", "forget", "doctor", "backups", "tune", "rag", "knowledge", "model",
-    "growth", "audit", "cartridge", "policy", "airgap", "hub", "modelfit",
-}
 
 #: 値を 1 つ取るオプション。直後の語はサブコマンド判定から外す。
 _VALUE_OPTIONS = {
@@ -391,152 +384,6 @@ def _run_serve_subcmd(argv: list[str]) -> int:
     return _run_serve(args)
 
 
-def _get_subcommand_handler(name: str):
-    """サブコマンド名に対応するハンドラを返す（遅延 import）
-
-    Returns:
-        ハンドラ関数、または未知のサブコマンドなら None
-    """
-    if name == "serve":
-        return _run_serve_subcmd
-    if name == "gui":
-        return _run_gui
-    if name == "export":
-        from backend.free.cli.data_commands import run_export
-        return run_export
-    if name == "import":
-        from backend.free.cli.data_commands import run_import
-        return run_import
-    if name == "reindex":
-        from backend.free.cli.reindex_command import run_reindex
-        return run_reindex
-    if name == "projectmap":
-        from backend.free.cli.projectmap_command import run_projectmap
-        return run_projectmap
-    if name == "theme":
-        from backend.free.cli.theme_command import run_theme
-        return run_theme
-    if name == "config":
-        from backend.free.cli.config_command import run_config
-        return run_config
-    if name == "reset":
-        from backend.free.cli.reset_command import run_reset
-        return run_reset
-    if name == "forget":
-        from backend.free.cli.forget_command import run_forget
-        return run_forget
-    if name == "doctor":
-        from backend.free.cli.doctor_command import run_doctor_command
-        return run_doctor_command
-    if name == "backups":
-        from backend.free.cli.backups_command import run_backups
-        return run_backups
-    if name == "tune":
-        from backend.free.cli.tune_command import run_tune
-        return run_tune
-    if name == "rag":
-        from backend.free.cli.rag_command import run_rag
-        return run_rag
-    if name == "knowledge":
-        return _run_knowledge_subcmd
-    if name == "audit":
-        return _run_audit_subcmd
-    if name == "cartridge":
-        return _run_cartridge_subcmd
-    if name == "policy":
-        return _run_policy_subcmd
-    if name == "airgap":
-        return _run_airgap_subcmd
-    if name == "hub":
-        return _run_hub_subcmd
-    if name == "modelfit":
-        return _run_modelfit_subcmd
-    if name == "model":
-        from backend.free.cli.model_commands import run_model
-        return run_model
-    if name == "growth":
-        from backend.free.cli.growth_command import run_growth
-        return run_growth
-    return None
-
-
-def _run_knowledge_subcmd(argv: list[str]) -> int:
-    """knowledge サブコマンド (Pro 専用)。Free には Pro モジュールが無いので案内して終える。"""
-    try:
-        from backend.pro.cli.knowledge_command import run_knowledge
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="knowledge"), file=sys.stderr)
-        return 1
-    return run_knowledge(argv)
-
-
-def _run_audit_subcmd(argv: list[str]) -> int:
-    """audit サブコマンド (Pro 専用、docs/p_07)。Free には Pro モジュールが無いので案内して終える。"""
-    try:
-        from backend.pro.cli.audit_command import run_audit
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="audit"), file=sys.stderr)
-        return 1
-    return run_audit(argv)
-
-
-def _run_cartridge_subcmd(argv: list[str]) -> int:
-    """cartridge サブコマンド (Pro 専用、署名付きカートリッジ docs/p_06)。Free は案内して終える。"""
-    try:
-        from backend.pro.cli.cartridge_command import run_cartridge
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="cartridge"), file=sys.stderr)
-        return 1
-    return run_cartridge(argv)
-
-
-def _run_policy_subcmd(argv: list[str]) -> int:
-    """policy サブコマンド (Pro 専用、組織ポリシーパック docs/p_09)。Free は案内して終える。"""
-    try:
-        from backend.pro.cli.policy_command import run_policy
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="policy"), file=sys.stderr)
-        return 1
-    return run_policy(argv)
-
-
-def _run_hub_subcmd(argv: list[str]) -> int:
-    """hub サブコマンド (Pro 専用、チーム知識ハブ docs/p_10)。Free は案内して終える。"""
-    try:
-        from backend.pro.cli.hub_command import run_hub
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="hub"), file=sys.stderr)
-        return 1
-    return run_hub(argv)
-
-
-def _run_modelfit_subcmd(argv: list[str]) -> int:
-    """modelfit サブコマンド (Pro 専用、モデル適合ラボ docs/p_11)。Free は案内して終える。"""
-    try:
-        from backend.pro.cli.modelfit_command import run_modelfit
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="modelfit"), file=sys.stderr)
-        return 1
-    return run_modelfit(argv)
-
-
-def _run_airgap_subcmd(argv: list[str]) -> int:
-    """airgap サブコマンド (Pro 専用、エアギャップ導入キット docs/p_08)。Free は案内して終える。"""
-    try:
-        from backend.pro.cli.airgap_command import run_airgap
-    except ImportError:
-        init_i18n()
-        print(msg("cli.pro_only_command", command="airgap"), file=sys.stderr)
-        return 1
-    return run_airgap(argv)
-
-
 # ────────────────────────────────────────────
 # Parser
 # ────────────────────────────────────────────
@@ -560,6 +407,38 @@ def _add_develop_flag(parser: argparse.ArgumentParser) -> None:
     get_develop_hook().extend_parser(parser)
 
 
+def _cli_edition() -> str:
+    """CLI が動いているエディション (``EVOREF_EDITION`` → 同梱の有無、cli_mode と同じ順)。"""
+    from backend.edition import develop_available, pro_available
+
+    env = os.environ.get("EVOREF_EDITION", "").strip().lower()
+    if env in ("free", "pro", "develop"):
+        return env
+    if develop_available():
+        return "develop"
+    return "pro" if pro_available() else "free"
+
+
+def version_line() -> str:
+    """``evoref --version`` の 1 行 (例: ``evoref 0.0.130 (free)`` / ``evoref 0.0.130 (pro, Pro 0.0.1)``)。
+
+    CLI のプロセスでは Pro の pillar が登録されないので ``get_runtime_version`` は Free の版を
+    返す。Pro 以上なら Pro の版を添える。
+    """
+    from backend.version import get_runtime_version
+
+    edition = _cli_edition()
+    line = f"evoref {get_runtime_version()} ({edition}"
+    if edition != "free":
+        try:
+            from backend.pro.__version__ import __version__ as pro_version  # type: ignore[import-not-found]
+        except ImportError:
+            pro_version = None
+        if pro_version:
+            line += f", Pro {pro_version}"
+    return line + ")"
+
+
 def _build_interactive_parser() -> argparse.ArgumentParser:
     """対話/単発モード用パーサー（create サブコマンド、デフォルト）"""
     parser = argparse.ArgumentParser(
@@ -569,6 +448,11 @@ def _build_interactive_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "message", nargs="?", default=None,
         help="Single message to send (non-interactive mode)",
+    )
+    # 版はローカルの配布物の版。稼働中の backend の版は evoref status が出す (f_06 §2.10)
+    parser.add_argument(
+        "--version", "-V", action="version", version=version_line(),
+        help="Show the installed version and edition, then exit",
     )
     parser.add_argument(
         "--file", "-f", action="append", default=[],
@@ -804,6 +688,12 @@ async def _run_non_interactive_chat(
         await _unregister_session(state.backend_url, state.session_id)
         _auto_serve_cleanup(auto_serve_state, console)
         return 1
+    if parse_command(message)[0] == "/feedback":
+        # 単発のメッセージには評価する直前の応答が無い (チャットとして送ると発話として残る)
+        print(msg("cli.feedback_non_interactive"), file=sys.stderr)
+        await _unregister_session(state.backend_url, state.session_id)
+        _auto_serve_cleanup(auto_serve_state, console)
+        return 2
     try:
         response, _shell_outs, _ttft = await chat_stream(
             message, state, console, non_interactive=True,
@@ -969,9 +859,10 @@ def main() -> None:
     # 値を取るオプションの直後の語 (``-f rag`` のファイル名など) はサブコマンドとみなさない。
     for idx, subcmd in (
         (i, a) for i, a in enumerate(argv)
-        if a in _SUBCOMMANDS and (i == 0 or argv[i - 1] not in _VALUE_OPTIONS)
+        if a in registry.COMMAND_WORDS and (i == 0 or argv[i - 1] not in _VALUE_OPTIONS)
     ):
-        handler = _get_subcommand_handler(subcmd)
+        # 名前の表と分岐は登録表 (docs/f_06 §2.9.2)。chat / create は None でモード指定へ落ちる
+        handler = registry.resolve(subcmd)
         if handler is not None:
             sub_argv = argv[:idx] + argv[idx + 1:]
             sys.exit(handler(sub_argv))

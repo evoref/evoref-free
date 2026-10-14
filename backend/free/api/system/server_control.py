@@ -1,16 +1,17 @@
-"""サーバー管理 API: llama-server プロセスの起動・停止
+"""サーバー管理 API (`/api/servers/*`): GUI 用の互換層 (c_06 §2.8)
 
-フロントエンドからベース/埋め込み/リランカーの
-llama-server プロセスを個別に起動・停止できるようにする。
+設定画面 (``frontend/src/lib/free/api/server.ts``) がベース / 埋め込み / リランカーの
+llama-server を個別に起動・停止する。プロセスの所有者は
+:class:`~backend.free.core.llama_process_manager.LlamaProcessManager` (`/api/model/process/*`、
+c_06 §2.6) で、ここは URL と応答形 (:class:`ServerActionResponse`、失敗も HTTP 200 +
+``success: false``) を保ったまま manager へ委譲するだけ。CLI は `/api/model/process/*` を使う。
+
+サーバ名は ``base`` / ``embed`` / ``rerank`` (component の ``embedding`` との写像は
+``llama_process_manager.component_of`` の 1 か所)。
 """
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import time
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 import httpx
@@ -19,40 +20,28 @@ from pydantic import BaseModel
 
 from backend.app_state import AppState, get_app_state
 from backend.config import get_config
-from backend.constants import DEFAULT_LLAMA_PORT
+from backend.free.api.model import process_service
+from backend.free.core.llama_process_manager import (
+    ProcessAlreadyRunningError,
+    ProcessManagerError,
+    ProcessNotConfiguredError,
+    ProcessNotManagedError,
+    ProcessPortBusyError,
+    ProcessStartTimeoutError,
+    component_of,
+)
+from backend.free.core.llama_process_manager import _resolve_endpoint as _component_endpoint
 from backend.log_config import get_logger
 
 logger = get_logger("api.server_control")
 
 router = APIRouter(prefix="/api/servers", tags=["server-control"])
 
-# ────────────────────────────────────────────
-# プロセス管理コンテナ（モジュールレベルシングルトン）
-# ────────────────────────────────────────────
-
 ServerName = Literal["base", "embed", "rerank"]
 
 
-@dataclass
-class ManagedProcess:
-    """管理対象の llama-server プロセス"""
-    name: ServerName
-    proc: subprocess.Popen
-    host: str
-    port: int
-
-
-_managed: dict[ServerName, ManagedProcess] = {}
-
-
-def _find_project_root() -> Path:
-    """プロジェクトルートを探索"""
-    from backend.free.cli.config_loader import _find_project_root
-    return _find_project_root()
-
-
 # ────────────────────────────────────────────
-# ヘルスチェック
+# ヘルスチェック (status.py の rerank 接続表示も使う)
 # ────────────────────────────────────────────
 
 async def _check_health(host: str, port: int) -> bool:
@@ -67,359 +56,16 @@ async def _check_health(host: str, port: int) -> bool:
         return False
 
 
-# ────────────────────────────────────────────
-# プロセス起動 / 停止
-# ────────────────────────────────────────────
-
-def _kill_process_tree(pid: int) -> None:
-    """プロセスツリーごと終了"""
-    import os
-    import signal as sig
-    if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError:
-            pass
-    else:
-        try:
-            os.killpg(os.getpgid(pid), sig.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
-
-
-def _build_cmd(
-    name: ServerName,
-    cfg: dict,
-    project_root: Path,
-    *,
-    model_override: str | None = None,
-    allow_decide: bool = False,
-) -> tuple[list[str], str, int] | None:
-    """サーバー名から起動コマンドと (host, port) を構築 (ブロッキング。async からは executor で呼ぶ)
-
-    環境調整の ``auto`` の項目 (c_16 §7.2.3) は既定では保存値を読むだけ (``--list-devices`` も
-    見積りも走らせない)。``allow_decide`` は base を止めた後の組み直しだけ真にする — 予約の再計算や
-    その場の見積りをし、輪郭は 1 回だけ読んで項目の間で共有する (本番の base が載った空きで
-    見積もって保存しない)。
-    """
-    from backend.free.core.tuning.resolve import launch_scope
-
-    with launch_scope(allow_decide):
-        return _compose_cmd(name, cfg, project_root, model_override=model_override)
-
-
-def _compose_cmd(
-    name: ServerName,
-    cfg: dict,
-    project_root: Path,
-    *,
-    model_override: str | None = None,
-) -> tuple[list[str], str, int] | None:
-    """サーバー名から起動コマンドと (host, port) を構築
-
-    Returns:
-        (cmd, host, port) or None（設定なし / モデル未指定）
-    """
-    from scripts.launch_llama import build_embed_cmd, build_llama_cmd
-
-    # 起動スクリプトは解決結果 (slots / -ngl / 環境調整の値) を config の ``__*`` キーに覚える。
-    # backend の config は長く生きるので、そのままだと画面の再起動が前の解決を使い回し、
-    # 予約した環境調整の再計算 (c_16 §7.2.3) が効かない。起動ごとに覚え直させる。
-    cfg = {k: v for k, v in cfg.items() if not (isinstance(k, str) and k.startswith("__"))}
-
-    if name == "base":
-        llama_cfg = cfg.get("llama", {})
-        host = llama_cfg.get("host", "127.0.0.1")
-        port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
-        cmd = build_llama_cmd(cfg, project_root, model_override=model_override)
-        return (cmd, host, port)
-
-    if name == "embed":
-        cmd = build_embed_cmd(cfg, project_root)
-        if cmd is None:
-            return None
-        embed_cfg = cfg.get("embedding", {})
-        host = embed_cfg.get("llama_host", "localhost")
-        port = embed_cfg.get("llama_port", 8082)
-        return (cmd, host, port)
-
-    if name == "rerank":
-        # 保存済みの自己テストで有効な配置だけで起こす (測り直すのは起動スクリプト、c_16 §7.2.1)
-        from scripts.launch_llama import (
-            RERANK_HOST,
-            build_rerank_cmd,
-            rerank_port,
-            saved_rerank_placement,
-        )
-
-        placement = saved_rerank_placement(cfg, project_root)
-        if placement is None:
-            return None
-        cmd = build_rerank_cmd(cfg, project_root, placement)
-        if cmd is None:
-            return None
-        return (cmd, RERANK_HOST, rerank_port(cfg))
-
-    return None
-
-
-def _open_stderr_log(project_root: Path, name: ServerName):
-    """llama-{name}.stderr.log を開く (CLI service_manager と同じ場所に統一)
-
-    `_spawn_server` が stderr=DEVNULL で完全にエラーを捨てていた問題に対し、
-    UI 経由起動時も CLI 起動時と同じファイルへ stderr を書き出す。
-    起動失敗の原因 (port 競合 / モデル不在 / Vulkan 初期化失敗 等) が
-    `<data_root>/logs/llama-{name}.stderr.log` に残るようになる。
-    """
-    from backend.config import resolve_data_path
-
-    log_dir = resolve_data_path("logs_dir", project_root)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    path = log_dir / f"llama-{name}.stderr.log"
-    # 追記モードなので、上限を超えたら 1 世代だけ退避してから開き直す。
-    # ローテーションが無く、UI から起動するたびに無制限に伸びていた。
-    _rotate_if_large(path)
-    return open(path, "ab")
-
-
-#: llama stderr ログのローテーション閾値 (bytes)。develop JSONL の
-#: ``max_log_mb`` と同じ 5MB を既定に合わせる。
-_STDERR_LOG_MAX_BYTES = 5 * 1024 * 1024
-
-
-def _rotate_if_large(path: Path) -> None:
-    """``path`` が閾値を超えていたら ``.1`` へ退避する (1 世代のみ保持)。"""
-    try:
-        if not path.exists() or path.stat().st_size < _STDERR_LOG_MAX_BYTES:
-            return
-        backup = path.with_suffix(path.suffix + ".1")
-        backup.unlink(missing_ok=True)
-        path.rename(backup)
-    except OSError as exc:
-        logger.warning("Failed to rotate %s: %s", path, exc)
-
-
-def _spawn_server(
-    name: ServerName, cfg: dict, *, cmd_override: list[str] | None = None, allow_decide: bool = False,
-) -> ManagedProcess | None:
-    """llama-server プロセスを起動 (``cmd_override`` は埋め込みの CPU 再起動用)
-
-    ``allow_decide`` は環境調整の見積りを許すか (base を止めた後だけ。:func:`_build_cmd`)。
-    """
-    project_root = _find_project_root()
-    result = _build_cmd(name, cfg, project_root, allow_decide=allow_decide)
-    if result is None:
-        logger.warning("server_control: no config for %s", name)
-        return None
-
-    cmd, host, port = result
-    if cmd_override is not None:
-        cmd = cmd_override
-    logger.info("server_control: starting %s on %s:%d", name, host, port)
-    logger.debug("server_control: cmd=%s", cmd)
-
-    stderr_f = _open_stderr_log(project_root, name)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(project_root),
-            stdout=subprocess.DEVNULL,
-            stderr=stderr_f,
-        )
-    except (FileNotFoundError, OSError) as e:
-        logger.error("server_control: failed to spawn %s: %s", name, e)
-        stderr_f.close()
-        return None
-
-    managed = ManagedProcess(name=name, proc=proc, host=host, port=port)
-    _managed[name] = managed
-    return managed
-
-
-def _spawn_server_with_override(
-    name: ServerName,
-    cfg: dict,
-    *,
-    model_override: str | None = None,
-    allow_decide: bool = False,
-) -> ManagedProcess | None:
-    """model_override 対応版の llama-server プロセス起動 (``allow_decide`` は :func:`_build_cmd`)"""
-    project_root = _find_project_root()
-    result = _build_cmd(
-        name, cfg, project_root, model_override=model_override,
-        allow_decide=allow_decide,
-    )
-    if result is None:
-        logger.warning("server_control: no config for %s", name)
-        return None
-
-    cmd, host, port = result
-    logger.info("server_control: starting %s on %s:%d (override=%s)", name, host, port, model_override)
-    logger.debug("server_control: cmd=%s", cmd)
-
-    stderr_f = _open_stderr_log(project_root, name)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(project_root),
-            stdout=subprocess.DEVNULL,
-            stderr=stderr_f,
-        )
-    except (FileNotFoundError, OSError) as e:
-        logger.error("server_control: failed to spawn %s: %s", name, e)
-        stderr_f.close()
-        return None
-
-    managed = ManagedProcess(name=name, proc=proc, host=host, port=port)
-    _managed[name] = managed
-    return managed
-
-
-def _stop_server(name: ServerName) -> bool:
-    """管理対象プロセスを停止 (このバックエンドが spawn したプロセスのみ)"""
-    managed = _managed.pop(name, None)
-    if managed is None:
-        return False
-
-    if managed.proc.poll() is None:
-        logger.info("server_control: stopping %s (pid=%d)", name, managed.proc.pid)
-        _kill_process_tree(managed.proc.pid)
-        try:
-            managed.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            managed.proc.kill()
-    return True
-
-
 def _resolve_endpoint(name: ServerName, cfg: dict) -> tuple[str, int] | None:
-    """サーバー名から (host, port) を config から直接解決する (停止経路専用)
-
-    `_build_cmd` と違い `enabled` / モデルパス有無のゲートに依存しない。
-    「無効化と同時にプロセスを停止する」経路では config が既に
-    `enabled=false` になっており、cmd ビルダーが ``None`` を返して
-    停止対象ポートを失う。停止に cmd は不要でポートだけ要るためこちらを使う。
-    """
-    if name == "base":
-        lc = cfg.get("llama", {}) or {}
-        return lc.get("host", "127.0.0.1"), int(lc.get("port", DEFAULT_LLAMA_PORT))
-    if name == "embed":
-        emb = cfg.get("embedding", {}) or {}
-        return emb.get("llama_host", "localhost"), int(emb.get("llama_port", 8082))
-    if name == "rerank":
-        rr = (cfg.get("rag") or {}).get("rerank") or {}
-        return "127.0.0.1", int(rr.get("port", 8083))
-    return None
-
-
-def _stop_external_server(name: ServerName, cfg: dict) -> tuple[bool, str]:
-    """外部起動された llama-server をポート占有 PID から特定して停止する
-
-    `_stop_server` が「このバックエンドが起動したプロセス」しか扱えない問題に対し、
-    `python scripts/launch_llama.py --all` 等で外部起動されたプロセスにも
-    UI の停止ボタンが効くようフォールバックさせる。
-
-    ポートは `_resolve_endpoint` で config から直接引く。`_build_cmd` 経由だと
-    enabled=false 等で cmd が ``None`` になりポートを失い、無効化と同時の
-    停止が機能しなくなる。
-
-    Returns:
-        (success, message)
-    """
-    from backend.free.cli.pid_manager import find_port_occupant
-
-    endpoint = _resolve_endpoint(name, cfg)
-    if endpoint is None:
-        return (False, "not configured")
-
-    _host, port = endpoint
-    occupant = find_port_occupant(port)
-    if occupant is None:
-        return (False, "no process listening on port")
-
-    logger.info(
-        "server_control: stopping external %s on port %d (pid=%d, name=%s)",
-        name, port, occupant.pid, occupant.process_name,
-    )
-    if not _kill_llama_occupant(occupant):
-        return (False, _foreign_occupant_message(occupant))
-    return (True, f"stopped external process pid={occupant.pid}")
-
-
-def _kill_llama_occupant(occupant) -> bool:
-    """ポートの占有者が llama-server なら kill して ``True``。別のイメージなら何もしない。"""
-    from backend.free.cli.pid_manager import IMAGE_LLAMA, kill_port_occupants
-
-    return bool(kill_port_occupants([occupant], expected={occupant.port: IMAGE_LLAMA}))
-
-
-def _foreign_occupant_message(occupant) -> str:
-    return (
-        f"port {occupant.port} is held by a non-llama-server process "
-        f"(pid={occupant.pid}, name={occupant.process_name or 'unknown'}); not killing it"
-    )
-
-
-def stop_server_process(
-    name: ServerName, cfg: dict, state: AppState,
-) -> tuple[bool, str]:
-    """llama-server プロセスを停止する (3 つの起動経路を順に試す)
-
-    UI の停止操作と「設定 OFF 時の自動停止」で共有する。VRAM 解放が目的なので、
-
-        1. server_control が spawn した Popen (`_managed`)
-        2. LlamaProcessManager 管理下 (`process_manager.enabled=true` 起動経路)
-        3. 外部起動 (`launch_llama.py --all` 等) を port 占有 PID から停止
-
-    のいずれかで止められれば ``success=True`` を返す。``AppState`` のクライアント
-    参照クリアは呼び出し側の責務。
-    """
-    if _stop_server(name):
-        return (True, "stopped")
-
-    mgr = getattr(state, "llama_manager", None)
-    if mgr is not None:
-        # LlamaProcessManager の component 名は embed のみ "embedding"
-        component = "embedding" if name == "embed" else name
-        try:
-            if mgr.get_entry(component) is not None:
-                mgr.stop(component)
-                return (True, "stopped (process manager)")
-        except Exception as e:
-            logger.warning(
-                "server_control: process_manager stop failed for %s: %s", name, e,
-            )
-
-    return _stop_external_server(name, cfg)
-
-
-def wait_port_released(name: ServerName, cfg: dict, timeout: float = 10.0) -> bool:
-    """指定サーバの port が LISTENING でなくなるまで待つ (停止後の再 spawn 前ガード)。
-
-    旧サーバを kill した直後に新プロセスを spawn すると、旧サーバの graceful
-    shutdown 残響で ``wait_for_health`` が旧サーバの ``/health`` 200 を拾う窓が
-    残る。再 spawn 前に port 解放を確認することでこの窓を潰す。``find_port_occupant``
-    は LISTENING のみマッチするため TIME_WAIT は拾わない (実害なし)。
-    """
-    from backend.free.cli.pid_manager import find_port_occupant
-
-    endpoint = _resolve_endpoint(name, cfg)
-    if endpoint is None:
-        return True
-    _host, port = endpoint
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if find_port_occupant(port) is None:
-            return True
-        time.sleep(0.5)
-    return find_port_occupant(port) is None
+    """サーバー名から (host, port) を config から直接解決する (enabled / モデルの有無を見ない)"""
+    try:
+        return _component_endpoint(component_of(name), cfg)
+    except ProcessManagerError:
+        return None
 
 
 # ────────────────────────────────────────────
-# API スキーマ
+# API スキーマ (frontend の ServerActionResponse と同じ形。変えない)
 # ────────────────────────────────────────────
 
 class ServerActionRequest(BaseModel):
@@ -434,6 +80,10 @@ class ServerActionResponse(BaseModel):
     message: str = ""
 
 
+def _reply(name: str, action: str, success: bool, message: str) -> ServerActionResponse:
+    return ServerActionResponse(name=name, action=action, success=success, message=message)
+
+
 # ────────────────────────────────────────────
 # エンドポイント
 # ────────────────────────────────────────────
@@ -443,135 +93,33 @@ async def start_server(
     req: ServerActionRequest,
     state: AppState = Depends(get_app_state),
 ):
-    """指定サーバーの llama-server プロセスを起動"""
-    name = req.name
-    force = req.force
+    """指定サーバーの llama-server プロセスを起動 (``force`` は動いているものを止めて起こし直す)"""
+    name, force = req.name, req.force
+    if state.llama_manager is None:
+        return _reply(name, "start", False, "process manager not initialized")
+    component = component_of(name)
     cfg = get_config()
-
-    # 既にプロセス管理中ならチェック
-    existing = _managed.get(name)
-    if existing and existing.proc.poll() is None:
-        if force:
-            # --force: 既存プロセスを停止してから再起動
-            logger.info("server_control: force-stopping %s before restart", name)
-            _stop_server(name)
-        else:
-            return ServerActionResponse(
-                name=name, action="start", success=False,
-                message="already running",
-            )
-
-    # 既にポートで起動中かチェック
-    import asyncio
-    from functools import partial
-
-    from backend.trace_context import run_in_executor_with_context
-
-    loop = asyncio.get_running_loop()
-    # kill より前の組み立ては保存値を読むだけ (イベントループを止めず、稼働中の base の空きで見積もらない)
-    result = await run_in_executor_with_context(loop, None, partial(_build_cmd, name, cfg, _find_project_root()))
-    cmd = None
-    if result is not None:
-        cmd, host, port = result
+    try:
+        await process_service.start_component(state, component, cfg, force=force)
+    except ProcessAlreadyRunningError:
+        return _reply(name, "start", False, "already running")
+    except ProcessPortBusyError as e:
+        if not e.is_llama:
+            return _reply(name, "start", False, str(e))
+        # 外部起動 (evoref serve / evoref-ctl) の llama-server — 二重に起こさず接続し直す
+        host, port = _component_endpoint(component, cfg)
         if await _check_health(host, port):
-            if force:
-                # --force: ポート占有プロセスを kill して再起動
-                logger.info("server_control: force-killing occupant on port %d", port)
-                from backend.free.cli.pid_manager import find_port_occupant
-                occ = find_port_occupant(port)
-                if occ and not _kill_llama_occupant(occ):
-                    return ServerActionResponse(
-                        name=name, action="start", success=False,
-                        message=_foreign_occupant_message(occ),
-                    )
-                # port 解放待ちは下の wait_port_released に一本化
-            else:
-                # 外部起動済み — 遅延接続を試みる
-                await _try_reconnect(name, state, cfg)
-                return ServerActionResponse(
-                    name=name, action="start", success=True,
-                    message="already healthy, reconnected",
-                )
-
-    # 旧プロセスの graceful shutdown 残響で wait_for_health が旧プロセスの
-    # 200 を拾う窓を潰す (mode.py の base 切替と同じパターン)。force=False
-    # で外部起動済みプロセスが無い場合も no-op で安全。
-    await asyncio.to_thread(wait_port_released, name, cfg, 10.0)
-
-    # base はここで止まっている (起動していない / 上で kill した) ので、組み直しで予約の再計算・
-    # その場の見積りを許す。埋め込み / リランカーは base が載ったままなので保存値を読むだけ
-    spawn = partial(_spawn_server, name, cfg, allow_decide=True) if name == "base" else partial(_spawn_server, name, cfg)
-    managed = await run_in_executor_with_context(loop, None, spawn)
-    if managed is None:
-        return ServerActionResponse(
-            name=name, action="start", success=False,
-            message="not configured",
-        )
-
-    # ヘルスチェック待機。expected_model_id で /props の load 済みモデルまで
-    # 検証し、旧プロセス残響の誤 ready 判定を防ぐ。
-    from scripts.launch_llama import (
-        EMBED_GPU_START_TIMEOUT_SEC,
-        RERANK_GPU_START_TIMEOUT_SEC,
-        _extract_model_basename,
-        embed_cpu_fallback_cmd,
-        rerank_cpu_fallback_cmd,
-        wait_for_health,
-    )
-    from backend.free.llm._base_client import (
-        health_wait_for_cfg,
-        model_path_from_cmd,
-        resolve_health_wait,
-    )
-
-    # 整数は明示値、auto / 無しは起動するモデルの GGUF サイズ連動 (c_16 §7.2.3)
-    model_path = model_path_from_cmd(cmd)
-    health_timeout = health_wait_for_cfg(
-        cfg, model_path, project_root=_find_project_root(), label=name,
-    )
-    expected = _extract_model_basename(cmd) if cmd else None
-    # 埋め込み / rerank が保存済みの GPU 配置 (auto) なら、起動しなければ CPU で 1 回だけ起こし直す
-    # (保存結果は書き換えない、c_16 §7.2.1 / §7.2.2)
-    if name == "embed" and cmd:
-        fallback = embed_cpu_fallback_cmd(cfg, cmd)
-        gpu_start_timeout = resolve_health_wait(
-            "auto", model_path, floor=EMBED_GPU_START_TIMEOUT_SEC, label="embed GPU start",
-        )
-    elif name == "rerank" and cmd:
-        fallback = rerank_cpu_fallback_cmd(cfg, _find_project_root(), cmd)
-        gpu_start_timeout = resolve_health_wait(
-            "auto", model_path, floor=RERANK_GPU_START_TIMEOUT_SEC, label="rerank GPU start",
-        )
-    else:
-        fallback, gpu_start_timeout = None, health_timeout
-    first_timeout = min(health_timeout, gpu_start_timeout) if fallback else health_timeout
-    healthy = await asyncio.to_thread(
-        wait_for_health, managed.host, managed.port, first_timeout, expected,
-    )
-    if not healthy and fallback is not None:
-        logger.warning(
-            "server_control: %s on GPU did not become healthy within %ds; restarting it on CPU",
-            name, first_timeout,
-        )
-        _stop_server(name)
-        managed = _spawn_server(name, cfg, cmd_override=fallback)
-        if managed is not None:
-            healthy = await asyncio.to_thread(
-                wait_for_health, managed.host, managed.port, health_timeout, expected,
-            )
-
-    if healthy:
-        await _try_reconnect(name, state, cfg)
-        return ServerActionResponse(
-            name=name, action="start", success=True,
-            message="force restarted" if force else "started",
-        )
-    else:
-        _stop_server(name)
-        return ServerActionResponse(
-            name=name, action="start", success=False,
-            message="health check timed out",
-        )
+            await process_service.reconnect_clients(state, component, cfg)
+            return _reply(name, "start", True, "already healthy, reconnected")
+        return _reply(name, "start", False, "port in use by an external llama-server that is not healthy yet")
+    except ProcessNotConfiguredError:
+        return _reply(name, "start", False, "not configured")
+    except ProcessStartTimeoutError:
+        return _reply(name, "start", False, "health check timed out")
+    except ProcessManagerError as e:
+        logger.warning("server_control: start %s failed: %s", name, e)
+        return _reply(name, "start", False, str(e))
+    return _reply(name, "start", True, "force restarted" if force else "started")
 
 
 @router.post("/stop", response_model=ServerActionResponse)
@@ -579,92 +127,16 @@ async def stop_server(
     req: ServerActionRequest,
     state: AppState = Depends(get_app_state),
 ):
-    """指定サーバーの llama-server プロセスを停止
-
-    まず本バックエンドが管理しているプロセスを試し、無ければポート占有プロセスを
-    特定して停止するフォールバックを行う (外部起動された llama-server にも対応)。
-    """
+    """指定サーバーの llama-server プロセスを停止 (このバックエンドが起こしたもの、無ければ外部の llama-server)"""
     name = req.name
-
-    if _stop_server(name):
-        message = "stopped"
-        success = True
-    else:
-        # 外部起動プロセスへのフォールバック
-        cfg = get_config()
-        success, message = _stop_external_server(name, cfg)
-
-    # AppState のクライアント参照をクリア (停止に成功した場合のみ)
-    if success:
-        if name == "base":
-            if state.local_client:
-                await state.local_client.aclose()
-            state.local_client = None
-            if state.llm_client:
-                state.llm_client.local = None
-        elif name == "embed":
-            # embedder オブジェクトは残すが httpx クライアントだけ閉じて
-            # 死んだサーバへの kept-alive socket を破棄する。次回 embed 呼び出しで
-            # _get_http_client が新しい AsyncClient を作る。
-            if state.embedder is not None and hasattr(state.embedder, "aclose"):
-                try:
-                    await state.embedder.aclose()
-                except Exception as e:
-                    logger.warning("server_control: failed to close embedder client: %s", e)
-        elif name == "rerank":
-            await _close_reranker_client(state)
-
-    return ServerActionResponse(
-        name=name,
-        action="stop",
-        success=success,
-        message=message,
-    )
-
-
-async def _try_reconnect(
-    name: ServerName,
-    state: AppState,
-    cfg: dict,
-) -> None:
-    """サーバー起動後にバックエンドのクライアントを再接続
-
-    base だけでなく embed も再構築する。再構築しないと
-    httpx.AsyncClient の kept-alive が前世代の死んだサーバの socket を
-    保持したままになり、起動直後の health_check / embed 呼び出しが
-    フライング失敗する。
-    """
-    if name == "base":
-        from backend.free.api.system.status import _try_lazy_connect
-        llama_cfg = cfg.get("llama", {})
-        host = llama_cfg.get("host", "127.0.0.1")
-        port = llama_cfg.get("port", DEFAULT_LLAMA_PORT)
-        url = f"http://{host}:{port}"
-        await _try_lazy_connect(state, url, llama_cfg)
-
-    elif name == "embed":
-        from backend.free.api.config.component_reload import reload_embedder
-        try:
-            await reload_embedder(state)
-        except Exception as e:
-            logger.warning("server_control: embed reload after start failed: %s", e)
-
-    elif name == "rerank":
-        # 死んだサーバへの kept-alive socket を捨てる (次の rerank 呼出で作り直す)。
-        # 前のサーバで開いた遮断器も閉じ直す (冷却を待たずに次のターンから使う)
-        await _close_reranker_client(state)
-        reranker = getattr(getattr(state, "gen", None), "reranker", None)
-        if reranker is not None:
-            reranker.reset_breaker()
-
-
-async def _close_reranker_client(state: AppState) -> None:
-    """``RerankClient`` の httpx クライアントだけ閉じる (オブジェクトは残す)。"""
-    gen = getattr(state, "gen", None)
-    reranker = getattr(gen, "reranker", None) if gen is not None else None
-    if reranker is None:
-        return
+    if state.llama_manager is None:
+        return _reply(name, "stop", False, "process manager not initialized")
     try:
-        await reranker.aclose()
-    except Exception as e:
-        logger.warning("server_control: failed to close rerank client: %s", e)
+        result = await process_service.stop_component(state, component_of(name), get_config())
+    except ProcessNotManagedError:
+        return _reply(name, "stop", False, "no process listening on port")
+    except ProcessManagerError as e:
+        return _reply(name, "stop", False, str(e))
+    if result.how == "managed":
+        return _reply(name, "stop", True, "stopped")
+    return _reply(name, "stop", True, f"stopped external process pid={result.pid}")

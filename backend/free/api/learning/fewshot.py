@@ -10,11 +10,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel
 
 from backend.app_state import AppState, get_app_state
 from backend.free.api._error_responses import api_error
+from backend.free.api._pagination import LimitParam, OffsetParam, paginate
 from backend.io.readonly import is_readonly
 from backend.log_config import get_logger
 
@@ -86,15 +87,37 @@ def _save(state: AppState, pool) -> None:
         logger.warning("fewshot pool save failed after UI action: %s", exc)
 
 
+#: ``archived`` の絞る前の件数を返す応答ヘッダ (``examples`` の件数は ``X-Total-Count``)。
+ARCHIVED_TOTAL_COUNT_HEADER = "X-Archived-Total-Count"
+
+
 @router.get("", response_model=FewShotListResponse)
 async def list_fewshot(
-    mode: str | None = None, state: AppState = Depends(get_app_state),
+    response: Response,
+    mode: str | None = None,
+    include_archived: bool = True,
+    limit: LimitParam = None,
+    offset: OffsetParam = 0,
+    state: AppState = Depends(get_app_state),
 ) -> FewShotListResponse:
-    """プール内 (active / stale) と退避済みの手本を返す。"""
+    """プール内 (active / stale) と退避済みの手本を返す。
+
+    ``include_archived=false`` なら ``archived`` は空 (本文を返さない。件数は
+    ヘッダで返す)。``limit`` / ``offset`` は任意 (省けば全件) で、``examples`` と
+    ``archived`` にそれぞれ同じ窓を掛ける。絞る前の件数は ``X-Total-Count``
+    (examples) と ``X-Archived-Total-Count`` (archived、``include_archived`` に関わらず)。
+    """
     pool = _pool(state)
+    examples = paginate(pool.list_examples(mode), limit, offset, response)
+    archived = paginate(
+        pool.list_archived(mode), limit, offset, response,
+        header=ARCHIVED_TOTAL_COUNT_HEADER,
+    )
+    if not include_archived:
+        archived = []
     return FewShotListResponse(
-        examples=[_to_model(ex) for ex in pool.list_examples(mode)],
-        archived=[_to_model(ex) for ex in pool.list_archived(mode)],
+        examples=[_to_model(ex) for ex in examples],
+        archived=[_to_model(ex) for ex in archived],
         pool_size=int(pool.pool_size),
     )
 

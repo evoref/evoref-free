@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from backend.constants import DEFAULT_LLAMA_PORT
 from backend.embed_priority import P3_BULK, with_embed_priority
+from backend.free.api._error_responses import api_error
 from backend.free.api.model._model_helpers import (
     build_model_detail_response,
     map_migration_history_items,
@@ -385,8 +386,10 @@ async def _restart_and_rebind(
     manager = state.llama_manager
     assert manager is not None
 
+    from backend.free.api.model.process_service import run_blocking
+
     try:
-        manager.restart(component, cfg)
+        await run_blocking(manager.restart, component, cfg)
         await rebind_component(component, state, cfg)
         _follow_embedder_rebind(component, state)
         logger.info(
@@ -402,7 +405,7 @@ async def _restart_and_rebind(
             migrator.rollback_component(component)
             cfg_after = get_config()
             try:
-                manager.restart(component, cfg_after)
+                await run_blocking(manager.restart, component, cfg_after)
                 from backend.free.core.component_rebind import rebind_component
                 await rebind_component(component, state, cfg_after)
                 _follow_embedder_rebind(component, state)
@@ -481,120 +484,118 @@ async def get_component_migration_history(component: str):
 
 
 # ────────────────────────────────────────────
-# llama-server プロセス管理 API
+# llama-server プロセス管理 API (c_06 §2.6。プロセスの所有者は LlamaProcessManager)
 # ────────────────────────────────────────────
 
-_ALL_PROCESS_COMPONENTS = ("base", "embedding")
-
-
 def _validate_process_component(component: str) -> None:
-    if component not in _ALL_PROCESS_COMPONENTS:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown process component: {component}. "
-                   f"Expected one of {_ALL_PROCESS_COMPONENTS}",
+    from backend.free.core.llama_process_manager import PROCESS_COMPONENTS
+
+    if component not in PROCESS_COMPONENTS:
+        raise api_error(
+            404, "E0404", f"Unknown process component: {component}. Expected one of {PROCESS_COMPONENTS}",
+            "api.process_unknown_component", component=component, expected=", ".join(PROCESS_COMPONENTS),
         )
+
+
+def _require_manager(state: AppState):
+    if state.llama_manager is None:
+        raise api_error(
+            503, "E0503", "LlamaProcessManager not initialized", "api.process_manager_unavailable",
+        )
+    return state.llama_manager
+
+
+def _process_error(component: str, e: Exception) -> HTTPException:
+    """``ProcessManagerError`` の各型 → c_06 §1.4 の構造化エラー。"""
+    from backend.free.core.llama_process_manager import (
+        ProcessAlreadyRunningError,
+        ProcessNotConfiguredError,
+        ProcessNotManagedError,
+        ProcessPortBusyError,
+        ProcessStartTimeoutError,
+    )
+
+    reason = str(e)
+    if isinstance(e, ProcessAlreadyRunningError):
+        return api_error(409, "E0409", reason, "api.process_already_running", component=component)
+    if isinstance(e, ProcessPortBusyError):
+        key = "api.process_port_busy_llama" if e.is_llama else "api.process_port_busy_foreign"
+        return api_error(
+            409, "E0409", reason, key, component=component, port=e.port, pid=e.pid,
+            name=e.process_name or "unknown",
+        )
+    if isinstance(e, ProcessNotManagedError):
+        return api_error(404, "E0404", reason, "api.process_not_running", component=component)
+    if isinstance(e, ProcessNotConfiguredError):
+        return api_error(400, "E0400", reason, "api.process_not_configured", component=component)
+    if isinstance(e, ProcessStartTimeoutError):
+        return api_error(504, "E0504", reason, "api.process_start_timeout", component=component)
+    return api_error(500, "E0500", reason, "api.process_failed", component=component, reason=reason)
+
+
+def _entry_body(component: str, entry) -> dict:
+    return {"component": component, "host": entry.host, "port": entry.port, "pid": entry.proc.pid}
 
 
 @router.get("/process/status")
 async def process_status(state: AppState = Depends(get_app_state)):
-    """LlamaProcessManager の状態スナップショット"""
+    """llama-server の状態 (管理下は PID / 生死、管理外はポートの外部占有者)"""
     if state.llama_manager is None:
         return {"managed": [], "components": {}}
-    components: dict[str, dict] = {}
-    for name in _ALL_PROCESS_COMPONENTS:
-        entry = state.llama_manager.get_entry(name)
-        if entry is None:
-            components[name] = {"managed": False}
-        else:
-            components[name] = {
-                "managed": True,
-                "host": entry.host,
-                "port": entry.port,
-                "pid": entry.proc.pid,
-                "alive": entry.proc.poll() is None,
-            }
-    return {
-        "managed": state.llama_manager.list_managed(),
-        "components": components,
-    }
+    from backend.free.api.model.process_service import run_blocking
+
+    return await run_blocking(state.llama_manager.status, get_config())
 
 
 @router.post("/process/{component}/start")
 async def process_start(
-    component: str, state: AppState = Depends(get_app_state),
+    component: str, force: bool = False, state: AppState = Depends(get_app_state),
 ):
-    """指定コンポーネントの llama-server を起動する"""
+    """指定コンポーネントの llama-server を起動する (``force`` は動いているものを止めて起こし直す)"""
     _validate_process_component(component)
-    if state.llama_manager is None:
-        raise HTTPException(
-            status_code=503,
-            detail="LlamaProcessManager not initialized",
-        )
+    _require_manager(state)
+    from backend.free.api.model.process_service import start_component
     from backend.free.core.llama_process_manager import ProcessManagerError
 
     try:
-        entry = state.llama_manager.start(component, get_config())
+        entry = await start_component(state, component, get_config(), force=force)
     except ProcessManagerError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {
-        "component": component,
-        "started": True,
-        "host": entry.host,
-        "port": entry.port,
-        "pid": entry.proc.pid,
-    }
+        raise _process_error(component, e) from e
+    return {**_entry_body(component, entry), "started": True}
 
 
 @router.post("/process/{component}/stop")
 async def process_stop(
     component: str, state: AppState = Depends(get_app_state),
 ):
-    """指定コンポーネントの llama-server を停止する"""
+    """指定コンポーネントの llama-server を停止する (管理下、無ければ外部の llama-server)"""
     _validate_process_component(component)
-    if state.llama_manager is None:
-        raise HTTPException(
-            status_code=503,
-            detail="LlamaProcessManager not initialized",
-        )
-    from backend.free.core.llama_process_manager import ProcessNotManagedError
+    _require_manager(state)
+    from backend.free.api.model.process_service import stop_component
+    from backend.free.core.llama_process_manager import ProcessManagerError
 
     try:
-        state.llama_manager.stop(component)
-    except ProcessNotManagedError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return {"component": component, "stopped": True}
+        result = await stop_component(state, component, get_config())
+    except ProcessManagerError as e:
+        raise _process_error(component, e) from e
+    return {"component": component, "stopped": True, "how": result.how, "pid": result.pid}
 
 
 @router.post("/process/{component}/restart")
 async def process_restart(
     component: str, state: AppState = Depends(get_app_state),
 ):
-    """指定コンポーネントの llama-server を再起動する"""
+    """指定コンポーネントの llama-server を再起動する (外部起動なら止めて管理下で起こし直す)"""
     _validate_process_component(component)
-    if state.llama_manager is None:
-        raise HTTPException(
-            status_code=503,
-            detail="LlamaProcessManager not initialized",
-        )
-    from backend.free.core.llama_process_manager import (
-        ProcessManagerError,
-        ProcessNotManagedError,
-    )
+    _require_manager(state)
+    from backend.free.api.model.process_service import restart_component
+    from backend.free.core.llama_process_manager import ProcessManagerError
 
     try:
-        entry = state.llama_manager.restart(component, get_config())
-    except ProcessNotManagedError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        entry = await restart_component(state, component, get_config())
     except ProcessManagerError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return {
-        "component": component,
-        "restarted": True,
-        "host": entry.host,
-        "port": entry.port,
-        "pid": entry.proc.pid,
-    }
+        raise _process_error(component, e) from e
+    return {**_entry_body(component, entry), "restarted": True}
 
 
 @router.post("/reembed-facts")

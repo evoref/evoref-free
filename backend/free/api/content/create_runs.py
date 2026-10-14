@@ -1,23 +1,27 @@
-"""staged クリエイトの run 一覧 / 詳細 / イベント再接続 API (f_10 §7、c_06)。
+"""staged クリエイトの run 一覧 / 詳細 / イベント再接続 / 削除 API (f_10 §7、c_06)。
 
 書き手は ``chat_stream_staged.run_staged_pipeline`` (staged) と
 ``generation.harness.LongFormHarness`` (longform、f_08 §2.3) の開始 / 終端
 だけ — この router は :mod:`backend.free.loop.staged.run_record` を呼ぶか、
 ``run.json``/``events.jsonl`` を読むだけの薄い層 (``project_map.py`` の
-router 作法に倣う)。
+router 作法に倣う)。削除は ``run_record.delete_run`` (GC と同じ作法) に委ねる。
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
 from pathlib import Path as FsPath
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, HTTPException, Path, Query, Response
 
 from backend.config import get_path_resolver
 from backend.error_handlers import ErrorResponse
+from backend.free.api._pagination import LimitParam, OffsetParam, paginate
 from backend.free.loop.staged.run_record import RUN_ID_PATTERN, RunRecord
 from backend.log_config import get_logger
+from backend.trace_context import run_in_executor_with_context
 
 logger = get_logger("api.create_runs")
 
@@ -50,15 +54,24 @@ def _stale_after_sec() -> float:
 
 
 @router.get("")
-async def list_create_runs(session_id: str | None = Query(default=None)) -> dict[str, Any]:
-    """staged クリエイトの run 一覧 (``started_at`` 降順、f_10 §7)。"""
+async def list_create_runs(
+    response: Response,
+    session_id: str | None = Query(default=None),
+    limit: LimitParam = None,
+    offset: OffsetParam = 0,
+) -> dict[str, Any]:
+    """staged クリエイトの run 一覧 (``started_at`` 降順、f_10 §7)。
+
+    ``limit`` / ``offset`` は任意 (省けば全件)。絞る前の件数は ``X-Total-Count``。
+    """
     from backend.free.loop.staged.run_record import list_runs
 
     create_dir = get_path_resolver().resolve_local("create_workspace_dir")
     runs = list_runs(
         create_dir, session_id=session_id, stale_after_sec=_stale_after_sec(),
     )
-    return {"runs": [_run_dict(record, status) for record, status in runs]}
+    page = paginate(runs, limit, offset, response)
+    return {"runs": [_run_dict(record, status) for record, status in page]}
 
 
 @router.get("/{run_id}")
@@ -143,6 +156,45 @@ async def get_create_run_artifacts(
         fc_doc = f"# 設計フローチャート\n\n```mermaid\n{flowchart_md.strip()}\n```\n"
         artifacts.append({"path": "flowchart.md", "language": "markdown", "content": fc_doc})
     return {"run_id": run_id, "artifacts": artifacts}
+
+
+@router.delete("/{run_id}")
+async def delete_create_run(
+    run_id: str = Path(pattern=_RUN_ID_PATTERN),
+) -> dict[str, Any]:
+    """run を削除する (c_06 §2.8 の稼働中可の管理操作)。
+
+    実行中 (``working``) は 409、無ければ 404、readonly は 423。消すのは run の作業場
+    (``run.json`` / ``events.jsonl`` / ``src/**`` などの生成物) だけで、利用者の出力先へ
+    配信したファイルと上書き前の退避 (``bk/overwrite/``) は run の外なので残る。
+    """
+    from backend.free.loop.staged.run_record import delete_run
+    from backend.io.readonly import is_readonly
+
+    if is_readonly():
+        raise _create_runs_error(
+            423, "E0423", "Data root is read-only; nothing was deleted", "api.data_readonly", run_id=run_id,
+        )
+    create_dir = get_path_resolver().resolve_local("create_workspace_dir")
+    outcome = await run_in_executor_with_context(
+        asyncio.get_running_loop(), None,
+        functools.partial(delete_run, create_dir, run_id, stale_after_sec=_stale_after_sec()),
+    )
+    if outcome == "not_found":
+        raise _create_runs_error(
+            404, "E0404", "Run not found", "api.create_run_not_found", run_id=run_id,
+        )
+    if outcome == "working":
+        raise _create_runs_error(
+            409, "E0409", "The run is working", "api.create_run_working",
+            run_id=run_id, reason="run_working",
+        )
+    if outcome == "in_use":
+        raise _create_runs_error(
+            409, "E0409", "The run's files are in use", "api.create_run_in_use",
+            run_id=run_id, reason="run_in_use",
+        )
+    return {"run_id": run_id, "deleted": True}
 
 
 __all__ = ["router"]

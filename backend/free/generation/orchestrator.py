@@ -1940,6 +1940,10 @@ def _unit_heading_markdown(
     sections = [u for u in getattr(plan, "units", []) if isinstance(u, SectionPlan)]
     if len(sections) < 2:
         return ""
+    # 創作文書 (短編小説) は章立ての見出しを付けない。1000 字の小説に
+    # 「## 雨の日の静けさ」「## 偶然の出会い」が並んだ (2026-10-14 ライブ監査)。
+    if _is_fiction_plan(plan):
+        return ""
     # planner が "## 見出し" 形式で返すこともあるため先頭の # と空白を落とす。
     heading = (unit.heading or "").lstrip("#").strip()
     if not heading:

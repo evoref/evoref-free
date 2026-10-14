@@ -22,7 +22,6 @@ from backend.log_config import get_logger
 
 logger = get_logger("cli.history")
 
-_DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 30.0
 #: ``GET /api/history`` の ``limit`` の上限 (``Query(le=100)``)。
 _PAGE_LIMIT = 100

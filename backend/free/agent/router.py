@@ -125,7 +125,10 @@ LONG_FORM_PATTERNS = [
     re.compile(
         r"^(?!.*(?:要約|要点|読んで|整理))"
         r"(?<!この)(?<!その)(?<!あの)"
-        rf"(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})"
+        # 「チェックリストにまとめて」の「に」は **既出の内容を別の形に直す** 依頼
+        # (2026-10-14 ライブ監査: 会話の引っ越しの話を 4 ユニット・137 秒で
+        # 会話を持たない長文生成に回していた)。名詞の直後の「に」は採らない。
+        rf"(?:{'|'.join(DOCUMENT_NOUNS_NEEDS_SUFFIX + DOCUMENT_NOUNS_STANDALONE)})(?!に)"
         r"(?:を)?[^を]*まとめ",
     ),
     # 「長文」「長編」の言及、または「長い」+ 創作文書系名詞 (物語/小説等、
@@ -1212,6 +1215,14 @@ def requests_short_output(query: str) -> bool:
     return False
 
 
+#: 1 通・1 件で完結する短い文面の名詞。ユニット分割しても構造化の利得が無い。
+#: 実測 (2026-10-13 ライブ監査): 「納期遅延をお詫びするメールの文面を書いて」が
+#: ``文面`` で long_form へ振られ、約 300 トークンを 5 ユニット・60 秒で生成した
+#: (deliberative なら 10 秒前後)。「長文」「長編」の明示があれば除外しない。
+_SHORT_MESSAGE_NOUN_RE = re.compile(r"メール|文面|メッセージ|挨拶文|依頼文|お詫び文|お礼文")
+_LONG_CUE_RE = re.compile(r"長文|長編")
+
+
 def _matches_any(patterns: list[re.Pattern], query: str) -> bool:
     """パターンリストのいずれかが query にマッチするか判定する。
 
@@ -1921,6 +1932,8 @@ class ComplexityClassifier:
         # 「2000字で」のような明示的な長文指定があればそちらが勝つ。
         if requests_short_output(query):
             return False
+        if _SHORT_MESSAGE_NOUN_RE.search(query) and not _LONG_CUE_RE.search(query):
+            return False
         if _matches_any(LONG_FORM_PATTERNS, query) or _matches_any(
             LONG_FORM_PATTERNS_EN, query,
         ):
@@ -2046,8 +2059,23 @@ def named_deliverable_names(query: str) -> list[str]:
         *_BARE_FILENAME_TARGET_RE.finditer(probe),
         *_RELATIVE_PATH_TARGET_RE.finditer(probe),
     ):
-        seen.setdefault(m.group(0), None)
+        seen.setdefault(_strip_leading_prose(m.group(0)), None)
     return list(seen)
+
+
+def _strip_leading_prose(name: str) -> str:
+    """名指しの先頭に連なった日本語の地の文を落とす (純粋関数)。
+
+    ``\\w`` は日本語も含むので、「…ガイドをWord文書mail_manner.docx」のように
+    空白なしで続く依頼文が裸名として丸ごと一致する。納品契約がその文字列を
+    「名指したファイル」と読み、実際には mail_manner.docx が書けていても未完了と
+    報告していた (2026-10-14 ライブ監査)。日本語の直後に英字が始まる最後の位置から
+    を名前とする。日本語が 3 字未満 (「第3章draft.md」型) は名前の一部とみなす。
+    """
+    for i in range(len(name) - 1, 0, -1):
+        if name[i].isascii() and name[i].isalpha() and not name[i - 1].isascii():
+            return name[i:] if i >= 3 else name
+    return name
 
 
 def named_deliverable_exts(query: str) -> set[str]:

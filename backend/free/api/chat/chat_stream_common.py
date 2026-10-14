@@ -477,6 +477,24 @@ def request_cancel(session_id: str, request_id: str | None = None) -> bool:
     return hit
 
 
+def request_cancel_all() -> int:
+    """進行中の全リクエスト (detached の制作を含む) にキャンセルを要求する。
+
+    正常停止 (``POST /api/system/shutdown``、c_06 §2.7) が使う。各層は
+    ``/api/chat/cancel`` と同じフラグを見て止まる (staged は ``run.json`` を
+    ``exit_kind=cancelled`` で終端する)。要求した件数を返す。
+    """
+    keys = list(_cancel_flags)
+    for key in keys:
+        _cancel_flags[key] = True
+    return len(keys)
+
+
+def active_request_count() -> int:
+    """キャンセルの鍵を持っている (= まだ終わっていない) リクエストの数。"""
+    return len(_cancel_flags)
+
+
 @asynccontextmanager
 async def cancel_scope(session_id: str):
     """キャンセルフラグのスコープ管理

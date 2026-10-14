@@ -17,6 +17,7 @@ import httpx
 from rich.console import Console
 
 from backend.free.cli.backend_headers import backend_headers
+from backend.free.cli.cli_common import add_common_args, resolve_backend_url
 from backend.free.cli.config_loader import _find_project_root, _setup_encoding
 from backend.free.cli.renderer import create_console, render_error, render_info, render_table
 from backend.i18n_helper import init_i18n, msg
@@ -24,7 +25,6 @@ from backend.log_config import get_logger, setup_cli_logging
 
 logger = get_logger("cli.rag")
 
-_DEFAULT_BACKEND = "http://localhost:8000"
 _TIMEOUT = 60.0
 #: 取り込みは抽出 + 埋め込みで文書の大きさに比例して掛かる。
 _INGEST_TIMEOUT = 900.0
@@ -48,7 +48,7 @@ def _error_detail(resp: httpx.Response) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--backend-url", default=_DEFAULT_BACKEND)
+    add_common_args(common, json=False)
     common.add_argument("--json", action="store_true", help="Print the raw JSON response")
     parser = argparse.ArgumentParser(prog="evoref rag", description=msg("cli.help_rag_command"))
     sub = parser.add_subparsers(dest="action", required=True)
@@ -72,7 +72,7 @@ def run_rag(argv: list[str]) -> int:
     init_i18n()
     args = _build_parser().parse_args(argv)
     console = create_console()
-    base = args.backend_url.rstrip("/")
+    base = resolve_backend_url(args.backend_url)
     try:
         with httpx.Client(headers=backend_headers(), timeout=_TIMEOUT) as client:
             if args.action == "calibrate":

@@ -29,6 +29,10 @@ if TYPE_CHECKING:
     from backend.free.agent.prompt_manager import PromptMeta, SystemPromptManager
 
 
+#: 履歴の版の本文 API (``/history/{version}``) が受ける版番号の上限。版は 1 から数える。
+HISTORY_VERSION_MAX = 999_999
+
+
 # ── HTTPException ビルダー ───────────────────────────────────────────
 
 
@@ -83,6 +87,15 @@ def prompt_file_not_found_error(message: str) -> HTTPException:
     return prompt_error(
         404, "E0404", message,
         "api.prompt_file_not_found",
+    )
+
+
+def prompt_version_not_found_error(mode: str, version: int) -> HTTPException:
+    """404 — 履歴の版の本文 (``GET /{mode}/history/{version}``) が無い場合。"""
+    return prompt_error(
+        404, "E0404", f"Prompt version not found: {mode} v{version}",
+        "api.prompt_version_not_found",
+        mode=mode, version=version,
     )
 
 
@@ -180,11 +193,16 @@ def prompt_detail_dict(
     meta: PromptMeta,
     content: str,
 ) -> dict[str, Any]:
-    """`get_prompt` 用の dict (フル content 込み)。"""
+    """`get_prompt` 用の dict (フル content 込み)。
+
+    ``model_calibrated_for`` は撤去した ``/api/optimize/status`` だけが返していた項
+    (2026-10-14)。
+    """
     return {
         "mode": mode,
         "version": meta.version,
         "source": meta.source,
         "updated_at": meta.updated_at,
+        "model_calibrated_for": meta.model_calibrated_for,
         "content": content,
     }

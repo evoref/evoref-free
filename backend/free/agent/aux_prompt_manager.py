@@ -16,6 +16,7 @@ from backend.free.agent._prompt_store_helpers import (
     list_history_entries,
     meta_file_path,
     read_body,
+    read_history_entry,
     read_history_version,
     read_meta,
     write_body,
@@ -194,6 +195,17 @@ class AuxPromptManager:
         if task not in self.TASKS:
             raise ValueError(f"Unknown aux task: {task}")
         return list_history_entries(self.prompt_dir, f"aux_{task}")
+
+    def get_history_version(self, task: str, version: int) -> dict[str, Any]:
+        """履歴の版 ``version`` の本文 (``{"version", "file", "content"}``)。読むだけ。
+
+        Raises:
+            ValueError: 不明なタスク名
+            FileNotFoundError: その版の履歴ファイルが無い
+        """
+        if task not in self.TASKS:
+            raise ValueError(f"Unknown aux task: {task}")
+        return read_history_entry(self.prompt_dir, f"aux_{task}", version)
 
     def rollback(self, task: str, version: int) -> None:
         """特定バージョンにロールバック"""
