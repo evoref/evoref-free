@@ -193,6 +193,7 @@ def _start_capability_probe(
         make_llama_chat_fn,
         probe_model_capabilities,
         probe_timeout_sec,
+        resolve_per_request_budget_effective,
     )
     from backend.free.llm.tps_calibration import measured_tps_of
 
@@ -233,6 +234,17 @@ def _start_capability_probe(
                     "arming client think watchdog (budget=%d chunks)",
                     _RUNAWAY_THINK_BUDGET_DEFAULT,
                 )
+            # 要求ごとの思考予算: 宣言 (プロファイル) とプローブ P4 から実効値を決める (c_15 §2.9.2)。
+            # 安全側へは降ろすだけ・宣言のないモデルは P4 が True のときだけ送る。
+            new_budget = resolve_per_request_budget_effective(
+                client._per_request_budget, snapshot.reasoning_budget_effective,
+            )
+            if new_budget != client._per_request_budget:
+                logger.info(
+                    "Capability probe adjusted per_request_budget: %s -> %s (P4=%s)",
+                    client._per_request_budget, new_budget, snapshot.reasoning_budget_effective,
+                )
+                client._per_request_budget = new_budget
             new_enable = resolve_enable_thinking(
                 cfg, "base",
                 explicit=llama_cfg.get("enable_thinking"),

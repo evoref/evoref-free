@@ -428,6 +428,9 @@ class ProfileReasoningConfig(BaseModel):
     server_control: bool = False
     budget_default: int = Field(default=-1, ge=-1)
     budget_message: str = ""
+    # 要求本文の ``reasoning_budget_tokens`` (purpose 別の思考予算) を送るか (docs/c_15 §2.9.2)。
+    # ``mode: always`` のモデルだけで読む。None = 未宣言 (能力プローブ P4 に委ねる。P4 の配線前は送らない)。
+    per_request_budget: bool | None = None
 
     # クライアント側ハンドリング (server_control=False)
     # 現状 client_think_budget (watchdog) のみ消費。on_runaway は値保持のみ (watchdog は値に

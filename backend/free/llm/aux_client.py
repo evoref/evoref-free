@@ -50,6 +50,12 @@ from backend.free.llm.generation_gate import (
 )
 from backend.free.llm.json_extract import extract_json_object
 from backend.free.llm.slot_prefix import apply_shared_prefix
+from backend.free.llm.think_budget import (
+    THINK_META_KEYS,
+    resolve_think_budget,
+    sent_max_tokens,
+    think_usage_of,
+)
 from backend.free.llm.json_schemas import (
     make_response_format,
     resolve_response_format_for_purpose,
@@ -663,8 +669,13 @@ class AuxClient:
         response_format: dict | None = None,
         response_schema: type[BaseModel] | None = None,
         deferrable: bool | None = None,
+        think_budget: int | None = None,
     ) -> dict:
         """ベースモデルで非ストリーミング生成し、OAI 互換 dict を返す。
+
+        ``think_budget`` (思考予算 B) を省くと purpose から引く
+        (``think_budget.resolve_think_budget``、docs/c_15 §2.9.3)。送るかは ``LocalClient``
+        が決め (常に思考するモデルだけ)、締切は送る max_tokens (答え + B + 余白) で組む。
 
         json_schema が解決できる purpose は文法制約経路
         (``generate_constrained``) を通す。解決できない自由文の purpose
@@ -688,9 +699,12 @@ class AuxClient:
         messages = self._with_slot_prefix(
             messages, slot, constrained=resolved is not None,
         )
+        budget = think_budget if think_budget is not None else resolve_think_budget(purpose)
+        answer_tokens = max_tokens if max_tokens is not None or resolved is None else 256
         effective_timeout = (
             timeout if timeout is not None else self.resolve_effective_timeout(
-                purpose, prompt_tokens=_prompt_tokens(messages), max_tokens=max_tokens,
+                purpose, prompt_tokens=_prompt_tokens(messages),
+                max_tokens=sent_max_tokens(self.local, answer_tokens, budget),
             )
         )
         queued_at = time.monotonic()
@@ -731,7 +745,13 @@ class AuxClient:
                 )
             meta: dict = {}
             # 既定 (None) は送らない — 差し替え実装・既存の呼出面を変えないため
-            cache_kwargs = {"cache_prompt": False} if cache_prompt is False else {}
+            opt_kwargs = {"cache_prompt": False} if cache_prompt is False else {}
+            if budget is not None:
+                opt_kwargs["think_budget"] = budget
+            think_base = {
+                "think_budget": budget,
+                "max_tokens_sent": sent_max_tokens(self.local, answer_tokens, budget),
+            }
 
             async def _call() -> dict:
                 if resolved is not None:
@@ -739,11 +759,11 @@ class AuxClient:
                         messages,
                         response_format=resolved,
                         temperature=_CONSTRAINED_DEFAULT_TEMPERATURE if temperature is None else temperature,
-                        max_tokens=max_tokens if max_tokens is not None else 256,
+                        max_tokens=answer_tokens,
                         id_slot=slot,
                         timeout=effective_timeout,
                         result_meta=meta,
-                        **cache_kwargs,
+                        **opt_kwargs,
                     )
                     return {"choices": [{
                         "message": {"content": content or ""},
@@ -756,7 +776,7 @@ class AuxClient:
                     max_tokens=max_tokens,
                     id_slot=slot,
                     request_timeout=effective_timeout,
-                    **cache_kwargs,
+                    **opt_kwargs,
                 )
                 if not isinstance(out, dict):
                     # stream=False なので dict のはずだが、差し替え実装の事故は握り潰さない
@@ -781,6 +801,7 @@ class AuxClient:
                     purpose=purpose, effective_timeout=effective_timeout,
                     constrained=resolved is not None, finish_reason="preempted",
                     queue_wait=queue_wait, slot=slot,
+                    think=think_base,
                 )
                 logger.info(
                     "Aux generation preempted by a chat request after %.1fs "
@@ -818,6 +839,7 @@ class AuxClient:
                     purpose=purpose, effective_timeout=effective_timeout,
                     constrained=resolved is not None, finish_reason="timeout",
                     queue_wait=queue_wait, slot=slot,
+                    think=think_base,
                 )
                 raise AuxTimeoutError(
                     f"Aux generation timed out after {effective_timeout:.1f}s "
@@ -834,6 +856,7 @@ class AuxClient:
                     purpose=purpose, effective_timeout=effective_timeout,
                     constrained=resolved is not None, finish_reason="error",
                     queue_wait=queue_wait, slot=slot,
+                    think=think_base,
                 )
                 raise
 
@@ -841,11 +864,18 @@ class AuxClient:
         # 成功側も同じ理由で競合サンプルを弾く (p95 が競合時の遅さで押し上がる)。
         if not was_contended_since(gate_token):
             self._record_success(purpose, elapsed)
+        # 思考の観測 (docs/c_15 §2.9.8)。文法制約経路は LocalClient が result_meta に、
+        # 通常生成は応答そのものに載る。
+        observed = (
+            {k: meta[k] for k in THINK_META_KEYS if k in meta}
+            if resolved is not None else think_usage_of(result, _content_of(result))
+        )
         self._log_request(
             messages, result, elapsed,
             purpose=purpose, effective_timeout=effective_timeout,
             constrained=resolved is not None,
             queue_wait=queue_wait, slot=slot,
+            think={**think_base, **observed},
         )
         return result
 
@@ -938,12 +968,13 @@ class AuxClient:
         finish_reason: str = "",
         queue_wait: float = 0.0,
         slot: int | None = None,
+        think: dict | None = None,
     ) -> None:
         """``requests`` JSONL へ補助呼出を記録する (DebugLogger 未注入時は no-op)。
 
-        ``queue_wait_sec`` / ``slot`` は ``log_aux_request`` がその kwarg を受ける
-        場合だけ渡す (debug_logger.py は本経路の管轄外なので、面が追随するまで
-        は落とす)。
+        ``queue_wait_sec`` / ``slot`` / 思考の観測値 (``think``、docs/c_15 §2.9.8) は
+        ``log_aux_request`` がその kwarg を受ける場合だけ渡す (debug_logger.py は本経路の
+        管轄外なので、面が追随するまでは落とす)。
         """
         if self._debug_logger is None:
             return
@@ -963,6 +994,9 @@ class AuxClient:
             kwargs["queue_wait_sec"] = round(queue_wait, 3)
         if slot is not None and (accepted is None or "slot" in accepted):
             kwargs["slot"] = slot
+        for key, value in (think or {}).items():
+            if key in THINK_META_KEYS and (accepted is None or key in accepted):
+                kwargs[key] = value
         self._debug_logger.log_aux_request(**kwargs)
 
 

@@ -151,6 +151,7 @@ def _collect_capabilities(state: AppState) -> list[CapabilityInfo]:
                 emits_think_tags=snap.emits_think_tags,
                 closes_think_tags=snap.closes_think_tags,
                 json_schema_enforced=snap.json_schema_enforced,
+                reasoning_budget_effective=snap.reasoning_budget_effective,
                 needs_lenient_json=snap.needs_lenient_json,
                 probe_divergence=list(snap.probe_divergence or []),
                 probed_at=snap.probed_at or "",

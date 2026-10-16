@@ -27,6 +27,7 @@ from backend.free.agent.prompt_utils import (
 from backend.free.core.leak_reasons import is_model_origin_reason
 from backend.free.core.text_norm import collapse_ws
 from backend.free.llm.json_extract import extract_json_object
+from backend.free.llm.think_budget import resolve_think_budget
 from backend.io import JSONLAppendStore
 from backend.io.codec import codec_for, persisted
 from backend.io.format_registry import FormatSpec, register_format
@@ -679,6 +680,9 @@ class PromptEvolver:
                 max_tokens=_EDIT_MAX_TOKENS,
                 id_slot=getattr(llm_client, "background_slot", -1),
                 timeout=_EDIT_TIMEOUT_SEC,
+                # 常に思考するモデルの思考予算 (docs/c_15 §2.9.3)。値は測定後 (今は None =
+                # 送らず、起動フラグの既定だけが掛かる)。
+                think_budget=resolve_think_budget("prompt_edit"),
             )
         except Exception as e:
             logger.warning("Prompt edit mutation failed: %s: %s", type(e).__name__, e)

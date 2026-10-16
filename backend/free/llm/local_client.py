@@ -24,6 +24,7 @@ from backend.free.llm._base_client import (
 from backend.free.core.turn_text import split_last_user
 from backend.free.llm.generation_gate import chat_generation, gate_stream
 from backend.free.llm.model_metadata import ModelMetadata
+from backend.free.llm.think_budget import think_usage_of
 from backend.free.llm.tps_calibration import (
     TIMEOUT_HEADROOM,
     TpsEstimate,
@@ -252,6 +253,8 @@ def sync_request_timeout(
 #: ``context_size`` が不明なときに無制限要求へ被せる ``max_tokens`` の上限。
 #: 上限なしで投げると llama-server は n_ctx を使い切るまで生成する。
 UNBOUNDED_MAX_TOKENS_CAP = 4096
+#: 思考予算を送る要求の max_tokens に足す余白 (サーバが強制する思考の終了列の分、docs/c_15 §2.9.4)。
+THINK_BUDGET_MARGIN_TOKENS = 8
 STREAM_CONTENT_TIMEOUT_BASE = 30.0  # reasoning 開始から最初の content トークンまでの初期タイムアウト（秒）
 STREAM_CONTENT_TIMEOUT_EXTEND = 10.0  # reasoning チャンク受信ごとの延長（秒）
 STREAM_CONTENT_TIMEOUT_CAP = 120.0  # 最大タイムアウト上限（秒）
@@ -619,6 +622,8 @@ class LocalClient(BaseHTTPClient):
         on_runaway: str = "fallback",
         context_size: int | None = None,
         leak_bias=None,
+        reasoning_mode: str | None = None,
+        per_request_budget: bool | None = None,
     ):
         super().__init__(timeout=_HTTP_TIMEOUT_SEC)
         # health check の DEBUG を状態変化時のみに絞る (ポーリングでログが埋まるのを防ぐ)
@@ -643,6 +648,10 @@ class LocalClient(BaseHTTPClient):
         # reasoning が分離されるモデルは content に <think> が出ないため発火しない。
         self._client_think_budget = max(0, int(client_think_budget or 0))
         self._on_runaway = on_runaway or "fallback"
+        # 要求ごとの思考予算 (docs/c_15 §2.9.2)。``reasoning_mode`` はプロファイルの
+        # ``reasoning.mode``、``per_request_budget`` はその宣言 (未宣言は None)。
+        self._reasoning_mode = reasoning_mode
+        self._per_request_budget = per_request_budget
         # モデル能力スナップショット (capability probe が背景で確定する; docs/c_15)。
         # 型: CapabilitySnapshot | None。未プローブ / プローブ無効時は None (prior 動作)。
         self.capabilities = None
@@ -666,6 +675,28 @@ class LocalClient(BaseHTTPClient):
     def classifier_slot_prefix(self) -> str | None:
         """分類器スロットの共有接頭辞 (分類器の system)。未公開なら ``None``。"""
         return self._classifier_slot_prefix
+
+    def _sends_think_budget(self, budget: int | None) -> bool:
+        """要求本文に ``reasoning_budget_tokens`` を載せるか (条件 S、docs/c_15 §2.9.2)。
+
+        mode == always かつ実効の ``per_request_budget`` が真かつ予算が 0 以上のときだけ。
+        実効値 (``_per_request_budget``) は宣言とプローブ P4 から決まる (``resolve_per_request_budget_effective``)。
+        負の予算は送らない (llama-server は -2 以下を HTTP 400、-1 は「サーバ既定へ戻る」)。
+        """
+        if budget is None or isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+            return False
+        return self._reasoning_mode == "always" and self._per_request_budget is True
+
+    def effective_max_tokens(self, answer: int | None, budget: int | None) -> int | None:
+        """答えの上限 ``answer`` と予算 ``budget`` で実際に送る max_tokens (docs/c_15 §2.9.4)。
+
+        条件 S のときだけ ``answer + budget + THINK_BUDGET_MARGIN_TOKENS``。S でない、または
+        ``answer`` が ``None`` / 0 (無制限 = ``_build_payload`` がコンテキストの残量へ寄せる) なら
+        ``answer`` のまま。締切・コンテキスト予算はこの値で計算する。
+        """
+        if not answer or not self._sends_think_budget(budget):
+            return answer
+        return answer + int(budget) + THINK_BUDGET_MARGIN_TOKENS
 
     @property
     def debug_logger(self):
@@ -1086,6 +1117,7 @@ class LocalClient(BaseHTTPClient):
         repetition_penalty: float | None = None,
         id_slot: int | None = None,
         cache_prompt: bool | None = None,
+        think_budget: int | None = None,
         **extra,
     ) -> dict:
         """共通ペイロード構築
@@ -1094,12 +1126,19 @@ class LocalClient(BaseHTTPClient):
         ``"cache_prompt": false`` を明示する — llama-server の既定は true なので、省略では
         切れない (壊れたスロット KV を避けて作り直す用途、e_03 §1.2)。
 
+        ``think_budget`` (思考予算 B) は条件 S (:meth:`_sends_think_budget`) のときだけ
+        ``reasoning_budget_tokens`` として載せ、``max_tokens`` を「答え + B + 余白」へ広げる
+        (:meth:`effective_max_tokens`)。**``reasoning_budget_tokens`` を載せるのはここ 1 か所**。
+        S でなければペイロードは従来と同じ (toggle / none は変えない、docs/c_15 §2.9.2)。
+
         ``max_tokens`` が ``None`` / ``0`` (config ``llama.max_tokens: 0`` = 無制限、
         ``chat.py`` は ``or None`` で落とす) のときは **無制限で投げない**。
         llama-server は n_ctx を使い切るまで生成し続け、ストリームの総壁時計
         締め切りも組めない。``context_size`` が分かればプロンプト推定を引いた
         残量へ、分からなければ ``UNBOUNDED_MAX_TOKENS_CAP`` へクランプする。
         """
+        send_budget = self._sends_think_budget(think_budget)
+        max_tokens = self.effective_max_tokens(max_tokens, think_budget)
         msgs = self._apply_system_fallback(messages)
         msgs = self._enforce_context_budget(msgs, max_tokens=max_tokens)
         if not max_tokens:
@@ -1158,6 +1197,10 @@ class LocalClient(BaseHTTPClient):
             payload["chat_template_kwargs"] = {
                 "enable_thinking": self._enable_thinking,
             }
+        # 常に思考するモデル: OFF スイッチが無いので思考の長さを要求単位で縛る (docs/c_15 §2.9)。
+        # 正式名だけを使う (別名は送らない)。
+        if send_budget:
+            payload["reasoning_budget_tokens"] = int(think_budget)
 
         payload.update(extra)
 
@@ -1180,11 +1223,12 @@ class LocalClient(BaseHTTPClient):
             "top_p=%s, top_k=%s, presence_penalty=%s, frequency_penalty=%s, "
             "repetition_penalty=%s, "
             "id_slot=%s, cache_prompt=%s, chat_template_kwargs=%s, "
-            "messages=%d, extra_keys=%s",
+            "think_budget=%s, messages=%d, extra_keys=%s",
             stream, temperature, max_tokens,
             top_p, top_k, presence_penalty, frequency_penalty, repetition_penalty,
             id_slot, payload.get("cache_prompt", self._cache_prompt),
-            payload.get("chat_template_kwargs") or "none", len(msgs),
+            payload.get("chat_template_kwargs") or "none",
+            payload.get("reasoning_budget_tokens", "none"), len(msgs),
             list(extra.keys()) or "none",
         )
         return payload
@@ -1203,6 +1247,7 @@ class LocalClient(BaseHTTPClient):
         id_slot: int | None = None,
         request_timeout: float | None = None,
         cache_prompt: bool | None = None,
+        think_budget: int | None = None,
     ) -> dict | TokenStream:
         """llama-server に推論リクエストを送信
 
@@ -1221,6 +1266,9 @@ class LocalClient(BaseHTTPClient):
                      プロンプト長から導出する (ストリーム経路の総壁時計締め切りと
                      同じ式、下限 ``self._http_timeout`` = 120s)。
                      ストリーミング (``stream=True``) には影響しない。
+            think_budget: 思考予算 B (docs/c_15 §2.9)。常に思考するモデルで宣言が
+                     真のときだけ送り、``max_tokens`` は「答えの長さ」のまま送る値を
+                     「答え + B + 余白」に広げる (締切も送る値で組む)。``None`` は送らない。
         """
         payload = self._build_payload(
             messages,
@@ -1234,6 +1282,7 @@ class LocalClient(BaseHTTPClient):
             repetition_penalty=repetition_penalty,
             id_slot=id_slot,
             cache_prompt=cache_prompt,
+            think_budget=think_budget,
         )
 
         if stream:
@@ -1792,15 +1841,23 @@ class LocalClient(BaseHTTPClient):
         result_meta: dict | None = None,
         cache_prompt: bool | None = None,
         usage_purpose: str = "",
+        think_budget: int | None = None,
     ) -> str | None:
         """``response_format`` (json_schema) で文法制約した非ストリーミング生成。
 
         ``cache_prompt`` は :meth:`generate` と同じ要求単位の上書き。
 
-        ``usage_purpose`` を渡すと、成功・失敗とも所要時間をそのターンの
-        ``op=timing`` の ``aux_usage`` へ足す (``AuxClient`` 経由は自前で記録するので渡さない)。
+        ``usage_purpose`` を渡すと、成功・失敗とも requests JSONL の aux 行を出し
+        (``log_aux_request``、そのターンの ``op=timing`` の ``aux_usage`` にも入る)、
+        ``log_aux_request`` を持たない logger では所要時間だけを集計へ足す
+        (``AuxClient`` 経由は自前で記録するので渡さない)。
 
-        ``result_meta`` (省略可) を渡すと ``finish_reason`` を書き戻す。
+        ``think_budget`` は :meth:`generate` と同じ (``max_tokens`` は答えの長さ。送る値は
+        :meth:`effective_max_tokens`)。呼出側の ``timeout`` は送る値で組むこと。
+
+        ``result_meta`` (省略可) を渡すと ``finish_reason`` と思考の観測値
+        (``completion_tokens`` / ``reasoning_chars`` / ``reasoning_tokens_est`` /
+        ``think_budget`` (実際に送った予算、送らなければ ``None``) / ``max_tokens_sent``) を書き戻す。
         ``"length"`` は max_tokens 到達 = JSON が途中で切れている印で、呼出側
         (``AuxClient.generate_json``) は修復せず安全側の空応答へ倒す。戻り値の
         型を変えない (``tool_call_judge`` / ``prompt_evolver`` は ``str | None``
@@ -1836,8 +1893,11 @@ class LocalClient(BaseHTTPClient):
             max_tokens=max_tokens,
             id_slot=id_slot,
             cache_prompt=cache_prompt,
+            think_budget=think_budget,
             **extra,
         )
+        sent_budget = payload.get("reasoning_budget_tokens")
+        max_tokens_sent = payload.get("max_tokens")
 
         client = self._get_http_client()
         retry_logger = make_retry_logger(self._debug_logger, backend="base")
@@ -1859,13 +1919,30 @@ class LocalClient(BaseHTTPClient):
 
         started_at = _time.monotonic()
 
-        def _record_usage() -> None:
+        def _record_usage(content: str = "", finish: str = "", think: dict | None = None) -> None:
             dl = self._debug_logger
-            if usage_purpose and dl is not None:
-                try:
-                    dl.record_turn_aux(usage_purpose, _time.monotonic() - started_at)
-                except Exception:  # noqa: BLE001 - 計測の失敗で判定を失わない
-                    pass
+            if not usage_purpose or dl is None:
+                return
+            elapsed = _time.monotonic() - started_at
+            try:
+                log_aux = getattr(dl, "log_aux_request", None)
+                if callable(log_aux):
+                    # 直呼びの判定も AuxClient 経由と同じ aux 行を出す (docs/c_15 §2.9.8)。
+                    log_aux(
+                        messages_count=len(payload.get("messages") or []),
+                        response_preview=content, elapsed_sec=elapsed,
+                        purpose=usage_purpose,
+                        resolved_timeout=timeout if timeout is not None else self._http_timeout,
+                        response_format_used=True, finish_reason=finish,
+                        response_length=len(content), slot=payload.get("id_slot"),
+                        **(think or {
+                            "think_budget": sent_budget, "max_tokens_sent": max_tokens_sent,
+                        }),
+                    )
+                else:
+                    dl.record_turn_aux(usage_purpose, elapsed)
+            except Exception:  # noqa: BLE001 - 計測の失敗で判定を失わない
+                pass
 
         try:
             if self._is_chat_slot(id_slot):
@@ -1884,19 +1961,31 @@ class LocalClient(BaseHTTPClient):
                     retryable_exceptions=GENERATION_RETRYABLE_EXCEPTIONS,
                 )
         except Exception as e:
-            _record_usage()
+            _record_usage(
+                finish="timeout" if isinstance(e, httpx.TimeoutException | TimeoutError) else "error",
+            )
             raise _map_llama_error(e, host=self.url, label="json_schema") from e
-        _record_usage()
         choices = data.get("choices") or [{}]
         message = choices[0].get("message") or {}
         content = message.get("content")
         finish_reason = choices[0].get("finish_reason")
+        think = {
+            **think_usage_of(data, content),
+            "think_budget": sent_budget,
+            "max_tokens_sent": max_tokens_sent,
+        }
+        _record_usage(
+            content if isinstance(content, str) else "",
+            finish_reason if isinstance(finish_reason, str) else "",
+            think,
+        )
         if result_meta is not None:
             result_meta["finish_reason"] = finish_reason
+            result_meta.update(think)
         if finish_reason == "length":
             logger.warning(
-                "Constrained generation hit max_tokens=%d; output is likely "
-                "truncated mid-JSON", max_tokens,
+                "Constrained generation hit max_tokens=%s (answer %d + think budget %s); "
+                "output is likely truncated mid-JSON", max_tokens_sent, max_tokens, sent_budget,
             )
         return content if isinstance(content, str) and content.strip() else None
 

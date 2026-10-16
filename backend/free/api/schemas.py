@@ -155,6 +155,7 @@ class CapabilityInfo(BaseModel):
     emits_think_tags: bool | None = None
     closes_think_tags: bool | None = None
     json_schema_enforced: bool | None = None
+    reasoning_budget_effective: bool | None = None
     needs_lenient_json: bool = False
     probe_divergence: list[str] = Field(default_factory=list)
     probed_at: str = ""

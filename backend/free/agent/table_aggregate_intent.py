@@ -34,6 +34,11 @@ from backend.free.llm.aux_client import PURPOSE_TIMEOUT_DEFAULTS
 from backend.free.llm.json_extract import extract_json_object
 from backend.free.llm.json_schemas import resolve_response_format_for_purpose
 from backend.free.llm.slot_prefix import apply_shared_prefix
+from backend.free.llm.think_budget import (
+    THINK_META_KEYS,
+    resolve_think_budget,
+    sent_max_tokens,
+)
 from backend.free.llm.tps_calibration import chat_path_timeout, derived_seconds, measured_tps_of
 from backend.log_config import get_logger
 from backend.utils import estimate_tokens
@@ -129,26 +134,33 @@ def round_trip_timeout(llm_client: Any, messages: list[dict], *, carried: bool =
     base = PURPOSE_TIMEOUT_DEFAULTS.get(PURPOSE, 40.0)
     tps = measured_tps_of(llm_client)
     prompt_tokens = sum(estimate_tokens(str(m.get("content") or "")) for m in messages)
-    budget = chat_path_timeout(base, tps, prompt_tokens=prompt_tokens, max_tokens=_MAX_TOKENS)
+    # 思考予算を送るモデルでは送る max_tokens (答え + 予算 + 余白) で組む (docs/c_15 §2.9.4)
+    max_tokens = sent_max_tokens(llm_client, _MAX_TOKENS, resolve_think_budget(PURPOSE))
+    budget = chat_path_timeout(base, tps, prompt_tokens=prompt_tokens, max_tokens=max_tokens)
     if not carried:
         return budget
-    need = derived_seconds(tps, prompt_tokens=prompt_tokens, max_tokens=_MAX_TOKENS)
+    need = derived_seconds(tps, prompt_tokens=prompt_tokens, max_tokens=max_tokens)
     return budget if need is None else min(budget, need)
 
 
 def _log_round_trip(
     llm_client: Any, messages: list[dict], content: str, elapsed: float, *,
-    timeout: float, slot: int, outcome: str,
+    timeout: float, slot: int, outcome: str, think: dict | None = None,
 ) -> None:
-    """往復を requests JSONL の aux 行に残す (``AuxClient`` 経由の補助タスクと同じ形)。"""
+    """往復を requests JSONL の aux 行に残す (``AuxClient`` 経由の補助タスクと同じ形)。
+
+    ``think`` は ``generate_constrained`` の ``result_meta`` (思考の観測値、docs/c_15 §2.9.8)。
+    """
     debug_logger = getattr(llm_client, "debug_logger", None)
     if debug_logger is None:
         return
+    observed = {k: v for k, v in (think or {}).items() if k in THINK_META_KEYS}
     try:
         debug_logger.log_aux_request(
             messages_count=len(messages), response_preview=content, elapsed_sec=elapsed,
             purpose=PURPOSE, resolved_timeout=timeout, response_format_used=True,
             finish_reason=outcome, response_length=len(content), slot=slot,
+            **observed,
         )
     except Exception:  # noqa: BLE001 - 計測の失敗で集計を失わない
         logger.debug("Table aggregate round trip was not logged", exc_info=True)
@@ -190,6 +202,7 @@ async def aggregate_retrieved_table(
     if not isinstance(slot, int) or isinstance(slot, bool):
         slot = getattr(llm_client, "background_slot", -1)
     timeout = round_trip_timeout(llm_client, messages, carried=carried)
+    meta: dict = {}
     started = time.monotonic()
     try:
         # usage_purpose は渡さない — aux 行 (_log_round_trip) が同じターンの集計へ足す
@@ -199,6 +212,9 @@ async def aggregate_retrieved_table(
             max_tokens=_MAX_TOKENS,
             id_slot=slot,
             timeout=timeout,
+            result_meta=meta,
+            # 常に思考するモデルの思考予算 (docs/c_15 §2.9.3)
+            think_budget=resolve_think_budget(PURPOSE),
         )
     except Exception as exc:  # noqa: BLE001 - 集計を諦めて従来の答えへ倒す
         elapsed = time.monotonic() - started
@@ -213,7 +229,9 @@ async def aggregate_retrieved_table(
         return None
     elapsed = time.monotonic() - started
     text = content if isinstance(content, str) else ""
-    _log_round_trip(llm_client, messages, text, elapsed, timeout=timeout, slot=slot, outcome="")
+    _log_round_trip(
+        llm_client, messages, text, elapsed, timeout=timeout, slot=slot, outcome="", think=meta,
+    )
     logger.info(
         "Table aggregate round trip: %.1fs (limit %.1fs, carried=%s, response %d chars)",
         elapsed, timeout, carried, len(text),

@@ -71,7 +71,7 @@ class CapabilitySnapshot:
     emits_think_tags: bool | None = None          # P2a: content に <think> を吐くか
     closes_think_tags: bool | None = None         # P2b: </think> で閉じるか
     json_schema_enforced: bool | None = None      # P3: json_schema grammar が強制されるか
-    reasoning_budget_effective: bool | None = None  # P4 (Phase 1.5)
+    reasoning_budget_effective: bool | None = None  # P4: 要求本文の思考予算 0 が効くか (c_15 §2.9.6)
     # 解決済み (観測優先で確定)
     effective_reasoning_mode: str | None = None
     needs_lenient_json: bool = False
@@ -177,6 +177,40 @@ def resolve_effective_reasoning_mode(
     return declared, divergence
 
 
+def interpret_budget_probe(
+    message: dict,
+    finish_reason: str | None,
+    *,
+    reasoning_separated: bool | None,
+) -> bool | None:
+    """P4: 要求本文の思考予算 0 が効いたかを、予算 0 を付けたカナリアの応答から判定する (c_15 §2.9.6)。
+
+    True は 5 条件の全成立: 思考が出ない / 本文が非空 / 本文に ``<think>`` が無い /
+    ``finish=stop`` / **P1 で思考の分離を観測済み**。最後の条件は偽陽性への対策で、思考を
+    分離しないモデルが予算を無視しても、短い回答なら前 4 条件を通ってしまう。
+    分離を観測していないモデルで 5 条件のうち前 4 つが成立するときは、予算が効いたとも
+    無視されたとも言えないので ``None``。思考が出た / 本文が空 / 上限到達は ``False``。
+    """
+    reasoning = ((message or {}).get("reasoning_content") or "").strip()
+    content = ((message or {}).get("content") or "").strip()
+    if reasoning or not content or "<think>" in content or finish_reason != "stop":
+        return False
+    return True if reasoning_separated is True else None
+
+
+def resolve_per_request_budget_effective(declared: bool | None, p4: bool | None) -> bool:
+    """宣言 ``per_request_budget`` とプローブ P4 から、要求ごとの予算を送るかの実効値を決める (c_15 §2.9.2)。
+
+    宣言 ``True`` は P4 が ``False`` のときだけ降ろす (安全側だけへの上書き)。未宣言 (``None``) は
+    P4 が ``True`` のときだけ送る。``False`` 宣言は常に送らない。
+    """
+    if declared is False:
+        return False
+    if declared is True:
+        return p4 is not False
+    return p4 is True
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # プローブ実行 (chat_fn 注入で単体テスト可能)
 # ─────────────────────────────────────────────────────────────────────────
@@ -205,11 +239,13 @@ async def probe_model_capabilities(
     declared_reasoning_mode: str | None,
     chat_fn: ChatFn,
     probe_json: bool = True,
+    probe_budget: bool = True,
 ) -> CapabilitySnapshot:
     """カナリアを投げて実挙動を観測し ``CapabilitySnapshot`` を返す。
 
     ``chat_fn`` は raw OAI ``/v1/chat/completions`` 応答 JSON を返す async 関数。
-    ``probe_json=False`` で P3 (json_schema 強制) をスキップする。アシスト撤去以降は
+    ``probe_json=False`` で P3 (json_schema 強制)、``probe_budget=False`` で P4 (思考予算) を
+    スキップする。アシスト撤去以降は
     補助タスクの json purpose もベースモデルが担うため、ベースでも既定で観測する。
     個々のプローブ失敗は握りつぶし観測を ``None`` のままにする (prior フォールバック)。
     全失敗でも例外は投げない (degraded 安全)。
@@ -218,6 +254,7 @@ async def probe_model_capabilities(
     emits_think: bool | None = None
     closes_think: bool | None = None
     json_enforced: bool | None = None
+    budget_effective: bool | None = None
 
     # P1/P2: reasoning 分離・<think> 出力・閉じ
     try:
@@ -235,6 +272,31 @@ async def probe_model_capabilities(
     except Exception as exc:
         logger.warning("capability probe P1/P2 failed (prior fallback): %s", exc)
 
+    # P4: 要求本文の思考予算 0 が効くか。always 宣言、または P1 で思考の分離を観測した
+    # モデルだけ (toggle / none には予算を送らないので観測しない、c_15 §2.9.6)。
+    if probe_budget and (declared_reasoning_mode == "always" or reasoning_separated):
+        try:
+            resp = await chat_fn(
+                {
+                    "messages": [{"role": "user", "content": _REASONING_PROBE_PROMPT}],
+                    "stream": False,
+                    "temperature": 0.0,
+                    "max_tokens": PROBE_BUDGET_MAX_TOKENS,
+                    "reasoning_budget_tokens": 0,
+                },
+            )
+            budget_effective = interpret_budget_probe(
+                _message_of(resp), _finish_reason_of(resp),
+                reasoning_separated=reasoning_separated,
+            )
+        except httpx.HTTPStatusError as exc:
+            # フィールドを受け付けない build / 範囲外の値は 4xx。効かないと観測する。
+            if 400 <= exc.response.status_code < 500:
+                budget_effective = False
+            logger.warning("capability probe P4 failed (%s): %s", budget_effective, exc)
+        except Exception as exc:
+            logger.warning("capability probe P4 failed (prior fallback): %s", exc)
+
     # P3: json_schema grammar 強制 (補助タスクの json purpose 用)
     if probe_json:
         try:
@@ -243,16 +305,19 @@ async def probe_model_capabilities(
             # 残すと、推論が 64 トークンの予算を食って本文が空になり「grammar
             # 非強制」と誤判定する (P-4)。P1/P2 は thinking の挙動そのものを
             # 測るので触らない。
-            resp = await chat_fn(
-                {
-                    "messages": [{"role": "user", "content": _JSON_PROBE_PROMPT}],
-                    "stream": False,
-                    "temperature": 0.0,
-                    "max_tokens": 64,
-                    "response_format": _JSON_PROBE_SCHEMA,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
-            )
+            json_payload: dict = {
+                "messages": [{"role": "user", "content": _JSON_PROBE_PROMPT}],
+                "stream": False,
+                "temperature": 0.0,
+                "max_tokens": 64,
+                "response_format": _JSON_PROBE_SCHEMA,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            # 常に思考するモデルで予算が効くなら、消費側と同じく予算 0 を付ける。付けないと
+            # 思考が 64 トークンを使い切り、本文が空で観測不能 (None) になる (c_15 §2.9.6)。
+            if budget_effective is True and declared_reasoning_mode == "always":
+                json_payload["reasoning_budget_tokens"] = 0
+            resp = await chat_fn(json_payload)
             content = _message_of(resp).get("content") or ""
             json_enforced = interpret_json_probe(content, _finish_reason_of(resp))
         except Exception as exc:
@@ -267,6 +332,8 @@ async def probe_model_capabilities(
         divergence.append("json_schema grammar not enforced (lenient parsing enabled)")
     if emits_think and closes_think is False:
         divergence.append("<think> emitted without </think> close (runaway risk)")
+    if budget_effective is False and declared_reasoning_mode == "always":
+        divergence.append("a zero request-level reasoning budget did not suppress thinking (per-request budget disabled)")
 
     snapshot = CapabilitySnapshot(
         model_id=model_id,
@@ -276,6 +343,7 @@ async def probe_model_capabilities(
         emits_think_tags=emits_think,
         closes_think_tags=closes_think,
         json_schema_enforced=json_enforced,
+        reasoning_budget_effective=budget_effective,
         effective_reasoning_mode=effective_mode,
         needs_lenient_json=(json_enforced is False),
         probed_at=utc_now(),
@@ -289,8 +357,9 @@ async def probe_model_capabilities(
     else:
         logger.info(
             "Capability probe ok for model=%s (separated=%s, emits_think=%s, "
-            "json_enforced=%s, effective_mode=%s)",
-            model_id, reasoning_separated, emits_think, json_enforced, effective_mode,
+            "json_enforced=%s, budget_effective=%s, effective_mode=%s)",
+            model_id, reasoning_separated, emits_think, json_enforced, budget_effective,
+            effective_mode,
         )
     return snapshot
 
@@ -305,6 +374,8 @@ PROBE_DECODE_TPS_NUMERATOR = 60.0
 PROBE_MIN_DECODE_TPS = 1.5
 #: P1/P2 (reasoning) カナリアの max_tokens。
 PROBE_REASONING_MAX_TOKENS = 128
+#: P4 (思考予算 0) カナリアの max_tokens。予算が効けば短文で終わる。
+PROBE_BUDGET_MAX_TOKENS = 64
 
 
 def probe_timeout_sec(
@@ -394,6 +465,8 @@ __all__ = [
     "ChatFn",
     "interpret_json_probe",
     "interpret_reasoning_probe",
+    "interpret_budget_probe",
+    "resolve_per_request_budget_effective",
     "resolve_effective_reasoning_mode",
     "probe_model_capabilities",
     "probe_timeout_sec",
