@@ -264,6 +264,11 @@ class DebugLogger:
         response_length: int = 0,
         queue_wait_sec: float | None = None,
         slot: int | None = None,
+        think_budget: int | None = None,
+        max_tokens_sent: int | None = None,
+        completion_tokens: int | None = None,
+        reasoning_chars: int | None = None,
+        reasoning_tokens_est: int | None = None,
     ) -> None:
         """補助タスクのリクエスト/レスポンスを記録
 
@@ -297,6 +302,10 @@ class DebugLogger:
             response_length: 応答 ``content`` 文字数。``response_preview``
                 は 200 文字に縮める仕様だが、実体の長さを別途記録することで
                 truncation の有無を JSONL から判定できる。``0`` なら記録しない。
+            think_budget / max_tokens_sent / completion_tokens / reasoning_chars /
+                reasoning_tokens_est: 思考予算の観測 (docs/c_15 §2.9.8)。送った予算
+                (送らなければ ``None``)・送った max_tokens・思考込みの生成トークン数・
+                ``reasoning_content`` の文字数・思考トークンの推定。``None`` なら記録しない。
         """
         if not self.enabled or not self.log_requests:
             return
@@ -322,6 +331,15 @@ class DebugLogger:
             entry["queue_wait_sec"] = round(float(queue_wait_sec), 3)
         if slot is not None:
             entry["slot"] = int(slot)
+        for key, value in (
+            ("think_budget", think_budget),
+            ("max_tokens_sent", max_tokens_sent),
+            ("completion_tokens", completion_tokens),
+            ("reasoning_chars", reasoning_chars),
+            ("reasoning_tokens_est", reasoning_tokens_est),
+        ):
+            if value is not None:
+                entry[key] = int(value)
         self._accumulate_turn_aux(purpose, elapsed_sec, queue_wait_sec)
         self._emit("requests", entry)
 

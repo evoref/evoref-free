@@ -18,6 +18,8 @@ from backend.config import (
     resolve_client_reasoning,
     resolve_context_size,
     resolve_enable_thinking,
+    resolve_per_request_budget,
+    resolve_reasoning_mode,
 )
 from backend.free.llm.model_metadata import ModelMetadata
 from backend.log_config import get_logger
@@ -55,6 +57,12 @@ def build_local_client(
         chat_template=getattr(metadata, "chat_template", None),
     )
     think_budget, on_runaway = resolve_client_reasoning(cfg, "base")
+    # 要求ごとの思考予算 (docs/c_15 §2.9.2)。enable_thinking と同じく base で解決する
+    # (モード切替後に載っているモデルで引かない既知の制約、c_15 §2.9.9)。
+    reasoning_mode = resolve_reasoning_mode(
+        cfg, "base", chat_template=getattr(metadata, "chat_template", None),
+    )
+    per_request_budget = resolve_per_request_budget(cfg, "base")
     # config の slots は宣言値。llama-server が実際に確保したスロット数
     # (``/props`` の total_slots) より多いと、``id_slot=2`` 等の要求が
     # 存在しないスロットを指して 400 になる。少ない方へ丸めて警告する。
@@ -88,6 +96,8 @@ def build_local_client(
         debug_logger=debug_logger,
         client_think_budget=think_budget,
         on_runaway=on_runaway,
+        reasoning_mode=reasoning_mode,
+        per_request_budget=per_request_budget,
         # 送信前コンテキスト超過ガード用 (slots>1 でも launch_llama が
         # --kv-unified を自動付与するため per-slot でも full n_ctx)。
         # ``llama.context_size`` の既定は None (プロファイル委譲) なので

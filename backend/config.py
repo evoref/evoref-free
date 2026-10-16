@@ -1055,6 +1055,16 @@ def resolve_client_reasoning(cfg: dict, slot: str) -> tuple[int, str]:
     return max(0, budget), str(on_runaway)
 
 
+def resolve_per_request_budget(cfg: dict, slot: str) -> bool | None:
+    """slot のモデル profile の ``reasoning.per_request_budget`` 宣言を返す (docs/c_15 §2.9.2)。
+
+    要求本文に思考予算を送るかの宣言。未宣言 / bool でない値は ``None``。送るかの最終判定
+    (mode == always 等) は ``LocalClient`` が行う。
+    """
+    value = _resolve_profile_reasoning(cfg, slot).get("per_request_budget")
+    return value if isinstance(value, bool) else None
+
+
 def _profile_context_size(cfg: dict, target: str) -> int | None:
     """target のモデルプロファイルから ``context_size`` を返す。
 

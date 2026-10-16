@@ -1,0 +1,24 @@
+# LiquidAI LFM2.5-24B-A2B (arch "lfm2moe"・64 experts / 有効 約 2B)。
+#
+# sampling はモデルカード (huggingface.co/LiquidAI/LFM2.5-24B-A2B) の推奨値:
+#   temperature 0.1 / top_k 50 / repetition_penalty 1.05
+# GGUF の ``general.sampling.*`` メタデータ (temp 0.1 / top_k 50 / penalty_repeat 1.05) と、
+# GGUF 配布ページの llama.cpp 例 (--temp 0.1 --top-k 50 --repeat-penalty 1.05) も同じ値。
+# arch 層 (lfm2moe.yaml、8B-A1B 向けの temperature 0.2 / top_k 80) はこのモデルの推奨と
+# 食い違うので、モデル別層で上書きする。top_p / min_p は推奨が無いので置かない。
+# MoE・context は arch 層をそのまま使う。
+sampling:
+  temperature: 0.1
+  top_k: 50
+  repetition_penalty: 1.05
+# 思考 (mode: always・client_think_budget 等) は arch 層から deep merge で継承し、
+# 思考予算の宣言だけを足す (docs/c_15 §2.9)。llama-server build 4bae5bf で、思考が
+# reasoning_content に分離され、起動フラグ --reasoning-budget と要求本文の
+# reasoning_budget_tokens が効くことを実機で確認した (c_15 §1.2.1)。8B-A1B は未検証なので
+# arch 層には宣言しない。
+#   budget_default 1536 = llama.max_tokens 2048 − 本文の余地 512 (起動フラグの安全網)
+#   per_request_budget  = 補助呼び出しへ purpose 別の予算を送る (think_budget.py の表)
+reasoning:
+  server_control: true
+  budget_default: 1536
+  per_request_budget: true

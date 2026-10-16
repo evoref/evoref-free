@@ -53,6 +53,7 @@ export interface CapabilityInfo {
 	emits_think_tags: boolean | null;
 	closes_think_tags: boolean | null;
 	json_schema_enforced: boolean | null;
+	reasoning_budget_effective: boolean | null;
 	needs_lenient_json: boolean;
 	probe_divergence: string[];
 	probed_at: string;

@@ -29,11 +29,13 @@ sampling:
   top_k: 80
   repetition_penalty: 1.05
 # reasoning (thinking)。LFM2.5-8B-A1B は OFF スイッチ無しの強制 reasoning モデル。
-# 実機検証 (c_15 Step0) で llama.cpp が thinking=0 (peg-native) で reasoning 領域を認識せず、
-# --reasoning-format / --reasoning-budget / -rea が全て no-op であることが確定。
-# よって server_control: false とし、思考はクライアント側 (_ReasoningFilter) で除去する。
+# 実機検証 (c_15 Step0、LFM2.5-8B-A1B・llama.cpp build 210a657、2026-06-02) で llama.cpp が
+# thinking=0 (peg-native) で reasoning 領域を認識せず、--reasoning-format / --reasoning-budget /
+# -rea が全て no-op だった。よって server_control: false とし、思考はクライアント側
+# (_ReasoningFilter) で除去する。現行 build (4bae5bf) の LFM2.5-24B-A2B では分離・予算とも
+# 効く (c_15 §1.2.1) が、8B-A1B は再測定していないので、予算の宣言は 24B の by-model 層にだけ置く。
 reasoning:
   mode: always
-  server_control: false      # llama.cpp 非認識 (thinking=0) → サーバ側 reasoning 制御不可 (Step0 実証)
+  server_control: false      # 8B-A1B・build 210a657 では llama.cpp 非認識 (thinking=0) → サーバ側制御不可 (Step0)
   client_think_budget: 4096  # watchdog 上限。LFM2.5 は難問で思考が 1000+ tok に達してから </think> を閉じるため、512 では回答到達前に stream 中断 (content 0) していた (実機実測)
   on_runaway: fallback

@@ -187,6 +187,8 @@ class LLMClient:
         id_slot: int | None = None,
         timeout: float | None = None,
         usage_purpose: str = "",
+        result_meta: dict | None = None,
+        think_budget: int | None = None,
     ) -> str | None:
         """``response_format`` (json_schema) で文法制約した非ストリーミング生成
 
@@ -196,6 +198,9 @@ class LLMClient:
         (``SleepTimeScheduler`` は ``in_flight_chat_count`` を読むため生の
         ``LocalClient`` ではなくファサードを保持している) ので、ここが無いと
         変異が黙って全文書き直し (実測 356 秒/回) へ縮退する。
+
+        ``result_meta`` / ``think_budget`` は ``LocalClient.generate_constrained`` へ透過する
+        (思考予算は docs/c_15 §2.9)。
 
         Returns:
             ``choices[0].message.content``。取得できなければ ``None``。
@@ -208,7 +213,13 @@ class LLMClient:
             id_slot=id_slot,
             timeout=timeout,
             usage_purpose=usage_purpose,
+            result_meta=result_meta,
+            think_budget=think_budget,
         )
+
+    def effective_max_tokens(self, answer: int | None, budget: int | None) -> int | None:
+        """実際に送る max_tokens (``LocalClient.effective_max_tokens`` の委譲)。"""
+        return self.local.effective_max_tokens(answer, budget)
 
     async def generate_with_logprobs(
         self,

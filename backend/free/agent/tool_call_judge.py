@@ -88,6 +88,7 @@ from backend.free.llm.aux_client import PURPOSE_TIMEOUT_DEFAULTS
 from backend.free.llm.json_extract import extract_json_object
 from backend.free.llm.json_schemas import resolve_response_format_for_purpose
 from backend.free.llm.slot_prefix import shared_prefix_messages
+from backend.free.llm.think_budget import resolve_think_budget, sent_max_tokens
 from backend.free.llm.tps_calibration import (
     chat_path_timeout,
     is_explicit_agent_timeout,
@@ -1341,6 +1342,8 @@ class ToolCallJudge:
                 ),
                 timeout=PURPOSE_TIMEOUT_DEFAULTS.get("date_intent", 20.0),
                 usage_purpose="date_intent",
+                # 常に思考するモデルの思考予算 (docs/c_15 §2.9.3)。締切は purpose の固定秒。
+                think_budget=resolve_think_budget("date_intent"),
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("date intent extraction failed: %s", exc)
@@ -2875,6 +2878,8 @@ class ToolCallJudge:
                 EXPRESSION_ABSTAIN, EXPRESSION_ABSTAIN_EN,
             )
         messages[0:0] = self._slot_shared_messages(tools_registry, mode, task_system)
+        # 式合成は思考を許す (0 だと自信のある誤った式が出る、docs/c_15 §2.9.3)。
+        synthesis_budget = resolve_think_budget("expression_synthesis")
         try:
             content = await client.generate_constrained(
                 messages,
@@ -2885,8 +2890,11 @@ class ToolCallJudge:
                     client, "classifier_slot",
                     getattr(client, "background_slot", -1),
                 ),
-                timeout=self._classifier_timeout(client, messages, CLASSIFY_MAX_TOKENS),
+                timeout=self._classifier_timeout(
+                    client, messages, sent_max_tokens(client, CLASSIFY_MAX_TOKENS, synthesis_budget),
+                ),
                 usage_purpose="expression_synthesis",
+                think_budget=synthesis_budget,
             )
         except Exception as exc:  # noqa: BLE001
             logger.info("expression synthesis failed: %s", exc)
@@ -2923,8 +2931,12 @@ class ToolCallJudge:
                         client, "classifier_slot",
                         getattr(client, "background_slot", -1),
                     ),
-                    timeout=self._classifier_timeout(client, messages, CLASSIFY_MAX_TOKENS),
+                    timeout=self._classifier_timeout(
+                        client, messages,
+                        sent_max_tokens(client, CLASSIFY_MAX_TOKENS, synthesis_budget),
+                    ),
                     usage_purpose="expression_synthesis",
+                    think_budget=synthesis_budget,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.info("expression synthesis retry failed: %s", exc)
@@ -3217,6 +3229,7 @@ class ToolCallJudge:
             "role": "system",
             "content": self._classifier_slot_prefix(tools_registry, mode),
         })
+        classifier_budget = resolve_think_budget("tool_classifier")
 
         try:
             content = await client.generate_constrained(
@@ -3245,9 +3258,14 @@ class ToolCallJudge:
                     getattr(client, "background_slot", -1),
                 ),
                 timeout=self._classifier_timeout(
-                    client, messages, self._tool_classifier_max_tokens,
+                    client, messages,
+                    sent_max_tokens(client, self._tool_classifier_max_tokens, classifier_budget),
                 ),
                 usage_purpose="tool_classifier",
+                # 判定 JSON の前の思考を止める (常に思考するモデルだけに効く、docs/c_15 §2.9)。
+                # 値は表の 0 / 512 だけ — 範囲外 (負) の予算は送らないが、4xx はこの分類器を
+                # プロセスごと止める (下の except) ので表の外の値を作らない。
+                think_budget=classifier_budget,
             )
         except httpx.HTTPStatusError as exc:
             # ``response_format`` 非対応の build。リトライしても回復しないので

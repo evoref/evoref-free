@@ -285,8 +285,14 @@ EXPRESSION_RETRY_EN = (
 )
 
 
-def parse_expression_response(content: str) -> str:
-    """式合成の応答から ``expression`` を取り出す。取れなければ空文字。"""
+def parse_expression_response(content: str | None) -> str:
+    """式合成の応答から ``expression`` を取り出す。取れなければ空文字。
+
+    ``content`` は本文の無い応答 (思考だけで ``max_tokens`` を使い切った等) で ``None`` になりうる。
+    """
+    if content is None:
+        logger.info("expression synthesis: empty response (no content)")
+        return ""
     try:
         data = json.loads(content)
     except (ValueError, TypeError):
